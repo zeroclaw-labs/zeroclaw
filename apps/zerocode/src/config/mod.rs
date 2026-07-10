@@ -218,6 +218,61 @@ impl Default for MessageQueueSettings {
     }
 }
 
+impl crate::config::MessageQueueSettings {
+    /// Convert config fields (from `config_list("message_queue")`) into
+    /// runtime settings. Falls back to schema defaults for any field that is
+    /// missing or unparseable.
+    #[allow(dead_code)]
+    pub(crate) fn from_config_fields(fields: &[crate::wire::ConfigFieldEntry]) -> Self {
+        let mut s = Self::default();
+        for f in fields {
+            let key = f.path.rsplit('.').next().unwrap_or(f.path.as_str());
+            let Some(value) = f.value.as_ref() else {
+                continue;
+            };
+            match key {
+                "cap" => {
+                    if let Some(n) = value.as_u64() {
+                        s.cap = n as usize;
+                    }
+                }
+                "default_width" => {
+                    if let Some(n) = value.as_u64() {
+                        s.default_width = n as u16;
+                    }
+                }
+                "min_width" => {
+                    if let Some(n) = value.as_u64() {
+                        s.min_width = n as u16;
+                    }
+                }
+                "max_width" => {
+                    if let Some(n) = value.as_u64() {
+                        s.max_width = n as u16;
+                    }
+                }
+                "width_step" => {
+                    if let Some(n) = value.as_u64() {
+                        s.width_step = n as u16;
+                    }
+                }
+                "auto_open" => {
+                    if let Some(b) = value.as_bool() {
+                        s.auto_open = b;
+                    }
+                }
+                "stay_open_when_empty" => {
+                    if let Some(b) = value.as_bool() {
+                        s.stay_open_when_empty = b;
+                    }
+                }
+                _ => {}
+            }
+        }
+        s
+    }
+}
+
 // ── Default helpers ───────────────────────────────────────────────────────────
 
 fn default_true() -> bool {

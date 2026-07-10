@@ -131,6 +131,13 @@ pub(crate) struct Chat {
     /// Guards the one-shot `[todotracker]` config fetch so it doesn't
     /// repeat on every session start.
     todo_settings_loaded: bool,
+    /// Parsed `[message_queue]` config, fetched once (lazily, on first
+    /// session start) and applied to every `ChatState` this pane
+    /// constructs. Defaults until fetched.
+    queue_settings: crate::config::MessageQueueSettings,
+    /// Guards the one-shot `[message_queue]` config fetch so it doesn't
+    /// repeat on every session start.
+    queue_settings_loaded: bool,
     /// Inbound `elicitation/create` requests that arrived while the pane was
     /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
     /// Rather than auto-cancel a legitimately-owned prompt during that
@@ -222,6 +229,8 @@ impl Chat {
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
             todo_settings_loaded: false,
+            queue_settings: crate::config::MessageQueueSettings::default(),
+            queue_settings_loaded: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -397,6 +406,17 @@ impl Chat {
             }
         }
 
+        // Fetch the [message_queue] config once, lazily, the first time this
+        // pane starts a session — so the queue honors cap / widths / auto-open.
+        // Best-effort: a failure keeps the schema defaults.
+        if !self.queue_settings_loaded {
+            self.queue_settings_loaded = true;
+            if let Ok(fields) = self.rpc.config_list(Some("message_queue")).await {
+                self.queue_settings =
+                    crate::config::MessageQueueSettings::from_config_fields(&fields);
+            }
+        }
+
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
         // the daemon-retained session, its persisted history, and its cwd.
@@ -435,6 +455,7 @@ impl Chat {
                     session.session_id,
                     agent_alias.to_string(),
                     self.todo_settings,
+                    self.queue_settings,
                 );
                 // Only ACP shows the working directory above the input bar.
                 if self.pane_kind == PaneKind::Acp {
@@ -4751,6 +4772,12 @@ pub struct ChatState {
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
+    /// Local UI settings for the TodoWrite tracker (width, location, etc.).
+    /// Retained across session resets.
+    pub(crate) todo_tracker_settings: crate::todo_tracker::TodoTrackerSettings,
+    /// Local UI settings for the message queue (cap, widths, auto-open, etc.).
+    /// Retained across session resets.
+    pub(crate) message_queue_settings: crate::config::MessageQueueSettings,
 }
 
 impl ChatState {
@@ -4758,6 +4785,7 @@ impl ChatState {
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        queue_settings: crate::config::MessageQueueSettings,
     ) -> Self {
         Self {
             session_id,
@@ -4818,6 +4846,8 @@ impl ChatState {
             info_message: None,
             model_picker: ModelPickerOverlay::None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
+            todo_tracker_settings: todo_settings,
+            message_queue_settings: queue_settings,
         }
     }
 
@@ -6105,6 +6135,7 @@ mod tests {
             "sess-1".to_string(),
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         )
     }
 
@@ -6221,6 +6252,7 @@ mod tests {
             "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
             "personal_code".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
         assert_eq!(
@@ -6235,6 +6267,7 @@ mod tests {
             "abcdef1234".to_string(),
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         assert_eq!(s.title(), "myagent  abcdef1");
     }
@@ -6245,6 +6278,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5");
@@ -6263,6 +6297,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         let area = Rect::new(10, 4, 80, 20);
@@ -6284,6 +6319,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
@@ -6299,6 +6335,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
 
@@ -6591,6 +6628,7 @@ mod tests {
             "abcdef1234".to_string(),
             "beta".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.refresh_title_hit_rects(area);
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -6652,6 +6690,7 @@ mod tests {
             "abcdef1234".to_string(),
             "beta".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.turn_in_flight = true;
         state.refresh_title_hit_rects(area);
@@ -7494,6 +7533,7 @@ mod tests {
             "sess".to_string(),
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
         let body = Rect::new(0, 0, 60, 20);
@@ -7514,6 +7554,7 @@ mod tests {
             "sess".to_string(),
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
         let body = Rect::new(0, 0, 60, 20);
@@ -7533,6 +7574,7 @@ mod tests {
             "sess".to_string(),
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         let pad = "filler line\n".repeat(200);
         state
@@ -8132,6 +8174,7 @@ mod tests {
             "40be7731122334455".to_string(),
             "personal_code".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         assert_eq!(s.title(), "personal_code  40be773");
     }
@@ -8142,6 +8185,7 @@ mod tests {
             "40be7731122334455".to_string(),
             "personal_code".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.session_name = Some("my work".to_string());
         assert_eq!(s.title(), "personal_code  — my work  40be773");
