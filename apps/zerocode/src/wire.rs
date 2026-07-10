@@ -48,6 +48,9 @@ pub struct DoctorSummary {
 pub struct DoctorRunResult {
     pub results: Vec<DoctorResultEntry>,
     pub summary: DoctorSummary,
+    /// Resolved active log persistence path from the daemon, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 #[cfg(test)]
