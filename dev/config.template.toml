@@ -1,10 +1,23 @@
-workspace_dir = "/zeroclaw-data/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-# This is the Ollama Base URL, not a secret key
-api_key = "http://host.docker.internal:11434"
-default_provider = "ollama"
-default_model = "llama3.2"
-default_temperature = 0.7
+schema_version = 3
+
+# Ollama running on the host. The endpoint belongs in `uri` under the
+# provider alias, NOT in a top-level `api_key` (which is a secret bearer
+# token, not a URL). `host.docker.internal` resolves to the Docker host on
+# Docker Desktop / OrbStack; on Linux add `--add-host=host.docker.internal:host-gateway`.
+[providers.models.ollama.default]
+model = "llama3.2"
+uri = "http://host.docker.internal:11434"
+
+# A V3 config needs at least one dispatchable agent pointing at a provider
+# alias, or the gateway stays in `needs_quickstart` mode (503 on chat).
+[agents.default]
+enabled = true
+model_provider = "ollama.default"
+risk_profile = "default"
+
+[risk_profiles.default]
+level = "supervised"
+auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]
 
 [gateway]
 port = 42617

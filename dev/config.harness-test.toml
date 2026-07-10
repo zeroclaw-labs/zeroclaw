@@ -1,10 +1,20 @@
-workspace_dir = "/zeroclaw-data/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-# API key: set via .env or environment variable at runtime
-api_key = "http://host.docker.internal:11434"
-default_provider = "ollama"
-default_model = "llama3.2"
-default_temperature = 0.7
+schema_version = 3
+
+# Ollama running on the host. The endpoint belongs in `uri` under the
+# provider alias, NOT in a top-level `api_key` (which is a secret bearer
+# token, not a URL).
+[providers.models.ollama.default]
+model = "llama3.2"
+uri = "http://host.docker.internal:11434"
+
+[agents.default]
+enabled = true
+model_provider = "ollama.default"
+risk_profile = "default"
+
+[risk_profiles.default]
+level = "supervised"
+auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "git_operations"]
 
 [gateway]
 port = 42617
@@ -12,14 +22,15 @@ host = "[::]"
 allow_public_bind = true
 require_pairing = false
 
-[agent]
+# Iteration/context caps live on the runtime profile in V3 (previously the
+# V1 `[agent]` block), and the agent references the profile by alias.
+[runtime_profiles.default]
 max_tool_iterations = 50
-max_tool_result_chars = 50000
 max_context_tokens = 32000
+max_tool_result_chars = 50000
 
-[agent.context_compression]
+[runtime_profiles.default.context_compression]
 enabled = true
-tool_result_retrim_chars = 2000
 
 [memory]
 backend = "sqlite"
@@ -28,7 +39,3 @@ hygiene_enabled = true
 archive_after_days = 7
 purge_after_days = 30
 embedding_provider = "none"
-
-[autonomy]
-level = "supervised"
-auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "git_operations"]
