@@ -905,14 +905,27 @@ pub async fn create_memory_for_agent(
         .get(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
 
-    // Hindsight external backend: selected via the install-wide string
-    // `[memory] backend = "hindsight"` (the per-agent `MemoryBackendKind` enum
-    // is a closed set, so hindsight rides the top-level string instead). Each
-    // agent gets its own server-namespaced bank, so the bank is the private
-    // per-agent scope; no local agent_id column or AgentScopedMemory wrapper is
-    // needed. Endpoint/token/bank are read from the environment by the driver.
-    if config.memory.backend.trim().eq_ignore_ascii_case("hindsight") {
-        let backend = hindsight::HindsightMemory::from_env(agent_alias)?;
+    let backend_kind = agent_cfg.memory.backend;
+
+    // Hindsight external backend: a first-class per-agent `MemoryBackendKind`.
+    // Each agent gets its own server-namespaced bank (derived from
+    // `[memory.hindsight] bank_template` or an explicit per-agent `bank_id`),
+    // so the bank is the private per-agent scope; no local agent_id column or
+    // AgentScopedMemory wrapper is needed. Endpoint/top-k come from the typed
+    // `[memory.hindsight]` section and the token is resolved from the env var
+    // it names. This branch precedes the storage-backed paths because hindsight
+    // has no `[storage.*]` instance to resolve.
+    //
+    // Selected when the per-agent backend is Hindsight, or when the install-wide
+    // `[memory] backend = "hindsight"` string selects it for all agents
+    // (backwards-compatible with the pre-enum install-wide selection).
+    let install_wide_hindsight = config.memory.backend.trim().eq_ignore_ascii_case("hindsight");
+    if matches!(backend_kind, ConfigBackend::Hindsight) || install_wide_hindsight {
+        let backend = hindsight::HindsightMemory::from_config(
+            &config.memory.hindsight,
+            agent_alias,
+            &agent_cfg.memory.bank_id,
+        )?;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -923,8 +936,6 @@ pub async fn create_memory_for_agent(
         );
         return Ok(Arc::new(backend));
     }
-
-    let backend_kind = agent_cfg.memory.backend;
 
     // Markdown branch: the wrapper composes per-agent dirs, not a
     // shared backend. Skip the inner-backend factory entirely.

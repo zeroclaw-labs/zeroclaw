@@ -13429,6 +13429,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
