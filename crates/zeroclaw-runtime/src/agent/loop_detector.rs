@@ -68,32 +68,80 @@ struct ToolCallRecord {
     result_hash: u64,
 }
 
-/// Produce a deterministic hash for a JSON value by recursively sorting
-/// object keys before serialisation.  This ensures `{"a":1,"b":2}` and
-/// `{"b":2,"a":1}` hash identically.
+/// Produce a deterministic hash for a JSON value that is invariant under
+/// object-key reordering.  Implemented as a streaming walker that feeds
+/// structural tags + sorted keys + leaves directly to a [`Hasher`], so no
+/// intermediate owned `serde_json::Value` or canonical `String` is allocated.
+///
+/// The hot path is `record()` in `collect_tool_results`, called once per
+/// successful tool call inside the agent loop.  The previous implementation
+/// (`canonicalise` + `serde_json::to_string`) deep-cloned the entire args
+/// tree and then serialised it, so on long tool-heavy turns each call added
+/// two transient allocations proportional to the input size; on glibc those
+/// freed chunks stayed in the per-thread arena and RSS grew monotonically
+/// (same family as the MCP tool-spec cloning issue split out into #8642).
+/// #8936.
 fn hash_value(value: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    let canonical = serde_json::to_string(&canonicalise(value)).unwrap_or_default();
-    canonical.hash(&mut hasher);
+    hash_value_into(value, &mut hasher);
     hasher.finish()
 }
 
-/// Return a clone of `value` with all object keys sorted recursively.
-fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
+/// Walker backing [`hash_value`].  Emits a deterministic byte stream keyed by
+/// structure: structural tags disambiguate `"123"` (string) from `123`
+/// (number), `true` from `"true"`, `null` from `"null"`.  Object keys are
+/// sorted on the fly; the key→value boundary is marked so two objects with
+/// the same keys and leaves hash identically regardless of insertion order.
+fn hash_value_into<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
     match value {
-        serde_json::Value::Object(map) => {
-            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-            sorted.sort_by_key(|(k, _)| *k);
-            let new_map: serde_json::Map<String, serde_json::Value> = sorted
-                .into_iter()
-                .map(|(k, v)| (k.clone(), canonicalise(v)))
-                .collect();
-            serde_json::Value::Object(new_map)
+        serde_json::Value::Null => {
+            "null".hash(hasher);
+        }
+        serde_json::Value::Bool(b) => {
+            "bool".hash(hasher);
+            b.hash(hasher);
+        }
+        serde_json::Value::Number(n) => {
+            "num".hash(hasher);
+            // serde_json::Number's `Hash` impl covers both integral and float
+            // variants; numbers written in the JSON as `1` and `1.0` are
+            // distinct tokens and therefore distinct under this hasher, which
+            // matches the previous serde_json::to_string behaviour.
+            n.hash(hasher);
+        }
+        serde_json::Value::String(s) => {
+            "str".hash(hasher);
+            // Length-prefix the string content so that, e.g. ["ab", "c"] and
+            // ["a", "bc"] (different leaf structure) cannot collide.
+            s.len().hash(hasher);
+            s.hash(hasher);
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(canonicalise).collect())
+            "arr".hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_value_into(item, hasher);
+            }
         }
-        other => other.clone(),
+        serde_json::Value::Object(map) => {
+            "obj".hash(hasher);
+            map.len().hash(hasher);
+            // Sort keys on the fly. `Vec<(&String, &Value)>` is the only
+            // allocation; the values themselves are borrowed, so a 1 MB
+            // payload costs (key references + Vec overhead) rather than a
+            // second tree-sized clone.
+            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            for (k, v) in sorted {
+                // Mark the key→value boundary so, e.g. `{"ab":"c"}` and
+                // `{"a":"bc"}` cannot collide on a shared suffix.
+                0u8.hash(hasher);
+                k.len().hash(hasher);
+                k.hash(hasher);
+                1u8.hash(hasher);
+                hash_value_into(v, hasher);
+            }
+        }
     }
 }
 
@@ -705,6 +753,52 @@ mod tests {
             hash_value(&a),
             hash_value(&b),
             "nested objects must also be key-order independent"
+        );
+    }
+
+    #[test]
+    fn hash_value_distinguishes_string_from_number_and_bool() {
+        // The streaming walker tags leaves by JSON type, so a number `1`,
+        // the string `"1"`, and the bool `true` must all produce distinct
+        // hashes (this used to fall out of serde_json::to_string).
+        let num = json!(1);
+        let str_num = json!("1");
+        let truthy = json!(true);
+        assert_ne!(hash_value(&num), hash_value(&str_num));
+        assert_ne!(hash_value(&num), hash_value(&truthy));
+        assert_ne!(hash_value(&str_num), hash_value(&truthy));
+        assert_ne!(hash_value(&json!(null)), hash_value(&json!("null")));
+    }
+
+    #[test]
+    fn hash_value_distinguishes_array_ordering() {
+        // Arrays are order-sensitive; [1, 2] and [2, 1] must hash differently.
+        assert_ne!(
+            hash_value(&json!([1, 2])),
+            hash_value(&json!([2, 1])),
+            "array ordering is part of the value and must affect the hash"
+        );
+    }
+
+    #[test]
+    fn hash_value_handles_large_args_without_panicking() {
+        // Pin the streaming walker on a payload that would have triggered
+        // a multi-MB transient allocation in the legacy canonicalise +
+        // serde_json::to_string path. We do not assert on allocation count
+        // (test-only instrumentation is brittle on glibc arenas) — we just
+        // assert the hash is stable and the call returns.
+        let big_payload = "x".repeat(1024 * 1024);
+        let args = json!({ "body": big_payload, "kind": "echo" });
+        let h1 = hash_value(&args);
+        let h2 = hash_value(&args);
+        assert_eq!(h1, h2, "hash must be deterministic for the same input");
+
+        // And a permuted key order over the same payload must match.
+        let args_permuted = json!({ "kind": "echo", "body": big_payload });
+        assert_eq!(
+            h1,
+            hash_value(&args_permuted),
+            "key-order independence must hold for large payloads too"
         );
     }
 
