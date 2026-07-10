@@ -88,6 +88,7 @@ This profile composes existing primitives:
 - `max_tool_iterations`, `max_context_tokens`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context.
 - `max_actions_per_hour`, `max_cost_per_day_cents`, and the timeout/delegation fields keep local runs on the same budget shape as the built-in preset.
 - `parallel_tools = false` and `keep_tool_context_turns = 1` keep local runs sequential and limit retained tool context.
+- `memory_recall_limit` sets how many memories each recall returns for this profile's agents. It drives both the per-turn memory-injection recall and the default `limit` of the `memory_recall` tool (when the model omits one). For a hindsight-backed agent with no `memory_recall_limit` set, `[memory.hindsight] top_k` fills the same role. The number of memories actually rendered into the per-turn preamble is separately capped by `[memory] inject_max_entries` (default 12; `0` = unlimited), so raise both the recall depth and `inject_max_entries` if a deeper-ranked fact must reach the model.
 
 With Ollama, this is a no-text-fallback profile: authorized tools remain configured in `risk_profile`, but text-form tool markup from the model is not executed. Use it for chat-first local agents, or for providers that return native/structured tool calls. If a local model must use ZeroClaw's text fallback tool syntax, set `strict_tool_parsing = false` and keep the other small-model limits.
 

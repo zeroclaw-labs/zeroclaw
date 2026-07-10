@@ -1981,7 +1981,9 @@ pub async fn run(
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
                                     cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                                        limit: config.effective_memory_recall_limit(agent_alias),
                                         min_relevance_score: config.memory.min_relevance_score,
+                                        max_entries: config.effective_memory_inject_max_entries(),
                                         ..Default::default()
                                     },
                                 }),
@@ -2547,7 +2549,11 @@ pub async fn run(
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
                                         cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                                            limit: config
+                                                .effective_memory_recall_limit(agent_alias),
                                             min_relevance_score: config.memory.min_relevance_score,
+                                            max_entries: config
+                                                .effective_memory_inject_max_entries(),
                                             ..Default::default()
                                         },
                                     }),
@@ -3417,7 +3423,9 @@ pub async fn process_message(
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
                         cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                            limit: config.effective_memory_recall_limit(agent_alias),
                             min_relevance_score: config.memory.min_relevance_score,
+                            max_entries: config.effective_memory_inject_max_entries(),
                             ..Default::default()
                         },
                     }),
