@@ -1613,7 +1613,9 @@ pub async fn run(
                 config.skills.install_suggestions.enabled,
             ) {
                 final_output = suggestion;
-                println!("{final_output}");
+                if interactive {
+                    println!("{final_output}");
+                }
                 observer.record_event(&ObserverEvent::TurnComplete);
                 return Ok(final_output);
             }
@@ -1907,7 +1909,9 @@ pub async fn run(
             // Emit the user-visible response before any background work so the
             // skill-review fork can never delay the user's answer.
             final_output = response;
-            println!("{final_output}");
+            if interactive {
+                println!("{final_output}");
+            }
             observer.record_event(&ObserverEvent::TurnComplete);
 
             if config.skills.skill_improvement.enabled {

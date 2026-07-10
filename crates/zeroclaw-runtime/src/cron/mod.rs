@@ -39,6 +39,9 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "lark",
     "feishu",
     "dingtalk",
+    "wechat",
+    "signal",
+    "email",
 ];
 
 /// Validate a shell command against an agent's security policy
