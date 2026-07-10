@@ -2898,6 +2898,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
+            timeout_secs: 120,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
