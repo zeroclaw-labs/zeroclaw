@@ -31,6 +31,7 @@
 //! | `ZC_HINDSIGHT_SHARED_BANK`| Shared/family bank merged read-only into recall/list; written only via the `shared_memory_store` tool | (none) |
 //! | `ZC_HINDSIGHT_SYSTEM_BANK`| System bank merged read-only into recall/list; written only via the `system_memory_store` tool | (none) |
 //! | `ZC_HINDSIGHT_RETAIN_ASYNC`| Send retains with the server-side `async` flag (vectorize off the critical path); falsey (`0`/`false`/`no`) forces sync | `true` |
+//! | `ZC_HINDSIGHT_RECALL_TYPES`| Comma-separated Hindsight fact types to restrict recall to (`experience`,`observation`,`world`); sent as the recall body's `types` array. Empty = no filter (all types) | (none) |
 //!
 //! Shared and system banks: `ZC_HINDSIGHT_SHARED_BANK` and
 //! `ZC_HINDSIGHT_SYSTEM_BANK` name two extra banks every agent can READ from
@@ -92,6 +93,12 @@ pub struct HindsightMemory {
     /// vectorization runs off the caller's critical path. Applies to `store`
     /// and `store_to_bank`. Read paths are unaffected.
     retain_async: bool,
+    /// Optional recall-side fact-type filter. When non-empty, each recall body
+    /// carries a `types` array (Hindsight fact types: `experience`,
+    /// `observation`, `world`) so the server returns only those record types.
+    /// Empty (default) sends nothing, keeping the recall body byte-identical to
+    /// the historical `{query, limit}` shape.
+    recall_types: Vec<String>,
     client: reqwest::Client,
 }
 
@@ -105,6 +112,7 @@ impl std::fmt::Debug for HindsightMemory {
             .field("system_bank", &self.system_bank)
             .field("default_top_k", &self.default_top_k)
             .field("retain_async", &self.retain_async)
+            .field("recall_types", &self.recall_types)
             .finish_non_exhaustive()
     }
 }
@@ -126,6 +134,23 @@ fn resolve_secondary_bank(
                 .filter(|s| !s.is_empty())
         })
         .filter(|b| !b.is_empty() && !taken.contains(&b.as_str()))
+}
+
+/// Env var restricting recall to specific Hindsight fact types (comma-separated).
+const RECALL_TYPES_ENV: &str = "ZC_HINDSIGHT_RECALL_TYPES";
+
+/// Parse `ZC_HINDSIGHT_RECALL_TYPES` (comma-separated fact types) into a trimmed,
+/// non-empty-token list. Returns `None` when the var is unset so callers can
+/// fall back to typed config; returns `Some(vec![])` when the var is set but
+/// blank so an explicit empty override disables the filter.
+fn recall_types_from_env() -> Option<Vec<String>> {
+    std::env::var(RECALL_TYPES_ENV).ok().map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 impl HindsightMemory {
@@ -183,6 +208,10 @@ impl HindsightMemory {
             cfg.top_k
         };
 
+        // Recall type filter: an explicit env override (comma-separated) wins,
+        // else the typed config value. Empty means "no filter" (all types).
+        let recall_types = recall_types_from_env().unwrap_or_else(|| cfg.recall_types.clone());
+
         Ok(Self {
             alias: agent_alias.to_string(),
             base_url,
@@ -192,6 +221,7 @@ impl HindsightMemory {
             token,
             default_top_k,
             retain_async: cfg.retain_async,
+            recall_types,
             client: reqwest::Client::new(),
         })
     }
@@ -238,6 +268,8 @@ impl HindsightMemory {
             .ok()
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
+        // Optional recall type filter from the env; unset -> no filter.
+        let recall_types = recall_types_from_env().unwrap_or_default();
 
         Ok(Self {
             alias: agent_alias.to_string(),
@@ -248,6 +280,7 @@ impl HindsightMemory {
             token,
             default_top_k,
             retain_async,
+            recall_types,
             client: reqwest::Client::new(),
         })
     }
@@ -295,6 +328,7 @@ impl HindsightMemory {
             token: token.to_string(),
             default_top_k: DEFAULT_TOP_K,
             retain_async: true,
+            recall_types: Vec::new(),
             client: reqwest::Client::new(),
         }
     }
@@ -362,7 +396,11 @@ impl HindsightMemory {
 
     /// Recall against a single named bank.
     async fn recall_bank(&self, bank: &str, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
-        let body = RecallBody { query, limit };
+        let body = RecallBody {
+            query,
+            limit,
+            types: &self.recall_types,
+        };
         let resp = self
             .client
             .post(self.recall_url_for(bank))
@@ -490,6 +528,12 @@ struct RetainBody<'a> {
 struct RecallBody<'a> {
     query: &'a str,
     limit: usize,
+    /// Server-side fact-type filter. Empty slice serializes to nothing (via
+    /// `skip_serializing_if`), so the default recall body stays byte-identical
+    /// to the historical `{query, limit}` shape. When populated, the live
+    /// Hindsight API returns only these fact types.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    types: &'a [String],
 }
 
 /// Body of the invalidate (soft-delete) PATCH: sets the item's lifecycle state.
@@ -839,6 +883,7 @@ mod tests {
             token: "test-token".to_string(),
             default_top_k: 5,
             retain_async: true,
+            recall_types: Vec::new(),
             client: reqwest::Client::new(),
         }
     }
@@ -1036,6 +1081,76 @@ mod tests {
         assert_eq!(hits[0].id, "m1");
         assert_eq!(hits[0].namespace, "fact");
         assert!((hits[0].score.unwrap() - 0.87).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn recall_without_filter_omits_types_field() {
+        // Default (no recall_types): the recall body must be byte-identical to
+        // the historical {query, limit} shape - no `types` key serialized.
+        let server = MockServer::start().await;
+        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = captured.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(move |req: &wiremock::Request| {
+                *sink.lock().unwrap() = Some(req.body_json::<serde_json::Value>().unwrap());
+                ResponseTemplate::new(200).set_body_json(json!({ "results": [] }))
+            })
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.recall("otter", 3, None, None, None)
+            .await
+            .expect("recall should succeed");
+
+        let body = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(body, json!({ "query": "otter", "limit": 3 }));
+        assert!(
+            body.get("types").is_none(),
+            "no-filter recall must not serialize a `types` field: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_with_filter_sends_types_array() {
+        // With recall_types configured, the body carries the exact `types`
+        // array the live Hindsight API honors server-side.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({
+                "query": "otter",
+                "limit": 3,
+                "types": ["observation"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "id": "m1",
+                        "text": "PURPLE-OTTER-42",
+                        "type": "observation",
+                        "context": "fact",
+                        "mentioned_at": "2026-07-10T00:00:00Z",
+                        "scores": { "final": 0.91 }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.recall_types = vec!["observation".to_string()];
+        let hits = mem
+            .recall("otter", 3, None, None, None)
+            .await
+            .expect("filtered recall should succeed");
+        // The mock only matches when `types: ["observation"]` is present, so a
+        // returned hit proves the filter was sent on the wire.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "m1");
     }
 
     #[tokio::test]

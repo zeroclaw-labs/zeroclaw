@@ -10663,6 +10663,17 @@ pub struct HindsightMemoryConfig {
     /// immediately queryable by embedding search right after the write).
     #[serde(default = "default_true")]
     pub retain_async: bool,
+    /// Restrict recall to specific Hindsight fact types. Each value must be one
+    /// of the server's fact types: `experience`, `observation`, `world`. The
+    /// driver sends these verbatim as the recall body's `types` array, which the
+    /// live Hindsight API honors server-side. Empty (default) means no filter -
+    /// recall returns all types, byte-identical to the pre-existing
+    /// `{query, limit}` body. Set to `["observation"]` for an
+    /// "observations-only" recall (durable, agent-authored facts) that drops the
+    /// noisier `world`/`experience` records. Overridable at runtime with the
+    /// comma-separated `ZC_HINDSIGHT_RECALL_TYPES` env var.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recall_types: Vec<String>,
 }
 
 impl Default for HindsightMemoryConfig {
@@ -10676,6 +10687,7 @@ impl Default for HindsightMemoryConfig {
             shared_bank: String::new(),
             system_bank: String::new(),
             retain_async: true,
+            recall_types: Vec::new(),
         }
     }
 }
@@ -10736,6 +10748,17 @@ impl HindsightMemoryConfig {
             return Err(
                 "[memory.hindsight] token_env must name an environment variable".to_string(),
             );
+        }
+        // recall_types, when set, must name real Hindsight fact types; a typo
+        // would otherwise surface only as a runtime HTTP 400 on every recall.
+        for t in &self.recall_types {
+            let v = t.trim();
+            if !matches!(v, "experience" | "observation" | "world") {
+                return Err(format!(
+                    "[memory.hindsight] recall_types entries must be one of \
+                     experience, observation, world (got {t:?})"
+                ));
+            }
         }
         Ok(())
     }
