@@ -3987,12 +3987,68 @@ impl Config {
         32_000
     }
 
+    /// True when `agent_alias` resolves to the hindsight backend, either via a
+    /// per-agent `[agents.<alias>.memory] backend = "hindsight"` or the
+    /// backwards-compatible install-wide `[memory] backend = "hindsight"`
+    /// string (mirrors `create_memory_for_agent`'s selection).
     #[must_use]
-    pub fn effective_memory_recall_limit(&self, agent_alias: &str) -> usize {
-        let raw = self
+    pub fn agent_uses_hindsight(&self, agent_alias: &str) -> bool {
+        use crate::multi_agent::MemoryBackendKind;
+        let per_agent = self
+            .agent(agent_alias)
+            .is_some_and(|a| matches!(a.memory.backend, MemoryBackendKind::Hindsight));
+        per_agent || self.memory.backend.trim().eq_ignore_ascii_case("hindsight")
+    }
+
+    /// Configured recall depth for an agent, or `None` when nothing is set (the
+    /// caller then applies the global default). Precedence: an explicit
+    /// runtime-profile `memory_recall_limit` wins; otherwise, for hindsight
+    /// agents, `[memory.hindsight] top_k` (so a configured top_k / the
+    /// `ZC_HINDSIGHT_TOP_K` default actually takes effect on the recall and
+    /// injection paths instead of being dead). A returned `0` means "unlimited".
+    fn configured_recall_limit(&self, agent_alias: &str) -> Option<usize> {
+        if let Some(raw) = self
             .runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.memory_recall_limit)
-            .unwrap_or(5);
+        {
+            return Some(raw);
+        }
+        if self.agent_uses_hindsight(agent_alias) {
+            return Some(self.memory.hindsight.top_k);
+        }
+        None
+    }
+
+    /// Recall limit used on the per-turn memory-injection path (`limit` passed
+    /// to each `recall`). `0` (unlimited) maps to `usize::MAX`. Now
+    /// hindsight-aware via [`Self::configured_recall_limit`].
+    #[must_use]
+    pub fn effective_memory_recall_limit(&self, agent_alias: &str) -> usize {
+        let raw = self.configured_recall_limit(agent_alias).unwrap_or(5);
+        if raw == 0 { usize::MAX } else { raw }
+    }
+
+    /// Default `limit` for the `memory_recall` TOOL when the model omits one.
+    /// Unlike the injection limit this never returns `usize::MAX`: a bare tool
+    /// call should yield a bounded, prompt-safe number of results. Resolves the
+    /// same configured depth (runtime-profile override, then hindsight
+    /// `top_k`), falling back to 5.
+    #[must_use]
+    pub fn effective_memory_recall_tool_limit(&self, agent_alias: &str) -> usize {
+        match self.configured_recall_limit(agent_alias) {
+            Some(n) if n > 0 => n,
+            _ => 5,
+        }
+    }
+
+    /// Cap on the number of memory entries rendered into the per-turn injection
+    /// preamble (`[memory] inject_max_entries`). `0` (unlimited) maps to
+    /// `usize::MAX`. This is the config-driven replacement for the former
+    /// hardcoded cap of 4 that hid deeper-ranked facts on the channel/daemon
+    /// path.
+    #[must_use]
+    pub fn effective_memory_inject_max_entries(&self) -> usize {
+        let raw = self.memory.inject_max_entries;
         if raw == 0 { usize::MAX } else { raw }
     }
 
@@ -10365,6 +10421,17 @@ pub struct MemoryConfig {
     /// context from bleeding into conversations. Default: 0.4
     #[serde(default = "default_min_relevance_score")]
     pub min_relevance_score: f64,
+    /// Maximum number of recalled memory entries rendered into the per-turn
+    /// memory-injection preamble (the `[Memory context]` block prepended before
+    /// the user message on the chat/channel/daemon paths). This is the hard cap
+    /// on injected facts after recall, decay, and relevance filtering. Was a
+    /// hardcoded 4, which hid deeper-ranked-but-relevant facts (e.g. a birthday
+    /// ranking ~#12) on the Telegram/daemon path even though they were in the
+    /// bank and API-recallable. Raise it to surface more context; `0` means
+    /// unlimited (bounded only by the per-entry and total-character budgets).
+    /// Default: 12.
+    #[serde(default = "default_inject_max_entries")]
+    pub inject_max_entries: usize,
     /// Max embedding cache entries before LRU eviction
     #[serde(default = "default_cache_size")]
     pub embedding_cache_size: usize,
@@ -10757,6 +10824,9 @@ fn default_keyword_weight() -> f64 {
 fn default_min_relevance_score() -> f64 {
     0.4
 }
+fn default_inject_max_entries() -> usize {
+    12
+}
 fn default_cache_size() -> usize {
     10_000
 }
@@ -10794,6 +10864,7 @@ impl Default for MemoryConfig {
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
             min_relevance_score: default_min_relevance_score(),
+            inject_max_entries: default_inject_max_entries(),
             embedding_cache_size: default_cache_size(),
             chunk_max_tokens: default_chunk_size(),
             response_cache_enabled: false,
@@ -30741,6 +30812,68 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .expect_err("top_k = 0 must fail validation for a hindsight agent");
     }
 
+    #[::core::prelude::v1::test]
+    fn inject_max_entries_defaults_to_twelve_and_is_config_driven() {
+        // The former hardcoded cap was 4; the config-driven default is 12 so
+        // deeper-ranked-but-relevant facts are no longer silently dropped.
+        let mut config = multi_agent_test_config();
+        assert_eq!(config.memory.inject_max_entries, 12);
+        assert_eq!(config.effective_memory_inject_max_entries(), 12);
+
+        // A raised cap flows through.
+        config.memory.inject_max_entries = 25;
+        assert_eq!(config.effective_memory_inject_max_entries(), 25);
+
+        // 0 means "unlimited" -> usize::MAX.
+        config.memory.inject_max_entries = 0;
+        assert_eq!(config.effective_memory_inject_max_entries(), usize::MAX);
+    }
+
+    #[::core::prelude::v1::test]
+    fn hindsight_top_k_drives_recall_limit_when_no_profile_override() {
+        // For a hindsight agent with no runtime-profile memory_recall_limit,
+        // the recall/injection limit and the memory_recall tool default both
+        // come from [memory.hindsight] top_k (previously top_k was dead because
+        // the driver default only applied when limit == 0, which never happened
+        // - the tool and injection paths hardcoded 5).
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.top_k = 15;
+
+        assert!(config.agent_uses_hindsight("alpha"));
+        assert_eq!(config.effective_memory_recall_limit("alpha"), 15);
+        assert_eq!(config.effective_memory_recall_tool_limit("alpha"), 15);
+    }
+
+    #[::core::prelude::v1::test]
+    fn non_hindsight_agent_keeps_default_recall_limit() {
+        // A sqlite agent with no runtime-profile override falls back to 5 on
+        // both the injection and tool paths (unchanged behavior).
+        let config = multi_agent_test_config();
+        assert!(!config.agent_uses_hindsight("alpha"));
+        assert_eq!(config.effective_memory_recall_limit("alpha"), 5);
+        assert_eq!(config.effective_memory_recall_tool_limit("alpha"), 5);
+    }
+
+    #[::core::prelude::v1::test]
+    fn runtime_profile_recall_limit_overrides_hindsight_top_k() {
+        // An explicit runtime-profile memory_recall_limit wins over top_k.
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        alpha.runtime_profile = "deep".into();
+        config.memory.hindsight.top_k = 15;
+        let profile = RuntimeProfileConfig {
+            memory_recall_limit: Some(30),
+            ..RuntimeProfileConfig::default()
+        };
+        config.runtime_profiles.insert("deep".to_string(), profile);
+
+        assert_eq!(config.effective_memory_recall_limit("alpha"), 30);
+        assert_eq!(config.effective_memory_recall_tool_limit("alpha"), 30);
+    }
+
     #[test]
     async fn agent_memory_backend_is_switchable_to_hindsight_through_set_prop() {
         let mut config = multi_agent_test_config();
@@ -33044,7 +33177,10 @@ system_bank = "zeroclaw-system"
         assert_eq!(cfg.memory.hindsight.top_k, 7);
         assert_eq!(cfg.memory.hindsight.bank_template, "zeroclaw-{agent}");
         assert_eq!(cfg.memory.hindsight.token_env, "ZC_HINDSIGHT_TOKEN");
-        assert_eq!(cfg.memory.hindsight.shared_bank_configured(), Some("zeroclaw-house"));
+        assert_eq!(
+            cfg.memory.hindsight.shared_bank_configured(),
+            Some("zeroclaw-house")
+        );
         assert_eq!(
             cfg.memory.hindsight.system_bank_configured(),
             Some("zeroclaw-system")

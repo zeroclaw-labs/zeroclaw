@@ -1693,6 +1693,7 @@ impl Agent {
             .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
                 limit: config.effective_memory_recall_limit(agent_alias),
                 min_relevance_score: config.memory.min_relevance_score,
+                max_entries: config.effective_memory_inject_max_entries(),
                 ..Default::default()
             })
             .prompt_builder(SystemPromptBuilder::with_defaults())
