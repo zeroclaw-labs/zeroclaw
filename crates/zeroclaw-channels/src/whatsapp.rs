@@ -276,13 +276,35 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Extract text content (text and location messages)
                     let content = if let Some(text_obj) = msg.get("text") {
-                        text_obj
-                            .get("body")
-                            .and_then(|b| b.as_str())
-                            .unwrap_or("")
-                            .to_string()
+                        let Some(body) = text_obj.get("body").and_then(|b| b.as_str()) else {
+                            continue;
+                        };
+                        body.to_string()
+                    } else if let Some(loc) = msg.get("location") {
+                        let lat = loc.get("latitude").and_then(|v| v.as_f64());
+                        let lng = loc.get("longitude").and_then(|v| v.as_f64());
+                        match (lat, lng) {
+                            (Some(lat), Some(lng)) => crate::util::format_location_content(
+                                lat,
+                                lng,
+                                loc.get("name").and_then(|v| v.as_str()),
+                            ),
+                            // Missing coordinates — drop rather than fabricate 0,0.
+                            _ => {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"from": from})),
+                                    "skipping location message without coordinates"
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         // Could be image, audio, etc. — skip for now
                         ::zeroclaw_log::record!(
@@ -362,6 +384,76 @@ impl WhatsAppChannel {
     }
 }
 
+impl WhatsAppChannel {
+    /// POST one message body to the Cloud API `/messages` endpoint.
+    async fn post_message(&self, body: serde_json::Value) -> anyhow::Result<()> {
+        // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .bearer_auth(&self.access_token)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            // `None` when the error body itself could not be read.
+            let error_body = resp.text().await.ok();
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "send failed:");
+            anyhow::bail!("WhatsApp API error: {status}");
+        }
+
+        Ok(())
+    }
+}
+
+/// The marker kinds the Cloud API backend extracts from outgoing text.
+const LOCATION_MARKER_KIND: &[&str] = &["LOCATION"];
+
+fn text_message_body(to: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "text",
+        "text": {
+            "preview_url": false,
+            "body": content
+        }
+    })
+}
+
+fn location_message_body(to: &str, loc: &crate::util::WhatsAppLocation) -> serde_json::Value {
+    // Meta's location-messages contract quotes outbound coordinates as
+    // strings (inbound webhooks deliver them as numbers — the asymmetry is
+    // theirs, see the official location-messages reference).
+    let mut location = serde_json::json!({
+        "latitude": loc.lat.to_string(),
+        "longitude": loc.lng.to_string(),
+    });
+    if let Some(name) = &loc.name {
+        location["name"] = serde_json::json!(name);
+    }
+    if let Some(address) = &loc.address {
+        location["address"] = serde_json::json!(address);
+    }
+    serde_json::json!({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "location",
+        "location": location
+    })
+}
+
 impl ::zeroclaw_api::attribution::Attributable for WhatsAppChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Channel(
@@ -380,45 +472,48 @@ impl Channel for WhatsAppChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
-        let url = format!(
-            "https://graph.facebook.com/v18.0/{}/messages",
-            self.endpoint_id
-        );
-
         // Normalize recipient (remove leading + if present for API)
-        let to = message
-            .recipient
-            .strip_prefix('+')
-            .unwrap_or(&message.recipient);
+        let to = match message.recipient.strip_prefix('+') {
+            Some(digits) => digits,
+            None => &message.recipient,
+        };
 
-        let body = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to,
-            "type": "text",
-            "text": {
-                "preview_url": false,
-                "body": message.content
+        // Native location pins ([LOCATION:...]) are the only marker kind this
+        // backend can deliver; markers of any other kind stay in the text.
+        let (text, location_markers) =
+            crate::util::parse_attachment_markers_of_kinds(&message.content, LOCATION_MARKER_KIND);
+
+        if location_markers.is_empty() {
+            // No pins: send the content untouched (extraction trims the text).
+            return self
+                .post_message(text_message_body(to, &message.content))
+                .await;
+        }
+
+        if !text.is_empty() {
+            self.post_message(text_message_body(to, &text)).await?;
+        }
+
+        let mut failed_markers = 0usize;
+        for (_, target) in &location_markers {
+            match crate::util::WhatsAppLocation::parse(target) {
+                Some(loc) => self.post_message(location_message_body(to, &loc)).await?,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"reason": "invalid_location"})),
+                        "whatsapp: location marker target is malformed or outside WGS84 range"
+                    );
+                    failed_markers += 1;
+                }
             }
-        });
-
-        ensure_https(&url)?;
-
-        let resp = self
-            .http_client()
-            .post(&url)
-            .bearer_auth(&self.access_token)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_body = resp.text().await.unwrap_or_default();
-            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "send failed:");
-            anyhow::bail!("WhatsApp API error: {status}");
+        }
+        if failed_markers == location_markers.len() && text.is_empty() {
+            anyhow::bail!(
+                "WhatsApp location marker must be `lat,lng[,name[,address]]` with in-range WGS84 coordinates"
+            );
         }
 
         Ok(())
@@ -620,6 +715,114 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
         assert_eq!(msgs[0].channel, "whatsapp");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+    }
+
+    #[test]
+    fn whatsapp_parse_location_message() {
+        let ch = WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            "whatsapp_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
+        let payload = serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1699999999",
+                            "type": "location",
+                            "location": {
+                                "latitude": 40.7128,
+                                "longitude": -74.0060,
+                                "name": "NYC"
+                            }
+                        }]
+                    }
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[Location: 40.712800, -74.006000 — NYC]");
+    }
+
+    #[test]
+    fn whatsapp_parse_location_message_without_coordinates_is_dropped() {
+        let ch = WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            "whatsapp_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
+        let payload = serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1699999999",
+                            "type": "location",
+                            "location": { "latitude": 40.7128 }
+                        }]
+                    }
+                }]
+            }]
+        });
+
+        assert!(ch.parse_webhook_payload(&payload).is_empty());
+    }
+
+    #[test]
+    fn location_message_body_includes_optional_fields() {
+        let full = crate::util::WhatsAppLocation {
+            lat: 40.7128,
+            lng: -74.0060,
+            name: Some("Liberty Island".into()),
+            address: Some("New York, NY 10004".into()),
+        };
+        assert_eq!(
+            location_message_body("1234567890", &full),
+            serde_json::json!({
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": "1234567890",
+                "type": "location",
+                "location": {
+                    // Outbound coordinates are strings per Meta's contract.
+                    "latitude": "40.7128",
+                    "longitude": "-74.006",
+                    "name": "Liberty Island",
+                    "address": "New York, NY 10004"
+                }
+            })
+        );
+
+        let bare = crate::util::WhatsAppLocation {
+            lat: 40.7128,
+            lng: -74.0060,
+            name: None,
+            address: None,
+        };
+        assert_eq!(
+            location_message_body("1234567890", &bare),
+            serde_json::json!({
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": "1234567890",
+                "type": "location",
+                "location": {
+                    "latitude": "40.7128",
+                    "longitude": "-74.006"
+                }
+            })
+        );
     }
 
     #[test]
@@ -1256,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_parse_location_message_skipped() {
+    fn whatsapp_parse_location_message_without_name() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1279,7 +1482,8 @@ mod tests {
             }]
         });
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[Location: 40.712800, -74.006000]");
     }
 
     #[test]

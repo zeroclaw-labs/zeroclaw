@@ -224,7 +224,8 @@ mod tests {
                     "properties": {
                         "command": {"type": "string"}
                     }
-                }),
+                })
+                .into(),
             },
             ToolSpec {
                 name: "file_read".to_string(),
@@ -234,7 +235,8 @@ mod tests {
                     "properties": {
                         "path": {"type": "string"}
                     }
-                }),
+                })
+                .into(),
             },
         ];
 
@@ -300,7 +302,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
 
         let payload = model_provider.convert_tools(&tools);
@@ -321,7 +323,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
 
         let request = ChatRequest {
@@ -472,7 +474,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
 
         let request = ChatRequest {
@@ -501,7 +503,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
 
         let request = ChatRequest {
@@ -527,7 +529,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
 
         let request = ChatRequest {
