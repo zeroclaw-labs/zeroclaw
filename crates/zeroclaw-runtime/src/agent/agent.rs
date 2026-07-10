@@ -288,6 +288,9 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         Ok(())
     }
 
+    /// Non-attributed entry point: delegates to
+    /// [`Self::request_approval_attributed`] and drops the attribution so the
+    /// routing decision lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
@@ -305,6 +308,8 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
+            // The deciding approver's name travels on the response itself (issue
+            // #7737); `None` for a bridge-synthesized fail-closed deny.
             RoutedApproval::Decided { response, decider } => {
                 Ok(Some(zeroclaw_api::channel::AttributedApprovalResponse {
                     response,
@@ -1593,6 +1598,8 @@ impl Agent {
             deferred_section,
             pinned_section,
             activated_handle,
+            // from_config performs no per-turn tool_filter_groups filtering
+            // itself (the multi-agent gap tracked as #6699 follow-up scope).
             mcp_tool_names: _,
         } = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
