@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::keymap::{Chord, overrides::OverrideTable};
 use crate::theme::{self, Theme};
+use crate::todo_tracker::TodoTrackerSettings;
 
 const FILE_NAME: &str = "zerocode-config.toml";
 const ENV_PREFIX: &str = "ZEROCODE_";
@@ -188,6 +189,35 @@ impl Default for MessageQueueSection {
     }
 }
 
+// ── Runtime settings types ────────────────────────────────────────────────────
+
+/// Runtime settings for the message queue, derived from `[message_queue]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MessageQueueSettings {
+    pub cap: usize,
+    pub default_width: u16,
+    pub min_width: u16,
+    pub max_width: u16,
+    pub width_step: u16,
+    pub auto_open: bool,
+    pub stay_open_when_empty: bool,
+}
+
+impl Default for MessageQueueSettings {
+    fn default() -> Self {
+        Self {
+            cap: default_queue_cap(),
+            default_width: default_queue_width(),
+            min_width: default_queue_min(),
+            max_width: default_queue_max(),
+            width_step: default_queue_step(),
+            auto_open: true,
+            stay_open_when_empty: false,
+        }
+    }
+}
+
 // ── Default helpers ───────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -326,6 +356,36 @@ impl ZerocodeConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
+    }
+
+    /// Convert the `[todotracker]` section into the runtime settings type
+    /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
+    pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
+        use crate::todo_tracker::TodoLocation;
+        TodoTrackerSettings {
+            enabled: self.todotracker.enabled,
+            enabled_at_start: self.todotracker.enabled_at_start,
+            location: match self.todotracker.location {
+                TodoTrackerLocation::Bottom => TodoLocation::Bottom,
+                TodoTrackerLocation::Left => TodoLocation::Left,
+                TodoTrackerLocation::Right => TodoLocation::Right,
+            },
+            width: self.todotracker.width,
+            max_height: self.todotracker.max_height,
+        }
+    }
+
+    /// Convert the `[message_queue]` section into the runtime settings type.
+    pub fn resolve_message_queue(&self) -> MessageQueueSettings {
+        MessageQueueSettings {
+            cap: self.message_queue.cap,
+            default_width: self.message_queue.default_width,
+            min_width: self.message_queue.min_width,
+            max_width: self.message_queue.max_width,
+            width_step: self.message_queue.width_step,
+            auto_open: self.message_queue.auto_open,
+            stay_open_when_empty: self.message_queue.stay_open_when_empty,
+        }
     }
 }
 
