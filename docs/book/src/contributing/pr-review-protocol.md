@@ -133,13 +133,8 @@ verdict:
 - Linked issue verbs are accurate: use `Closes` / `Fixes` / `Resolves` only
   when the PR fully resolves the issue; otherwise use `Related`, `Depends on`,
   or `Supersedes`.
-- Behavior claims are checked against the controlling contract: the relevant
-  architecture doc, source-of-truth module, trait boundary, existing test,
-  public API shape, source comment, or explicit maintainer decision. Issue-fit
-  alone is not enough.
-- Provenance claims are real. If the PR body, commits, docs, or review thread
-  cite an RFC, audit, issue, PR, path, generated artifact, or follow-up finding,
-  verify that the artifact exists and supports the claim.
+- Behavior claims are checked against the controlling contract: the relevant architecture doc, source-of-truth module, trait boundary, existing test, public API shape, source comment, or explicit maintainer decision. Issue-fit alone is not enough.
+- Provenance claims are real. If the PR body, commits, docs, or review thread cite an RFC, audit, issue, PR, path, generated artifact, or follow-up finding, verify that the artifact exists and supports the claim.
 - Validation evidence names the checks being relied on: required CI, focused local tests, manual smoke, docs/link gates, or full workspace checks when broad coverage proves something narrower evidence would miss. Commands that ran include relevant output or an honest skip reason. Fresh required CI is valid evidence when it covers the changed surface; do not require duplicate local Cargo for the same head, target, and feature set. Pending CI is not evidence yet.
 - Security/privacy, compatibility, rollback, and scope-boundary claims match
   the diff and current behavior.
