@@ -195,8 +195,8 @@ For the live-versus-unwired status of each source and the transport details, see
 
 The same syntax applies to:
 
-- Trigger `condition` fields — evaluated against the incoming event payload.
-- Step `when` guards — evaluated against accumulated run data
+- Trigger `condition` fields, evaluated against the incoming event payload.
+- Step `when` guards, evaluated against accumulated run data
   (e.g., `$.steps.3.ok == true` checks whether step 3 completed successfully).
 
 ### Condition examples
