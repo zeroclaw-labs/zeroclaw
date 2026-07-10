@@ -676,10 +676,14 @@ impl DelegateTool {
     fn memory_tools_for_target(
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
+        recall_default_limit: usize,
     ) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-            Box::new(MemoryRecallTool::new(memory.clone())),
+            Box::new(MemoryRecallTool::with_default_limit(
+                memory.clone(),
+                recall_default_limit,
+            )),
             Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
             Box::new(MemoryExportTool::new(memory.clone())),
             Box::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
@@ -2566,11 +2570,25 @@ impl DelegateTool {
                 let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
                 {
                     match self.memory_for_target_agent(agent_name).await {
-                        Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
+                        Ok(Some(memory)) => {
+                            // Target's configured recall depth so a delegated
+                            // turn honors the same limit the target agent would
+                            // use directly (falls back to the historical default
+                            // when no root config is threaded).
+                            let recall_default_limit = self
+                                .root_config
+                                .as_deref()
+                                .map_or(5, |c| c.effective_memory_recall_tool_limit(agent_name));
+                            Self::memory_tools_for_target(
+                                memory,
+                                target_policy,
+                                recall_default_limit,
+                            )
                             .into_iter()
                             .filter(|tool| target_policy_gate.is_tool_allowed(tool.name()))
                             .map(|tool| (tool.name().to_string(), tool))
-                            .collect(),
+                            .collect()
+                        }
                         Ok(None) => HashMap::new(),
                         Err(e) => {
                             return Ok(ToolResult {
@@ -2985,7 +3003,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let admin_tools =
-            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&admin_target));
+            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&admin_target), 25);
         let admin_names: Vec<&str> = admin_tools.iter().map(|t| t.name()).collect();
         assert!(
             admin_names.contains(&"system_memory_store"),
@@ -3001,7 +3019,7 @@ mod tests {
         // wrongly pass; the assembly must drop it via the admin authority.
         let non_admin_target = test_security();
         let default_tools =
-            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&non_admin_target));
+            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&non_admin_target), 25);
         let default_names: Vec<String> =
             default_tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
@@ -3026,7 +3044,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let excluded_names: Vec<String> =
-            DelegateTool::memory_tools_for_target(memory, admin_but_excluded)
+            DelegateTool::memory_tools_for_target(memory, admin_but_excluded, 25)
                 .iter()
                 .map(|t| t.name().to_string())
                 .collect();

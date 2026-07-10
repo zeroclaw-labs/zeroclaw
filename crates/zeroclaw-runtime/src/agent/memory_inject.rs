@@ -16,8 +16,14 @@ use crate::util::truncate_with_ellipsis;
 
 /// Default recall limit per session (all legacy paths used 5).
 pub const DEFAULT_RECALL_LIMIT: usize = 5;
-/// Default cap on rendered entries (from the channel renderer's budget).
-pub const DEFAULT_MAX_ENTRIES: usize = 4;
+/// Default cap on rendered entries. Was 4 (the channel renderer's original
+/// budget), which silently dropped deeper-ranked-but-relevant facts (e.g. a
+/// birthday ranking ~#12) on the channel/daemon injection path. Raised to match
+/// the config-driven `[memory] inject_max_entries` default so the fallback used
+/// when no config is threaded is no longer surprisingly small. The live daemon/
+/// channel paths always pass the config value; this constant is the builder/
+/// test fallback and the two stay in sync intentionally.
+pub const DEFAULT_MAX_ENTRIES: usize = 12;
 /// Default per-entry character cap before ellipsis truncation.
 pub const DEFAULT_ENTRY_MAX_CHARS: usize = 800;
 /// Default total character budget for the rendered block.
@@ -655,6 +661,66 @@ mod tests {
         ]);
         let observer = RecordingObserver::default();
 
+        // Explicit cap of 4 to exercise the entry-count cap mechanism itself
+        // (the default cap is now higher and config-driven).
+        let cfg = MemoryInjectConfig {
+            max_entries: 4,
+            ..Default::default()
+        };
+        let context = render_memory_context(&mem, &observer, "query", &[], &cfg, false).await;
+
+        // Entry cap: 4 of the 5 render.
+        assert!(context.contains("- d: four"));
+        assert!(!context.contains("- e: five"));
+        // Per-entry cap: the 900-char content is ellipsis-truncated.
+        assert!(context.contains("..."));
+        assert!(!context.contains(&long));
+    }
+
+    #[tokio::test]
+    async fn higher_max_entries_injects_more_than_the_old_hardcoded_four() {
+        // Regression for the hardcoded max_entries = 4 cap: with a config-driven
+        // higher cap, entries beyond the 4th (a deeper-ranked-but-relevant fact,
+        // e.g. a birthday) now render instead of being silently dropped.
+        let mem = FixtureMemory::with(vec![
+            entry("a", "one", MemoryCategory::Core, None),
+            entry("b", "two", MemoryCategory::Core, None),
+            entry("c", "three", MemoryCategory::Core, None),
+            entry("d", "four", MemoryCategory::Core, None),
+            entry(
+                "birthday",
+                "user's birthday is May 3",
+                MemoryCategory::Core,
+                None,
+            ),
+            entry("f", "six", MemoryCategory::Core, None),
+        ]);
+        let observer = RecordingObserver::default();
+
+        let cfg = MemoryInjectConfig {
+            max_entries: 6,
+            ..Default::default()
+        };
+        let context = render_memory_context(&mem, &observer, "query", &[], &cfg, false).await;
+
+        // The 5th entry (index 4) would have been cut at the old cap of 4.
+        assert!(context.contains("- birthday: user's birthday is May 3"));
+        assert!(context.contains("- f: six"));
+    }
+
+    #[tokio::test]
+    async fn default_max_entries_now_admits_a_fifth_entry() {
+        // The default cap rose from 4 to DEFAULT_MAX_ENTRIES; a 5th entry that
+        // the old default dropped now renders under the new default.
+        let mem = FixtureMemory::with(vec![
+            entry("a", "one", MemoryCategory::Core, None),
+            entry("b", "two", MemoryCategory::Core, None),
+            entry("c", "three", MemoryCategory::Core, None),
+            entry("d", "four", MemoryCategory::Core, None),
+            entry("e", "five", MemoryCategory::Core, None),
+        ]);
+        let observer = RecordingObserver::default();
+
         let context = render_memory_context(
             &mem,
             &observer,
@@ -665,12 +731,7 @@ mod tests {
         )
         .await;
 
-        // Entry cap: 4 of the 5 render.
-        assert!(context.contains("- d: four"));
-        assert!(!context.contains("- e: five"));
-        // Per-entry cap: the 900-char content is ellipsis-truncated.
-        assert!(context.contains("..."));
-        assert!(!context.contains(&long));
+        assert!(context.contains("- e: five"));
     }
 
     #[tokio::test]
