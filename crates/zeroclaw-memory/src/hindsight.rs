@@ -1050,6 +1050,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn count_reports_total_from_list_endpoint() {
+        // The dashboard memory-count path calls `count()`; a hindsight bank with
+        // many entries must map through as a non-zero total (the bug it fixes:
+        // the UI showed 0 while the bank was full).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "1", "text": "a" },
+                    { "id": "2", "text": "b" }
+                ],
+                "total": 12
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let n = mem.count().await.expect("count should succeed");
+        assert_eq!(n, 12, "count must reflect the bank total, not 0");
+    }
+
+    #[tokio::test]
+    async fn count_falls_back_to_item_len_without_total() {
+        // When the server omits `total`, the item count is the fallback - still
+        // non-zero for a populated bank.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "1", "text": "a" },
+                    { "id": "2", "text": "b" },
+                    { "id": "3", "text": "c" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert_eq!(mem.count().await.expect("count"), 3);
+    }
+
+    #[tokio::test]
+    async fn list_returns_bank_items() {
+        // The dashboard/gateway list path maps hindsight list items to entries.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "m1", "text": "first", "context": "c1" },
+                    { "id": "m2", "text": "second", "context": "c2" }
+                ],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let items = mem.list(None, None).await.expect("list should succeed");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content, "first");
+        assert_eq!(items[1].content, "second");
+    }
+
+    #[tokio::test]
     async fn recall_merges_system_bank_read_only() {
         let server = MockServer::start().await;
         // Private, shared, and system banks each answer recall; all three merge.
