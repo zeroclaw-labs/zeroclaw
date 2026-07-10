@@ -2343,12 +2343,6 @@ impl Chat {
                                     state.browse_multi.insert(idx);
                                 }
                                 state.mark_dirty_full();
-                            } else {
-                                // Ctrl+click outside browse mode: copy silently
-                                state.browse_multi.clear();
-                                state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
-                                state.mark_dirty_full();
                             }
                         } else if shift {
                             if state.in_browse_mode() {
@@ -2358,12 +2352,6 @@ impl Chat {
                                 state.browse_anchor = state.browse_cursor;
                                 state.browse_cursor = Some(idx);
                                 state.mark_dirty_full();
-                            } else {
-                                // Shift+click outside browse mode: copy silently
-                                state.browse_multi.clear();
-                                state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
-                                state.mark_dirty_full();
                             }
                         } else {
                             // Plain click
@@ -2372,7 +2360,9 @@ impl Chat {
                             state.mark_dirty_full();
 
                             if state.in_browse_mode() {
-                                // In browse mode: move cursor, prepare for drag/up copy
+                                // In browse mode: move cursor and prepare for
+                                // optional drag-range selection. Copying still
+                                // requires the explicit keyboard copy command.
                                 state.browse_cursor = Some(idx);
                                 state.mouse_down_entry = Some(idx);
                             } else {
@@ -2420,26 +2410,12 @@ impl Chat {
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
                     state.scrollbar_drag = None;
-                    // Auto-copy on mouse-up based on gesture:
-                    //   * Click (no drag) → copy the single entry.
-                    //   * Drag (range set) → copy the selection.
-                    if let Some(idx) = state.mouse_down_entry.take() {
-                        if state.browse_anchor.is_some() {
-                            // Drag → copy the range
-                            let text = state.yank_selection();
-                            if !text.is_empty() {
-                                crate::mouse::copy_osc52(&text);
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-                            }
-                        } else {
-                            // Plain click → copy the single entry
-                            let text = state.yank_single_entry(idx);
-                            if !text.is_empty() {
-                                crate::mouse::copy_osc52(&text);
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-                            }
-                        }
-                    }
+                    // Mouse-up ends a browse-mode drag gesture only. It must
+                    // not copy implicitly: users expect dragging transcript
+                    // text to be safe while selecting words/lines in the
+                    // terminal, and whole-message copy now lives behind the
+                    // explicit `[Copy]` affordance.
+                    state.mouse_down_entry = None;
                 }
                 _ => {}
             }
@@ -4838,9 +4814,9 @@ pub struct ChatState {
     /// Set by mouse click, cleared on any key press. Separate from
     /// `browse_cursor` so clicking doesn't steal keyboard input.
     highlighted_entry: Option<usize>,
-    /// Entry index where mouse went down, reset on up.  Used to distinguish
-    /// a plain click (no Drag events → auto-copy single entry on Up) from a
-    /// drag gesture (Drag events occurred → auto-copy the range on Up).
+    /// Entry index where mouse went down while browse mode is active. Used
+    /// only to extend in-app range selection during a drag; mouse-up never
+    /// copies implicitly.
     mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
@@ -5048,15 +5024,6 @@ impl ChatState {
             .get(idx)
             .map(clipboard_text)
             .unwrap_or_default()
-    }
-
-    /// Copy a single entry to clipboard silently (no browse mode, just OSC 52).
-    fn copy_entry_silently(state: &mut ChatState, idx: usize) {
-        let text = state.yank_single_entry(idx);
-        if !text.is_empty() {
-            crate::mouse::copy_osc52(&text);
-            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-        }
     }
 
     /// Build the clipboard string. Single = body. Multi = role-prefixed.
@@ -7693,6 +7660,95 @@ mod tests {
         assert!(
             matches!(state.copy_feedback, Some(CopyFeedback::Message { .. })),
             "message copy should leave a transient copied-state cue"
+        );
+    }
+
+    #[tokio::test]
+    async fn modifier_click_does_not_copy_whole_message_outside_browse_mode() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("select just this word")));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+        let entry_rect = state
+            .entry_rects
+            .first()
+            .expect("entry region should be rendered")
+            .1;
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: entry_rect.x + 1,
+            row: entry_rect.y,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(
+            state.info_message.is_none(),
+            "modifier-click outside browse mode must not app-copy the whole message"
+        );
+        assert_eq!(
+            state.highlighted_entry, None,
+            "modifier-click outside browse mode should not select the whole message"
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_up_after_browse_drag_does_not_copy_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("second")));
+        state.browse_cursor = Some(1);
+        state.browse_anchor = Some(0);
+        state.mouse_down_entry = Some(0);
+        state.mark_dirty_full();
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(up, Rect::new(0, 0, 80, 20)).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.mouse_down_entry, None);
+        assert!(
+            state.info_message.is_none(),
+            "ending a mouse drag must not app-copy the selected messages"
         );
     }
 
