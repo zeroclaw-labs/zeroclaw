@@ -10491,7 +10491,7 @@ pub struct MemoryConfig {
     #[serde(default = "default_conflict_supersede_enabled")]
     pub conflict_supersede_enabled: bool,
     /// Enable write-time near-duplicate detection.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub dedup_on_write: bool,
     /// Jaccard threshold for text-only duplicate detection.
     #[serde(default = "default_dedup_jaccard_threshold")]
@@ -10773,7 +10773,7 @@ fn default_hindsight_bank_template() -> String {
 }
 
 fn default_hindsight_top_k() -> usize {
-    5
+    25
 }
 
 fn default_hindsight_token_env() -> String {
@@ -10878,7 +10878,7 @@ fn default_min_relevance_score() -> f64 {
     0.4
 }
 fn default_inject_max_entries() -> usize {
-    12
+    15
 }
 fn default_cache_size() -> usize {
     10_000
@@ -10934,7 +10934,7 @@ impl Default for MemoryConfig {
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
             conflict_supersede_enabled: default_conflict_supersede_enabled(),
-            dedup_on_write: false,
+            dedup_on_write: true,
             dedup_jaccard_threshold: default_dedup_jaccard_threshold(),
             dedup_action: MemoryDedupAction::default(),
             consolidate_daily: true,
@@ -13426,6 +13426,13 @@ fn default_telegram_api_base_url() -> String {
     TELEGRAM_OFFICIAL_API_BASE_URL.to_string()
 }
 
+/// Telegram-specific streaming default: `partial` (progressive draft edits).
+/// Scoped to the Telegram channel only; the global `StreamMode` default stays
+/// `Off` and other channels are unaffected.
+fn default_telegram_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
 fn default_channel_approval_timeout_secs() -> u64 {
     300
 }
@@ -13457,8 +13464,11 @@ pub struct TelegramConfig {
     #[serde(default = "default_telegram_api_base_url")]
     pub api_base_url: String,
     /// Streaming mode for progressive response delivery via message edits.
+    /// Defaults to `partial` for Telegram specifically (progressive draft edits
+    /// give a first token in ~1-3s instead of a 16-40s wait), independent of the
+    /// global `StreamMode` default (Off) and other channels.
     #[tab(Behavior)]
-    #[serde(default)]
+    #[serde(default = "default_telegram_stream_mode")]
     pub stream_mode: StreamMode,
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[tab(Behavior)]
@@ -13515,7 +13525,7 @@ impl Default for TelegramConfig {
             enabled: false,
             bot_token: String::new(),
             api_base_url: default_telegram_api_base_url(),
-            stream_mode: StreamMode::default(),
+            stream_mode: default_telegram_stream_mode(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
@@ -25259,10 +25269,13 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn telegram_config_defaults_stream_off() {
+    async fn telegram_config_defaults_stream_partial() {
+        // Telegram-specific default is `partial` (progressive draft edits) for
+        // perceived-latency; scoped to this channel only (global StreamMode
+        // default stays Off).
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.api_base_url, "https://api.telegram.org");
@@ -30868,12 +30881,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[::core::prelude::v1::test]
-    fn inject_max_entries_defaults_to_twelve_and_is_config_driven() {
-        // The former hardcoded cap was 4; the config-driven default is 12 so
-        // deeper-ranked-but-relevant facts are no longer silently dropped.
+    fn inject_max_entries_defaults_to_fifteen_and_is_config_driven() {
+        // The former hardcoded cap was 4; the config-driven default is 15 so
+        // deeper-ranked-but-relevant facts are no longer silently dropped
+        // (verified-good breadth on the hal9001 deploy).
         let mut config = multi_agent_test_config();
-        assert_eq!(config.memory.inject_max_entries, 12);
-        assert_eq!(config.effective_memory_inject_max_entries(), 12);
+        assert_eq!(config.memory.inject_max_entries, 15);
+        assert_eq!(config.effective_memory_inject_max_entries(), 15);
 
         // A raised cap flows through.
         config.memory.inject_max_entries = 25;

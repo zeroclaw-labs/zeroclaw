@@ -27,7 +27,7 @@
 //! | `ZC_HINDSIGHT_TOKEN`| Bearer token (raw, no "Bearer " prefix)   | (required) |
 //! | `ZC_HINDSIGHT_BASE` | API base URL                              | `https://tokengate.appz.cloud/api/embedding/hindsight` |
 //! | `ZC_HINDSIGHT_BANK` | Explicit bank id (overrides per-agent)    | `zeroclaw-<alias>` |
-//! | `ZC_HINDSIGHT_TOP_K`| Default recall limit when caller passes 0 | `5` |
+//! | `ZC_HINDSIGHT_TOP_K`| Default recall limit when caller passes 0 | `25` |
 //! | `ZC_HINDSIGHT_SHARED_BANK`| Shared/family bank merged read-only into recall/list; written only via the `shared_memory_store` tool | (none) |
 //! | `ZC_HINDSIGHT_SYSTEM_BANK`| System bank merged read-only into recall/list; written only via the `system_memory_store` tool | (none) |
 //! | `ZC_HINDSIGHT_RETAIN_ASYNC`| Send retains with the server-side `async` flag (vectorize off the critical path); falsey (`0`/`false`/`no`) forces sync | `true` |
@@ -66,7 +66,7 @@ use serde::Deserialize;
 use zeroclaw_config::schema::HindsightMemoryConfig;
 
 const DEFAULT_BASE: &str = "https://tokengate.appz.cloud/api/embedding/hindsight";
-const DEFAULT_TOP_K: usize = 5;
+const DEFAULT_TOP_K: usize = 25;
 /// Env var naming the shared/family bank (read-merged; written via tool only).
 const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
 /// Env var naming the system bank (read-merged; written via tool only).
@@ -913,7 +913,7 @@ mod tests {
             shared_bank: None,
             system_bank: None,
             token: "test-token".to_string(),
-            default_top_k: 5,
+            default_top_k: 25,
             retain_async: true,
             recall_types: Vec::new(),
             client: reqwest::Client::new(),

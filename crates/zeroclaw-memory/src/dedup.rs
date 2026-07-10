@@ -132,7 +132,12 @@ mod tests {
 
     #[test]
     fn disabled_gate_inserts() {
-        let cfg = MemoryConfig::default();
+        // dedup_on_write now defaults to true, so disable it explicitly to
+        // exercise the disabled-gate short-circuit.
+        let cfg = MemoryConfig {
+            dedup_on_write: false,
+            ..MemoryConfig::default()
+        };
         let action = dedup_gate(
             &[entry("a", "User prefers Rust")],
             "User prefers Rust",
