@@ -45,6 +45,18 @@
 //! failing or bypassing the backend's own contract. Deletion targets the
 //! private bank only - the same bank writes land in.
 //!
+//! Retain durability: writes (`store`, `store_to_bank`) are SYNCHRONOUS by
+//! default (`[memory.hindsight] retain_async = false`), so a successful
+//! `Memory::store` return means the item is durably queryable before the call
+//! returns - an immediate recall, next-turn injection, or another agent's
+//! shared-bank read cannot miss it. Setting `retain_async = true` (or the
+//! `ZC_HINDSIGHT_RETAIN_ASYNC` env override, read through this same
+//! [`HindsightMemory::from_config`] constructor so it reaches every runtime
+//! path) sends the server-side `async` flag instead, trading that
+//! read-after-write guarantee for lower in-turn latency; the env value is
+//! parsed strictly (`true`/`false`/`1`/`0`/`yes`/`no`, case-insensitive) and
+//! any other value is a startup error rather than a silent fallback.
+//!
 //! Recall type filter: `recall_types` (typed `[memory.hindsight] recall_types`,
 //! env fallback `ZC_HINDSIGHT_RECALL_TYPES`) restricts recall to selected
 //! Hindsight fact types (`experience`, `observation`, `world`); it is sent as
@@ -94,6 +106,22 @@ use zeroclaw_config::schema::{
 const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
 /// Env var naming the system bank (read-merged; written via tool only).
 const SYSTEM_BANK_ENV: &str = "ZC_HINDSIGHT_SYSTEM_BANK";
+/// Env var overriding `[memory.hindsight] retain_async`. Read inside
+/// [`HindsightMemory::from_config`] (the single canonical constructor) so the
+/// override reaches every runtime path, not just an env-only entry point.
+const RETAIN_ASYNC_ENV: &str = "ZC_HINDSIGHT_RETAIN_ASYNC";
+
+/// Strictly parse a boolean-shaped env value. Unlike a falsey-only check, an
+/// unrecognized value (e.g. a typo) is REJECTED as an error instead of
+/// silently defaulting to `true` - a typo in a durability-affecting override
+/// must fail loudly, not flip retain semantics unnoticed.
+fn parse_strict_bool(raw: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => Err(other.to_string()),
+    }
+}
 
 /// Percent-encode a single URL path segment (bank id or server-provided memory
 /// id). Encodes everything that is not an unreserved URL character so a bank
@@ -181,6 +209,12 @@ pub struct HindsightMemory {
     /// Empty (default) sends nothing, keeping the recall body byte-identical to
     /// the historical `{query, limit}` shape.
     recall_types: Vec<String>,
+    /// When true, retain (write) requests set the server-side `async` flag so
+    /// vectorization runs off the caller's critical path, trading away
+    /// read-after-write durability. Applies to `store` and `store_to_bank`.
+    /// Read paths are unaffected. Default `false` (synchronous): a successful
+    /// `store` return means the item is immediately queryable.
+    retain_async: bool,
     client: reqwest::Client,
 }
 
@@ -194,6 +228,7 @@ impl std::fmt::Debug for HindsightMemory {
             .field("system_bank", &self.system_bank)
             .field("default_top_k", &self.default_top_k)
             .field("recall_types", &self.recall_types)
+            .field("retain_async", &self.retain_async)
             .finish_non_exhaustive()
     }
 }
@@ -321,6 +356,24 @@ impl HindsightMemory {
             None => cfg.recall_types.clone(),
         };
 
+        // Retain durability: the typed default is synchronous (`false`), so a
+        // successful `store`/`store_to_bank` is durably queryable before the
+        // call returns. `ZC_HINDSIGHT_RETAIN_ASYNC` overrides it, but is read
+        // HERE (the single canonical constructor every runtime path uses) so
+        // the documented rollback actually reaches per-agent construction,
+        // not just the removed env-only path. Parsed strictly: an
+        // unrecognized value is a startup error rather than being silently
+        // treated as `true`.
+        let retain_async = match std::env::var(RETAIN_ASYNC_ENV) {
+            Ok(raw) => parse_strict_bool(&raw).map_err(|bad| {
+                anyhow::Error::msg(format!(
+                    "environment variable {RETAIN_ASYNC_ENV} has an invalid value {bad:?}; \
+                     must be one of true, false, 1, 0, yes, no (case-insensitive)"
+                ))
+            })?,
+            Err(_) => cfg.retain_async,
+        };
+
         Ok(Self {
             alias: agent_alias.to_string(),
             base_url,
@@ -330,6 +383,7 @@ impl HindsightMemory {
             token,
             default_top_k,
             recall_types,
+            retain_async,
             client: build_client(cfg.timeout_secs),
         })
     }
@@ -377,6 +431,7 @@ impl HindsightMemory {
             token: token.to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             recall_types: Vec::new(),
+            retain_async: false,
             client: build_client(DEFAULT_HINDSIGHT_TIMEOUT_SECS),
         }
     }
@@ -570,7 +625,7 @@ impl HindsightMemory {
                 context: Some(context_owned.as_str()),
                 tags,
             }],
-            is_async: false,
+            is_async: self.retain_async,
         };
         let resp = self
             .client
@@ -875,7 +930,7 @@ impl Memory for HindsightMemory {
                 context: Some(context_owned.as_str()),
                 tags: Self::tags_for(&category),
             }],
-            is_async: false,
+            is_async: self.retain_async,
         };
         let resp = self
             .client
@@ -1127,6 +1182,8 @@ mod tests {
             token: "test-token".to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             recall_types: Vec::new(),
+            // Matches the production default: synchronous retain.
+            retain_async: false,
             client: build_client(DEFAULT_HINDSIGHT_TIMEOUT_SECS),
         }
     }
@@ -1239,6 +1296,8 @@ mod tests {
     #[tokio::test]
     async fn store_posts_retain_payload_to_bank() {
         let server = MockServer::start().await;
+        // Default is SYNCHRONOUS retain: the body carries "async": false so a
+        // successful response means the item is durably queryable.
         Mock::given(method("POST"))
             .and(path("/v1/default/banks/zeroclaw-test/memories"))
             .and(header("authorization", "Bearer test-token"))
@@ -1254,6 +1313,224 @@ mod tests {
         mem.store("fact", "PURPLE-OTTER-42", MemoryCategory::Core, None)
             .await
             .expect("store should succeed against the mock retain endpoint");
+    }
+
+    #[tokio::test]
+    async fn store_uses_sync_retain_by_default() {
+        // Assert the async flag explicitly: with the default retain_async, the
+        // body must carry "async": false.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_partial_json(json!({ "async": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(
+            !mem.retain_async,
+            "retain_async must default to false (sync)"
+        );
+        mem.store("k", "v", MemoryCategory::Core, None)
+            .await
+            .expect("sync retain should succeed");
+    }
+
+    #[tokio::test]
+    async fn store_uses_async_retain_when_configured_on() {
+        // With retain_async explicitly on, the body must carry "async": true.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_partial_json(json!({ "async": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.retain_async = true;
+        mem.store("k", "v", MemoryCategory::Core, None)
+            .await
+            .expect("async retain should succeed");
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_uses_sync_retain_by_default() {
+        // The shared/system write path honors retain_async too.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .and(body_partial_json(json!({ "async": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        assert!(!mem.retain_async);
+        mem.store_to_bank("zeroclaw-house", "k", "v", MemoryCategory::Core, "shared")
+            .await
+            .expect("sync store_to_bank should succeed");
+    }
+
+    /// Blocker fix (stateful-success): a caller relying on the default
+    /// (synchronous) retain must be able to immediately recall what it just
+    /// stored, proving `Memory::store` success means "durably queryable" by
+    /// default rather than "queued". This exercises store -> recall against
+    /// the SAME mock server instance rather than asserting only that the
+    /// request body carried a particular flag.
+    #[tokio::test]
+    async fn sync_store_is_immediately_visible_to_recall() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_partial_json(json!({ "async": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "id": "mem-1",
+                    "text": "GOLDEN-EMU-77",
+                    "type": "world",
+                    "context": "fact",
+                    "mentioned_at": "2026-07-10T00:00:00Z",
+                    "scores": { "final": 1.0 }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(!mem.retain_async, "default must be synchronous");
+        mem.store("fact", "GOLDEN-EMU-77", MemoryCategory::Core, None)
+            .await
+            .expect("sync store should succeed");
+        let hits = mem
+            .recall("GOLDEN-EMU-77", 5, None, None, None)
+            .await
+            .expect("recall should succeed immediately after a sync store");
+        assert!(
+            hits.iter().any(|e| e.content.contains("GOLDEN-EMU-77")),
+            "a synchronously-stored item must be visible to an immediate recall"
+        );
+    }
+
+    /// Blocker fix (async does not prove durability / delayed-read + failure
+    /// coverage): asserting the request body says `"async": true` does NOT by
+    /// itself prove the item was durably stored. This proves the corollary an
+    /// opted-in async caller must accept: a `store()` call that returns `Ok`
+    /// can still correspond to server-side work that later fails, and the
+    /// driver has no completion/barrier signal for that queued outcome - the
+    /// caller opted OUT of the read-after-write guarantee, it is not
+    /// additionally guaranteed eventual success.
+    #[tokio::test]
+    async fn async_retain_ok_does_not_prove_eventual_success() {
+        let server = MockServer::start().await;
+        // The server acknowledges the queue submission with 200 even though
+        // the item's vectorization could later fail or be cancelled server
+        // side; the driver has no operation-id tracking to distinguish that
+        // from a fully durable write.
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_partial_json(json!({ "async": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.retain_async = true;
+        let result = mem
+            .store("k", "queued-item", MemoryCategory::Core, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "async submission is acknowledged as Ok even though it only proves \
+             queuing, not the eventual embed/durability outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_defaults_retain_async_false() {
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_RETAIN";
+        // SAFETY: single-threaded test; set + remove within this test only.
+        unsafe { std::env::set_var(env_name, "tok") };
+        unsafe { std::env::remove_var(RETAIN_ASYNC_ENV) };
+        let cfg = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
+            token_env: env_name.to_string(),
+            ..HindsightMemoryConfig::default()
+        };
+        let mem = HindsightMemory::from_config(&cfg, "scout", "").expect("construct");
+        assert!(
+            !mem.retain_async,
+            "retain_async must default to false (sync)"
+        );
+
+        let cfg_on = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
+            token_env: env_name.to_string(),
+            retain_async: true,
+            ..HindsightMemoryConfig::default()
+        };
+        let mem_on = HindsightMemory::from_config(&cfg_on, "scout", "").expect("construct");
+        assert!(mem_on.retain_async, "retain_async on must propagate");
+        unsafe { std::env::remove_var(env_name) };
+    }
+
+    /// Blocker fix (env override reaches the real runtime path): the
+    /// documented `ZC_HINDSIGHT_RETAIN_ASYNC` rollback must reach
+    /// `from_config` (the canonical constructor `create_memory_for_agent`
+    /// uses for every per-agent runtime), not merely a removed env-only
+    /// constructor. This is the "production-construction regression" the
+    /// review asked for: it drives the exact `from_config` call the runtime
+    /// factory makes and proves the env value wins over a conflicting typed
+    /// default.
+    #[tokio::test]
+    async fn retain_async_env_override_reaches_from_config_runtime_path() {
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ENV_OVERRIDE";
+        unsafe { std::env::set_var(env_name, "tok") };
+        // Typed config says sync (false); the env override flips it to async.
+        unsafe { std::env::set_var(RETAIN_ASYNC_ENV, "true") };
+        let cfg = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
+            token_env: env_name.to_string(),
+            retain_async: false,
+            ..HindsightMemoryConfig::default()
+        };
+        let mem = HindsightMemory::from_config(&cfg, "scout", "").expect("construct");
+        assert!(
+            mem.retain_async,
+            "ZC_HINDSIGHT_RETAIN_ASYNC=true must override a typed-config false \
+             through the canonical from_config runtime path"
+        );
+        unsafe { std::env::remove_var(RETAIN_ASYNC_ENV) };
+        unsafe { std::env::remove_var(env_name) };
+    }
+
+    /// Blocker fix (strict boolean parser rejects typos): an unrecognized env
+    /// value must be a construction ERROR, not silently coerced to `true`
+    /// (which would otherwise be a way for a typo to unknowingly disable the
+    /// durability guarantee).
+    #[tokio::test]
+    async fn retain_async_env_override_rejects_invalid_value() {
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ENV_TYPO";
+        unsafe { std::env::set_var(env_name, "tok") };
+        unsafe { std::env::set_var(RETAIN_ASYNC_ENV, "asyncc") };
+        let cfg = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
+            token_env: env_name.to_string(),
+            ..HindsightMemoryConfig::default()
+        };
+        let err = HindsightMemory::from_config(&cfg, "scout", "").unwrap_err();
+        assert!(
+            err.to_string().contains(RETAIN_ASYNC_ENV) && err.to_string().contains("asyncc"),
+            "an invalid env value must fail construction naming the bad value: {err}"
+        );
+        unsafe { std::env::remove_var(RETAIN_ASYNC_ENV) };
+        unsafe { std::env::remove_var(env_name) };
     }
 
     #[tokio::test]
@@ -1638,6 +1915,7 @@ mod tests {
             token: "test-token".to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             recall_types: Vec::new(),
+            retain_async: false,
             client: build_client(DEFAULT_HINDSIGHT_TIMEOUT_SECS),
         }
     }
@@ -1718,6 +1996,7 @@ mod tests {
             token: "test-token".to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             recall_types: Vec::new(),
+            retain_async: true,
             // 1s is comfortably above the mock's response latency floor yet far
             // below the ~30s artificial delay, so the deadline is what fires.
             client: build_client(1),

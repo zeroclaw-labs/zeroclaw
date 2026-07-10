@@ -10747,6 +10747,24 @@ pub struct HindsightMemoryConfig {
     /// comma-separated `ZC_HINDSIGHT_RECALL_TYPES` env var.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recall_types: Vec<String>,
+    /// Send retain (write) requests with the server-side `async` flag set, so
+    /// the Hindsight service performs vectorization off the caller's critical
+    /// path. The write is acknowledged as soon as the item is queued, BEFORE
+    /// embedding completes, which removes several seconds from an in-turn
+    /// `memory_store` but also removes the read-after-write guarantee: an
+    /// immediate recall, next-turn injection, or another agent's shared-bank
+    /// read can miss a write that was just reported successful, and the
+    /// driver does not track the queued operation to confirm it eventually
+    /// completed. Default: **false** (synchronous) so a successful
+    /// `Memory::store` always means "durably queryable now". Set to true only
+    /// for callers that do not need immediate read-after-write (nothing in
+    /// the same turn reads the just-written item back) and can tolerate a
+    /// queued write silently failing later. Applies to both the private
+    /// `store` path and the shared/system `store_to_bank` path. Overridable
+    /// at runtime with `ZC_HINDSIGHT_RETAIN_ASYNC` (strict boolean: `true`,
+    /// `false`, `1`, `0`, `yes`, `no`; any other value is a startup error).
+    #[serde(default)]
+    pub retain_async: bool,
 }
 
 impl Default for HindsightMemoryConfig {
@@ -10761,6 +10779,7 @@ impl Default for HindsightMemoryConfig {
             shared_bank: String::new(),
             system_bank: String::new(),
             recall_types: Vec::new(),
+            retain_async: false,
         }
     }
 }
