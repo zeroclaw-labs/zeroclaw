@@ -832,3 +832,7 @@ cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
 cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
 cli-doctor-ctxwin-none = No se necesitan actualizaciones.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
+cli-doctor-degraded-section = La sección de configuración `{$path}` está mal formada y se restableció a sus valores predeterminados; los valores de esa sección NO están en efecto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.

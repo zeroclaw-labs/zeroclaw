@@ -930,21 +930,18 @@ fn check_degraded_sections(config: &Config, items: &mut Vec<DiagItem>) {
     for path in &config.degraded_security {
         items.push(DiagItem::error(
             cat,
-            format!(
-                "SECURITY-CRITICAL config section `{path}` is invalid and was reset to its \
-                 default so the daemon can boot; the running posture may be WEAKER than \
-                 intended. Run `zeroclaw config migrate` to see the parse error, then repair \
-                 the file."
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-degraded-security",
+                &[("path", path.as_str())],
             ),
         ));
     }
     for path in &config.degraded_sections {
         items.push(DiagItem::warn(
             cat,
-            format!(
-                "config section `{path}` is malformed and was reset to defaults; values in \
-                 that section are NOT in effect. Run `zeroclaw config migrate` to see the \
-                 parse error, then repair the file."
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-degraded-section",
+                &[("path", path.as_str())],
             ),
         ));
     }

@@ -832,3 +832,7 @@ cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しま
 cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
 cli-doctor-ctxwin-none = 更新は必要ありません。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
