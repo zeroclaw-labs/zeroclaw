@@ -57,6 +57,12 @@ pub struct ChannelGatePrompt {
     pub reference: String,
     /// The presented choices, in order.
     pub choices: Vec<GateChoice>,
+    /// Body a RESOLVED prompt should keep showing (the context, without the
+    /// how-to-answer instructions): on finalize the channel appends the outcome
+    /// line under it, so the record of WHAT was approved survives in place.
+    /// `None` = the outcome replaces the body entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_description: Option<String>,
 }
 
 /// One selectable choice on a [`ChannelGatePrompt`].
@@ -68,6 +74,22 @@ pub struct GateChoice {
     pub label: String,
     /// Visual emphasis hint for channels that support it.
     pub emphasis: GateChoiceEmphasis,
+    /// When set, this choice collects free text from the operator before it is
+    /// answered (e.g. "Edit" amends a draft, "Revise" sends guidance). Channels
+    /// with a native form (Discord modal) render one; channels without simply
+    /// omit the choice — plain approve/deny stays universally answerable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<GateChoiceInput>,
+}
+
+/// The text-collection spec of an input-bearing [`GateChoice`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateChoiceInput {
+    /// Field label shown on the form (e.g. "Edited draft").
+    pub label: String,
+    /// Pre-filled text (e.g. the current draft an Edit starts from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
 }
 
 /// Rendering hint for a [`GateChoice`].

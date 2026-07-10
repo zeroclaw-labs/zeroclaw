@@ -58,6 +58,20 @@ pub fn resolve_gate(
         return Ok(ResolveOutcome::RejectedSelfApproval);
     }
 
+    // Amend/Revise are deterministic-checkpoint decisions (resolve_checkpoint
+    // owns them); an approval gate has no draft to edit or re-run. Refuse HERE,
+    // before the claim reacquire and the ledger append, so no side effect records
+    // a decision that was never applied.
+    if matches!(
+        decision,
+        ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. }
+    ) {
+        return Err(anyhow::Error::msg(format!(
+            "run {run_id} is parked at an approval gate; amend/revise apply only to \
+             deterministic checkpoints — approve or deny instead"
+        )));
+    }
+
     // 2a. Refuse to resolve an approval while the run's parked snapshot has not
     //     yet been durably persisted (`persist_parked_snapshot_then_release_claim`'s
     //     fail-closed keep, tracked in `claims_pending_persist`). That claim
@@ -159,6 +173,13 @@ pub fn resolve_gate(
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
             engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
             ResolveOutcome::Denied
+        }
+        // Rejected at entry (before the claim reacquire and ledger append);
+        // defensive so this match stays exhaustive without a panic path.
+        ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. } => {
+            return Err(anyhow::Error::msg(
+                "amend/revise apply only to deterministic checkpoints",
+            ));
         }
     };
 

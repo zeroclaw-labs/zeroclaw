@@ -44,6 +44,16 @@ pub struct GateNotice<'a> {
     /// The step's authored `- prompt:` template; `{{path.to.field}}`
     /// placeholders resolve against `context`. `None` = automatic summary.
     pub gate_prompt: Option<&'a str>,
+    /// Gate revision (bumped per `Revise`). Rides in the prompt reference
+    /// (`<run_id>#<rev>` when > 0) so an answer on a superseded prompt can never
+    /// resolve the current one.
+    pub revision: u32,
+    /// The checkpoint's `- edit:` field: when set, the prompt offers an Edit
+    /// choice collecting the amended text (pre-filled from `context[field]`).
+    pub edit_field: Option<&'a str>,
+    /// Whether the prompt offers a Revise choice (llm.generate predecessor
+    /// exists and the revision cap has headroom).
+    pub can_revise: bool,
 }
 
 /// A no-op route adapter: logs the delivery intent but sends nowhere. The default
@@ -269,6 +279,13 @@ impl ApprovalBroker {
             ApprovalDecision::Deny { .. } => Ok(BrokerOutcome::Resolved(
                 engine.resolve_gate(run_id, decision, principal)?,
             )),
+            // Amend/Revise are deterministic-checkpoint decisions: an approval
+            // gate has no piped draft to edit and no predecessor to re-run. Fail
+            // closed BEFORE any vote or ledger side effect.
+            ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. } => anyhow::bail!(
+                "run {run_id} is parked at an approval gate; amend/revise apply only to \
+                 deterministic checkpoints — approve or deny instead"
+            ),
             ApprovalDecision::Approve => {
                 let need = policy
                     .as_ref()

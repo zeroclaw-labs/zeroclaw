@@ -58,11 +58,18 @@ impl GateLedgerEntry {
             Some(ApprovalDecision::Deny {
                 reason: Some(reason),
             }) => Some(reason.clone()),
+            // The guidance IS the why of a revise — carry it as the row's reason
+            // so the ledger records what the approver asked for. An amend's full
+            // text lives in the run record (the checkpoint step's output); the
+            // row only records THAT the draft was operator-amended.
+            Some(ApprovalDecision::Revise { guidance }) => Some(guidance.clone()),
             _ => None,
         };
         let decision_label = match &self.decision {
             Some(ApprovalDecision::Approve) => Some("approve"),
             Some(ApprovalDecision::Deny { .. }) => Some("deny"),
+            Some(ApprovalDecision::Amend { .. }) => Some("amend"),
+            Some(ApprovalDecision::Revise { .. }) => Some("revise"),
             None => None,
         };
         let payload = serde_json::json!({

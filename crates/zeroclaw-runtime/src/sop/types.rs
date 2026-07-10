@@ -287,6 +287,11 @@ pub struct SopStep {
     /// approver sees WHAT they are approving; absent = an automatic summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_prompt: Option<String>,
+    /// Editable-field opt-in for a checkpoint step (`- edit: body` bullet): the
+    /// named field of the piped value an approver may amend before the run
+    /// resumes (the gate prompt gains an "Edit" choice). Absent = no editing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<String>,
 }
 
 impl Default for SopStep {
@@ -307,6 +312,7 @@ impl Default for SopStep {
             capability_input: None,
             policy: None,
             gate_prompt: None,
+            edit: None,
         }
     }
 }
@@ -605,6 +611,19 @@ pub struct SopRun {
     /// Number of LLM calls saved by deterministic execution in this run.
     #[serde(default)]
     pub llm_calls_saved: u64,
+    /// Gate-presentation counter: bumped on each `Revise` re-presentation AND on
+    /// each new checkpoint park after the first, so EVERY prompt this run ever
+    /// sends has a unique revision-qualified reference (`<run_id>#<rev>`; bare =
+    /// 0, the run's very first gate). An answer on a superseded prompt — an older
+    /// draft, or an earlier GATE's leftover buttons — can never resolve the
+    /// current one.
+    #[serde(default)]
+    pub revision: u32,
+    /// `revision` as of the CURRENT gate's first presentation. `revision -
+    /// revision_base` = re-drafts spent at this gate (the per-gate revise cap);
+    /// reset when a new checkpoint parks, untouched by revise re-parks.
+    #[serde(default)]
+    pub revision_base: u32,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -1049,6 +1068,8 @@ path = "/sop/test"
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

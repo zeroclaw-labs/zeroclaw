@@ -113,6 +113,7 @@ fn outcome_response(outcome: &ResolveOutcome) -> (StatusCode, &'static str) {
     match outcome {
         ResolveOutcome::Resumed(_) => (StatusCode::OK, "resumed"),
         ResolveOutcome::Denied => (StatusCode::OK, "denied"),
+        ResolveOutcome::Revised => (StatusCode::OK, "revised"),
         ResolveOutcome::AlreadyResolved => (StatusCode::OK, "already_resolved"),
         ResolveOutcome::NotWaiting => (StatusCode::NOT_FOUND, "not_waiting"),
         ResolveOutcome::RejectedSelfApproval => (StatusCode::FORBIDDEN, "rejected_self_approval"),

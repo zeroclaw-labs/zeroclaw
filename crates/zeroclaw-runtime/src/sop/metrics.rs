@@ -297,8 +297,16 @@ impl SopMetricsCollector {
                 continue;
             };
             for ev in &events {
+                // An `amend` IS an approval (of the operator's text) — the live
+                // path meters it via `record_approval_metric` exactly like a
+                // plain approve, so the rebuild must count it too or the
+                // counters drift across a restart. Denials, escalations, and
+                // revises (the gate stays open) are not approvals.
                 if ev.kind != "gate_resolved"
-                    || ev.payload.get("decision").and_then(|d| d.as_str()) != Some("approve")
+                    || !matches!(
+                        ev.payload.get("decision").and_then(|d| d.as_str()),
+                        Some("approve") | Some("amend")
+                    )
                 {
                     continue;
                 }
@@ -740,6 +748,8 @@ mod tests {
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         }
     }
 
@@ -1310,6 +1320,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1422,6 +1434,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
 

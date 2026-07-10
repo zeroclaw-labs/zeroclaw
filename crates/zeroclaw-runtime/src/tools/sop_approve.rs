@@ -148,6 +148,13 @@ impl Tool for SopApproveTool {
                 output: String::new(),
                 error: Some(format!("Run {run_id} was denied.")),
             }),
+            // Unreachable from this tool (it only sends Approve), but a stable
+            // report beats a panic if the outcome set grows another producer.
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::Revised)) => Ok(ToolResult {
+                success: true,
+                output: format!("Run {run_id} re-drafted; the gate was re-presented."),
+                error: None,
+            }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting))
             | Ok(BrokerOutcome::NotWaiting) => Ok(ToolResult {
                 success: false,

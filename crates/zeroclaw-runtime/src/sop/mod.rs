@@ -395,6 +395,15 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 } else {
                     Some(val.to_string())
                 };
+            } else if let Some(val) = bullet.strip_prefix("edit:") {
+                // Editable-field opt-in for a checkpoint gate: the named field of
+                // the piped value an approver may amend before the run resumes.
+                let val = val.trim();
+                current.edit = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -437,6 +446,7 @@ struct StepParseState {
     mode: Option<SopExecutionMode>,
     policy: Option<String>,
     gate_prompt: Option<String>,
+    edit: Option<String>,
 }
 
 impl StepParseState {
@@ -467,6 +477,7 @@ impl StepParseState {
             mode: self.mode.take(),
             policy: self.policy.take(),
             gate_prompt: self.gate_prompt.take(),
+            edit: self.edit.take(),
         });
         *self = Self::default();
     }

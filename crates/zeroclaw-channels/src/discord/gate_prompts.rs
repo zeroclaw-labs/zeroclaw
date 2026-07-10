@@ -1,0 +1,143 @@
+//! Process-wide registry of sent SOP gate prompts, keyed by gate reference.
+//!
+//! PROCESS-WIDE, not per-channel-instance, deliberately: the daemon builds more
+//! than one channel map today (the SOP approval route adapter's map in
+//! `build_sop_adapters` and the orchestrator's own), so the `DiscordChannel`
+//! that SENDS a gate prompt and the one that later FINALIZES it are different
+//! instances of the same alias. A per-instance registry made the finalize a
+//! silent no-op (the resolved gate's embed never updated). One shared registry
+//! makes finalize instance-agnostic; each record carries the sending instance's
+//! bot token so the PATCH is correct even across aliases with different tokens.
+//!
+//! In-memory only: a restart loses the mapping, after which finalize no-ops and
+//! the stale buttons resolve as already-answered via the marker path — the same
+//! degraded mode as before, never a wrong edit.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+/// Registry entries older than this are swept on the next insert: a gate
+/// parked this long has almost certainly been resolved through another surface
+/// (or its run reaped), and an unswept registry would otherwise grow for the
+/// daemon's whole lifetime. A swept entry only degrades finalize to a no-op —
+/// the same mode as a restart, never a wrong edit.
+const SWEEP_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// One sent gate prompt: where its message lives, how to authenticate the
+/// finalize PATCH, and any input-bearing choices (for modal pre-fill).
+#[derive(Debug, Clone)]
+pub(crate) struct GatePromptRecord {
+    pub(crate) channel_id: String,
+    pub(crate) message_id: String,
+    pub(crate) title: String,
+    /// Bot token of the instance that SENT the prompt — the finalize PATCH must
+    /// use it even when a different alias/instance resolves the answer.
+    pub(crate) bot_token: String,
+    /// Body the finalized embed keeps (the approval context, minus the reply
+    /// instructions); the outcome line is appended under it so the record of
+    /// WHAT was approved survives resolution. `None` = outcome-only.
+    pub(crate) resolved_description: Option<String>,
+    /// Input-bearing choices (Edit / Revise) so a live process can pre-fill
+    /// their modals. Best-effort: lost on restart, after which the modal opens
+    /// blank (the draft is still readable in the embed).
+    pub(crate) inputs: Vec<GatePromptInput>,
+}
+
+/// The text-collection spec of one input-bearing choice on a sent prompt.
+#[derive(Debug, Clone)]
+pub(crate) struct GatePromptInput {
+    pub(crate) choice_id: String,
+    pub(crate) label: String,
+    pub(crate) prefill: Option<String>,
+}
+
+static GATE_PROMPTS: LazyLock<Mutex<HashMap<String, (Instant, GatePromptRecord)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record a sent gate prompt under its reference (replacing any previous entry
+/// for the same reference). Sweeps expired entries so the registry stays
+/// bounded by live-gate volume, not daemon uptime.
+pub(crate) fn record(reference: &str, record: GatePromptRecord) {
+    let mut map = GATE_PROMPTS.lock().expect("gate prompt registry poisoned");
+    map.retain(|_, (at, _)| at.elapsed() < SWEEP_AFTER);
+    map.insert(reference.to_string(), (Instant::now(), record));
+}
+
+/// Remove and return the prompt recorded under `reference`. The caller PATCHes
+/// the message; on a transient failure it should `record` the entry back so a
+/// later terminal event can retry.
+pub(crate) fn take(reference: &str) -> Option<GatePromptRecord> {
+    GATE_PROMPTS
+        .lock()
+        .expect("gate prompt registry poisoned")
+        .remove(reference)
+        .map(|(_, r)| r)
+}
+
+/// The input spec of `choice_id` on the prompt recorded under `reference`,
+/// without consuming the record (a modal open must not stop a later finalize).
+pub(crate) fn input_for(reference: &str, choice_id: &str) -> Option<GatePromptInput> {
+    GATE_PROMPTS
+        .lock()
+        .expect("gate prompt registry poisoned")
+        .get(reference)
+        .and_then(|(_, r)| r.inputs.iter().find(|i| i.choice_id == choice_id))
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(title: &str) -> GatePromptRecord {
+        GatePromptRecord {
+            channel_id: "c1".into(),
+            message_id: "m1".into(),
+            title: title.into(),
+            bot_token: "t1".into(),
+            resolved_description: Some("the approval context".into()),
+            inputs: vec![GatePromptInput {
+                choice_id: "edit".into(),
+                label: "Edited body".into(),
+                prefill: Some("draft".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn record_is_visible_across_callers_and_take_consumes() {
+        // Unique reference per test: the registry is process-wide by design.
+        let reference = "run-registry-take";
+        record(reference, rec("A"));
+        // Any caller (a different channel instance) sees it…
+        let got = take(reference).expect("recorded entry is visible process-wide");
+        assert_eq!(got.title, "A");
+        assert_eq!(got.bot_token, "t1");
+        // …and take consumed it.
+        assert!(take(reference).is_none());
+    }
+
+    #[test]
+    fn reinsert_after_failed_finalize_allows_retry() {
+        let reference = "run-registry-retry";
+        record(reference, rec("A"));
+        let got = take(reference).expect("first take");
+        // Simulate a failed PATCH: put it back, a later event retries.
+        record(reference, got);
+        assert!(take(reference).is_some(), "re-inserted entry is retryable");
+    }
+
+    #[test]
+    fn input_for_reads_without_consuming() {
+        let reference = "run-registry-input";
+        record(reference, rec("A"));
+        let input = input_for(reference, "edit").expect("edit input recorded");
+        assert_eq!(input.prefill.as_deref(), Some("draft"));
+        assert!(input_for(reference, "revise").is_none(), "unknown choice");
+        assert!(
+            take(reference).is_some(),
+            "input_for must not consume the record"
+        );
+    }
+}

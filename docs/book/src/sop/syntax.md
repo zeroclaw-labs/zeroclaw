@@ -139,6 +139,27 @@ a `request_route`/`escalation_route` for its out-of-band notice; checkpoint
 resolution itself is not membership/quorum-gated (it is an in-band pause, not a
 policied approval gate).
 
+Two further checkpoint resolutions let a reviewer shape the draft instead of
+just gating it (both ledger-audited like approve/deny):
+
+- **Edit (amend)** - opt-in via an `- edit: <field>` bullet on the checkpoint:
+  the approver may replace that field of the piped value with their own text
+  before the run resumes (on Discord, an Edit button opens a modal pre-filled
+  with the current value). The checkpoint's recorded output carries the
+  human-approved text; the predecessor step keeps the model's original for the
+  audit trail. The ledger row records `decision: amend`.
+- **Revise** - offered automatically when the checkpoint's predecessor is an
+  `llm.generate` step: the approver sends guidance, the engine re-runs that
+  step with the guidance framed as reviewer feedback (`revision_feedback`,
+  carried in the step's static config plane - the untrusted payload framing is
+  unchanged), replaces the draft, and re-presents the gate. Every gate
+  presentation the run makes carries a unique revision (each revise bumps it,
+  and so does each later checkpoint's first park); prompt references become
+  `<run_id>#<rev>`, and an answer on a superseded prompt - an older draft, or
+  an earlier gate's leftover buttons - is refused. Capped at 3 revisions per
+  gate; a failed re-draft keeps the previous draft parked and answerable. The
+  ledger records `decision: revise` with the guidance as the reason.
+
 ### Injected-adapter capabilities
 
 Two `kind: capability` steps perform real side effects through adapters the daemon

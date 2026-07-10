@@ -102,7 +102,7 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
     let Some(run) = engine.get_run(run_id) else {
         return;
     };
-    let (sop_name, step) = (run.sop_name.clone(), run.current_step);
+    let (sop_name, step, revision) = (run.sop_name.clone(), run.current_step, run.revision);
     let context = crate::sop::engine::step_input_value(run, step);
     let Some(policy_name) = engine.current_step_policy_name(run_id) else {
         return;
@@ -117,6 +117,13 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
                 step,
                 context: &context,
                 gate_prompt: None,
+                // Carry the live revision so an answer to the escalation prompt
+                // references the CURRENT presentation (a stale-rev reference is
+                // refused as superseded). Edit/Revise stay off the escalation
+                // notice — it is a "this gate is stuck" surface, not a review.
+                revision,
+                edit_field: None,
+                can_revise: false,
             },
         );
     }

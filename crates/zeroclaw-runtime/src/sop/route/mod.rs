@@ -91,6 +91,7 @@ mod tests {
             scope: None,
             routing: StepRouting::default(),
             gate_prompt: None,
+            edit: None,
             on_failure: Default::default(),
             mode: None,
             capability: None,
@@ -136,6 +137,8 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         }
     }
 

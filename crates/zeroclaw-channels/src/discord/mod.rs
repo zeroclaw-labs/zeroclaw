@@ -38,6 +38,7 @@ mod slash_options;
 // pending registry. Accessed via explicit paths (`super::components::…`).
 mod components;
 mod custom_id;
+mod gate_prompts;
 mod pending;
 // Buttoned tool-approval surface (Allow-once / Session / Always / Deny) +
 // the server-side decision enum a click resolves the approval `oneshot` with.
@@ -119,11 +120,6 @@ pub struct DiscordChannel {
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
     pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
-    /// Sent SOP-gate prompts by reference -> (channel_id, message_id, title),
-    /// so a resolved gate's message can be finalized (buttons stripped, outcome
-    /// shown). In-memory: a restart loses the mapping (finalize then no-ops;
-    /// the stale buttons resolve as already-answered via the marker path).
-    gate_prompts: Arc<AsyncMutex<HashMap<String, (String, String, String)>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -202,7 +198,6 @@ impl DiscordChannel {
             multi_message_thread_ts: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
-            gate_prompts: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
@@ -1062,6 +1057,7 @@ fn build_component_rows(
                             placeholder: f.placeholder.clone(),
                             min_length: f.min_length,
                             max_length: f.max_length,
+                            value: None,
                         })
                         .collect();
                     let built_modal = DiscordModal {
@@ -2847,6 +2843,35 @@ impl Channel for DiscordChannel {
                                             &user_id,
                                             crate::allowlist::Match::Sensitive,
                                         ) {
+                                            // Shared-token deployments: every
+                                            // alias receives every click, and
+                                            // each alias has its OWN peer list —
+                                            // a sibling alias whose list lacks
+                                            // this user must not fire a loud
+                                            // reject that races the owning
+                                            // alias's answer (for the modal-open
+                                            // kind, the response IS the modal;
+                                            // losing that race kills Edit/Revise
+                                            // outright). If the interaction's
+                                            // channel is not one of OURS, this
+                                            // SOP-gate click is not ours to
+                                            // reject. (A thread whose parent is
+                                            // ours is silenced too — acceptable:
+                                            // this user failed OUR peer check,
+                                            // so the only loss is the rejection
+                                            // notice.)
+                                            let is_foreign_sop_gate =
+                                                custom_id::CustomId::parse(&custom_id_raw)
+                                                    .is_some_and(|cid| {
+                                                        approval::is_sop_gate_kind(&cid.kind)
+                                                    })
+                                                    && !channel_filter.is_empty()
+                                                    && !channel_filter
+                                                        .iter()
+                                                        .any(|c| c == &interaction_channel);
+                                            if is_foreign_sop_gate {
+                                                return;
+                                            }
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized component interaction");
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unauthorized",
@@ -2889,12 +2914,16 @@ impl Channel for DiscordChannel {
                                             // of racing this alias's rejection.
                                             // Every other denial (or kind) keeps
                                             // the loud fail-closed reject.
+                                            // Guild- and channel-scope denials
+                                            // both mean "not my interaction" for
+                                            // a shared-token sibling alias.
                                             let is_foreign_sop_gate = matches!(
                                                 denial,
                                                 InteractionDenial::ChannelNotAllowed
+                                                    | InteractionDenial::GuildNotAllowed
                                             ) && custom_id::CustomId::parse(&custom_id_raw)
                                                 .is_some_and(|cid| {
-                                                    cid.kind == approval::SOP_GATE_KIND
+                                                    approval::is_sop_gate_kind(&cid.kind)
                                                 });
                                             if is_foreign_sop_gate {
                                                 return;
@@ -2930,6 +2959,110 @@ impl Channel for DiscordChannel {
                                                         sender: user_id.clone(),
                                                         reply_target: interaction_channel.clone(),
                                                         content: format!("{choice} {reference}"),
+                                                        channel: "discord".to_string(),
+                                                        channel_alias: Some(alias.clone()),
+                                                        timestamp: std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default()
+                                                            .as_secs(),
+                                                        internal_sop_event: Some(format!(
+                                                            "sop.gate:{choice}:{reference}"
+                                                        )),
+                                                        ..Default::default()
+                                                    };
+                                                    if tx.send(channel_msg).await.is_ok() {
+                                                        "channel-discord-approval-recorded"
+                                                    } else {
+                                                        "channel-discord-component-expired"
+                                                    }
+                                                }
+                                                _ => "channel-discord-component-expired",
+                                            };
+                                            let msg = i18n::get_required_cli_string(ack_key);
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate ack failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stateless input-bearing SOP-gate button
+                                        // (Edit / Revise): the click's response IS
+                                        // opening a modal whose own custom_id
+                                        // re-carries `<choice>:<reference>`. The
+                                        // pre-fill comes from the in-memory prompt
+                                        // registry (best-effort — blank after a
+                                        // restart; the draft is in the embed).
+                                        if let Some(cid) = custom_id::CustomId::parse(&custom_id_raw)
+                                            && cid.kind == approval::SOP_GATE_MODAL_KIND
+                                        {
+                                            let Some((choice, reference)) = cid
+                                                .arg
+                                                .split_once(':')
+                                                .filter(|(c, r)| !c.is_empty() && !r.is_empty())
+                                            else {
+                                                let msg = i18n::get_required_cli_string("channel-discord-component-expired");
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate ack failed");
+                                                }
+                                                return;
+                                            };
+                                            let input = gate_prompts::input_for(reference, choice);
+                                            let (label, prefill) = match input {
+                                                Some(i) => (i.label, i.prefill),
+                                                None => ("Text".to_string(), None),
+                                            };
+                                            let title = match choice {
+                                                "edit" => "Edit the draft",
+                                                "revise" => "Ask for a re-draft",
+                                                _ => "Provide text",
+                                            };
+                                            let modal = components::DiscordModal {
+                                                custom_id: custom_id::CustomId::new(
+                                                    approval::SOP_GATE_SUBMIT_KIND,
+                                                    format!("{choice}:{reference}"),
+                                                ),
+                                                title: title.to_string(),
+                                                fields: vec![components::ModalField {
+                                                    custom_id: "text".to_string(),
+                                                    label,
+                                                    style: components::TextInputStyle::Paragraph,
+                                                    required: true,
+                                                    placeholder: None,
+                                                    min_length: Some(1),
+                                                    max_length: Some(4000),
+                                                    value: prefill,
+                                                }],
+                                            };
+                                            if let Err(e) = discord_open_modal(&client, &interaction_id, &interaction_token, &modal).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate modal open failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stateless SOP-gate modal SUBMIT (type 5):
+                                        // the typed text becomes the marker
+                                        // message's content (the amended draft or
+                                        // the re-draft guidance); the custom_id
+                                        // carries which choice + gate it answers.
+                                        if let Some(cid) = custom_id::CustomId::parse(&custom_id_raw)
+                                            && cid.kind == approval::SOP_GATE_SUBMIT_KIND
+                                        {
+                                            let text = modal_fields
+                                                .iter()
+                                                .find(|(id, _)| id == "text")
+                                                .map(|(_, v)| v.trim().to_string())
+                                                .unwrap_or_default();
+                                            let ack_key = match cid.arg.split_once(':') {
+                                                Some((choice, reference))
+                                                    if !choice.is_empty()
+                                                        && !reference.is_empty()
+                                                        && !text.is_empty() =>
+                                                {
+                                                    let channel_msg = ChannelMessage {
+                                                        id: format!("discord_sopgate_{interaction_id}"),
+                                                        sender: user_id.clone(),
+                                                        reply_target: interaction_channel.clone(),
+                                                        content: text,
                                                         channel: "discord".to_string(),
                                                         channel_alias: Some(alias.clone()),
                                                         timestamp: std::time::SystemTime::now()
@@ -4177,13 +4310,18 @@ impl Channel for DiscordChannel {
                     GateChoiceEmphasis::Negative => components::ButtonStyle::Danger,
                     GateChoiceEmphasis::Neutral => components::ButtonStyle::Secondary,
                 };
+                // Input-bearing choices (Edit / Revise) open a modal on click;
+                // plain choices emit the gate marker directly. Both stay
+                // stateless: the custom_id carries `<choice>:<reference>`.
+                let kind = if choice.input.is_some() {
+                    approval::SOP_GATE_MODAL_KIND
+                } else {
+                    approval::SOP_GATE_KIND
+                };
                 components::button(
                     style,
                     &choice.label,
-                    custom_id::CustomId::new(
-                        approval::SOP_GATE_KIND,
-                        format!("{}:{}", choice.id, prompt.reference),
-                    ),
+                    custom_id::CustomId::new(kind, format!("{}:{}", choice.id, prompt.reference)),
                 )
             })
             .collect();
@@ -4204,36 +4342,73 @@ impl Channel for DiscordChannel {
             &outgoing,
         )
         .await?;
-        self.gate_prompts.lock().await.insert(
-            prompt.reference.clone(),
-            (channel_id.to_string(), message_id, prompt.title.clone()),
+        gate_prompts::record(
+            &prompt.reference,
+            gate_prompts::GatePromptRecord {
+                channel_id: channel_id.to_string(),
+                message_id,
+                title: prompt.title.clone(),
+                bot_token: self.bot_token.clone(),
+                resolved_description: prompt.resolved_description.clone(),
+                inputs: prompt
+                    .choices
+                    .iter()
+                    .filter_map(|c| {
+                        c.input.as_ref().map(|input| gate_prompts::GatePromptInput {
+                            choice_id: c.id.clone(),
+                            label: input.label.clone(),
+                            prefill: input.prefill.clone(),
+                        })
+                    })
+                    .collect(),
+            },
         );
         Ok(true)
     }
 
     async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
-        let Some((channel_id, message_id, title)) =
-            self.gate_prompts.lock().await.remove(reference)
-        else {
+        // Process-wide registry (see `gate_prompts`): the instance that sent the
+        // prompt and the one finalizing it are usually DIFFERENT instances of
+        // the same alias (separate channel maps), so the lookup and the PATCH
+        // token must not be tied to `self`.
+        let Some(record) = gate_prompts::take(reference) else {
             return Ok(false);
         };
+        // Keep the approval CONTEXT in place and append the outcome under it —
+        // a resolved prompt should still show what was approved, not erase it.
         // PATCH with an EXPLICIT empty components array: omitting the key would
         // leave the buttons in place on Discord's side.
+        let description = match &record.resolved_description {
+            Some(base) => format!("{base}\n\n{outcome}"),
+            None => outcome.to_string(),
+        };
         let body = serde_json::json!({
-            "embeds": [{"title": title, "description": outcome}],
+            "embeds": [{"title": record.title, "description": description}],
             "components": [],
         });
-        let url =
-            format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages/{}",
+            record.channel_id, record.message_id
+        );
         let resp = self
             .http_client()
             .patch(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("Authorization", format!("Bot {}", record.bot_token))
             .json(&body)
             .send()
-            .await?;
+            .await;
+        // Transient failure: put the record back so a later terminal event (a
+        // stale click's "window has passed") can retry the edit.
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                gate_prompts::record(reference, record);
+                return Err(e.into());
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status();
+            gate_prompts::record(reference, record);
             anyhow::bail!("Discord gate-prompt finalize failed ({status})");
         }
         Ok(true)

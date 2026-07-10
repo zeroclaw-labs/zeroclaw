@@ -253,8 +253,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// (channel hint, repo, number, body) as received by `post_comment`.
+    type RecordedCall = (Option<String>, String, u64, String);
+
     struct RecordingAdapter {
-        calls: Mutex<Vec<(Option<String>, String, u64, String)>>,
+        calls: Mutex<Vec<RecordedCall>>,
         result: Result<(), String>,
     }
 

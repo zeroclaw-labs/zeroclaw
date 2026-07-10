@@ -6177,6 +6177,21 @@ impl AgentRouter {
     }
 }
 
+/// Split an inbound gate reference into its run part and revision. A reference
+/// may be revision-qualified (`<run_id>#<rev>`); a bare reference means
+/// revision 0 (the ORIGINAL presentation) — NOT "whatever is current" — so a
+/// click on a superseded prompt can never resolve a newer draft it wasn't
+/// looking at. A malformed suffix leaves the whole string as the run part.
+fn parse_gate_reference(reference: &str) -> (String, u32) {
+    match reference.rsplit_once('#') {
+        Some((run_part, rev_part)) if !run_part.is_empty() => match rev_part.parse::<u32>() {
+            Ok(rev) => (run_part.to_string(), rev),
+            Err(_) => (reference.to_string(), 0),
+        },
+        _ => (reference.to_string(), 0),
+    }
+}
+
 /// Resolve a SOP gate answered from a chat channel. Two answer forms converge
 /// here, per the channel-agnostic gate-prompt seam:
 ///
@@ -6205,7 +6220,13 @@ async fn dispatch_channel_sop_gate(
         .and_then(|s| s.strip_prefix(MARKER_PREFIX))
     {
         match rest.split_once(':') {
-            Some((c, r)) if !c.is_empty() && !r.is_empty() => {
+            Some((c, r))
+                if !r.is_empty()
+                    && matches!(
+                        c.to_ascii_lowercase().as_str(),
+                        "approve" | "deny" | "edit" | "revise"
+                    ) =>
+            {
                 (Form::Marker, c.to_ascii_lowercase(), r.to_string())
             }
             _ => {
@@ -6213,13 +6234,15 @@ async fn dispatch_channel_sop_gate(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"marker": rest})),
-                    "dropping malformed channel SOP-gate marker"
+                    "dropping malformed or unknown channel SOP-gate marker"
                 );
                 return true;
             }
         }
     } else if msg.internal_sop_event.is_none() {
         // Text form: exactly two tokens, and the first must be a known choice.
+        // Edit/Revise stay marker-only (they carry a text payload a two-token
+        // reply cannot); approve/deny remain universally answerable.
         let mut words = msg.content.split_whitespace();
         match (words.next(), words.next(), words.next()) {
             (Some(c), Some(r), None)
@@ -6238,11 +6261,15 @@ async fn dispatch_channel_sop_gate(
         return matches!(form, Form::Marker);
     };
 
-    // Resolve `reference` against runs actually parked on a human: the full run
-    // id, or an unambiguous suffix (prompts may show a shortened id). For the
-    // TEXT form a non-match means "not a gate answer" — fall through to the
-    // agent; a marker non-match is consumed (stale buttons after the run ended).
-    let resolved_run_id = {
+    let (ref_run, ref_rev) = parse_gate_reference(&reference);
+
+    // Resolve against runs actually parked on a human: the full run id, or an
+    // unambiguous suffix (prompts may show a shortened id). For the TEXT form a
+    // non-match means "not a gate answer" — fall through to the agent; a marker
+    // non-match is consumed (stale buttons after the run ended). A matched run
+    // whose CURRENT revision differs from the reference's is superseded: the
+    // prompt the operator answered shows an older draft.
+    let resolved = {
         let Ok(guard) = engine.lock() else {
             return matches!(form, Form::Marker);
         };
@@ -6253,16 +6280,45 @@ async fn dispatch_channel_sop_gate(
                     | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint
             )
         });
-        let matched: Vec<String> = candidates
+        let matched: Vec<(String, u32)> = candidates
             .by_ref()
-            .filter(|r| r.run_id == reference || r.run_id.ends_with(&reference))
-            .map(|r| r.run_id.clone())
+            .filter(|r| r.run_id == ref_run || r.run_id.ends_with(&ref_run))
+            .map(|r| (r.run_id.clone(), r.revision))
             .collect();
         match matched.as_slice() {
             [one] => Some(one.clone()),
             _ => None,
         }
     };
+    if let Some((run_id, current_rev)) = &resolved
+        && *current_rev != ref_rev
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "run_id": run_id,
+                    "reference": reference,
+                    "current_revision": current_rev,
+                    "channel": msg.channel.as_str(),
+                })
+            ),
+            "channel SOP-gate answer targeted a superseded prompt revision"
+        );
+        if let Some(channel) = gate_channel {
+            let _ = channel
+                .finalize_gate_prompt(
+                    &reference,
+                    "\u{1f501} This prompt was superseded by a newer draft \u{2014} \
+                     answer the latest prompt instead.",
+                )
+                .await;
+        }
+        // Consumed for both forms: it named a real parked gate, just an old
+        // presentation of it — never a message for the agent.
+        return true;
+    }
+    let resolved_run_id = resolved.map(|(run_id, _)| run_id);
     let Some(run_id) = resolved_run_id else {
         return match form {
             Form::Marker => {
@@ -6296,13 +6352,40 @@ async fn dispatch_channel_sop_gate(
         Some(alias) => format!("{}.{alias}", msg.channel),
         None => msg.channel.clone(),
     };
-    let decision = if choice == "approve" {
-        zeroclaw_runtime::sop::approval::ApprovalDecision::Approve
-    } else {
-        zeroclaw_runtime::sop::approval::ApprovalDecision::Deny {
-            reason: Some(format!("denied by {} via {channel_key}", msg.sender)),
+    let decision = match choice.as_str() {
+        "approve" => zeroclaw_runtime::sop::approval::ApprovalDecision::Approve,
+        // Edit / Revise carry their text in the marker message's content (the
+        // connector puts the modal's typed field there). Empty text cannot
+        // amend or steer anything — consume without resolving (the connector's
+        // required-field modal makes this unreachable in practice).
+        "edit" | "revise" => {
+            let text = msg.content.trim().to_string();
+            if text.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "choice": choice,
+                        })),
+                    "channel SOP-gate edit/revise arrived without text; ignored"
+                );
+                return true;
+            }
+            if choice == "edit" {
+                zeroclaw_runtime::sop::approval::ApprovalDecision::Amend { text }
+            } else {
+                zeroclaw_runtime::sop::approval::ApprovalDecision::Revise { guidance: text }
+            }
         }
+        _ => zeroclaw_runtime::sop::approval::ApprovalDecision::Deny {
+            reason: Some(format!("denied by {} via {channel_key}", msg.sender)),
+        },
     };
+    let is_edit = matches!(
+        decision,
+        zeroclaw_runtime::sop::approval::ApprovalDecision::Amend { .. }
+    );
     let principal = zeroclaw_runtime::sop::approval::ApprovalPrincipal::channel(
         channel_key.clone(),
         Some(msg.sender.clone()),
@@ -6331,12 +6414,22 @@ async fn dispatch_channel_sop_gate(
             // can be retried or CHANGED while the run is still parked.
             use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
             let final_text = match &outcome {
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) if is_edit => Some(format!(
+                    "\u{2705} Approved with edits by <@{}> \u{2014} run resumed with the \
+                     amended text.",
+                    msg.sender
+                )),
                 BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => Some(format!(
                     "\u{2705} Approved by <@{}> \u{2014} run resumed.",
                     msg.sender
                 )),
                 BrokerOutcome::Resolved(ResolveOutcome::Denied) => Some(format!(
                     "\u{1f6ab} Denied by <@{}> \u{2014} run cancelled.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::Revised) => Some(format!(
+                    "\u{1f501} Revision requested by <@{}> \u{2014} a new draft prompt is \
+                     on its way.",
                     msg.sender
                 )),
                 BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved) => Some(
@@ -6346,19 +6439,29 @@ async fn dispatch_channel_sop_gate(
                 ),
                 _ => None,
             };
-            if let (Some(text), Some(channel)) = (final_text, gate_channel) {
-                if let Err(e) = channel.finalize_gate_prompt(&run_id, &text).await {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "error": e.to_string(),
-                            })),
-                        "gate-prompt finalize failed (decision unaffected)"
-                    );
-                }
+            // Finalize by the prompt's CANONICAL reference (revision-qualified
+            // when > 0): the prompt registry is keyed by what was sent, and a
+            // text reply may have used a shortened id.
+            let finalize_reference = if ref_rev == 0 {
+                run_id.clone()
+            } else {
+                format!("{run_id}#{ref_rev}")
+            };
+            if let (Some(text), Some(channel)) = (final_text, gate_channel)
+                && let Err(e) = channel
+                    .finalize_gate_prompt(&finalize_reference, &text)
+                    .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": e.to_string(),
+                        })),
+                    "gate-prompt finalize failed (decision unaffected)"
+                );
             }
         }
         Err(e) => {
@@ -25050,6 +25153,65 @@ Done."#;
         assert!(
             !dispatch_channel_sop_gate(&router, &msg, None).await,
             "a text reply with no parked-run match must fall through to the agent"
+        );
+    }
+
+    #[test]
+    fn gate_reference_parsing_defaults_bare_to_revision_zero() {
+        // Bare = revision 0 (the original presentation), NOT "current": a click
+        // on a superseded prompt must never resolve a newer draft.
+        assert_eq!(parse_gate_reference("det-1-0001"), ("det-1-0001".into(), 0));
+        assert_eq!(
+            parse_gate_reference("det-1-0001#2"),
+            ("det-1-0001".into(), 2)
+        );
+        // Malformed suffix: the whole string is the run part (matches nothing).
+        assert_eq!(
+            parse_gate_reference("det-1-0001#zz"),
+            ("det-1-0001#zz".into(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_edit_and_revise_markers_are_consumed() {
+        // Edit/Revise markers exist only to answer a gate — consumed even when
+        // no engine is available, exactly like approve/deny markers.
+        for (choice, content) in [
+            ("edit", "my rewritten draft"),
+            ("revise", "make it shorter"),
+        ] {
+            let msg = ChannelMessage {
+                channel: "discord".to_string(),
+                channel_alias: Some("gnosis".to_string()),
+                sender: "111222333".to_string(),
+                content: content.to_string(),
+                internal_sop_event: Some(format!("sop.gate:{choice}:det-1-0001#1")),
+                ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+            };
+            let router = router_without_sop_engine();
+            assert!(
+                dispatch_channel_sop_gate(&router, &msg, None).await,
+                "a {choice} marker must be consumed, not become an agent turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_gate_unknown_marker_choice_is_dropped() {
+        // An unknown choice in a marker is malformed — consumed (it can only be
+        // a gate artifact), never resolved as a decision. Guards the old
+        // behavior where any non-"approve" choice silently became a DENY.
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            sender: "111222333".to_string(),
+            content: "frobnicate det-1-0001".to_string(),
+            internal_sop_event: Some("sop.gate:frobnicate:det-1-0001".to_string()),
+            ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_channel_sop_gate(&router, &msg, None).await,
+            "an unknown-choice marker must still be consumed"
         );
     }
 

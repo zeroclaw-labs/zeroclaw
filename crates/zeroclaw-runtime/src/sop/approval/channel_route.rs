@@ -133,19 +133,32 @@ fn summarize_context(context: &serde_json::Value) -> String {
     lines.join(" ")
 }
 
+/// The reference an answer must carry: the run id, revision-qualified once the
+/// gate has been re-presented (`<run_id>#<rev>`). Plain `<run_id>` ≡ revision 0,
+/// so pre-revision prompts and habits keep working — and a click on a superseded
+/// prompt (older revision) can never resolve the current one.
+fn gate_reference(notice: &GateNotice<'_>) -> String {
+    if notice.revision == 0 {
+        notice.run_id.to_string()
+    } else {
+        format!("{}#{}", notice.run_id, notice.revision)
+    }
+}
+
 /// How to answer, appended to every notice.
-fn reply_instructions(run_id: &str) -> String {
+fn reply_instructions(reference: &str, run_id: &str) -> String {
     format!(
-        "Reply `approve {run_id}` or `deny {run_id}` here, or use \
+        "Reply `approve {reference}` or `deny {reference}` here, or use \
          `zeroclaw sop approve|deny {run_id}`."
     )
 }
 
-/// Render the approval-request notice body: WHAT is being approved (the step's
-/// authored `- prompt:` rendered over the gate context, or an automatic context
-/// summary) plus how to answer. The `approve <run_id>` text reply resolves the
-/// gate via the orchestrator's gate intercept; CLI / gateway keep working.
-fn render_notice(notice: &GateNotice<'_>) -> String {
+/// The notice's CONTEXT body — the header plus WHAT is being approved (the
+/// step's authored `- prompt:` rendered over the gate context, or an automatic
+/// context summary), WITHOUT the how-to-answer instructions. This is also what
+/// a finalized prompt keeps showing (the outcome line appended under it), so
+/// the record of what was approved survives resolution in place.
+fn render_context(notice: &GateNotice<'_>) -> String {
     let what = match notice.gate_prompt {
         // The `- prompt:` bullet is a single line; a literal `\n` in it is the
         // author's line break.
@@ -153,41 +166,107 @@ fn render_notice(notice: &GateNotice<'_>) -> String {
         None => summarize_context(notice.context),
     };
     let (run_id, sop_name, step) = (notice.run_id, notice.sop_name, notice.step);
-    let header = format!("SOP approval needed: '{sop_name}' run `{run_id}` (step {step}).");
-    let instructions = reply_instructions(run_id);
-    if what.trim().is_empty() {
-        format!("{header}\n\n{instructions}")
+    let header = if notice.revision == 0 {
+        format!("SOP approval needed: '{sop_name}' run `{run_id}` (step {step}).")
     } else {
-        format!("{header}\n\n{what}\n\n{instructions}")
+        format!(
+            "SOP approval needed: '{sop_name}' run `{run_id}` (step {step}, revision {}).",
+            notice.revision
+        )
+    };
+    if what.trim().is_empty() {
+        header
+    } else {
+        format!("{header}\n\n{what}")
     }
+}
+
+/// Render the approval-request notice body: the context plus how to answer.
+/// The `approve <reference>` text reply resolves the gate via the
+/// orchestrator's gate intercept; CLI / gateway keep working.
+fn render_notice(notice: &GateNotice<'_>) -> String {
+    let context = render_context(notice);
+    let instructions = reply_instructions(&gate_reference(notice), notice.run_id);
+    format!("{context}\n\n{instructions}")
 }
 
 /// Build the native gate prompt for channels that render one (buttons /
 /// keyboards). The description carries the text-reply form too, so a screenshot
-/// or forward of the prompt is still actionable.
+/// or forward of the prompt is still actionable. Edit/Revise are input-bearing
+/// choices: channels with a native form (Discord modal) render them; channels
+/// without simply omit them, and approve/deny stay universally answerable.
 fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelGatePrompt {
-    use zeroclaw_api::channel::{ChannelGatePrompt, GateChoice, GateChoiceEmphasis};
+    use zeroclaw_api::channel::{
+        ChannelGatePrompt, GateChoice, GateChoiceEmphasis, GateChoiceInput,
+    };
     // Discord embeds cap descriptions at 4096 chars; stay comfortably under.
     let mut description = render_notice(notice);
     if description.chars().count() > 3500 {
         description = description.chars().take(3500).collect::<String>() + "\u{2026}";
     }
+    let mut choices = vec![GateChoice {
+        id: "approve".to_string(),
+        label: "Approve".to_string(),
+        emphasis: GateChoiceEmphasis::Positive,
+        input: None,
+    }];
+    if let Some(field) = notice.edit_field {
+        // Pre-fill with the editable field's current value so the operator
+        // starts from the draft, not a blank box.
+        let prefill = notice
+            .context
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // A value over Discord's 4000-char text-input cap would be silently
+        // truncated into the form and the TRUNCATED text posted as approved —
+        // withhold Edit instead (Revise/deny remain; the operator can also
+        // resolve out-of-band).
+        let oversize = prefill.as_ref().is_some_and(|p| p.chars().count() > 4000);
+        if !oversize {
+            choices.push(GateChoice {
+                id: "edit".to_string(),
+                label: "Edit".to_string(),
+                emphasis: GateChoiceEmphasis::Neutral,
+                input: Some(GateChoiceInput {
+                    label: format!("Edited {field} (posted as approved)"),
+                    prefill,
+                }),
+            });
+        }
+    }
+    if notice.can_revise {
+        choices.push(GateChoice {
+            id: "revise".to_string(),
+            label: "Revise".to_string(),
+            emphasis: GateChoiceEmphasis::Neutral,
+            input: Some(GateChoiceInput {
+                label: "Guidance for the re-draft".to_string(),
+                prefill: None,
+            }),
+        });
+    }
+    choices.push(GateChoice {
+        id: "deny".to_string(),
+        label: "Deny".to_string(),
+        emphasis: GateChoiceEmphasis::Negative,
+        input: None,
+    });
+    // What a RESOLVED prompt keeps showing: the context without the (no longer
+    // actionable) reply instructions; the channel appends the outcome line.
+    // Capped a little tighter than the live description so the appended
+    // outcome still fits Discord's 4096-char embed limit.
+    let mut resolved_description = render_context(notice);
+    if resolved_description.chars().count() > 3400 {
+        resolved_description =
+            resolved_description.chars().take(3400).collect::<String>() + "\u{2026}";
+    }
     ChannelGatePrompt {
         title: format!("SOP approval needed: {}", notice.sop_name),
         description,
-        reference: notice.run_id.to_string(),
-        choices: vec![
-            GateChoice {
-                id: "approve".to_string(),
-                label: "Approve".to_string(),
-                emphasis: GateChoiceEmphasis::Positive,
-            },
-            GateChoice {
-                id: "deny".to_string(),
-                label: "Deny".to_string(),
-                emphasis: GateChoiceEmphasis::Negative,
-            },
-        ],
+        reference: gate_reference(notice),
+        choices,
+        resolved_description: Some(resolved_description),
     }
 }
 
@@ -289,6 +368,9 @@ mod tests {
             step: 1,
             context: &ctx,
             gate_prompt: Some("Review {{repo}}#{{number}} please"),
+            revision: 0,
+            edit_field: None,
+            can_revise: false,
         };
         let text = render_notice(&authored);
         assert!(text.contains("Review o/r#9 please"));
@@ -308,6 +390,75 @@ mod tests {
             "auto summary carries the body: {text}"
         );
     }
+    #[test]
+    fn gate_prompt_offers_edit_and_revise_with_prefill_and_versioned_reference() {
+        let ctx = serde_json::json!({"body": "the model draft", "repo": "o/r"});
+        let notice = GateNotice {
+            run_id: "run-42",
+            sop_name: "triage",
+            step: 3,
+            context: &ctx,
+            gate_prompt: None,
+            revision: 0,
+            edit_field: Some("body"),
+            can_revise: true,
+        };
+        let prompt = build_gate_prompt(&notice);
+        assert_eq!(
+            prompt.reference, "run-42",
+            "revision 0 keeps a bare reference"
+        );
+        let ids: Vec<&str> = prompt.choices.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["approve", "edit", "revise", "deny"]);
+        let edit = prompt.choices.iter().find(|c| c.id == "edit").unwrap();
+        assert_eq!(
+            edit.input.as_ref().unwrap().prefill.as_deref(),
+            Some("the model draft"),
+            "edit pre-fills from the declared field"
+        );
+        let revise = prompt.choices.iter().find(|c| c.id == "revise").unwrap();
+        assert!(revise.input.as_ref().unwrap().prefill.is_none());
+        assert!(prompt.choices[0].input.is_none(), "approve stays plain");
+
+        // Revision > 0: the reference (and the text-reply instructions) carry it,
+        // so an answer on the superseded prompt can never resolve this one.
+        let revised = GateNotice {
+            revision: 2,
+            ..notice
+        };
+        let prompt = build_gate_prompt(&revised);
+        assert_eq!(prompt.reference, "run-42#2");
+        assert!(
+            prompt.description.contains("approve run-42#2"),
+            "text-reply instructions must name the versioned reference: {}",
+            prompt.description
+        );
+        // The resolved body keeps WHAT was approved but drops the (no longer
+        // actionable) reply instructions — the channel appends the outcome.
+        let resolved = prompt.resolved_description.as_deref().unwrap();
+        assert!(
+            resolved.contains("the model draft"),
+            "resolved body keeps the context: {resolved}"
+        );
+        assert!(
+            !resolved.contains("Reply `approve"),
+            "resolved body must not re-show the reply instructions: {resolved}"
+        );
+
+        // No edit declaration, no revisable predecessor → plain approve/deny.
+        let plain = GateNotice {
+            edit_field: None,
+            can_revise: false,
+            ..notice
+        };
+        let ids: Vec<String> = build_gate_prompt(&plain)
+            .choices
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(ids, ["approve", "deny"]);
+    }
+
     use async_trait::async_trait;
     use std::sync::Mutex;
     use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
@@ -345,6 +496,9 @@ mod tests {
                 step: 3,
                 context: &serde_json::Value::Null,
                 gate_prompt: None,
+                revision: 0,
+                edit_field: None,
+                can_revise: false,
             },
         )
         .unwrap();
@@ -367,6 +521,9 @@ mod tests {
                     step: 1,
                     context: &serde_json::Value::Null,
                     gate_prompt: None,
+                    revision: 0,
+                    edit_field: None,
+                    can_revise: false,
                 }
             )
             .is_err()
@@ -423,6 +580,9 @@ mod tests {
                     step: 3,
                     context: &serde_json::Value::Null,
                     gate_prompt: None,
+                    revision: 0,
+                    edit_field: None,
+                    can_revise: false,
                 },
             )
             .expect("a registered channel delivers");
@@ -455,6 +615,9 @@ mod tests {
                     step: 3,
                     context: &serde_json::Value::Null,
                     gate_prompt: None,
+                    revision: 0,
+                    edit_field: None,
+                    can_revise: false,
                 },
             )
             .expect_err("an unregistered channel is a real misconfiguration");
@@ -474,6 +637,9 @@ mod tests {
                         step: 3,
                         context: &serde_json::Value::Null,
                         gate_prompt: None,
+                        revision: 0,
+                        edit_field: None,
+                        can_revise: false,
                     },
                 )
                 .is_err(),
