@@ -31,6 +31,7 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    timeout_secs: u64,
 }
 
 #[cfg(test)]
@@ -259,12 +260,19 @@ impl AnthropicModelProvider {
                 .map(ToString::to_string),
             base_url,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            timeout_secs: 120,
         }
     }
 
     /// Override the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
         self
     }
 
@@ -842,7 +850,7 @@ impl AnthropicModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.anthropic",
-            120,
+            self.timeout_secs,
             10,
         )
     }
