@@ -337,6 +337,25 @@ export default function SopCanvas({
   const flowRoleDesc = useMemo(() => indexLegend(legend?.flow_roles), [legend]);
   const runStateDesc = useMemo(() => indexLegend(legend?.run_states), [legend]);
 
+  // Abandon an in-progress wire draw (flow or data) and clear the ghost line.
+  const cancelLink = useCallback(() => {
+    setLinkFrom(null);
+    setDataLink(null);
+    setCursor(null);
+  }, []);
+
+  // Escape cancels a wire currently being drawn.
+  useEffect(() => {
+    if (linkFrom === null && dataLink === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      cancelLink();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [linkFrom, dataLink, cancelLink]);
+
   const handleTitle = useCallback(
     (actionKey: string, role: FlowRole): string => {
       const desc = flowRoleDesc.get(role);
@@ -513,15 +532,13 @@ export default function SopCanvas({
         </div>
       )}
       <CanvasLegend legend={legend} />
-      {linkFrom !== null ? (
+      {linkFrom !== null || dataLink !== null ? (
         <div className="absolute left-2 top-2 z-10 rounded bg-pc-elevated px-2 py-1 text-xs text-pc-text">
-          {t('sops.linking')}: {linkKind}. {t('sops.link_hint')}
+          {t('sops.linking')}: {dataLink !== null ? t('sops.wire_kind_data') : linkKind}.{' '}
+          {t('sops.link_hint')}
           <button
             type="button"
-            onClick={() => {
-              setLinkFrom(null);
-              setCursor(null);
-            }}
+            onClick={cancelLink}
             className="ml-2 text-pc-text-muted underline"
           >
             {t('sops.cancel')}

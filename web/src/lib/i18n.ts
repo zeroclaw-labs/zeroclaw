@@ -1063,7 +1063,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.undo': 'Undo',
     'sops.undo_hint': 'Undo the last canvas edit (Ctrl+Z)',
     'sops.linking': 'Linking',
-    'sops.link_hint': 'click a target node',
+    'sops.link_hint': 'click a target node, or press Esc to cancel',
     'sops.untitled': 'untitled',
     'sops.checkpoint': 'checkpoint',
     'sops.no_tools': 'no tools',
