@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
 import MarkdownEditor from '@/components/MarkdownEditor';
@@ -23,7 +23,6 @@ import {
   graphDraft,
   triggerSources,
   sopFieldHelp,
-  overlayStateByStep,
   overlayCallsByStep,
   parseCondition,
   buildCondition,
@@ -1336,9 +1335,8 @@ function StepInspector({
 const noop = () => {};
 
 /// Build a Manual-run payload skeleton from a SOP's step-1 input JSON Schema.
-/// Registry-driven: the example keys and placeholder value shapes come from the
-/// SOP's own declared `schema.input`, never a hardcoded per-SOP template. Falls
-/// back to an empty object when step 1 declares no input properties.
+/// Registry-driven: keys and placeholder value shapes come from the SOP's own
+/// declared `schema.input`, never a hardcoded per-SOP template.
 function payloadSkeleton(sop: Sop | null): string {
   const input = sop?.steps?.find((s) => s.number === 1)?.schema?.input;
   const props =
@@ -1373,33 +1371,315 @@ function placeholderForType(type: string | undefined): unknown {
   }
 }
 
-export default function Sops() {
+/// Manual-run affordance for a SOP that declares a manual trigger. Fires
+/// POST /api/sops/{name}/run and navigates to the run detail page so the
+/// existing overlay route animates the run.
+function ManualRunPanel({ name, sop }: { name: string; sop: Sop | null }) {
+  const navigate = useNavigate();
+  const [payload, setPayload] = useState('');
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+
+  const hasManualTrigger = useMemo(
+    () => (sop?.triggers ?? []).some((tr) => tr.type === 'manual'),
+    [sop],
+  );
+
+  useEffect(() => {
+    if (!hasManualTrigger) {
+      setPayload('');
+      return;
+    }
+    setPayload((cur) => (cur.trim() ? cur : payloadSkeleton(sop)));
+  }, [hasManualTrigger, sop]);
+
+  const onRun = useCallback(() => {
+    const trimmed = payload.trim();
+    if (trimmed) {
+      try {
+        JSON.parse(trimmed);
+      } catch {
+        setRunError(`${t('sops.run_error')}: invalid JSON`);
+        return;
+      }
+    }
+    setRunning(true);
+    setRunError(null);
+    runSop(name, trimmed || undefined)
+      .then(({ run_id }) =>
+        navigate(`/runs/${encodeURIComponent(name)}/${encodeURIComponent(run_id)}`),
+      )
+      .catch((e: unknown) => setRunError(`${t('sops.run_error')}: ${String(e)}`))
+      .finally(() => setRunning(false));
+  }, [name, payload, navigate]);
+
+  if (!hasManualTrigger) return null;
+
+  return (
+    <Card className="space-y-2">
+      <textarea
+        value={payload}
+        onChange={(e) => setPayload(e.target.value)}
+        placeholder={t('sops.run_payload_placeholder')}
+        rows={4}
+        className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 font-mono text-xs text-pc-text"
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={onRun}
+          disabled={running}
+          className="inline-flex items-center gap-1 rounded border border-pc-border bg-pc-accent px-3 py-1 text-sm font-medium text-[#0b1220] hover:opacity-90 disabled:opacity-40"
+        >
+          {running ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : null}
+          {t('sops.run')}
+        </button>
+        {runError ? <span className="text-xs text-status-error">{runError}</span> : null}
+      </div>
+    </Card>
+  );
+}
+
+// ── /sops ── read-only collection navigator. No selection, graph, overlay, or
+// mutation lives here; rows link to the addressable member view. Create is an
+// addressable action (/sops/new), not inline state.
+export function SopsList() {
   const [sops, setSops] = useState<SopSummary[]>([]);
-  const [selected, setSelected] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    listSops()
+      .then((list) => {
+        if (active) setSops(list);
+      })
+      .catch((e: unknown) => {
+        if (active) setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <div className="p-6 space-y-6 animate-fade-in">
+      <PageHeader
+        title={t('sops.title')}
+        description={t('sops.subtitle')}
+        actions={
+          <Link
+            to="/sops/new"
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-[#0b1220] hover:bg-pc-accent-light"
+          >
+            <Plus className="h-4 w-4" aria-hidden /> {t('sops.new')}
+          </Link>
+        }
+      />
+      {error ? (
+        <Card>
+          <div className="text-status-error">{error}</div>
+        </Card>
+      ) : loading ? (
+        <Card>
+          <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
+        </Card>
+      ) : sops.length === 0 ? (
+        <Card>
+          <div className="text-pc-text-muted">{t('sops.empty')}</div>
+        </Card>
+      ) : (
+        <Card className="p-2">
+          <ul className="space-y-1">
+            {sops.map((s) => (
+              <li key={s.name}>
+                <Link
+                  to={`/sops/${encodeURIComponent(s.name)}`}
+                  className="block rounded px-3 py-2 text-sm text-pc-text hover:bg-pc-elevated"
+                >
+                  <div className="font-medium">{s.name}</div>
+                  {s.description ? (
+                    <div className="truncate text-xs text-pc-text-muted">{s.description}</div>
+                  ) : null}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ── /sops/:name ── read-only member representation. Renders the SOP graph via
+// the same graph/get RPC the editor loads from, with no run-overlay tint: run
+// progress belongs to /runs, not the SOP resource. Edit and Delete are
+// addressable member actions, never inline editing.
+export function SopView() {
+  const { name = '' } = useParams();
+  const navigate = useNavigate();
   const [graph, setGraph] = useState<SopGraph | null>(null);
   const [viewSop, setViewSop] = useState<Sop | null>(null);
   const [loading, setLoading] = useState(true);
-  const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
+
+  useEffect(() => {
+    if (!name) return;
+    let active = true;
+    setLoading(true);
+    Promise.all([getSopGraph(name), getSop(name)])
+      .then(([g, full]) => {
+        if (!active) return;
+        setGraph(g);
+        setViewSop(full);
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setGraph(null);
+        setViewSop(null);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [name]);
+
+  const onDelete = useCallback(() => {
+    deleteSop(name)
+      .then(() => navigate('/sops'))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+  }, [name, navigate]);
+
+  return (
+    <div className="p-6 space-y-6 animate-fade-in">
+      <PageHeader
+        title={name}
+        description={viewSop?.description || t('sops.subtitle')}
+        actions={
+          <Link to="/sops" className="text-sm text-pc-accent hover:underline">
+            {t('sops.back_to_list')}
+          </Link>
+        }
+      />
+      {error ? (
+        <Card>
+          <div className="text-status-error">{error}</div>
+        </Card>
+      ) : null}
+      <ManualRunPanel name={name} sop={viewSop} />
+      <div>
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          {graph ? (
+            <Badge tone="neutral">
+              {graph.nodes.length} {t('sops.steps')}
+            </Badge>
+          ) : null}
+          <div className="ml-auto flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setLayer((l) => (l === 'visual' ? 'fields' : 'visual'))}
+              disabled={!graph}
+              className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
+            >
+              {layer === 'visual' ? t('sops.layer_fields') : t('sops.layer_visual')}
+            </button>
+            <Link
+              to={`/sops/${encodeURIComponent(name)}/edit`}
+              className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated"
+            >
+              {t('sops.edit')}
+            </Link>
+            <button
+              type="button"
+              onClick={onDelete}
+              className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-status-error hover:bg-pc-elevated"
+            >
+              <Trash2 className="h-4 w-4" aria-hidden /> {t('sops.delete')}
+            </button>
+          </div>
+        </div>
+        {loading ? (
+          <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
+        ) : graph ? (
+          <>
+            {layer === 'visual' && viewSop ? (
+              <SopCanvas
+                draft={viewSop}
+                graph={graph}
+                selectedStep={null}
+                readOnly
+                onSelectStep={noop}
+                onSelectTrigger={noop}
+                onAddStep={noop}
+                onConnect={noop}
+                onDisconnect={noop}
+                onConnectData={noop}
+                onDisconnectData={noop}
+              />
+            ) : (
+              <SopStepList graph={graph} />
+            )}
+            <DiagnosticsPanel graph={graph} />
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+// ── /sops/new and /sops/:name/edit ── the authoring surface. The draft is the
+// single source of edit state; graph projection comes from graphDraft/wireDraft
+// (never re-derived client-side). Captured-calls overlay is loaded from the
+// SOP's latest run to feed the pin-from-run flow in the step inspector.
+export function SopEditor() {
+  const { name: routeName } = useParams();
+  const editingRoute = routeName ?? null;
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const [runPayload, setRunPayload] = useState('');
-  const [running, setRunning] = useState(false);
-  const [runError, setRunError] = useState<string | null>(null);
+
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
   const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
   const [selectedTrigger, setSelectedTrigger] = useState<number | null>(null);
   const [triggerRegistry, setTriggerRegistry] = useState<TriggerSourceRegistry | null>(null);
   const [agentAliases, setAgentAliases] = useState<string[]>([]);
+  const [latestOverlay, setLatestOverlay] = useState<RunOverlay | null>(null);
 
-  // Mirror the in-progress draft to session storage so navigating away (e.g. to
-  // channel setup for an unconfigured trigger) and back does not lose it, and
-  // warn on a full tab close/reload while a draft is open.
+  // Load the draft the route addresses: an existing SOP by name for edit, or a
+  // blank draft for new. A session-mirrored draft under the same identity wins
+  // so navigating away (e.g. to configure a trigger channel) and back is lossless.
+  useEffect(() => {
+    let active = true;
+    if (editingRoute === null) {
+      setDraft((cur) => (cur && editingName === null ? cur : blankSop('')));
+      setEditingName(null);
+      return;
+    }
+    if (draft && editingName === editingRoute) return;
+    getSop(editingRoute)
+      .then((full) => {
+        if (!active) return;
+        setEditingName(full.name);
+        setDraft(full);
+      })
+      .catch((e: unknown) => {
+        if (active) setSaveError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingRoute]);
+
   useEffect(() => {
     storeDraft(draft);
     if (!draft) return;
@@ -1421,10 +1701,7 @@ export default function Sops() {
       .then((reg) => {
         if (active) setTriggerRegistry(reg);
       })
-      .catch(() => {
-        // Registry is best-effort: the editor still renders bound sources it
-        // knows about and simply omits channel aliases if the fetch failed.
-      });
+      .catch(() => {});
     return () => {
       active = false;
     };
@@ -1436,30 +1713,47 @@ export default function Sops() {
       .then((list) => {
         if (active) setAgentAliases(list.map((a) => a.alias));
       })
-      .catch(() => {
-        // Agent list is best-effort: the selector falls back to free-typed
-        // aliases if the fetch failed.
-      });
+      .catch(() => {});
     return () => {
       active = false;
     };
   }, []);
 
-  const onConnect = useCallback(
-    (from: number, to: number, kind: WireRole, portIndex?: number) => {
-      setDraft((d) => {
-        if (!d) return d;
-        wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
-          .then((res) => {
-            setDraft(res.sop);
-            setDraftGraph(res.graph);
-          })
-          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
-        return d;
-      });
-    },
-    [],
-  );
+  // Captured-calls overlay from the SOP's latest run, one-shot. Feeds the step
+  // inspector's pin-from-run flow only; live run watching is the run page's job.
+  useEffect(() => {
+    setLatestOverlay(null);
+    if (editingRoute === null) return;
+    let active = true;
+    listRuns(editingRoute)
+      .then((runs) => {
+        const latest = runs.sort((a, b) => b.started_at.localeCompare(a.started_at))[0];
+        if (!latest) return null;
+        return getRunOverlay(editingRoute, latest.run_id);
+      })
+      .then((o) => {
+        if (active && o) setLatestOverlay(o);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [editingRoute]);
+
+  const runCallsByStep = useMemo(() => overlayCallsByStep(latestOverlay), [latestOverlay]);
+
+  const onConnect = useCallback((from: number, to: number, kind: WireRole, portIndex?: number) => {
+    setDraft((d) => {
+      if (!d) return d;
+      wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
+        .then((res) => {
+          setDraft(res.sop);
+          setDraftGraph(res.graph);
+        })
+        .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+      return d;
+    });
+  }, []);
 
   const onDisconnect = useCallback(
     (from: number, to: number, kind: WireRole, portIndex?: number) => {
@@ -1495,26 +1789,20 @@ export default function Sops() {
     [],
   );
 
-  const onDisconnectData = useCallback(
-    (toStep: number, toPin: string) => {
-      setDraft((d) => {
-        if (!d) return d;
-        const next = writeStepBinding(d, toStep, toPin, null);
-        graphDraft(next)
-          .then((g) => {
-            setDraft(next);
-            setDraftGraph(g);
-          })
-          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
-        return next;
-      });
-    },
-    [],
-  );
+  const onDisconnectData = useCallback((toStep: number, toPin: string) => {
+    setDraft((d) => {
+      if (!d) return d;
+      const next = writeStepBinding(d, toStep, toPin, null);
+      graphDraft(next)
+        .then((g) => {
+          setDraft(next);
+          setDraftGraph(g);
+        })
+        .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+      return next;
+    });
+  }, []);
 
-  // Reproject the draft graph from the backend whenever the draft changes so
-  // the canvas reflects trigger fan-in, data wires, pins, and layout without
-  // re-deriving graph shape client-side. Single source: `graphDraft`.
   useEffect(() => {
     if (!draft) {
       setDraftGraph(null);
@@ -1533,202 +1821,6 @@ export default function Sops() {
     };
   }, [draft]);
 
-  const refreshList = useCallback((selectName?: string) => {
-    return listSops()
-      .then((list) => {
-        setSops(list);
-        if (selectName) setSelected(selectName);
-        else if (list.length > 0 && !list.some((s) => s.name === selectName)) {
-          setSelected(list[0]?.name ?? '');
-        }
-        return list;
-      })
-      .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : String(e));
-        return [];
-      });
-  }, []);
-
-  const startNew = useCallback(() => {
-    setSaveError(null);
-    setEditingName(null);
-    setDraft(blankSop(''));
-  }, []);
-
-  const startEdit = useCallback(() => {
-    if (!selected) return;
-    setSaveError(null);
-    getSop(selected)
-      .then((full) => {
-        setEditingName(full.name);
-        setDraft(full);
-      })
-      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
-  }, [selected]);
-
-  const onSaveDraft = useCallback(() => {
-    if (!draft) return;
-    setSaving(true);
-    setSaveError(null);
-    // Name authority, three cases:
-    //   - new draft (no editing name): create, 409 if the name already exists,
-    //     so a new SOP can never silently overwrite an existing one.
-    //   - edit under the same name: upsert via PUT (never 409s on itself).
-    //   - rename (name diverged from the editing name): rejected. A rename is
-    //     not a save; it must be an explicit operation so it cannot fork or
-    //     clobber an unrelated SOP through a swallowed delete.
-    const isNew = editingName === null;
-    if (!isNew && draft.name !== editingName) {
-      setSaving(false);
-      setSaveError(
-        `rename not supported: '${editingName}' cannot be saved as '${draft.name}'`,
-      );
-      return;
-    }
-    const write = isNew ? createSop(draft) : saveSop(draft);
-    write
-      .then(() => {
-        setSaving(false);
-        setDraft(null);
-        setEditingName(null);
-        return refreshList(draft.name);
-      })
-      .catch((e: unknown) => {
-        setSaving(false);
-        setSaveError(e instanceof Error ? e.message : String(e));
-      });
-  }, [draft, editingName, refreshList]);
-
-  const onDeleteSelected = useCallback(() => {
-    if (!selected) return;
-    deleteSop(selected)
-      .then(() => refreshList())
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, [selected, refreshList]);
-
-  useEffect(() => {
-    let active = true;
-    const deepSop = searchParams.get('sop');
-    const deepRun = searchParams.get('run');
-    // Legacy deep link: a ?run= now lives on the run detail page.
-    if (deepSop && deepRun) {
-      navigate(
-        `/runs/${encodeURIComponent(deepSop)}/${encodeURIComponent(deepRun)}`,
-        { replace: true },
-      );
-      return;
-    }
-    listSops()
-      .then((list) => {
-        if (!active) return;
-        setSops(list);
-        const target = deepSop && list.some((s) => s.name === deepSop) ? deepSop : list[0]?.name;
-        if (target) setSelected(target);
-        setLoading(false);
-      })
-      .catch((e: unknown) => {
-        if (!active) return;
-        setError(e instanceof Error ? e.message : String(e));
-        setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const loadGraph = useCallback((name: string) => {
-    if (!name) return;
-    setGraphLoading(true);
-    Promise.all([getSopGraph(name), getSop(name)])
-      .then(([g, full]) => {
-        setGraph(g);
-        setViewSop(full);
-        setGraphLoading(false);
-      })
-      .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : String(e));
-        setGraph(null);
-        setViewSop(null);
-        setGraphLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    if (selected) loadGraph(selected);
-  }, [selected, loadGraph]);
-
-  // Latest-run tint for the read-only canvas and captured calls for the
-  // editor's pin-from-run flow. Single-sourced: latest run comes from the
-  // same runs listing the Runs page uses, projected through the same overlay
-  // endpoint the run detail page polls. One-shot per selection; live watching
-  // is the run detail page's job.
-  const [latestOverlay, setLatestOverlay] = useState<RunOverlay | null>(null);
-  useEffect(() => {
-    setLatestOverlay(null);
-    if (!selected) return;
-    let active = true;
-    listRuns(selected)
-      .then((runs) => {
-        const latest = runs.sort((a, b) => b.started_at.localeCompare(a.started_at))[0];
-        if (!latest) return null;
-        return getRunOverlay(selected, latest.run_id);
-      })
-      .then((o) => {
-        if (active && o) setLatestOverlay(o);
-      })
-      .catch(() => {
-        // Overlay is decoration on this page; absence just renders untinted.
-      });
-    return () => {
-      active = false;
-    };
-  }, [selected]);
-
-  const runStateByStep = useMemo(() => overlayStateByStep(latestOverlay), [latestOverlay]);
-  const runCallsByStep = useMemo(() => overlayCallsByStep(latestOverlay), [latestOverlay]);
-
-  // A Manual run is only offered when the SOP actually declares a manual
-  // trigger; the payload field and prefill key off this, never a per-SOP check.
-  const hasManualTrigger = useMemo(
-    () => (viewSop?.triggers ?? []).some((tr) => tr.type === 'manual'),
-    [viewSop],
-  );
-
-  // Seed the payload textarea from the SOP's own step-1 input schema so the
-  // example is registry-driven, not hardcoded per SOP. Only runs when the SOP
-  // is manual-triggerable and the user has not already typed a payload.
-  useEffect(() => {
-    if (!hasManualTrigger) {
-      setRunPayload('');
-      return;
-    }
-    setRunPayload((cur) => (cur.trim() ? cur : payloadSkeleton(viewSop)));
-  }, [hasManualTrigger, viewSop]);
-
-  const onRunSop = useCallback(() => {
-    if (!selected) return;
-    const payload = runPayload.trim();
-    if (payload) {
-      try {
-        JSON.parse(payload);
-      } catch {
-        setRunError(t('sops.run_error') + ': invalid JSON');
-        return;
-      }
-    }
-    setRunning(true);
-    setRunError(null);
-    runSop(selected, payload || undefined)
-      .then(({ run_id }) => {
-        navigate(`/runs/${encodeURIComponent(selected)}/${encodeURIComponent(run_id)}`);
-      })
-      .catch((e) => setRunError(`${t('sops.run_error')}: ${String(e)}`))
-      .finally(() => setRunning(false));
-  }, [selected, runPayload, navigate]);
-
-  // Keep the inspector pointed at a real step: select the first step when a
-  // draft opens and drop the selection when its step is removed.
   useEffect(() => {
     if (!draft) {
       setSelectedStep(null);
@@ -1745,6 +1837,40 @@ export default function Sops() {
     setSaveError(null);
     setDraft((d) => (d ? updater(d) : d));
   }, []);
+
+  const close = useCallback(
+    (toName?: string) => {
+      setDraft(null);
+      setEditingName(null);
+      navigate(toName ? `/sops/${encodeURIComponent(toName)}` : '/sops');
+    },
+    [navigate],
+  );
+
+  const onSaveDraft = useCallback(() => {
+    if (!draft) return;
+    setSaving(true);
+    setSaveError(null);
+    // Name authority, three cases:
+    //   - new draft (no editing name): create, 409 if the name already exists,
+    //     so a new SOP can never silently overwrite an existing one.
+    //   - edit under the same name: upsert via PUT (never 409s on itself).
+    //   - rename (name diverged from the editing name): rejected. A rename is
+    //     not a save; it must be an explicit operation so it cannot fork or
+    //     clobber an unrelated SOP through a swallowed delete.
+    const isNew = editingName === null;
+    if (!isNew && draft.name !== editingName) {
+      setSaving(false);
+      setSaveError(`rename not supported: '${editingName}' cannot be saved as '${draft.name}'`);
+      return;
+    }
+    const write = isNew ? createSop(draft) : saveSop(draft);
+    const savedName = draft.name;
+    write
+      .then(() => close(savedName))
+      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSaving(false));
+  }, [draft, editingName, close]);
 
   const editorHandlers = draft
     ? {
@@ -1786,211 +1912,70 @@ export default function Sops() {
       }
     : null;
 
-  return (
-    <div className="p-6 space-y-6 animate-fade-in">
-      <PageHeader
-        title={t('sops.title')}
-        description={t('sops.subtitle')}
-        actions={
-          !draft ? (
-            <button
-              type="button"
-              onClick={startNew}
-              className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-[#0b1220] hover:bg-pc-accent-light"
-            >
-              <Plus className="h-4 w-4" aria-hidden /> {t('sops.new')}
-            </button>
-          ) : null
-        }
-      />
-      {error ? (
-        <Card>
-          <div className="text-status-error">{error}</div>
-        </Card>
-      ) : null}
-      {draft && editorHandlers ? (
-        <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
-          <DraftSidebar
-            draft={draft}
-            saving={saving}
-            saveError={saveError}
-            selectedStep={selectedStep}
-            selectedTrigger={selectedTrigger}
-            triggerRegistry={triggerRegistry}
-            agentAliases={agentAliases}
-            onSelectStep={setSelectedStep}
-            onField={editorHandlers.onField}
-            onTrigger={editorHandlers.onTrigger}
-            onAddTrigger={editorHandlers.onAddTrigger}
-            onRemoveTrigger={editorHandlers.onRemoveTrigger}
-            onAddStep={editorHandlers.onAddStep}
-            onRemoveStep={editorHandlers.onRemoveStep}
-            onMoveStep={editorHandlers.onMoveStep}
-            onSave={onSaveDraft}
-            onCancel={() => {
-              setDraft(null);
-              setEditingName(null);
-            }}
-          />
-          <div className="min-w-0 space-y-4">
-            <StepInspector
-              draft={draft}
-              selectedStep={selectedStep}
-              runCallsByStep={runCallsByStep}
-              agentAliases={agentAliases}
-              onStep={editorHandlers.onStep}
-              onRemoveStep={editorHandlers.onRemoveStep}
-              onMoveStep={editorHandlers.onMoveStep}
-            />
-            {draftGraph ? (
-              <SopCanvas
-                draft={draft}
-                graph={draftGraph}
-                selectedStep={selectedStep}
-                runStateByStep={runStateByStep}
-                onSelectStep={setSelectedStep}
-                onSelectTrigger={setSelectedTrigger}
-                onAddStep={editorHandlers.onAddStep}
-                onRemoveStep={(n) => {
-                  const i = draft.steps.findIndex((s) => s.number === n);
-                  if (i >= 0) editorHandlers.onRemoveStep(i);
-                }}
-                onConnect={onConnect}
-                onDisconnect={onDisconnect}
-                onConnectData={onConnectData}
-                onDisconnectData={onDisconnectData}
-                onMoveNode={editorHandlers.onMoveNode}
-              />
-            ) : null}
-          </div>
-        </div>
-      ) : loading ? (
+  if (!draft || !editorHandlers) {
+    return (
+      <div className="p-6">
         <Card>
           <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
         </Card>
-      ) : sops.length === 0 ? (
-        <Card>
-          <div className="text-pc-text-muted">{t('sops.empty')}</div>
-        </Card>
-      ) : (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[14rem_minmax(0,1fr)]">
-          <Card className="h-fit p-2">
-            <ul className="space-y-1">
-              {sops.map((s) => (
-                <li key={s.name}>
-                  <button
-                    type="button"
-                    onClick={() => setSelected(s.name)}
-                    className={`w-full rounded px-2 py-1.5 text-left text-sm ${
-                      s.name === selected
-                        ? 'bg-pc-accent text-[#0b1220]'
-                        : 'text-pc-text hover:bg-pc-elevated'
-                    }`}
-                  >
-                    <div className="font-medium">{s.name}</div>
-                    {s.description ? (
-                      <div
-                        className={`truncate text-xs ${
-                          s.name === selected ? 'text-[#0b1220]/70' : 'text-pc-text-muted'
-                        }`}
-                      >
-                        {s.description}
-                      </div>
-                    ) : null}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </Card>
-          <div>
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              <span className="font-medium text-pc-text">{selected}</span>
-              {graph ? (
-                <Badge tone="neutral">
-                  {graph.nodes.length} {t('sops.steps')}
-                </Badge>
-              ) : null}
-              <div className="ml-auto flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => setLayer((l) => (l === 'visual' ? 'fields' : 'visual'))}
-                  disabled={!graph}
-                  className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
-                >
-                  {layer === 'visual' ? t('sops.layer_fields') : t('sops.layer_visual')}
-                </button>
-                <button
-                  type="button"
-                  onClick={startEdit}
-                  disabled={!graph}
-                  className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
-                >
-                  {t('sops.edit')}
-                </button>
-                <button
-                  type="button"
-                  onClick={onDeleteSelected}
-                  className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-status-error hover:bg-pc-elevated"
-                >
-                  <Trash2 className="h-4 w-4" aria-hidden /> {t('sops.delete')}
-                </button>
-              </div>
-            </div>
-            {hasManualTrigger ? (
-              <div className="mb-3 space-y-2">
-                <textarea
-                  value={runPayload}
-                  onChange={(e) => setRunPayload(e.target.value)}
-                  placeholder={t('sops.run_payload_placeholder')}
-                  rows={4}
-                  className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 font-mono text-xs text-pc-text"
-                />
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={onRunSop}
-                    disabled={running}
-                    className="inline-flex items-center gap-1 rounded border border-pc-border bg-pc-accent px-3 py-1 text-sm font-medium text-[#0b1220] hover:opacity-90 disabled:opacity-40"
-                  >
-                    {running ? (
-                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                    ) : null}
-                    {t('sops.run')}
-                  </button>
-                  {runError ? (
-                    <span className="text-xs text-status-error">{runError}</span>
-                  ) : null}
-                </div>
-              </div>
-            ) : null}
-            {graphLoading ? (
-              <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
-            ) : graph ? (
-              <>
-                {layer === 'visual' && viewSop ? (
-                  <SopCanvas
-                    draft={viewSop}
-                    graph={graph}
-                    selectedStep={null}
-                    runStateByStep={runStateByStep}
-                    readOnly
-                    onSelectStep={noop}
-                    onSelectTrigger={noop}
-                    onAddStep={noop}
-                    onConnect={noop}
-                    onDisconnect={noop}
-                    onConnectData={noop}
-                    onDisconnectData={noop}
-                  />
-                ) : (
-                  <SopStepList graph={graph} overlay={latestOverlay} />
-                )}
-                <DiagnosticsPanel graph={graph} />
-              </>
-            ) : null}
-          </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 space-y-6 animate-fade-in">
+      <PageHeader title={t('sops.editor_title')} description={t('sops.subtitle')} />
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
+        <DraftSidebar
+          draft={draft}
+          saving={saving}
+          saveError={saveError}
+          selectedStep={selectedStep}
+          selectedTrigger={selectedTrigger}
+          triggerRegistry={triggerRegistry}
+          agentAliases={agentAliases}
+          onSelectStep={setSelectedStep}
+          onField={editorHandlers.onField}
+          onTrigger={editorHandlers.onTrigger}
+          onAddTrigger={editorHandlers.onAddTrigger}
+          onRemoveTrigger={editorHandlers.onRemoveTrigger}
+          onAddStep={editorHandlers.onAddStep}
+          onRemoveStep={editorHandlers.onRemoveStep}
+          onMoveStep={editorHandlers.onMoveStep}
+          onSave={onSaveDraft}
+          onCancel={() => close(editingName ?? undefined)}
+        />
+        <div className="min-w-0 space-y-4">
+          <StepInspector
+            draft={draft}
+            selectedStep={selectedStep}
+            runCallsByStep={runCallsByStep}
+            agentAliases={agentAliases}
+            onStep={editorHandlers.onStep}
+            onRemoveStep={editorHandlers.onRemoveStep}
+            onMoveStep={editorHandlers.onMoveStep}
+          />
+          {draftGraph ? (
+            <SopCanvas
+              draft={draft}
+              graph={draftGraph}
+              selectedStep={selectedStep}
+              onSelectStep={setSelectedStep}
+              onSelectTrigger={setSelectedTrigger}
+              onAddStep={editorHandlers.onAddStep}
+              onRemoveStep={(n) => {
+                const i = draft.steps.findIndex((s) => s.number === n);
+                if (i >= 0) editorHandlers.onRemoveStep(i);
+              }}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+              onConnectData={onConnectData}
+              onDisconnectData={onDisconnectData}
+              onMoveNode={editorHandlers.onMoveNode}
+            />
+          ) : null}
         </div>
-      )}
+      </div>
     </div>
   );
 }

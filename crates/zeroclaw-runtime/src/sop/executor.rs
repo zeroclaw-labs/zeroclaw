@@ -151,6 +151,220 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
     }
 }
 
+/// Upper bound on steps a single headless drive may execute, so a routing
+/// cycle can never pin a background task forever.
+const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+
+/// Spawn a background task that drives a resumed SOP action to its next
+/// blocking or terminal state. Gate-clearing surfaces without an ambient agent
+/// turn (HTTP decide, WS approvals, manual dashboard runs) land here:
+/// `ExecuteStep` runs through a fresh agent loop under the step's resolved
+/// agent, `DeterministicStep` routes through the engine's headless
+/// deterministic driver, and every other action is already parked or terminal.
+pub fn spawn_headless_run_driver(
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+) {
+    zeroclaw_spawn::spawn!(async move {
+        drive_headless_run(config, engine, audit, first_action).await;
+    });
+}
+
+async fn drive_headless_run(
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+) {
+    use crate::sop::types::SopStepStatus;
+
+    let mut action = first_action;
+    for _ in 0..MAX_HEADLESS_DRIVE_STEPS {
+        match action {
+            SopRunAction::ExecuteStep {
+                run_id,
+                step,
+                context,
+            } => {
+                let agent_alias = step
+                    .agent
+                    .clone()
+                    .or_else(|| config.agents.keys().min().cloned())
+                    .unwrap_or_default();
+                let started_at = crate::sop::engine::now_iso8601();
+                let session_path =
+                    std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
+                let run_result = Box::pin(crate::agent::run(
+                    config.clone(),
+                    &agent_alias,
+                    Some(context),
+                    None,
+                    None,
+                    config
+                        .model_provider_for_agent(&agent_alias)
+                        .and_then(|e| e.temperature),
+                    vec![],
+                    false,
+                    Some(session_path),
+                    None,
+                    zeroclaw_api::ingress::TurnOrigin::Daemon,
+                    crate::agent::loop_::AgentRunOverrides::default(),
+                ))
+                .await;
+                let completed_at = crate::sop::engine::now_iso8601();
+                let step_result = match run_result {
+                    Ok(output) => SopStepResult {
+                        step_number: step.number,
+                        status: SopStepStatus::Completed,
+                        output,
+                        started_at,
+                        completed_at: Some(completed_at),
+                        tool_calls: Vec::new(),
+                    },
+                    Err(e) => SopStepResult {
+                        step_number: step.number,
+                        status: SopStepStatus::Failed,
+                        output: e.to_string(),
+                        started_at,
+                        completed_at: Some(completed_at),
+                        tool_calls: Vec::new(),
+                    },
+                };
+                match advance_sop_step(&engine, &run_id, step_result.clone()) {
+                    Ok((next, finished_run)) => {
+                        audit_sop_step(
+                            audit.as_deref(),
+                            &run_id,
+                            &step_result,
+                            finished_run.as_ref(),
+                        )
+                        .await;
+                        action = next;
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "run_id": run_id,
+                                    "error": e.to_string(),
+                                })),
+                            "SOP headless driver: failed to advance run"
+                        );
+                        return;
+                    }
+                }
+            }
+            SopRunAction::DeterministicStep { ref run_id, .. } => {
+                let run_id = run_id.clone();
+                let next = {
+                    let mut guard = match engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.drive_headless_deterministic(&run_id, action)
+                };
+                match next {
+                    Ok(SopRunAction::DeterministicStep { .. }) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"run_id": run_id})),
+                            "SOP headless driver: deterministic drive made no progress"
+                        );
+                        return;
+                    }
+                    Ok(next) => action = next,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "run_id": run_id,
+                                    "error": e.to_string(),
+                                })),
+                            "SOP headless driver: deterministic drive failed"
+                        );
+                        return;
+                    }
+                }
+            }
+            SopRunAction::WaitApproval { run_id, step, .. }
+            | SopRunAction::CheckpointWait { run_id, step, .. } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "step": step.number,
+                        })),
+                    "SOP headless driver: run parked at a gate"
+                );
+                return;
+            }
+            SopRunAction::Pending {
+                run_id,
+                step,
+                reason,
+                ..
+            } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "step": step,
+                            "reason": reason,
+                        })),
+                    "SOP headless driver: run pending on dependencies"
+                );
+                return;
+            }
+            SopRunAction::Completed { run_id, sop_name } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                        })),
+                    "SOP headless driver: run completed"
+                );
+                return;
+            }
+            SopRunAction::Failed {
+                run_id,
+                sop_name,
+                reason,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                            "reason": reason,
+                        })),
+                    "SOP headless driver: run failed"
+                );
+                return;
+            }
+        }
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "SOP headless driver: step budget exhausted; leaving run in place"
+    );
+}
+
 pub(crate) fn advance_sop_step(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,

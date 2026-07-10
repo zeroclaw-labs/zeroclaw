@@ -213,7 +213,21 @@ pub async fn handle_sop_run(
 
     for result in &results {
         match result {
-            zeroclaw_runtime::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
+                let needs_driver = matches!(
+                    action.as_ref(),
+                    zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                        | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                );
+                if needs_driver {
+                    let config = state.config.read().clone();
+                    zeroclaw_runtime::sop::spawn_headless_run_driver(
+                        config,
+                        std::sync::Arc::clone(engine),
+                        Some(std::sync::Arc::clone(audit)),
+                        action.as_ref().clone(),
+                    );
+                }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
             }
             zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { reason, .. } => {
@@ -363,6 +377,7 @@ pub async fn handle_sop_decide(
     );
     let _guard = span.enter();
 
+    let mut resumed_action: Option<zeroclaw_runtime::sop::types::SopRunAction> = None;
     {
         let mut guard = match engine.lock() {
             Ok(g) => g,
@@ -379,11 +394,10 @@ pub async fn handle_sop_decide(
             Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
                 use zeroclaw_runtime::sop::approval::{ApprovalPrincipal, ResolveOutcome};
                 match guard.resolve_gate(&run_id, decision, ApprovalPrincipal::http(None)) {
-                    Ok(
-                        ResolveOutcome::Resumed(_)
-                        | ResolveOutcome::Denied
-                        | ResolveOutcome::AlreadyResolved,
-                    ) => {}
+                    Ok(ResolveOutcome::Resumed(action)) => {
+                        resumed_action = Some(*action);
+                    }
+                    Ok(ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved) => {}
                     Ok(ResolveOutcome::NotWaiting) => {
                         return (
                             StatusCode::CONFLICT,
@@ -412,15 +426,30 @@ pub async fn handle_sop_decide(
                 }
             }
             _ => {
-                if let Err(e) = guard.decide_checkpoint(&run_id, decision) {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    )
-                        .into_response();
+                match guard.decide_checkpoint(&run_id, decision) {
+                    Ok(action) => {
+                        resumed_action = Some(action);
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": e.to_string() })),
+                        )
+                            .into_response();
+                    }
                 }
             }
         }
+    }
+
+    if let Some(action) = resumed_action {
+        let config = state.config.read().clone();
+        zeroclaw_runtime::sop::spawn_headless_run_driver(
+            config,
+            std::sync::Arc::clone(engine),
+            state.sop_audit.clone(),
+            action,
+        );
     }
 
     match zeroclaw_runtime::sop::run_overlay_for(&sop, engine, &run_id) {

@@ -98,7 +98,7 @@ export default function RunDetail() {
             {t('run_detail.progress')} {overlay.current_step}/{overlay.total_steps}
           </span>
           <Link
-            to={`/sops?sop=${encodeURIComponent(sop)}`}
+            to={`/sops/${encodeURIComponent(sop)}`}
             className="text-sm text-pc-accent hover:underline"
           >
             {t('run_detail.open_sop')}

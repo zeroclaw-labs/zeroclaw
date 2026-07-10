@@ -18,7 +18,9 @@ import {
   RunDetail,
   Runs,
   Skills,
-  Sops,
+  SopEditor,
+  SopView,
+  SopsList,
   Tools,
 } from './lazyPages';
 
@@ -45,7 +47,10 @@ export const Router = () => (
         <Route path="/tools" element={<Tools />} />
         <Route path="/cron" element={<Cron />} />
         <Route path="/skills" element={<Skills />} />
-        <Route path="/sops" element={<Sops />} />
+        <Route path="/sops" element={<SopsList />} />
+        <Route path="/sops/new" element={<SopEditor />} />
+        <Route path="/sops/:name" element={<SopView />} />
+        <Route path="/sops/:name/edit" element={<SopEditor />} />
         <Route path="/runs" element={<Runs />} />
         <Route path="/runs/:sop/:runId" element={<RunDetail />} />
         <Route path="/integrations" element={<Integrations />} />

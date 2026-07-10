@@ -23,7 +23,7 @@ use super::types::{
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
 use crate::security::{ContentSafety, new_marker_id};
 use serde_json::Value;
-use zeroclaw_config::schema::{ApprovalMode, SopConfig};
+use zeroclaw_config::schema::SopConfig;
 
 /// Central SOP orchestrator: loads SOPs, matches triggers, manages run lifecycle.
 pub struct SopEngine {
@@ -154,6 +154,8 @@ impl SopEngine {
                         .store
                         .renew_claim_for_restore(&pr.run.run_id, &pr.run.sop_name)
                     {
+                        let span = ::zeroclaw_log::attribution_span!(&pr.run);
+                        let _guard = span.enter();
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -179,6 +181,12 @@ impl SopEngine {
                     }
                 }
                 if restored > 0 {
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        sop_name = "*",
+                    );
+                    let _guard = span.enter();
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -187,13 +195,83 @@ impl SopEngine {
                     );
                 }
             }
-            Err(e) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "SOP engine: failed to restore runs from store"
-            ),
+            Err(e) => {
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    sop_name = "*",
+                );
+                let _guard = span.enter();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP engine: failed to restore runs from store"
+                );
+            }
+        }
+        self.restore_finished_runs();
+    }
+
+    /// Seed the display retention window (`finished_runs`) from the store's
+    /// terminal records at boot, newest-first and capped at `max_finished_runs`.
+    /// Terminal runs are durable but not part of the active-run rehydrate set, so
+    /// without this the Runs surface drops all completed/failed/cancelled runs
+    /// across a restart even though they remain on disk.
+    fn restore_finished_runs(&mut self) {
+        let limit = self.config.max_finished_runs;
+        match self.store.load_terminal_runs(limit) {
+            Ok(runs) => {
+                let mut seeded = 0usize;
+                for pr in runs {
+                    let span = ::zeroclaw_log::attribution_span!(&pr.run);
+                    let _guard = span.enter();
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": pr.run.run_id.as_str(),
+                                "sop_name": pr.run.sop_name.as_str(),
+                            })),
+                        "SOP engine: seeded terminal run into the retention window"
+                    );
+                    self.finished_runs.push(pr.run);
+                    seeded += 1;
+                }
+                self.finished_runs
+                    .sort_by(|a, b| a.started_at.cmp(&b.started_at));
+                if seeded > 0 {
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        sop_name = "*",
+                    );
+                    let _guard = span.enter();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"seeded": seeded})),
+                        &format!("SOP engine seeded {seeded} terminal run(s) into the retention window")
+                    );
+                }
+            }
+            Err(e) => {
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    sop_name = "*",
+                );
+                let _guard = span.enter();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP engine: failed to seed terminal runs from store"
+                );
+            }
         }
     }
 
@@ -1017,13 +1095,7 @@ impl SopEngine {
                 .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
             format_step_context(sop, run, &step, &self.config)
         };
-        let action = resolve_step_action(
-            sop,
-            &step,
-            run_id.to_string(),
-            context,
-            self.config.approval_mode,
-        );
+        let action = resolve_step_action(sop, &step, run_id.to_string(), context);
         if matches!(action, SopRunAction::WaitApproval { .. })
             && let Some(run) = self.active_runs.get_mut(run_id)
         {
@@ -2483,13 +2555,7 @@ fn execution_mode_needs_approval(mode: SopExecutionMode, sop: &Sop, step: &SopSt
 }
 
 /// Determine the action for a step based on the effective execution mode.
-fn resolve_step_action(
-    sop: &Sop,
-    step: &SopStep,
-    run_id: String,
-    context: String,
-    approval_mode: ApprovalMode,
-) -> SopRunAction {
+fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: String) -> SopRunAction {
     let mut step = step.clone();
     step.agent = step
         .effective_agent(sop.agent.as_deref())
@@ -2507,10 +2573,8 @@ fn resolve_step_action(
 
     let effective_mode = step.mode.unwrap_or(sop.execution_mode);
     let sop_needs_approval = execution_mode_needs_approval(sop.execution_mode, sop, step);
-    let mut needs_approval = execution_mode_needs_approval(effective_mode, sop, step);
-    if approval_mode == ApprovalMode::OutOfBandRequired && sop_needs_approval && !needs_approval {
-        needs_approval = true;
-    }
+    let step_needs_approval = execution_mode_needs_approval(effective_mode, sop, step);
+    let needs_approval = sop_needs_approval || step_needs_approval;
 
     if needs_approval {
         SopRunAction::WaitApproval {
@@ -4309,14 +4373,17 @@ mod tests {
     }
 
     #[test]
-    fn step_mode_can_relax_step_by_step_step() {
+    fn step_mode_cannot_relax_step_by_step_step() {
         let mut sop = test_sop("s1", SopExecutionMode::StepByStep, SopPriority::Normal);
         sop.steps[0].mode = Some(SopExecutionMode::Auto);
         let mut engine = engine_with_sops(vec![sop]);
 
         let action = engine.start_run("s1", manual_event()).unwrap();
 
-        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "a step auto override must not relax the SOP's step_by_step gate, got {action:?}"
+        );
     }
 
     #[test]
@@ -4325,7 +4392,7 @@ mod tests {
         sop.steps[0].mode = Some(SopExecutionMode::Auto);
         let mut engine = engine_with_config_sops(
             SopConfig {
-                approval_mode: ApprovalMode::OutOfBandRequired,
+                approval_mode: zeroclaw_config::schema::ApprovalMode::OutOfBandRequired,
                 ..SopConfig::default()
             },
             vec![sop],
@@ -4370,6 +4437,25 @@ mod tests {
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(engine.approve_step(&run_id).is_err());
+    }
+
+    #[test]
+    fn step_auto_override_cannot_defeat_supervised_step_one_gate() {
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps[0].mode = Some(SopExecutionMode::Auto);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "supervised SOP must gate step 1 even when the step overrides mode to auto, got {action:?}"
+        );
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.active_runs().get(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval,
+            "the run must park at the gate, not sit Running at step 1"
+        );
     }
 
     // ── Advance step gate guard (#8678) ─────────────────
@@ -5618,6 +5704,62 @@ type = "manual"
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
         engine.restore_runs();
         assert!(engine.active_runs().contains_key("r-restore"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn engine_restores_finished_runs_from_store() {
+        use super::super::store::SqliteRunStore;
+        let path = std::env::temp_dir()
+            .join(format!("zc-sop-engine-restore-fin-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+
+        // Persist a terminal run: saved active, then finished with a bumped revision.
+        let base = SopRun {
+            run_id: "r-done".to_string(),
+            sop_name: "deploy".to_string(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: now_iso8601(),
+            },
+            frame_marker_id: "marker-done".to_string(),
+            status: SopRunStatus::Running,
+            current_step: 0,
+            total_steps: 1,
+            started_at: now_iso8601(),
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+        store
+            .save_run(&PersistedRun::new(
+                base.clone(),
+                now_iso8601(),
+                SopTriggerSource::Manual,
+            ))
+            .unwrap();
+        let mut terminal = base;
+        terminal.status = SopRunStatus::Completed;
+        terminal.completed_at = Some(now_iso8601());
+        let mut persisted = PersistedRun::new(terminal, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = 1;
+        store.finish_run("r-done", &persisted).unwrap();
+
+        // A fresh engine seeds its retention window from the store's terminal set.
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
+        engine.restore_runs();
+        assert!(
+            !engine.active_runs().contains_key("r-done"),
+            "terminal run must not rehydrate as active"
+        );
+        let finished = engine.finished_runs(None);
+        assert_eq!(finished.len(), 1, "terminal run seeded into retention window");
+        assert_eq!(finished[0].run_id, "r-done");
+        assert_eq!(finished[0].status, SopRunStatus::Completed);
         let _ = std::fs::remove_file(&path);
     }
 
