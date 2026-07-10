@@ -114,6 +114,114 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+// ── Todo tracker ──────────────────────────────────────────────────────────────
+
+/// Where the todo tracker renders inside the Code pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TodoTrackerLocation {
+    Bottom,
+    Left,
+    #[default]
+    Right,
+}
+
+/// The `[todotracker]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TodoTrackerSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub enabled_at_start: bool,
+    #[serde(default)]
+    pub location: TodoTrackerLocation,
+    #[serde(default = "default_todotracker_width")]
+    pub width: u16,
+    #[serde(default = "default_todotracker_max_height")]
+    pub max_height: u16,
+}
+
+impl Default for TodoTrackerSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoTrackerLocation::Right,
+            width: default_todotracker_width(),
+            max_height: default_todotracker_max_height(),
+        }
+    }
+}
+
+// ── Message queue ─────────────────────────────────────────────────────────────
+
+/// The `[message_queue]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MessageQueueSection {
+    #[serde(default = "default_queue_cap")]
+    pub cap: usize,
+    #[serde(default = "default_queue_width")]
+    pub default_width: u16,
+    #[serde(default = "default_queue_min")]
+    pub min_width: u16,
+    #[serde(default = "default_queue_max")]
+    pub max_width: u16,
+    #[serde(default = "default_queue_step")]
+    pub width_step: u16,
+    #[serde(default = "default_true")]
+    pub auto_open: bool,
+    #[serde(default)]
+    pub stay_open_when_empty: bool,
+}
+
+impl Default for MessageQueueSection {
+    fn default() -> Self {
+        Self {
+            cap: default_queue_cap(),
+            default_width: default_queue_width(),
+            min_width: default_queue_min(),
+            max_width: default_queue_max(),
+            width_step: default_queue_step(),
+            auto_open: true,
+            stay_open_when_empty: false,
+        }
+    }
+}
+
+// ── Default helpers ───────────────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_todotracker_width() -> u16 {
+    32
+}
+
+fn default_todotracker_max_height() -> u16 {
+    5
+}
+
+fn default_queue_cap() -> usize {
+    32
+}
+
+fn default_queue_width() -> u16 {
+    36
+}
+
+fn default_queue_min() -> u16 {
+    24
+}
+
+fn default_queue_max() -> u16 {
+    80
+}
+
+fn default_queue_step() -> u16 {
+    4
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ZerocodeConfig {
     #[serde(default = "default_locale")]
@@ -126,6 +234,10 @@ pub(crate) struct ZerocodeConfig {
     /// entries fall back to compile-time defaults.
     #[serde(default)]
     keybindings: HashMap<String, ChordSpec>,
+    #[serde(default)]
+    pub todotracker: TodoTrackerSection,
+    #[serde(default)]
+    pub message_queue: MessageQueueSection,
 }
 
 impl Default for ZerocodeConfig {
@@ -135,6 +247,8 @@ impl Default for ZerocodeConfig {
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
             keybindings: HashMap::new(),
+            todotracker: TodoTrackerSection::default(),
+            message_queue: MessageQueueSection::default(),
         }
     }
 }
@@ -269,6 +383,24 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             Ok(rows) => config.keybindings = rows,
             Err(e) => eprintln!(
                 "zerocode: ignoring [keybindings] in {} ({e}); using defaults",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("todotracker") {
+        match v.clone().try_into::<TodoTrackerSection>() {
+            Ok(section) => config.todotracker = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [todotracker] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("message_queue") {
+        match v.clone().try_into::<MessageQueueSection>() {
+            Ok(section) => config.message_queue = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [message_queue] in {} ({e}); using default",
                 path.display()
             ),
         }
