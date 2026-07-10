@@ -37,10 +37,28 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         return NextStep::Complete;
     };
 
-    if let Some(when) = current.routing.when.as_deref()
-        && !evaluate_condition(when, Some(&ctx.run_data.to_payload().to_string()))
-    {
-        return NextStep::Complete;
+    let when_holds = if let Some(when) = current.routing.when.as_deref() {
+        evaluate_condition(when, Some(&ctx.run_data.to_payload().to_string()))
+    } else {
+        true
+    };
+
+    if !when_holds {
+        let linear_next = ctx.run.current_step.saturating_add(1);
+        if linear_next > ctx.run.total_steps {
+            return NextStep::Complete;
+        }
+        let Some(step) = ctx.sop.steps.iter().find(|s| s.number == linear_next) else {
+            return NextStep::Complete;
+        };
+        if !guard::within_visit_bound(ctx.run, linear_next, ctx.max_step_visits) {
+            return NextStep::Fail(format!("step {linear_next} visit limit reached"));
+        }
+        return if eligible(step, ctx.run_data) {
+            NextStep::Step(linear_next)
+        } else {
+            NextStep::Wait(linear_next)
+        };
     }
 
     let explicit_next = current.routing.next;
@@ -167,5 +185,61 @@ mod tests {
         };
 
         assert_eq!(resolve_next(&ctx), NextStep::Wait(2));
+    }
+
+    #[test]
+    fn when_false_advances_to_linear_next() {
+        let mut sop = sop();
+        sop.steps[0].routing.when = Some("$.steps.1.remaining > 0".into());
+        sop.steps[0].routing.next = Some(1);
+        sop.steps.push(SopStep {
+            number: 3,
+            title: "Review".into(),
+            body: String::new(),
+            suggested_tools: Vec::new(),
+            requires_confirmation: false,
+            kind: SopStepKind::Execute,
+            schema: None,
+            scope: None,
+            routing: StepRouting::default(),
+            on_failure: Default::default(),
+            mode: None,
+            capability: None,
+            capability_input: None,
+        });
+        let mut run = run();
+        run.current_step = 1;
+        run.total_steps = 3;
+        let mut run_data = RunData::default();
+        run_data.outputs.insert(1, serde_json::json!({"remaining": 0}));
+        let ctx = RouteCtx {
+            sop: &sop,
+            run: &run,
+            run_data: &run_data,
+            last_status: SopStepStatus::Completed,
+            max_step_visits: 256,
+        };
+
+        assert_eq!(resolve_next(&ctx), NextStep::Step(2));
+    }
+
+    #[test]
+    fn when_false_on_last_step_completes() {
+        let mut sop = sop();
+        sop.steps[1].routing.when = Some("$.steps.2.remaining > 0".into());
+        sop.steps[1].routing.next = Some(2);
+        let mut run = run();
+        run.current_step = 2;
+        let mut run_data = RunData::default();
+        run_data.outputs.insert(2, serde_json::json!({"remaining": 0}));
+        let ctx = RouteCtx {
+            sop: &sop,
+            run: &run,
+            run_data: &run_data,
+            last_status: SopStepStatus::Completed,
+            max_step_visits: 256,
+        };
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 }
