@@ -2,12 +2,13 @@
 //!
 //! `unicode-width` follows Unicode East Asian Width and reports many
 //! emoji base characters as width 1 (Ambiguous). Modern terminals render
-//! emoji presentation sequences (base + U+FE0F, or emoji-default bases)
-//! as 2 cells. Under-counting by 1 cell makes padding/wrapping drop a
-//! space immediately after the glyph.
+//! emoji presentation sequences (base + U+FE0F) as 2 cells, and also
+//! render emoji-default bases in the dedicated emoji blocks as 2 cells
+//! even without an explicit VS16. Under-counting by 1 cell makes
+//! padding/wrapping drop a space immediately after the glyph.
 //!
 //! These helpers keep East Asian Width for ordinary text and correct
-//! emoji presentation sequences to the 2-cell terminal reality.
+//! only the sequences that terminals actually draw double-width.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -17,12 +18,12 @@ pub(crate) fn display_width(text: &str) -> usize {
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         let mut w = ch.width().unwrap_or(0);
-        // Emoji presentation selector: force the preceding base to 2 cells.
-        // unicode-width already counts FE0F itself as 0, so we only bump the base.
+        // Explicit emoji presentation selector: force the preceding base
+        // to 2 cells. unicode-width already counts FE0F itself as 0.
         if chars.peek() == Some(&'\u{FE0F}') && w == 1 {
             w = 2;
         } else if is_emoji_default_presentation(ch) && w == 1 {
-            // Emoji-default bases that unicode-width still marks Ambiguous/narrow.
+            // Bare emoji-default bases in the dedicated emoji blocks.
             w = 2;
         }
         total = total.saturating_add(w);
@@ -34,6 +35,9 @@ pub(crate) fn display_width(text: &str) -> usize {
 ///
 /// Prefer [`display_width`] for multi-codepoint sequences (emoji + VS16,
 /// ZWJ families, flags). This is for hard-wrap loops that walk `char`s.
+/// Bare scalars in Misc Symbols / Dingbats keep their `unicode-width`
+/// value here; only an explicit `base + U+FE0F` sequence (via
+/// [`display_width`]) bumps those to 2.
 pub(crate) fn char_display_width(ch: char) -> usize {
     let w = ch.width().unwrap_or(0);
     if is_emoji_default_presentation(ch) && w == 1 {
@@ -43,46 +47,38 @@ pub(crate) fn char_display_width(ch: char) -> usize {
     }
 }
 
-/// True when `ch` is an emoji-default presentation character that terminals
-/// render double-width even without an explicit VS16.
+/// True when `ch` is an emoji-default presentation character in a
+/// dedicated emoji block that terminals render double-width even without
+/// an explicit VS16.
 ///
-/// Covers the common ranges where `unicode-width` still reports 1 for
-/// characters that modern terminals treat as emoji (2 cells).
+/// Intentionally **excludes** the broad Misc Symbols (`U+2600..=U+26FF`)
+/// and Dingbats (`U+2700..=U+27BF`) ranges: those blocks mix text-default
+/// and emoji-default scalars, and bare width-1 symbols there must keep
+/// their `unicode-width` value unless an explicit `U+FE0F` follows.
 fn is_emoji_default_presentation(ch: char) -> bool {
     let c = ch as u32;
     matches!(
         c,
-        // Miscellaneous Symbols and Pictographs, Supplemental Symbols, etc.
-        // that are emoji-default but still Ambiguous in East Asian Width.
-        0x1F300..=0x1F5FF // Misc Symbols and Pictographs (includes 🏔 U+1F3D4)
+        // Dedicated emoji blocks. Bases here are emoji-default; terminals
+        // draw them 2 cells even without VS16. Includes 🏔 U+1F3D4.
+        0x1F300..=0x1F5FF // Misc Symbols and Pictographs
             | 0x1F600..=0x1F64F // Emoticons
             | 0x1F680..=0x1F6FF // Transport and Map
             | 0x1F900..=0x1F9FF // Supplemental Symbols and Pictographs
             | 0x1FA70..=0x1FAFF // Symbols and Pictographs Extended-A
-            | 0x2600..=0x26FF // Misc symbols (☀ ⚠ ⚡ …) — many are emoji-default
-            | 0x2700..=0x27BF // Dingbats
     )
 }
 
-/// Sanity: plain ASCII and CJK still match `unicode-width`.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn ascii_and_cjk_match_unicode_width() {
-        assert_eq!(
-            display_width("hello"),
-            unicode_width::UnicodeWidthStr::width("hello")
-        );
-        assert_eq!(
-            display_width("界"),
-            unicode_width::UnicodeWidthStr::width("界")
-        );
-        assert_eq!(
-            display_width("abcd界"),
-            unicode_width::UnicodeWidthStr::width("abcd界")
-        );
+        assert_eq!(display_width("hello"), UnicodeWidthStr::width("hello"));
+        assert_eq!(display_width("界"), UnicodeWidthStr::width("界"));
+        assert_eq!(display_width("abcd界"), UnicodeWidthStr::width("abcd界"));
     }
 
     #[test]
@@ -97,15 +93,45 @@ mod tests {
 
     #[test]
     fn snow_capped_mountain_base_without_vs16_is_still_two_cells() {
-        // Bare 🏔 is emoji-default in modern terminals even without VS16.
+        // Bare 🏔 lives in Misc Symbols and Pictographs and is emoji-default.
         let s = "\u{1F3D4}";
         assert_eq!(display_width(s), 2);
     }
 
     #[test]
     fn warning_with_emoji_presentation_is_two_cells() {
-        let s = "\u{26A0}\u{FE0F}"; // ⚠️
+        // ⚠️ is text-default ⚠ + VS16; only the explicit presentation bumps it.
+        let s = "\u{26A0}\u{FE0F}";
         assert_eq!(display_width(s), 2);
+    }
+
+    #[test]
+    fn bare_misc_symbol_keeps_unicode_width() {
+        // Bare ⚠ (U+26A0) is text-default presentation. Over-broad range
+        // matching used to force this to 2 and would reintroduce off-by-one
+        // padding/hit-test bugs in the opposite direction.
+        let s = "\u{26A0}";
+        assert_eq!(display_width(s), UnicodeWidthStr::width(s));
+        assert_eq!(display_width(s), 1);
+        assert_eq!(char_display_width('\u{26A0}'), 1);
+    }
+
+    #[test]
+    fn bare_dingbat_keeps_unicode_width() {
+        // Bare ✓ (U+2713) is a normal width-1 symbol, not emoji-default.
+        let s = "\u{2713}";
+        assert_eq!(display_width(s), UnicodeWidthStr::width(s));
+        assert_eq!(display_width(s), 1);
+        assert_eq!(char_display_width('\u{2713}'), 1);
+    }
+
+    #[test]
+    fn bare_heart_dingbat_keeps_unicode_width_without_vs16() {
+        // Bare ❤ (U+2764) is text-default; only ❤︎ / ❤️ with VS16 is emoji.
+        let s = "\u{2764}";
+        assert_eq!(display_width(s), UnicodeWidthStr::width(s));
+        assert_eq!(display_width(s), 1);
+        assert_eq!(display_width("\u{2764}\u{FE0F}"), 2);
     }
 
     #[test]
@@ -115,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn char_display_width_bumps_ambiguous_emoji_base() {
+    fn char_display_width_bumps_ambiguous_emoji_block_base() {
         assert_eq!(char_display_width('\u{1F3D4}'), 2);
         assert_eq!(char_display_width('a'), 1);
         assert_eq!(char_display_width('界'), 2);
