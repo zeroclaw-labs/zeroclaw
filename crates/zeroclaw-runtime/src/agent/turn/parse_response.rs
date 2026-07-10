@@ -84,16 +84,28 @@ pub(crate) fn resolve_display_text(
 
 /// Narration to relay after the live stream, given what was already forwarded.
 /// Returns the suffix of `display_text` past `streamed_visible_text` when the
-/// latter is a genuine prefix. On any divergence the whole `display_text` is
-/// relayed: duplicate output is recoverable noise, a dropped tail is permanent
-/// loss, so the total function never truncates.
+/// latter is a genuine prefix. `display_text` is a whitespace-trimmed
+/// rendering (`strip_think_tags` trims) of the same buffer the stream
+/// forwarded byte-exact, so when the exact prefix fails the trimmed streamed
+/// text is tried before concluding divergence — otherwise a trailing `\n\n`
+/// before a tool call re-relays (duplicates) the whole turn. On genuine
+/// divergence the whole `display_text` is relayed: duplicate output is
+/// recoverable noise, a dropped tail is permanent loss, so the total function
+/// never truncates.
 pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
 ) -> &'a str {
+    if let Some(rest) = display_text.strip_prefix(streamed_visible_text) {
+        return rest;
+    }
+    let stream_core = streamed_visible_text.trim();
+    if !stream_core.is_empty()
+        && let Some(rest) = display_text.strip_prefix(stream_core)
+    {
+        return rest;
+    }
     display_text
-        .strip_prefix(streamed_visible_text)
-        .unwrap_or(display_text)
 }
 
 /// The interpreted Ok-arm of one provider call.
@@ -337,6 +349,45 @@ mod tests {
         assert_eq!(
             unforwarded_narration("final visible text", "diverged live text"),
             "final visible text"
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_trailing_whitespace() {
+        // display_text is the trimmed rendering of the same buffer the live
+        // stream forwarded; a trailing "\n\n" before a tool call must not
+        // re-relay (and thus duplicate) the whole narration.
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "Checking the data.\n\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_leading_whitespace() {
+        // Leading whitespace survives the incremental think-tag stripper but
+        // is trimmed from display_text.
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data."),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_whitespace_on_both_ends() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data.\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_suffix_past_the_whitespace_trimmed_streamed_prefix() {
+        // Stream cut short after "\nAbout to"; display_text is the trimmed
+        // full turn. Only the unseen tail is relayed.
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to"),
+            " check."
         );
     }
 }
