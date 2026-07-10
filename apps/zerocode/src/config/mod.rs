@@ -506,6 +506,63 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
     write_document(&path, &doc)
 }
 
+/// Persist the entire `[todotracker]` section, editing only that section.
+/// Other sections (theme, keybindings, connection, etc.) are preserved.
+pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let serialized = toml::Value::try_from(section)
+        .context("serializing todotracker section")?
+        .as_table()
+        .cloned()
+        .unwrap_or_default();
+    doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
+    write_document(&path, &doc)
+}
+
+/// Persist a single `[todotracker.<field>]` leaf, leaving the rest of the
+/// section and all other sections intact.
+pub(crate) fn persist_todotracker_field(
+    config_dir: &Path,
+    field: &str,
+    value: toml::Value,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "todotracker")?.insert(field.to_string(), value);
+    write_document(&path, &doc)
+}
+
+/// Persist the entire `[message_queue]` section, editing only that section.
+/// Other sections are preserved.
+pub(crate) fn persist_message_queue(
+    config_dir: &Path,
+    section: &MessageQueueSection,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let serialized = toml::Value::try_from(section)
+        .context("serializing message_queue section")?
+        .as_table()
+        .cloned()
+        .unwrap_or_default();
+    doc.insert("message_queue".to_string(), toml::Value::Table(serialized));
+    write_document(&path, &doc)
+}
+
+/// Persist a single `[message_queue.<field>]` leaf, leaving the rest of the
+/// section and all other sections intact.
+pub(crate) fn persist_message_queue_field(
+    config_dir: &Path,
+    field: &str,
+    value: toml::Value,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "message_queue")?.insert(field.to_string(), value);
+    write_document(&path, &doc)
+}
+
 pub(crate) fn persist_connection_field(
     config_dir: &Path,
     leaf_path: &str,
@@ -599,6 +656,9 @@ fn apply_env_overrides(config: &mut ZerocodeConfig) -> Result<()> {
 
 /// Set a leaf at a dotted `path` via a serde roundtrip through `toml::Value`.
 /// No field names are hardcoded: the struct's serialized shape is the registry.
+/// The string value is parsed into the correct TOML type by inspecting the
+/// existing field value (string → string, bool → bool, integer → integer,
+/// etc.).
 fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     target: &mut T,
     path: &str,
@@ -625,7 +685,36 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     if !table.contains_key(*leaf) {
         anyhow::bail!("path '{path}' did not resolve to a config field");
     }
-    table.insert((*leaf).to_string(), toml::Value::String(value.to_string()));
+
+    // Parse the string into the correct TOML type by inspecting the existing
+    // field value. This lets env overrides like ZEROCODE__TODOTRACKER__ENABLED=false
+    // set a boolean without the caller knowing the field type.
+    let existing = table[*leaf].clone();
+    let new_value = match existing {
+        toml::Value::String(_) => toml::Value::String(value.to_string()),
+        toml::Value::Boolean(_) => toml::Value::Boolean(value.parse().with_context(|| {
+            format!("failed to parse '{value}' as bool for {path}")
+        })?),
+        toml::Value::Integer(_) => toml::Value::Integer(value.parse().with_context(|| {
+            format!("failed to parse '{value}' as integer for {path}")
+        })?),
+        toml::Value::Float(_) => toml::Value::Float(value.parse().with_context(|| {
+            format!("failed to parse '{value}' as float for {path}")
+        })?),
+        toml::Value::Array(_) => {
+            let parsed: Vec<toml::Value> = toml::from_str(value).with_context(|| {
+                format!("failed to parse '{value}' as array for {path}")
+            })?;
+            toml::Value::Array(parsed)
+        }
+        toml::Value::Datetime(_) => toml::Value::Datetime(value.parse().with_context(|| {
+            format!("failed to parse '{value}' as datetime for {path}")
+        })?),
+        toml::Value::Table(_) => {
+            anyhow::bail!("cannot set a table field via set_prop: {path}")
+        }
+    };
+    table.insert((*leaf).to_string(), new_value);
 
     *target = root
         .try_into()
@@ -1075,5 +1164,223 @@ mod tests {
             doc["connection"]["wss"]["tls"]["skip_verify"].as_bool(),
             Some(true)
         );
+    }
+
+    // ── Todo tracker persistence tests ──────────────────────────────────────
+
+    #[test]
+    fn persist_todotracker_writes_section_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        let section = TodoTrackerSection {
+            enabled: false,
+            enabled_at_start: true,
+            location: TodoTrackerLocation::Left,
+            width: 40,
+            max_height: 8,
+        };
+        persist_todotracker(dir.path(), &section).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(false));
+        assert_eq!(doc["todotracker"]["enabled_at_start"].as_bool(), Some(true));
+        assert_eq!(doc["todotracker"]["location"].as_str(), Some("left"));
+        assert_eq!(doc["todotracker"]["width"].as_integer(), Some(40));
+        assert_eq!(doc["todotracker"]["max_height"].as_integer(), Some(8));
+    }
+
+    #[test]
+    fn persist_todotracker_field_updates_single_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[todotracker]\nenabled = true\nwidth = 32\n\n[theme]\nname = \"nord\"\n",
+        );
+        persist_todotracker_field(dir.path(), "width", toml::Value::Integer(50))
+            .unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(true));
+        assert_eq!(doc["todotracker"]["width"].as_integer(), Some(50));
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+    }
+
+    #[test]
+    fn persist_todotracker_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = TodoTrackerSection {
+            enabled: false,
+            enabled_at_start: true,
+            location: TodoTrackerLocation::Bottom,
+            width: 48,
+            max_height: 10,
+        };
+        persist_todotracker(dir.path(), &section).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.todotracker.enabled);
+        assert!(cfg.todotracker.enabled_at_start);
+        assert_eq!(cfg.todotracker.location, TodoTrackerLocation::Bottom);
+        assert_eq!(cfg.todotracker.width, 48);
+        assert_eq!(cfg.todotracker.max_height, 10);
+    }
+
+    #[test]
+    fn persist_todotracker_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = TodoTrackerSection {
+            enabled: false,
+            ..Default::default()
+        };
+        persist_todotracker(dir.path(), &section).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn bad_todotracker_does_not_blank_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[todotracker]\nwidth = \"not_a_number\"\n",
+        );
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert_eq!(cfg.todotracker.width, default_todotracker_width());
+    }
+
+    // ── Message queue persistence tests ─────────────────────────────────────
+
+    #[test]
+    fn persist_message_queue_writes_section_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        let section = MessageQueueSection {
+            cap: 64,
+            default_width: 40,
+            min_width: 20,
+            max_width: 100,
+            width_step: 8,
+            auto_open: false,
+            stay_open_when_empty: true,
+        };
+        persist_message_queue(dir.path(), &section).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(64));
+        assert_eq!(doc["message_queue"]["default_width"].as_integer(), Some(40));
+        assert_eq!(doc["message_queue"]["min_width"].as_integer(), Some(20));
+        assert_eq!(doc["message_queue"]["max_width"].as_integer(), Some(100));
+        assert_eq!(doc["message_queue"]["width_step"].as_integer(), Some(8));
+        assert_eq!(doc["message_queue"]["auto_open"].as_bool(), Some(false));
+        assert_eq!(
+            doc["message_queue"]["stay_open_when_empty"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn persist_message_queue_field_updates_single_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[message_queue]\ncap = 32\ndefault_width = 36\n\n[theme]\nname = \"nord\"\n",
+        );
+        persist_message_queue_field(dir.path(), "cap", toml::Value::Integer(128))
+            .unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(128));
+        assert_eq!(doc["message_queue"]["default_width"].as_integer(), Some(36));
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+    }
+
+    #[test]
+    fn persist_message_queue_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = MessageQueueSection {
+            cap: 64,
+            default_width: 40,
+            min_width: 20,
+            max_width: 100,
+            width_step: 8,
+            auto_open: false,
+            stay_open_when_empty: true,
+        };
+        persist_message_queue(dir.path(), &section).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.message_queue.cap, 64);
+        assert_eq!(cfg.message_queue.default_width, 40);
+        assert_eq!(cfg.message_queue.min_width, 20);
+        assert_eq!(cfg.message_queue.max_width, 100);
+        assert_eq!(cfg.message_queue.width_step, 8);
+        assert!(!cfg.message_queue.auto_open);
+        assert!(cfg.message_queue.stay_open_when_empty);
+    }
+
+    #[test]
+    fn persist_message_queue_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = MessageQueueSection {
+            cap: 64,
+            ..Default::default()
+        };
+        persist_message_queue(dir.path(), &section).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(64));
+    }
+
+    #[test]
+    fn bad_message_queue_does_not_blank_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[message_queue]\ncap = \"not_a_number\"\n",
+        );
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert_eq!(cfg.message_queue.cap, default_queue_cap());
+    }
+
+    // ── Env override tests for new sections ─────────────────────────────────
+
+    #[test]
+    fn set_prop_todotracker_enabled() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "todotracker.enabled", "false").unwrap();
+        assert!(!c.todotracker.enabled);
+    }
+
+    #[test]
+    fn set_prop_todotracker_width() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "todotracker.width", "50").unwrap();
+        assert_eq!(c.todotracker.width, 50);
+    }
+
+    #[test]
+    fn set_prop_message_queue_cap() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "message_queue.cap", "128").unwrap();
+        assert_eq!(c.message_queue.cap, 128);
+    }
+
+    #[test]
+    fn set_prop_message_queue_auto_open() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "message_queue.auto_open", "false").unwrap();
+        assert!(!c.message_queue.auto_open);
+    }
+
+    #[test]
+    fn set_prop_todotracker_location() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "todotracker.location", "left").unwrap();
+        assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
     }
 }
