@@ -1,4 +1,4 @@
-import { getCost, getMapKeys, getMemory, getSessions, listProps, patchConfig } from './api';
+import { getCost, getMapKeys, getSessions, getStatus, listProps, patchConfig } from './api';
 
 export interface AgentSummary {
   alias: string;
@@ -21,7 +21,11 @@ export interface AgentSummary {
   sessionCount: number;
   lastActivity: string | null;
   monthCostUsd: number | null;
-  /** Persisted memory rows attributed to this agent via `agent_alias`. */
+  /** Live entry count from this agent's OWN memory backend, fetched via
+   *  `/api/status?agent=<alias>` (which dispatches to the active per-agent
+   *  backend). For hindsight this is the private per-agent bank; for SQL it is
+   *  the agent-scoped rows. Not derived from install-wide `agent_alias`
+   *  bucketing, which read 0 for hindsight (its rows carry no `agent_alias`). */
   memoryCount: number;
 }
 
@@ -64,12 +68,15 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   const { keys } = await getMapKeys('agents');
   if (keys.length === 0) return [];
 
-  // Fetch sessions + cost + memories in parallel with per-agent prop
-  // lookups. Falls back to empty/null if any endpoint errors so a partial
-  // outage doesn't blank the agents page.
+  // Fetch sessions + cost in parallel with per-agent prop lookups. Falls back
+  // to empty/null if any endpoint errors so a partial outage doesn't blank the
+  // agents page. Per-agent memory counts come from each agent's own
+  // `/api/status?agent=<alias>` below (which dispatches to that agent's active
+  // backend) rather than bucketing install-wide entries by `agent_alias` -
+  // hindsight rows live in a per-agent server bank and carry no `agent_alias`,
+  // so the old bucketing always read 0 for them.
   const sessionsPromise = getSessions().catch(() => []);
   const costPromise = getCost().catch(() => null);
-  const memoriesPromise = getMemory().catch(() => []);
 
   // Reverse-build agent → peer_groups in parallel with the per-agent walks.
   // listProps('peer_groups.<alias>.agents') is the field that names members.
@@ -93,7 +100,15 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
 
   const summaries = await Promise.all(
     keys.map(async (alias): Promise<AgentSummary> => {
-      const { entries } = await listProps(`agents.${alias}`);
+      const [{ entries }, memoryCount] = await Promise.all([
+        listProps(`agents.${alias}`),
+        // Per-agent status dispatches to that agent's OWN memory backend, so
+        // the count is correct for hindsight (per-agent bank), SQL (scoped
+        // rows), markdown (its dir), etc. Falls back to 0 on error.
+        getStatus(alias)
+          .then((s) => s.memory_count ?? 0)
+          .catch(() => 0),
+      ]);
       // Configurable-macro paths are kebab-case (snake field names
       // converted via snake_to_kebab in zeroclaw-macros).
       const lookup = (suffixKebab: string) =>
@@ -118,23 +133,16 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         sessionCount: 0,
         lastActivity: null,
         monthCostUsd: null,
-        memoryCount: 0,
+        memoryCount,
       };
     }),
   );
 
-  const [sessions, cost, peerGroups, memories] = await Promise.all([
+  const [sessions, cost, peerGroups] = await Promise.all([
     sessionsPromise,
     costPromise,
     peerGroupsPromise,
-    memoriesPromise,
   ]);
-  const memoriesByAgent = memories.reduce<Record<string, number>>((acc, m) => {
-    if (m.agent_alias) {
-      acc[m.agent_alias] = (acc[m.agent_alias] ?? 0) + 1;
-    }
-    return acc;
-  }, {});
   for (const summary of summaries) {
     const owned = sessions.filter((s) => s.agent_alias === summary.alias);
     summary.sessionCount = owned.length;
@@ -146,7 +154,6 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
     const agentCost = cost?.by_agent?.[summary.alias];
     summary.monthCostUsd = agentCost ? agentCost.cost_usd : null;
     summary.peerGroups = peerGroups[summary.alias] ?? [];
-    summary.memoryCount = memoriesByAgent[summary.alias] ?? 0;
   }
 
   return summaries;
