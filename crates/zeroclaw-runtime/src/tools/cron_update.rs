@@ -651,6 +651,9 @@ mod tests {
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(channel_strs.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
         assert!(channel_strs.contains(&"dingtalk"));
+        assert!(channel_strs.contains(&"wechat"));
+        assert!(channel_strs.contains(&"signal"));
+        assert!(channel_strs.contains(&"email"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks
         // back to the originating conversation.

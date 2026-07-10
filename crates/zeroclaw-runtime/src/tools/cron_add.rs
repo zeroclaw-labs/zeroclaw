@@ -1160,6 +1160,9 @@ mod tests {
 
         assert_eq!(values.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
         assert!(values.contains(&"dingtalk"));
+        assert!(values.contains(&"wechat"));
+        assert!(values.contains(&"signal"));
+        assert!(values.contains(&"email"));
     }
 
     #[tokio::test]

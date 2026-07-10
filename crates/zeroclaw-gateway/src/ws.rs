@@ -1014,10 +1014,13 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context window (max input tokens) for this agent.
+    // Resolve context budget for this agent. Wire field is named
+    // `max_context_tokens` and must track the runtime-profile budget
+    // (same source Zerocode's context meter uses), not the provider
+    // model-window helper which falls back to 32_000 when unset.
     let max_context_tokens = {
         let cfg = state.config.read();
-        cfg.effective_model_context_window(&turn_alias) as u64
+        cfg.effective_max_context_tokens(&turn_alias) as u64
     };
 
     // Broadcast agent_start event

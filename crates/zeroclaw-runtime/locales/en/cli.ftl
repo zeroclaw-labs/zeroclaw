@@ -891,6 +891,7 @@ channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
+channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
