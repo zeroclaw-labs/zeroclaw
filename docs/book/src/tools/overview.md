@@ -1,10 +1,13 @@
 # Tools: Overview
 
-**Tools** are the agent's hands. A tool is a capability the model can invoke mid-conversation, run a shell command, fetch an HTTP URL, open a browser, write a file, read a sensor. Every tool call is subject to [security policy](../security/overview.md) and produces a [tool receipt](../security/tool-receipts.md).
+**Tools** are the agent's hands. A tool is a capability the model can invoke mid-conversation, run a shell command, fetch an HTTP URL, open a browser, write a file, read a sensor. Every tool call is subject to [security policy](../security/overview.md). Successful executions can include a [tool receipt](../security/tool-receipts.md) when receipts are enabled.
 
 Tools are not to be confused with `zeroclaw` CLI subcommands. CLI commands are for operators; tools are for the agent.
 
 An agent gets its tools through the skill, knowledge, and MCP bundles it references; see [Agents](../agents/overview.md) for how bundles attach to an agent.
+For the turn-level path from provider tool call to approval, dispatch, receipt,
+observer event, and history entry, see
+[Tool execution lifecycle](../architecture/tool-execution-lifecycle.md).
 
 Before adding a built-in tool or replacing one with an external integration,
 use the [Built-In Tool Inventory](../developing/tool-inventory.md)
@@ -89,7 +92,7 @@ Every tool invocation is classified by risk:
 
 The [autonomy level](../security/autonomy.md) determines what each risk tier can do without operator approval. Default (`Supervised`): low runs, medium asks, high blocks.
 
-Every tool invocation, approved or blocked, produces a [tool receipt](../security/tool-receipts.md) in the audit log.
+When receipts are enabled, successful executions receive a [tool receipt](../security/tool-receipts.md). Denied, blocked, replaced, failed, or interrupted calls do not receive receipts.
 
 ## Disabling tools on non-CLI channels
 
@@ -107,6 +110,7 @@ See [Autonomy levels](../security/autonomy.md) for the full set of per-profile f
 ## See also
 
 - [MCP](./mcp.md)
+- [Tool execution lifecycle](../architecture/tool-execution-lifecycle.md)
 - [ACP](../channels/acp.md)
 - [Browser automation](./browser.md)
 - [Security → Overview](../security/overview.md)

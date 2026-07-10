@@ -1819,6 +1819,7 @@ export function addCronJob(body: {
   allowed_tools?: string[];
   enabled?: boolean;
   delivery?: CronDelivery;
+  uses_memory?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
     method: "POST",
@@ -1873,6 +1874,7 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    uses_memory?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(

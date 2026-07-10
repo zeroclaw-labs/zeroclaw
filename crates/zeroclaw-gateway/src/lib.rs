@@ -43,6 +43,7 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -1992,6 +1993,17 @@ pub async fn run_gateway(
         )
     } else {
         inner
+    };
+
+    let tls_enabled = config
+        .gateway
+        .tls
+        .as_ref()
+        .is_some_and(|tls_cfg| tls_cfg.enabled);
+    let app = if tls_enabled {
+        app.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
+    } else {
+        app.layer(axum::middleware::from_fn(security_headers::apply))
     };
 
     // ── TLS / mTLS setup ───────────────────────────────────────────
