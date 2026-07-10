@@ -96,11 +96,12 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
-const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 5] = [
+const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 6] = [
     SQLITE_PROFILE,
     LUCID_PROFILE,
     POSTGRES_PROFILE,
     MARKDOWN_PROFILE,
+    HINDSIGHT_PROFILE,
     NONE_PROFILE,
 ];
 
@@ -154,6 +155,10 @@ mod tests {
             classify_memory_backend("markdown"),
             MemoryBackendKind::Markdown
         );
+        assert_eq!(
+            classify_memory_backend("hindsight"),
+            MemoryBackendKind::Hindsight
+        );
         assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
     }
 
@@ -165,12 +170,13 @@ mod tests {
     #[test]
     fn selectable_backends_are_ordered_for_onboarding() {
         let backends = selectable_memory_backends();
-        assert_eq!(backends.len(), 5);
+        assert_eq!(backends.len(), 6);
         assert_eq!(backends[0].key, "sqlite");
         assert_eq!(backends[1].key, "lucid");
         assert_eq!(backends[2].key, "postgres");
         assert_eq!(backends[3].key, "markdown");
-        assert_eq!(backends[4].key, "none");
+        assert_eq!(backends[4].key, "hindsight");
+        assert_eq!(backends[5].key, "none");
     }
 
     #[test]
@@ -213,13 +219,40 @@ mod tests {
 
     #[test]
     fn each_known_backend_profile_carries_a_matching_key() {
-        for name in ["sqlite", "lucid", "postgres", "qdrant", "markdown", "none"] {
+        for name in [
+            "sqlite",
+            "lucid",
+            "postgres",
+            "qdrant",
+            "markdown",
+            "hindsight",
+            "none",
+        ] {
             assert_eq!(
                 memory_backend_profile(name).key,
                 name,
                 "profile for {name} should carry a matching key"
             );
         }
+    }
+
+    #[test]
+    fn hindsight_profile_is_external_non_sqlite_backend() {
+        let profile = memory_backend_profile("hindsight");
+        assert_eq!(profile.key, "hindsight");
+        assert!(!profile.sqlite_based);
+        assert!(!profile.uses_sqlite_hygiene);
+        assert!(profile.auto_save_default);
+    }
+
+    #[test]
+    fn hindsight_is_selectable_for_onboarding() {
+        assert!(
+            selectable_memory_backends()
+                .iter()
+                .any(|b| b.key == "hindsight"),
+            "hindsight should be an onboarding option"
+        );
     }
 
     #[test]

@@ -35,9 +35,11 @@ pub enum AccessMode {
 
 /// Per-agent memory backend selector.
 ///
-/// Closed set; the schema is law. The enum mirrors the storage-instance
+/// Closed set; the schema is law. Most variants mirror the storage-instance
 /// outer keys under `Config.storage.<kind>.<alias>`: `sqlite`, `postgres`,
 /// `qdrant`, `markdown`, `lucid`, plus `none` for the no-storage case.
+/// `hindsight` is the exception: it has no local storage instance because
+/// persistence and vectorization live entirely server-side (see below).
 ///
 /// An agent's backend is locked at agent creation and immutable on
 /// subsequent loads. `Config::validate()` enforces immutability against
@@ -64,6 +66,15 @@ pub enum MemoryBackendKind {
     /// Hybrid local SQLite + external Lucid CLI
     /// (`crates/zeroclaw-memory/src/lucid.rs`).
     Lucid,
+    /// External Hindsight HTTP memory
+    /// (`crates/zeroclaw-memory/src/hindsight.rs`). Store and recall route to
+    /// a remote Hindsight service that owns vectorization and embedding
+    /// search, so no local embedding provider or storage instance is needed.
+    /// Endpoint/top-k/token settings come from the install-wide
+    /// `[memory.hindsight]` section; the per-agent bank derives from
+    /// `bank_template` (or an explicit `agents.<alias>.memory.bank_id`),
+    /// giving each agent a private server-namespaced memory space.
+    Hindsight,
 }
 
 /// Per-agent filesystem and cross-agent access settings, nested under
@@ -120,6 +131,14 @@ pub struct AgentMemoryConfig {
     /// The backend kind this agent uses. Defaults to `Sqlite` for new
     /// agents; once an agent has on-disk data the value is locked.
     pub backend: MemoryBackendKind,
+    /// Explicit Hindsight bank id override for this agent. Only meaningful
+    /// when `backend = "hindsight"`. When empty (default), the runtime
+    /// derives the bank from the install-wide `[memory.hindsight] bank_template`
+    /// with `{agent}` substituted by this agent's alias, giving each agent a
+    /// private server-namespaced memory space. Set this to pin a specific
+    /// bank (e.g. to share one bank across a small group of aliases).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bank_id: String,
 }
 
 /// Preferred output modality for a peer group.
@@ -311,6 +330,7 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Qdrant, "\"qdrant\""),
             (MemoryBackendKind::Markdown, "\"markdown\""),
             (MemoryBackendKind::Lucid, "\"lucid\""),
+            (MemoryBackendKind::Hindsight, "\"hindsight\""),
         ];
         for (kind, expected) in cases {
             let json = serde_json::to_string(&kind).unwrap();
@@ -368,6 +388,26 @@ gamma = "read_write"
         assert_eq!(
             AgentMemoryConfig::default().backend,
             MemoryBackendKind::Sqlite
+        );
+        assert!(AgentMemoryConfig::default().bank_id.is_empty());
+    }
+
+    #[test]
+    fn agent_memory_config_round_trips_hindsight_with_bank_id() {
+        let toml_input = r#"
+backend = "hindsight"
+bank_id = "zeroclaw-research"
+"#;
+        let parsed: AgentMemoryConfig = toml::from_str(toml_input).unwrap();
+        assert_eq!(parsed.backend, MemoryBackendKind::Hindsight);
+        assert_eq!(parsed.bank_id, "zeroclaw-research");
+
+        // Empty bank_id is skipped on serialize so backwards-compat configs
+        // stay byte-identical.
+        let default_toml = toml::to_string(&AgentMemoryConfig::default()).unwrap();
+        assert!(
+            !default_toml.contains("bank_id"),
+            "empty bank_id must not serialize: {default_toml}"
         );
     }
 

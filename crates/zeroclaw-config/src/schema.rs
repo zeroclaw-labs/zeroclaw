@@ -4416,6 +4416,10 @@ impl Config {
                 .get(alias)
                 .map(ActiveStorage::Lucid)
                 .unwrap_or(ActiveStorage::None),
+            // Hindsight has no `[storage.*]` instance: persistence and
+            // vectorization are server-side. Its settings live on
+            // `[memory.hindsight]`, so resolve straight to that section.
+            "hindsight" => ActiveStorage::Hindsight(&self.memory.hindsight),
             _ => ActiveStorage::None,
         }
     }
@@ -4439,6 +4443,10 @@ pub enum ActiveStorage<'a> {
     Markdown(&'a MarkdownStorageConfig),
     /// Lucid CLI sync instance.
     Lucid(&'a LucidStorageConfig),
+    /// External Hindsight HTTP memory. Carries the `[memory.hindsight]`
+    /// section rather than a `[storage.*]` instance, because persistence and
+    /// vectorization are server-side.
+    Hindsight(&'a HindsightMemoryConfig),
 }
 
 impl ActiveStorage<'_> {
@@ -4452,6 +4460,7 @@ impl ActiveStorage<'_> {
             ActiveStorage::Qdrant(_) => "qdrant",
             ActiveStorage::Markdown(_) => "markdown",
             ActiveStorage::Lucid(_) => "lucid",
+            ActiveStorage::Hindsight(_) => "hindsight",
         }
     }
 }
@@ -10457,6 +10466,16 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub policy: MemoryPolicyConfig,
+
+    // ── Hindsight external backend ──────────────────────────────
+    /// Hindsight external-memory settings (`[memory.hindsight]`). Only
+    /// consulted when an agent's `backend = "hindsight"`. Unlike the SQL /
+    /// Qdrant backends, Hindsight has no `[storage.<kind>.<alias>]` instance
+    /// because persistence and vectorization are server-side; its endpoint
+    /// and bank-derivation live here instead.
+    #[serde(default)]
+    #[nested]
+    pub hindsight: HindsightMemoryConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -10480,6 +10499,126 @@ pub struct MemoryPolicyConfig {
     /// Namespaces that are read-only (writes are rejected).
     #[serde(default)]
     pub read_only_namespaces: Vec<String>,
+}
+
+/// Hindsight external-memory configuration (`[memory.hindsight]` section).
+///
+/// Consulted only when an agent selects `backend = "hindsight"`. The remote
+/// Hindsight service owns vectorization and embedding search, so this backend
+/// needs no local embedding provider and no `[storage.*]` instance - just an
+/// endpoint, a per-agent bank derivation, and a bearer token.
+///
+/// Token handling: the bearer token is a secret and is deliberately kept out
+/// of the committed config. By default the runtime reads it from the env var
+/// named by `token_env` (`ZC_HINDSIGHT_TOKEN`). An inline `token` may be set in
+/// a non-committed local config as an escape hatch; `token_env` wins when both
+/// are present. This sidesteps the `${ENV}`-non-expansion gotcha by resolving
+/// the environment in the driver rather than relying on string interpolation.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.hindsight"]
+#[serde(default)]
+pub struct HindsightMemoryConfig {
+    /// Base URL of the Hindsight HTTP API (no trailing slash required). The
+    /// driver appends `/v1/default/banks/<bank>/memories[...]` for retain and
+    /// recall. Default targets the tokengate embedding proxy.
+    #[serde(default = "default_hindsight_base_url")]
+    pub base_url: String,
+    /// Template used to derive each agent's private bank id. The literal
+    /// `{agent}` is replaced by the agent alias, so `zeroclaw-{agent}` yields
+    /// `zeroclaw-clawdia` for agent `clawdia`. A per-agent
+    /// `agents.<alias>.memory.bank_id` override takes precedence over this
+    /// template when set. The server namespaces banks per account on top of
+    /// this id.
+    #[serde(default = "default_hindsight_bank_template")]
+    pub bank_template: String,
+    /// Default number of memories to return from a recall when the caller
+    /// does not specify a limit. Must be greater than zero.
+    #[serde(default = "default_hindsight_top_k")]
+    pub top_k: usize,
+    /// Name of the environment variable that holds the bearer token. Read at
+    /// backend construction so no secret lands in the committed config. This
+    /// is the NAME of an env var, not a secret itself, so it is classified as
+    /// a public value even though its name is credential-shaped.
+    #[serde(default = "default_hindsight_token_env")]
+    #[credential_class = "public_value"]
+    pub token_env: String,
+    /// Optional inline bearer token. Escape hatch for non-committed local
+    /// configs; when both this and `token_env` resolve, `token_env` wins.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl Default for HindsightMemoryConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_hindsight_base_url(),
+            bank_template: default_hindsight_bank_template(),
+            top_k: default_hindsight_top_k(),
+            token_env: default_hindsight_token_env(),
+            token: None,
+        }
+    }
+}
+
+impl HindsightMemoryConfig {
+    /// Resolve this agent's bank id: an explicit per-agent `bank_id` override
+    /// wins; otherwise `bank_template` with `{agent}` substituted by `alias`.
+    #[must_use]
+    pub fn bank_for(&self, alias: &str, agent_override: &str) -> String {
+        let trimmed = agent_override.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        self.bank_template.replace("{agent}", alias)
+    }
+
+    /// Validate the section's own invariants. Called from `Config::validate`
+    /// only when at least one agent uses the hindsight backend, so installs
+    /// that never touch hindsight pay nothing and cannot be broken by it.
+    pub(crate) fn validate_self(&self) -> Result<(), String> {
+        let base = self.base_url.trim();
+        if base.is_empty() {
+            return Err("[memory.hindsight] base_url must not be empty".to_string());
+        }
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            return Err(format!(
+                "[memory.hindsight] base_url must start with http:// or https:// (got {base:?})"
+            ));
+        }
+        if !self.bank_template.contains("{agent}") && self.bank_template.trim().is_empty() {
+            return Err(
+                "[memory.hindsight] bank_template must not be empty (use `{agent}` for per-agent banks)"
+                    .to_string(),
+            );
+        }
+        if self.top_k == 0 {
+            return Err("[memory.hindsight] top_k must be greater than zero".to_string());
+        }
+        if self.token_env.trim().is_empty() {
+            return Err("[memory.hindsight] token_env must name an environment variable".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn default_hindsight_base_url() -> String {
+    "https://tokengate.appz.cloud/api/embedding/hindsight".into()
+}
+
+fn default_hindsight_bank_template() -> String {
+    "zeroclaw-{agent}".into()
+}
+
+fn default_hindsight_top_k() -> usize {
+    5
+}
+
+fn default_hindsight_token_env() -> String {
+    "ZC_HINDSIGHT_TOKEN".into()
 }
 
 fn default_retrieval_stages() -> Vec<String> {
@@ -10644,6 +10783,7 @@ impl Default for MemoryConfig {
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
+            hindsight: HindsightMemoryConfig::default(),
         }
     }
 }
@@ -19983,6 +20123,20 @@ impl Config {
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
                     );
                 }
+            }
+
+            // Hindsight backend: validate the shared `[memory.hindsight]`
+            // section once we see an agent that selects it. Skipped entirely
+            // for installs that never use hindsight, so its defaults can never
+            // break an unrelated config.
+            if agent.memory.backend == crate::multi_agent::MemoryBackendKind::Hindsight
+                && let Err(msg) = self.memory.hindsight.validate_self()
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    "memory.hindsight".to_string(),
+                    "agents.{alias}.memory.backend = \"hindsight\" but {msg}",
+                );
             }
 
             // workspace.read_memory_from: every alias must exist as a
@@ -32708,6 +32862,7 @@ allowed_users = []
             risk_profile: "default".into(),
             memory: crate::multi_agent::AgentMemoryConfig {
                 backend: crate::multi_agent::MemoryBackendKind::Postgres,
+                ..crate::multi_agent::AgentMemoryConfig::default()
             },
             ..AliasedAgentConfig::default()
         };
@@ -32728,6 +32883,76 @@ allowed_users = []
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_accepts_hindsight_agent_with_default_section() {
+        // A hindsight agent validates cleanly against the default
+        // [memory.hindsight] section (valid base_url, bank_template, top_k).
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config
+            .validate()
+            .expect("hindsight agent with default section should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_hindsight_agent_with_bad_base_url() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.base_url = "ftp://nope".to_string();
+        let err = config
+            .validate()
+            .expect_err("invalid hindsight base_url must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory.hindsight") && msg.contains("http"),
+            "expected hindsight base_url explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_ignores_hindsight_section_when_no_agent_uses_it() {
+        // A broken [memory.hindsight] must not break installs that never
+        // select the backend: validation is scoped to hindsight agents.
+        let mut config = multi_agent_test_config();
+        config.memory.hindsight.top_k = 0; // invalid, but unused
+        config
+            .validate()
+            .expect("unused hindsight section must not fail validation");
+    }
+
+    #[test]
+    async fn config_round_trips_hindsight_memory_section() {
+        let toml_input = r#"
+schema_version = 3
+
+[memory]
+backend = "sqlite"
+
+[memory.hindsight]
+base_url = "https://tokengate.appz.cloud/api/embedding/hindsight"
+bank_template = "zeroclaw-{agent}"
+top_k = 7
+token_env = "ZC_HINDSIGHT_TOKEN"
+"#;
+        let cfg: Config = toml::from_str(toml_input).expect("parse hindsight section");
+        assert_eq!(cfg.memory.hindsight.top_k, 7);
+        assert_eq!(cfg.memory.hindsight.bank_template, "zeroclaw-{agent}");
+        assert_eq!(cfg.memory.hindsight.token_env, "ZC_HINDSIGHT_TOKEN");
+        assert_eq!(cfg.memory.hindsight.bank_for("clawdia", ""), "zeroclaw-clawdia");
+        // Round-trip back to TOML and confirm the section survives.
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        assert!(serialized.contains("bank_template = \"zeroclaw-{agent}\""));
+    }
+
+    #[test]
+    async fn resolve_active_storage_reports_hindsight_kind() {
+        let mut config = Config::default();
+        config.memory.backend = "hindsight".to_string();
+        assert_eq!(config.resolve_active_storage().kind(), "hindsight");
     }
 
     #[test]
