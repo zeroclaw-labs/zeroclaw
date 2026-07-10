@@ -4077,6 +4077,25 @@ impl MatrixChannel {
             }
         }
     }
+
+    async fn redact_single_draft_before_final(
+        client: &Client,
+        recipient: &str,
+        event_id: &OwnedEventId,
+        reason: &str,
+    ) {
+        if let Err(err) =
+            outbound::redact(client, recipient, event_id, Some(reason.to_string())).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                "matrix: single-message draft cleanup failed before final send; sending final response anyway"
+            );
+        }
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for MatrixChannel {
@@ -4443,25 +4462,13 @@ impl Channel for MatrixChannel {
                     // Delete before the final send so the user's timeline
                     // lands on the final answer rather than a trailing
                     // "message deleted" event after it.
-                    if let Err(err) = outbound::redact(
+                    Self::redact_single_draft_before_final(
                         client,
                         recipient,
                         &draft.event_id,
-                        Some("streaming draft replaced by final response".to_string()),
+                        "streaming draft replaced by final response",
                     )
-                    .await
-                    {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"err": err.to_string()})),
-                            "matrix: single-message draft delete failed before final send; sending final response anyway"
-                        );
-                    }
+                    .await;
                 }
 
                 if plan.keeps_draft()
@@ -4472,19 +4479,13 @@ impl Channel for MatrixChannel {
                         self.config.message_max_bytes.max(1),
                     ) {
                         streaming::SingleRetainedDraftAction::DeletePlaceholder => {
-                            outbound::redact(
+                            Self::redact_single_draft_before_final(
                                 client,
                                 recipient,
                                 &draft.event_id,
-                                Some(
-                                    "empty streaming draft removed before final response"
-                                        .to_string(),
-                                ),
+                                "empty streaming draft removed before final response",
                             )
-                            .await
-                            .context(
-                                "matrix: empty single-message draft delete failed before final send",
-                            )?;
+                            .await;
                         }
                         streaming::SingleRetainedDraftAction::Flush(visible_text) => {
                             if let Err(edit_err) =
@@ -5846,8 +5847,7 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn single_delete_redact_failure_still_sends_final() {
+        async fn assert_single_redact_failure_still_sends_final(stream_draft_delete: bool) {
             let server = MockServer::start().await;
             let room_id = "!room:server";
             let draft_id = owned_event_id!("$draft:server");
@@ -5975,7 +5975,7 @@ mod tests {
                     device_id: Some("DEVICE".to_string()),
                     allowed_rooms: vec![room_id.to_string()],
                     stream_mode: MatrixStreamMode::SingleMessage,
-                    stream_draft_delete: true,
+                    stream_draft_delete,
                     reply_in_thread: false,
                     ack_reactions: Some(false),
                     ..MatrixConfig::default()
@@ -6050,9 +6050,19 @@ mod tests {
                         .into_iter()
                         .map(|request| request.url.path().to_string())
                         .collect::<Vec<_>>();
-                    panic!("delete-mode finalize timed out; received paths: {paths:?}");
+                    panic!("single-message finalize timed out; received paths: {paths:?}");
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn single_delete_redact_failure_still_sends_final() {
+            assert_single_redact_failure_still_sends_final(true).await;
+        }
+
+        #[tokio::test]
+        async fn retained_placeholder_redact_failure_still_sends_final() {
+            assert_single_redact_failure_still_sends_final(false).await;
         }
 
         #[test]
