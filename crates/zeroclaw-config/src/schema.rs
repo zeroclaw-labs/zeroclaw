@@ -10566,6 +10566,24 @@ pub struct MemoryConfig {
     /// Action to take when a duplicate is detected.
     #[serde(default)]
     pub dedup_action: MemoryDedupAction,
+    /// Write a per-turn "Daily history" entry during auto-consolidation. Each
+    /// substantive turn otherwise appends one timestamped Daily summary row, so
+    /// with a shared/append-only backend (e.g. hindsight) ordinary question
+    /// turns steadily accumulate transient rows. Turn this off to stop the
+    /// per-turn Daily write entirely (Core fact extraction still runs). Default:
+    /// true (keep the daily log), but see `daily_dedup` which gates it against
+    /// near-duplicates by default so it does not flood.
+    #[serde(default = "default_true")]
+    pub consolidate_daily: bool,
+    /// Dedup-gate the per-turn Daily history write: before appending a Daily
+    /// summary, recall recent Daily entries and skip the write when an
+    /// exact or near-identical (Jaccard >= `dedup_jaccard_threshold`) summary
+    /// already exists. Independent of `dedup_on_write` (which governs only the
+    /// Phase-2 Core write), so the transient Daily log can be deduplicated
+    /// without changing Core behavior. Default: true (safe: repeated/near-
+    /// identical turn summaries are not stored again).
+    #[serde(default = "default_true")]
+    pub daily_dedup: bool,
 
     // ── Memory Budget / Pinning ────────────────────────────────
     /// Maximum Core rows before budget compaction. 0 = unbounded.
@@ -11057,6 +11075,8 @@ impl Default for MemoryConfig {
             dedup_on_write: false,
             dedup_jaccard_threshold: default_dedup_jaccard_threshold(),
             dedup_action: MemoryDedupAction::default(),
+            consolidate_daily: true,
+            daily_dedup: true,
             core_max_rows: 0,
             core_max_bytes: 0,
             daily_max_rows: 0,
