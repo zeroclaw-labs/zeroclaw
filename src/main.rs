@@ -1791,6 +1791,11 @@ async fn run_quickstart_cli(
                     | MemoryChoice::Qdrant
                     | MemoryChoice::Lucid
                     | MemoryChoice::None => (),
+                    // Hindsight is intentionally omitted from the interactive
+                    // quickstart picker (like Qdrant): it needs an external
+                    // endpoint + bearer token, so it is opt-in via
+                    // `[memory.hindsight]` rather than a one-click choice.
+                    MemoryChoice::Hindsight => (),
                 };
                 let labels: Vec<String> = kinds
                     .iter()
@@ -4457,7 +4462,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            // For hindsight, append the per-agent bank template so the operator
+            // can see which server-side bank scheme is active (e.g.
+            // `hindsight (bank: zeroclaw-{agent})`) rather than a bare name.
+            let memory_backend = if effective_memory_backend == "hindsight" {
+                format!(
+                    "hindsight (bank: {})",
+                    config.memory.hindsight.bank_template
+                )
+            } else {
+                effective_memory_backend.to_string()
+            };
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {
