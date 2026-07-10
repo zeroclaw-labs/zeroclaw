@@ -604,6 +604,83 @@ impl McpRegistry {
         })
     }
 
+    /// Build a registry with `n` placeholder servers, each backed by a no-op
+    /// transport. The server names are `stub_0`, `stub_1`, ..., `stub_{n-1}`.
+    ///
+    /// Test-only: gated behind the `test-helpers` feature so it is NOT
+    /// available in production builds. Downstream test suites (e.g.
+    /// `zeroclaw-runtime::daemon`) enable the feature via their
+    /// `[dev-dependencies]` declaration and use this helper to build an
+    /// `Arc<McpRegistry>` whose `server_count() == n` without spawning a
+    /// real stdio child, so unit tests can exercise
+    /// "registry-completeness" decisions purely on `server_count()`. The
+    /// transport is a local no-op so the registry is safe to drop in tests
+    /// without leaking any OS resources — but it MUST NOT be used in
+    /// production code: any real MCP tool call on the resulting registry
+    /// will panic in the `unreachable!()` branch.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_count(n: usize) -> Self {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        /// No-op transport: never contacted in the daemon-side tests that
+        /// exercise `server_count`-driven decisions. Returning `Err` would
+        /// panic any caller that actually tries to use the registry; the
+        /// daemon tests only read `server_count` and compare Arc pointers,
+        /// so the unreachable body is acceptable.
+        struct NoopTransport;
+
+        #[async_trait]
+        impl McpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &mut self,
+                _request: &JsonRpcRequest,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_with_server_count registry is only used for server_count/Arc equality"
+                )
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn stub_server(name: &str) -> McpServer {
+            let inner = McpServerInner {
+                config: McpServerConfig {
+                    name: name.to_string(),
+                    ..McpServerConfig::default()
+                },
+                transport: Box::new(NoopTransport),
+                #[cfg(target_has_atomic = "64")]
+                next_id: AtomicU64::new(0),
+                #[cfg(not(target_has_atomic = "64"))]
+                next_id: AtomicU32::new(0),
+                tools: Vec::new(),
+                capabilities: McpServerCapabilities::default(),
+            };
+            McpServer {
+                inner: Arc::new(Mutex::new(inner)),
+            }
+        }
+
+        let mut servers = Vec::with_capacity(n);
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index = HashMap::new();
+        for i in 0..n {
+            let name = format!("stub_{i}");
+            let server_idx = servers.len();
+            server_index.insert(name.clone(), server_idx);
+            servers.push(stub_server(&name));
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()
