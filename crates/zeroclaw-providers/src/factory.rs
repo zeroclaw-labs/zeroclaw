@@ -993,6 +993,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(mt);
         }
+        if let Some(ts) = opts.provider_timeout_secs {
+            p = p.with_timeout_secs(ts);
+        }
         Ok(Box::new(p))
     }
 }
