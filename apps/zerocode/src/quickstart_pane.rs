@@ -404,6 +404,10 @@ fn memory_options() -> Vec<PickerOption> {
         | MemoryKind::Qdrant
         | MemoryKind::Lucid
         | MemoryKind::None => (),
+        // Hindsight is omitted from the quickstart picker (like Qdrant): it
+        // needs an external endpoint + bearer token, so it is opt-in via
+        // `[memory.hindsight]` rather than a one-click onboarding choice.
+        MemoryKind::Hindsight => (),
     };
     variants
         .into_iter()
