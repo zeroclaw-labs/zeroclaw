@@ -33,9 +33,10 @@ pub use capability::{
 };
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
-    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
-    LayoutGeometry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay,
-    SopGraph, SopGraphExt, TRIGGER_NODE_BASE, TextGraphFormat, ToolSpecs, render_graph_text,
+    FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
+    GraphWire, LayoutGeometry, LegendEntry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState,
+    PinClass, RunOverlay, SopGraph, SopGraphExt, TRIGGER_NODE_BASE, TextGraphFormat, ToolSpecs,
+    render_graph_text,
 };
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;

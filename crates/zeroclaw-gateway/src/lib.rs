@@ -1745,6 +1745,10 @@ pub async fn run_gateway(
             get(api_sop_author::handle_sop_trigger_sources),
         )
         .route(
+            "/api/sops/graph-legend",
+            get(api_sop_author::handle_sop_graph_legend),
+        )
+        .route(
             "/api/tools/param-options",
             post(api_sop_author::handle_tools_param_options),
         )

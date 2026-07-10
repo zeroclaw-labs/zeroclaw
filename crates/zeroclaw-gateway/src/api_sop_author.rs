@@ -576,3 +576,13 @@ pub async fn handle_sop_graph_draft(
         zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&req.sop, &sop_tool_specs(&state));
     Json(graph).into_response()
 }
+
+pub async fn handle_sop_graph_legend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    Json(zeroclaw_runtime::sop::GraphLegend::canonical()).into_response()
+}

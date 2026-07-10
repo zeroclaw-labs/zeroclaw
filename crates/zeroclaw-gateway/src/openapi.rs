@@ -110,6 +110,7 @@ pub fn build_spec() -> serde_json::Value {
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
             "Sop":              schema_value::<zeroclaw_runtime::sop::Sop>(),
             "SopGraph":         schema_value::<zeroclaw_runtime::sop::SopGraph>(),
+            "GraphLegend":      schema_value::<zeroclaw_runtime::sop::GraphLegend>(),
             "RunOverlay":       schema_value::<zeroclaw_runtime::sop::RunOverlay>(),
             "ApprovalDecision": schema_value::<zeroclaw_runtime::sop::ApprovalDecision>(),
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),

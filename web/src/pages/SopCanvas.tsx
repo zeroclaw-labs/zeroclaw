@@ -5,6 +5,8 @@ import {
   runStateTone,
   flowRoleTone,
   layoutGeometry,
+  getGraphLegend,
+  indexLegend,
   CANONICAL_LAYOUT_GEOMETRY,
   type RunStateTone,
   type WireTone,
@@ -15,6 +17,7 @@ import {
   type GraphNode,
   type GraphPin,
   type GraphWire,
+  type GraphLegend,
   type FlowRole,
 } from '@/lib/sops';
 
@@ -122,11 +125,35 @@ const HANDLE_OFFSET: Partial<Record<FlowRole, number>> = {
   failure: -18,
 };
 
+// Switch nodes fill the right edge with their ports, so failure/dependency
+// handles move up into the header band instead of the center offsets.
+const SWITCH_NODE_FAILURE_Y = 8;
+const SWITCH_NODE_DEPENDENCY_Y = 20;
+
+function flowOutY(nodeY: number, kind: FlowRole, hasSwitch: boolean): number | undefined {
+  if (hasSwitch) {
+    if (kind === 'failure') return nodeY + SWITCH_NODE_FAILURE_Y;
+    if (kind === 'dependency') return nodeY + SWITCH_NODE_DEPENDENCY_Y;
+    return undefined;
+  }
+  const offset = HANDLE_OFFSET[kind];
+  return offset !== undefined ? nodeY + NODE_H / 2 + offset : undefined;
+}
+
+// Inbound flow anchors mirror the outbound convention so a wire lands on a
+// visible handle instead of the node's bare edge.
+function flowInY(nodeY: number, kind: FlowRole): number {
+  const offset = HANDLE_OFFSET[kind];
+  return nodeY + NODE_H / 2 + (offset ?? 0);
+}
+
+const EMPTY_RUN_STATE: Map<number, NodeRunState> = new Map();
+
 interface Props {
   draft: Sop;
   graph: SopGraph;
   selectedStep: number | null;
-  runStateByStep: Map<number, NodeRunState>;
+  runStateByStep?: Map<number, NodeRunState>;
   readOnly?: boolean;
   onSelectStep: (n: number) => void;
   onSelectTrigger: (index: number) => void;
@@ -140,6 +167,72 @@ interface Props {
 }
 
 type ContextMenu = { x: number; y: number; step: number | null };
+
+const LEGEND_WIRE_DASH: Partial<Record<FlowRole, string>> = {
+  dependency: '5 4',
+  trigger: '4 3',
+};
+
+function CanvasLegend({ legend }: { legend: GraphLegend | null }) {
+  const [open, setOpen] = useState(false);
+  const flowRoles = legend?.flow_roles ?? [];
+  const dataDesc =
+    legend?.pin_classes.find((p) => p.key === 'data')?.description ?? t('sops.legend_data');
+  return (
+    <div className="absolute bottom-2 left-2 z-10">
+      {open ? (
+        <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-2 text-xs shadow-lg">
+          <div className="mb-1 flex items-center justify-between gap-4">
+            <span className="font-medium text-pc-text">{t('sops.legend_title')}</span>
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              className="text-pc-text-muted hover:text-pc-text"
+              aria-label={t('sops.cancel')}
+            >
+              ×
+            </button>
+          </div>
+          <div className="space-y-1">
+            {flowRoles.map((row) => (
+              <div key={row.key} className="flex items-center gap-2" title={row.description}>
+                <svg width="28" height="8" aria-hidden>
+                  <line
+                    x1="0"
+                    y1="4"
+                    x2="28"
+                    y2="4"
+                    stroke={wireStroke(row.key as FlowRole)}
+                    strokeWidth="2"
+                    strokeDasharray={LEGEND_WIRE_DASH[row.key as FlowRole]}
+                  />
+                </svg>
+                <span className="text-pc-text-secondary">{row.description}</span>
+              </div>
+            ))}
+            <div className="flex items-center gap-2" title={dataDesc}>
+              <svg width="28" height="10" aria-hidden>
+                <line x1="0" y1="5" x2="28" y2="5" stroke={WIRE_STROKE.data} strokeWidth="2" strokeDasharray="2 3" />
+              </svg>
+              <span className="text-pc-text-secondary">{dataDesc}</span>
+            </div>
+            <div className="mt-1 border-t border-pc-border pt-1 text-pc-text-muted">
+              {t('sops.legend_handles_hint')}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="rounded border border-pc-border bg-pc-surface px-2 py-1 text-xs text-pc-text-muted hover:text-pc-text"
+        >
+          {t('sops.legend_title')}
+        </button>
+      )}
+    </div>
+  );
+}
 
 function MenuItem({
   label,
@@ -167,7 +260,7 @@ export default function SopCanvas({
   draft,
   graph,
   selectedStep,
-  runStateByStep,
+  runStateByStep = EMPTY_RUN_STATE,
   readOnly = false,
   onSelectStep,
   onSelectTrigger,
@@ -192,6 +285,30 @@ export default function SopCanvas({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const [panning, setPanning] = useState(false);
+  const [legend, setLegend] = useState<GraphLegend | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    getGraphLegend()
+      .then((l) => {
+        if (active) setLegend(l);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const flowRoleDesc = useMemo(() => indexLegend(legend?.flow_roles), [legend]);
+  const runStateDesc = useMemo(() => indexLegend(legend?.run_states), [legend]);
+
+  const handleTitle = useCallback(
+    (actionKey: string, role: FlowRole): string => {
+      const desc = flowRoleDesc.get(role);
+      return desc ? `${t(actionKey)} — ${desc}` : t(actionKey);
+    },
+    [flowRoleDesc],
+  );
 
   // Reseed from the backend layout when the projection changes, preserving any
   // positions the user has dragged for nodes that still exist.
@@ -341,6 +458,7 @@ export default function SopCanvas({
           </button>
         </div>
       )}
+      <CanvasLegend legend={legend} />
       {linkFrom !== null ? (
         <div className="absolute left-2 top-2 z-10 rounded bg-pc-elevated px-2 py-1 text-xs text-pc-text">
           {t('sops.linking')}: {linkKind}. {t('sops.link_hint')}
@@ -382,6 +500,13 @@ export default function SopCanvas({
                 label={t('sops.menu_wire_failure')}
                 onClick={() => {
                   startLink(menu.step as number, 'failure');
+                  setMenu(null);
+                }}
+              />
+              <MenuItem
+                label={t('sops.menu_wire_dependency')}
+                onClick={() => {
+                  startLink(menu.step as number, 'dependency');
                   setMenu(null);
                 }}
               />
@@ -440,14 +565,13 @@ export default function SopCanvas({
             const kind = (w.flow_role ?? 'sequence') as FlowRole;
             const active = runStateByStep.get(w.to_step) === 'active';
             const portIndex = switchPortIndex(w);
-            const handleOffset = HANDLE_OFFSET[kind];
+            const srcHasSwitch = (stepByNum.get(w.from_step)?.routing?.switch ?? []).length > 0;
             const srcY =
               portIndex !== undefined
                 ? switchPortY(a.y, portIndex)
-                : handleOffset !== undefined
-                  ? a.y + NODE_H / 2 + handleOffset
-                  : undefined;
-            const d = edgePath(a, b, srcY);
+                : flowOutY(a.y, kind, srcHasSwitch);
+            const dstY = kind === 'trigger' ? undefined : flowInY(b.y, kind);
+            const d = edgePath(a, b, srcY, dstY);
             const hovered = hoverWire === i;
             const wireLabel = kind === 'trigger' ? nodeByStep.get(w.from_step)?.subtitle : undefined;
             return (
@@ -469,7 +593,14 @@ export default function SopCanvas({
                     onDisconnect(w.from_step, w.to_step, kind, portIndex);
                   }}
                 >
-                  {!readOnly && kind !== 'trigger' ? <title>{t('sops.wire_delete_hint')}</title> : null}
+                  {kind === 'trigger' ? (
+                    <title>{flowRoleDesc.get('trigger') ?? t('sops.wire_kind_trigger')}</title>
+                  ) : (
+                    <title>
+                      {flowRoleDesc.get(kind) ?? t(`sops.wire_kind_${kind}`)}
+                      {readOnly ? '' : ` — ${t('sops.wire_delete_hint')}`}
+                    </title>
+                  )}
                 </path>
                 <path
                   d={d}
@@ -583,7 +714,10 @@ export default function SopCanvas({
                     onDisconnectData(w.to_step, w.to_pin);
                   }}
                 >
-                  {readOnly ? null : <title>{t('sops.data_wire_delete_hint')}</title>}
+                  <title>
+                    {t('sops.wire_kind_data')}
+                    {readOnly ? '' : ` — ${t('sops.data_wire_delete_hint')}`}
+                  </title>
                 </path>
                 <path
                   d={d}
@@ -746,6 +880,7 @@ export default function SopCanvas({
         {state ? (
           <text x={12} y={64} fontSize="10" fill={nodeStateStroke(state)}>
             {t(`sops.run_state.${state}`)}
+            {runStateDesc.get(state) ? <title>{runStateDesc.get(state)}</title> : null}
           </text>
         ) : null}
         {switchRules.length > 0 ? (
@@ -773,11 +908,37 @@ export default function SopCanvas({
                   className={readOnly ? '' : 'cursor-crosshair'}
                 >
                   <title>
-                    {t('sops.handle_switch')}: {rule.name}
+                    {handleTitle('sops.handle_switch', 'switch')}: {rule.name}
                   </title>
                 </circle>
               </g>
             ))}
+            <circle
+              cx={NODE_W}
+              cy={SWITCH_NODE_FAILURE_Y}
+              r={4.5}
+              fill={wireStroke('failure')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'failure');
+              }}
+              className={readOnly ? '' : 'cursor-crosshair'}
+            >
+              <title>{handleTitle('sops.handle_failure', 'failure')}</title>
+            </circle>
+            <circle
+              cx={NODE_W}
+              cy={SWITCH_NODE_DEPENDENCY_Y}
+              r={4.5}
+              fill={wireStroke('dependency')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'dependency');
+              }}
+              className={readOnly ? '' : 'cursor-crosshair'}
+            >
+              <title>{handleTitle('sops.handle_dependency', 'dependency')}</title>
+            </circle>
           </g>
         ) : (
           <g>
@@ -792,7 +953,7 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{t('sops.handle_sequence')}</title>
+              <title>{handleTitle('sops.handle_sequence', 'sequence')}</title>
             </circle>
             <circle
               cx={NODE_W}
@@ -805,11 +966,32 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{t('sops.handle_failure')}</title>
+              <title>{handleTitle('sops.handle_failure', 'failure')}</title>
+            </circle>
+            <circle
+              cx={NODE_W}
+              cy={NODE_H / 2 + 18}
+              r={5}
+              fill={wireStroke('dependency')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'dependency');
+              }}
+              className={readOnly ? '' : 'cursor-crosshair'}
+            >
+              <title>{handleTitle('sops.handle_dependency', 'dependency')}</title>
             </circle>
           </g>
         )}
-        <circle cx={0} cy={NODE_H / 2} r={5} fill="var(--pc-border-strong)" />
+        <circle cx={0} cy={NODE_H / 2} r={5} fill={wireStroke('sequence')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
+          <title>{handleTitle('sops.handle_in_sequence', 'sequence')}</title>
+        </circle>
+        <circle cx={0} cy={NODE_H / 2 - 18} r={4} fill={wireStroke('failure')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
+          <title>{handleTitle('sops.handle_in_failure', 'failure')}</title>
+        </circle>
+        <circle cx={0} cy={NODE_H / 2 + 18} r={4} fill={wireStroke('dependency')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
+          <title>{handleTitle('sops.handle_in_dependency', 'dependency')}</title>
+        </circle>
         {dataPins(node, 'inputs').map((pin, di) => {
           const active = dataLink !== null && dataTypesCompatible(dataLink.dataType, pin.data_type ?? null);
           return (

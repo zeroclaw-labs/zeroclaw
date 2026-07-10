@@ -56,6 +56,8 @@ export type ConditionValueType = Schemas['ConditionValueType'];
 export type NodeRunOverlay = Schemas['NodeRunOverlay'];
 export type NodeRunState = Schemas['NodeRunState'];
 export type SopRunStatus = Schemas['SopRunStatus'];
+export type GraphLegend = Schemas['GraphLegend'];
+export type LegendEntry = Schemas['LegendEntry'];
 
 export interface SopSummary {
   name: string;
@@ -109,6 +111,21 @@ export async function listRuns(sop?: string): Promise<SopRunSummary[]> {
 
 export function getSopGraph(name: string): Promise<SopGraph> {
   return apiFetch<SopGraph>(`/api/sops/${encodeURIComponent(name)}/graph`);
+}
+
+let legendCache: Promise<GraphLegend> | null = null;
+
+/// Canonical graph legend, cached for the session (static registry).
+export function getGraphLegend(): Promise<GraphLegend> {
+  if (!legendCache) legendCache = apiFetch<GraphLegend>('/api/sops/graph-legend');
+  return legendCache;
+}
+
+/// Index a legend section by its stable `key` for hover/description lookup.
+export function indexLegend(entries: LegendEntry[] | undefined): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const e of entries ?? []) map.set(e.key, e.description);
+  return map;
 }
 
 export function getSop(name: string): Promise<Sop> {

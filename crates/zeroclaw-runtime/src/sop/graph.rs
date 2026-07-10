@@ -19,8 +19,9 @@ pub type ToolSpecs = HashMap<String, ToolSpec>;
 // one definition. Re-exported here so the projection logic below and every
 // downstream `crate::sop::graph::GraphPin` path keep working unchanged.
 pub use zeroclaw_sop_graph::{
-    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
-    LayoutGeometry, NodeKind, NodePosition, NodeRunState, PinClass, SopGraph, TRIGGER_NODE_BASE,
+    FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
+    GraphWire, LayoutGeometry, LegendEntry, NodeKind, NodePosition, NodeRunState, PinClass,
+    SopGraph, TRIGGER_NODE_BASE,
 };
 
 /// Rendering style for `render_graph_text`.

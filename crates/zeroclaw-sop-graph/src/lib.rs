@@ -42,6 +42,29 @@ pub enum FlowRole {
     Trigger,
 }
 
+impl FlowRole {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            FlowRole::Sequence => "Implicit fallthrough or explicit routing.next.",
+            FlowRole::Dependency => {
+                "routing.depends_on fan-in: source must complete before target runs."
+            }
+            FlowRole::Failure => "on_failure: goto recovery edge.",
+            FlowRole::Switch => "Named conditional port from routing.switch.",
+            FlowRole::Trigger => "Derived from the SOP's triggers; read-only, never hand-wired.",
+        }
+    }
+}
+
+impl PinClass {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            PinClass::Flow => "Execution-order edge: which step runs after which.",
+            PinClass::Data => "Typed data edge derived from a {{steps.N}} binding.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -243,6 +266,91 @@ pub enum NodeRunState {
     Skipped,
 }
 
+impl NodeRunState {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            NodeRunState::Pending => "Not reached yet (or the run ended before reaching it).",
+            NodeRunState::Active => "The run's current step while the run is live.",
+            NodeRunState::Completed => "The step finished successfully.",
+            NodeRunState::Failed => "The step errored and did not complete.",
+            NodeRunState::Skipped => "The step was routed around and never ran.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One legend row: a graph concept plus its human description. The stable
+/// `key` is the snake_case wire value the canvas maps tones/handles against.
+pub struct LegendEntry {
+    pub key: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// The canonical legend for the SOP canvas: flow-wire roles, pin classes, and
+/// run states. The single authority a surface reads to render a legend and
+/// per-handle/per-wire hover context, so no surface hardcodes these lists.
+pub struct GraphLegend {
+    pub flow_roles: Vec<LegendEntry>,
+    pub pin_classes: Vec<LegendEntry>,
+    pub run_states: Vec<LegendEntry>,
+}
+
+impl GraphLegend {
+    pub fn canonical() -> Self {
+        let flow_roles = [
+            FlowRole::Sequence,
+            FlowRole::Dependency,
+            FlowRole::Failure,
+            FlowRole::Switch,
+            FlowRole::Trigger,
+        ]
+        .into_iter()
+        .map(|role| LegendEntry {
+            key: <&'static str>::from(role).to_string(),
+            description: role.describe().to_string(),
+        })
+        .collect();
+        let pin_classes = [PinClass::Flow, PinClass::Data]
+            .into_iter()
+            .map(|class| LegendEntry {
+                key: <&'static str>::from(class).to_string(),
+                description: class.describe().to_string(),
+            })
+            .collect();
+        let run_states = [
+            NodeRunState::Pending,
+            NodeRunState::Active,
+            NodeRunState::Completed,
+            NodeRunState::Failed,
+            NodeRunState::Skipped,
+        ]
+        .into_iter()
+        .map(|state| LegendEntry {
+            key: run_state_key(state).to_string(),
+            description: state.describe().to_string(),
+        })
+        .collect();
+        Self {
+            flow_roles,
+            pin_classes,
+            run_states,
+        }
+    }
+}
+
+fn run_state_key(state: NodeRunState) -> &'static str {
+    match state {
+        NodeRunState::Pending => "pending",
+        NodeRunState::Active => "active",
+        NodeRunState::Completed => "completed",
+        NodeRunState::Failed => "failed",
+        NodeRunState::Skipped => "skipped",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +417,32 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(role).unwrap(), wire);
         }
+    }
+
+    #[test]
+    fn canonical_legend_covers_every_variant_with_matching_keys() {
+        let legend = GraphLegend::canonical();
+        assert_eq!(legend.flow_roles.len(), 5);
+        assert_eq!(legend.pin_classes.len(), 2);
+        assert_eq!(legend.run_states.len(), 5);
+        for entry in legend
+            .flow_roles
+            .iter()
+            .chain(&legend.pin_classes)
+            .chain(&legend.run_states)
+        {
+            assert!(!entry.key.is_empty());
+            assert!(!entry.description.is_empty());
+        }
+        let flow_keys: Vec<&str> = legend.flow_roles.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            flow_keys,
+            ["sequence", "dependency", "failure", "switch", "trigger"]
+        );
+        let state_keys: Vec<&str> = legend.run_states.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            state_keys,
+            ["pending", "active", "completed", "failed", "skipped"]
+        );
     }
 }
