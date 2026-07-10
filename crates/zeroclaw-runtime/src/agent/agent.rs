@@ -1598,6 +1598,9 @@ impl Agent {
             deferred_section,
             pinned_section,
             activated_handle,
+            // from_config performs no per-turn tool_filter_groups filtering
+            // itself (the multi-agent gap tracked as #6699 follow-up scope).
+            mcp_tool_names: _,
         } = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
