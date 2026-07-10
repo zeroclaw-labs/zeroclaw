@@ -31,7 +31,9 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
-use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+use zeroclaw_api::webhook::{
+    RawWebhook, WEBHOOK_REPLY_CHANNEL, WebhookOutcome, WebhookReject,
+};
 
 /// Host-supplied sender authorization for normalized inbound messages.
 ///
@@ -709,6 +711,8 @@ impl Channel for WasmChannel {
         let webhook_factory = self.webhook_factory.clone();
         let webhook_loop = async move {
             while let Some(RawWebhook {
+                method,
+                query,
                 headers,
                 body,
                 cancellation,
@@ -716,13 +720,34 @@ impl Channel for WasmChannel {
                 reply,
             }) = webhook_rx.recv().await
             {
+                // `parse-webhook` keeps its additive `(headers, body)` WIT
+                // signature. Materialize the host-owned request line as
+                // reserved headers for this call only.
+                let mut webhook_headers = Vec::with_capacity(headers.len() + 2);
+                webhook_headers.push(("x-webhook-method".to_string(), method));
+                webhook_headers.push(("x-webhook-query".to_string(), query));
+                webhook_headers.extend(headers);
                 let decoded = tokio::select! {
                     biased;
                     () = cancellation.cancelled() => None,
-                    result = webhook_factory.parse_webhook(&headers, &body) => Some(result),
+                    result = webhook_factory.parse_webhook(&webhook_headers, &body) => Some(result),
                 };
                 match decoded {
                     Some(Ok(Ok(messages))) => {
+                        // A single reserved-channel message is a verification
+                        // handshake response. It never enters sender
+                        // authorization, idempotency, or the agent queue.
+                        if let [message] = messages.as_slice()
+                            && message.channel == WEBHOOK_REPLY_CHANNEL
+                        {
+                            let response = if cancellation.is_cancelled() {
+                                Err(WebhookReject::Timeout)
+                            } else {
+                                Ok(WebhookOutcome::Body(message.content.clone()))
+                            };
+                            let _ = reply.send(response);
+                            continue;
+                        }
                         let mut delivery_failed = false;
                         for message in messages {
                             let message = from_wit_inbound(message, &webhook_channel_ref);
@@ -786,7 +811,7 @@ impl Channel for WasmChannel {
                                 "channel inbound receiver closed".to_string(),
                             ))
                         } else {
-                            Ok(())
+                            Ok(WebhookOutcome::Ack)
                         };
                         let _ = reply.send(response);
                     }

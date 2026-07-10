@@ -223,6 +223,36 @@ mod component {
             headers: Vec<(String, String)>,
             body: Vec<u8>,
         ) -> Result<Vec<InboundMessage>, WebhookRejection> {
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            // Verification handshake: a GET echoes the `challenge` query value in
+            // the HTTP response body via the reserved `__webhook_reply__` channel
+            // (stands in for Slack url_verification / WhatsApp hub.challenge).
+            if header("x-webhook-method") == Some("GET") {
+                let challenge = header("x-webhook-query")
+                    .unwrap_or("")
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("challenge="))
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(vec![InboundMessage {
+                    id: "verify".to_string(),
+                    sender: String::new(),
+                    reply_target: String::new(),
+                    content: challenge,
+                    channel: "__webhook_reply__".to_string(),
+                    channel_alias: None,
+                    timestamp: 0,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: Vec::new(),
+                    subject: None,
+                }]);
+            }
             // Auth: the caller must present this fixture's configured secret in
             // `x-fixture-secret`; otherwise reject (the host replies 401 and
             // enqueues nothing). Stands in for a real platform HMAC check.

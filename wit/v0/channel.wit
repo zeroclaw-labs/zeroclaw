@@ -331,6 +331,17 @@ interface channel {
     /// from `headers`) and returns a typed rejection to make the gateway reply
     /// 401 or 400 and enqueue nothing. `headers` are lower-cased; `body` is the
     /// exact received bytes.
+    ///
+    /// The host also serves GET on the route and surfaces the request line via
+    /// two reserved lower-cased headers: `x-webhook-method` (`"GET"`/`"POST"`)
+    /// and `x-webhook-query` (the raw query string, e.g. carrying
+    /// `hub.challenge`). To answer a verification handshake that must echo a
+    /// challenge in the HTTP *response* body (Slack `url_verification` POST,
+    /// WhatsApp/wecom `hub.challenge` GET), return exactly one `inbound-message`
+    /// whose `channel` is the reserved value `__webhook_reply__` and whose
+    /// `content` is the body to send; the host replies 200 with that body and
+    /// enqueues nothing. This keeps the response-body path additive — the
+    /// signature here is unchanged, so existing plugins need no rebuild.
     /// Gated by `webhook-ingress`; stub: return
     /// `err(bad-request("unsupported"))`.
     parse-webhook: func(

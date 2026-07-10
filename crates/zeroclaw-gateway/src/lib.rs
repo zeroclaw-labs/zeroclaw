@@ -2773,7 +2773,7 @@ pub struct WebhookQuery {
     pub agent: Option<String>,
 }
 
-/// POST /plugin/{path} — hand a raw inbound webhook to the plugin channel that
+/// GET or POST /plugin/{path} — hand a raw inbound webhook to the plugin channel that
 /// claimed `path`. The plugin verifies authenticity and decodes the payload in
 /// its own `parse-webhook` export; the reply drives the status code. The turn is
 /// never run inline: the message goes through the plugin's bounded inbound queue
@@ -2782,7 +2782,10 @@ fn plugin_webhook_routes(
     registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
 ) -> Router<AppState> {
     Router::new()
-        .route("/plugin/{path}", post(handle_plugin_webhook))
+        .route(
+            "/plugin/{path}",
+            get(handle_plugin_webhook).post(handle_plugin_webhook),
+        )
         .layer(axum::Extension(registry))
 }
 
@@ -2791,10 +2794,12 @@ async fn handle_plugin_webhook(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
     axum::extract::Path(path): axum::extract::Path<String>,
+    method: axum::http::Method,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+    use zeroclaw_api::webhook::{RawWebhook, WebhookOutcome, WebhookReject};
 
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
@@ -2833,6 +2838,8 @@ async fn handle_plugin_webhook(
     let _cancel_parse_on_exit = cancellation.clone().drop_guard();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let raw = RawWebhook {
+        method: method.as_str().to_string(),
+        query: raw_query.unwrap_or_default(),
         headers: header_pairs,
         body: body.to_vec(),
         cancellation,
@@ -2858,7 +2865,10 @@ async fn handle_plugin_webhook(
     )
     .await
     {
-        Ok(Ok(Ok(()))) => StatusCode::OK.into_response(),
+        // Verification handshake (Slack url_verification / WhatsApp hub.challenge)
+        // → 200 with the plugin-supplied body; ordinary events → 200 empty.
+        Ok(Ok(Ok(WebhookOutcome::Body(body)))) => (StatusCode::OK, body).into_response(),
+        Ok(Ok(Ok(WebhookOutcome::Ack))) => StatusCode::OK.into_response(),
         Ok(Ok(Err(WebhookReject::Unauthorized(detail)))) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -4969,8 +4979,10 @@ mod tests {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
         zeroclaw_spawn::spawn!(async move {
             let raw = rx.recv().await.expect("route sends raw webhook");
-            let _ = seen_tx.send((raw.headers.clone(), raw.body.clone()));
-            let _ = raw.reply.send(Ok(()));
+            let _ = seen_tx.send((raw.method, raw.query, raw.headers, raw.body));
+            let _ = raw
+                .reply
+                .send(Ok(zeroclaw_api::webhook::WebhookOutcome::Ack));
         });
 
         let peer = SocketAddr::from(([203, 0, 113, 7], 30_300));
@@ -4983,7 +4995,9 @@ mod tests {
             .await
             .expect("plugin route is infallible");
         assert_eq!(response.status(), StatusCode::OK);
-        let (headers, body) = seen_rx.await.expect("sink records request");
+        let (method, query, headers, body) = seen_rx.await.expect("sink records request");
+        assert_eq!(method, "POST");
+        assert!(query.is_empty());
         assert_eq!(body, b"signed body");
         assert!(
             headers
@@ -4991,6 +5005,46 @@ mod tests {
                 .any(|(name, value)| name == "x-fixture-secret" && value == "test-secret"),
             "Axum request headers reach the plugin normalized to lower-case names"
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_serves_get_challenge_body() {
+        use zeroclaw_api::webhook::{PluginWebhookRegistry, WebhookOutcome};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let (sink, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+        let worker = zeroclaw_spawn::spawn!(async move {
+            let raw = rx.recv().await.expect("route sends verification request");
+            assert_eq!(raw.method, "GET");
+            assert_eq!(raw.query, "hub.mode=subscribe&challenge=echo-me-42");
+            assert!(raw.body.is_empty());
+            assert!(
+                raw.idempotency.is_some(),
+                "the worker receives the canonical store handle and decides after parsing whether to reserve"
+            );
+            let _ = raw
+                .reply
+                .send(Ok(WebhookOutcome::Body("echo-me-42".to_string())));
+        });
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/plugin/fixture?hub.mode=subscribe&challenge=echo-me-42")
+            .body(Body::empty())
+            .expect("valid verification request");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 13], 30_306))));
+        let response = plugin_webhook_test_router(state, registry)
+            .oneshot(request)
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_text(response).await, "echo-me-42");
+        worker.await.expect("verification worker completes");
     }
 
     #[tokio::test]
@@ -5079,6 +5133,8 @@ mod tests {
         let (prefill_reply, _prefill_rx) = tokio::sync::oneshot::channel();
         full_sink
             .try_send(RawWebhook {
+                method: "POST".to_string(),
+                query: String::new(),
                 headers: Vec::new(),
                 body: Vec::new(),
                 cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
@@ -5116,7 +5172,9 @@ mod tests {
             mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::webhook::RawWebhook>,
         ) {
             while let Some(raw) = rx.recv().await {
-                let _ = raw.reply.send(Ok(()));
+                let _ = raw
+                    .reply
+                    .send(Ok(zeroclaw_api::webhook::WebhookOutcome::Ack));
             }
         }
 

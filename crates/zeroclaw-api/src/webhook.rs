@@ -52,9 +52,25 @@ impl WebhookIdempotency {
     }
 }
 
+/// The reserved `channel` value a plugin returns from `parse-webhook` to make the
+/// gateway reply 200 with a custom body instead of enqueuing a message. Used for
+/// verification handshakes that echo a challenge in the HTTP response — Slack
+/// `url_verification` (POST) and WhatsApp/wecom `hub.challenge` (GET). A
+/// `parse-webhook` that returns a single message whose `channel` equals this
+/// sentinel is answered with that message's `content` as the response body; the
+/// message is not enqueued. This keeps the challenge feature additive — no
+/// `channel`-interface signature change, so existing plugins need no rebuild.
+pub const WEBHOOK_REPLY_CHANNEL: &str = "__webhook_reply__";
+
 /// A raw inbound webhook the gateway received on `/plugin/<path>`, plus a
 /// one-shot the plugin side resolves so the HTTP handler can pick a status code.
 pub struct RawWebhook {
+    /// HTTP method, upper-cased (`"GET"` | `"POST"`). Surfaced to the plugin as
+    /// the reserved `x-webhook-method` header so it can handle GET verification.
+    pub method: String,
+    /// Raw query string (no leading `?`; `""` when none). Surfaced as the
+    /// reserved `x-webhook-query` header — carries e.g. `hub.challenge`.
+    pub query: String,
     /// Header names (lower-cased) → values, as received.
     pub headers: Vec<(String, String)>,
     /// Exact received body bytes.
@@ -68,9 +84,20 @@ pub struct RawWebhook {
     /// plugin worker uses the authenticated, parsed message ID; it never trusts
     /// a caller-supplied idempotency header before guest authentication.
     pub idempotency: Option<WebhookIdempotency>,
-    /// Resolved once the plugin has decoded (or rejected) the webhook: `Ok` →
-    /// 200, `Err(reject)` → the reject's status.
-    pub reply: oneshot::Sender<Result<(), WebhookReject>>,
+    /// Resolved once the plugin has decoded (or rejected) the webhook. `Ok(Ack)`
+    /// → 200 empty; `Ok(Body(s))` → 200 with `s` (a challenge echo);
+    /// `Err(reject)` → the reject's status.
+    pub reply: oneshot::Sender<Result<WebhookOutcome, WebhookReject>>,
+}
+
+/// A successful webhook outcome — how the gateway answers a 200.
+#[derive(Debug, Clone)]
+pub enum WebhookOutcome {
+    /// 200 with an empty body (events accepted / enqueued — the default).
+    Ack,
+    /// 200 with this exact body: a verification-handshake echo (Slack
+    /// `url_verification` challenge, WhatsApp `hub.challenge`).
+    Body(String),
 }
 
 /// Why a webhook was rejected — drives the gateway's HTTP status.

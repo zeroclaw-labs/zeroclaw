@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::webhook::{RawWebhook, WebhookCancellation, WebhookIdempotency, WebhookReject};
+use zeroclaw_api::webhook::{
+    RawWebhook, WebhookCancellation, WebhookIdempotency, WebhookOutcome, WebhookReject,
+};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::error::PluginError;
@@ -309,10 +311,12 @@ async fn webhook_ingress_delivers_inbound() {
     let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
 
     // Valid signature → the body is decoded into an inbound message and the
-    // reply resolves Ok.
+    // reply resolves Ok(Ack).
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"hello from webhook".to_vec(),
             cancellation: WebhookCancellation::new(),
@@ -322,8 +326,8 @@ async fn webhook_ingress_delivers_inbound() {
         .await
         .expect("sink accepts");
     assert!(
-        matches!(reply_rx.await, Ok(Ok(()))),
-        "valid webhook → reply Ok"
+        matches!(reply_rx.await, Ok(Ok(WebhookOutcome::Ack))),
+        "valid webhook → reply Ok(Ack)"
     );
     assert!(
         resolver_calls.load(Ordering::SeqCst) >= 2,
@@ -348,6 +352,8 @@ async fn webhook_ingress_delivers_inbound() {
     let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "wrong".to_string())],
             body: b"nope".to_vec(),
             cancellation: WebhookCancellation::new(),
@@ -366,6 +372,8 @@ async fn webhook_ingress_delivers_inbound() {
     let (reply_tx3, reply_rx3) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: vec![0xff],
             cancellation: WebhookCancellation::new(),
@@ -377,6 +385,82 @@ async fn webhook_ingress_delivers_inbound() {
     assert!(
         matches!(reply_rx3.await, Ok(Err(WebhookReject::BadRequest(_)))),
         "malformed payload → BadRequest"
+    );
+
+    listener.abort();
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
+}
+
+#[tokio::test]
+async fn webhook_challenge_returns_body_without_delivery_or_reservation() {
+    let wasm = fixture();
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror(
+            "fixture",
+            "default",
+            &wasm,
+            &[PluginPermission::ConfigRead],
+            "test-secret",
+            test_limits(),
+            allow_all(),
+        )
+        .await
+        .expect("fixture instantiates"),
+    );
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    // Drain the fixture's one-shot configure echo before proving the challenge
+    // response does not enter the normal inbound queue.
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("fixture emits configure echo")
+        .expect("listener remains active");
+
+    let reservations = Arc::new(AtomicUsize::new(0));
+    let reserve_count = Arc::clone(&reservations);
+    let idempotency = WebhookIdempotency::new(
+        move |_| {
+            reserve_count.fetch_add(1, Ordering::SeqCst);
+            true
+        },
+        |_| {},
+    );
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            method: "GET".to_string(),
+            query: "hub.mode=subscribe&challenge=echo-me-42".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            cancellation: WebhookCancellation::new(),
+            idempotency: Some(idempotency),
+            reply: reply_tx,
+        })
+        .await
+        .expect("sink accepts verification request");
+    assert!(
+        matches!(reply_rx.await, Ok(Ok(WebhookOutcome::Body(body))) if body == "echo-me-42"),
+        "GET verification returns the echoed challenge body"
+    );
+    assert_eq!(
+        reservations.load(Ordering::SeqCst),
+        0,
+        "a response-only challenge must not reserve a message ID"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "a response-only challenge must not reach the agent queue"
     );
 
     listener.abort();
@@ -416,6 +500,8 @@ async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
     let (stalled_reply_tx, stalled_reply_rx) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"stall-parse".to_vec(),
             cancellation,
@@ -445,6 +531,8 @@ async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
     let (recovery_reply_tx, recovery_reply_rx) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"after-timeout".to_vec(),
             cancellation: WebhookCancellation::new(),
@@ -456,7 +544,7 @@ async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
     assert!(
         matches!(
             tokio::time::timeout(Duration::from_secs(2), recovery_reply_rx).await,
-            Ok(Ok(Ok(())))
+            Ok(Ok(Ok(WebhookOutcome::Ack)))
         ),
         "later webhook succeeds on the same channel instance"
     );
@@ -542,6 +630,8 @@ async fn authenticated_webhook_message_ids_are_idempotent() {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         sink_tx
             .send(RawWebhook {
+                method: "POST".to_string(),
+                query: String::new(),
                 headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
                 body: body.to_vec(),
                 cancellation: WebhookCancellation::new(),
@@ -551,7 +641,7 @@ async fn authenticated_webhook_message_ids_are_idempotent() {
             .await
             .expect("sink accepts authenticated webhook");
         assert!(
-            matches!(reply_rx.await, Ok(Ok(()))),
+            matches!(reply_rx.await, Ok(Ok(WebhookOutcome::Ack))),
             "valid delivery and an authenticated retry are both acknowledged"
         );
         if expected_delivery {
@@ -622,6 +712,8 @@ async fn unauthorized_webhook_sender_does_not_reserve_message_id() {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         sink_tx
             .send(RawWebhook {
+                method: "POST".to_string(),
+                query: String::new(),
                 headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
                 body: body.to_vec(),
                 cancellation: WebhookCancellation::new(),
@@ -630,7 +722,7 @@ async fn unauthorized_webhook_sender_does_not_reserve_message_id() {
             })
             .await
             .expect("sink accepts authenticated webhook");
-        assert!(matches!(reply_rx.await, Ok(Ok(()))));
+        assert!(matches!(reply_rx.await, Ok(Ok(WebhookOutcome::Ack))));
     }
 
     assert_eq!(
