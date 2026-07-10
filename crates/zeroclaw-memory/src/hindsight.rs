@@ -227,7 +227,7 @@ impl HindsightMemory {
             .into_iter()
             .map(|r| {
                 let score = r.scores.as_ref().and_then(final_score);
-                Self::to_entry(r.id, r.text, r.context, r.mentioned_at, score)
+                Self::to_entry(r.id, r.text, r.context, r.mentioned_at, &r.tags, score)
             })
             .collect())
     }
@@ -253,7 +253,7 @@ impl HindsightMemory {
         Ok(parsed
             .items
             .into_iter()
-            .map(|i| Self::to_entry(i.id, i.text, i.context, i.mentioned_at, None))
+            .map(|i| Self::to_entry(i.id, i.text, i.context, i.mentioned_at, &i.tags, None))
             .collect())
     }
 }
@@ -297,6 +297,11 @@ struct RecallResult {
     context: Option<String>,
     #[serde(default)]
     mentioned_at: Option<String>,
+    /// The retain-time tags (`["zeroclaw", <category>]`, plus optional
+    /// `author:`/`tier:` meta tags on shared/system writes). Used to decode the
+    /// row's real `MemoryCategory` so the dedup gates can see it.
+    #[serde(default)]
+    tags: Vec<String>,
     #[serde(default)]
     scores: Option<serde_json::Value>,
 }
@@ -317,6 +322,10 @@ struct ListItem {
     context: Option<String>,
     #[serde(default)]
     mentioned_at: Option<String>,
+    /// Same retain-time tags the recall path exposes; decoded into the entry's
+    /// `MemoryCategory` (see [`RecallResult::tags`]).
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,18 +341,41 @@ impl HindsightMemory {
         vec!["zeroclaw".to_string(), category.to_string()]
     }
 
+    /// Decode a row's real [`MemoryCategory`] from the tags the driver itself
+    /// wrote via [`Self::tags_for`] (`["zeroclaw", <category>]`, plus optional
+    /// `author:`/`tier:` meta tags on shared/system writes). This is the reverse
+    /// of `tags_for`: it MUST round-trip the exact strings `MemoryCategory`'s
+    /// `Display` emits (`core`/`daily`/`conversation`, else the custom name).
+    ///
+    /// Skips the fixed `zeroclaw` marker and any `key:value` meta tag (e.g.
+    /// `author:and`, `tier:shared`), then takes the first remaining tag as the
+    /// category. Falls back to `Core` when no category tag is present, matching
+    /// the historical behavior for untagged rows.
+    fn category_from_tags(tags: &[String]) -> MemoryCategory {
+        tags.iter()
+            .map(|t| t.trim())
+            .find(|t| !t.is_empty() && *t != "zeroclaw" && !t.contains(':'))
+            .map_or(MemoryCategory::Core, |t| match t {
+                "core" => MemoryCategory::Core,
+                "daily" => MemoryCategory::Daily,
+                "conversation" => MemoryCategory::Conversation,
+                other => MemoryCategory::Custom(other.to_string()),
+            })
+    }
+
     fn to_entry(
         id: Option<String>,
         text: Option<String>,
         context: Option<String>,
         mentioned_at: Option<String>,
+        tags: &[String],
         score: Option<f64>,
     ) -> MemoryEntry {
         MemoryEntry {
             id: id.clone().unwrap_or_default(),
             key: id.unwrap_or_default(),
             content: text.unwrap_or_default(),
-            category: MemoryCategory::Core,
+            category: Self::category_from_tags(tags),
             timestamp: mentioned_at.unwrap_or_default(),
             session_id: None,
             score,
@@ -730,5 +762,113 @@ mod tests {
         mem.store("k", "   ", MemoryCategory::Core, None)
             .await
             .expect("empty content should short-circuit without any request");
+    }
+
+    #[test]
+    fn category_from_tags_decodes_zeroclaw_category() {
+        // Round-trip: whatever tags_for writes, category_from_tags must decode.
+        // Order is not guaranteed by the server, and the fixed "zeroclaw" marker
+        // must be ignored.
+        for cat in [
+            MemoryCategory::Core,
+            MemoryCategory::Daily,
+            MemoryCategory::Conversation,
+            MemoryCategory::Custom("project".to_string()),
+        ] {
+            let tags = HindsightMemory::tags_for(&cat);
+            assert_eq!(HindsightMemory::category_from_tags(&tags), cat);
+            // Reversed order still decodes the same category.
+            let mut rev = tags.clone();
+            rev.reverse();
+            assert_eq!(HindsightMemory::category_from_tags(&rev), cat);
+        }
+    }
+
+    #[test]
+    fn category_from_tags_ignores_meta_and_falls_back_to_core() {
+        // Shared/system writes append author:/tier: meta tags; those must be
+        // skipped so the real category tag wins.
+        assert_eq!(
+            HindsightMemory::category_from_tags(&[
+                "zeroclaw".into(),
+                "daily".into(),
+                "author:and".into(),
+                "tier:shared".into(),
+            ]),
+            MemoryCategory::Daily
+        );
+        // No category tag present -> Core fallback (historical behavior).
+        assert_eq!(
+            HindsightMemory::category_from_tags(&["zeroclaw".into()]),
+            MemoryCategory::Core
+        );
+        assert_eq!(
+            HindsightMemory::category_from_tags(&[]),
+            MemoryCategory::Core
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_decodes_category_from_tags() {
+        // Regression for the dedup bug: a recalled row tagged "daily" must
+        // decode to MemoryCategory::Daily (and "core"/"conversation" likewise),
+        // so the downstream dedup gates can see the real category instead of
+        // every row reading back as Core.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "d1", "text": "daily summary", "tags": ["daily", "zeroclaw"],
+                      "scores": { "final": 0.9 } },
+                    { "id": "c1", "text": "core fact", "tags": ["zeroclaw", "core"],
+                      "scores": { "final": 0.8 } },
+                    { "id": "v1", "text": "chat bit", "tags": ["conversation", "zeroclaw"],
+                      "scores": { "final": 0.7 } },
+                    { "id": "u1", "text": "untagged", "scores": { "final": 0.6 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall("anything", 10, None, None, None)
+            .await
+            .expect("recall should succeed");
+        let by_id = |id: &str| {
+            hits.iter()
+                .find(|h| h.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+                .category
+                .clone()
+        };
+        assert_eq!(by_id("d1"), MemoryCategory::Daily);
+        assert_eq!(by_id("c1"), MemoryCategory::Core);
+        assert_eq!(by_id("v1"), MemoryCategory::Conversation);
+        // Untagged rows keep the historical Core fallback.
+        assert_eq!(by_id("u1"), MemoryCategory::Core);
+    }
+
+    #[tokio::test]
+    async fn list_decodes_category_from_tags() {
+        // The list path (used by empty/recent-query recall) must decode tags too.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "d1", "text": "daily summary", "tags": ["daily", "zeroclaw"] },
+                    { "id": "c1", "text": "core fact", "tags": ["zeroclaw", "core"] }
+                ],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let items = mem.list(None, None).await.expect("list should succeed");
+        assert_eq!(items[0].category, MemoryCategory::Daily);
+        assert_eq!(items[1].category, MemoryCategory::Core);
     }
 }
