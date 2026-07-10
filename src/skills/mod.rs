@@ -250,9 +250,10 @@ pub async fn handle_command(
 
             let (installed_dir, files_scanned) = if let Some(skill_name) = skill.as_deref() {
                 if !is_git_source(&source) {
-                    anyhow::bail!(
-                        "--skill <name> requires a git repository URL as the source (got '{source}')"
-                    );
+                    anyhow::bail!(get_required_cli_string_with_args(
+                        "cli-skills-install-skill-requires-git",
+                        &[("source", &source)]
+                    ));
                 }
                 install_git_catalog_skill_source(
                     &source,
@@ -262,7 +263,10 @@ pub async fn handle_command(
                     workspace_dir,
                 )
                 .with_context(|| {
-                    format!("failed to install skill '{skill_name}' from catalog {source}")
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-catalog-failed",
+                        &[("skill", skill_name), ("source", &source)],
+                    )
                 })?
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)

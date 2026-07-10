@@ -2429,9 +2429,10 @@ pub fn install_git_catalog_skill_source(
     workspace_dir: &Path,
 ) -> Result<(PathBuf, usize)> {
     if !is_registry_source(skill_name) {
-        anyhow::bail!(
-            "invalid --skill name '{skill_name}': use a bare skill name (letters, digits, '-', '_')"
-        );
+        anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-invalid-skill-name",
+            &[("skill", skill_name)]
+        ));
     }
 
     use std::hash::{Hash, Hasher};
@@ -2442,23 +2443,35 @@ pub fn install_git_catalog_skill_source(
         let _ = std::fs::remove_dir_all(&clone_dir);
     }
 
-    clone_skills_registry(&clone_dir, url)
-        .with_context(|| format!("failed to clone skill catalog {url}"))?;
+    clone_skills_registry(&clone_dir, url).with_context(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-catalog-clone-failed",
+            &[("url", url)],
+        )
+    })?;
 
     let result = (|| {
         let skill_dir = clone_dir.join("skills").join(skill_name);
         if !skill_dir.is_dir() {
             let available = list_registry_skill_names(&clone_dir);
             if available.is_empty() {
-                anyhow::bail!(
-                    "skill '{skill_name}' not found in {url}: no skills/ directory, or it is empty"
-                );
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog-empty",
+                    &[("skill", skill_name), ("url", url)]
+                ));
             }
-            anyhow::bail!(
-                "skill '{skill_name}' not found in {url}.\nAvailable skills: {}",
-                available.join(", ")
-            );
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-skill-not-in-catalog",
+                &[
+                    ("skill", skill_name),
+                    ("url", url),
+                    ("available", &available.join(", ")),
+                ]
+            ));
         }
+        // i18n-exempt: internal invariant — the clone path is our own ASCII
+        // `.skill-catalog-<hex>` scratch dir, so this only fires on a broken
+        // host filesystem; it is a developer diagnostic, not normal CLI output.
         let skill_dir_str = skill_dir
             .to_str()
             .with_context(|| format!("skill path is not valid UTF-8: {}", skill_dir.display()))?;
