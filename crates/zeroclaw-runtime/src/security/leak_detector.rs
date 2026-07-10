@@ -85,11 +85,13 @@ impl LeakDetector {
         self.scan_with_protected_spans(content, &[])
     }
 
-    /// Scan content while preserving caller-supplied byte ranges.
+    /// Scan content while applying caller-supplied byte ranges to heuristics.
     ///
-    /// Protected spans are intentionally opaque. Callers may use whatever
-    /// structured parser is appropriate to identify ranges that must not be
-    /// rewritten, while this detector remains format-agnostic.
+    /// Protected spans mark ranges that the high-entropy heuristic must not
+    /// rewrite. Deterministic credential detectors still scan the full content
+    /// and may redact precise credential patterns inside protected ranges. This
+    /// keeps format-specific paths, URLs, and references from tripping entropy
+    /// detection without letting real secrets hide in functional destinations.
     pub fn scan_with_protected_spans(
         &self,
         content: &str,
