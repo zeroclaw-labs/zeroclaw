@@ -135,7 +135,7 @@ When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
 2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
-3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the RFC stale policy.
+3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the canonical [issue stale policy](./labels.md#issue-stale-policy).
 
 When a maintainer submits a request-changes review and the next step is on the PR author, apply `needs-author-action` in the same review/label packet. Do not add it when the requested change is maintainer-fixable and a maintainer intends to push the cleanup, when another maintainer or owner is taking over the branch, or when the block is waiting on a maintainer decision rather than author work.
 

@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 5
+> Starting v0.7.0 · Type: Governance · Rev. 6
 >
-> **Canonical reference** · Ratified by the team · Rev. 5
+> **Canonical reference** · Ratified by the team · Rev. 6
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -23,6 +23,7 @@
 | 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
 | 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
 | 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
+| 6 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source (#8989) |
 
 ---
 
@@ -658,7 +659,7 @@ This table records governance intent and historical taxonomy shape. For current 
 | `status:accepted` | `#0e8a16` Green | RFC or work item ratified; not stale-exempt by itself |
 | `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
 | `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
-| `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
+| `status:stale` | `#e4e669` Yellow | Issue is in the response window defined by the [maintainer label guide](../maintainers/labels.md#issue-stale-policy) |
 | `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and visible routing evidence in the operational source |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
@@ -740,7 +741,7 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 **Stale issue management (maintainer-run):**
 
-No stale workflow is currently configured. During a maintainer-run stale pass, issues with no original-author activity for 20 days are labeled `status:stale` and receive a comment asking whether the issue is still relevant. Issues with no original-author activity for 10 days after the stale label is applied are closed. This prevents the backlog from accumulating issues that are no longer active while preserving a defined response window. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
+No GitHub Actions stale workflow is currently configured in the repository. Maintainers run stale passes to prevent inactive issues from accumulating while preserving a defined response window for the affected community. The [issue stale policy](../maintainers/labels.md#issue-stale-policy) is the sole operational source for timing, qualifying activity, exclusions, and re-engagement; the issue-triage protocol carries only the execution mechanics.
 
 **PR size labeling (future/optional):**
 
