@@ -947,4 +947,30 @@ pub enum SopCommands {
     },
     /// List SOP runs currently waiting for approval (talks to the running daemon)
     Pending,
+    /// Render an SOP's node graph as text
+    Graph {
+        /// Name of the SOP to render
+        name: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = SopGraphFormat::Outline)]
+        format: SopGraphFormat,
+    },
+    /// Delete an SOP definition from disk
+    Delete {
+        /// Name of the SOP to delete
+        name: String,
+    },
+}
+
+/// Text output format for `sop graph`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum SopGraphFormat {
+    /// One line per node with its outbound flow edges.
+    Outline,
+    /// `from -> to [role]` adjacency, one edge per line.
+    Adjacency,
+    /// Pretty-printed JSON of the whole projection.
+    Json,
 }

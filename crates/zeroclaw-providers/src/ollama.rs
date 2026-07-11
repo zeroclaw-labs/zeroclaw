@@ -1279,18 +1279,17 @@ mod tests {
             ChatMessage::system("You are helpful."),
             ChatMessage::user("read a file"),
         ];
-        let tools = vec![ToolSpec {
-            name: "file_read".to_string(),
-            description: "Read a file".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "file_read",
+            "Read a file",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"}
                 },
                 "required": ["path"]
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let response = provider
             .chat(

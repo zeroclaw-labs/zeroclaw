@@ -428,6 +428,12 @@ export interface ListResponseEntry {
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
+  /**
+   * Surface hint from the schema's `#[multiline]` attribute: render a
+   * multi-line text area (e.g. a PEM key body) instead of a single-line
+   * input. Absent/false on single-line fields.
+   */
+  multiline?: boolean;
 }
 
 export interface DriftEntry {

@@ -14719,21 +14719,24 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
-/// Where an AMQP delivery is routed once consumed.
+/// Where a fan-in delivery is routed once consumed. Used by AMQP, which carries
+/// this field to choose between the agent loop, the SOP engine, or both.
+/// Agent-loop channels (Telegram, Discord, Slack, ...) do not carry a `dispatch`
+/// field: their fan-in is trigger-driven, opting in via a SOP `channel` trigger
+/// while the normal agent turn always runs. The mode is source-agnostic.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum AmqpDispatch {
-    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`
-    /// shaped by `content_template`/`thread_id_field`. This is the default and
-    /// preserves the original AMQP consumer behavior.
+pub enum SopDispatch {
+    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`.
+    /// This is the default and preserves each channel's original behavior.
     #[default]
     AgentLoop,
-    /// Dispatch the delivery to the SOP engine as an `amqp` `SopEvent`
-    /// (`topic` = routing key, `payload` = delivery body), matching SOPs whose
-    /// `amqp` trigger routing key matches. No agent turn is started.
+    /// Dispatch the delivery to the SOP engine as a `SopEvent` (`topic` =
+    /// source identifier, `payload` = body), matching SOPs whose trigger for
+    /// this source matches. No agent turn is started.
     Sop,
     /// Do both: dispatch to the SOP engine and drive an agent turn from the
     /// same delivery.
@@ -14817,7 +14820,7 @@ pub struct AmqpConfig {
     /// the delivery against SOP `amqp` triggers by routing key.
     #[tab(Behavior)]
     #[serde(default)]
-    pub dispatch: AmqpDispatch,
+    pub dispatch: SopDispatch,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -16194,7 +16197,7 @@ impl ChannelConfig for BlueskyConfig {
 /// access token against the instance's `/api/v1` endpoint, named by the
 /// required `api_base_url`. Inbound issue/PR comments are polled from the
 /// forge REST API, so the daemon needs no inbound network exposure.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
 pub struct GitConfig {
@@ -16215,13 +16218,22 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub app_id: u64,
-    /// Path to the app's RS256 private key, the `.pem` file GitHub
-    /// generates on the app's settings page. Should be readable only by
-    /// the daemon user (0600); looser permissions log a startup warning.
-    /// GitHub provider only.
+    /// RS256 private key PEM, the contents of the `.pem` file GitHub
+    /// generates on the app's settings page, inline and encrypted at rest.
+    /// Include the BEGIN/END lines. GitHub provider only.
+    #[secret]
+    #[multiline]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
-    #[serde(default)]
-    pub private_key_path: String,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Filesystem path to the RS256 private key `.pem` file, read at startup
+    /// when `private_key` (inline PEM) is unset. Backward-compatible fallback
+    /// for configs that predate the inline-PEM field. GitHub provider only.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_path: Option<String>,
     /// Installation ID to act as. When unset, the app's installations are
     /// listed on first use and a sole installation is auto-selected;
     /// startup fails if the app has zero or multiple installations.
@@ -16301,6 +16313,36 @@ pub struct GitConfig {
     pub excluded_tools: Vec<String>,
 }
 
+impl std::fmt::Debug for GitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitConfig")
+            .field("enabled", &self.enabled)
+            .field("provider", &self.provider)
+            .field("app_id", &self.app_id)
+            .field("private_key", &self.private_key.as_ref().map(|_| "***"))
+            .field("private_key_path", &self.private_key_path)
+            .field("installation_id", &self.installation_id)
+            .field("api_base_url", &self.api_base_url)
+            .field(
+                "access_token",
+                &if self.access_token.is_empty() {
+                    ""
+                } else {
+                    "***"
+                },
+            )
+            .field("repos", &self.repos)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("mention_only", &self.mention_only)
+            .field("listen_to_bots", &self.listen_to_bots)
+            .field("proxy_url", &self.proxy_url)
+            .field("events", &self.events)
+            .field("events_backbone", &self.events_backbone)
+            .field("excluded_tools", &self.excluded_tools)
+            .finish()
+    }
+}
+
 fn default_github_poll_interval_secs() -> u64 {
     30
 }
@@ -16315,7 +16357,8 @@ impl Default for GitConfig {
             enabled: false,
             provider: default_git_provider(),
             app_id: 0,
-            private_key_path: String::new(),
+            private_key: None,
+            private_key_path: None,
             installation_id: None,
             api_base_url: None,
             access_token: String::new(),
@@ -21247,9 +21290,8 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Required to enable runtime SOP loading. When omitted, no SOPs are loaded
-    /// at runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still
-    /// resolve the default `<workspace>/sops` for offline inspection.
+    /// Optional override. When omitted, the runtime and CLI both resolve the
+    /// default `<workspace>/sops`; SOPs load from there whenever it exists.
     #[serde(default)]
     pub sops_dir: Option<String>,
 
@@ -21671,7 +21713,6 @@ max_height = 8
             r#"
             enabled = true
             app_id = 12345
-            private_key_path = "~/.zeroclaw/github-app.pem"
             events_backbone = true
 
             [events]
@@ -21780,7 +21821,7 @@ max_height = 8
 
     #[test]
     async fn amqp_dispatch_defaults_to_agent_loop() {
-        assert_eq!(AmqpConfig::default().dispatch, AmqpDispatch::AgentLoop);
+        assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
     #[test]
@@ -29611,6 +29652,31 @@ url = "http://localhost:8080/mcp"
         assert!(
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
+        );
+    }
+
+    #[test]
+    async fn git_config_debug_redacts_private_key_and_access_token() {
+        let cfg = GitConfig {
+            private_key: Some(
+                "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETPEM\n-----END RSA PRIVATE KEY-----"
+                    .into(),
+            ),
+            access_token: "ghp_supersecrettoken".into(),
+            ..GitConfig::default()
+        };
+        let debug_output = format!("{cfg:?}");
+        assert!(
+            !debug_output.contains("SUPERSECRETPEM"),
+            "Debug output must not contain the raw private_key PEM"
+        );
+        assert!(
+            !debug_output.contains("ghp_supersecrettoken"),
+            "Debug output must not contain the raw access_token"
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Debug output must mask the private_key and access_token"
         );
     }
 
