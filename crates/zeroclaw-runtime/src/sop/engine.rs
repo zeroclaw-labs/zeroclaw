@@ -2964,6 +2964,13 @@ impl SopEngine {
     /// an append-only ledger row (kind `gate_vote`, actor = the principal). Quorum is
     /// counted from these rows so votes are durable and survive a restart. Distinct
     /// from `gate_resolved`, which is appended only once the gate actually clears.
+    ///
+    /// IDEMPOTENT per `(run, step, policy, voter_key)`: a repeat vote by the same voter
+    /// under the same policy is a no-op, so retries (e.g. an approver clicking twice
+    /// while the gate is still pending quorum) do not grow the append-only log with
+    /// duplicate rows. The count already dedups by `voter_key`, so this changes storage
+    /// footprint, not the tally. A read failure is surfaced (fail-closed) rather than
+    /// risking a duplicate append.
     pub(crate) fn record_gate_vote(
         &self,
         run_id: &str,
@@ -2971,6 +2978,14 @@ impl SopEngine {
         policy: &str,
         principal: &super::approval::ApprovalPrincipal,
     ) -> Result<(), StoreError> {
+        let voter_key = principal.voter_key();
+        if self
+            .gate_votes_for_step(run_id, step)?
+            .iter()
+            .any(|v| v.voter_key == voter_key && v.policy.as_deref() == Some(policy))
+        {
+            return Ok(());
+        }
         let ev = SopEventRecord {
             run_id: run_id.to_string(),
             seq: 0,
@@ -2980,7 +2995,7 @@ impl SopEngine {
             // `gateway:<id>` voter (same paired token, two transports = one voter),
             // while the agent/CLI sources stay distinct. See `ApprovalPrincipal::
             // voter_key`'s own doc for the full canonicalization rationale.
-            actor: Some(principal.voter_key()),
+            actor: Some(voter_key),
             reason: None,
             // `policy` scopes the vote to the policy in effect when it was cast, and
             // `source`/`identity` capture enough to REVALIDATE the voter against the
@@ -5060,6 +5075,34 @@ mod tests {
             "step-2 quorum does not include step-1 voters"
         );
         assert_eq!(distinct(3), 0, "no votes recorded for step 3");
+    }
+
+    #[test]
+    fn record_gate_vote_is_idempotent_per_voter_and_policy() {
+        // A repeat vote by the same voter under the same policy must not grow the
+        // append-only ledger (the count already dedups by voter_key; this keeps a
+        // retry from writing duplicate rows). A different policy is a distinct row.
+        use crate::sop::approval::ApprovalPrincipal;
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let engine = engine_with_sops(vec![]).with_store(store);
+        let alice = ApprovalPrincipal::cli(Some("alice".into()));
+
+        engine.record_gate_vote("run-1", 1, "prod", &alice).unwrap();
+        engine.record_gate_vote("run-1", 1, "prod", &alice).unwrap();
+        assert_eq!(
+            engine.gate_votes_for_step("run-1", 1).unwrap().len(),
+            1,
+            "a repeat vote by the same voter under the same policy must not append a duplicate row"
+        );
+
+        engine
+            .record_gate_vote("run-1", 1, "prod2", &alice)
+            .unwrap();
+        assert_eq!(
+            engine.gate_votes_for_step("run-1", 1).unwrap().len(),
+            2,
+            "a vote under a different policy is a distinct row"
+        );
     }
 
     #[test]
