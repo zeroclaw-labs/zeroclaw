@@ -12,7 +12,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Maximum content size per canvas frame (256 KB).
 pub const MAX_CONTENT_SIZE: usize = 256 * 1024;
@@ -238,7 +238,7 @@ impl Tool for CanvasTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: action".to_string()),
                 });
             }
@@ -261,7 +261,7 @@ impl Tool for CanvasTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required parameter: content (for render action)"
                                     .to_string(),
@@ -273,7 +273,7 @@ impl Tool for CanvasTool {
                 if content.len() > MAX_CONTENT_SIZE {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Content exceeds maximum size of {} bytes",
                             MAX_CONTENT_SIZE
@@ -287,12 +287,13 @@ impl Tool for CanvasTool {
                         output: format!(
                             "Rendered {} content to canvas '{}' (frame: {})",
                             content_type, canvas_id, frame.frame_id
-                        ),
+                        )
+                        .into(),
                         error: None,
                     }),
                     None => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Maximum canvas count ({}) reached. Clear unused canvases first.",
                             MAX_CANVAS_COUNT
@@ -305,12 +306,13 @@ impl Tool for CanvasTool {
                 Some(frame) => Ok(ToolResult {
                     success: true,
                     output: serde_json::to_string_pretty(&frame)
-                        .unwrap_or_else(|_| frame.content.clone()),
+                        .unwrap_or_else(|_| frame.content.clone())
+                        .into(),
                     error: None,
                 }),
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("Canvas '{}' is empty", canvas_id),
+                    output: format!("Canvas '{}' is empty", canvas_id).into(),
                     error: None,
                 }),
             },
@@ -320,9 +322,9 @@ impl Tool for CanvasTool {
                 Ok(ToolResult {
                     success: true,
                     output: if existed {
-                        format!("Canvas '{}' cleared", canvas_id)
+                        format!("Canvas '{}' cleared", canvas_id).into()
                     } else {
-                        format!("Canvas '{}' was already empty", canvas_id)
+                        format!("Canvas '{}' was already empty", canvas_id).into()
                     },
                     error: None,
                 })
@@ -336,7 +338,7 @@ impl Tool for CanvasTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required parameter: expression (for eval action)"
                                     .to_string(),
@@ -353,12 +355,13 @@ impl Tool for CanvasTool {
                             "Eval request sent to canvas '{}' (frame: {}). \
                              Result will be available to connected viewers.",
                             canvas_id, frame.frame_id
-                        ),
+                        )
+                        .into(),
                         error: None,
                     }),
                     None => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Maximum canvas count ({}) reached. Clear unused canvases first.",
                             MAX_CANVAS_COUNT
@@ -369,7 +372,7 @@ impl Tool for CanvasTool {
 
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action: '{}'. Valid actions: render, snapshot, clear, eval",
                     other

@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn activated_set_tracks_activation() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -349,7 +349,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn activated_set_resolves_unique_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -393,7 +393,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn activated_set_rejects_ambiguous_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool(&'static str);
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -434,7 +434,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }

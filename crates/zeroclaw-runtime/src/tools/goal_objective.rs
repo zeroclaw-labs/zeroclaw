@@ -76,7 +76,7 @@ impl Tool for GoalObjectiveTool {
         if objective.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(crate::i18n::get_required_tool_string(
                     "tool-goal-objective-error-empty-objective",
                 )),
@@ -86,7 +86,7 @@ impl Tool for GoalObjectiveTool {
         let Some(ctx) = current_goal_admission_context() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(crate::i18n::get_required_tool_string(
                     "tool-goal-objective-error-missing-context",
                 )),
@@ -95,7 +95,7 @@ impl Tool for GoalObjectiveTool {
         if ctx.agent_alias != self.agent_alias {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(crate::i18n::get_required_tool_string(
                     "tool-goal-objective-error-agent-context-mismatch",
                 )),
@@ -119,7 +119,7 @@ impl Tool for GoalObjectiveTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

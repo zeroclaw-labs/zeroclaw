@@ -96,7 +96,7 @@ impl GoalHumanGateTool {
         {
             return Ok(Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("Action blocked: {error}")),
             }));
         }

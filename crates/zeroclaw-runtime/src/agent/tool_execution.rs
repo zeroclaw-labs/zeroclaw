@@ -90,6 +90,7 @@ fn unavailable_tool_outcome(
         error_reason: Some(reason),
         duration,
         receipt: None,
+        output_data: None,
     }
 }
 
@@ -118,6 +119,10 @@ fn contains_goal_admission_tool_call(tool_calls: &[ParsedToolCall]) -> bool {
 pub struct ToolExecutionOutcome {
     /// Tool output returned to the model loop.
     pub output: String,
+    /// Structured output when the tool declared one (`ToolOutput::data`).
+    /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
+    /// `output`.
+    pub output_data: Option<serde_json::Value>,
     /// Whether the tool reported success.
     pub success: bool,
     /// Raw failure text on the data path. Credential scrubbing is a rendering
@@ -224,6 +229,7 @@ pub(crate) async fn execute_one_tool(
             error_reason: Some(reason),
             duration,
             receipt: None,
+            output_data: None,
         });
     };
 
@@ -361,13 +367,14 @@ pub(crate) async fn execute_one_tool(
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
+                        output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
                         duration,
                         receipt,
                     })
                 } else {
-                    let reason = r.error.unwrap_or(r.output);
+                    let reason = r.error.unwrap_or_else(|| r.output.into_string());
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
@@ -385,6 +392,7 @@ pub(crate) async fn execute_one_tool(
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
+                        output_data: None,
                     })
                 }
             }
@@ -423,6 +431,7 @@ pub(crate) async fn execute_one_tool(
                     error_reason: Some(reason),
                     duration,
                     receipt: None,
+                    output_data: None,
                 })
             }
         }

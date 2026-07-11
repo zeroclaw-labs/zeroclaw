@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 const ARCHIVE_DIRNAME: &str = ".archive";
 const ALLOWED_FILE_PREFIXES: &[&str] = &["references/", "templates/", "scripts/"];
@@ -112,7 +112,7 @@ impl Tool for SkillsListTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read skills directory: {e}")),
                 });
             }
@@ -121,7 +121,7 @@ impl Tool for SkillsListTool {
         if entries.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: "0 installed skills.".to_string(),
+                output: "0 installed skills.".to_string().into(),
                 error: None,
             });
         }
@@ -136,7 +136,7 @@ impl Tool for SkillsListTool {
         }
         Ok(ToolResult {
             success: true,
-            output: out,
+            output: out.into(),
             error: None,
         })
     }
@@ -227,7 +227,7 @@ impl Tool for SkillViewTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -239,7 +239,7 @@ impl Tool for SkillViewTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Skill '{slug}' not found: {e}")),
                 });
             }
@@ -271,7 +271,7 @@ impl Tool for SkillViewTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -379,7 +379,7 @@ impl Tool for SkillManageTool {
             "archive" => self.archive(slug).await,
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{other}'. Valid: patch, write_file, archive"
                 )),
@@ -451,7 +451,7 @@ impl SkillManageTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -460,7 +460,7 @@ impl SkillManageTool {
         if !md_path.exists() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Skill '{slug}' not found (no SKILL.md)")),
             });
         }
@@ -468,7 +468,7 @@ impl SkillManageTool {
         if md_path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "SKILL.md for '{slug}' is a symlink — refusing patch"
                 )),
@@ -481,7 +481,7 @@ impl SkillManageTool {
         if content.len() > MAX_FILE_BYTES {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "patch content exceeds {MAX_FILE_BYTES} bytes ({} given)",
                     content.len()
@@ -501,7 +501,7 @@ impl SkillManageTool {
         if !self.config.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Skill improvement is disabled (enabled: false)".to_string()),
             });
         }
@@ -513,7 +513,7 @@ impl SkillManageTool {
         if !improver.should_improve_skill(slug) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Skill '{slug}' is on cooldown — try again later")),
             });
         }
@@ -533,19 +533,19 @@ impl SkillManageTool {
                 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(err),
                     });
                 }
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Patched skill '{slug}'."),
+                    output: format!("Patched skill '{slug}'.").into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Patch failed: {e}")),
             }),
         }
@@ -557,7 +557,7 @@ impl SkillManageTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -577,7 +577,7 @@ impl SkillManageTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "file_path must start with one of: {}",
                     ALLOWED_FILE_PREFIXES.join(", ")
@@ -587,14 +587,14 @@ impl SkillManageTool {
         if file_path.contains("..") || file_path.contains('\0') {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_path contains forbidden segment".to_string()),
             });
         }
         if content.len() > MAX_FILE_BYTES {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "content exceeds {MAX_FILE_BYTES} bytes ({} given)",
                     content.len()
@@ -615,7 +615,7 @@ impl SkillManageTool {
         if !canonical_target_parent.starts_with(&canonical_skill_dir) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_path escapes skill directory".to_string()),
             });
         }
@@ -625,7 +625,7 @@ impl SkillManageTool {
         if target.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("target path is a symlink — refusing write".to_string()),
             });
         }
@@ -653,7 +653,7 @@ impl SkillManageTool {
                 rollback_write(&target, pre_snapshot.as_deref(), target_existed).await;
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Post-write audit errored: {e}")),
                 });
             }
@@ -662,7 +662,7 @@ impl SkillManageTool {
             rollback_write(&target, pre_snapshot.as_deref(), target_existed).await;
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Wrote {file_path} but skill failed audit (rolled back): {}",
                     report.summary()
@@ -671,7 +671,7 @@ impl SkillManageTool {
         }
         Ok(ToolResult {
             success: true,
-            output: format!("Wrote {file_path} for skill '{slug}'."),
+            output: format!("Wrote {file_path} for skill '{slug}'.").into(),
             error: None,
         })
     }
@@ -683,7 +683,7 @@ impl SkillManageTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(e.to_string()),
                     });
                 }
@@ -699,7 +699,7 @@ impl SkillManageTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Archive directory {ARCHIVE_DIRNAME} is a symlink — refusing archive"
                 )),
@@ -711,7 +711,7 @@ impl SkillManageTool {
         if !canonical_archive_dir.starts_with(&canonical_skills_root) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("archive directory escapes canonical skills root".to_string()),
             });
         }
@@ -727,14 +727,14 @@ impl SkillManageTool {
         if final_target.parent() != Some(canonical_archive_dir.as_path()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("archive target escapes archive directory".to_string()),
             });
         }
         tokio::fs::rename(&canonical_skill_dir, &final_target).await?;
         Ok(ToolResult {
             success: true,
-            output: format!("Archived skill '{slug}' to {}", final_target.display()),
+            output: format!("Archived skill '{slug}' to {}", final_target.display()).into(),
             error: None,
         })
     }

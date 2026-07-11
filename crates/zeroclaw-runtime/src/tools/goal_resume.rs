@@ -77,7 +77,7 @@ impl Tool for GoalResumeTool {
         let Some(ctx) = current_goal_admission_context() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(crate::i18n::get_required_tool_string(
                     "tool-goal-resume-error-missing-context",
                 )),
@@ -86,7 +86,7 @@ impl Tool for GoalResumeTool {
         if ctx.agent_alias != self.agent_alias {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(crate::i18n::get_required_tool_string(
                     "tool-goal-resume-error-agent-context-mismatch",
                 )),
@@ -114,7 +114,7 @@ impl Tool for GoalResumeTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
