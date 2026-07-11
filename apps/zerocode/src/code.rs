@@ -4,6 +4,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
 use crate::client::RpcClient;
+use crate::config::UiProfile;
 use crate::transcript;
 
 pub(crate) struct Code {
@@ -11,14 +12,18 @@ pub(crate) struct Code {
 }
 
 impl Code {
-    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+    pub(crate) fn new(rpc: Arc<RpcClient>, ui_profile: UiProfile) -> Self {
         Self {
-            inner: transcript::Transcript::new(rpc, transcript::PaneKind::Code),
+            inner: transcript::Transcript::new(rpc, transcript::PaneKind::Code, ui_profile),
         }
     }
 
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
         self.inner.init().await
+    }
+
+    pub(crate) fn set_ui_profile(&mut self, profile: UiProfile) {
+        self.inner.set_ui_profile(profile);
     }
 
     pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {

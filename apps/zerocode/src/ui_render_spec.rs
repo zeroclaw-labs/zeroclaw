@@ -1,3 +1,5 @@
+use crate::config::UiProfile;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UiRenderSpec {
     pub(crate) transcript: TranscriptRenderSpec,
@@ -34,6 +36,13 @@ pub(crate) enum IconMode {
 }
 
 impl UiRenderSpec {
+    pub(crate) const fn for_profile(profile: UiProfile) -> Self {
+        match profile {
+            UiProfile::Minimal => Self::minimal(),
+            UiProfile::Rich => Self::rich(),
+        }
+    }
+
     pub(crate) const fn minimal() -> Self {
         Self {
             transcript: TranscriptRenderSpec {

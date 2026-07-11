@@ -360,6 +360,7 @@ mod payload_capture_tests {
     fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
         TurnCtx {
             observer,
+            tools_registry: &[],
             provider_name: "stub",
             model: "stub-model",
             temperature: None,

@@ -1644,6 +1644,7 @@ mod tests {
             session_id: "s".into(),
             request_id: "r".into(),
             tool_name: "shell".into(),
+            presentation: ToolPresentation::Generic,
             arguments_summary: "ls".into(),
             timeout_secs: 30,
         };

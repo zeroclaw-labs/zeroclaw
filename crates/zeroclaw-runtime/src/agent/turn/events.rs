@@ -152,6 +152,10 @@ mod tests {
         }
     }
 
+    fn default_presentation() -> ToolPresentation {
+        ToolPresentation::Generic
+    }
+
     fn ok_outcome() -> ToolExecutionOutcome {
         ToolExecutionOutcome {
             output: "out".into(),
@@ -168,8 +172,20 @@ mod tests {
     #[tokio::test]
     async fn idless_calls_get_distinct_synthesized_pair_ids() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
-        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(None),
+            &ok_outcome(),
+            default_presentation(),
+        )
+        .await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(None),
+            &ok_outcome(),
+            default_presentation(),
+        )
+        .await;
         drop(tx);
 
         let mut ids = Vec::new();
@@ -196,7 +212,13 @@ mod tests {
     #[tokio::test]
     async fn existing_ids_pass_through() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(Some("native-7")), &ok_outcome()).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(Some("native-7")),
+            &ok_outcome(),
+            default_presentation(),
+        )
+        .await;
         drop(tx);
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -216,7 +238,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let call = parsed_call(None);
         let id = resolve_tool_call_id(&call);
-        emit_tool_call_pending(&tx, &id, &call).await;
+        emit_tool_call_pending(&tx, &id, &call, default_presentation()).await;
         emit_tool_result(&tx, &id, &call.name, &ok_outcome()).await;
         drop(tx);
 
@@ -250,7 +272,13 @@ mod tests {
             output_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(Some("c1")),
+            &outcome,
+            default_presentation(),
+        )
+        .await;
         drop(tx);
         let mut saw_result = false;
         while let Some(ev) = rx.recv().await {

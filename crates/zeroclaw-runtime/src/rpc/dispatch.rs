@@ -5669,6 +5669,7 @@ mod tests {
             id: "tc_1".into(),
             name: "bash".into(),
             args: json!({"cmd": "ls"}),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);
@@ -5835,6 +5836,7 @@ mod tests {
         let event = TurnEvent::ApprovalRequest {
             request_id: "ar_1".into(),
             tool_name: "bash".into(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "rm -rf /".into(),
             timeout_secs: 30,
         };

@@ -1436,7 +1436,7 @@ impl AcpServer {
             // Attribution (agent_alias, model_provider, session_key) flows
             // from the enclosing spans — not repeated here in attrs.
             match &event {
-                TurnEvent::ToolCall { id, name, args } => {
+                TurnEvent::ToolCall { id, name, args, .. } => {
                     tool_call_count += 1;
                     ::zeroclaw_log::record!(
                         DEBUG,
@@ -2083,7 +2083,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
-        TurnEvent::ToolCall { id, name, args } => {
+        TurnEvent::ToolCall { id, name, args, .. } => {
             let acp_content = to_acp_content(name, args);
             let mut update = serde_json::json!({
                 "sessionUpdate": "tool_call",
@@ -3118,6 +3118,7 @@ mod tests {
                     "old_string": "let x = 1;",
                     "new_string": "let x = 2;"
                 }),
+                presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             },
         );
         let v = serde_json::to_value(call.unwrap()).unwrap();
@@ -3154,6 +3155,7 @@ mod tests {
                     "path": "src/new.rs",
                     "content": "fn main() {}"
                 }),
+                presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             },
         );
         let v = serde_json::to_value(call.unwrap()).unwrap();
@@ -3201,6 +3203,7 @@ mod tests {
                 id: "tc-12345".to_string(),
                 name: "shell".to_string(),
                 args: serde_json::json!({"command": "ls -la"}),
+                presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             },
         );
         let call_value =

@@ -176,9 +176,10 @@ pub async fn run(
     owns_ephemeral: bool,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
-    let show_chat_pane = config::ensure_and_load(config_dir)
-        .map(|config| config.ui.show_chat_pane)
-        .unwrap_or(false);
+    let ui_config = config::ensure_and_load(config_dir)
+        .map(|config| config.ui)
+        .unwrap_or_default();
+    let show_chat_pane = ui_config.show_chat_pane;
     // Per-agent theme overrides live in a process-global registry (theme.rs),
     // mirroring how the global theme works: the Config pane writes there on
     // assign/clear so changes apply live, and the draw loop reads it each frame
@@ -225,15 +226,19 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
-                let mut code_pane = code::Code::new(rpc.clone());
+                let mut code_pane = code::Code::new(rpc.clone(), ui_config.profile);
                 // Carry the pre-disconnect session across a reconnect rebuild so
                 // the rebuilt pane resumes the daemon-retained session (#7182)
                 // instead of minting a fresh one. None on first build.
                 code_pane.set_resume_session_id($resume_code.0);
                 code_pane.set_resume_agent_alias($resume_code.1);
+                code_pane.set_ui_profile(ui_config.profile);
                 code_pane.init().await?;
-                let mut chat_pane =
-                    transcript::Transcript::new(rpc.clone(), transcript::PaneKind::Chat);
+                let mut chat_pane = transcript::Transcript::new(
+                    rpc.clone(),
+                    transcript::PaneKind::Chat,
+                    ui_config.profile,
+                );
                 chat_pane.set_resume_session_id($resume_chat.0);
                 chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;

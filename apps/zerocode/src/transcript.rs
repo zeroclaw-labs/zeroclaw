@@ -23,6 +23,7 @@ use crate::client::{
     ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, TurnEndOutcome,
     method, parse_session_update,
 };
+use crate::config::UiProfile;
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
@@ -31,7 +32,7 @@ use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
 use crate::ui_render_spec::{RailMode, ThoughtMode, UiRenderSpec};
-use zeroclaw_api::tool::ToolPresentation;
+use crate::wire::ToolPresentation;
 
 // Height of the approval popup anchored to the bottom of the content area.
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
@@ -118,6 +119,7 @@ pub(crate) struct Transcript {
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
     phase: TranscriptPhase,
     pane_kind: PaneKind,
+    ui_profile: UiProfile,
     /// One-shot session id to reattach to on the next session start, set by
     /// the app layer across a reconnect so the rebuilt pane resumes the
     /// pre-disconnect session (the daemon retains it, #7182) instead of
@@ -212,7 +214,7 @@ fn should_retry_on_entry(phase: &TranscriptPhase) -> bool {
 }
 
 impl Transcript {
-    pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
+    pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind, ui_profile: UiProfile) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         Self {
@@ -231,6 +233,7 @@ impl Transcript {
                 loading: true,
             },
             pane_kind,
+            ui_profile,
             resume_session_id: None,
             resume_agent_alias: None,
             pick_agent_list_area: Rect::default(),
@@ -239,6 +242,16 @@ impl Transcript {
             todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
             todo_settings_loaded: false,
             deferred_elicitations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn set_ui_profile(&mut self, profile: UiProfile) {
+        if self.ui_profile == profile {
+            return;
+        }
+        self.ui_profile = profile;
+        if let TranscriptPhase::Active(state) = &mut self.phase {
+            state.set_ui_profile(profile);
         }
     }
 
@@ -502,7 +515,11 @@ impl Transcript {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = TranscriptState::new(session.session_id, agent_alias.to_string());
+                let mut state = TranscriptState::new(
+                    session.session_id,
+                    agent_alias.to_string(),
+                    self.ui_profile,
+                );
                 if self.pane_kind == PaneKind::Code {
                     state.cwd = session.workspace_dir;
                 }
@@ -5229,6 +5246,7 @@ pub struct TranscriptState {
     /// the pulse starts from phase 0.
     turn_started_at: Instant,
     show_thoughts: bool,
+    ui_profile: UiProfile,
     /// Browse mode cursor (most-recently moved position).
     browse_cursor: Option<usize>,
     /// Anchor for range selection; set when Shift+↑/↓ is first pressed.
@@ -5318,10 +5336,18 @@ pub struct TranscriptState {
 
 impl TranscriptState {
     fn render_spec(&self) -> UiRenderSpec {
-        UiRenderSpec::minimal()
+        UiRenderSpec::for_profile(self.ui_profile)
     }
 
-    pub fn new(session_id: String, agent_alias: String) -> Self {
+    fn set_ui_profile(&mut self, profile: UiProfile) {
+        if self.ui_profile == profile {
+            return;
+        }
+        self.ui_profile = profile;
+        self.mark_dirty_full();
+    }
+
+    pub fn new(session_id: String, agent_alias: String, ui_profile: UiProfile) -> Self {
         Self {
             session_id,
             agent_alias,
@@ -5343,6 +5369,7 @@ impl TranscriptState {
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
             show_thoughts: true,
+            ui_profile,
             browse_cursor: None,
             browse_anchor: None,
             browse_multi: std::collections::BTreeSet::new(),
@@ -6751,7 +6778,23 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn state() -> TranscriptState {
-        TranscriptState::new("sess-1".to_string(), "myagent".to_string())
+        TranscriptState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            UiProfile::Minimal,
+        )
+    }
+
+    fn transcript(client: Arc<RpcClient>, pane_kind: PaneKind) -> Transcript {
+        Transcript::new(client, pane_kind, UiProfile::Minimal)
+    }
+
+    fn transcript_state(session_id: &str, agent_alias: &str) -> TranscriptState {
+        TranscriptState::new(
+            session_id.to_string(),
+            agent_alias.to_string(),
+            UiProfile::Minimal,
+        )
     }
 
     #[test]
@@ -7258,6 +7301,40 @@ mod tests {
     }
 
     #[test]
+    fn minimal_profile_has_no_rails() {
+        let spec = UiRenderSpec::for_profile(UiProfile::Minimal);
+        assert_eq!(spec.transcript.rails, RailMode::None);
+        assert_eq!(rail_header_width(&spec), 0);
+    }
+
+    #[test]
+    fn rich_profile_uses_typed_rails() {
+        let spec = UiRenderSpec::for_profile(UiProfile::Rich);
+        assert_eq!(spec.transcript.rails, RailMode::Typed);
+        assert_eq!(rail_header_width(&spec), 2);
+    }
+
+    #[test]
+    fn ui_profile_change_marks_dirty_without_mutating_entries() {
+        let mut state = state();
+        state
+            .entries
+            .push(TranscriptEntry::AgentMessage(Arc::<str>::from("hello")));
+        let before = state.entries.clone();
+        state.dirty = LinesDirty::Clean;
+
+        state.set_ui_profile(UiProfile::Rich);
+
+        assert_eq!(state.entries.len(), before.len());
+        assert!(matches!(
+            (&state.entries[0], &before[0]),
+            (TranscriptEntry::AgentMessage(a), TranscriptEntry::AgentMessage(b)) if a == b
+        ));
+        assert_eq!(state.dirty, LinesDirty::Full);
+        assert_eq!(state.render_spec(), UiRenderSpec::rich());
+    }
+
+    #[test]
     fn minimal_spec_keeps_semantic_tool_rendering() {
         let entry = TranscriptEntry::Tool {
             tool_call_id: Arc::<str>::from("tool-1"),
@@ -7521,10 +7598,7 @@ mod tests {
 
     #[test]
     fn title_shows_agent_uid_provider_model() {
-        let mut s = TranscriptState::new(
-            "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
-            "personal_code".to_string(),
-        );
+        let mut s = transcript_state("9caf2a14-0e6d-4127-b016-357c0b757b87", "personal_code");
         s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
         assert_eq!(
             s.title(),
@@ -7534,13 +7608,13 @@ mod tests {
 
     #[test]
     fn title_falls_back_before_identity_resolved() {
-        let s = TranscriptState::new("abcdef1234".to_string(), "myagent".to_string());
+        let s = transcript_state("abcdef1234", "myagent");
         assert_eq!(s.title(), "myagent  abcdef1");
     }
 
     #[test]
     fn set_model_identity_keeps_full_ref_and_updates_live() {
-        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = transcript_state("abcdef1234", "ag");
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5");
         s.set_model_identity(None, Some("gpt-5-mini"));
@@ -7632,7 +7706,7 @@ mod tests {
 
     #[test]
     fn title_hit_rects_target_provider_and_model_segments() {
-        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = transcript_state("abcdef1234", "ag");
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         let area = Rect::new(10, 4, 80, 20);
 
@@ -7649,7 +7723,7 @@ mod tests {
 
     #[test]
     fn title_hit_rects_target_agent_before_model_identity_resolves() {
-        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = transcript_state("abcdef1234", "ag");
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
 
@@ -7660,7 +7734,7 @@ mod tests {
 
     #[test]
     fn title_hit_rects_clip_at_pane_edge() {
-        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = transcript_state("abcdef1234", "ag");
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 25, 20));
@@ -7723,7 +7797,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         transcript.phase = TranscriptPhase::Active(Box::new(state()));
         if let TranscriptPhase::Active(s) = &mut transcript.phase {
             s.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
@@ -7746,7 +7820,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         transcript.phase = TranscriptPhase::Active(Box::new(state()));
         // Not modal before the prompt arrives (empty input → command mode).
         assert!(!transcript.wants_text_input());
@@ -7764,7 +7838,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         // No session yet → None.
         assert_eq!(transcript.current_session_id(), None);
         transcript.phase = TranscriptPhase::Active(Box::new(state()));
@@ -7777,7 +7851,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         transcript.set_resume_session_id(Some("sess-prev".to_string()));
 
         let init = tokio::spawn(async move {
@@ -7822,7 +7896,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         transcript.set_resume_session_id(Some("sess-prev".to_string()));
         transcript.set_resume_agent_alias(Some("beta".to_string()));
 
@@ -8227,7 +8301,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         transcript.phase = TranscriptPhase::PickAgent {
@@ -8437,9 +8511,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Chat);
+        let mut chat = transcript(client, PaneKind::Chat);
         let area = Rect::new(10, 4, 80, 20);
-        let mut state = TranscriptState::new("abcdef1234".to_string(), "beta".to_string());
+        let mut state = transcript_state("abcdef1234", "beta");
         state.refresh_title_hit_rects(area);
         chat.phase = TranscriptPhase::Active(Box::new(state));
 
@@ -8494,9 +8568,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Chat);
+        let mut chat = transcript(client, PaneKind::Chat);
         let area = Rect::new(10, 4, 80, 20);
-        let mut state = TranscriptState::new("abcdef1234".to_string(), "beta".to_string());
+        let mut state = transcript_state("abcdef1234", "beta");
         state.turn_in_flight = true;
         state.refresh_title_hit_rects(area);
         chat.phase = TranscriptPhase::Active(Box::new(state));
@@ -8529,7 +8603,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         let mut state = state();
         state
             .entries
@@ -8620,7 +8694,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         transcript.phase = TranscriptPhase::Error("No enabled agents yet.".to_string());
 
         let refresh = tokio::spawn(async move {
@@ -8670,7 +8744,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut transcript = Transcript::new(client, PaneKind::Code);
+        let mut transcript = transcript(client, PaneKind::Code);
         let mut list_state = ListState::default();
         list_state.select(Some(1)); // user has "beta" highlighted
         transcript.phase = TranscriptPhase::PickAgent {
@@ -9826,14 +9900,13 @@ mod tests {
 
     #[test]
     fn title_includes_short_session_hash() {
-        let s = TranscriptState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        let s = transcript_state("40be7731122334455", "personal_code");
         assert_eq!(s.title(), "personal_code  40be773");
     }
 
     #[test]
     fn title_with_session_name_keeps_hash() {
-        let mut s =
-            TranscriptState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        let mut s = transcript_state("40be7731122334455", "personal_code");
         s.session_name = Some("my work".to_string());
         assert_eq!(s.title(), "personal_code  — my work  40be773");
     }

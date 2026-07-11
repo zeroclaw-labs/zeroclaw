@@ -252,6 +252,7 @@ mod tests {
                     id: "c1".to_string(),
                     name: "shell".to_string(),
                     args: serde_json::json!({ "command": "cargo test" }),
+                    presentation: zeroclaw_api::tool::ToolPresentation::Generic,
                 })
                 .await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;

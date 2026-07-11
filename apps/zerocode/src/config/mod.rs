@@ -66,16 +66,41 @@ impl Default for ThemeSection {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UiProfile {
+    #[default]
+    Minimal,
+    Rich,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct UiSection {
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_chat_pane: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_ui_profile_or_default",
+        skip_serializing_if = "is_default_ui_profile"
+    )]
+    pub profile: UiProfile,
 }
 
 impl UiSection {
     fn is_empty(&self) -> bool {
-        !self.show_chat_pane
+        !self.show_chat_pane && self.profile == UiProfile::default()
     }
+}
+
+fn is_default_ui_profile(profile: &UiProfile) -> bool {
+    *profile == UiProfile::default()
+}
+
+fn deserialize_ui_profile_or_default<'de, D>(deserializer: D) -> Result<UiProfile, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(UiProfile::deserialize(deserializer).unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -543,6 +568,20 @@ mod tests {
             body.contains("locale = \"en\""),
             "default config must surface the locale prop on disk; got:\n{body}"
         );
+    }
+
+    #[test]
+    fn invalid_ui_profile_falls_back_to_minimal() {
+        let c: ZerocodeConfig = toml::from_str("[ui]\nprofile = \"unknown\"\n").unwrap();
+        assert_eq!(c.ui.profile, UiProfile::Minimal);
+    }
+
+    #[test]
+    fn ui_profile_round_trips_when_configured() {
+        let c: ZerocodeConfig = toml::from_str("[ui]\nprofile = \"rich\"\n").unwrap();
+        assert_eq!(c.ui.profile, UiProfile::Rich);
+        let body = toml::to_string_pretty(&c).unwrap();
+        assert!(body.contains("profile = \"rich\""), "{body}");
     }
 
     #[test]

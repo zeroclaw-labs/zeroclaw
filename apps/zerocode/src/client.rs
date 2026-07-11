@@ -1,8 +1,8 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
 //!
-//! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
-//! plumbing the daemon uses for bidirectional calls.
+//! Wraps the same JSON-RPC request/response plumbing the daemon uses for
+//! bidirectional calls.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -15,8 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
-use zeroclaw_api::tool::ToolPresentation;
+use crate::wire::{
+    ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape, ToolPresentation,
+};
 
 const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
