@@ -10236,6 +10236,17 @@ pub async fn start_channels(
             );
         }
 
+        // ── Wire deferred PipelineTool with per-agent policy gate (channel path) ──
+        if let Some(ref raw) = all_tools_result_ch.pipeline_raw
+            && security.is_tool_allowed("execute_pipeline")
+        {
+            let policy =
+                zeroclaw_runtime::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+            if let Some(pipe) = zeroclaw_runtime::tools::build_pipeline_tool(raw, policy) {
+                built_tools.push(pipe);
+            }
+        }
+
         // Wire MCP tools into the per-agent registry before freezing —
         // non-fatal. When `mcp.deferred_loading` is enabled, MCP tools are
         // exposed via a `tool_search` built-in rather than added eagerly.
