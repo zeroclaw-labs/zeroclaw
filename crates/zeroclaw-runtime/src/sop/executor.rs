@@ -246,12 +246,15 @@ async fn drive_headless_run(
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "run_id": run_id,
-                                    "error": e.to_string(),
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
                             "SOP headless driver: failed to advance run"
                         );
                         return;
@@ -271,9 +274,12 @@ async fn drive_headless_run(
                     Ok(SopRunAction::DeterministicStep { .. }) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"run_id": run_id})),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"run_id": run_id})),
                             "SOP headless driver: deterministic drive made no progress"
                         );
                         return;
@@ -282,12 +288,15 @@ async fn drive_headless_run(
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "run_id": run_id,
-                                    "error": e.to_string(),
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
                             "SOP headless driver: deterministic drive failed"
                         );
                         return;

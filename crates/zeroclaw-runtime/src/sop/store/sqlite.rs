@@ -673,7 +673,8 @@ mod tests {
     fn load_terminal_runs_filters_orders_and_limits() {
         let s = SqliteRunStore::open_in_memory().unwrap();
         // One active run must never surface in the terminal load.
-        s.save_run(&run("active", SopRunStatus::Running, "1")).unwrap();
+        s.save_run(&run("active", SopRunStatus::Running, "1"))
+            .unwrap();
         // Three terminal runs finished at ascending progress marks.
         for (id, prog) in [("t-old", "1"), ("t-mid", "2"), ("t-new", "3")] {
             s.save_run(&run(id, SopRunStatus::Running, prog)).unwrap();
@@ -698,7 +699,10 @@ mod tests {
         let capped = s.load_terminal_runs(2).unwrap();
         assert_eq!(capped.len(), 2, "limit truncates the tail");
         assert_eq!(
-            capped.iter().map(|r| r.run.run_id.as_str()).collect::<Vec<_>>(),
+            capped
+                .iter()
+                .map(|r| r.run.run_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["t-new", "t-mid"],
             "limit keeps the newest runs"
         );

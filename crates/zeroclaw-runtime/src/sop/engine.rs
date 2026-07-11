@@ -253,7 +253,9 @@ impl SopEngine {
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_attrs(::serde_json::json!({"seeded": seeded})),
-                        &format!("SOP engine seeded {seeded} terminal run(s) into the retention window")
+                        &format!(
+                            "SOP engine seeded {seeded} terminal run(s) into the retention window"
+                        )
                     );
                 }
             }
@@ -5710,8 +5712,10 @@ type = "manual"
     #[test]
     fn engine_restores_finished_runs_from_store() {
         use super::super::store::SqliteRunStore;
-        let path = std::env::temp_dir()
-            .join(format!("zc-sop-engine-restore-fin-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "zc-sop-engine-restore-fin-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
 
@@ -5757,7 +5761,11 @@ type = "manual"
             "terminal run must not rehydrate as active"
         );
         let finished = engine.finished_runs(None);
-        assert_eq!(finished.len(), 1, "terminal run seeded into retention window");
+        assert_eq!(
+            finished.len(),
+            1,
+            "terminal run seeded into retention window"
+        );
         assert_eq!(finished[0].run_id, "r-done");
         assert_eq!(finished[0].status, SopRunStatus::Completed);
         let _ = std::fs::remove_file(&path);

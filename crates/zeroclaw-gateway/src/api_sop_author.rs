@@ -425,20 +425,18 @@ pub async fn handle_sop_decide(
                     }
                 }
             }
-            _ => {
-                match guard.decide_checkpoint(&run_id, decision) {
-                    Ok(action) => {
-                        resumed_action = Some(action);
-                    }
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({ "error": e.to_string() })),
-                        )
-                            .into_response();
-                    }
+            _ => match guard.decide_checkpoint(&run_id, decision) {
+                Ok(action) => {
+                    resumed_action = Some(action);
                 }
-            }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            },
         }
     }
 

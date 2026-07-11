@@ -315,8 +315,7 @@ where
         };
         match resolved {
             Some(Ok(outcome)) => {
-                if let zeroclaw_runtime::sop::approval::ResolveOutcome::Resumed(action) = &outcome
-                {
+                if let zeroclaw_runtime::sop::approval::ResolveOutcome::Resumed(action) = &outcome {
                     let config = state.config.read().clone();
                     zeroclaw_runtime::sop::spawn_headless_run_driver(
                         config,
