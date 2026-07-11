@@ -116,6 +116,11 @@ impl Tool for CronUpdateTool {
                             "type": "boolean",
                             "description": "If true, delete the job automatically after its first successful run"
                         },
+                        "uses_memory": {
+                            "type": "boolean",
+                            "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs.",
+                            "default": true
+                        },
                         // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
                         // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
                         // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
@@ -651,6 +656,9 @@ mod tests {
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(channel_strs.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
         assert!(channel_strs.contains(&"dingtalk"));
+        assert!(channel_strs.contains(&"wechat"));
+        assert!(channel_strs.contains(&"signal"));
+        assert!(channel_strs.contains(&"email"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks
         // back to the originating conversation.
@@ -765,6 +773,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into()]),
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -803,6 +812,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);

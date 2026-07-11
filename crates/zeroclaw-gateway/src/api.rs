@@ -126,6 +126,8 @@ pub struct CronAddBody {
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
+    /// If false, disable memory recall for this agent cron job (default: true).
+    pub uses_memory: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +147,8 @@ pub struct CronPatchBody {
     /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
     /// the current state unchanged.
     pub enabled: Option<bool>,
+    /// If false, disable memory recall for this agent cron job (default: true).
+    pub uses_memory: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -402,6 +406,7 @@ pub async fn handle_api_cron_add(
         model,
         allowed_tools,
         delete_after_run,
+        uses_memory,
     } = body;
 
     let config = state.config.read().clone();
@@ -465,6 +470,7 @@ pub async fn handle_api_cron_add(
             delivery,
             delete_after_run,
             allowed_tools,
+            uses_memory.unwrap_or(true),
         )
     } else {
         let command = match command.as_deref() {
@@ -614,6 +620,7 @@ pub async fn handle_api_cron_patch(
         command,
         prompt,
         enabled,
+        uses_memory,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -696,6 +703,7 @@ pub async fn handle_api_cron_patch(
         command: patch_command,
         prompt: patch_prompt,
         enabled,
+        uses_memory,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 

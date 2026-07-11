@@ -857,6 +857,15 @@ pub struct MapKeySection {
     /// `#[natural_key]` (legacy whole-array `ObjectArray` round-trip,
     /// no per-element addressing).
     pub natural_key: Option<&'static str>,
+    /// Whether this section's map key is a `#[resource_key]` — a value
+    /// drawn from another domain (a model id, tool name, …) that may
+    /// itself contain dots, rather than a short operator-chosen alias
+    /// validated by `validate_alias_key`. Consumers that split a dotted
+    /// prop path into "map key" + "field name" by first-dot-boundary
+    /// MUST exclude `resource_key` sections: naive splitting corrupts a
+    /// resource key like `gpt-4.1` into a bogus alias `gpt-4` plus a
+    /// nonsense tail `1`.
+    pub resource_key: bool,
 }
 
 /// Serializable wire representation of a config field for API consumers
@@ -1185,5 +1194,55 @@ mod secret_field_tests {
             msg.contains("mcp.servers.foo.headers.Authorization"),
             "error must include field path; got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_key_tests {
+    // Pins `MapKeySection::resource_key`, the discriminator that
+    // `ensure_map_key_for_prop_path` (in the `zeroclawlabs` binary crate)
+    // filters on: `true` for sections keyed by a value drawn from another
+    // domain (a model id, tool name, …) that may itself contain dots;
+    // `false` for sections keyed by a short operator-chosen alias.
+    use crate::schema::Config;
+
+    fn resource_key_of(path: &str) -> bool {
+        Config::map_key_sections()
+            .into_iter()
+            .find(|section| section.path == path)
+            .unwrap_or_else(|| panic!("no map_key_sections() entry for `{path}`"))
+            .resource_key
+    }
+
+    #[test]
+    fn cost_rate_sections_are_resource_keyed() {
+        for path in [
+            "cost.rates.tools",
+            "cost.rates.providers.models.openai",
+            "cost.rates.providers.tts.openai",
+            "cost.rates.providers.transcription.openai",
+        ] {
+            assert!(
+                resource_key_of(path),
+                "`{path}` prices a resource id (model/voice/tool name), \
+                 so its map key must be marked #[resource_key]"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_keyed_sections_are_not_resource_keyed() {
+        for path in [
+            "risk_profiles",
+            "peer_groups",
+            "channels.telegram",
+            "providers.models.openai",
+        ] {
+            assert!(
+                !resource_key_of(path),
+                "`{path}` is keyed by an operator-chosen alias, not a \
+                 resource id, so it must not be marked #[resource_key]"
+            );
+        }
     }
 }
