@@ -340,4 +340,44 @@ mod tests {
             "[\"a\",\"b\"]"
         );
     }
+
+    #[test]
+    fn object_field_accepts_object_and_rejects_other_shapes() {
+        let value = serde_json::json!({"model": "gpt-4.1", "limit": 1024});
+        let coerced = coerce_for_set_prop(&value, Some(PropKind::Object)).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&coerced).unwrap();
+        assert_eq!(reparsed, value);
+
+        let err = coerce_for_set_prop(
+            &serde_json::json!(["not", "object"]),
+            Some(PropKind::Object),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ConfigApiCode::ValueTypeMismatch);
+        assert!(err.message.contains("JSON object"));
+    }
+
+    #[test]
+    fn object_array_field_accepts_array_and_rejects_other_shapes() {
+        let value = serde_json::json!([
+            {"name": "alpha"},
+            {"name": "beta", "enabled": true}
+        ]);
+        let coerced = coerce_for_set_prop(&value, Some(PropKind::ObjectArray)).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&coerced).unwrap();
+        assert_eq!(reparsed, value);
+
+        let scalar_items = serde_json::json!(["alpha", 42]);
+        let coerced = coerce_for_set_prop(&scalar_items, Some(PropKind::ObjectArray)).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&coerced).unwrap();
+        assert_eq!(reparsed, scalar_items);
+
+        let err = coerce_for_set_prop(
+            &serde_json::json!({"name": "alpha"}),
+            Some(PropKind::ObjectArray),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ConfigApiCode::ValueTypeMismatch);
+        assert!(err.message.contains("JSON array"));
+    }
 }
