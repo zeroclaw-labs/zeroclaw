@@ -738,9 +738,9 @@ The active path labeler applies scope labels to PRs based on changed files. Risk
 
 GitHub enforces CODEOWNERS automatically when the file exists and branch protection requires it. No Action required.
 
-**Stale issue management (`.github/workflows/stale.yml`):**
+**Stale issue management (maintainer-run):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
+No stale workflow is currently configured. During a maintainer-run stale pass, issues with no original-author activity for 20 days are labeled `status:stale` and receive a comment asking whether the issue is still relevant. Issues with no original-author activity for 10 days after the stale label is applied are closed. This prevents the backlog from accumulating issues that are no longer active while preserving a defined response window. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
 
 **PR size labeling (future/optional):**
 

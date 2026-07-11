@@ -41,7 +41,7 @@ The protocol encodes operational details from RFC #5577 (governance and stale th
 | **Accounting** | Count and categorize open issues by type, age, label coverage; surface top action items; ask user which mode to run |
 | **Triage** | Process issues with no triage labels: classify, apply labels, link to open PRs, flag thin bug reports, redirect security issues |
 | **Sweep** | Full backlog pass in priority order: fixed-by-merged-PR → duplicates → r:support → stale candidates |
-| **Stale** | RFC §5577 enforcement: `status:stale` at 45 days no-activity, close at 60 days; per exclusion rules |
+| **Stale** | RFC §5577 enforcement: `status:stale` after 20 days without original-author activity, close 10 days after the label is applied; per exclusion rules |
 | **Won't-fix** | Close issues that violate named core engineering constraints, with constraint and RFC/AGENTS.md reference |
 | **Single** | Full triage of one issue: classify, label, link PRs, assess staleness, act or escalate |
 

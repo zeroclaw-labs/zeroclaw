@@ -83,7 +83,7 @@ Any `gh issue list` with `--limit N` may silently truncate. After every bulk fet
    | Type | bug, feature, RFC, other/unlabeled |
    | Age (by `createdAt`) | <7d, 7–30d, 30–60d, 60d+ |
    | Triage coverage | labeled vs. unlabeled |
-   | Stale candidates | issues where the original creator has posted nothing after their opening post, and the issue is 45+ days old. Maintainer comments, label changes, and PR links do not reset this clock — only a follow-up comment from the original author does. |
+   | Stale candidates | issues where the original creator has posted nothing after their opening post, and the issue is 20+ days old. Maintainer comments, label changes, and PR links do not reset this clock — only a follow-up comment from the original author does. |
    | Active PR linkage | issues with an open PR referencing them |
    | r:needs-repro | count |
    | r:support | count |
@@ -91,7 +91,7 @@ Any `gh issue list` with `--limit N` may silently truncate. After every bulk fet
 3. Surface the top action items — specifically:
    - Unlabeled issues (no triage labels at all)
    - Bug reports with no repro evidence
-   - Issues 45+ days old with no author follow-up
+   - Issues 20+ days old with no author follow-up
    - Issues that may be fixed by a recently merged PR
 
 4. Present the summary clearly. Then ask: **"Which mode do you want to run — triage, sweep, stale, wont-fix, or a specific issue number?"**
@@ -266,8 +266,8 @@ Flag (do not close) issues that meet the stale entry condition per §4. Present 
 
 ### Policy thresholds (from RFC #5577 §11)
 
-- Issues with **no activity for 45 days** → apply `status:stale` + comment asking if still relevant
-- Issues with **no activity for 15 days after `status:stale` was applied** (60 days total) → close with welcoming re-open invite
+- Issues with **no activity for 20 days** → apply `status:stale` + comment asking if still relevant
+- Issues with **no activity for 10 days after `status:stale` was applied** (30 days total when labeled at the threshold) → close with welcoming re-open invite
 
 Activity is defined as: a follow-up comment or update from the **original author** after the opening post. Maintainer comments, label changes, and PR links do not reset the clock — the signal is whether the person who filed the issue is still engaged.
 
@@ -308,11 +308,11 @@ Target policy: `status:no-stale` protects an issue only when the stale-exemption
    - Check the open PR batch for issue references before relying on `status:in-progress` or stale eligibility. Fall back to a per-issue PR search only when the batch result is ambiguous.
    - Check opening-post reactions for the 10-or-more 👍 threshold.
 
-5. For issues at 45–59 days since author-last-active (not already labeled `status:stale`):
+5. For issues at 20+ days since author-last-active (not already labeled `status:stale`):
    - Apply `status:stale`
-   - Comment: acknowledge the issue is still valid, ask if it is still relevant or if the reporter has a workaround; mention that it will be closed in 15 days without a response but can always be reopened
+   - Comment: acknowledge the issue is still valid, ask if it is still relevant or if the reporter has a workaround; mention that it will be closed in 10 days without a response but can always be reopened
 
-6. For issues already carrying `status:stale`, compute when the label was applied (check the label-application comment date or use `gh api` to check issue timeline events). Close only if **15+ days have passed since `status:stale` was applied** — not since author-last-active. The 15-day window is the reporter's guaranteed response time; do not shorten it.
+6. For issues already carrying `status:stale`, compute when the label was applied (check the label-application comment date or use `gh api` to check issue timeline events). Close only if **10+ days have passed since `status:stale` was applied** — not since author-last-active. The 10-day window is the reporter's guaranteed response time; do not shorten it.
    - Close with a comment: thank the reporter, explain the backlog hygiene reason, and include the phrase **"you can reopen this issue by commenting here, or open a new issue with updated context — either works"**
    - Reference a related open issue or feature if one exists
 
@@ -422,7 +422,7 @@ For issues, risk labels estimate likely fix blast radius from the report. Reasse
 
 ### Status
 
-- `status:stale` — original author has not engaged for 45+ days; pending closure
+- `status:stale` — original author has not engaged for 20+ days; pending closure
 - `status:accepted` — RFC or work item accepted by the team; not stale-exempt by itself
 - `status:blocked` — waiting on external blocker; exempt from stale while the blocker is recorded and unresolved
 - `status:in-progress` — linked open PR exists; verify live PR state before stale decisions

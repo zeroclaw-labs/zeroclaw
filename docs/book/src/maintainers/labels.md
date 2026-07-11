@@ -312,7 +312,7 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 | `status:accepted` | RFC or work item ratified by the team. This does not exempt the issue from stale handling by itself. |
 | `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
-| `status:stale` | No author activity for the stale window; may close if not refreshed |
+| `status:stale` | No original-author activity for 20 days; may close 10 days after the label is applied if the author does not re-engage |
 | `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-routing-evidence) has a contributor-visible stale-exemption reason and routing evidence. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
 
 ## Resolution labels
@@ -338,7 +338,7 @@ Applied manually: the auto-response automation that used to handle these was rem
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
 | `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself. |
-| `stale-candidate` | Dormant PR or issue that is a candidate for closing. For PRs, follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). |
+| `stale-candidate` | Dormant PR that is a candidate for closing. Follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). Issue stale passes use `status:stale` instead. |
 
 ## Community pickup labels
 
