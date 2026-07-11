@@ -82,10 +82,6 @@ impl Code {
         self.inner.in_browse_mode()
     }
 
-    pub(crate) fn wants_quit_chord(&self) -> bool {
-        self.inner.wants_quit_chord()
-    }
-
     pub(crate) fn exit_browse_mode(&mut self) {
         self.inner.exit_browse_mode();
     }
