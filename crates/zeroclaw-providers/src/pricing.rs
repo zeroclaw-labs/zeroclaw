@@ -525,11 +525,11 @@ async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMa
     // gateway; first-fill latency is bounded by the slowest gateway, not the
     // sum of all of them) ──
     let mut any_ok = false;
-    let catalogs = join_all(
-        groups
-            .iter()
-            .map(|group| group.handle.list_models_with_pricing()),
-    )
+    let catalogs = join_all(groups.iter().map(|group| async {
+        crate::ProviderDispatch::from_ref(&*group.handle)
+            .list_models_with_pricing()
+            .await
+    }))
     .await;
     let mut gateway_results: Vec<(&[WantedModel], HashMap<String, ModelRates>)> =
         Vec::with_capacity(groups.len());

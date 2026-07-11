@@ -1533,10 +1533,10 @@ impl Agent {
             None
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (WebSocket/daemon sessions).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         // If caller provided an engine (daemon path), use it; otherwise
-        // build our own (CLI/standalone path).
+        // build our own (CLI/standalone path) only when the gate is set.
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
             (None, None) if config.sop.sops_dir.is_some() => {
@@ -1598,6 +1598,9 @@ impl Agent {
             deferred_section,
             pinned_section,
             activated_handle,
+            // from_config performs no per-turn tool_filter_groups filtering
+            // itself (the multi-agent gap tracked as #6699 follow-up scope).
+            mcp_tool_names: _,
         } = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,

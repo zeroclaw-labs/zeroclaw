@@ -227,7 +227,7 @@ pub async fn handle_command(
             for finding in report.findings {
                 println!("    - {finding}");
             }
-            anyhow::bail!("Skill audit failed.");
+            anyhow::bail!(get_required_cli_string("cli-skills-audit-failed"));
         }
         crate::SkillCommands::Install {
             source,
@@ -253,7 +253,12 @@ pub async fn handle_command(
                     .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .with_context(|| format!("failed to install git skill source: {source}"))?
+                    .with_context(|| {
+                        get_required_cli_string_with_args(
+                            "cli-skills-install-git-failed",
+                            &[("source", &source)],
+                        )
+                    })?
             } else if is_registry_source(&source) {
                 println!(
                     "{}",
@@ -270,7 +275,12 @@ pub async fn handle_command(
                     config.skills.registry_url.as_deref(),
                     no_tier_banner,
                 )
-                .with_context(|| format!("failed to install skill from registry: {source}"))?
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-registry-failed",
+                        &[("source", &source)],
+                    )
+                })?
             } else if is_extra_registry_source(&source) {
                 // `is_extra_registry_source` is `parse_extra_registry_source(..).is_some()`,
                 // so this re-parse always succeeds. `unwrap_or_default` only guards an
@@ -293,10 +303,20 @@ pub async fn handle_command(
                     &config.skills.extra_registries,
                     no_tier_banner,
                 )
-                .with_context(|| format!("failed to install skill from extra registry: {source}"))?
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-extra-registry-failed",
+                        &[("source", &source)],
+                    )
+                })?
             } else {
                 install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?
+                    .with_context(|| {
+                        get_required_cli_string_with_args(
+                            "cli-skills-install-local-failed",
+                            &[("source", &source)],
+                        )
+                    })?
             };
             let status = console::style("✓").green().bold().to_string();
             let installed_path = installed_dir.display().to_string();
@@ -1257,6 +1277,33 @@ mod install_location_tests {
         AliasedAgentConfig {
             skill_bundles: bundles.iter().map(|s| (*s).to_string()).collect(),
             ..AliasedAgentConfig::default()
+        }
+    }
+
+    /// The `skills install`/`audit` error strings route through Fluent. Assert
+    /// the new `cli-skills-*` keys resolve (not the `{key}` missing-marker) and
+    /// interpolate their `{$source}` argument, so a code/ftl key rename can't
+    /// silently degrade these user-facing errors to a literal key. Uses the
+    /// locale-independent argument value as the resolution signal.
+    #[test]
+    fn install_error_strings_resolve_through_fluent() {
+        use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+        let audit = get_required_cli_string("cli-skills-audit-failed");
+        assert!(
+            !audit.starts_with('{') && audit.contains("audit"),
+            "cli-skills-audit-failed did not resolve: {audit}"
+        );
+        for key in [
+            "cli-skills-install-git-failed",
+            "cli-skills-install-registry-failed",
+            "cli-skills-install-extra-registry-failed",
+            "cli-skills-install-local-failed",
+        ] {
+            let msg = get_required_cli_string_with_args(key, &[("source", "acme/widget")]);
+            assert!(
+                msg.contains("failed to install") && msg.contains("acme/widget"),
+                "{key} did not resolve/interpolate: {msg}"
+            );
         }
     }
 

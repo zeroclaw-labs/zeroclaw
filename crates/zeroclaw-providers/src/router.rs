@@ -1310,17 +1310,16 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "run shell commands".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell commands",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" }
                 }
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let mut stream = router.stream_chat(
             ChatRequest {

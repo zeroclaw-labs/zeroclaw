@@ -2095,6 +2095,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2122,6 +2123,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2150,6 +2152,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2307,6 +2310,7 @@ mod tests {
             }),
             false,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2403,6 +2407,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         assert!(!job.delete_after_run);

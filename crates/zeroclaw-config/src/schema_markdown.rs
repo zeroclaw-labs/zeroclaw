@@ -509,15 +509,37 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         .get("properties")
         .and_then(Value::as_object)
         .unwrap_or(&empty);
+
+    // For HashMap sections (e.g. `cron`, `risk_profiles`), there are no
+    // `properties` — the value type lives under `additionalProperties`.
+    // Descend into it and render the per-alias fields.
     if props.is_empty() {
+        if let Some(add) = schema.get("additionalProperties")
+            && add.is_object()
+        {
+            let value_schema = resolve(add, defs);
+            if value_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some()
+            {
+                // Insert `<alias>` into the displayed path so the table header
+                // reads `[cron.<alias>]`, `[risk_profiles.<alias>]`, etc.
+                let mut map_path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
+                map_path.push("<alias>".to_string());
+                let map_path_str = map_path.join(".");
+                let _ = writeln!(out, "## `{map_path_str}`\n");
+                if let Some(desc) = value_schema.get("description").and_then(Value::as_str) {
+                    out.push_str(desc);
+                    out.push_str("\n\n");
+                }
+                let map_path_refs: Vec<&str> = map_path.iter().map(String::as_str).collect();
+                write_section_fields(out, value_schema, defs, &map_path_str, &map_path_refs);
+                return;
+            }
+        }
         return;
     }
-
-    let required: Vec<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
 
     // Family-map container (e.g. `providers.models`, `channels`): every field
     // is a `HashMap<String, T>` slot. Listing all slots here, each an empty
@@ -542,6 +564,31 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         );
         return;
     }
+
+    write_section_fields(out, schema, defs, &path_str, path);
+}
+
+/// Render a struct's fields as a markdown table and recurse into sub-sections.
+/// Shared by `write_section` and the HashMap-value-type path for sections like
+/// `cron` where the schema has `additionalProperties` instead of `properties`.
+fn write_section_fields(
+    out: &mut String,
+    schema: &Value,
+    defs: &Map<String, Value>,
+    _path_str: &str,
+    path: &[&str],
+) {
+    let empty = Map::new();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
 
     out.push_str("| Key | Type | Default | Description |\n");
     out.push_str("|-----|------|---------|-------------|\n");
@@ -843,5 +890,38 @@ mod tests {
         assert_eq!(first_line(Some("first\r\nsecond")), "first");
         assert_eq!(first_line(Some("")), "");
         assert_eq!(first_line(None), "");
+    }
+
+    #[test]
+    fn cron_section_exposes_uses_memory_field() {
+        // Regression test for #8397: the generated config reference must expose
+        // per-cron-job fields (including `uses_memory`) instead of only the
+        // top-level `[cron]` summary. `cron` is a `HashMap<String, CronJobDecl>`
+        // — the generator must descend into `additionalProperties` to render
+        // the CronJobDecl fields.
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+
+        // The cron section heading with <alias> must exist.
+        assert!(
+            md.contains("## `cron.<alias>`"),
+            "cron section should have a `cron.<alias>` subheading"
+        );
+
+        // `uses_memory` must appear as a field in the cron section.
+        assert!(
+            md.contains("uses_memory"),
+            "cron section should expose the `uses_memory` field"
+        );
+
+        // Other CronJobDecl fields should also be present.
+        for field in [
+            "name", "job_type", "schedule", "enabled", "prompt", "command",
+        ] {
+            assert!(
+                md.contains(field),
+                "cron section should expose the `{field}` field"
+            );
+        }
     }
 }
