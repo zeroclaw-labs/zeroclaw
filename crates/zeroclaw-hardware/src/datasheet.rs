@@ -197,7 +197,7 @@ impl Tool for DatasheetTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: action".to_string()),
                 });
             }
@@ -212,7 +212,7 @@ impl Tool for DatasheetTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some(
                                 "missing required parameter: device_name for action 'search'"
                                     .to_string(),
@@ -229,7 +229,8 @@ impl Tool for DatasheetTool {
                             "Datasheet for '{device}' already cached at: {}\n\
                              Use action='read' to get the local path.",
                             path.display()
-                        ),
+                        )
+                        .into(),
                         error: None,
                     });
                 }
@@ -241,7 +242,8 @@ impl Tool for DatasheetTool {
                         "Suggested web search for '{device}' datasheet:\n{query}\n\n\
                          Once you have a direct PDF URL, use:\n\
                          datasheet(action=\"download\", device_name=\"{device}\", url=\"<URL>\")"
-                    ),
+                    )
+                    .into(),
                     error: None,
                 })
             }
@@ -252,7 +254,7 @@ impl Tool for DatasheetTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some(
                                 "missing required parameter: device_name for action 'download'"
                                     .to_string(),
@@ -265,7 +267,7 @@ impl Tool for DatasheetTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some(
                                 "missing required parameter: url for action 'download'".to_string(),
                             ),
@@ -283,12 +285,13 @@ impl Tool for DatasheetTool {
                              ~/.zeroclaw/hardware/devices/aardvark0.md with the key \
                              registers, I2C address, and protocol notes from this datasheet.",
                             path.display()
-                        ),
+                        )
+                        .into(),
                         error: None,
                     }),
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!("download failed: {e}")),
                     }),
                 }
@@ -313,7 +316,7 @@ impl Tool for DatasheetTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
@@ -324,7 +327,7 @@ impl Tool for DatasheetTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some(
                                 "missing required parameter: device_name for action 'read'"
                                     .to_string(),
@@ -338,12 +341,13 @@ impl Tool for DatasheetTool {
                         output: format!(
                             "Datasheet for '{device}' is available at: {}",
                             path.display()
-                        ),
+                        )
+                        .into(),
                         error: None,
                     }),
                     None => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!(
                             "no datasheet found for '{device}'. \
                              Use action='search' to find one."
@@ -354,7 +358,7 @@ impl Tool for DatasheetTool {
 
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!(
                     "unknown action '{other}'. Valid: search, download, list, read"
                 )),

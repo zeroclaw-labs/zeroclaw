@@ -423,6 +423,7 @@ cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
 cli-sop-loaded-header = SOP chargés ({$count}) :
 cli-sop-none-to-validate = Aucun SOP trouvé à valider.
 cli-sop-valid = ✅ {$name} — valide
+cli-sop-deleted = SOP supprimé : {$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} avertissement(s) :
 cli-sop-all-passed = Tous les SOP ont réussi la validation.
 cli-sop-priority = {"  "}Priorité :      {$value}
