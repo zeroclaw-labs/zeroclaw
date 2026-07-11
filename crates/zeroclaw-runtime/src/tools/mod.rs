@@ -68,6 +68,7 @@ pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
 pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
+pub use zeroclaw_tools::homeassistant_tool::HomeAssistantTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
@@ -982,6 +983,36 @@ pub fn all_tools_with_runtime(
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+            )));
+        }
+    }
+
+    // Home Assistant integration (config-gated). Talks the native HA REST API
+    // (NOT the MCP server integration). URL + token fall back to HASS_URL /
+    // HASS_TOKEN env vars so no secret needs to live in config.toml.
+    if root_config.homeassistant.enabled {
+        let ha_url = if root_config.homeassistant.url.trim().is_empty() {
+            std::env::var("HASS_URL").unwrap_or_default()
+        } else {
+            root_config.homeassistant.url.trim().to_string()
+        };
+        let ha_token = if root_config.homeassistant.token.trim().is_empty() {
+            std::env::var("HASS_TOKEN").unwrap_or_default()
+        } else {
+            root_config.homeassistant.token.trim().to_string()
+        };
+        if ha_url.trim().is_empty() || ha_token.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "homeassistant tool enabled but url/token missing (set homeassistant.url/token or HASS_URL/HASS_TOKEN env vars) — skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(HomeAssistantTool::new(
+                ha_url,
+                ha_token,
+                security.clone(),
             )));
         }
     }

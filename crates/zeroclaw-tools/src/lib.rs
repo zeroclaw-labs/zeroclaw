@@ -41,6 +41,7 @@ pub mod google_workspace;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
+pub mod homeassistant_tool;
 pub mod http_request;
 pub mod image_gen;
 pub mod image_info;

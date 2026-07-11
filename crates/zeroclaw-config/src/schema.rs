@@ -544,6 +544,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub jira: JiraConfig,
 
+    /// Home Assistant integration configuration (`[homeassistant]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub homeassistant: HomeAssistantConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -16703,6 +16709,37 @@ impl Default for NotionConfig {
     }
 }
 
+/// Home Assistant integration configuration (`[homeassistant]`).
+///
+/// When `enabled = true`, registers the `homeassistant` tool which talks to a
+/// Home Assistant instance over its native REST API (NOT the MCP server
+/// integration). It can list entities, read one entity's state, and call a
+/// service. `url` is the HA origin (e.g. `http://10.10.10.100:8123`); `token`
+/// is a long-lived access token. Both may be supplied via env (`HASS_URL` /
+/// `HASS_TOKEN`) so no secret is committed to `config.toml`.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "homeassistant"]
+pub struct HomeAssistantConfig {
+    /// Enable the `homeassistant` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HA base URL (origin), e.g. `http://10.10.10.100:8123`.
+    /// Falls back to the `HASS_URL` env var when empty.
+    #[serde(default)]
+    pub url: String,
+    /// Long-lived access token. Falls back to `HASS_TOKEN` env var when empty.
+    /// Stored encrypted at rest.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: String,
+}
+
 /// Jira integration configuration (`[jira]`).
 ///
 /// When `enabled = true`, registers the `jira` tool which can get tickets,
@@ -17114,6 +17151,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            homeassistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -23984,6 +24022,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            homeassistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -24791,6 +24830,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            homeassistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
