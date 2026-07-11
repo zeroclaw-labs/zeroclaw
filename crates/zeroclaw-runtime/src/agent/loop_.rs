@@ -1361,8 +1361,8 @@ pub async fn run(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (CLI agent run).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
@@ -1401,19 +1401,7 @@ pub async fn run(
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            mut deferred_section,
-            pinned_section,
-            activated_handle,
-            mcp_tool_names,
-        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
             security: &security,
@@ -1431,10 +1419,22 @@ pub async fn run(
             emit_assembly_logs: true,
         })
         .await;
+        // run injects one combined MCP prompt block: deferred tool-search listing +
+        // pinned resources, composed by the harness.
+        let deferred_section = assembled.combined_mcp_prompt_section();
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle,
+            mcp_tool_names,
+            ..
+        } = assembled;
         let tools_registry = registry.into_inner();
-        // run injects one combined MCP prompt block: fold the pinned-resources section
-        // onto the deferred tool-search listing (the seam now surfaces them separately).
-        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -1839,7 +1839,9 @@ pub async fn run(
                 config.skills.install_suggestions.enabled,
             ) {
                 final_output = suggestion;
-                println!("{final_output}");
+                if interactive {
+                    println!("{final_output}");
+                }
                 observer.record_event(&ObserverEvent::TurnComplete);
                 return Ok(final_output);
             }
@@ -2139,7 +2141,9 @@ pub async fn run(
             // Emit the user-visible response before any background work so the
             // skill-review fork can never delay the user's answer.
             final_output = response;
-            println!("{final_output}");
+            if interactive {
+                println!("{final_output}");
+            }
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Background skill review fork — post-turn, opt-in
@@ -2981,8 +2985,8 @@ pub async fn process_message(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (process_message CLI agent).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
@@ -3027,19 +3031,7 @@ pub async fn process_message(
         // non-Full autonomy. Only process_message (i.e. gateway live chat and peer
         // delegation) had that admit; the real channels already use the plain filter.
         // See the PR body for the hardening rationale.
-        let scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            mut deferred_section,
-            pinned_section,
-            activated_handle: activated_handle_pm,
-            mcp_tool_names: mcp_tool_names_pm,
-        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
             security: &security,
@@ -3054,10 +3046,23 @@ pub async fn process_message(
             emit_assembly_logs: true,
         })
         .await;
+        // process_message injects one combined MCP prompt block: deferred tool-search
+        // listing + pinned resources, composed by the harness. `mut` because the
+        // text-tool prompt policy below may clear it for a non-native strict target.
+        let mut deferred_section = assembled.combined_mcp_prompt_section();
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle: activated_handle_pm,
+            mcp_tool_names: mcp_tool_names_pm,
+            ..
+        } = assembled;
         let tools_registry = registry.into_inner();
-        // process_message injects one combined MCP prompt block: fold pinned resources
-        // onto the deferred tool-search listing (the seam surfaces them separately).
-        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -4842,7 +4847,7 @@ mod tests {
                 .unwrap_or_default();
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: format!("counted:{value}"),
+                output: format!("counted:{value}").into(),
                 error: None,
             })
         }
@@ -4922,7 +4927,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string(),
+                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string().into(),
                 error: None,
             })
         }
@@ -4953,7 +4958,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: crate::tools::ToolOutput::default(),
                 error: None,
             })
         }
@@ -5004,7 +5009,7 @@ mod tests {
                 .push(args.clone());
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: args.to_string(),
+                output: args.to_string().into(),
                 error: None,
             })
         }
@@ -5072,7 +5077,7 @@ mod tests {
 
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: format!("ok:{value}"),
+                output: format!("ok:{value}").into(),
                 error: None,
             })
         }
@@ -5118,7 +5123,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: false,
-                output: String::new(),
+                output: crate::tools::ToolOutput::default(),
                 error: Some(self.error_reason.clone()),
             })
         }
@@ -6436,6 +6441,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
@@ -6577,6 +6583,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
             step_scope_enforce: true,
@@ -6819,7 +6826,7 @@ mod tests {
             }
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: "fast-done".to_string(),
+                output: "fast-done".to_string().into(),
                 error: None,
             })
         }
@@ -10177,11 +10184,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10263,11 +10270,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10340,11 +10347,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10380,11 +10387,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10719,11 +10726,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -11329,11 +11336,11 @@ This is an example, not an invocation."#;
                 ],
             )]);
         let messages = vec![ChatMessage::user("hi")];
-        let tools = [crate::tools::ToolSpec {
-            name: "count_tool".to_string(),
-            description: "Count values".to_string(),
-            parameters: serde_json::json!({"type": "object"}).into(),
-        }];
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
         let outcome = consume_provider_streaming_response(
@@ -11677,7 +11684,7 @@ This is an example, not an invocation."#;
             );
             Ok(crate::tools::ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         }
@@ -13238,11 +13245,7 @@ Let me check the result."#;
     // which is exactly how the no-op shipped unnoticed.
 
     fn make_spec(name: &str) -> crate::tools::ToolSpec {
-        crate::tools::ToolSpec {
-            name: name.to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({}).into(),
-        }
+        crate::tools::ToolSpec::new(name.to_string(), String::new(), serde_json::json!({}))
     }
 
     fn mcp_set(names: &[&str]) -> HashSet<String> {
@@ -14684,7 +14687,7 @@ Let me check the result."#;
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: crate::tools::ToolOutput::default(),
                 error: None,
             })
         }

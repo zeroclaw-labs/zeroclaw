@@ -1895,21 +1895,21 @@ mod tests {
         use zeroclaw_api::tool::ToolSpec;
 
         let tools = vec![
-            ToolSpec {
-                name: "valid_tool".into(),
-                description: "A valid tool".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
-            ToolSpec {
-                name: "mcp:server.bad".into(),
-                description: "Invalid name".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
-            ToolSpec {
-                name: "another-valid".into(),
-                description: "Also valid".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new(
+                "valid_tool",
+                "A valid tool",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "mcp:server.bad",
+                "Invalid name",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "another-valid",
+                "Also valid",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -1932,17 +1932,17 @@ mod tests {
 
         let tools = vec![
             // New format — must pass through.
-            ToolSpec {
-                name: "openrouter-spend__check_openrouter_spend".into(),
-                description: "Skill tool".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new(
+                "openrouter-spend__check_openrouter_spend",
+                "Skill tool",
+                serde_json::json!({"type": "object"}),
+            ),
             // Old format — must still be rejected so the regression stays caught.
-            ToolSpec {
-                name: "openrouter-spend.check_openrouter_spend".into(),
-                description: "Skill tool with legacy dotted name".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new(
+                "openrouter-spend.check_openrouter_spend",
+                "Skill tool with legacy dotted name",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -1961,11 +1961,11 @@ mod tests {
     fn convert_tools_returns_none_when_all_invalid() {
         use zeroclaw_api::tool::ToolSpec;
 
-        let tools = vec![ToolSpec {
-            name: "mcp:bad.name".into(),
-            description: "Invalid".into(),
-            parameters: serde_json::json!({"type": "object"}).into(),
-        }];
+        let tools = vec![ToolSpec::new(
+            "mcp:bad.name",
+            "Invalid",
+            serde_json::json!({"type": "object"}),
+        )];
 
         assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
     }
