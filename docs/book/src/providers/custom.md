@@ -109,6 +109,7 @@ pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
     fn supports_streaming(&self) -> bool { true }
     fn supports_streaming_tool_events(&self) -> bool { false }
+    fn streams_text_with_tools(&self) -> bool { false }
 
     async fn chat(
         &self,

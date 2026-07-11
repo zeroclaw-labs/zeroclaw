@@ -15,15 +15,17 @@ Channels consume these events via the `Channel` trait's outbound stream hook.
 
 ## Capability flags
 
-A provider exposes two flags so the runtime knows what it can expect:
+A provider exposes three flags so the runtime knows what it can expect:
 
 ```rust
 fn supports_streaming(&self) -> bool { true }
 fn supports_streaming_tool_events(&self) -> bool { true }
+fn streams_text_with_tools(&self) -> bool { true }
 ```
 
 - **`supports_streaming`**: true for every actively maintained provider
-- **`supports_streaming_tool_events`**: true when the provider emits `ToolCall` events during the stream rather than at the end
+- **`supports_streaming_tool_events`**: true when the provider emits structured `ToolCall` events during the stream rather than at the end
+- **`streams_text_with_tools`**: true when streaming still yields correct visible text with tools present even though tool calls are *not* emitted as structured stream events. This covers providers that carry tool calls inside the text stream, parsed downstream from the accumulated response. It differs from `supports_streaming_tool_events` in the delivery shape: `supports_streaming_tool_events` promises discrete `ToolCall` events mid-stream, while `streams_text_with_tools` promises only that visible text streams live and the tool calls are recovered afterward from the full response. A provider can advertise either, both, or neither; the runtime stream gate uses `streams_text_with_tools` to keep streaming visible text live instead of falling back to a single terminal payload when tools are in play.
 
 OpenAI-compatible providers differ: some stream tool-call arg deltas chunk-by-chunk, others only emit the call once complete. The `compatible.rs` SSE parser handles both.
 
@@ -56,7 +58,10 @@ To disable reasoning entirely on a reasoning-capable model, set the relevant rea
 
 ## Tool calls mid-stream
 
-When a model decides to call a tool, the provider emits `ToolCall`. The runtime:
+When a model decides to call a tool, the provider either emits a structured
+`ToolCall` stream event (`supports_streaming_tool_events`) or carries the call
+inside the text stream to be parsed downstream from the accumulated response
+(`streams_text_with_tools`). In both cases the runtime:
 
 1. Pauses reading from the provider's stream
 2. Flushes any buffered text to the channel
