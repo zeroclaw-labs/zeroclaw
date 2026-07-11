@@ -1823,17 +1823,17 @@ async fn run_quickstart_cli(
                 ];
                 #[allow(clippy::no_effect_underscore_binding)]
                 let _exhaustive = |k: MemoryChoice| match k {
+                    // Hindsight is intentionally omitted from the interactive
+                    // quickstart picker (like Qdrant): it needs an external
+                    // endpoint + bearer token, so it is opt-in via
+                    // `[memory.hindsight]` rather than a one-click choice.
                     MemoryChoice::Sqlite
                     | MemoryChoice::Markdown
                     | MemoryChoice::Postgres
                     | MemoryChoice::Qdrant
                     | MemoryChoice::Lucid
+                    | MemoryChoice::Hindsight
                     | MemoryChoice::None => (),
-                    // Hindsight is intentionally omitted from the interactive
-                    // quickstart picker (like Qdrant): it needs an external
-                    // endpoint + bearer token, so it is opt-in via
-                    // `[memory.hindsight]` rather than a one-click choice.
-                    MemoryChoice::Hindsight => (),
                 };
                 let labels: Vec<String> = kinds
                     .iter()
