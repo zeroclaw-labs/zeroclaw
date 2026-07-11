@@ -2984,10 +2984,30 @@ impl SopEngine {
     /// not carry step-1 votes into step 2; the voter key is source-qualified, so a
     /// repeat vote by the same identity on the same source counts once. Returns 0 on
     /// a store error (fail-closed: an unreadable ledger cannot satisfy a quorum).
-    pub(crate) fn distinct_gate_voters(&self, run_id: &str, step: u32) -> usize {
-        let Ok(events) = self.store.list_events(run_id) else {
-            return 0;
-        };
+    pub(crate) fn distinct_gate_voters(
+        &self,
+        run_id: &str,
+        step: u32,
+    ) -> Result<usize, StoreError> {
+        // A read failure here must NOT collapse to 0 votes: that would report a bogus
+        // `PendingQuorum { have: 0 }` after a vote was durably appended, silently
+        // swallowing the store error. Surface it so the broker fails the resolve
+        // (leaving the gate waiting) and a retry re-counts. Actors are deduped, so a
+        // retried vote does not double-count.
+        let events = self.store.list_events(run_id).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "step": step,
+                        "error": e.to_string(),
+                    })),
+                "SOP engine: quorum voter count could not read the gate ledger (fail-closed, gate stays waiting)"
+            );
+            e
+        })?;
         let mut voters: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for ev in events {
             if ev.kind == "gate_vote"
@@ -2997,7 +3017,7 @@ impl SopEngine {
                 voters.insert(actor);
             }
         }
-        voters.len()
+        Ok(voters.len())
     }
 
     /// Record the approval completion metric at the gate-clearing chokepoint, so
@@ -4954,17 +4974,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 1),
+            engine.distinct_gate_voters("run-1", 1).unwrap(),
             2,
             "gateway:alice (http+ws collapsed) + cli:bob = 2 distinct step-1 voters"
         );
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 2),
+            engine.distinct_gate_voters("run-1", 2).unwrap(),
             1,
             "step-2 quorum does not include step-1 voters"
         );
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 3),
+            engine.distinct_gate_voters("run-1", 3).unwrap(),
             0,
             "no votes recorded for step 3"
         );

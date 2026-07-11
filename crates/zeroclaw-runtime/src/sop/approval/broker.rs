@@ -263,7 +263,10 @@ impl ApprovalBroker {
                 // Quorum > 1: durably record this vote, then count distinct approvers
                 // FOR THE CURRENT STEP so a multi-gate run does not reuse earlier votes.
                 engine.record_gate_vote(run_id, step, &principal)?;
-                let have = engine.distinct_gate_voters(run_id, step);
+                // Propagate a gate-ledger read failure instead of counting it as 0
+                // votes: the vote above is durably recorded, so failing here leaves
+                // the gate waiting for a retry rather than reporting a bogus quorum.
+                let have = engine.distinct_gate_voters(run_id, step)?;
                 if have >= need {
                     Ok(BrokerOutcome::Resolved(
                         engine.resolve_gate(run_id, decision, principal)?,
@@ -573,6 +576,171 @@ mod tests {
         }
     }
 
+    /// Delegates to an in-memory store but fails every `list_events`, to prove a
+    /// gate-ledger read failure during quorum counting is surfaced (the resolve
+    /// errors, the gate stays waiting) rather than swallowed into 0 votes. `save_run`
+    /// and `append_event` succeed, so the run parks durably and the vote records -
+    /// modelling the "vote appended, then the ledger read fails" case exactly.
+    struct ListEventsFailsStore {
+        inner: crate::sop::store::InMemoryRunStore,
+    }
+    impl crate::sop::store::SopRunStore for ListEventsFailsStore {
+        fn save_run(
+            &self,
+            r: &crate::sop::store::PersistedRun,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.save_run(r)
+        }
+        fn finish_run(
+            &self,
+            id: &str,
+            t: &crate::sop::store::PersistedRun,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.finish_run(id, t)
+        }
+        fn load_terminal_runs(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
+        fn load_active_runs(
+            &self,
+        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
+            self.inner.load_active_runs()
+        }
+        fn load_run(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::sop::store::PersistedRun>, crate::sop::store::StoreError>
+        {
+            self.inner.load_run(id)
+        }
+        fn last_terminal_completed_at(
+            &self,
+            s: &str,
+        ) -> Result<Option<String>, crate::sop::store::StoreError> {
+            self.inner.last_terminal_completed_at(s)
+        }
+        fn try_claim_run(
+            &self,
+            id: &str,
+            s: &str,
+            p: usize,
+            g: usize,
+        ) -> Result<Option<crate::sop::store::ClaimToken>, crate::sop::store::StoreError> {
+            self.inner.try_claim_run(id, s, p, g)
+        }
+        fn renew_claim_for_restore(
+            &self,
+            id: &str,
+            s: &str,
+        ) -> Result<crate::sop::store::ClaimToken, crate::sop::store::StoreError> {
+            self.inner.renew_claim_for_restore(id, s)
+        }
+        fn claim_counts(&self, s: &str) -> Result<(usize, usize), crate::sop::store::StoreError> {
+            self.inner.claim_counts(s)
+        }
+        fn heartbeat_claim(
+            &self,
+            t: &crate::sop::store::ClaimToken,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.heartbeat_claim(t)
+        }
+        fn release_claim(
+            &self,
+            t: &crate::sop::store::ClaimToken,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.release_claim(t)
+        }
+        fn expired_claims(
+            &self,
+            n: &str,
+        ) -> Result<Vec<crate::sop::store::ClaimToken>, crate::sop::store::StoreError> {
+            self.inner.expired_claims(n)
+        }
+        fn append_event(
+            &self,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.append_event(e)
+        }
+        fn list_events(
+            &self,
+            _id: &str,
+        ) -> Result<Vec<crate::sop::store::SopEventRecord>, crate::sop::store::StoreError> {
+            Err(crate::sop::store::StoreError::Backend(
+                "injected list_events failure".into(),
+            ))
+        }
+        fn save_proposal(
+            &self,
+            p: &crate::sop::store::ProposalRecord,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.save_proposal(p)
+        }
+        fn load_proposal(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::sop::store::ProposalRecord>, crate::sop::store::StoreError>
+        {
+            self.inner.load_proposal(id)
+        }
+        fn list_proposals(
+            &self,
+            s: Option<crate::sop::store::ProposalStatus>,
+        ) -> Result<Vec<crate::sop::store::ProposalRecord>, crate::sop::store::StoreError> {
+            self.inner.list_proposals(s)
+        }
+        fn prune(
+            &self,
+            p: &crate::sop::store::RetentionPolicy,
+        ) -> Result<usize, crate::sop::store::StoreError> {
+            self.inner.prune(p)
+        }
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+        fn backend(&self) -> &'static str {
+            "list-events-fails-test"
+        }
+    }
+
+    #[test]
+    fn quorum_vote_read_failure_is_surfaced_not_swallowed() {
+        // Regression (Audacity88 #8880 finding #3): after a vote is durably appended,
+        // counting distinct voters reads the gate ledger. If that read fails, the
+        // broker must SURFACE the error (leaving the gate waiting for a retry), not
+        // collapse to a bogus `PendingQuorum { have: 0 }` that swallows the failure.
+        let store = std::sync::Arc::new(ListEventsFailsStore {
+            inner: crate::sop::store::InMemoryRunStore::new(),
+        });
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval: approval_cfg(&["alice", "bob"], 2),
+            ..SopConfig::default()
+        };
+        let mut e = SopEngine::new(sop_config)
+            .with_approval_broker(broker)
+            .with_store(store.clone());
+        e.set_sops_for_test(vec![policy_sop("prod")]);
+        let action = e.start_run("deploy", manual()).unwrap();
+        let id = match action {
+            SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected WaitApproval, got {other:?}"),
+        };
+
+        let res = e.resolve_via_broker(
+            &id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("alice".into())),
+        );
+        assert!(
+            res.is_err(),
+            "a gate-ledger read failure during quorum counting must surface, not report PendingQuorum(0)"
+        );
+    }
+
     #[test]
     fn quorum_vote_refused_while_park_persist_is_pending() {
         // Regression: a quorum vote is recorded before `resolve_gate` runs (only
@@ -616,7 +784,7 @@ mod tests {
             "the vote must be refused while the park's snapshot is not yet durably persisted"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1),
+            e.distinct_gate_voters(&id, 1).unwrap(),
             0,
             "no gate_vote row must be recorded for a refused vote attempt"
         );
@@ -671,7 +839,7 @@ mod tests {
             "the agent principal must be rejected under OutOfBandRequired, got {out:?}"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1),
+            e.distinct_gate_voters(&id, 1).unwrap(),
             0,
             "no gate_vote row must be recorded for a principal approval_mode rejects"
         );
