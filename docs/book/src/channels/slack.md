@@ -92,6 +92,14 @@ secure.
 answers inside a thread if a message there @-mentions it, instead of replying to
 every message in a thread it's part of.
 
+On the first message ZeroClaw handles in an existing thread, it fetches prior
+replies and prepends a bounded `[Thread context]` block so the agent can answer
+with the earlier discussion. `thread_context_max_messages` controls how many of
+the newest prior messages are included while preserving chronological order.
+The default is `20`, the maximum is `50`, and `0` disables this automatic
+hydration. Fetch failures do not drop the current message and are retried on the
+next eligible reply.
+
 ## Mentions and formatting
 
 - `mention_only`: when `true`, the bot only answers messages that @-mention it,
