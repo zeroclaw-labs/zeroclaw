@@ -5369,52 +5369,84 @@ mod tests {
         assert_eq!(v["params"]["max_context_tokens"], 32_000);
     }
 
-    /// Regression: Zerocode's context meter must read the runtime-profile
-    /// `max_context_tokens` budget, not the provider model-window helper.
-    /// The model-window path falls back to 32_000 when `context_window` is
-    /// unset, which made the meter ignore a profile set to e.g. 128_000.
+    /// Resolution chain for `effective_max_context_tokens`, exercised through
+    /// `context_usage_max_tokens` (the helper the live emitter calls).
+    /// Chain: runtime_profile.max_context_tokens → provider context_window →
+    /// 32_000 stub. Covers #8872 (profile budget wins over the model-window
+    /// helper) and the provider-window fallback fix (the meter must not freeze
+    /// at 32_000 when only the provider `context_window` is set).
     #[test]
-    fn context_usage_max_tokens_uses_runtime_profile_budget() {
+    fn context_usage_max_tokens_resolution() {
         use std::collections::HashMap;
+        use zeroclaw_config::providers::Providers;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
+        // (runtime_profile.max_context_tokens, provider.context_window, expected)
+        let cases: &[(Option<usize>, Option<usize>, u64)] = &[
+            (Some(128_000), None, 128_000), // #8872: profile wins, no provider window
+            (Some(128_000), Some(200_000), 128_000),
+            (None, Some(200_000), 200_000), // the fix: provider-window fallback
+            (None, None, 32_000),           // hard stub
+        ];
 
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                // No provider context_window configured — the broken path
-                // would fall back to 32_000 here.
-                ..AliasedAgentConfig::default()
-            },
-        );
+        for (profile, window, expected) in cases {
+            let mut runtime_profiles = HashMap::new();
+            if let Some(t) = profile {
+                runtime_profiles.insert(
+                    "coding".to_string(),
+                    RuntimeProfileConfig {
+                        max_context_tokens: Some(*t),
+                        ..RuntimeProfileConfig::default()
+                    },
+                );
+            }
 
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            ..Config::default()
-        };
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: if profile.is_some() {
+                        "coding".into()
+                    } else {
+                        "".into()
+                    },
+                    model_provider: "anthropic.default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
 
-        assert_eq!(
-            context_usage_max_tokens(&cfg, "coder"),
-            128_000,
-            "context meter must use runtime_profiles.<name>.max_context_tokens"
-        );
-        assert_eq!(
-            cfg.effective_model_context_window("coder"),
-            32_000,
-            "sanity: model-window helper still defaults to 32k without provider context_window"
-        );
+            let mut providers = Providers::default();
+            if let Some(w) = window {
+                providers
+                    .models
+                    .ensure("anthropic", "default")
+                    .expect("ensure creates entry")
+                    .context_window = Some(*w);
+            }
+
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
+
+            assert_eq!(
+                context_usage_max_tokens(&cfg, "coder"),
+                *expected,
+                "resolution (profile={profile:?}, window={window:?})"
+            );
+            // #8872 sanity: the model-window helper stays at the 32k stub when
+            // no provider context_window is configured, so the two must differ.
+            if window.is_none() {
+                assert_eq!(
+                    cfg.effective_model_context_window("coder"),
+                    32_000,
+                    "model-window helper must stay at 32k stub without provider context_window"
+                );
+            }
+        }
     }
 
     /// Boundary regression: prove the corrected ceiling survives the *wire*
@@ -5472,121 +5504,6 @@ mod tests {
         assert_eq!(
             v["params"]["max_context_tokens"], 128_000,
             "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
-        );
-    }
-
-    /// Regression: profile budget wins over provider context_window when both set.
-    #[test]
-    fn context_usage_max_tokens_profile_wins_over_provider() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "anthropic.default".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        providers
-            .models
-            .ensure("anthropic", "default")
-            .expect("ensure creates entry")
-            .context_window = Some(200_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
-
-        assert_eq!(
-            context_usage_max_tokens(&cfg, "coder"),
-            128_000,
-            "runtime profile budget must win over provider context_window"
-        );
-    }
-
-    /// Regression: profile-unset falls back to provider context_window (new chain).
-    #[test]
-    fn context_usage_max_tokens_provider_fallback() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "".into(),
-                model_provider: "anthropic.default".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        providers
-            .models
-            .ensure("anthropic", "default")
-            .expect("ensure creates entry")
-            .context_window = Some(200_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles: HashMap::new(),
-            providers,
-            ..Config::default()
-        };
-
-        assert_eq!(
-            context_usage_max_tokens(&cfg, "coder"),
-            200_000,
-            "must fall back to provider context_window when runtime profile not set"
-        );
-    }
-
-    /// Regression: both unset falls back to 32_000 stub.
-    #[test]
-    fn context_usage_max_tokens_both_unset() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "".into(),
-                model_provider: "".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let cfg = Config {
-            agents,
-            runtime_profiles: HashMap::new(),
-            ..Config::default()
-        };
-
-        assert_eq!(
-            context_usage_max_tokens(&cfg, "coder"),
-            32_000,
-            "hard stub fallback when neither profile nor provider is set"
         );
     }
 
