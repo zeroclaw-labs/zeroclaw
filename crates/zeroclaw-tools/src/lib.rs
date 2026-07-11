@@ -28,6 +28,7 @@ pub mod file_edit;
 pub mod file_upload;
 pub mod file_upload_bundle;
 pub mod file_write;
+pub mod git_forge;
 pub mod git_operations;
 pub mod glob_search;
 pub mod hardware_board_info;

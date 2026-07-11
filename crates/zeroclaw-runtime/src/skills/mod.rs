@@ -1804,6 +1804,13 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
 
 /// Convert skill tools into callable `Tool` trait objects.
 ///
+/// NOTE: this is a policy-blind converter - it does not apply the agent's
+/// `excluded_tools` denylist. Code building a **model-visible** registry must
+/// register skill tools via [`crate::tools::register_skill_tools`] (and its
+/// `*_with_context*` variants), which gate each tool through
+/// `SecurityPolicy::is_tool_excluded`. Call this raw converter only when policy
+/// gating is applied separately.
+///
 /// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
 /// (for `shell`/`script` kinds), `SkillHttpTool` (for `http` kind), or
 /// `SkillBuiltinTool` (for `builtin` kind), enabling them to appear as

@@ -1907,8 +1907,12 @@ impl OpenAiCompatibleModelProvider {
             items
                 .iter()
                 .map(|tool| {
+                    // Owned copy is required here: the per-model sanitizer
+                    // (`convert_tool_specs_for_model`) mutates these Value
+                    // trees in place, so they cannot share the registry's
+                    // Arc-backed schema (#8642).
                     let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
-                        tool.parameters.clone(),
+                        (*tool.parameters).clone(),
                     );
                     serde_json::json!({
                         "type": "function",
@@ -4688,17 +4692,17 @@ mod tests {
     #[test]
     fn prompt_guided_tool_fallback_injects_system_instruction() {
         let input = vec![ChatMessage::user("check status")];
-        let tools = vec![zeroclaw_api::tool::ToolSpec {
-            name: "shell_exec".to_string(),
-            description: "Execute shell command".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "shell_exec",
+            "Execute shell command",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" }
                 },
                 "required": ["command"]
             }),
-        }];
+        )];
 
         let output = OpenAiCompatibleModelProvider::with_prompt_guided_tool_instructions(
             &input,
