@@ -21,7 +21,9 @@ use super::events::{self, EventFilter, GitEvent};
 use super::poll::{PollState, PollStream};
 use super::router::{self, RouteAction, TransportPlan};
 use super::traits::{GitProvider, ReactionTarget, SelfIdentity};
-use super::types::{COMMENT_MAX_CHARS, GitChannelError, IssueRef, RepoRef};
+use super::types::{
+    COMMENT_MAX_CHARS, ForgeMethod, ForgeRequest, GitChannelError, IssueRef, RepoRef,
+};
 
 /// The channel key under `[channels.git.<alias>]` — also stamped on every
 /// `ChannelMessage` as its `channel`.
@@ -35,6 +37,27 @@ const MIN_POLL_INTERVAL_SECS: u64 = 15;
 /// abuse limits punish rapid content mutation.
 const DRAFT_EDIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Resolve the GitHub App private key PEM, preferring the inline `private_key`
+/// and falling back to reading `private_key_path` from disk. Backward-compatible
+/// with configs that predate the inline field.
+fn resolve_github_private_key(cfg: &GitConfig) -> anyhow::Result<Option<String>> {
+    if cfg.private_key.is_some() {
+        return Ok(cfg.private_key.clone());
+    }
+    let Some(path) = cfg
+        .private_key_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(pem) => Ok(Some(pem)),
+        Err(e) => anyhow::bail!("git channel: reading private_key_path `{path}` failed: {e}"),
+    }
+}
+
 /// Build the configured forge provider, or a clear error for an unknown
 /// `provider` value. The only forge-aware seam in the channel.
 fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
@@ -44,7 +67,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             {
                 Ok(Box::new(super::providers::github::GithubProvider::new(
                     cfg.app_id,
-                    cfg.private_key_path.clone(),
+                    resolve_github_private_key(cfg)?,
                     cfg.installation_id,
                     cfg.proxy_url.clone(),
                 )))
@@ -602,6 +625,30 @@ impl Channel for GitChannel {
         self.provider.add_reaction(&target, emoji).await?;
         Ok(())
     }
+
+    async fn forge_request(
+        &self,
+        request: zeroclaw_api::channel::ForgeApiRequest,
+    ) -> anyhow::Result<zeroclaw_api::channel::ForgeApiResponse> {
+        let Some(method) = ForgeMethod::parse(&request.method) else {
+            anyhow::bail!(
+                "invalid forge HTTP method `{}` (expected GET/POST/PATCH/PUT/DELETE)",
+                request.method
+            );
+        };
+        let resp = self
+            .provider
+            .forge_request(ForgeRequest {
+                method,
+                path: request.path,
+                body: request.body,
+            })
+            .await?;
+        Ok(zeroclaw_api::channel::ForgeApiResponse {
+            status: resp.status,
+            body: resp.body,
+        })
+    }
 }
 
 /// Split text into comment-sized chunks at paragraph (preferred) or word
@@ -649,6 +696,43 @@ mod tests {
         let ch = channel(vec![]);
         assert_eq!(ch.name(), "git");
         assert_eq!(ch.alias(), "git_test_alias");
+    }
+
+    #[test]
+    fn resolve_key_prefers_inline_then_path() {
+        let inline = GitConfig {
+            private_key: Some("INLINE-PEM".to_string()),
+            private_key_path: Some("/does/not/matter".to_string()),
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            resolve_github_private_key(&inline).unwrap().as_deref(),
+            Some("INLINE-PEM")
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("git_key_{}.pem", std::process::id()));
+        std::fs::write(&path, "PATH-PEM").unwrap();
+        let from_path = GitConfig {
+            private_key: None,
+            private_key_path: Some(path.to_string_lossy().into_owned()),
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            resolve_github_private_key(&from_path).unwrap().as_deref(),
+            Some("PATH-PEM")
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let neither = GitConfig::default();
+        assert!(resolve_github_private_key(&neither).unwrap().is_none());
+
+        let missing = GitConfig {
+            private_key: None,
+            private_key_path: Some("/no/such/key.pem".to_string()),
+            ..GitConfig::default()
+        };
+        assert!(resolve_github_private_key(&missing).is_err());
     }
 
     #[test]
@@ -766,18 +850,11 @@ mod tests {
         use crate::git::providers::github::api_test_support::with_base;
         use crate::git::providers::github::{GithubProvider, TEST_KEY_PEM};
 
-        fn write_test_key() -> tempfile::NamedTempFile {
-            use std::io::Write;
-            let mut f = tempfile::NamedTempFile::new().unwrap();
-            f.write_all(TEST_KEY_PEM.as_bytes()).unwrap();
-            f
-        }
-
-        fn base_cfg(key_file: &tempfile::NamedTempFile) -> GitConfig {
+        fn base_cfg() -> GitConfig {
             GitConfig {
                 enabled: true,
                 app_id: 1,
-                private_key_path: key_file.path().to_string_lossy().into_owned(),
+                private_key: Some(TEST_KEY_PEM.to_string()),
                 installation_id: Some(77),
                 repos: vec!["octo/repo".into()],
                 ..GitConfig::default()
@@ -788,7 +865,7 @@ mod tests {
         fn mock_channel(cfg: GitConfig, server_uri: String) -> GitChannel {
             let provider = GithubProvider::new(
                 cfg.app_id,
-                cfg.private_key_path.clone(),
+                cfg.private_key.clone(),
                 cfg.installation_id,
                 None,
             )
@@ -875,8 +952,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
 
             let filter = test_filter();
             let plan = default_plan();
@@ -939,8 +1015,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let key = write_test_key();
-            let mut cfg = base_cfg(&key);
+            let mut cfg = base_cfg();
             cfg.events.insert(
                 "pull_request.opened".to_string(),
                 zeroclaw_config::schema::GitEventRoute {
@@ -1025,10 +1100,9 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
             let cfg = GitConfig {
                 events_backbone: true,
-                ..base_cfg(&key)
+                ..base_cfg()
             };
             let ch = mock_channel(cfg, server.uri());
 
@@ -1102,8 +1176,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let mut cfg = base_cfg(&key);
+            let mut cfg = base_cfg();
             cfg.events.insert(
                 "workflow_run.failed".to_string(),
                 zeroclaw_config::schema::GitEventRoute {
@@ -1158,8 +1231,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
@@ -1199,8 +1271,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let draft_id = ch
                 .send_draft(&SendMessage::new("thinking…", "octo/repo#5"))
                 .await
@@ -1233,8 +1304,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
@@ -1288,8 +1358,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let floor = now - chrono::Duration::hours(1);
@@ -1378,8 +1447,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(now - chrono::Duration::hours(1));

@@ -419,6 +419,7 @@ cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
 cli-sop-none-to-validate = 未找到可验证的 SOP。
 cli-sop-valid = ✅ {$name} — 有效
+cli-sop-deleted = 已删除 SOP：{$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} 个警告:
 cli-sop-all-passed = 所有 SOP 均已通过验证。
 cli-sop-priority = {"  "}优先级:       {$value}

@@ -420,6 +420,7 @@ cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
 cli-sop-none-to-validate = No se encontraron SOP para validar.
 cli-sop-valid = ✅ {$name} — válido
+cli-sop-deleted = SOP eliminado: {$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} advertencia(s):
 cli-sop-all-passed = Todos los SOP pasaron la validación.
 cli-sop-priority = {"  "}Prioridad:       {$value}
