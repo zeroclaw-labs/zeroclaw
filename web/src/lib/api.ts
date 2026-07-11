@@ -1518,6 +1518,8 @@ export interface QuickstartTypeOption {
   display_name: string;
   /** True for local providers that need no credential; always false for channels. */
   local: boolean;
+  /** Daemon-derived runtime preset to auto-select for this provider. */
+  default_runtime_profile?: string | null;
 }
 
 export interface QuickstartState {
@@ -1525,6 +1527,8 @@ export interface QuickstartState {
   agents: string[];
   risk_profiles: string[];
   runtime_profiles: string[];
+  /** Canonical fallback when a provider has no runtime recommendation. */
+  default_runtime_profile?: string | null;
   model_providers: string[];
   channels: string[];
   /**

@@ -97,6 +97,21 @@ const DEFAULT_FORM: FormState = {
   personalityFiles: [],
 };
 
+function runtimeDefaultForProvider(
+  state: QuickstartState | null,
+  providerType?: string,
+): string | null {
+  const advertised = providerType
+    ? state?.model_provider_types.find((provider) => provider.kind === providerType)
+        ?.default_runtime_profile
+    : null;
+  return (
+    advertised ??
+    state?.default_runtime_profile ??
+    null
+  );
+}
+
 const MUTED = { color: "var(--pc-text-muted)" } as const;
 const FAINT = { color: "var(--pc-text-faint)" } as const;
 const ERROR = { color: "var(--color-status-error)" } as const;
@@ -112,6 +127,7 @@ export default function Quickstart() {
   );
   const lastStepRef = useRef<QuickstartStep | null>(null);
   const submittedRef = useRef(false);
+  const runtimeAutoDefaultedRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,18 +136,12 @@ export default function Quickstart() {
         const s = await getQuickstartState();
         if (!cancelled) {
           setState(s);
-          // Default the runtime profile to the previously-hardcoded value
-          // ("unbounded") so behaviour is unchanged unless the user picks
-          // another preset. Fall back to the first preset if the daemon ever
-          // drops "unbounded" from the list. Don't clobber a user choice.
-          const defaultRuntime =
-            s.runtime_presets.find((p) => p.preset_name === "unbounded") ??
-            s.runtime_presets[0];
+          const defaultRuntime = runtimeDefaultForProvider(s);
           if (defaultRuntime) {
             setForm((f) =>
               f.runtime
                 ? f
-                : { ...f, runtime: { preset_name: defaultRuntime.preset_name } },
+                : { ...f, runtime: { preset_name: defaultRuntime } },
             );
           }
         }
@@ -165,6 +175,8 @@ export default function Quickstart() {
   };
 
   const submit = async () => {
+    const runtime = form.runtime;
+    if (!runtime) return;
     setBusy(true);
     setErrors([]);
     const res = await quickstartApply({
@@ -172,7 +184,7 @@ export default function Quickstart() {
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
       runtime_profile: {
         mode: "fresh",
-        value: form.runtime?.preset_name ?? "unbounded",
+        value: runtime.preset_name,
       },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
@@ -210,15 +222,17 @@ export default function Quickstart() {
 
   const providerDone = form.provider !== null;
   const riskDone = form.risk !== null;
+  const runtimeDone = form.runtime !== null;
   const memoryDone = form.memory !== null;
   const agentDone = form.agentName.trim() !== "";
-  const allDone = providerDone && riskDone && memoryDone && agentDone;
+  const allDone = providerDone && riskDone && runtimeDone && memoryDone && agentDone;
 
   // Required-step progress for the wizard stepper. Channels / peer groups /
   // personality files are optional and intentionally excluded from the gate.
   const steps = [
     { label: t("quickstart.step_provider"), done: providerDone },
     { label: t("quickstart.step_risk"), done: riskDone },
+    { label: t("quickstart.runtime_profile_title"), done: runtimeDone },
     { label: t("quickstart.step_memory"), done: memoryDone },
     { label: t("quickstart.step_agent"), done: agentDone },
   ];
@@ -280,7 +294,20 @@ export default function Quickstart() {
           <ProviderForm
             state={state}
             onStage={(p) => {
-              setForm((f) => ({ ...f, provider: p }));
+              setForm((f) => {
+                const defaultRuntime = runtimeDefaultForProvider(
+                  state,
+                  p.provider_type,
+                );
+                return {
+                  ...f,
+                  provider: p,
+                  runtime:
+                    runtimeAutoDefaultedRef.current && defaultRuntime
+                      ? { preset_name: defaultRuntime }
+                      : f.runtime,
+                };
+              });
               recordStep("model_provider");
             }}
           />
@@ -312,6 +339,7 @@ export default function Quickstart() {
         }))}
         value={form.runtime?.preset_name ?? ""}
         onChange={(v) => {
+          runtimeAutoDefaultedRef.current = false;
           setForm((f) => ({ ...f, runtime: { preset_name: v } }));
           recordStep("runtime_profile");
         }}

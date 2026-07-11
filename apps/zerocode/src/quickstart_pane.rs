@@ -22,11 +22,6 @@ use std::sync::Arc;
 const UNSET_DISPLAY: &str = "<unset>";
 const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
 const MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT: usize = 5;
-// Policy aliases for provider-driven runtime defaults. The daemon-owned
-// `quickstart/state.runtime_presets` table is checked before either alias is
-// auto-applied, so the preset inventory remains the source of truth.
-const DEFAULT_RUNTIME_PRESET: &str = "unbounded";
-const LOCAL_PROVIDER_RUNTIME_PRESET: &str = "local_small";
 
 /// Upper bound on rendered secret-mask bullets. A pasted API key can be
 /// 100+ chars; one bullet per character wraps the masked value across
@@ -759,39 +754,49 @@ impl FormState {
     }
 
     fn runtime_profile_choice(&self) -> SelectorChoice<String> {
-        if self.runtime.is_empty() {
-            return SelectorChoice::Fresh(DEFAULT_RUNTIME_PRESET.to_string());
-        }
         match self.runtime_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
         }
     }
 
-    fn apply_provider_runtime_default(
-        &mut self,
-        provider_is_local: bool,
-        preset_available: impl Fn(&str) -> bool,
-    ) {
-        let preferred = if provider_is_local {
-            LOCAL_PROVIDER_RUNTIME_PRESET
-        } else {
-            DEFAULT_RUNTIME_PRESET
-        };
-        let next = if preset_available(preferred) {
-            preferred
-        } else {
-            DEFAULT_RUNTIME_PRESET
-        };
-        if !preset_available(next) {
-            return;
-        }
+    fn apply_provider_runtime_default(&mut self, default: Option<&str>) {
+        let Some(next) = default else { return };
         if self.runtime.is_empty() || self.runtime_auto_defaulted {
             self.runtime = next.to_string();
             self.runtime_mode = SelectorMode::Fresh;
             self.runtime_auto_defaulted = true;
         }
     }
+}
+
+fn provider_runtime_default<'a>(
+    snapshot: Option<&'a QuickstartStateResult>,
+    type_key: &str,
+) -> Option<&'a str> {
+    let snapshot = snapshot?;
+    snapshot
+        .model_provider_types
+        .iter()
+        .find(|provider| provider.kind == type_key)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .or(snapshot.default_runtime_profile.as_deref())
+}
+
+fn apply_existing_provider_choice(
+    form: &mut FormState,
+    snapshot: Option<&QuickstartStateResult>,
+    dotted_ref: &str,
+) {
+    let Some((provider_type, alias)) = dotted_ref.split_once('.') else {
+        return;
+    };
+    form.provider_type = provider_type.to_string();
+    form.provider_alias = alias.to_string();
+    form.provider_mode = SelectorMode::Existing;
+    form.model.clear();
+    form.provider_fields.clear();
+    form.apply_provider_runtime_default(provider_runtime_default(snapshot, provider_type));
 }
 
 /// Modal kinds the pane can put up over the main checklist. Each
@@ -2116,45 +2121,7 @@ impl QuickstartPane {
     }
 
     fn adopt_existing_provider(&mut self, dotted_ref: String) {
-        if let Some((ty, alias)) = dotted_ref.split_once('.') {
-            self.form.provider_type = ty.to_string();
-            self.form.provider_alias = alias.to_string();
-            self.form.provider_mode = SelectorMode::Existing;
-            // Default model / field values aren't carried in the
-            // "existing" path — the runtime resolves the alias against
-            // the live config at apply time. Leave them empty so they
-            // don't overwrite the existing alias's values.
-            self.form.model.clear();
-            self.form.provider_fields.clear();
-            let runtime_presets = self.runtime_preset_names();
-            self.form.apply_provider_runtime_default(false, |preset| {
-                runtime_presets.iter().any(|known| known == preset)
-            });
-        }
-    }
-
-    fn provider_type_is_local(&self, type_key: &str) -> bool {
-        self.state_snapshot
-            .as_ref()
-            .and_then(|snap| {
-                snap.model_provider_types
-                    .iter()
-                    .find(|provider| provider.kind == type_key)
-            })
-            .map(|provider| provider.local)
-            .unwrap_or(false)
-    }
-
-    fn runtime_preset_names(&self) -> Vec<String> {
-        self.state_snapshot
-            .as_ref()
-            .map(|snap| {
-                snap.runtime_presets
-                    .iter()
-                    .map(|preset| preset.preset_name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        apply_existing_provider_choice(&mut self.form, self.state_snapshot.as_ref(), &dotted_ref);
     }
 
     fn adopt_existing_channel(&mut self, dotted_ref: String) {
@@ -2368,8 +2335,9 @@ impl QuickstartPane {
         }
         match f.selector {
             Selector::ModelProvider => {
-                let provider_is_local = self.provider_type_is_local(&f.type_key);
-                let runtime_presets = self.runtime_preset_names();
+                let runtime_default =
+                    provider_runtime_default(self.state_snapshot.as_ref(), &f.type_key)
+                        .map(str::to_string);
                 let pick = |key: &str| {
                     f.fields
                         .iter()
@@ -2406,9 +2374,7 @@ impl QuickstartPane {
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
                 self.form
-                    .apply_provider_runtime_default(provider_is_local, |preset| {
-                        runtime_presets.iter().any(|known| known == preset)
-                    });
+                    .apply_provider_runtime_default(runtime_default.as_deref());
             }
             Selector::Channels => {
                 let pick = |key: &str| {
@@ -3559,6 +3525,7 @@ mod tests {
             agents: Vec::new(),
             risk_profiles: Vec::new(),
             runtime_profiles: Vec::new(),
+            default_runtime_profile: Some("unbounded".into()),
             model_providers: existing.into_iter().map(str::to_string).collect(),
             channels: Vec::new(),
             unassigned_channels: Vec::new(),
@@ -3568,16 +3535,19 @@ mod tests {
                     kind: "openrouter".into(),
                     display_name: "OpenRouter".into(),
                     local: false,
+                    default_runtime_profile: Some("unbounded".into()),
                 },
                 crate::client::QuickstartTypeOption {
                     kind: "anthropic".into(),
                     display_name: "Anthropic".into(),
                     local: false,
+                    default_runtime_profile: Some("unbounded".into()),
                 },
                 crate::client::QuickstartTypeOption {
-                    kind: "ollama".into(),
-                    display_name: "Ollama".into(),
+                    kind: "lmstudio".into(),
+                    display_name: "LM Studio".into(),
                     local: true,
+                    default_runtime_profile: Some("local_small".into()),
                 },
             ],
             channel_types: Vec::new(),
@@ -3636,6 +3606,20 @@ mod tests {
     }
 
     #[test]
+    fn existing_local_provider_adoption_uses_daemon_runtime_default() {
+        let snapshot = model_provider_snapshot(vec!["lmstudio.default"]);
+        let mut form = FormState::default_form();
+
+        apply_existing_provider_choice(&mut form, Some(&snapshot), "lmstudio.default");
+
+        assert_eq!(form.provider_type, "lmstudio");
+        assert_eq!(form.provider_alias, "default");
+        assert_eq!(form.provider_mode, SelectorMode::Existing);
+        assert_eq!(form.runtime, "local_small");
+        assert!(form.runtime_auto_defaulted);
+    }
+
+    #[test]
     fn model_provider_alias_duplicate_is_caught_from_snapshot() {
         let snap = model_provider_snapshot(vec!["openrouter.default"]);
         let mut form = FieldFormModal {
@@ -3671,10 +3655,6 @@ mod tests {
         form.fields[0].buf = "work".into();
 
         assert!(model_provider_alias_duplicate_error(Some(&snap), &form).is_none());
-    }
-
-    fn preset_available(_: &str) -> bool {
-        true
     }
 
     #[test]
@@ -3786,7 +3766,7 @@ mod tests {
     fn local_provider_defaults_to_local_small_runtime_profile() {
         let mut f = FormState::default_form();
 
-        f.apply_provider_runtime_default(true, preset_available);
+        f.apply_provider_runtime_default(Some("local_small"));
 
         assert_eq!(f.runtime, "local_small");
         assert_eq!(
@@ -3799,7 +3779,7 @@ mod tests {
     fn cloud_provider_defaults_to_unbounded_runtime_profile() {
         let mut f = FormState::default_form();
 
-        f.apply_provider_runtime_default(false, preset_available);
+        f.apply_provider_runtime_default(Some("unbounded"));
 
         assert_eq!(f.runtime, "unbounded");
         assert_eq!(
@@ -3809,16 +3789,24 @@ mod tests {
     }
 
     #[test]
-    fn local_provider_default_falls_back_when_local_small_preset_is_absent() {
+    fn missing_provider_override_uses_daemon_state_fallback() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.model_provider_types[0].default_runtime_profile = None;
+
+        assert_eq!(
+            provider_runtime_default(Some(&snapshot), "openrouter"),
+            Some("unbounded"),
+        );
+    }
+
+    #[test]
+    fn missing_provider_and_state_defaults_leave_runtime_incomplete() {
         let mut f = FormState::default_form();
 
-        f.apply_provider_runtime_default(true, |preset| preset == "unbounded");
+        f.apply_provider_runtime_default(None);
 
-        assert_eq!(f.runtime, "unbounded");
-        assert_eq!(
-            f.to_submission().runtime_profile,
-            SelectorChoice::Fresh("unbounded".into())
-        );
+        assert!(f.runtime.is_empty());
+        assert!(!f.selector_is_complete(Selector::RuntimeProfile, &[]));
     }
 
     #[test]
@@ -3827,7 +3815,7 @@ mod tests {
         f.runtime = "tight".into();
         f.runtime_mode = SelectorMode::Fresh;
 
-        f.apply_provider_runtime_default(true, preset_available);
+        f.apply_provider_runtime_default(Some("local_small"));
 
         assert_eq!(f.runtime, "tight");
         assert_eq!(
@@ -3842,7 +3830,7 @@ mod tests {
         f.runtime = "unbounded".into();
         f.runtime_mode = SelectorMode::Fresh;
 
-        f.apply_provider_runtime_default(true, preset_available);
+        f.apply_provider_runtime_default(Some("local_small"));
 
         assert_eq!(f.runtime, "unbounded");
         assert_eq!(
@@ -3857,7 +3845,7 @@ mod tests {
         f.runtime = "local_small".into();
         f.runtime_mode = SelectorMode::Fresh;
 
-        f.apply_provider_runtime_default(false, preset_available);
+        f.apply_provider_runtime_default(Some("unbounded"));
 
         assert_eq!(f.runtime, "local_small");
         assert_eq!(
@@ -3870,12 +3858,12 @@ mod tests {
     fn explicit_runtime_choice_stops_provider_default_rewrites() {
         let mut f = FormState::default_form();
 
-        f.apply_provider_runtime_default(true, preset_available);
+        f.apply_provider_runtime_default(Some("local_small"));
         assert_eq!(f.runtime, "local_small");
         f.runtime = "unbounded".into();
         f.runtime_mode = SelectorMode::Fresh;
         f.runtime_auto_defaulted = false;
-        f.apply_provider_runtime_default(true, preset_available);
+        f.apply_provider_runtime_default(Some("local_small"));
 
         assert_eq!(f.runtime, "unbounded");
         assert_eq!(

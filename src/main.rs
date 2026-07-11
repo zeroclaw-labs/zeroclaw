@@ -1229,6 +1229,20 @@ fn apply_homebrew_onboard_config_dir() {
     );
 }
 
+#[cfg(feature = "agent-runtime")]
+fn quickstart_runtime_profile_for_provider(
+    provider_type: &str,
+    providers: &[zeroclaw_runtime::quickstart::QuickstartTypeOption],
+    default_runtime_profile: &str,
+) -> String {
+    providers
+        .iter()
+        .find(|provider| provider.kind == provider_type)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .unwrap_or(default_runtime_profile)
+        .to_string()
+}
+
 /// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
 ///
 /// Mirrors the TUI Quickstart pane's structure: a single screen
@@ -2344,6 +2358,18 @@ async fn run_quickstart_cli(
 
     // ── Assemble submission ─────────────────────────────────────
     let provider = form.provider.expect("provider satisfied");
+    let provider_type = match &provider {
+        ProviderChoice::Fresh { kind, .. } => kind.as_str(),
+        ProviderChoice::Existing { alias_ref } => alias_ref
+            .split_once('.')
+            .map(|(provider_type, _)| provider_type)
+            .unwrap_or(alias_ref),
+    };
+    let runtime_profile = SelectorChoice::Fresh(quickstart_runtime_profile_for_provider(
+        provider_type,
+        providers,
+        &state.default_runtime_profile,
+    ));
     let model_provider = match provider {
         ProviderChoice::Fresh {
             kind,
@@ -2363,9 +2389,6 @@ async fn run_quickstart_cli(
         PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
         PresetChoice::Existing(a) => SelectorChoice::Existing(a),
     };
-    // Runtime profile picker removed from all surfaces; apply silently
-    // forces the `unbounded` preset. Submit it so the field stays well-formed.
-    let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
     let channels = form
         .channels
@@ -7894,6 +7917,51 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "lmstudio".into(),
+            display_name: "LM Studio".into(),
+            local: true,
+            default_runtime_profile: Some("local_small".into()),
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("lmstudio", &providers, "unbounded"),
+            "local_small"
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_advertised_remote_provider_runtime_default() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            local: false,
+            default_runtime_profile: Some("unbounded".into()),
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("anthropic", &providers, "unbounded"),
+            "unbounded"
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_state_fallback_when_provider_has_no_override() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "ollama".into(),
+            display_name: "Ollama".into(),
+            local: true,
+            default_runtime_profile: None,
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("ollama", &providers, "unbounded"),
+            "unbounded"
+        );
+    }
 
     #[test]
     fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {

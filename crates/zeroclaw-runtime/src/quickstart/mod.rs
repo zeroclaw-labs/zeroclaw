@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use zeroclaw_config::helpers::kebab_to_snake;
 use zeroclaw_config::presets::{
     AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-    SelectorChoice, risk_preset, runtime_preset,
+    SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
 use zeroclaw_config::schema::Config;
 
@@ -447,6 +447,8 @@ pub struct QuickstartState {
     pub agents: Vec<String>,
     pub risk_profiles: Vec<String>,
     pub runtime_profiles: Vec<String>,
+    /// Canonical runtime fallback used when a provider has no recommendation.
+    pub default_runtime_profile: String,
     /// `<provider_type>.<alias>` refs for every configured model provider.
     pub model_providers: Vec<String>,
     /// `<channel_type>.<alias>` refs.
@@ -502,6 +504,11 @@ pub struct QuickstartTypeOption {
     /// credential. Channels always report `false`; providers reflect
     /// their `local` flag from `ModelProviderInfo`.
     pub local: bool,
+    /// Runtime preset the daemon recommends when this provider is selected.
+    /// Resolved from provider registry metadata and the canonical preset table
+    /// for each state snapshot; never persisted as config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_runtime_profile: Option<String>,
 }
 
 /// Build a [`QuickstartState`] snapshot from the live config.
@@ -520,6 +527,9 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
             kind: info.name.to_string(),
             display_name: info.display_name.to_string(),
             local: info.local,
+            default_runtime_profile: zeroclaw_providers::recommended_runtime_profile(info.name)
+                .and_then(runtime_preset)
+                .map(|preset| preset.preset_name.to_string()),
         })
         .collect();
     // Channel kinds come from the schema-side inventory. The
@@ -538,6 +548,9 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         agents: cfg.agents.keys().cloned().collect(),
         risk_profiles: cfg.risk_profiles.keys().cloned().collect(),
         runtime_profiles: cfg.runtime_profiles.keys().cloned().collect(),
+        default_runtime_profile: recommended_runtime_preset(None)
+            .map(|preset| preset.preset_name.to_string())
+            .unwrap_or_default(),
         model_providers: cfg
             .providers
             .models
@@ -609,6 +622,7 @@ fn build_channel_type_options(
             kind: info.kind.to_string(),
             display_name: info.name.to_string(),
             local: false,
+            default_runtime_profile: None,
         })
         .collect()
 }
@@ -789,6 +803,9 @@ fn apply_into(
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
 ) -> Option<AppliedAgent> {
+    if !validate_runtime_profile_choice(config, &submission.runtime_profile, errors, ctx) {
+        return None;
+    }
     let provider_ref = apply_model_provider(config, &submission.model_provider, errors, ctx)?;
     emit_selector_pick(
         ctx,
@@ -910,6 +927,40 @@ fn apply_into(
         channels: channel_refs,
         memory_backend,
     })
+}
+
+fn validate_runtime_profile_choice(
+    config: &Config,
+    choice: &SelectorChoice<String>,
+    errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
+) -> bool {
+    let message = match choice {
+        SelectorChoice::Existing(alias) if !config.runtime_profiles.contains_key(alias) => {
+            Some(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::RuntimeProfile,
+                "",
+                format!("no `{alias}` profile configured"),
+                "cli-quickstart-error-no-profile",
+                &[("alias", alias)],
+            ))
+        }
+        SelectorChoice::Fresh(preset_name) if runtime_preset(preset_name).is_none() => {
+            Some(QuickstartError::new(
+                QuickstartStep::RuntimeProfile,
+                "",
+                format!("unknown runtime preset `{preset_name}`"),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(error) = message {
+        errors.push(error);
+        false
+    } else {
+        true
+    }
 }
 
 /// Surface representation of a selector's submission mode for
@@ -1950,6 +2001,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_runtime_defaults_follow_canonical_provider_recommendations() {
+        let snapshot = snapshot_state(&Config::default());
+
+        let local = snapshot
+            .model_provider_types
+            .iter()
+            .find(|provider| provider.kind == "lmstudio")
+            .expect("LM Studio should be present in the canonical provider registry");
+        assert!(local.local);
+        assert_eq!(
+            local.default_runtime_profile.as_deref(),
+            Some("local_small")
+        );
+
+        let ollama = snapshot
+            .model_provider_types
+            .iter()
+            .find(|provider| provider.kind == "ollama")
+            .expect("Ollama should be present in the canonical provider registry");
+        assert!(ollama.local);
+        assert_eq!(
+            ollama.default_runtime_profile.as_deref(),
+            None,
+            "providers without native tools must use the canonical fallback",
+        );
+
+        let remote = snapshot
+            .model_provider_types
+            .iter()
+            .find(|provider| provider.kind == "anthropic")
+            .expect("Anthropic should be present in the canonical provider registry");
+        assert!(!remote.local);
+        assert_eq!(remote.default_runtime_profile, None);
+        assert_eq!(snapshot.default_runtime_profile, "unbounded");
+
+        let cli_shim = snapshot
+            .model_provider_types
+            .iter()
+            .find(|provider| provider.kind == "gemini_cli")
+            .expect("Gemini CLI should be present in the canonical provider registry");
+        assert!(cli_shim.local);
+        assert_eq!(
+            cli_shim.default_runtime_profile.as_deref(),
+            None,
+            "credential-free cloud CLI providers must not inherit local-small policy",
+        );
+
+        for provider in &snapshot.model_provider_types {
+            if let Some(default) = provider.default_runtime_profile.as_deref() {
+                assert!(
+                    snapshot
+                        .runtime_presets
+                        .iter()
+                        .any(|preset| preset.preset_name == default),
+                    "provider {} advertised unavailable runtime preset {default}",
+                    provider.kind,
+                );
+            }
+        }
+    }
+
     fn fresh_submission(agent_name: &str) -> BuilderSubmission {
         BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
@@ -2152,6 +2265,52 @@ mod tests {
         submission.risk_profile = SelectorChoice::Fresh("does-not-exist".into());
         let errors = validate_only(&submission, &cfg).unwrap_err();
         assert!(errors.iter().any(|e| e.step == QuickstartStep::RiskProfile));
+    }
+
+    #[tokio::test]
+    async fn rejected_runtime_selection_leaves_live_config_unchanged() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).expect("serialize initial config");
+        let before_dirty_paths = cfg.dirty_paths.clone();
+        let mut submission = fresh_submission("bot");
+        submission.runtime_profile = SelectorChoice::Fresh("does-not-exist".into());
+
+        let errors = apply(submission, &mut cfg).await.unwrap_err();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.step == QuickstartStep::RuntimeProfile),
+            "expected a runtime-profile error, got {errors:?}",
+        );
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize rejected config"),
+            before,
+        );
+        assert_eq!(cfg.dirty_paths, before_dirty_paths);
+    }
+
+    #[tokio::test]
+    async fn missing_existing_runtime_leaves_live_config_unchanged() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).expect("serialize initial config");
+        let before_dirty_paths = cfg.dirty_paths.clone();
+        let mut submission = fresh_submission("bot");
+        submission.runtime_profile = SelectorChoice::Existing("missing".into());
+
+        let errors = apply(submission, &mut cfg).await.unwrap_err();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.step == QuickstartStep::RuntimeProfile),
+            "expected a runtime-profile error, got {errors:?}",
+        );
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize rejected config"),
+            before,
+        );
+        assert_eq!(cfg.dirty_paths, before_dirty_paths);
     }
 
     #[test]
