@@ -7,8 +7,13 @@ export interface AgentSummary {
   channels: string[];
   riskProfile: string;
   runtimeProfile: string;
-  /** Memory backend kind from `[agents.<alias>.memory].backend`. Empty
-   * string when unset (the agent inherits the default — sqlite). */
+  /** Active memory backend kind for this agent, sourced live from
+   * `/api/status?agent=<alias>` (`memory_backend`), which resolves the agent's
+   * OWN backend. This reports `hindsight` even when the agent selects it via the
+   * backwards-compatible install-wide `[memory] backend = "hindsight"` string
+   * (which leaves its per-agent `[agents.<alias>.memory].backend` at the default
+   * sqlite, so the config prop alone would mislabel it). Falls back to the
+   * per-agent config prop, then empty. */
   memoryBackend: string;
   skillBundles: string[];
   knowledgeBundles: string[];
@@ -100,15 +105,15 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
 
   const summaries = await Promise.all(
     keys.map(async (alias): Promise<AgentSummary> => {
-      const [{ entries }, memoryCount] = await Promise.all([
+      const [{ entries }, status] = await Promise.all([
         listProps(`agents.${alias}`),
         // Per-agent status dispatches to that agent's OWN memory backend, so
-        // the count is correct for hindsight (per-agent bank), SQL (scoped
-        // rows), markdown (its dir), etc. Falls back to 0 on error.
-        getStatus(alias)
-          .then((s) => s.memory_count ?? 0)
-          .catch(() => 0),
+        // both the count and the backend label are correct for hindsight
+        // (per-agent bank), SQL (scoped rows), markdown (its dir), etc. Falls
+        // back to null on error; the fields then degrade to 0 / the config prop.
+        getStatus(alias).catch(() => null),
       ]);
+      const memoryCount = status?.memory_count ?? 0;
       // Configurable-macro paths are kebab-case (snake field names
       // converted via snake_to_kebab in zeroclaw-macros).
       const lookup = (suffixKebab: string) =>
@@ -124,7 +129,10 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         channels: entryAsStringArray(lookup('channels')),
         riskProfile: stringField('risk_profile'),
         runtimeProfile: stringField('runtime_profile'),
-        memoryBackend: stringField('memory.backend'),
+        // Prefer the live active backend from /api/status (correct for
+        // install-wide hindsight selection); fall back to the per-agent config
+        // prop when status is unavailable.
+        memoryBackend: status?.memory_backend || stringField('memory.backend'),
         skillBundles: entryAsStringArray(lookup('skill_bundles')),
         knowledgeBundles: entryAsStringArray(lookup('knowledge_bundles')),
         mcpBundles: entryAsStringArray(lookup('mcp_bundles')),

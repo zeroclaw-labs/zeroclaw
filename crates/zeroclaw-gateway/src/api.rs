@@ -262,7 +262,22 @@ pub async fn handle_api_status(
     // (so the dashboard's old shape still renders during onboarding,
     // before any agent exists).
     let agent_alias = query.agent.as_deref().filter(|s| !s.trim().is_empty());
-    let (model_provider, model, temperature, memory_backend) =
+
+    // Resolve the agent's ACTIVE memory handle once and reuse it for both the
+    // backend label and the entry count. This dispatches to the agent's OWN
+    // backend the same way `GET /api/memory?agent=` does, so an agent that
+    // selects hindsight via the backwards-compatible install-wide
+    // `[memory] backend = "hindsight"` string (which leaves its per-agent
+    // `MemoryBackendKind` at the default `sqlite`) is reported as `hindsight`,
+    // not the misleading default. Unknown/unscoped alias -> None, and both the
+    // label and count fall back to the install-wide `state.mem` handle below.
+    let agent_memory_handle: Option<std::sync::Arc<dyn zeroclaw_memory::Memory>> = match agent_alias
+    {
+        Some(alias) => resolve_memory_handle(&state, Some(alias)).await.ok(),
+        None => None,
+    };
+
+    let (model_provider, model, temperature) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
                 let provider_ref = if agent.model_provider.is_empty() {
@@ -277,12 +292,7 @@ pub async fn handle_api_status(
                     .unwrap_or_default();
                 let temperature: Option<f64> =
                     resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
-                let backend_kind = agent.memory.backend;
-                let backend = serde_json::to_value(backend_kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| format!("{backend_kind:?}").to_lowercase());
-                (provider_ref, model, temperature, backend)
+                (provider_ref, model, temperature)
             }
             None => (
                 config
@@ -293,28 +303,43 @@ pub async fn handle_api_status(
                     .map(|(ty, alias, _)| format!("{ty}.{alias}")),
                 state.model.clone(),
                 state.temperature,
-                state.mem.name().to_string(),
             ),
         };
 
+    // Backend label from the ACTIVE resolved handle: `Memory::name()` returns
+    // the real backend kind ("hindsight", "sqlite", "markdown", …), so the
+    // status panel reflects what the agent actually uses rather than the
+    // per-agent `MemoryBackendKind` enum (which is the `sqlite` default when
+    // hindsight is selected install-wide). If the handle could not be built for
+    // a known agent, fall back to that agent's declared enum so the label stays
+    // agent-specific; otherwise use the install-wide handle.
+    let memory_backend = match &agent_memory_handle {
+        Some(handle) => handle.name().to_string(),
+        None => match agent_alias.and_then(|alias| config.agent(alias)) {
+            Some(agent) => {
+                let backend_kind = agent.memory.backend;
+                serde_json::to_value(backend_kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| format!("{backend_kind:?}").to_lowercase())
+            }
+            None => state.mem.name().to_string(),
+        },
+    };
+
     let process = zeroclaw_runtime::process_stats::sample();
 
-    // Memory count for the active backend. When `?agent=<alias>` is supplied we
-    // resolve that agent's OWN backend (the per-alias hindsight bank, the
-    // agent-scoped SQL rows, the agent's markdown dir, …) so the dashboard
-    // reflects the live store rather than a default/empty local one. This is the
-    // dispatch the web memory-count path was missing for hindsight agents (their
-    // rows live in a per-agent server bank with no `agent_alias`, so the old
-    // frontend bucketing of install-wide entries always read 0). Best-effort:
-    // an unreachable/misconfigured backend yields 0 rather than failing status.
-    // Semantics: for hindsight this is the PRIVATE per-agent bank only (an
+    // Memory count for the active backend, from the same resolved handle as the
+    // label above. For hindsight this is the PRIVATE per-agent bank only (an
     // agent's own footprint), not the read-merged shared/system tiers, so the
     // dashboard's per-agent sum is not inflated by household-shared entries.
-    let memory_count: usize = match agent_alias {
-        Some(alias) => match resolve_memory_handle(&state, Some(alias)).await {
-            Ok(handle) => handle.count().await.unwrap_or(0),
-            Err(_) => 0,
-        },
+    // Best-effort: an unreachable/misconfigured backend yields 0 rather than
+    // failing status. This is the dispatch the web memory-count path was missing
+    // for hindsight agents (their rows live in a per-agent server bank with no
+    // `agent_alias`, so the old frontend bucketing of install-wide entries read
+    // 0).
+    let memory_count: usize = match &agent_memory_handle {
+        Some(handle) => handle.count().await.unwrap_or(0),
         None => state.mem.count().await.unwrap_or(0),
     };
 
@@ -2312,6 +2337,44 @@ mod tests {
 
         let json = response_json(response).await;
         assert_eq!(json["memory_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_reports_hindsight_backend_for_install_wide_agent() {
+        // Regression for the `DB: sqlite` mislabel: agent `and` selects
+        // hindsight via the backwards-compatible install-wide
+        // `[memory] backend = "hindsight"` string, leaving its per-agent
+        // `MemoryBackendKind` at the default `sqlite`. The status endpoint must
+        // report the ACTIVE resolved backend (`hindsight`) from the handle's
+        // `name()`, not the per-agent enum default. The count comes from the
+        // same handle; with an unreachable endpoint it degrades to 0 (best
+        // effort), which is fine - this test asserts the backend label.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        // Point the driver at an unreachable local port and supply an inline
+        // token so construction succeeds without env/network: `name()` needs
+        // no I/O and `count()` fails fast to 0.
+        config.memory.hindsight.base_url = "http://127.0.0.1:1".to_string();
+        config.memory.hindsight.token = Some("test-token".to_string());
+        config.agents.insert(
+            "and".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let state = test_state_with_memory(config, Vec::new());
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("and".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_backend"], "hindsight");
     }
 
     #[tokio::test]
