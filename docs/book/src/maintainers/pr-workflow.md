@@ -68,6 +68,24 @@ When a tracker marker label is needed, use `type:tracker`. It applies to issue-o
 
 If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or routing evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
+### Named milestone policy
+
+Named milestones are finite delivery cohorts, not permanent domain backlogs. For this policy, a named milestone is organized around a capability or outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Its domain is the capability area named at the start of its title. A combined title occupies each domain it names.
+
+Keep no more than eight named milestones open as a soft cap. Exceeding the cap requires an explicit maintainer decision that records why another active planning surface is worth the added coordination cost. Keep at most one named milestone open per domain.
+
+Every named milestone needs an explicit scope and close criteria, though a due date is optional. Do not open a successor for a domain until its current named milestone closes. Before closing, close or reroute every unfinished issue. Closed named milestones stay closed. Follow-on work can form a new named milestone only when enough coherent scope exists to define another finite outcome. Name that milestone for the outcome; do not create rolling `v2`, `v2.1`, or similar successors by default.
+
+Once a named milestone is active, limit new intake to work required to finish its stated cohort: direct scope, blockers, dependencies, and regressions. Route other work by intent:
+
+| Destination | Use for |
+|---|---|
+| Current named milestone | Work required to complete the milestone's defined cohort. |
+| Numbered release milestone | Urgent bugs, maintenance, or release-bound work that fits that release. |
+| RFC or design issue | Work whose design or governance direction is not settled. |
+| `Parking Lot` | Short-term routing while maintainers decide the next concrete home. |
+| `Icebox` | Valid future work for a domain with an active named milestone when it is outside the current cohort and is not scheduled soon. |
+
 ## PR lanes
 
 PR lanes are routing expectations, not another required label family. Use them to decide how much review depth, sequencing, and maintainer attention a PR needs. CODEOWNERS, native GitHub review state, CI, labels, linked issues, and explicit relationship keywords still carry the actual routing data.
