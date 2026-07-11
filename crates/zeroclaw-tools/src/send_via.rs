@@ -27,7 +27,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::multi_agent::OutputModality;
 use zeroclaw_config::multi_agent::PeerGroupConfig;
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
@@ -264,7 +264,7 @@ impl Tool for SendViaTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -298,11 +298,10 @@ impl Tool for SendViaTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: json!({
+                        output: ToolOutput::json(json!({
                             "status": "rejected",
                             "reason": "`target` is required when `body` is present"
-                        })
-                        .to_string(),
+                        })),
                         error: None,
                     });
                 }
@@ -314,12 +313,11 @@ impl Tool for SendViaTool {
                     Err(reason) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: json!({
+                            output: ToolOutput::json(json!({
                                 "target": target_key,
                                 "status": "rejected",
                                 "reason": reason
-                            })
-                            .to_string(),
+                            })),
                             error: None,
                         });
                     }
@@ -332,13 +330,12 @@ impl Tool for SendViaTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: json!({
+                        output: ToolOutput::json(json!({
                             "target": target_key,
                             "status": "rejected",
                             "reason": "target peer group has no external_peers configured; \
                                        cannot determine send recipient"
-                        })
-                        .to_string(),
+                        })),
                         error: None,
                     });
                 }
@@ -354,23 +351,21 @@ impl Tool for SendViaTool {
             return match channel.send(&message).await {
                 Ok(()) => Ok(ToolResult {
                     success: true,
-                    output: json!({
+                    output: ToolOutput::json(json!({
                         "target": channel_key,
                         "mode": "immediate",
                         "resolved_modality": modality_str(modality),
                         "status": "ok"
-                    })
-                    .to_string(),
+                    })),
                     error: None,
                 }),
                 Err(e) => Ok(ToolResult {
                     success: false,
-                    output: json!({
+                    output: ToolOutput::json(json!({
                         "target": channel_key,
                         "status": "failed",
                         "reason": e.to_string()
-                    })
-                    .to_string(),
+                    })),
                     error: None,
                 }),
             };
@@ -380,11 +375,10 @@ impl Tool for SendViaTool {
         if target.is_none() && explicit_modality.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: json!({
+                output: ToolOutput::json(json!({
                     "status": "rejected",
                     "reason": "at least one of `target` or `modality` is required when `body` is absent"
-                })
-                .to_string(),
+                })),
                 error: None,
             });
         }
@@ -400,13 +394,12 @@ impl Tool for SendViaTool {
                     if recipient.is_none() {
                         return Ok(ToolResult {
                             success: false,
-                            output: json!({
+                            output: ToolOutput::json(json!({
                                 "target": t,
                                 "status": "rejected",
                                 "reason": "target peer group has no external_peers configured; \
                                            cannot determine routing recipient"
-                            })
-                            .to_string(),
+                            })),
                             error: None,
                         });
                     }
@@ -419,12 +412,11 @@ impl Tool for SendViaTool {
                 Err(reason) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: json!({
+                        output: ToolOutput::json(json!({
                             "target": t,
                             "status": "rejected",
                             "reason": reason
-                        })
-                        .to_string(),
+                        })),
                         error: None,
                     });
                 }
@@ -458,25 +450,23 @@ impl Tool for SendViaTool {
         if !queued {
             return Ok(ToolResult {
                 success: false,
-                output: json!({
+                output: ToolOutput::json(json!({
                     "target": resolved_channel.as_deref().unwrap_or("<originating>"),
                     "status": "ignored",
                     "reason": "routing is only available while handling a channel turn"
-                })
-                .to_string(),
+                })),
                 error: None,
             });
         }
 
         Ok(ToolResult {
             success: true,
-            output: json!({
+            output: ToolOutput::json(json!({
                 "target": resolved_channel.as_deref().unwrap_or("<originating>"),
                 "mode": "routing",
                 "resolved_modality": modality_str(resolved_modality),
                 "status": "queued"
-            })
-            .to_string(),
+            })),
             error: None,
         })
     }

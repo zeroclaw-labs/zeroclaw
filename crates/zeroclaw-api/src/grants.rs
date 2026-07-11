@@ -80,6 +80,8 @@ pub enum Resource {
     Plugins,
     /// Direct tool invocation surfaces.
     Tools,
+    /// Standard Operating Procedure authoring, execution, and decision surfaces.
+    Sops,
 }
 
 /// What may be done to a [`Resource`].

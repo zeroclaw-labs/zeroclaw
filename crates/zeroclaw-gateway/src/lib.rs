@@ -28,6 +28,7 @@ pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
+pub mod api_sop_author;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -43,6 +44,7 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -51,6 +53,7 @@ pub mod tls;
 pub mod voice_duplex;
 pub mod ws;
 pub mod ws_approval;
+pub mod ws_sop_runs;
 
 use anyhow::{Context, Result};
 #[cfg(any(
@@ -80,7 +83,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -801,6 +804,59 @@ fn protected_api_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/webauthn/credentials/{id}",
             delete(api_webauthn::handle_delete_credential),
+        );
+
+    // ── SOP authoring + execution (auth-gated dashboard surfaces) ──
+    let protected = protected
+        .route(
+            "/api/sops",
+            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
+        )
+        .route(
+            "/api/sops/{name}",
+            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
+        )
+        .route(
+            "/api/sops/{name}/graph",
+            get(api_sop_author::handle_sop_graph),
+        )
+        .route("/api/sops/{name}/run", post(api_sop_author::handle_sop_run))
+        .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
+        .route(
+            "/api/sops/{name}/full",
+            get(api_sop_author::handle_sop_full),
+        )
+        .route(
+            "/api/sops/wire-draft",
+            post(api_sop_author::handle_sop_wire_draft),
+        )
+        .route(
+            "/api/sops/graph-draft",
+            post(api_sop_author::handle_sop_graph_draft),
+        )
+        .route(
+            "/api/sops/trigger-sources",
+            get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/graph-legend",
+            get(api_sop_author::handle_sop_graph_legend),
+        )
+        .route(
+            "/api/tools/param-options",
+            post(api_sop_author::handle_tools_param_options),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_author::handle_sop_run_overlay),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/decide",
+            post(api_sop_author::handle_sop_decide),
+        )
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
         );
 
     // ── Plugin management API (requires plugins-wasm feature) ──
@@ -1943,10 +1999,6 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Pairing handshake (must run unauthenticated) ──
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
-        .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
-            post(api_config::handle_refresh_context_window),
-        )
         // ── OpenAPI spec + docs (unauthenticated by design) ──
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
@@ -1954,6 +2006,8 @@ pub async fn run_gateway(
         .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket SOP runs feed ──
+        .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
@@ -2010,6 +2064,17 @@ pub async fn run_gateway(
         )
     } else {
         inner
+    };
+
+    let tls_enabled = config
+        .gateway
+        .tls
+        .as_ref()
+        .is_some_and(|tls_cfg| tls_cfg.enabled);
+    let app = if tls_enabled {
+        app.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
+    } else {
+        app.layer(axum::middleware::from_fn(security_headers::apply))
     };
 
     // ── TLS / mTLS setup ───────────────────────────────────────────
@@ -4534,7 +4599,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tools::ToolResult> {
             Ok(tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: tools::ToolOutput::default(),
                 error: None,
             })
         }

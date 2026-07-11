@@ -249,6 +249,10 @@ pub struct ListEntry {
     /// it to split General / Providers / Channels / etc.
     #[serde(skip_serializing_if = "str::is_empty")]
     pub tab: &'static str,
+    /// Surface hint from `#[multiline]`: render a multi-line text area
+    /// (e.g. a PEM key body) instead of a single-line input.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiline: bool,
 }
 
 /// Stable wire-form name for a `PropKind` variant. Matches the lower-kebab
@@ -363,6 +367,7 @@ fn lookup_prop_field(
                     ),
                     tab: zeroclaw_config::traits::ConfigTab::None,
                     alias_source: None,
+                    multiline: false,
                 }
             })
         })
@@ -811,6 +816,7 @@ pub async fn handle_list(State(state): State<AppState>, Query(q): Query<ListQuer
                 enum_variants,
                 section,
                 tab: info.tab.label(),
+                multiline: info.multiline,
             }
         })
         .collect();
@@ -3690,6 +3696,7 @@ mod tests {
             enum_variants: vec![],
             section: Some("providers.models"),
             tab: "",
+            multiline: false,
         };
         let json = serde_json::to_value(&entry).expect("serialize");
         let obj = json.as_object().expect("object");

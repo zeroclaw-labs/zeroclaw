@@ -112,4 +112,16 @@ pub trait GitProvider: Send + Sync {
         target: &ReactionTarget,
         emoji: &str,
     ) -> Result<(), GitChannelError>;
+
+    /// Low-level, provider-relative forge API call. The transport seam every
+    /// higher-level forge operation is built on: the provider prepends its API
+    /// base, attaches auth, sends `req`, and returns the status plus decoded
+    /// JSON body without raising on non-2xx (the caller inspects the forge's
+    /// own error envelope). This is what lets the `git_forge` tool carry a
+    /// resource/action vocabulary and a `raw` catch-all over one seam, without
+    /// a new trait method per operation.
+    async fn forge_request(
+        &self,
+        req: super::types::ForgeRequest,
+    ) -> Result<super::types::ForgeResponse, GitChannelError>;
 }

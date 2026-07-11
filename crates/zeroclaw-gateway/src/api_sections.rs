@@ -4,6 +4,7 @@
 
 use axum::{
     extract::{Query, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ use zeroclaw_runtime::rpc::types::{
 };
 
 use super::AppState;
+use super::api::require_auth;
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -53,12 +55,20 @@ pub struct ModelsQuery {
 /// with `live: false` so the form falls back to a free-text input.
 pub async fn handle_catalog_models(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
-    let _ = state;
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
+    // Snapshot config so the catalog resolves the alias credential and can reach
+    // the native /models endpoint (surfacing new native-only models that the
+    // models.dev snapshot may not carry yet) instead of silently falling back.
+    let cfg = state.config.read().clone();
     let (models, pricing, live) =
-        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+        zeroclaw_runtime::quickstart::model_catalog_with_config(Some(&cfg), &q.model_provider)
+            .await;
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,

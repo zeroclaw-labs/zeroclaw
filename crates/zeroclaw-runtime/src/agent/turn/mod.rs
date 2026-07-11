@@ -202,6 +202,50 @@ pub struct ToolLoop<'a> {
     pub turn_id: &'a str,
 }
 
+async fn enforce_reported_budget(
+    history: &mut Vec<ChatMessage>,
+    reported_input_tokens: usize,
+    context_token_budget: usize,
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    observer: &dyn crate::observability::Observer,
+) {
+    if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
+        return;
+    }
+    let taken = std::mem::take(history);
+    let result = crate::agent::history_trim::trim_to_reported_budget(
+        taken,
+        context_token_budget,
+        reported_input_tokens,
+    );
+    if result.trimmed {
+        let mut trimmed = result.history;
+        crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+        *history = trimmed;
+        if let Some(tx) = event_tx {
+            let _ = tx
+                .send(TurnEvent::HistoryTrimmed {
+                    dropped_messages: result.dropped_messages,
+                    kept_turns: result.kept_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                })
+                .await;
+        }
+        observer.record_event(
+            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                dropped_messages: result.dropped_messages,
+                kept_turns: result.kept_turns,
+                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        );
+    } else {
+        *history = result.history;
+    }
+}
+
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
         exec,
@@ -437,13 +481,45 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         preflight_history_maintenance(history);
 
         if iteration == 0 && context_token_budget > 0 {
+            // The system prompt + inlined tool definitions form an irreducible
+            // floor whole-turn trimming can never drop. When that floor alone
+            // meets or exceeds the budget, trimming conversation history can
+            // never bring the request under budget — surface the actionable
+            // root cause once per turn (this block is gated on iteration == 0)
+            // so the misconfiguration is not silent (#5808). Whole-turn
+            // trimming below still runs and is harmless (it keeps the most
+            // recent turn); the model call / reactive recovery proceeds.
+            let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
+            if system_floor >= context_token_budget {
+                let __zc_floor_span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    model = %model,
+                    model_provider = %provider_name,
+                );
+                let _zc_floor_guard = __zc_floor_span.entered();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "system_floor": system_floor,
+                            "budget": context_token_budget,
+                            "error_key": "context_floor_exceeds_budget",
+                        })),
+                    crate::agent::history::context_floor_remediation(
+                        system_floor,
+                        context_token_budget,
+                    )
+                );
+            }
             let taken = std::mem::take(history);
             let result =
                 crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
             if result.trimmed {
                 let mut trimmed = result.history;
-                let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
-                trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
+                crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
                 *history = trimmed;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -647,6 +723,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             parse_issue_detected,
             protocol_suppressed,
             response_streamed_live,
+            reported_input_tokens,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
@@ -669,6 +746,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     interpreted.parse_issue_detected,
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
+                    interpreted.input_tokens,
                 )
             }
             Err(e) => {
@@ -679,6 +757,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     event_tx.as_ref(),
                     observer,
+                    context_token_budget,
                 )
                 .await;
                 if recovered {
@@ -843,6 +922,16 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 out.push(msg.clone());
             }
             history.push(msg);
+            if let Some(reported) = reported_input_tokens {
+                enforce_reported_budget(
+                    history,
+                    reported as usize,
+                    context_token_budget,
+                    event_tx.as_ref(),
+                    observer,
+                )
+                .await;
+            }
             return Ok(accumulated_display_text);
         }
 
@@ -983,6 +1072,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                             error_reason: None,
                             duration: std::time::Duration::ZERO,
                             receipt: None,
+                            output_data: None,
                         },
                     ));
                 }
@@ -1007,6 +1097,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         error_reason: None,
                         duration: std::time::Duration::ZERO,
                         receipt: None,
+                        output_data: None,
                     };
                     events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
                 }
@@ -1100,6 +1191,17 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 agent_alias,
             )
             .await?;
+        }
+
+        if let Some(reported) = reported_input_tokens {
+            enforce_reported_budget(
+                history,
+                reported as usize,
+                context_token_budget,
+                event_tx.as_ref(),
+                observer,
+            )
+            .await;
         }
     }
 
@@ -1270,56 +1372,61 @@ async fn drive_live_sop_actions(
                     );
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
-                    let step_output = Box::pin(run_tool_call_loop(ToolLoop {
-                        exec: ResolvedAgentExecution::resolve(
-                            ResolvedModelAccess {
-                                model_provider,
-                                provider_name,
-                                model,
-                                temperature,
-                            },
-                            ResolvedIo {
-                                tools_registry,
-                                observer,
-                                silent,
-                                approval,
-                                multimodal_config,
-                                hooks,
-                                activated_tools,
-                                model_switch_callback: model_switch_callback.clone(),
-                                receipt_generator,
-                            },
-                            ResolvedRuntimeKnobs {
-                                max_tool_iterations,
-                                excluded_tools: &sop_excluded_tools,
-                                dedup_exempt_tools,
-                                pacing,
-                                strict_tool_parsing,
-                                parallel_tools,
-                                max_tool_result_chars,
-                                context_token_budget,
-                                knobs,
-                            },
-                        ),
-                        history,
-                        channel_name,
-                        channel_reply_target,
-                        cancellation_token: cancellation_token.clone(),
-                        on_delta: on_delta.clone(),
-                        shared_budget: shared_budget.clone(),
-                        channel,
-                        collected_receipts,
-                        event_tx: event_tx.clone(),
-                        steering: None,
-                        new_messages_out: new_messages_out.as_deref_mut(),
-                        image_cache: image_cache.as_deref_mut(),
-                        memory: None,
-                        ingress: IngressContext::sub_turn(),
-                        agent_alias,
-                        turn_id: &nested_turn_id,
-                    }))
+                    let step_call_sink = crate::sop::executor::new_step_call_sink();
+                    let step_output = crate::sop::executor::scope_step_call_sink(
+                        step_call_sink.clone(),
+                        Box::pin(run_tool_call_loop(ToolLoop {
+                            exec: ResolvedAgentExecution::resolve(
+                                ResolvedModelAccess {
+                                    model_provider,
+                                    provider_name,
+                                    model,
+                                    temperature,
+                                },
+                                ResolvedIo {
+                                    tools_registry,
+                                    observer,
+                                    silent,
+                                    approval,
+                                    multimodal_config,
+                                    hooks,
+                                    activated_tools,
+                                    model_switch_callback: model_switch_callback.clone(),
+                                    receipt_generator,
+                                },
+                                ResolvedRuntimeKnobs {
+                                    max_tool_iterations,
+                                    excluded_tools: &sop_excluded_tools,
+                                    dedup_exempt_tools,
+                                    pacing,
+                                    strict_tool_parsing,
+                                    parallel_tools,
+                                    max_tool_result_chars,
+                                    context_token_budget,
+                                    knobs,
+                                },
+                            ),
+                            history,
+                            channel_name,
+                            channel_reply_target,
+                            cancellation_token: cancellation_token.clone(),
+                            on_delta: on_delta.clone(),
+                            shared_budget: shared_budget.clone(),
+                            channel,
+                            collected_receipts,
+                            event_tx: event_tx.clone(),
+                            steering: None,
+                            new_messages_out: new_messages_out.as_deref_mut(),
+                            image_cache: image_cache.as_deref_mut(),
+                            memory: None,
+                            ingress: IngressContext::sub_turn(),
+                            agent_alias,
+                            turn_id: &nested_turn_id,
+                        })),
+                    )
                     .await;
 
+                    let step_calls = crate::sop::executor::drain_step_calls(&step_call_sink);
                     let completed_at = crate::sop::engine::now_iso8601();
                     let step_result = match step_output {
                         Ok(output) => crate::sop::SopStepResult {
@@ -1328,6 +1435,7 @@ async fn drive_live_sop_actions(
                             output,
                             started_at,
                             completed_at: Some(completed_at),
+                            tool_calls: step_calls,
                         },
                         Err(e) => crate::sop::SopStepResult {
                             step_number: step.number,
@@ -1335,6 +1443,7 @@ async fn drive_live_sop_actions(
                             output: e.to_string(),
                             started_at,
                             completed_at: Some(completed_at),
+                            tool_calls: step_calls,
                         },
                     };
 
@@ -1547,5 +1656,66 @@ mod surface3_tests {
         let mut history: Vec<ChatMessage> = Vec::new();
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
+    }
+}
+
+#[cfg(test)]
+mod reported_budget_tests {
+    use super::*;
+    use crate::observability::NoopObserver;
+
+    fn big_history() -> Vec<ChatMessage> {
+        let big = "x".repeat(2000);
+        vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1".to_string()),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2".to_string()),
+            ChatMessage::user("turn3 short".to_string()),
+            ChatMessage::assistant("final answer".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn enforce_trims_when_reported_exceeds_budget() {
+        let mut history = big_history();
+        let before = history.len();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated * 4;
+        let budget = reported / 2;
+        enforce_reported_budget(&mut history, reported, budget, None, &NoopObserver).await;
+        assert!(
+            history.len() < before,
+            "over-budget no-tool history must be trimmed before it is persisted"
+        );
+        assert_eq!(history[0].role, "system", "system prompt is preserved");
+        assert!(
+            history.iter().any(|m| m.content.contains("final answer")),
+            "the most recent turn survives the trim"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_noop_when_within_budget() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hi".to_string()),
+            ChatMessage::assistant("hello".to_string()),
+        ];
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(after, before, "within-budget history is untouched");
+    }
+
+    #[tokio::test]
+    async fn enforce_noop_when_budget_disabled() {
+        let mut history = big_history();
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(after, before, "zero budget disables enforcement");
     }
 }

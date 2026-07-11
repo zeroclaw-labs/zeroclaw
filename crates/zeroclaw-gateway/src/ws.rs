@@ -309,23 +309,36 @@ where
     };
     let frame = if let Some(engine) = state.sop_engine.as_ref() {
         let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
-        match engine.lock() {
-            Ok(mut g) => match g.resolve_gate(&run_id, decision, principal) {
-                Ok(outcome) => serde_json::json!({
+        let resolved = match engine.lock() {
+            Ok(mut g) => Some(g.resolve_gate(&run_id, decision, principal)),
+            Err(_) => None,
+        };
+        match resolved {
+            Some(Ok(outcome)) => {
+                if let zeroclaw_runtime::sop::approval::ResolveOutcome::Resumed(action) = &outcome {
+                    let config = state.config.read().clone();
+                    zeroclaw_runtime::sop::spawn_headless_run_driver(
+                        config,
+                        std::sync::Arc::clone(engine),
+                        state.sop_audit.clone(),
+                        action.as_ref().clone(),
+                    );
+                }
+                serde_json::json!({
                     "type": "sop_approval_result",
                     "run_id": run_id,
                     "outcome": outcome.label(),
-                }),
-                Err(e) => serde_json::json!({
-                    "type": "error",
-                    "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                        "cli-sop-ws-resolve-failed",
-                        &[("error", &e.to_string())],
-                    ),
-                    "code": "SOP_RESOLVE_FAILED"
-                }),
-            },
-            Err(_) => serde_json::json!({
+                })
+            }
+            Some(Err(e)) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-sop-ws-resolve-failed",
+                    &[("error", &e.to_string())],
+                ),
+                "code": "SOP_RESOLVE_FAILED"
+            }),
+            None => serde_json::json!({
                 "type": "error",
                 "message": zeroclaw_runtime::i18n::get_required_cli_string(
                     "cli-sop-ws-engine-lock-poisoned"
@@ -1014,10 +1027,13 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context window (max input tokens) for this agent.
+    // Resolve context budget for this agent. Wire field is named
+    // `max_context_tokens` and must track the runtime-profile budget
+    // (same source Zerocode's context meter uses), not the provider
+    // model-window helper which falls back to 32_000 when unset.
     let max_context_tokens = {
         let cfg = state.config.read();
-        cfg.effective_model_context_window(&turn_alias) as u64
+        cfg.effective_max_context_tokens(&turn_alias) as u64
     };
 
     // Broadcast agent_start event
@@ -1295,6 +1311,10 @@ async fn process_chat_message(
                             "dropped_messages": dropped_messages,
                             "kept_turns": kept_turns,
                             "reason": reason,
+                        }),
+                        TurnEvent::Plan { entries } => serde_json::json!({
+                            "type": "plan",
+                            "entries": entries,
                         }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
