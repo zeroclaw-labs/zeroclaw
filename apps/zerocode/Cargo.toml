@@ -58,6 +58,7 @@ shellexpand = "3.1"
 directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 # Enable the in-crate PKI test helpers (gen_ca / gen_client_csr) so the WSS TLS

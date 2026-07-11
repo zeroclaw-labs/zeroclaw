@@ -71,6 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_runtime::sop::approval::{
+    ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
+};
 
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
@@ -259,6 +262,88 @@ async fn resolve_ws_memory_handle(
     zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
         .await
         .map(Some)
+}
+
+/// Resolve a SOP approval gate from a WebSocket `kind:"sop"` `approval_response`
+/// frame and reply with the result/error frame. Returns `true` when the frame was
+/// a SOP frame (handled), so the caller stops further processing.
+///
+/// EPIC C: the principal is transport-derived (ws + session id), never from the
+/// frame. Shared by the idle connection loop AND the mid-turn forward loop so a
+/// SOP approval over the same connection is answered, never silently dropped, no
+/// matter when it arrives.
+async fn handle_ws_sop_frame<S>(
+    parsed: &serde_json::Value,
+    state: &AppState,
+    session_id: &str,
+    sender: &mut S,
+) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if parsed["kind"].as_str() != Some("sop") {
+        return false;
+    }
+    let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+    let decision = match parsed["decision"].as_str().unwrap_or("") {
+        "approve" => Some(SopApprovalDecision::Approve),
+        // Thread the optional reason through, like the HTTP/CLI deny surfaces, so
+        // the ledger records it.
+        "deny" => Some(SopApprovalDecision::Deny {
+            reason: parsed["reason"].as_str().map(str::to_string),
+        }),
+        _ => None,
+    };
+    // run_id + a valid decision are both required; the let-else avoids an expect()
+    // on the downstream resolve (codebase rule: no expect/unwrap in production).
+    let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-invalid-approval"
+            ),
+            "code": "INVALID_APPROVAL_RESPONSE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return true;
+    };
+    let frame = if let Some(engine) = state.sop_engine.as_ref() {
+        let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
+        match engine.lock() {
+            Ok(mut g) => match g.resolve_gate(&run_id, decision, principal) {
+                Ok(outcome) => serde_json::json!({
+                    "type": "sop_approval_result",
+                    "run_id": run_id,
+                    "outcome": outcome.label(),
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "error",
+                    "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-sop-ws-resolve-failed",
+                        &[("error", &e.to_string())],
+                    ),
+                    "code": "SOP_RESOLVE_FAILED"
+                }),
+            },
+            Err(_) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-sop-ws-engine-lock-poisoned"
+                ),
+                "code": "SOP_LOCK_POISONED"
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-subsystem-disabled"
+            ),
+            "code": "SOP_DISABLED"
+        })
+    };
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    true
 }
 
 async fn handle_socket(
@@ -530,6 +615,7 @@ async fn handle_socket(
                         &ws_memory,
                         &content,
                         &session_key,
+                        &session_id,
                     )
                     .await;
                 }
@@ -600,6 +686,13 @@ async fn handle_socket(
 
                 // ── approval_response (operator answered a tool prompt) ──
                 if msg_type == "approval_response" {
+                    // EPIC C: a SOP-kind frame resolves a SOP gate via the shared
+                    // engine + resolve_gate (keyed by run_id), NOT the tool-prompt
+                    // pending_approvals map (keyed by request_id). The principal is
+                    // transport-derived (ws + session id), never from the frame.
+                    if handle_ws_sop_frame(&parsed, &state, &session_id, &mut sender).await {
+                        continue;
+                    }
                     let request_id = parsed["request_id"].as_str().unwrap_or("");
                     let decision_str = parsed["decision"].as_str().unwrap_or("");
                     let decision = match decision_str {
@@ -672,6 +765,7 @@ async fn handle_socket(
                     &ws_memory,
                     &content,
                     &session_key,
+                    &session_id,
                 )
                 .await;
             }
@@ -893,6 +987,7 @@ async fn process_chat_message(
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
+    session_id: &str,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -918,6 +1013,15 @@ async fn process_chat_message(
             zeroclaw_runtime::agent::cost::TurnUsage::default(),
         ))
     });
+
+    // Resolve context budget for this agent. Wire field is named
+    // `max_context_tokens` and must track the runtime-profile budget
+    // (same source Zerocode's context meter uses), not the provider
+    // model-window helper which falls back to 32_000 when unset.
+    let max_context_tokens = {
+        let cfg = state.config.read();
+        cfg.effective_max_context_tokens(&turn_alias) as u64
+    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -999,6 +1103,11 @@ async fn process_chat_message(
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
+    // Track the most recent absolute provider-reported prompt size
+    // (replaces on each TurnEvent::Usage; not accumulated).
+    // Used for accurate context-bar rendering on the client.
+    let mut last_input_tokens: Option<u64> = None;
+
     // Routes the three concurrent streams that the running turn cares about:
     //   1. inbound `approval_response` frames from the WebSocket client,
     //   2. `TurnEvent::ApprovalRequest` events from `WsApprovalChannel`,
@@ -1055,6 +1164,15 @@ async fn process_chat_message(
                     };
                     match parsed["type"].as_str() {
                         Some("approval_response") => {
+                            // A SOP-kind frame is a gate resolution (keyed by run_id),
+                            // not a tool-prompt response (keyed by request_id). Resolve
+                            // it here too so it is answered mid-turn instead of being
+                            // silently dropped on the request_id path below.
+                            if handle_ws_sop_frame(&parsed, state, session_id, &mut *sender)
+                                .await
+                            {
+                                continue;
+                            }
                             let request_id = parsed["request_id"].as_str().unwrap_or("");
                             let decision = match parsed["decision"].as_str().unwrap_or("") {
                                 "approve" => Some(ChannelApprovalResponse::Approve),
@@ -1139,6 +1257,7 @@ async fn process_chat_message(
                             // cache reads.
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                                last_input_tokens = Some(it);
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
@@ -1179,6 +1298,10 @@ async fn process_chat_message(
                             "dropped_messages": dropped_messages,
                             "kept_turns": kept_turns,
                             "reason": reason,
+                        }),
+                        TurnEvent::Plan { entries } => serde_json::json!({
+                            "type": "plan",
+                            "entries": entries,
                         }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
@@ -1318,6 +1441,7 @@ async fn process_chat_message(
                     let model_provider = state.model_provider.clone();
                     let model = state.model.clone();
                     let temperature = state.temperature;
+                    let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
                     zeroclaw_spawn::spawn!(async move {
@@ -1326,6 +1450,7 @@ async fn process_chat_message(
                             &model,
                             temperature,
                             mem.as_ref(),
+                            &memory_config,
                             &user_msg,
                             &assistant_resp,
                         )
@@ -1372,6 +1497,8 @@ async fn process_chat_message(
                 "cost_usd": cost_usd,
                 "model": turn_model,
                 "provider": provider_label,
+                "max_context_tokens": max_context_tokens,
+                "last_input_tokens": last_input_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -1402,6 +1529,7 @@ async fn process_chat_message(
                         "output_tokens": total_output_tokens,
                         "tokens_used": total_tokens,
                         "cost_usd": cost_usd,
+                        "last_input_tokens": last_input_tokens,
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"
@@ -1478,6 +1606,32 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn sop_ws_error_frames_resolve_via_fluent() {
+        // The SOP WebSocket error frames are UI-surfaced and route through the
+        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
+        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+        for key in [
+            "cli-sop-ws-invalid-approval",
+            "cli-sop-ws-engine-lock-poisoned",
+            "cli-sop-ws-subsystem-disabled",
+        ] {
+            let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
+            assert!(
+                !s.starts_with('{') || !s.ends_with('}'),
+                "fluent missing-key fallback leaked for {key}: {s:?}"
+            );
+        }
+        let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-sop-ws-resolve-failed",
+            &[("error", "boom")],
+        );
+        assert!(
+            resolved.contains("boom"),
+            "the resolve-failed frame must interpolate the error: {resolved:?}"
+        );
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {

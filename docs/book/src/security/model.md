@@ -55,9 +55,9 @@ Docs: [Sandboxing](./sandboxing.md).
 
 ## Tool receipts
 
-Every tool invocation, whether it executed, was blocked, or required approval, produces a signed receipt in a chain. Each receipt includes the hash of the previous one, so tampering with any receipt invalidates the rest.
+Tool receipts provide HMAC evidence that a successful tool call and its result passed through the runtime. When receipts are enabled, successful tool outputs receive an HMAC-SHA256 receipt over the call and result, and the receipt is fed back into the conversation with the tool result.
 
-Receipts are the source of truth for "what did the agent do yesterday". They're readable, greppable, and durable.
+Receipts help catch fabricated tool claims. They are not a chained or durable audit log today: receipt keys are ephemeral, receipts are not cross-signed with the conversation hash, and persistent receipt storage is still future work.
 
 Docs: [Tool receipts](./tool-receipts.md).
 
@@ -68,8 +68,27 @@ Beyond the six layers:
 - **OTP gating**: `[security.otp] gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
 - **Emergency stop**: `zeroclaw estop` halts all in-flight tool calls. With `[security.estop] enabled = true`, resuming requires an OTP.
 - **Prompt injection guard**: scans model output for known injection patterns before tool calls are validated.
-- **Leak detector**: scans outbound messages for secrets (API key patterns, private keys) and blocks sends that match.
+- **Leak detector**: scans outbound channel responses for credentials and redacts matches before delivery. It covers deterministic credential patterns and can also run a standalone high-entropy-token heuristic.
 - **Pairing guard**: device pairing for channel auth; prevents stolen credentials from working on a new device.
+
+## Leak detector configuration
+
+Configure outbound leak detection in its own TOML section:
+
+```toml
+[security.leak_detection]
+enabled = true
+sensitivity = 0.7
+high_entropy_tokens = true
+```
+
+`enabled = false` disables the entire outbound leak detector.
+`high_entropy_tokens = false` disables only the standalone entropy heuristic;
+deterministic credential patterns still run. `sensitivity` accepts `0.0`
+through `1.0`; higher values are more aggressive.
+
+The complete field table and defaults are in the
+[Config reference](../reference/config.md#securityleak_detection).
 
 ## When things go wrong
 

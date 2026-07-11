@@ -85,6 +85,19 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
+    /// Receiver for server-initiated JSON-RPC requests that expect a
+    /// response (today: `elicitation/create`). Drained per draw alongside
+    /// `notif_rx` so an ACP-style multiple-choice prompt routed over the
+    /// Code tab's RPC channel is surfaced as an interactive modal — or
+    /// auto-cancelled when it can't be matched to the active session or
+    /// its schema won't parse — without blocking the daemon's tool call
+    /// indefinitely.
+    ///
+    /// See `crates/zeroclaw-runtime/src/rpc/approval_channel.rs` for the
+    /// emitter side and the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
+    /// for the wire protocol.
+    inbound_rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
     /// Background-fetched git status updates: (session_id, branch, hash).
     git_branch_tx: mpsc::Sender<GitStatusUpdate>,
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
@@ -111,6 +124,48 @@ pub(crate) struct Chat {
     /// Double-click tracker for the agent picker: a second click on the same row
     /// confirms (enters the session), matching the keyboard Enter.
     pick_agent_double_click: crate::mouse::DoubleClickTracker,
+    /// Parsed `[todotracker]` config, fetched once (lazily, on first
+    /// session start) and applied to every `ChatState` this pane
+    /// constructs. Defaults until fetched.
+    todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
+    /// repeat on every session start.
+    todo_settings_loaded: bool,
+    /// Inbound `elicitation/create` requests that arrived while the pane was
+    /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
+    /// Rather than auto-cancel a legitimately-owned prompt during that
+    /// transient window — which silently drops the agent's `ask_user` — we
+    /// hold it here and retry installation on subsequent drains until it
+    /// either matches (modal installed) or its grace deadline expires (then
+    /// answered `cancel`, unblocking the daemon's tool call). See
+    /// `drain_inbound_requests` / `try_install_elicitation`.
+    deferred_elicitations: Vec<DeferredInboundRequest>,
+}
+
+/// How long an unroutable inbound `elicitation/create` is retried before it is
+/// answered `cancel`. Covers the transient window where the pane is switching
+/// or resuming a session and `phase` is briefly not `Active` on the target
+/// session. Short enough that a genuinely-unroutable request still unblocks the
+/// daemon's tool call promptly.
+const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
+
+/// An inbound server-initiated request buffered for a retry pass because it
+/// could not be installed on arrival. Carries the arrival instant so the drain
+/// loop can enforce [`ELICITATION_ROUTE_GRACE`].
+struct DeferredInboundRequest {
+    req: crate::client::RpcInboundRequest,
+    first_seen: Instant,
+}
+
+/// Outcome of attempting to route one inbound `elicitation/create` to the
+/// active session. See `Chat::try_install_elicitation`.
+enum ElicitationRouting {
+    /// Modal installed on the active session; it owns the request id.
+    Installed,
+    /// Schema/params could not be decoded; caller must answer `cancel`.
+    Unparseable(serde_json::Value),
+    /// Parsed but does not target the active session yet; retry briefly.
+    Defer(crate::client::RpcInboundRequest),
 }
 
 /// Result of one background `session/git_branch` poll, routed back to the UI
@@ -149,6 +204,7 @@ impl Chat {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
+            inbound_rx: rpc.subscribe_inbound_requests(),
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
@@ -164,6 +220,9 @@ impl Chat {
             resume_agent_alias: None,
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
+            todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
+            todo_settings_loaded: false,
+            deferred_elicitations: Vec::new(),
         }
     }
 
@@ -325,6 +384,19 @@ impl Chat {
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+        // Fetch the [todotracker] config once, lazily, the first time this
+        // pane starts a session — so the tracker honors enabled /
+        // enabled_at_start / location / width / max_height. Best-effort: a
+        // failure keeps the schema defaults. Done here (not in init()) so the
+        // hot refresh path stays a single agents/status round-trip.
+        if !self.todo_settings_loaded {
+            self.todo_settings_loaded = true;
+            if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
+                self.todo_settings =
+                    crate::todo_tracker::TodoTrackerSettings::from_config_fields(&fields);
+            }
+        }
+
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
         // the daemon-retained session, its persisted history, and its cwd.
@@ -359,7 +431,11 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = ChatState::new(session.session_id, agent_alias.to_string());
+                let mut state = ChatState::new(
+                    session.session_id,
+                    agent_alias.to_string(),
+                    self.todo_settings,
+                );
                 // Only ACP shows the working directory above the input bar.
                 if self.pane_kind == PaneKind::Acp {
                     state.cwd = session.workspace_dir;
@@ -494,6 +570,215 @@ impl Chat {
         if applied {
             self.pump_queue();
         }
+    }
+
+    /// Drain server-initiated JSON-RPC requests (today: only
+    /// `elicitation/create`) and dispatch them so the daemon's tool call
+    /// doesn't stall.
+    ///
+    /// An `elicitation/create` targeting the active session with a schema we
+    /// understand is installed as an interactive picker modal (via
+    /// `route_inbound_elicitation` → `try_install_elicitation`); the user's
+    /// selection is sent back as the JSON-RPC response. A request whose schema
+    /// won't parse is answered `{"action": "cancel"}` immediately. A request
+    /// that parses but does not target the active session — the pane may be
+    /// mid resume/reset/switch — is *deferred* and retried for a short grace
+    /// window before it is cancelled, so a legitimately-owned prompt is never
+    /// dropped during a transition. `cancel` collapses to `Ok(None)` in the
+    /// daemon's `RpcApprovalChannel::request_choice`, letting the calling tool
+    /// fall back to its non-channel path. See the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
+    ///
+    /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
+    /// future daemon-side feature doesn't silently park a request id.
+    fn drain_inbound_requests(&mut self) {
+        loop {
+            let req = match self.inbound_rx.try_recv() {
+                Ok(req) => req,
+                // A `Lagged` receiver has irrecoverably lost frames from the
+                // broadcast buffer. For response-bearing requests (today:
+                // `elicitation/create`) a lost frame means the daemon parks
+                // its tool call until `session_timeout_secs` (default 3600s) —
+                // the user sees `ask_user` hang. We cannot recover the dropped
+                // ids here, but we MUST NOT swallow it silently: surface a
+                // system message so the hang is diagnosable, then keep draining
+                // the frames still buffered. The capacity bump on the sender
+                // side (`INBOUND_REQUEST_CHANNEL_CAPACITY`) makes this rare.
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                "zc-chat-elicitation-dropped",
+                            ))));
+                        state.mark_dirty_append();
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            };
+            match req.method.as_str() {
+                "elicitation/create" => self.route_inbound_elicitation(req),
+                other => {
+                    let method = other.to_string();
+                    let id = req.id.clone();
+                    let rpc = self.rpc.clone();
+                    tokio::spawn(async move {
+                        let _ = rpc
+                            .respond_to_inbound_request(
+                                id,
+                                Err(crate::jsonrpc::JsonRpcError {
+                                    code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                                    message: format!("Method not found: {method}"),
+                                    data: None,
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            }
+        }
+
+        // Retry any elicitations that arrived before their session was
+        // installable, and cancel the ones whose grace window has elapsed.
+        self.drain_deferred_elicitations();
+    }
+
+    /// Route one inbound `elicitation/create`: install it if its session is
+    /// active, defer it if the pane is mid-transition (so a legitimately-owned
+    /// prompt is not dropped during a session switch/resume), or cancel it
+    /// outright if its schema is unparseable.
+    fn route_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
+        match self.try_install_elicitation(req) {
+            ElicitationRouting::Installed => {}
+            ElicitationRouting::Unparseable(id) => Self::answer_cancel(&self.rpc, id),
+            ElicitationRouting::Defer(req) => {
+                self.deferred_elicitations.push(DeferredInboundRequest {
+                    req,
+                    first_seen: Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Retry deferred elicitations. Each is re-attempted once per drain; when
+    /// its session becomes active the modal installs, and when its grace
+    /// deadline lapses it is answered `cancel` so the daemon's tool call never
+    /// stalls indefinitely on a session that never materialised in this pane.
+    fn drain_deferred_elicitations(&mut self) {
+        if self.deferred_elicitations.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.deferred_elicitations);
+        for entry in pending {
+            let expired = entry.first_seen.elapsed() >= ELICITATION_ROUTE_GRACE;
+            match self.try_install_elicitation(entry.req) {
+                ElicitationRouting::Installed => {}
+                ElicitationRouting::Unparseable(id) => Self::answer_cancel(&self.rpc, id),
+                ElicitationRouting::Defer(req) => {
+                    if expired {
+                        Self::answer_cancel(&self.rpc, req.id);
+                    } else {
+                        self.deferred_elicitations.push(DeferredInboundRequest {
+                            req,
+                            first_seen: entry.first_seen,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answer an inbound request with `{"action":"cancel"}`, which the daemon's
+    /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
+    /// calling tool takes its non-channel fallback path.
+    fn answer_cancel(rpc: &Arc<RpcClient>, id: serde_json::Value) {
+        let rpc = rpc.clone();
+        tokio::spawn(async move {
+            let _ = rpc
+                .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
+                .await;
+        });
+    }
+
+    /// Try to install an inbound elicitation as a modal on the active session.
+    ///
+    /// Returns [`ElicitationRouting`]:
+    /// - `Installed` — the request targets the active session and parsed; a
+    ///   modal was installed and owns the request id.
+    /// - `Unparseable(id)` — the schema could not be decoded; the caller must
+    ///   answer `cancel` (retrying would never succeed).
+    /// - `Defer(req)` — the request parsed but does not (yet) target the
+    ///   active session; the caller should retry it briefly rather than
+    ///   cancelling a possibly-owned prompt during a session transition.
+    ///
+    /// Wire shape per the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
+    fn try_install_elicitation(
+        &mut self,
+        req: crate::client::RpcInboundRequest,
+    ) -> ElicitationRouting {
+        let params: Option<crate::wire::ElicitationRequestParams> =
+            serde_json::from_value(req.params.clone()).ok();
+        let shape = params
+            .as_ref()
+            .and_then(|p| crate::wire::ElicitationShape::from_schema(&p.requested_schema));
+
+        // A request we can't decode (missing params or an unknown schema)
+        // can never install — cancel it immediately, no retry.
+        let (params, shape) = match (params, shape) {
+            (Some(p), Some(s)) => (p, s),
+            _ => return ElicitationRouting::Unparseable(req.id),
+        };
+
+        // Must target THIS pane's active session. If not, it may simply be
+        // that the pane is mid resume/reset/switch — defer and retry rather
+        // than cancel a prompt this pane will shortly own.
+        let matches_active = matches!(
+            &self.phase,
+            ChatPhase::Active(state) if state.session_id == params.session_id
+        );
+        if !matches_active {
+            return ElicitationRouting::Defer(req);
+        }
+
+        let pending = match shape {
+            crate::wire::ElicitationShape::Single { choices, .. } => PendingElicitation {
+                request_id: req.id,
+                session_id: params.session_id,
+                message: params.message,
+                choices: choices.into_iter().map(|c| c.title).collect(),
+                multi: false,
+                min_items: 1,
+                max_items: 1,
+                cursor: 0,
+                selected: Vec::new(),
+            },
+            crate::wire::ElicitationShape::Multi {
+                choices,
+                min_items,
+                max_items,
+                ..
+            } => {
+                let n = choices.len();
+                PendingElicitation {
+                    request_id: req.id,
+                    session_id: params.session_id,
+                    message: params.message,
+                    choices: choices.into_iter().map(|c| c.title).collect(),
+                    multi: true,
+                    min_items,
+                    max_items,
+                    cursor: 0,
+                    selected: vec![false; n],
+                }
+            }
+        };
+
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            state.set_pending_elicitation(pending);
+        }
+        ElicitationRouting::Installed
     }
 
     fn settle_stuck_cancel(&mut self) {
@@ -659,6 +944,7 @@ impl Chat {
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
+        self.drain_inbound_requests();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -825,6 +1111,100 @@ impl Chat {
             }
         }
 
+        // ── Elicitation modal key handling ───────────────────────
+        // Highest-priority Active-phase overlay after the model picker:
+        // an outstanding agent question must be answered before normal
+        // chat keys resume. Navigation mutates the modal in place;
+        // confirm/cancel answer the daemon's JSON-RPC request id and
+        // clear the modal.
+        if state.pending_elicitation.is_some() {
+            use crate::keymap::ModalAction;
+            let action = ModalAction::from_chord(&key);
+
+            // Multi-select toggle on Space. Single-select ignores Space.
+            if action == Some(ModalAction::Toggle) {
+                let mut toggled = false;
+                if let Some(e) = state.pending_elicitation.as_mut()
+                    && e.multi
+                    && let Some(slot) = e.selected.get_mut(e.cursor)
+                {
+                    *slot = !*slot;
+                    toggled = true;
+                }
+                if toggled {
+                    state.mark_dirty_full();
+                }
+                return false;
+            }
+
+            match action {
+                Some(ModalAction::Up) => {
+                    if let Some(e) = state.pending_elicitation.as_mut() {
+                        e.cursor = e.cursor.saturating_sub(1);
+                    }
+                    state.mark_dirty_full();
+                    return false;
+                }
+                Some(ModalAction::Down) => {
+                    if let Some(e) = state.pending_elicitation.as_mut()
+                        && e.cursor + 1 < e.choices.len()
+                    {
+                        e.cursor += 1;
+                    }
+                    state.mark_dirty_full();
+                    return false;
+                }
+                Some(ModalAction::Confirm) => {
+                    // Build the response without holding the modal borrow,
+                    // then answer the daemon. For an invalid multi-select
+                    // (bounds unmet) keep the modal open.
+                    let payload = state
+                        .pending_elicitation
+                        .as_ref()
+                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
+                    if let Some((id, content)) = payload {
+                        state.pending_elicitation = None;
+                        state.mark_dirty_full();
+                        let rpc = self.rpc.clone();
+                        tokio::spawn(async move {
+                            let _ = rpc
+                                .respond_to_inbound_request(
+                                    id,
+                                    Ok(serde_json::json!({
+                                        "action": "accept",
+                                        "content": content
+                                    })),
+                                )
+                                .await;
+                        });
+                    }
+                    // else: invalid selection — swallow, leave modal up.
+                    return false;
+                }
+                Some(ModalAction::Cancel) => {
+                    if let Some(e) = state.pending_elicitation.take() {
+                        state.mark_dirty_full();
+                        let id = e.request_id;
+                        let rpc = self.rpc.clone();
+                        tokio::spawn(async move {
+                            let _ = rpc
+                                .respond_to_inbound_request(
+                                    id,
+                                    Ok(serde_json::json!({ "action": "cancel" })),
+                                )
+                                .await;
+                        });
+                    }
+                    return false;
+                }
+                _ => {
+                    // Swallow every other key so the prompt stays modal and
+                    // nothing leaks into the input bar.
+                    return false;
+                }
+            }
+        }
+
         // ── Session overlay key handling ─────────────────────────
         match &mut state.session_overlay {
             SessionOverlay::List {
@@ -946,8 +1326,7 @@ impl Chat {
 
         // Any key press clears the mouse-click highlight — the user is done
         // with visual selection and is interacting via keyboard.
-        state.highlighted_entry = None;
-        state.mouse_down_entry = None;
+        state.clear_mouse_highlight();
 
         // ── Auto-exit browse mode on typing keys ─────────────────
         // If the user pressed a printable key that isn't a browse-mode
@@ -1259,6 +1638,10 @@ impl Chat {
                 state.show_thoughts = !state.show_thoughts;
                 state.mark_dirty_full();
             }
+            Some(ChatTabAction::TodoToggle) => {
+                state.todo_tracker.toggle();
+                state.mark_dirty_full();
+            }
             Some(ChatTabAction::BrowseEnter) => {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, false);
@@ -1302,6 +1685,24 @@ impl Chat {
             }
             Some(ChatTabAction::FastScrollDown) => {
                 state.scroll_down(5);
+            }
+            Some(ChatTabAction::ScrollUp) => {
+                state.scroll_up(1);
+            }
+            Some(ChatTabAction::ScrollDown) => {
+                state.scroll_down(1);
+            }
+            Some(ChatTabAction::PageUp) => {
+                state.page_up();
+            }
+            Some(ChatTabAction::PageDown) => {
+                state.page_down();
+            }
+            Some(ChatTabAction::JumpStart) => {
+                state.scroll_to_top();
+            }
+            Some(ChatTabAction::JumpEnd) => {
+                state.scroll_to_bottom();
             }
             Some(ChatTabAction::BrowseUpVim)
                 if state.in_browse_mode()
@@ -1610,6 +2011,47 @@ impl Chat {
         }
     }
 
+    async fn open_agent_picker(&mut self, current_alias: String) {
+        let agents = match self.rpc.agents_status().await {
+            Ok(result) => result
+                .agents
+                .into_iter()
+                .filter(|agent| agent.enabled)
+                .map(|agent| agent.alias)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                if let ChatPhase::Active(state) = &mut self.phase {
+                    state.info_message =
+                        Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                            "zc-chat-error-fetch-agents",
+                            &[("error", &e.to_string())],
+                        )));
+                    state.mark_dirty_full();
+                }
+                return;
+            }
+        };
+
+        if agents.len() <= 1 {
+            return;
+        }
+
+        let selected = agents
+            .iter()
+            .position(|agent| agent == &current_alias)
+            .unwrap_or(0);
+        let mut list_state = ListState::default();
+        list_state.select(Some(selected));
+
+        self.resume_session_id = None;
+        self.resume_agent_alias = None;
+        self.phase = ChatPhase::PickAgent {
+            agents,
+            list_state,
+            loading: false,
+        };
+    }
+
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
@@ -1654,9 +2096,23 @@ impl Chat {
             return;
         }
 
+        if let ChatPhase::Active(state) = &self.phase
+            && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && !state.turn_in_flight
+            && !state.input_bar.has_file_explorer()
+            && matches!(state.session_overlay, SessionOverlay::None)
+            && !state.model_picker.is_open()
+            && state.title_hit_target_at(mouse.column, mouse.row) == Some(TitleHitTarget::Agent)
+        {
+            let current_alias = state.agent_alias.clone();
+            self.open_agent_picker(current_alias).await;
+            return;
+        }
+
         if let ChatPhase::Active(ref mut state) = self.phase {
             // Let the file explorer handle mouse events first when open.
             if state.input_bar.handle_mouse(mouse) {
+                state.clear_mouse_highlight();
                 return;
             }
 
@@ -1715,6 +2171,7 @@ impl Chat {
                 && let Some(target) = state.title_hit_target_at(col, row)
             {
                 match target {
+                    TitleHitTarget::Agent => {}
                     TitleHitTarget::ModelProvider => {
                         let rpc = self.rpc.clone();
                         Self::open_provider_picker(&rpc, state).await;
@@ -1972,6 +2429,15 @@ impl Chat {
         }
     }
 
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        match &self.phase {
+            ChatPhase::Active(s) => {
+                s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
@@ -1980,6 +2446,16 @@ impl Chat {
                 // The model picker is modal: claim text-input so global keys
                 // (`?`, reload) are suppressed; its own handler swallows keys.
                 if s.model_picker.is_open() {
+                    return true;
+                }
+                // An elicitation modal is modal too: claim text-input (like
+                // the model picker) so global chords — `?` help, `Ctrl+R`
+                // reload — are suppressed by `app.rs` and the pane's own modal
+                // handler owns every key while the daemon waits on the
+                // `elicitation/create` response. Returning `false` here would
+                // let those globals fire *over* an in-flight prompt, breaking
+                // modality.
+                if s.pending_elicitation().is_some() {
                     return true;
                 }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
@@ -2055,6 +2531,37 @@ impl crate::widgets::HelpContext for Chat {
                         ]);
                     }
                     SessionOverlay::None => {}
+                }
+                if state.pending_elicitation().is_some() {
+                    // The elicitation modal is keyboard-driven; source its
+                    // hints from the ModalAction registry so they track any
+                    // rebind. Multi-select adds the toggle line.
+                    use crate::keymap::{ModalAction as M, action_key_labels};
+                    let multi = state
+                        .pending_elicitation()
+                        .map(|e| e.multi)
+                        .unwrap_or(false);
+                    let mut entries = vec![E::new(
+                        action_key_labels(M::Up)
+                            .into_iter()
+                            .chain(action_key_labels(M::Down)),
+                        crate::i18n::t("zc-chat-help-move-up"),
+                    )];
+                    if multi {
+                        entries.push(E::new(
+                            action_key_labels(M::Toggle),
+                            crate::i18n::t("zc-elicit-help-toggle"),
+                        ));
+                    }
+                    entries.push(E::new(
+                        action_key_labels(M::Confirm),
+                        crate::i18n::t("zc-elicit-help-confirm"),
+                    ));
+                    entries.push(E::new(
+                        action_key_labels(M::Cancel),
+                        crate::i18n::t("zc-elicit-help-cancel"),
+                    ));
+                    return HelpNode::entries(entries);
                 }
                 if state.pending_approval().is_some() {
                     use crate::keymap::{ChatTabAction as C, action_key_labels};
@@ -2149,10 +2656,6 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
                     E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
-                    E::key(
-                        "/toggle-thinking",
-                        crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
-                    ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::NewSession),
@@ -2160,7 +2663,7 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
-                        crate::i18n::t("zc-chat-help-session-list"),
+                        crate::i18n::t("zc-chat-help-switch-session"),
                     ),
                     E::spacer(),
                     E::key(
@@ -2301,7 +2804,57 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
+/// Split `area` into (body, optional tracker area) based on the
+/// tracker's location and visibility. Side panels (`Left`/`Right`) take
+/// the configured column width clamped to at most half the pane width;
+/// the bottom strip grows with the plan up to the configured max height,
+/// clamped to at most half the pane height. Returns `None` for the
+/// tracker area when it wants no space — the body then gets the whole
+/// area (existing layout untouched).
+fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (Rect, Option<Rect>) {
+    if !tracker.wants_space() {
+        return (area, None);
+    }
+    match tracker.location() {
+        crate::todo_tracker::TodoLocation::Right => {
+            let w = tracker.width().min(area.width / 2);
+            let body = Rect::new(area.x, area.y, area.width.saturating_sub(w), area.height);
+            let panel = Rect::new(area.x + body.width, area.y, w, area.height);
+            (body, Some(panel))
+        }
+        crate::todo_tracker::TodoLocation::Left => {
+            let w = tracker.width().min(area.width / 2);
+            let panel = Rect::new(area.x, area.y, w, area.height);
+            let body = Rect::new(
+                area.x + w,
+                area.y,
+                area.width.saturating_sub(w),
+                area.height,
+            );
+            (body, Some(panel))
+        }
+        crate::todo_tracker::TodoLocation::Bottom => {
+            // Grow up to the configured cap (+2 rows for the bordered
+            // block), but never exceed half the pane height.
+            let want = (tracker.total() as u16 + 2).min(tracker.max_height());
+            let h = want.min(area.height / 2);
+            let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(h));
+            let panel = Rect::new(area.x, area.y + body.height, area.width, h);
+            (body, Some(panel))
+        }
+    }
+}
+
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
+    // Carve the TodoWrite tracker's area first (outermost split), so the
+    // rest of the pane (queue sidebar, transcript, input) lays out in the
+    // remaining body. When the tracker wants no space, `body == area` and
+    // the existing layout is untouched.
+    let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
+    if let Some(panel) = todo_area {
+        state.todo_tracker.render(f, panel);
+    }
+
     let area = if state.queue_sidebar_open() {
         let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
@@ -2314,11 +2867,11 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
         area
     };
 
-    let show_cursor = state.pending_approval().is_none();
+    let show_cursor = state.pending_approval().is_none() && state.pending_elicitation().is_none();
     let turn_status = state.turn_status.clone();
     let turn_started_at = state.turn_started_at;
 
-    let _live_input_tokens = state.context_input_tokens;
+    let _live_input_tokens: Option<u64> = state.context_input_tokens;
 
     // Transient info-bar messages (queue/attach notices, model-switch notes)
     // render at the app level via InfoBar from `state.info_message`. The paused
@@ -2390,6 +2943,10 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
+    }
+
+    if state.pending_elicitation().is_some() {
+        render_elicitation_overlay(f, state, area);
     }
 
     match &state.session_overlay {
@@ -2870,10 +3427,10 @@ fn header_fence_lang(line: &Line<'static>) -> Option<String> {
     }
 }
 
-/// Wrap recovered fence body text in its Markdown fence so a copied fence round-
-/// trips to the same source the model emitted, language tag included.
-fn fenced_text(lang: Option<&str>, body: &str) -> String {
-    format!("```{}\n{body}\n```", lang.unwrap_or(""))
+/// Return the code body for clipboard copy without markdown fences.
+/// Users pasting into a terminal expect raw commands, not fenced blocks.
+fn fenced_text(_lang: Option<&str>, body: &str) -> String {
+    body.to_string()
 }
 
 /// Wrapped screen-row count for a single cached line at the given width.
@@ -2926,32 +3483,13 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.rebuild_lines(inner_width);
     }
 
-    let mut lines: Vec<Line> = state.cached_lines.iter().map(borrow_line).collect();
-    let mut transient = false;
-
-    if !state.streaming_text.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-            theme::agent_label_style(),
-        )]));
-        lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
-        transient = true;
-    }
-
-    if state.show_thoughts && !state.streaming_thought.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("(thinking) ", theme::thought_style()),
-            Span::styled(state.streaming_thought.as_str(), theme::dim_style()),
-        ]));
-        transient = true;
-    }
-
-    if state.pending_approval().is_some() {
-        for _ in 0..APPROVAL_OVERLAY_HEIGHT {
-            lines.push(Line::default());
-        }
-        transient = true;
-    }
+    // Determine transient overlays (live streaming / approval) up front from
+    // cheap state reads. Transient frames append uncached lines and must use
+    // the full-buffer path; idle/scroll frames render only the viewport slice.
+    let has_stream_text = !state.streaming_text.is_empty();
+    let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
+    let has_approval = state.pending_approval().is_some();
+    let transient = has_stream_text || has_stream_thought || has_approval;
 
     // Reserve a pinned top row inside the panel for the session's first user
     // message — a recovery reminder that stays put across scroll and reload.
@@ -2982,10 +3520,38 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         inner.height.saturating_sub(first_row_h),
     );
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Build the full line buffer (history + transient overlays) only on
+    // transient frames; idle/scroll frames never materialize the whole
+    // history and instead slice the viewport below.
+    let transient_lines: Vec<Line<'static>> = if transient {
+        let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
+        if has_stream_text {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                theme::agent_label_style(),
+            )]));
+            lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
+        }
+        if has_stream_thought {
+            lines.push(Line::from(vec![
+                Span::styled("(thinking) ", theme::thought_style()),
+                Span::styled(state.streaming_thought.clone(), theme::dim_style()),
+            ]));
+        }
+        if has_approval {
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
+        }
+        lines
+    } else {
+        Vec::new()
+    };
 
     let total_rows = if transient {
-        p.line_count(inner_width) as u16
+        Paragraph::new(transient_lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16
     } else {
         state.cached_total_rows
     };
@@ -2996,7 +3562,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.scroll_offset.min(max_scroll)
     };
 
-    let p = p.scroll((scroll, 0));
+    // Non-transient frames (idle, scrolling) render only the viewport slice so
+    // per-frame work stays O(visible) instead of O(history). Transient frames
+    // (live streaming, approval overlay) append uncached lines and keep the
+    // full-buffer path.
+    let (render_lines, render_scroll) = if transient {
+        (transient_lines, scroll)
+    } else {
+        state.visible_line_slice(scroll, inner_height)
+    };
+
+    let p = Paragraph::new(render_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
 
     state.last_total_rows = total_rows;
@@ -3010,16 +3588,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi) in &state.cached_screen_ranges {
+    for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
         if visible_hi <= visible_lo {
             continue;
         }
+        // Width follows the entry's rendered text, not the full panel, so a
+        // click in the blank margin beside a short message misses every rect
+        // and clears the highlight (#8652).
         let rect = Rect::new(
             body_x,
             body_y + (visible_lo - scroll),
-            body_w,
+            content_width.min(body_w),
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
@@ -3119,8 +3700,116 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(p, overlay_area);
 }
 
-/// Strip `old_string`, `new_string`, and `content` from an `arguments_summary`
-/// string (format: `"key: val, key: val, …"`) so the approval overlay stays
+/// Render the elicitation modal: the agent's question plus a selectable
+/// list of choices. Single-select shows a `>` cursor; multi-select adds
+/// `[x]`/`[ ]` checkboxes and a live count against the min/max bounds.
+///
+/// Height is derived from the choice count, clamped to the available
+/// area so a long list scrolls rather than overflowing. Mirrors the
+/// bottom-anchored, horizontally-inset geometry of
+/// [`render_approval_overlay`].
+fn render_elicitation_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+    let e = match state.pending_elicitation() {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Body lines: message (wrapped by the List items below it is not, so
+    // we keep the message in the block title area) + one row per choice +
+    // a key-hint footer. Budget: 2 border + 1 message + N choices + 1
+    // footer, clamped to the area height.
+    let choice_rows = e.choices.len() as u16;
+    let desired = choice_rows.saturating_add(5); // borders + msg + footer + pad
+    let max_h = area.height.saturating_sub(2).max(3);
+    let overlay_h = desired.min(max_h).max(3);
+
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(overlay_h)])
+        .split(area);
+    let overlay_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(5),
+            Constraint::Min(60),
+            Constraint::Percentage(5),
+        ])
+        .split(vert[1])[1];
+
+    f.render_widget(Clear, overlay_area);
+
+    let fill = theme::fill_style();
+    let title = if e.multi {
+        let n = e.selected_count();
+        format!(
+            " Choose ({n} selected, need {}..={}) ",
+            e.min_items, e.max_items
+        )
+    } else {
+        String::from(" Choose one ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, theme::warn_style()))
+        .border_style(theme::approval_border_style())
+        .style(fill);
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    // Split inner: message line(s), choice list, footer hint.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let msg = Paragraph::new(e.message.clone())
+        .style(fill)
+        .wrap(Wrap { trim: true });
+    f.render_widget(msg, chunks[0]);
+
+    let items: Vec<ListItem> = e
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, title)| {
+            let checkbox = if e.multi {
+                if e.selected.get(i).copied().unwrap_or(false) {
+                    "[x] "
+                } else {
+                    "[ ] "
+                }
+            } else {
+                ""
+            };
+            let line = format!("{checkbox}{title}");
+            let style = if i == e.cursor {
+                theme::selected_style()
+            } else {
+                fill
+            };
+            ListItem::new(Line::from(Span::styled(line, style)))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(e.cursor.min(e.choices.len().saturating_sub(1))));
+    let list = List::new(items).style(fill);
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    let hint = if e.multi {
+        "↑/↓ move  Space toggle  Enter confirm  Esc cancel"
+    } else {
+        "↑/↓ move  Enter confirm  Esc cancel"
+    };
+    let footer = Paragraph::new(Span::styled(hint, theme::dim_style())).style(fill);
+    f.render_widget(footer, chunks[2]);
+}
+
 /// compact when a diff preview is already shown in the conversation.
 fn strip_content_fields(summary: &str) -> String {
     let mut s = summary;
@@ -3717,6 +4406,86 @@ pub struct PendingApproval {
     pub timeout_secs: u64,
 }
 
+/// A pending ACP `elicitation/create` prompt awaiting a user choice.
+///
+/// Unlike [`PendingApproval`] (fixed allow/reject buttons), an
+/// elicitation is a selectable list of choices — single- or
+/// multi-select — that the agent authored. The modal owns the cursor
+/// and (for multi-select) the per-row checkbox state; on confirm we
+/// translate the selection back into the index-based `choice-N` wire
+/// constants the daemon expects and answer the original JSON-RPC
+/// request id.
+///
+/// `request_id` is a `serde_json::Value` (not `String`) because
+/// JSON-RPC permits numeric ids and we must echo the exact id shape
+/// the daemon sent. See the ACP elicitation RFD
+/// (https://agentclientprotocol.com/rfds/elicitation).
+#[derive(Debug, Clone)]
+pub struct PendingElicitation {
+    /// JSON-RPC request id to respond to. Echoed verbatim.
+    pub request_id: serde_json::Value,
+    /// Session this elicitation belongs to. Captured at install time so a
+    /// future mouse handler (or a cross-session correctness assert) can
+    /// confirm the modal still targets the active session. Read indirectly
+    /// today via the install-time match in `try_install_elicitation`.
+    #[allow(dead_code)]
+    pub session_id: String,
+    /// Prompt text shown above the choice list.
+    pub message: String,
+    /// User-visible choice titles, in wire order. The `choice-N` const
+    /// is the index into this vec.
+    pub choices: Vec<String>,
+    /// Whether this is a multi-select (checkbox) prompt.
+    pub multi: bool,
+    /// Multi-select lower bound (inclusive). Ignored for single-select.
+    pub min_items: usize,
+    /// Multi-select upper bound (inclusive). Ignored for single-select.
+    pub max_items: usize,
+    /// Highlighted row.
+    pub cursor: usize,
+    /// Per-row checkbox state for multi-select. Empty / unused for
+    /// single-select.
+    pub selected: Vec<bool>,
+}
+
+impl PendingElicitation {
+    /// Number of currently-checked rows (multi-select only).
+    pub fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|&&b| b).count()
+    }
+
+    /// Whether the current selection satisfies the multi-select
+    /// `min_items`/`max_items` bounds. Always `true` for single-select
+    /// (the cursor itself is the answer).
+    pub fn selection_valid(&self) -> bool {
+        if !self.multi {
+            return !self.choices.is_empty();
+        }
+        let n = self.selected_count();
+        n >= self.min_items && n <= self.max_items
+    }
+
+    /// Build the `accept` content payload for the current selection, or
+    /// `None` if the selection is invalid (e.g. too few boxes checked).
+    pub fn accept_content(&self) -> Option<serde_json::Value> {
+        if !self.selection_valid() {
+            return None;
+        }
+        if self.multi {
+            let consts: Vec<serde_json::Value> = self
+                .selected
+                .iter()
+                .enumerate()
+                .filter(|&(_, &on)| on)
+                .map(|(i, _)| serde_json::json!(format!("choice-{i}")))
+                .collect();
+            Some(serde_json::json!({ "choices": consts }))
+        } else {
+            Some(serde_json::json!({ "choice": format!("choice-{}", self.cursor) }))
+        }
+    }
+}
+
 /// One row in the chat / code-tab transcript. Heavy payloads
 /// (agent messages, tool inputs, tool outputs) are refcounted via
 /// `Arc<str>` so cloning is O(1) — the renderer and the
@@ -3817,6 +4586,7 @@ struct ScrollbarDrag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TitleHitTarget {
+    Agent,
     ModelProvider,
     Model,
 }
@@ -3877,6 +4647,12 @@ pub struct ChatState {
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
+    /// A pending ACP elicitation prompt (single- or multi-select). Like
+    /// `pending_approval`, this is a modal overlay that captures keys
+    /// until the user confirms or cancels. Mutually exclusive with
+    /// `pending_approval` in practice — the daemon never has both an
+    /// approval and an elicitation outstanding for the same session.
+    pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
     /// Fine-grained label for the input-bar title while a turn is active.
     /// Lockstep with `turn_in_flight` (`Idle` ↔ `false`) but adds the
@@ -3921,11 +4697,15 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
-    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end)`.
-    /// Unlike `cached_line_ranges` (unwrapped line indices), these account for
-    /// markdown wrapping so mouse hit-testing (`entry_rects`) lands on the
-    /// correct screen rows for agent messages, code blocks, and tables.
-    cached_screen_ranges: Vec<(usize, u16, u16)>,
+    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
+    /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
+    /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
+    /// lands on the correct screen rows for agent messages, code blocks, and
+    /// tables. `content_width` is the widest rendered column extent of the
+    /// entry (clamped to the viewport), so hit-testing ignores the blank space
+    /// beside short messages — a click there dismisses the highlight instead of
+    /// re-selecting the entry.
+    cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -3968,10 +4748,17 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// Live TodoWrite tracker panel for this session. Read-only; fed by
+    /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
+    todo_tracker: crate::todo_tracker::TodoTracker,
 }
 
 impl ChatState {
-    pub fn new(session_id: String, agent_alias: String) -> Self {
+    pub fn new(
+        session_id: String,
+        agent_alias: String,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) -> Self {
         Self {
             session_id,
             agent_alias,
@@ -3988,6 +4775,7 @@ impl ChatState {
             streaming_text: String::new(),
             streaming_thought: String::new(),
             pending_approval: None,
+            pending_elicitation: None,
             turn_in_flight: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -4029,6 +4817,7 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
     }
 
@@ -4041,6 +4830,14 @@ impl ChatState {
 
     fn mark_dirty_full(&mut self) {
         self.dirty = LinesDirty::Full;
+    }
+
+    fn clear_mouse_highlight(&mut self) {
+        if self.highlighted_entry.is_some() || self.mouse_down_entry.is_some() {
+            self.highlighted_entry = None;
+            self.mouse_down_entry = None;
+            self.mark_dirty_full();
+        }
     }
 
     // ── Browse-mode helpers ───────────────────────────────────────
@@ -4158,10 +4955,10 @@ impl ChatState {
     /// top is shown.  Does nothing when `cached_screen_ranges` is empty
     /// (pre-render path).
     fn scroll_entry_into_view(&mut self, entry_idx: usize) {
-        let Some(&(_, lo, _hi)) = self
+        let Some(&(_, lo, _hi, _)) = self
             .cached_screen_ranges
             .iter()
-            .find(|(idx, _, _)| *idx == entry_idx)
+            .find(|(idx, _, _, _)| *idx == entry_idx)
         else {
             return;
         };
@@ -4299,6 +5096,63 @@ impl ChatState {
         self.rebuild_screen_ranges(width);
     }
 
+    /// Collect only the cached lines whose wrapped screen rows intersect the
+    /// viewport `[scroll, scroll + height)`, plus the residual scroll within
+    /// the first partially-visible entry. Lets `render_conversation` build a
+    /// `Paragraph` sized to the viewport instead of cloning the whole history
+    /// every frame, so scroll and keystroke latency stay flat as a session
+    /// grows. Returns `(lines, local_scroll)`; an empty slice yields the full
+    /// `scroll` so the caller's clamping is unchanged.
+    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), scroll);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), scroll);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        let local_scroll = scroll.saturating_sub(self.cached_screen_ranges[first].1);
+        (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
+    }
+
+    fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), 0);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), 0);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        (
+            self.cached_lines[line_lo..line_hi].to_vec(),
+            self.cached_screen_ranges[first].1,
+        )
+    }
+
     /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
     /// each entry's `Line`s individually, so screen row positions reflect
     /// markdown wrapping (code blocks, tables, etc.). Called after every
@@ -4314,30 +5168,33 @@ impl ChatState {
             if entry_lines.is_empty() {
                 continue;
             }
+            // Widest rendered column extent of the entry, clamped to the
+            // viewport. Lines wider than `width` wrap to full-width rows, so the
+            // clamp yields the true on-screen extent. Hit-testing uses this so
+            // the blank space beside a short message is treated as outside the
+            // entry.
+            let content_width = entry_lines
+                .iter()
+                .map(|l| l.width() as u16)
+                .max()
+                .unwrap_or(0)
+                .min(width);
             let wrapped = Paragraph::new(entry_lines)
                 .wrap(Wrap { trim: false })
                 .line_count(width) as u16;
             let screen_lo = screen_cursor;
             screen_cursor += wrapped;
             self.cached_screen_ranges
-                .push((entry_idx, screen_lo, screen_cursor));
+                .push((entry_idx, screen_lo, screen_cursor, content_width));
         }
     }
 
-    /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
-    /// tracking its wrapped screen-row offset, and for each code fence records
-    /// the `[Copy]` label cells on both the header and footer bars plus the
-    /// fence's source text, re-wrapped in its Markdown fence (language tag and
-    /// backticks) from the recovered body lines so a copied fence round-trips.
-    /// `scroll` and `body` map global wrapped rows onto screen cells; labels
-    /// scrolled out of view are dropped.
     fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
-        let mut screen_cursor = 0u16;
-        // (header_row, header_label_col, header_label_cells, lang, accumulated_body)
+        let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
         let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
-        for line in &self.cached_lines {
+        for line in &lines {
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
                 let lang = header_fence_lang(line);
@@ -4402,6 +5259,25 @@ impl ChatState {
         }
     }
 
+    pub fn page_up(&mut self) {
+        self.scroll_up(self.last_inner_height.max(1));
+    }
+
+    pub fn page_down(&mut self) {
+        self.scroll_down(self.last_inner_height.max(1));
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.pinned_to_bottom = false;
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.scroll_offset = max;
+        self.pinned_to_bottom = true;
+    }
+
     pub fn title(&self) -> String {
         self.title_parts()
             .into_iter()
@@ -4413,7 +5289,7 @@ impl ChatState {
     fn title_parts(&self) -> Vec<(Option<TitleHitTarget>, String)> {
         let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
         let mut parts: Vec<(Option<TitleHitTarget>, String)> = Vec::with_capacity(5);
-        parts.push((None, self.agent_alias.clone()));
+        parts.push((Some(TitleHitTarget::Agent), self.agent_alias.clone()));
         if let Some(ref name) = self.session_name {
             parts.push((None, format!("— {name}")));
         }
@@ -4490,6 +5366,24 @@ impl ChatState {
         self.pending_approval.take()
     }
 
+    pub fn pending_elicitation(&self) -> Option<&PendingElicitation> {
+        self.pending_elicitation.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn take_pending_elicitation(&mut self) -> Option<PendingElicitation> {
+        self.pending_elicitation.take()
+    }
+
+    /// Install a pending elicitation modal. Replaces any prior one (the
+    /// daemon serializes elicitations per session, so a second arrival
+    /// before the first is answered is a protocol anomaly we resolve by
+    /// keeping the newest).
+    pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
+        self.pending_elicitation = Some(e);
+        self.mark_dirty_full();
+    }
+
     /// Commit any accumulated streaming thought as an entry. Called at the two
     /// natural flush points: when a tool call interrupts thinking, and when the
     /// first response text chunk arrives after a thinking phase.
@@ -4523,7 +5417,8 @@ impl ChatState {
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
-            | SessionUpdate::TurnComplete { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::TurnComplete { session_id, .. }
+            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -4665,6 +5560,12 @@ impl ChatState {
                         self.commit_turn(String::new(), false);
                     }
                 }
+            }
+            // Whole-list replace: hand the authoritative plan to the
+            // tracker, which runs the auto-pop rule. Session routing is
+            // already enforced by the session_id check above.
+            SessionUpdate::Plan { entries, .. } => {
+                self.todo_tracker.set_plan(entries);
             }
         }
     }
@@ -5073,6 +5974,7 @@ impl ChatState {
         self.cached_render_start = 0;
         self.cached_render_width = 0;
         self.pending_approval = None;
+        self.pending_elicitation = None;
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -5199,7 +6101,118 @@ mod tests {
     use super::*;
 
     fn state() -> ChatState {
-        ChatState::new("sess-1".to_string(), "myagent".to_string())
+        ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        )
+    }
+
+    #[test]
+    fn hidden_tracker_leaves_full_area_for_body() {
+        let t = crate::todo_tracker::TodoTracker::new(
+            crate::todo_tracker::TodoLocation::Right,
+            true,
+            false,
+        ); // hidden, no plan
+        let full = Rect::new(0, 0, 100, 40);
+        let (body, tracker) = carve_todo_area(&t, full);
+        assert_eq!(body, full);
+        assert!(tracker.is_none());
+    }
+
+    #[test]
+    fn visible_right_tracker_carves_column() {
+        let mut t = crate::todo_tracker::TodoTracker::new(
+            crate::todo_tracker::TodoLocation::Right,
+            true,
+            true,
+        );
+        t.set_plan(vec![crate::wire::PlanEntry {
+            content: "A".into(),
+            status: crate::wire::PlanStatus::Pending,
+            priority: crate::wire::PlanPriority::Medium,
+            active_form: None,
+        }]);
+        let full = Rect::new(0, 0, 100, 40);
+        let (body, tracker) = carve_todo_area(&t, full);
+        let tracker = tracker.expect("visible tracker gets an area");
+        assert_eq!(body.width + tracker.width, full.width);
+        assert_eq!(tracker.width, 32);
+        assert_eq!(body.height, full.height);
+    }
+
+    #[test]
+    fn tracker_width_is_clamped_on_narrow_terminals() {
+        let t = crate::todo_tracker::TodoTracker::new(
+            crate::todo_tracker::TodoLocation::Right,
+            true,
+            true,
+        );
+        let full = Rect::new(0, 0, 40, 20); // narrow
+        let (_body, tracker) = carve_todo_area(&t, full);
+        let tracker = tracker.expect("side panel visible");
+        assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
+    }
+
+    #[test]
+    fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+
+        let total = s.cached_lines.len();
+        assert!(total > 100, "expected a deep history, got {total} lines");
+
+        let height = 20u16;
+        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let mid_scroll = max_scroll / 2;
+
+        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, height);
+
+        assert!(
+            slice.len() < total,
+            "viewport slice ({}) must be smaller than full history ({total})",
+            slice.len()
+        );
+        assert!(
+            slice.len() <= (height as usize) + 8,
+            "viewport slice ({}) should be bounded near the viewport height ({height}), not the history",
+            slice.len()
+        );
+        assert!(
+            local_scroll < height,
+            "local scroll ({local_scroll}) must land inside the first visible entry, below viewport height ({height})"
+        );
+    }
+
+    #[test]
+    fn visible_line_slice_handles_top_and_bottom_extents() {
+        let mut s = state();
+        for i in 0..50 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        let height = 12u16;
+
+        let (top, top_local) = s.visible_line_slice(0, height);
+        assert_eq!(top_local, 0, "scroll 0 keeps the first entry aligned");
+        assert!(!top.is_empty());
+
+        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let (bottom, _) = s.visible_line_slice(max_scroll, height);
+        assert!(!bottom.is_empty(), "bottom extent must still yield lines");
     }
 
     #[test]
@@ -5207,6 +6220,7 @@ mod tests {
         let mut s = ChatState::new(
             "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
             "personal_code".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
         );
         s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
         assert_eq!(
@@ -5217,13 +6231,21 @@ mod tests {
 
     #[test]
     fn title_falls_back_before_identity_resolved() {
-        let s = ChatState::new("abcdef1234".to_string(), "myagent".to_string());
+        let s = ChatState::new(
+            "abcdef1234".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert_eq!(s.title(), "myagent  abcdef1");
     }
 
     #[test]
     fn set_model_identity_keeps_full_ref_and_updates_live() {
-        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = ChatState::new(
+            "abcdef1234".to_string(),
+            "ag".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5");
         s.set_model_identity(None, Some("gpt-5-mini"));
@@ -5237,7 +6259,11 @@ mod tests {
 
     #[test]
     fn title_hit_rects_target_provider_and_model_segments() {
-        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = ChatState::new(
+            "abcdef1234".to_string(),
+            "ag".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         let area = Rect::new(10, 4, 80, 20);
 
@@ -5248,23 +6274,32 @@ mod tests {
             Some(TitleHitTarget::ModelProvider)
         );
         assert_eq!(s.title_hit_target_at(38, 4), Some(TitleHitTarget::Model));
-        assert_eq!(s.title_hit_target_at(12, 4), None);
+        assert_eq!(s.title_hit_target_at(12, 4), Some(TitleHitTarget::Agent));
         assert_eq!(s.title_hit_target_at(25, 5), None);
     }
 
     #[test]
-    fn title_hit_rects_are_empty_before_model_identity_resolves() {
-        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+    fn title_hit_rects_target_agent_before_model_identity_resolves() {
+        let mut s = ChatState::new(
+            "abcdef1234".to_string(),
+            "ag".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
 
-        assert!(s.title_hit_rects.is_empty());
-        assert_eq!(s.title_hit_target_at(12, 4), None);
+        assert_eq!(s.title_hit_rects.len(), 1);
+        assert_eq!(s.title_hit_target_at(12, 4), Some(TitleHitTarget::Agent));
+        assert_eq!(s.title_hit_target_at(16, 4), None);
     }
 
     #[test]
     fn title_hit_rects_clip_at_pane_edge() {
-        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+        let mut s = ChatState::new(
+            "abcdef1234".to_string(),
+            "ag".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 25, 20));
@@ -5336,6 +6371,61 @@ mod tests {
             ));
         }
         assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
+    async fn pending_elicitation_makes_chat_claim_text_input() {
+        // Regression: while an `elicitation/create` prompt is pending the
+        // pane MUST be modal — it has to claim
+        // text-input so `app.rs` suppresses global chords (`?` help,
+        // `Ctrl+R` reload) and routes every key to the modal handler. If
+        // this returns `false`, those globals fire over an in-flight
+        // prompt while the daemon waits on the JSON-RPC response, breaking
+        // modality. Mirrors `open_picker_makes_chat_claim_text_input`.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        // Not modal before the prompt arrives (empty input → command mode).
+        assert!(!chat.wants_text_input());
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.set_pending_elicitation(single_elicitation());
+        }
+        assert!(
+            chat.wants_text_input(),
+            "an active pending elicitation must claim modal focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn wants_quit_chord_tracks_in_flight_turn_state() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        assert!(
+            !chat.wants_quit_chord(),
+            "idle pane must leave Ctrl+C to the quit modal"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.turn_in_flight = true;
+        }
+        assert!(
+            chat.wants_quit_chord(),
+            "an in-flight turn must consume Ctrl+C to cancel before quit"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.enter_cancelling();
+        }
+        assert!(
+            !chat.wants_quit_chord(),
+            "an already-cancelling turn must not re-consume Ctrl+C"
+        );
     }
 
     #[tokio::test]
@@ -5425,7 +6515,18 @@ mod tests {
             None,
         );
 
-        // Second request must be session_new_with_id carrying the prior id for
+        // Second request: the one-shot [todotracker] config fetch fired on the
+        // first session start. Respond with an empty field set (defaults apply).
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("start_session should fetch todotracker config")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "config/list");
+        let id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
+
+        // Third request must be session_new_with_id carrying the prior id for
         // the prior agent — NOT a fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -5475,6 +6576,224 @@ mod tests {
         } else {
             panic!("expected PickAgent phase");
         }
+    }
+
+    #[tokio::test]
+    async fn active_agent_title_click_opens_agent_picker() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let area = Rect::new(10, 4, 80, 20);
+        let mut state = ChatState::new(
+            "abcdef1234".to_string(),
+            "beta".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        state.refresh_title_hit_rects(area);
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        let switch = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("agent title click should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        let id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 1},
+                    {"alias": "disabled", "enabled": false, "live_sessions": 0}
+                ]
+            })),
+            None,
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("agent picker should open after agents/status response")
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, list_state, ..
+        } = chat.phase
+        else {
+            panic!("expected PickAgent phase");
+        };
+        assert_eq!(agents, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(list_state.selected(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn active_agent_title_click_ignored_while_turn_in_flight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let area = Rect::new(10, 4, 80, 20);
+        let mut state = ChatState::new(
+            "abcdef1234".to_string(),
+            "beta".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        state.turn_in_flight = true;
+        state.refresh_title_hit_rects(area);
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        chat.handle_mouse(click, area).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "in-flight agent title click must not call agents/status"
+        );
+        assert!(
+            matches!(chat.phase, ChatPhase::Active(_)),
+            "in-flight agent title click must leave the active session visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_bar_click_clears_transcript_mouse_highlight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.highlighted_entry = Some(0);
+        state.mouse_down_entry = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: area.height.saturating_sub(2),
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.mouse_down_entry, None);
+        assert_eq!(
+            state.dirty,
+            LinesDirty::Full,
+            "clearing the highlight must invalidate rendered transcript lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_side_click_clears_transcript_mouse_highlight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hi")));
+        state.highlighted_entry = Some(0);
+        state.mouse_down_entry = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+
+        // The rendered entry rect must hug the text, not span the panel, so
+        // there is blank space beside the short message to click in.
+        let (_, rect) = state
+            .entry_rects
+            .iter()
+            .find(|(idx, _)| *idx == 0)
+            .copied()
+            .expect("entry 0 has a screen rect");
+        assert!(
+            rect.width < area.width - 2,
+            "short message rect must not span the full panel width: {rect:?}"
+        );
+        // A column just past the text but well within the panel — the blank
+        // margin beside the message.
+        let blank_col = rect.x + rect.width + 1;
+        let blank_row = rect.y;
+        assert!(
+            blank_col < area.width - 1,
+            "blank column stays in the panel"
+        );
+
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: blank_col,
+            row: blank_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.mouse_down_entry, None);
+        assert_eq!(
+            state.dirty,
+            LinesDirty::Full,
+            "clearing the highlight must invalidate rendered transcript lines"
+        );
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
@@ -6171,7 +7490,11 @@ mod tests {
         let _g = theme::set_active_for_test(
             theme::theme_by_name("icy_blue").expect("icy_blue registered"),
         );
-        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        let mut state = ChatState::new(
+            "sess".to_string(),
+            "agent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
         let body = Rect::new(0, 0, 60, 20);
         state.rebuild_copy_regions(60, 0, body);
@@ -6180,30 +7503,67 @@ mod tests {
             "a highlighted fence must still register copy regions"
         );
         assert_eq!(
-            state.copy_hit_regions[0].text, "```rust\nfn main() {}\nlet y = 2;\n```",
-            "copy text re-wraps the body in its fence with the language tag"
+            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
+            "copy text contains only the code body without markdown fences"
         );
     }
 
     #[test]
     fn copy_region_unlabeled_fence_omits_language() {
-        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        let mut state = ChatState::new(
+            "sess".to_string(),
+            "agent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
         let body = Rect::new(0, 0, 60, 20);
         state.rebuild_copy_regions(60, 0, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "```\nplain text\n```",
-            "an unlabeled fence round-trips with bare backticks, no ` code ` label"
+            state.copy_hit_regions[0].text, "plain text",
+            "copy text contains only the code body without fences"
         );
     }
 
     #[test]
-    fn fenced_text_round_trips_language_and_backticks() {
-        assert_eq!(
-            fenced_text(Some("python"), "x = 1"),
-            "```python\nx = 1\n```"
+    fn copy_regions_track_scroll_with_history_above_viewport() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
         );
-        assert_eq!(fenced_text(None, "x = 1"), "```\nx = 1\n```");
+        let mut state = ChatState::new(
+            "sess".to_string(),
+            "agent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let pad = "filler line\n".repeat(200);
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from(pad.as_str())));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```rust\nfn main() {}\n```\n",
+        )));
+        state.dirty = LinesDirty::Full;
+        state.rebuild_lines(60);
+
+        let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
+        let body = Rect::new(0, 0, 60, 20);
+
+        state.rebuild_copy_regions(60, fence_entry.1, body);
+        assert_eq!(
+            state.copy_hit_regions[0].text, "fn main() {}",
+            "scrolled-to fence registers a copy region with body only"
+        );
+
+        state.rebuild_copy_regions(60, 0, body);
+        assert!(
+            state.copy_hit_regions.is_empty(),
+            "fence far below the viewport registers nothing"
+        );
+    }
+
+    #[test]
+    fn fenced_text_returns_body_without_markdown_fences() {
+        assert_eq!(fenced_text(Some("python"), "x = 1"), "x = 1");
+        assert_eq!(fenced_text(None, "x = 1"), "x = 1");
     }
 
     #[test]
@@ -6699,6 +8059,32 @@ mod tests {
     }
 
     #[test]
+    fn page_and_jump_scroll_move_the_viewport() {
+        let mut s = state();
+        s.last_total_rows = 100;
+        s.last_inner_height = 10;
+        s.scroll_to_bottom();
+        let bottom = s.scroll_offset;
+        assert_eq!(bottom, 90);
+        assert!(s.pinned_to_bottom);
+
+        s.page_up();
+        assert_eq!(s.scroll_offset, 80);
+        assert!(!s.pinned_to_bottom);
+
+        s.scroll_to_top();
+        assert_eq!(s.scroll_offset, 0);
+        assert!(!s.pinned_to_bottom);
+
+        s.page_down();
+        assert_eq!(s.scroll_offset, 10);
+
+        s.scroll_to_bottom();
+        assert_eq!(s.scroll_offset, bottom);
+        assert!(s.pinned_to_bottom);
+    }
+
+    #[test]
     fn queue_sidebar_resize_clamps_to_bounds() {
         let mut s = state();
         for _ in 0..40 {
@@ -6742,13 +8128,21 @@ mod tests {
 
     #[test]
     fn title_includes_short_session_hash() {
-        let s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        let s = ChatState::new(
+            "40be7731122334455".to_string(),
+            "personal_code".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert_eq!(s.title(), "personal_code  40be773");
     }
 
     #[test]
     fn title_with_session_name_keeps_hash() {
-        let mut s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        let mut s = ChatState::new(
+            "40be7731122334455".to_string(),
+            "personal_code".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         s.session_name = Some("my work".to_string());
         assert_eq!(s.title(), "personal_code  — my work  40be773");
     }
@@ -6807,5 +8201,282 @@ mod tests {
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    // ── Elicitation modal ────────────────────────────────────────
+
+    fn single_elicitation() -> PendingElicitation {
+        PendingElicitation {
+            request_id: serde_json::json!("elicit-1"),
+            session_id: "sess-1".to_string(),
+            message: "Pick a fruit".to_string(),
+            choices: vec![
+                "Apple".to_string(),
+                "Banana".to_string(),
+                "Cherry".to_string(),
+            ],
+            multi: false,
+            min_items: 1,
+            max_items: 1,
+            cursor: 0,
+            selected: Vec::new(),
+        }
+    }
+
+    fn multi_elicitation() -> PendingElicitation {
+        PendingElicitation {
+            request_id: serde_json::json!(42),
+            session_id: "sess-1".to_string(),
+            message: "Pick toppings".to_string(),
+            choices: vec![
+                "Cheese".to_string(),
+                "Olives".to_string(),
+                "Ham".to_string(),
+            ],
+            multi: true,
+            min_items: 1,
+            max_items: 2,
+            cursor: 0,
+            selected: vec![false, false, false],
+        }
+    }
+
+    #[test]
+    fn single_select_accept_content_uses_cursor_index() {
+        let mut e = single_elicitation();
+        e.cursor = 2;
+        let content = e.accept_content().expect("single select always valid");
+        assert_eq!(content, serde_json::json!({ "choice": "choice-2" }));
+    }
+
+    #[test]
+    fn single_select_is_always_valid_when_choices_present() {
+        let e = single_elicitation();
+        assert!(e.selection_valid());
+    }
+
+    #[test]
+    fn single_select_with_no_choices_is_invalid() {
+        let mut e = single_elicitation();
+        e.choices.clear();
+        assert!(!e.selection_valid());
+        assert!(e.accept_content().is_none());
+    }
+
+    #[test]
+    fn multi_select_requires_min_items() {
+        let e = multi_elicitation(); // min 1, nothing selected
+        assert!(!e.selection_valid());
+        assert!(e.accept_content().is_none());
+    }
+
+    #[test]
+    fn multi_select_rejects_over_max_items() {
+        let mut e = multi_elicitation(); // max 2
+        e.selected = vec![true, true, true]; // 3 selected
+        assert_eq!(e.selected_count(), 3);
+        assert!(!e.selection_valid());
+        assert!(e.accept_content().is_none());
+    }
+
+    #[test]
+    fn multi_select_accept_content_lists_checked_indices() {
+        let mut e = multi_elicitation();
+        e.selected = vec![true, false, true]; // indices 0 and 2
+        assert!(e.selection_valid());
+        let content = e.accept_content().expect("2 within 1..=2");
+        assert_eq!(
+            content,
+            serde_json::json!({ "choices": ["choice-0", "choice-2"] })
+        );
+    }
+
+    #[test]
+    fn elicitation_numeric_request_id_is_preserved() {
+        let e = multi_elicitation();
+        // Numeric ids must round-trip as numbers, not strings, so the
+        // daemon can match the response to its outbound request.
+        assert_eq!(e.request_id, serde_json::json!(42));
+    }
+
+    #[test]
+    fn set_and_take_pending_elicitation_round_trip() {
+        let mut s = state();
+        assert!(s.pending_elicitation().is_none());
+        s.set_pending_elicitation(single_elicitation());
+        assert!(s.pending_elicitation().is_some());
+        let taken = s.take_pending_elicitation().expect("was set");
+        assert_eq!(taken.message, "Pick a fruit");
+        assert!(s.pending_elicitation().is_none());
+    }
+
+    #[test]
+    fn reset_for_session_clears_pending_elicitation() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.reset_for_session("sess-2".to_string(), None);
+        assert!(
+            s.pending_elicitation().is_none(),
+            "a session switch must drop any stale elicitation modal"
+        );
+    }
+
+    // ── Inbound elicitation routing (ask_user intermittent-failure fix) ──
+
+    /// Build an inbound `elicitation/create` request for `session_id` with a
+    /// canonical single-select schema (the shape the daemon emits).
+    fn inbound_single_elicitation(id: &str, session_id: &str) -> crate::client::RpcInboundRequest {
+        crate::client::RpcInboundRequest {
+            id: serde_json::json!(id),
+            method: "elicitation/create".to_string(),
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "mode": "form",
+                "message": "Pick one",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "oneOf": [
+                                { "const": "choice-0", "title": "Yes" },
+                                { "const": "choice-1", "title": "No" }
+                            ]
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
+    fn test_chat() -> (Chat, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        (Chat::new(client, PaneKind::Chat), rx)
+    }
+
+    /// An elicitation whose session matches the active pane installs a modal
+    /// immediately and sends no response (the user answers it later).
+    #[tokio::test]
+    async fn elicitation_matching_active_session_installs_modal() {
+        let (mut chat, mut rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state())); // session_id = "sess-1"
+
+        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-1"));
+
+        // Modal installed.
+        match &chat.phase {
+            ChatPhase::Active(s) => assert!(
+                s.pending_elicitation().is_some(),
+                "matching-session elicitation must install a modal"
+            ),
+            _ => panic!("expected Active phase"),
+        }
+        // Nothing deferred, and no auto-response was written.
+        assert!(chat.deferred_elicitations.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "an installed elicitation must not be auto-answered"
+        );
+    }
+
+    /// An elicitation for a *different* session must NOT be auto-cancelled on
+    /// arrival — the pane may be mid-transition. It is deferred for retry.
+    #[tokio::test]
+    async fn elicitation_for_other_session_is_deferred_not_cancelled() {
+        let (mut chat, mut rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state())); // active = "sess-1"
+
+        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-OTHER"));
+
+        assert_eq!(
+            chat.deferred_elicitations.len(),
+            1,
+            "a non-matching elicitation must be deferred, not cancelled outright"
+        );
+        // Give the (non-)spawned responder a chance — nothing must be sent yet.
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a deferred elicitation must not be answered during its grace window"
+        );
+    }
+
+    /// A deferred elicitation installs as soon as its session becomes active.
+    #[tokio::test]
+    async fn deferred_elicitation_installs_once_session_becomes_active() {
+        let (mut chat, _rx) = test_chat();
+        // No active session yet (still picking an agent) → defer.
+        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-1"));
+        assert_eq!(chat.deferred_elicitations.len(), 1);
+
+        // Session comes up.
+        chat.phase = ChatPhase::Active(Box::new(state())); // "sess-1"
+        chat.drain_deferred_elicitations();
+
+        assert!(
+            chat.deferred_elicitations.is_empty(),
+            "the deferred elicitation must be consumed once installable"
+        );
+        match &chat.phase {
+            ChatPhase::Active(s) => assert!(s.pending_elicitation().is_some()),
+            _ => panic!("expected Active"),
+        }
+    }
+
+    /// A deferred elicitation whose grace window elapses without becoming
+    /// installable is answered `cancel` so the daemon's tool call unblocks.
+    #[tokio::test]
+    async fn expired_deferred_elicitation_is_cancelled() {
+        let (mut chat, mut rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state())); // active = "sess-1"
+
+        // Defer an elicitation for a session this pane will never own, with an
+        // already-expired arrival time.
+        chat.deferred_elicitations.push(DeferredInboundRequest {
+            req: inbound_single_elicitation("e1", "sess-GONE"),
+            first_seen: Instant::now() - (ELICITATION_ROUTE_GRACE + Duration::from_millis(1)),
+        });
+
+        chat.drain_deferred_elicitations();
+
+        assert!(
+            chat.deferred_elicitations.is_empty(),
+            "an expired deferral must be dropped from the retry buffer"
+        );
+        // A `{"action":"cancel"}` response must have been written.
+        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expired deferral must emit a cancel response")
+            .expect("writer channel open");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["id"], serde_json::json!("e1"));
+        assert_eq!(frame["result"]["action"], "cancel");
+    }
+
+    /// An unparseable elicitation (unknown schema) is cancelled immediately —
+    /// deferring it would never succeed.
+    #[tokio::test]
+    async fn unparseable_elicitation_is_cancelled_immediately() {
+        let (mut chat, mut rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        let mut req = inbound_single_elicitation("e1", "sess-1");
+        // Corrupt the schema so `ElicitationShape::from_schema` returns None.
+        req.params["requestedSchema"] = serde_json::json!({ "type": "object" });
+
+        chat.route_inbound_elicitation(req);
+
+        assert!(
+            chat.deferred_elicitations.is_empty(),
+            "an unparseable elicitation must not be deferred"
+        );
+        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("unparseable elicitation must emit a cancel response")
+            .expect("writer channel open");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["result"]["action"], "cancel");
     }
 }

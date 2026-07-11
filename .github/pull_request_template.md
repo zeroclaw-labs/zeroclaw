@@ -1,7 +1,7 @@
 ## Summary
 
 - **Base branch:** `master` (all contributions)
-- **What changed and why:** (2–5 bullets — the diff shows *what*, you explain *why*)
+- **What changed and why:** (2 to 5 bullets; the diff shows *what*, you explain *why*)
 - **Scope boundary:** (what this PR explicitly does NOT change)
 - **Blast radius:** (what other subsystems or consumers could be affected)
 - **Linked issue(s):** Use plain text outside backticks. Use `Closes #`,
@@ -11,11 +11,24 @@
   example `type:docs`, `risk:low`, `size:S`, `docs`. During label-spelling
   migration, copy the exact live label spelling from the GitHub UI.
 
-## Validation Evidence (required)
+## Testing (required)
 
-Local validation is the signal CI cannot replace. Run the full battery and paste literal output (tails, failures, warnings — not "all passed").
+### How you can test
 
-```bash
+Written for a human reviewer to run by hand, not for CI. Frame it A/B: the same steps should show the old behavior on `master` and the new behavior on this branch, so the reviewer can see the delta themselves.
+
+- **Reviewer testing requested?** (`Yes` / `N/A`; if `N/A`, one line why, e.g. docs-only, pure refactor)
+- **Interface(s) exercised:** Name the surface(s) this touches using the same vocabulary the attribution span records: `surface` (`web` / `tui` / `cli`) and `channel` for messaging surfaces. Match the live attribution values; do not invent interface names.
+- **Setup / preconditions:** (config, provider, channel, or state needed first)
+- **Steps to run:** (the exact click-through or command sequence)
+- **Expected on this branch (after):** (what the reviewer should observe if it works)
+- **Prior behavior on `master` (before):** (run the same steps unpatched; what breaks or is missing, so the fix is visible)
+
+### How I tested
+
+Local validation is the signal CI cannot replace. Run the full battery and paste literal output (tails, failures, warnings, not "all passed").
+
+```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
@@ -24,12 +37,12 @@ cargo test
 Docs-only changes: replace with markdown lint + link-integrity (`scripts/ci/docs_quality_gate.sh`). Bootstrap scripts: add `bash -n install.sh`.
 
 - **Commands run and tail output:**
-- **Beyond CI — what did you manually verify?** (scenarios, edge cases, what you did NOT verify)
+- **Beyond CI, what did you manually verify?** (functional scenarios, edge cases, and any security-relevant behavior; also what you did NOT verify)
 - **If any command was intentionally skipped, why:**
 
 ## Security & Privacy Impact (required)
 
-Yes/No for each. Answer any `Yes` with a 1–2 sentence explanation.
+Yes/No for each. Answer any `Yes` with a 1-2 sentence risk-and-mitigation note. Manual verification of these scenarios goes under `### How I tested`, not here.
 
 - New permissions, capabilities, or file system access scope? (`Yes/No`)
 - New external network calls? (`Yes/No`)

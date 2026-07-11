@@ -81,11 +81,17 @@ pub fn with_ephemeral_workspace_warning(text: &str) -> String {
 }
 
 /// Description of a tool for the LLM
+///
+/// `parameters` is `Arc`-shared: tool specs are reassembled every agent-loop
+/// iteration and re-emitted on every provider request, so the schema tree is
+/// handed out by reference count instead of deep-cloned (#8642). Serde's `rc`
+/// feature serializes `Arc<T>` exactly as `T`, so the wire format is
+/// unchanged; deserializing produces a fresh allocation per spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    pub parameters: serde_json::Value,
+    pub parameters: std::sync::Arc<serde_json::Value>,
 }
 
 /// Core tool trait — implement for any capability.
@@ -111,11 +117,15 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
     /// Get the full spec for LLM registration
+    ///
+    /// Tools that store a large schema should override this to hand out an
+    /// `Arc::clone` of the stored tree instead of rebuilding it per call
+    /// (see `McpToolWrapper`).
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),
             description: self.description().to_string(),
-            parameters: self.parameters_schema(),
+            parameters: std::sync::Arc::new(self.parameters_schema()),
         }
     }
 }
@@ -123,6 +133,30 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8642 wire-format guarantee: `Arc`-shared parameters must serialize
+    /// byte-identically to a plain `Value`, and deserialize back losslessly.
+    #[test]
+    fn tool_spec_arc_parameters_serialize_transparently() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        });
+        let spec = ToolSpec {
+            name: "shell".to_string(),
+            description: "Run commands".to_string(),
+            parameters: std::sync::Arc::new(schema.clone()),
+        };
+        let arc_params = serde_json::to_string(&spec.parameters).expect("arc serializes");
+        let plain_params = serde_json::to_string(&schema).expect("plain value serializes");
+        assert_eq!(arc_params, plain_params);
+
+        let arc_json = serde_json::to_string(&spec).expect("spec serializes");
+        let back: ToolSpec = serde_json::from_str(&arc_json).expect("spec deserializes");
+        assert_eq!(back.name, spec.name);
+        assert_eq!(*back.parameters, *spec.parameters);
+    }
 
     #[test]
     fn ephemeral_warning_names_cause_and_fix() {

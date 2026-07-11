@@ -162,6 +162,14 @@ pub struct PeerGroupConfig {
     /// agent always reply and deliver proactive messages (cron, announces)
     /// as TTS voice notes on channels that support audio output.
     pub output_modality: OutputModality,
+    /// When `true`, members of this peer group are authorized to issue
+    /// `/model --agent <model>` on the agent this group is bound to.
+    /// Default `false` (deny-by-default). The runtime resolves this live
+    /// from `Config::peer_groups` at command-dispatch time via
+    /// `Config::channel_agent_scope_admins`; no cache, no per-channel
+    /// duplicate sender list. See issue #8044.
+    #[serde(default)]
+    pub admin_for_agent_scope: bool,
 }
 
 /// `[a2a.server]` — inbound A2A discovery server.
@@ -421,7 +429,6 @@ output_modality = "voice"
         assert_eq!(with_voice.output_modality, OutputModality::Voice);
         assert_eq!(with_voice.external_peers[0].as_str(), "@alice");
 
-        // Omitting the field falls back to mirror (current behavior).
         let defaulted: PeerGroupConfig = toml::from_str(r#"channel = "telegram""#).unwrap();
         assert_eq!(defaulted.output_modality, OutputModality::Mirror);
     }

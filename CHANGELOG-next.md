@@ -101,6 +101,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Per-sender `/thinking` overrides restored (#8011).
 - Re-loadable media refs preserved in cached history (#8153).
 - `refreshed_new_session_system_prompt` loads bundled skills (#8203).
+- **ACP elicitation (multiple-choice)**: agent-driven `ask_user` and `poll` calls now use the ACP [`elicitation/create`](https://agentclientprotocol.com/protocol/schema) method (form mode, enum schema) when the client advertises `elicitation.form` in `initialize.clientCapabilities`. Clients that don't yet advertise the capability keep using the existing `session/request_permission` path with no behaviour change. The Zerocode TUI advertises the capability, and its Code tab renders an interactive single-/multi-select modal (↑/↓ to move, Space to toggle for multi-select, Enter to confirm, Esc to cancel) that answers the daemon over the same `elicitation/create` wire format — making the Code tab a strict superset of the external ACP channel. Note that multiple-choice elicitation is currently a draft in the ACP spec and no external editor (Zed included) implements the client half yet, so the external-channel path is exercised today only by the Zerocode Code tab. Free-form text and URL mode are not implemented and remain follow-up work.
 
 ## Web and Dashboard
 
@@ -115,6 +116,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Registry-driven pane help, themed code-fence syntax highlighting, per-fence copy, and unified split-pane config navigation (#8282).
 - Daemon version mismatch detection (#8192).
 - MCP initialized for Chat TUI sessions (#8199).
+- Deferred MCP tools are now advertised in the Chat TUI system prompt so the agent knows `tool_search` exists and can discover MCP tools (#8193).
 - Active config directory surfaced in the Config header (#7999).
 - Approval overlay background filled (#7823).
 - Queue-paused hint skipped when the backlog is empty (#7857).
@@ -146,6 +148,8 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 
 | Area | Fix |
 |---|---|
+| zerocode | Context usage meter now reads the runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`) instead of the provider model-window helper, so the Zerocode context bar and gateway WS `done.max_context_tokens` reflect the configured budget rather than freezing at the 32k default when no provider `context_window` is set |
+| daemon | Back off exponentially when a supervised component exits immediately, and trim glibc arenas between restarts, to stop the WSL2 restart-storm OOM (#5542) |
 | config | Gate Android shell import on non-Windows (#8189) |
 | tools | Normalize Windows workspace-prefixed paths (#8114) |
 | tools | Resolve external coding tool `working_directory` from project root (#7967) |
@@ -169,6 +173,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 | web_fetch | `allowed_private_hosts = ["*"]` covers DNS-resolved private hosts (#7412) |
 | skills | Correct the "ClawhHub" typo in skill installer messages (#8262) |
 | docker | Keep Node base policy in container TOML (#8112); correct Node 24 digest pins (#7932); drop stale aardvark-sys build.rs COPY (#8092) |
+| zerocode/elicitation | Fix intermittent `ask_user`/`poll` failures under ACP elicitation: defer (rather than immediately cancel) an inbound `elicitation/create` whose session is mid resume/reset/switch, and surface — instead of silently dropping — a lagged inbound-request broadcast so a prompt can no longer hang the daemon's tool call until the session timeout |
 
 ## Docs
 

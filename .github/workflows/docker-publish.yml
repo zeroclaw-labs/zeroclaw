@@ -5,6 +5,10 @@ name: Docker Publish
 # dev/ci/docker-tags.toml; this workflow consumes it so published tags can never
 # drift from the spec. Each entry produces an immutable version-pinned tag
 # (Alpine-style `<stem>-v<version>`) and a floating tag (`<stem>`).
+#
+# Images are pushed with the canonical platform matrix first, signed by digest,
+# then the pinned tag is scanned in report-only mode (exit-code: 0). Enforcement
+# flips in a follow-up after the baseline is triaged.
 
 on:
   push:
@@ -18,7 +22,8 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
+  # OIDC, package write, and security-events permissions are granted only to
+  # the jobs that need them.
 
 env:
   REGISTRY: ghcr.io
@@ -42,9 +47,14 @@ jobs:
 
   publish:
     name: Build & push ${{ matrix.stem }}
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     needs: [matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for keyless cosign OIDC signing of container images
     strategy:
       fail-fast: false
       matrix:
@@ -59,15 +69,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Build and push pinned + floating tags
+        id: build-push
         uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          # Platforms are resolved per tag from the generated matrix: Dockerfile
+          # tags build amd64+arm64 (the Dockerfile cross-compiles to arm64 on the
+          # native amd64 builder), Containerfile tags stay amd64-only.
+          platforms: ${{ matrix.platforms }}
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
           tags: |

@@ -690,6 +690,33 @@ export async function putPersonalityFile(
 
 // ── Skills (api_skills.rs) ───────────────────────────────────────────
 
+/** A predefined choice for a typed slash option. Only meaningful for
+ *  string/integer/number options; `value` is kept as text and coerced to the
+ *  option's type by the channel. Mirrors the runtime `SkillSlashChoice`. */
+export interface SkillSlashChoice {
+  name: string;
+  value: string;
+}
+
+/** A typed option a `slash`-tagged skill exposes on its slash command. Mirrors
+ *  the runtime `SkillSlashOption` (SKILL.md `slash_options:` /
+ *  SKILL.toml `[[skill.slash_options]]`), shaped after Discord's application
+ *  command option model. `type` is one of `string | integer | number |
+ *  boolean | user | channel | role | mentionable`; unknown values are dropped
+ *  by the channel. `choices` apply to string/integer/number; `min`/`max` to
+ *  integer/number; `min_length`/`max_length` to string. */
+export interface SkillSlashOption {
+  name: string;
+  description: string;
+  type: string;
+  required?: boolean;
+  choices?: SkillSlashChoice[];
+  min?: number | null;
+  max?: number | null;
+  min_length?: number | null;
+  max_length?: number | null;
+}
+
 export interface SkillFrontmatter {
   name: string;
   description: string;
@@ -700,6 +727,10 @@ export interface SkillFrontmatter {
   /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
    *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
   tags?: string[];
+  /** Typed slash-command options (zeroclaw-labs/zeroclaw#8021). Only meaningful
+   *  with the `slash` tag; edited by the bespoke editor in SkillsBundleEditor.
+   *  Omitted by the backend when empty. */
+  slash_options?: SkillSlashOption[];
 }
 
 export interface SkillBundleEntry {
@@ -727,6 +758,35 @@ export interface SkillDocument {
 export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
 
 /**
+ * A lower-precedence same-name skill that a winning skill shadowed (it did
+ * not load). `origin` is the loser's origin tag (e.g. `"bundle"`).
+ */
+export interface ShadowedSkillEntry {
+  name: string;
+  origin: string;
+}
+
+/**
+ * A candidate skill the audited resolver dropped (failed its security audit,
+ * was unauditable, or its manifest failed to parse). Surfaced so operators
+ * can tell "no skills configured" apart from "all skills failed audit".
+ */
+export interface DroppedSkillEntry {
+  name: string;
+  origin: string;
+  /** Stable machine-readable reason tag. */
+  reason_kind:
+    | "audit_findings"
+    | "audit_error"
+    | "manifest_parse_error"
+    | string;
+  /** Human-readable detail (the audit summary / error text). */
+  reason: string;
+  /** On-disk directory of the dropped skill, when known. */
+  directory?: string | null;
+}
+
+/**
  * One skill in an agent's EFFECTIVE skill set, as resolved by the runtime
  * (not just the configured bundles). Returned by {@link listAgentSkills}.
  */
@@ -743,6 +803,8 @@ export interface AgentSkillEntry {
   /** True only when `origin === 'bundle'` — i.e. the skill is editable via
    *  the bundle endpoints and can be expanded for detail. */
   editable: boolean;
+  /** Lower-precedence same-name skills this one shadows. Empty normally. */
+  shadowed?: ShadowedSkillEntry[];
 }
 
 export interface SkillCreateRequest {
@@ -754,6 +816,21 @@ export interface SkillCreateRequest {
 
 export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
   return apiFetch("/api/skills/bundles");
+}
+
+/** One kind's capability row from the backend slash-option kind registry. The
+ *  editor walks these rather than hardcoding the kind list or which constraints
+ *  each kind carries. Sourced from the generated OpenAPI schema, which is built
+ *  by walking the backend `SlashOptionKind` enum. */
+export type SlashOptionKindDescriptor =
+  components["schemas"]["SlashOptionKindDescriptor"];
+
+/** Fetch the canonical typed-slash-option kind registry (kind list + per-kind
+ *  choice/numeric-bound/length-bound capabilities). */
+export function listSlashOptionKinds(): Promise<{
+  kinds: SlashOptionKindDescriptor[];
+}> {
+  return apiFetch("/api/skills/slash-option-kinds");
 }
 
 export function listSkillsInBundle(
@@ -770,7 +847,11 @@ export function listSkillsInBundle(
  */
 export function listAgentSkills(
   alias: string,
-): Promise<{ agent: string; skills: AgentSkillEntry[] }> {
+): Promise<{
+  agent: string;
+  skills: AgentSkillEntry[];
+  dropped?: DroppedSkillEntry[];
+}> {
   return apiFetch(`/api/agents/${encodeURIComponent(alias)}/skills`);
 }
 
@@ -988,6 +1069,43 @@ export function objectArrayElementProps(
     });
   }
   return out;
+}
+
+/** Read the backend-stamped `x-required-by-transport` metadata off the
+ *  `McpServerConfig` schema (a `mcp.servers.<name>` map value). The backend
+ *  derives this map from `McpTransport::required_leaf`, the same relationship
+ *  `validate_mcp_config` enforces, so the form classifies a transport's
+ *  required leaf by reading the registry rather than re-encoding the enum.
+ *  Returns `null` when the path doesn't resolve or the backend predates the
+ *  extension, in which case callers leave required-ness unclassified. */
+export function mcpRequiredByTransport(
+  schema: JsonSchema,
+): Record<string, string> | null {
+  if (!schema) return null;
+  // Walk root -> mcp -> servers (a map whose value type is McpServerConfig).
+  let cur: unknown = schema;
+  for (const seg of ["mcp", "servers"]) {
+    cur = unwrapOptional(resolveRef(cur, schema));
+    if (!cur || typeof cur !== "object") return null;
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    if (!props || !Object.prototype.hasOwnProperty.call(props, seg)) return null;
+    cur = props[seg];
+  }
+  // `cur` is the servers map; its value type (McpServerConfig) carries the
+  // extension, reachable through `additionalProperties`.
+  cur = unwrapOptional(resolveRef(cur, schema));
+  if (!cur || typeof cur !== "object") return null;
+  const additional = (cur as { additionalProperties?: unknown })
+    .additionalProperties;
+  const serverDef = unwrapOptional(resolveRef(additional, schema));
+  if (!serverDef || typeof serverDef !== "object") return null;
+  const raw = (serverDef as Record<string, unknown>)["x-required-by-transport"];
+  if (!raw || typeof raw !== "object") return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k.toLowerCase()] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export function descriptionForPath(
@@ -1701,6 +1819,7 @@ export function addCronJob(body: {
   allowed_tools?: string[];
   enabled?: boolean;
   delivery?: CronDelivery;
+  uses_memory?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
     method: "POST",
@@ -1755,6 +1874,7 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    uses_memory?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(

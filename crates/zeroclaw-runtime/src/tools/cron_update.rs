@@ -67,7 +67,7 @@ impl Tool for CronUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)"
+        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.). Accepts job name or ID — no need to call cron_list first."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -76,7 +76,7 @@ impl Tool for CronUpdateTool {
             "properties": {
                 "job_id": {
                     "type": "string",
-                    "description": "ID of the cron job to update, as returned by cron_add or cron_list"
+                    "description": "ID or name of the cron job to update. Accepts either the UUID returned by cron_add/cron_list or the human-readable job name (case-insensitive). No need to call cron_list first."
                 },
                 "patch": {
                     "type": "object",
@@ -115,6 +115,11 @@ impl Tool for CronUpdateTool {
                         "delete_after_run": {
                             "type": "boolean",
                             "description": "If true, delete the job automatically after its first successful run"
+                        },
+                        "uses_memory": {
+                            "type": "boolean",
+                            "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs.",
+                            "default": true
                         },
                         // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
                         // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
@@ -202,7 +207,7 @@ impl Tool for CronUpdateTool {
             });
         }
 
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
+        let raw_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {
                 return Ok(ToolResult {
@@ -212,6 +217,19 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+
+        let job_id_owned =
+            match cron::resolve_job_id_or_name(&self.config, raw_id, &self.agent_alias) {
+                Ok(id) => id,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            };
+        let job_id = job_id_owned.as_str();
 
         let patch_val = match args.get("patch") {
             Some(v) => v.clone(),
@@ -638,6 +656,9 @@ mod tests {
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(channel_strs.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
         assert!(channel_strs.contains(&"dingtalk"));
+        assert!(channel_strs.contains(&"wechat"));
+        assert!(channel_strs.contains(&"signal"));
+        assert!(channel_strs.contains(&"email"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks
         // back to the originating conversation.
@@ -752,6 +773,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into()]),
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -790,6 +812,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -807,5 +830,52 @@ mod tests {
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             Some(vec!["file_read".into(), "web_search".into()])
         );
+    }
+
+    #[tokio::test]
+    async fn accepts_job_name_without_prior_cron_list() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        cron::add_shell_job(
+            &cfg,
+            TEST_AGENT,
+            Some("morning_briefing".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 7 * * 1-5".into(),
+                tz: None,
+            },
+            "echo ok",
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": "morning_briefing",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("\"enabled\": false"));
+    }
+
+    #[tokio::test]
+    async fn errors_on_unknown_name() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": "no_such_job",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("no_such_job"),);
     }
 }

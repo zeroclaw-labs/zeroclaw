@@ -93,8 +93,9 @@ jobs:
             exit 1
           fi
           if ! git ls-remote --exit-code --tags "$REPO_URL" "refs/tags/${PTR_TAG}" >/dev/null 2>&1; then
-            echo "::error::stable pointer names '${PTR_TAG}' but that git tag does not exist. Cut and push the release tag (which deploys its docs) before flipping the pointer."
-            exit 1
+            echo "::warning::stable pointer names '${PTR_TAG}' but that git tag does not exist yet. This is expected when the version bump that flips the pointer lands on master before the release tag is cut from that same commit. The pointer target is verified at deploy time, when the tag's docs dir must be present on gh-pages."
+          else
+            echo "Stable pointer tag '${PTR_TAG}' exists."
           fi
           if ! git ls-remote --exit-code "$REPO_URL" "refs/heads/gh-pages" >/dev/null 2>&1; then
             echo "gh-pages does not exist yet; pointer target presence is checked at deploy time."
@@ -288,8 +289,26 @@ jobs:
             # regress the live pointer (same hazard as _shared below). master is
             # the single writer; tag deploys leave the existing gh-pages pointer
             # untouched so the version it names keeps resolving and survives prune.
+            #
+            # Flip is deferred until the target version dir is present on gh-pages.
+            # A version bump lands on master before the release tag is cut from
+            # that same commit, so the master bump deploy runs while /vX.Y.Z/ does
+            # not yet exist. Publishing the bumped pointer then would name a
+            # missing dir and trip the deploy-time guard below, failing the bump
+            # deploy. Instead, only publish the bumped pointer once its dir exists;
+            # otherwise retain whatever pointer is already live so the prior stable
+            # keeps resolving. The tag deploy creates /vX.Y.Z/ (tags never write
+            # the pointer), and the next master deploy then publishes the flip
+            # deterministically. This makes the bump deploy succeed unconditionally
+            # and gives a rerun a real recovery path: once the dir exists, the flip
+            # is published rather than caught as an error.
             if [ "$TAG" = "master" ] && [ -f "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" ]; then
-              cp "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" stable-version.txt
+              NEW_PTR="$(tr -d '[:space:]' < "${GITHUB_WORKSPACE}/docs/book/stable-version.txt")"
+              if [ -z "$NEW_PTR" ] || [ -d "$NEW_PTR" ]; then
+                cp "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" stable-version.txt
+              else
+                echo "::notice::stable pointer wants '${NEW_PTR}' but its version dir is not on gh-pages yet; retaining current pointer. The flip publishes on the next master deploy after '${NEW_PTR}' is deployed."
+              fi
             fi
 
             # Shared chrome (_shared/) is owned by master: every version's pages
@@ -323,9 +342,13 @@ jobs:
             $MDBOOK_XTASK retrofit-selector
             $MDBOOK_XTASK gen-root-index > index.html
 
-            # Guard: if a pointer is set but its version dir is absent, the root
-            # would silently redirect to /master/. Fail loudly instead. (Absent
-            # only when the release tag's deploy never landed its dir on gh-pages.)
+            # Guard: a published pointer must always name a present version dir,
+            # or the root would silently redirect to a missing path. The flip is
+            # now deferred above until the target dir exists, so a master deploy
+            # never writes a dangling pointer. This guard stays as a defense for
+            # the residual case: an already-live pointer on gh-pages whose dir was
+            # dropped by prune-versions this run. Fail loudly instead of shipping
+            # a broken root.
             # Use exit, not return: this function is invoked bare and inside the
             # retry `until` loop body, and bash suppresses errexit for commands in
             # a tested context, so a `return 1` could be swallowed and the broken

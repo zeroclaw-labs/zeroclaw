@@ -41,6 +41,7 @@ mod logs;
 mod mouse;
 mod quickstart_pane;
 mod theme;
+mod todo_tracker;
 mod turn_status;
 mod widgets;
 mod wire;

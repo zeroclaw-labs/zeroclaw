@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval::ApprovalManager;
 use crate::observability::{Observer, ObserverEvent};
-use crate::tools::Tool;
+use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::TurnEvent;
 
@@ -20,9 +20,68 @@ use super::turn::TurnMeta;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// If a just-completed tool call was a successful `TodoWrite`, build the
+/// corresponding `TurnEvent::Plan` from its arguments. Returns `None`
+/// for any other tool, a failed call, or arguments that fail to parse
+/// (defensive — a real failure would already have `success == false`).
+fn maybe_plan_event(
+    call_name: &str,
+    success: bool,
+    call_arguments: &serde_json::Value,
+) -> Option<zeroclaw_api::agent::TurnEvent> {
+    if call_name != "TodoWrite" || !success {
+        return None;
+    }
+    let entries = crate::tools::todo_write::parse_entries(call_arguments).ok()?;
+    Some(zeroclaw_api::agent::TurnEvent::Plan { entries })
+}
+
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ToolDispatchContext<'a> {
+    pub tools_registry: &'a [Box<dyn Tool>],
+    pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    pub excluded_tools: &'a [String],
+}
+
+fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
+    let name = name.trim();
+    excluded_tools
+        .iter()
+        .any(|excluded| excluded.trim().eq_ignore_ascii_case(name))
+}
+
+fn unavailable_tool_outcome(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    duration: Duration,
+) -> ToolExecutionOutcome {
+    let reason = format!("Tool not available in this turn: {call_name}");
+    observer.record_event(&ObserverEvent::ToolCall {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        duration,
+        success: false,
+        arguments: Some(full_args.to_string()),
+        result: Some(scrub_credentials(&reason)),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+    ToolExecutionOutcome {
+        output: reason.clone(),
+        success: false,
+        error_reason: Some(reason),
+        duration,
+        receipt: None,
+    }
 }
 
 // ── Outcome ──────────────────────────────────────────────────────────────
@@ -46,8 +105,7 @@ pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
     tool_call_id: Option<&str>,
-    tools_registry: &[Box<dyn Tool>],
-    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    dispatch: ToolDispatchContext<'_>,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
@@ -72,9 +130,20 @@ pub(crate) async fn execute_one_tool(
     });
     let start = Instant::now();
 
-    let static_tool = find_tool(tools_registry, call_name);
+    if is_excluded_tool(call_name, dispatch.excluded_tools) {
+        return Ok(unavailable_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            start.elapsed(),
+        ));
+    }
+
+    let static_tool = find_tool(dispatch.tools_registry, call_name);
     let activated_arc = if static_tool.is_none() {
-        match activated_tools {
+        match dispatch.activated_tools {
             Some(at) => {
                 let activated_tools = match at.lock() {
                     Ok(guard) => guard,
@@ -125,6 +194,17 @@ pub(crate) async fn execute_one_tool(
             receipt: None,
         });
     };
+
+    if is_excluded_tool(tool.name(), dispatch.excluded_tools) {
+        return Ok(unavailable_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            start.elapsed(),
+        ));
+    }
 
     use ::zeroclaw_log::Instrument;
     let tool_span = ::zeroclaw_log::info_span!(
@@ -332,6 +412,16 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
+    // After the ToolResult card closes, publish the plan if this was a
+    // successful TodoWrite. Whole-list replace; parse failures are
+    // swallowed (the ToolResult already conveyed success/failure).
+    if let Some(tx) = event_tx
+        && let Ok(out) = &outcome
+        && let Some(plan_event) = maybe_plan_event(call_name, out.success, &call_arguments)
+    {
+        let _ = tx.send(plan_event).await;
+    }
+
     outcome
 }
 
@@ -373,8 +463,7 @@ pub fn should_execute_tools_in_parallel(
 /// already-closed `tool_call_id`. Non-cancellation errors still abort.
 pub(crate) async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
-    tools_registry: &[Box<dyn Tool>],
-    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    dispatch: ToolDispatchContext<'_>,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
@@ -388,8 +477,7 @@ pub(crate) async fn execute_tools_parallel(
                 &call.name,
                 call.arguments.clone(),
                 call.tool_call_id.as_deref(),
-                tools_registry,
-                activated_tools,
+                dispatch,
                 meta,
                 observer,
                 cancellation_token,
@@ -420,8 +508,7 @@ pub(crate) async fn execute_tools_parallel(
 /// that interrupts a running tool leaves that call's slot `None`.
 pub(crate) async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
-    tools_registry: &[Box<dyn Tool>],
-    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    dispatch: ToolDispatchContext<'_>,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
@@ -438,8 +525,7 @@ pub(crate) async fn execute_tools_sequential(
             &call.name,
             call.arguments.clone(),
             call.tool_call_id.as_deref(),
-            tools_registry,
-            activated_tools,
+            dispatch,
             meta,
             observer,
             cancellation_token,
@@ -461,7 +547,7 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
-    use super::execute_one_tool;
+    use super::{ToolDispatchContext, execute_one_tool};
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
@@ -567,8 +653,11 @@ mod tests {
             "docker-mcp__extract_text",
             serde_json::json!({}),
             None,
-            &[], // no static tools — force activated-tools path
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[], // no static tools - force activated-tools path
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &NoopObserver,
             None,
@@ -593,6 +682,51 @@ mod tests {
             1,
             "recovered activated tool should have been invoked exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_blocks_excluded_activated_suffix_resolution() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let meta = crate::agent::turn::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let excluded = vec!["docker-mcp__extract_text".to_string()];
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({}),
+            Some("call-1"),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &excluded,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("excluded activated tool should return an unavailable outcome");
+
+        assert!(!outcome.success);
+        assert_eq!(
+            outcome.output,
+            "Tool not available in this turn: extract_text"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
     // Pinned regression for the `tool_search` branch of
@@ -798,5 +932,55 @@ mod tests {
             should_execute_tools_in_parallel(&batch, None),
             "no approval manager + non-tool_search batch must run in parallel"
         );
+    }
+
+    // ── Plan emission tests ────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod plan_emission_tests {
+        use super::super::maybe_plan_event;
+        use serde_json::json;
+
+        #[test]
+        fn plan_event_built_for_successful_todowrite() {
+            let args = json!({ "todos": [ { "content": "A", "status": "pending" } ] });
+            let ev = maybe_plan_event("TodoWrite", true, &args);
+            match ev {
+                Some(zeroclaw_api::agent::TurnEvent::Plan { entries }) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].content, "A");
+                }
+                _ => panic!("expected a Plan event"),
+            }
+        }
+
+        #[test]
+        fn no_plan_event_for_other_tools() {
+            let args = json!({ "todos": [ { "content": "A", "status": "pending" } ] });
+            assert!(maybe_plan_event("shell", true, &args).is_none());
+        }
+
+        #[test]
+        fn no_plan_event_for_failed_todowrite() {
+            let args = json!({ "todos": [ { "content": "A", "status": "pending" } ] });
+            assert!(maybe_plan_event("TodoWrite", false, &args).is_none());
+        }
+
+        #[test]
+        fn no_plan_event_for_unparseable_todowrite_args() {
+            let args = json!({ "todos": [ { "status": "pending" } ] });
+            assert!(maybe_plan_event("TodoWrite", true, &args).is_none());
+        }
+
+        #[test]
+        fn empty_list_produces_clear_plan_event() {
+            let args = json!({ "todos": [] });
+            match maybe_plan_event("TodoWrite", true, &args) {
+                Some(zeroclaw_api::agent::TurnEvent::Plan { entries }) => {
+                    assert!(entries.is_empty());
+                }
+                _ => panic!("expected an empty Plan event (clear)"),
+            }
+        }
     }
 }
