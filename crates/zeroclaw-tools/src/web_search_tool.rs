@@ -1,4 +1,6 @@
-use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_search_provider};
+use super::web_search_provider_routing::{
+    SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
+};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -204,10 +206,10 @@ impl WebSearchTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "search_provider": "duckduckgo",
-                        "search_status": "blocked",
+                        "search_status": SearchStatus::Blocked.as_str(),
                         "http_status": status.as_u16(),
                     })),
-                format!("web_search: DuckDuckGo request blocked (http {status})")
+                "web_search provider request blocked"
             );
             if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
                 anyhow::bail!(message);
@@ -1044,14 +1046,15 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({
                 "search_provider": provider,
-                "search_status": "blocked",
+                "search_status": SearchStatus::Blocked.as_str(),
                 "http_status": status.as_u16(),
             })),
-        format!("web_search: {provider} request blocked (http {status})")
+        "web_search provider request blocked"
     );
     anyhow::Error::msg(format!(
-        "{provider} search failed (search_status=blocked, http={status}). \
-         Try a different provider (SearXNG, Brave, or Tavily)."
+        "{provider} search failed (search_status={}, http={status}). \
+         Try a different provider (SearXNG, Brave, or Tavily).",
+        SearchStatus::Blocked.as_str()
     ))
 }
 

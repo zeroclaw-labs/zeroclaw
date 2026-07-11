@@ -8,12 +8,7 @@ pub enum WebSearchProviderRoute {
     Bocha,
 }
 
-/// Structured search status: distinguishes "provider failure" from "no results".
-///
-/// The first slice (issue #5316) only fills `Blocked` on the HTTP failure
-/// path; `Timeout`/`Empty`/`ParseError` are reserved for later slices. The
-/// enum is defined once with all variants so later tasks can use it without
-/// changing every match site.
+/// Structured search status: distinguishes provider failure from a genuine empty result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStatus {
     Ok,
@@ -21,6 +16,19 @@ pub enum SearchStatus {
     Timeout,
     Empty,
     ParseError,
+}
+
+impl SearchStatus {
+    /// Stable lowercase wire string for log attrs and error-message tags.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Blocked => "blocked",
+            Self::Timeout => "timeout",
+            Self::Empty => "empty",
+            Self::ParseError => "parse_error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,14 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn search_status_variants_exist() {
-        // First slice uses Blocked primarily; the remaining variants are reserved
-        // for later slices (Empty detection, timeout classification) but must be
-        // defined in the first PR so later enum changes don't break match sites.
-        let _ = SearchStatus::Ok;
-        let _ = SearchStatus::Blocked;
-        let _ = SearchStatus::Timeout;
-        let _ = SearchStatus::Empty;
-        let _ = SearchStatus::ParseError;
+    fn search_status_as_str_returns_stable_wire_strings() {
+        // Log attrs and error-message tags depend on these exact lowercase
+        // strings — drifting one silently breaks agent routing heuristics.
+        assert_eq!(SearchStatus::Ok.as_str(), "ok");
+        assert_eq!(SearchStatus::Blocked.as_str(), "blocked");
+        assert_eq!(SearchStatus::Timeout.as_str(), "timeout");
+        assert_eq!(SearchStatus::Empty.as_str(), "empty");
+        assert_eq!(SearchStatus::ParseError.as_str(), "parse_error");
     }
 }
