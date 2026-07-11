@@ -1,0 +1,10 @@
+[package]
+name = "zeroclaw-commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared built-in slash command catalogue for ZeroClaw surfaces."
+publish = false
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive"] }

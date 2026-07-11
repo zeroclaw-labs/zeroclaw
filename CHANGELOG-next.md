@@ -146,6 +146,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 
 | Area | Fix |
 |---|---|
+| zerocode | Context usage meter now reads the runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`) instead of the provider model-window helper, so the Zerocode context bar and gateway WS `done.max_context_tokens` reflect the configured budget rather than freezing at the 32k default when no provider `context_window` is set |
 | daemon | Back off exponentially when a supervised component exits immediately, and trim glibc arenas between restarts, to stop the WSL2 restart-storm OOM (#5542) |
 | config | Gate Android shell import on non-Windows (#8189) |
 | tools | Normalize Windows workspace-prefixed paths (#8114) |
@@ -170,6 +171,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 | web_fetch | `allowed_private_hosts = ["*"]` covers DNS-resolved private hosts (#7412) |
 | skills | Correct the "ClawhHub" typo in skill installer messages (#8262) |
 | docker | Keep Node base policy in container TOML (#8112); correct Node 24 digest pins (#7932); drop stale aardvark-sys build.rs COPY (#8092) |
+| zerocode/elicitation | Fix intermittent `ask_user`/`poll` failures under ACP elicitation: defer (rather than immediately cancel) an inbound `elicitation/create` whose session is mid resume/reset/switch, and surface — instead of silently dropping — a lagged inbound-request broadcast so a prompt can no longer hang the daemon's tool call until the session timeout |
 
 ## Docs
 

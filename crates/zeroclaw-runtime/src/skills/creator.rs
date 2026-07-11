@@ -26,7 +26,6 @@ use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ModelProvider};
 use zeroclaw_config::schema::SkillCreationConfig;
 use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
-use zeroclaw_providers::ProviderDispatch;
 
 use super::document::SkillDocument;
 
@@ -225,34 +224,30 @@ impl SkillCreator {
         model: &str,
     ) -> Result<String> {
         let prompt = self.build_reflection_prompt(slug, task_description, tool_calls, final_answer);
-        // Fail closed before spending a provider call when the parent turn's
-        // cost budget is already exhausted. No-op when unscoped (e.g. tests that
-        // drive reflection without a `TOOL_LOOP_COST_TRACKING_CONTEXT` scope).
-        crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
-        // Route through the structured dispatch path (rather than the bare
-        // `chat_with_system`) so the returned token usage can be recorded
-        // against the same cost tracker as the main tool loop.
         let messages = [
             ChatMessage::system(REFLECTION_SYSTEM_PROMPT),
             ChatMessage::user(prompt),
         ];
-        let resp = ProviderDispatch::from_ref(model_provider)
-            .chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                model,
-                None,
-            )
+        // One-shot metered query through the shared provider seam: budget-gate,
+        // attribution-preserving dispatch, and cost recording against the same
+        // tracker as the main tool loop, so the returned token usage is charged
+        // like an in-loop call. temperature None: reflection is deterministic.
+        // Metering is a no-op when unscoped (e.g. tests without a
+        // `TOOL_LOOP_COST_TRACKING_CONTEXT`).
+        let access = crate::agent::loop_::ResolvedModelAccess {
+            model_provider,
+            provider_name,
+            model,
+            temperature: None,
+        };
+        let resp = access
+            .run_model_query(ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            })
             .await
             .context("reflection provider call failed")?;
-        // Record spend before output validation, so a malformed reflected body
-        // that falls back to SKILL.toml still counts the provider usage.
-        if let Some(usage) = resp.usage.as_ref() {
-            crate::agent::cost::record_tool_loop_cost_usage(provider_name, model, usage);
-        }
         let raw = resp.text.unwrap_or_default();
         Self::normalize_reflected_md(slug, &raw)
     }
