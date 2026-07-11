@@ -116,6 +116,11 @@ impl Tool for CronUpdateTool {
                             "type": "boolean",
                             "description": "If true, delete the job automatically after its first successful run"
                         },
+                        "uses_memory": {
+                            "type": "boolean",
+                            "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs.",
+                            "default": true
+                        },
                         // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
                         // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
                         // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
@@ -768,6 +773,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into()]),
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -806,6 +812,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
