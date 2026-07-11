@@ -16,6 +16,32 @@ pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
+/// Stable, non-sensitive lifecycle labels that channels may render while a
+/// turn is running. The enum deliberately carries no tool names, arguments,
+/// prompts, provider output, or error details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressEvent {
+    Received,
+    Planning,
+    WaitingOnModel,
+    RunningTool,
+    CompactingContext,
+    FinalizingResponse,
+}
+
+impl ProgressEvent {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Received => "Received",
+            Self::Planning => "Planning",
+            Self::WaitingOnModel => "Waiting on model",
+            Self::RunningTool => "Running tool",
+            Self::CompactingContext => "Compacting context",
+            Self::FinalizingResponse => "Finalizing response",
+        }
+    }
+}
+
 /// Delta sent from the agent loop to the channel's draft updater.
 /// Append-only — no clear/reset variant exists by design.
 #[derive(Debug, Clone)]
@@ -24,6 +50,16 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+}
+
+/// Send a stable lifecycle label through the existing draft stream without
+/// exposing tool names, arguments, prompts, provider output, or error details.
+pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
+    if let Some(tx) = on_delta {
+        let _ = tx
+            .send(StreamDelta::Status(event.label().to_string()))
+            .await;
+    }
 }
 
 /// Backwards-compatible alias while callers are migrated.
@@ -139,6 +175,33 @@ pub(crate) async fn emit_posthoc_turn_chunk(event_tx: Option<&Sender<TurnEvent>>
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn progress_event_labels_are_stable_and_non_sensitive() {
+        let labels = [
+            ProgressEvent::Received,
+            ProgressEvent::Planning,
+            ProgressEvent::WaitingOnModel,
+            ProgressEvent::RunningTool,
+            ProgressEvent::CompactingContext,
+            ProgressEvent::FinalizingResponse,
+        ]
+        .map(ProgressEvent::label);
+
+        assert_eq!(
+            labels,
+            [
+                "Received",
+                "Planning",
+                "Waiting on model",
+                "Running tool",
+                "Compacting context",
+                "Finalizing response",
+            ]
+        );
+        assert!(labels.iter().all(|label| !label.contains("shell")));
+        assert!(labels.iter().all(|label| !label.contains("command")));
+    }
 
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {
         ParsedToolCall {

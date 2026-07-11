@@ -76,7 +76,7 @@ pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, StreamDelta};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
@@ -756,6 +756,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &e,
                     iteration,
                     event_tx.as_ref(),
+                    on_delta.as_ref(),
                     observer,
                     context_token_budget,
                 )

@@ -2,7 +2,7 @@
 //! streaming/non-streaming chat dispatch.
 
 use super::context::TurnCtx;
-use super::events::StreamDelta;
+use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
@@ -50,6 +50,7 @@ pub(crate) async fn announce_llm_request(
     iteration: usize,
 ) -> Instant {
     // ── Progress: LLM thinking ────────────────────────────
+    send_progress(ctx.on_delta, ProgressEvent::WaitingOnModel).await;
     if let Some(tx) = ctx.on_delta {
         let phase = if iteration == 0 {
             "\u{1f914} Thinking...\n".to_string()

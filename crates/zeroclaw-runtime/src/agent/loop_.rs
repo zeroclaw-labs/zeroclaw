@@ -1003,9 +1003,10 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    PROGRESS_MIN_INTERVAL_MS, ProgressEvent, ResolvedAgentExecution, ResolvedIo,
+    ResolvedModelAccess, ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled,
+    drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop,
+    scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
