@@ -7,6 +7,7 @@ import {
   layoutGeometry,
   getGraphLegend,
   indexLegend,
+  indexLegendLabels,
   CANONICAL_LAYOUT_GEOMETRY,
   type RunStateTone,
   type WireTone,
@@ -128,30 +129,72 @@ function switchPortLaneBottom(ruleCount: number): number {
 }
 
 const DATA_PIN_GAP = 16;
-// Data-pin lane top depends on whether the node has a switch-port lane above it,
-// so pins always land below the flow (and switch) handles with a divider gap.
-function dataPinTop(ruleCount: number): number {
-  return switchPortLaneBottom(ruleCount) + 8;
+// Output data pins share the right edge with switch ports, so they land below
+// the switch-port lane. Input data pins share the left edge with only the
+// inbound flow handles, so they anchor just under the inbound flow lane and do
+// not inherit the right-side switch-port offset.
+function dataPinTop(side: 'inputs' | 'outputs', ruleCount: number): number {
+  return side === 'inputs' ? FLOW_LANE_BOTTOM + 8 : switchPortLaneBottom(ruleCount) + 8;
 }
-function dataPinY(nodeY: number, index: number, ruleCount: number): number {
-  return nodeY + dataPinTop(ruleCount) + index * DATA_PIN_GAP;
+function dataPinY(
+  nodeY: number,
+  side: 'inputs' | 'outputs',
+  index: number,
+  ruleCount: number,
+): number {
+  return nodeY + dataPinTop(side, ruleCount) + index * DATA_PIN_GAP;
 }
 
 function dataPins(node: GraphNode, side: 'inputs' | 'outputs'): GraphPin[] {
   return node[side].filter((p) => p.class === 'data');
 }
 
-function nodeHeight(node: GraphNode, ruleCount: number): number {
-  const pinRows = Math.max(dataPins(node, 'inputs').length, dataPins(node, 'outputs').length);
-  const bottom =
-    pinRows > 0
-      ? dataPinTop(ruleCount) + pinRows * DATA_PIN_GAP + 6
-      : switchPortLaneBottom(ruleCount) + 6;
-  return Math.max(NODE_H, bottom);
+function contentBottom(node: GraphNode, ruleCount: number): number {
+  const inputs = dataPins(node, 'inputs').length;
+  const outputs = dataPins(node, 'outputs').length;
+  const inputBottom = inputs > 0 ? dataPinTop('inputs', ruleCount) + (inputs - 1) * DATA_PIN_GAP + 6 : 0;
+  const outputBottom =
+    outputs > 0 ? dataPinTop('outputs', ruleCount) + (outputs - 1) * DATA_PIN_GAP + 6 : 0;
+  const switchBottom = ruleCount > 0 ? switchPortLaneBottom(ruleCount) + 6 : 0;
+  const flowBottom = flowLaneY(0, 'dependency') + 8;
+  return Math.max(inputBottom, outputBottom, switchBottom, flowBottom);
+}
+
+const TOOLS_BAR_H = 22;
+
+function toolsBarTop(node: GraphNode, ruleCount: number): number {
+  return contentBottom(node, ruleCount) + 4;
+}
+
+function nodeHeight(node: GraphNode, ruleCount: number, expandedRows: number): number {
+  const barBlock = TOOLS_BAR_H + (expandedRows > 0 ? expandedRows * 16 + 8 : 0);
+  return toolsBarTop(node, ruleCount) + barBlock + 6;
 }
 
 function dataTypesCompatible(from: string | null, to: string | null): boolean {
   return from === null || to === null || from === to;
+}
+
+function argsEntries(args: unknown): [string, string][] {
+  if (args === null || args === undefined) return [];
+  if (typeof args === 'object' && !Array.isArray(args)) {
+    return Object.entries(args as Record<string, unknown>).map(([k, v]) => {
+      let val: string;
+      try {
+        val = typeof v === 'string' ? v : JSON.stringify(v);
+      } catch {
+        val = String(v);
+      }
+      return [k, val.length > 32 ? `${val.slice(0, 32)}…` : val];
+    });
+  }
+  let s: string;
+  try {
+    s = typeof args === 'string' ? args : JSON.stringify(args);
+  } catch {
+    return [];
+  }
+  return s ? [['', s.length > 40 ? `${s.slice(0, 40)}…` : s]] : [];
 }
 
 function flowOutY(nodeY: number, kind: FlowRole): number | undefined {
@@ -312,6 +355,7 @@ export default function SopCanvas({
   const [cursor, setCursor] = useState<XY | null>(null);
   const [hoverWire, setHoverWire] = useState<number | null>(null);
   const [menu, setMenu] = useState<ContextMenu | null>(null);
+  const [toolsOpen, setToolsOpen] = useState<Set<number>>(() => new Set());
   const svgRef = useRef<SVGSVGElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
@@ -335,7 +379,10 @@ export default function SopCanvas({
   }, []);
 
   const flowRoleDesc = useMemo(() => indexLegend(legend?.flow_roles), [legend]);
+  const flowRoleLabel = useMemo(() => indexLegendLabels(legend?.flow_roles), [legend]);
+  const pinClassDesc = useMemo(() => indexLegend(legend?.pin_classes), [legend]);
   const runStateDesc = useMemo(() => indexLegend(legend?.run_states), [legend]);
+  const dataWireTitle = pinClassDesc.get('data') ?? t('sops.wire_kind_data');
 
   // Abandon an in-progress wire draw (flow or data) and clear the ghost line.
   const cancelLink = useCallback(() => {
@@ -357,11 +404,21 @@ export default function SopCanvas({
   }, [linkFrom, dataLink, cancelLink]);
 
   const handleTitle = useCallback(
-    (actionKey: string, role: FlowRole): string => {
+    (direction: 'out' | 'in', role: FlowRole): string => {
+      const label = flowRoleLabel.get(role) ?? role;
+      const chrome = (direction === 'out' ? t('sops.handle_out') : t('sops.handle_in')).replace(
+        '{label}',
+        label,
+      );
       const desc = flowRoleDesc.get(role);
-      return desc ? `${t(actionKey)} — ${desc}` : t(actionKey);
+      return desc ? `${chrome} — ${desc}` : chrome;
     },
-    [flowRoleDesc],
+    [flowRoleDesc, flowRoleLabel],
+  );
+
+  const roleLabel = useCallback(
+    (role: FlowRole): string => flowRoleLabel.get(role) ?? role,
+    [flowRoleLabel],
   );
 
   // Reseed from the backend layout when the projection changes, preserving any
@@ -534,7 +591,7 @@ export default function SopCanvas({
       <CanvasLegend legend={legend} />
       {linkFrom !== null || dataLink !== null ? (
         <div className="absolute left-2 top-2 z-10 rounded bg-pc-elevated px-2 py-1 text-xs text-pc-text">
-          {t('sops.linking')}: {dataLink !== null ? t('sops.wire_kind_data') : linkKind}.{' '}
+          {t('sops.linking')}: {dataLink !== null ? dataWireTitle : roleLabel(linkKind)}.{' '}
           {t('sops.link_hint')}
           <button
             type="button"
@@ -638,7 +695,7 @@ export default function SopCanvas({
             const portIndex = switchPortIndex(w);
             const srcY =
               portIndex !== undefined ? switchPortY(a.y, portIndex) : flowOutY(a.y, kind);
-            const dstY = kind === 'trigger' ? undefined : flowInY(b.y, kind);
+            const dstY = kind === 'trigger' ? flowInY(b.y, 'sequence') : flowInY(b.y, kind);
             const d = edgePath(a, b, srcY, dstY);
             const hovered = hoverWire === i;
             const wireLabel = kind === 'trigger' ? nodeByStep.get(w.from_step)?.subtitle : undefined;
@@ -678,10 +735,10 @@ export default function SopCanvas({
                   }}
                 >
                   {kind === 'trigger' ? (
-                    <title>{flowRoleDesc.get('trigger') ?? t('sops.wire_kind_trigger')}</title>
+                    <title>{flowRoleDesc.get('trigger') ?? roleLabel('trigger')}</title>
                   ) : (
                     <title>
-                      {flowRoleDesc.get(kind) ?? t(`sops.wire_kind_${kind}`)}
+                      {flowRoleDesc.get(kind) ?? roleLabel(kind)}
                       {readOnly ? '' : ` — ${t('sops.wire_delete_hint')}`}
                     </title>
                   )}
@@ -781,8 +838,8 @@ export default function SopCanvas({
             // otherwise anchor to the node's bare center and render as a
             // phantom pipe leaving from nowhere. Drop it instead.
             if (fromIdx < 0 || toIdx < 0) return null;
-            const srcY = dataPinY(a.y, fromIdx, rulesForStep(w.from_step));
-            const dstY = dataPinY(b.y, toIdx, rulesForStep(w.to_step));
+            const srcY = dataPinY(a.y, 'outputs', fromIdx, rulesForStep(w.from_step));
+            const dstY = dataPinY(b.y, 'inputs', toIdx, rulesForStep(w.to_step));
             const d = edgePath(a, b, srcY, dstY);
             const hovered = hoverWire === -(i + 1);
             return (
@@ -816,7 +873,7 @@ export default function SopCanvas({
                   }}
                 >
                   <title>
-                    {t('sops.wire_kind_data')}
+                    {dataWireTitle}
                     {readOnly ? '' : ` — ${t('sops.data_wire_delete_hint')}`}
                   </title>
                 </path>
@@ -858,7 +915,7 @@ export default function SopCanvas({
                 d={edgePath(
                   src,
                   { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 },
-                  idx >= 0 ? dataPinY(src.y, idx, rulesForStep(dataLink.step)) : undefined,
+                  idx >= 0 ? dataPinY(src.y, 'outputs', idx, rulesForStep(dataLink.step)) : undefined,
                 )}
                 fill="none"
                 stroke={WIRE_STROKE.data}
@@ -925,6 +982,16 @@ export default function SopCanvas({
     const isCheckpoint = step?.kind === 'checkpoint';
     const switchRules = step?.routing?.switch ?? [];
     const ruleCount = switchRules.length;
+    const allowedTools = step?.suggested_tools ?? [];
+    const plannedCalls = step?.calls ?? [];
+    const callArgRows = plannedCalls.map((c) => argsEntries(c.args));
+    const toolRows = allowedTools.length + plannedCalls.length;
+    const expandedRowCount =
+      allowedTools.length +
+      plannedCalls.length +
+      callArgRows.reduce((sum, rows) => sum + rows.length, 0);
+    const expanded = toolsOpen.has(node.step);
+    const expandedRows = expanded ? expandedRowCount : 0;
     return (
       <g
         key={node.step}
@@ -946,7 +1013,7 @@ export default function SopCanvas({
       >
         <rect
           width={NODE_W}
-          height={nodeHeight(node, ruleCount)}
+          height={nodeHeight(node, ruleCount, expandedRows)}
           rx={10}
           fill="var(--pc-bg-surface)"
           stroke={selected ? 'var(--pc-accent)' : nodeStateStroke(state)}
@@ -970,13 +1037,6 @@ export default function SopCanvas({
             ⋔ {t('sops.switch')}
           </text>
         ) : null}
-        <text x={12} y={46} fontSize="10" fill="var(--pc-text-muted)">
-          {step?.calls && step.calls.length > 0
-            ? `⚙ ${step.calls.length} ${t('sops.calls_chip')}`
-            : step?.suggested_tools && step.suggested_tools.length > 0
-              ? step.suggested_tools.slice(0, 3).join(', ')
-              : t('sops.no_tools')}
-        </text>
         {state ? (
           <text x={12} y={64} fontSize="10" fill={nodeStateStroke(state)}>
             {t(`sops.run_state.${state}`)}
@@ -996,8 +1056,11 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{handleTitle('sops.handle_failure', 'failure')}</title>
+              <title>{handleTitle('out', 'failure')}</title>
             </circle>
+            <text x={NODE_W + 9} y={flowLaneY(0, 'failure') + 3} fontSize="8" fill={wireStroke('failure')}>
+              {roleLabel('failure')}
+            </text>
             <circle
               cx={NODE_W}
               cy={flowLaneY(0, 'dependency')}
@@ -1009,8 +1072,11 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{handleTitle('sops.handle_dependency', 'dependency')}</title>
+              <title>{handleTitle('out', 'dependency')}</title>
             </circle>
+            <text x={NODE_W + 9} y={flowLaneY(0, 'dependency') + 3} fontSize="8" fill={wireStroke('dependency')}>
+              {roleLabel('dependency')}
+            </text>
             {switchRules.map((rule, ri) => (
               <g key={`port-${ri}`}>
                 <text
@@ -1034,7 +1100,7 @@ export default function SopCanvas({
                   className={readOnly ? '' : 'cursor-crosshair'}
                 >
                   <title>
-                    {handleTitle('sops.handle_switch', 'switch')}: {rule.name}
+                    {handleTitle('out', 'switch')}: {rule.name}
                   </title>
                 </circle>
               </g>
@@ -1053,8 +1119,11 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{handleTitle('sops.handle_sequence', 'sequence')}</title>
+              <title>{handleTitle('out', 'sequence')}</title>
             </circle>
+            <text x={NODE_W + 9} y={flowLaneY(0, 'sequence') + 3} fontSize="8" fill={wireStroke('sequence')}>
+              {roleLabel('sequence')}
+            </text>
             <circle
               cx={NODE_W}
               cy={flowLaneY(0, 'failure')}
@@ -1066,8 +1135,11 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{handleTitle('sops.handle_failure', 'failure')}</title>
+              <title>{handleTitle('out', 'failure')}</title>
             </circle>
+            <text x={NODE_W + 9} y={flowLaneY(0, 'failure') + 3} fontSize="8" fill={wireStroke('failure')}>
+              {roleLabel('failure')}
+            </text>
             <circle
               cx={NODE_W}
               cy={flowLaneY(0, 'dependency')}
@@ -1079,26 +1151,38 @@ export default function SopCanvas({
               }}
               className={readOnly ? '' : 'cursor-crosshair'}
             >
-              <title>{handleTitle('sops.handle_dependency', 'dependency')}</title>
+              <title>{handleTitle('out', 'dependency')}</title>
             </circle>
+            <text x={NODE_W + 9} y={flowLaneY(0, 'dependency') + 3} fontSize="8" fill={wireStroke('dependency')}>
+              {roleLabel('dependency')}
+            </text>
           </g>
         )}
         <circle cx={0} cy={flowLaneY(0, 'sequence')} r={5} fill={wireStroke('sequence')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
-          <title>{handleTitle('sops.handle_in_sequence', 'sequence')}</title>
+          <title>{handleTitle('in', 'sequence')}</title>
         </circle>
+        <text x={-9} y={flowLaneY(0, 'sequence') + 3} fontSize="8" textAnchor="end" fill={wireStroke('sequence')}>
+          {roleLabel('sequence')}
+        </text>
         <circle cx={0} cy={flowLaneY(0, 'failure')} r={4} fill={wireStroke('failure')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
-          <title>{handleTitle('sops.handle_in_failure', 'failure')}</title>
+          <title>{handleTitle('in', 'failure')}</title>
         </circle>
+        <text x={-9} y={flowLaneY(0, 'failure') + 3} fontSize="8" textAnchor="end" fill={wireStroke('failure')}>
+          {roleLabel('failure')}
+        </text>
         <circle cx={0} cy={flowLaneY(0, 'dependency')} r={4} fill={wireStroke('dependency')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
-          <title>{handleTitle('sops.handle_in_dependency', 'dependency')}</title>
+          <title>{handleTitle('in', 'dependency')}</title>
         </circle>
+        <text x={-9} y={flowLaneY(0, 'dependency') + 3} fontSize="8" textAnchor="end" fill={wireStroke('dependency')}>
+          {roleLabel('dependency')}
+        </text>
         {dataPins(node, 'inputs').map((pin, di) => {
           const active = dataLink !== null && dataTypesCompatible(dataLink.dataType, pin.data_type ?? null);
           return (
             <g key={`din-${pin.name}`}>
               <circle
                 cx={0}
-                cy={dataPinY(0, di, ruleCount)}
+                cy={dataPinY(0, 'inputs', di, ruleCount)}
                 r={5}
                 fill={active ? WIRE_STROKE.data : 'var(--pc-bg-surface)'}
                 stroke={WIRE_STROKE.data}
@@ -1121,7 +1205,7 @@ export default function SopCanvas({
                   {pin.required ? ` (${t('sops.pin_required')})` : ''}
                 </title>
               </circle>
-              <text x={10} y={dataPinY(0, di, ruleCount) + 3} fontSize="9" fill="var(--pc-text-muted)">
+              <text x={10} y={dataPinY(0, 'inputs', di, ruleCount) + 3} fontSize="9" fill="var(--pc-text-muted)">
                 {pin.name.slice(0, 18)}
               </text>
             </g>
@@ -1131,7 +1215,7 @@ export default function SopCanvas({
           <g key={`dout-${pin.name}`}>
             <circle
               cx={NODE_W}
-              cy={dataPinY(0, di, ruleCount)}
+              cy={dataPinY(0, 'outputs', di, ruleCount)}
               r={5}
               fill={WIRE_STROKE.data}
               onPointerDown={(e) => {
@@ -1144,11 +1228,76 @@ export default function SopCanvas({
                 {pin.name}: {pin.data_type ?? t('sops.pin_any')}
               </title>
             </circle>
-            <text x={NODE_W - 10} y={dataPinY(0, di, ruleCount) + 3} fontSize="9" textAnchor="end" fill="var(--pc-text-muted)">
+            <text x={NODE_W - 10} y={dataPinY(0, 'outputs', di, ruleCount) + 3} fontSize="9" textAnchor="end" fill="var(--pc-text-muted)">
               {pin.name.slice(0, 18)}
             </text>
           </g>
         ))}
+        <foreignObject
+          x={6}
+          y={toolsBarTop(node, ruleCount)}
+          width={NODE_W - 12}
+          height={nodeHeight(node, ruleCount, expandedRows) - toolsBarTop(node, ruleCount) - 4}
+        >
+          <div className="text-[10px] leading-tight text-pc-text-muted">
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setToolsOpen((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(node.step)) next.delete(node.step);
+                  else next.add(node.step);
+                  return next;
+                });
+              }}
+              className="flex w-full items-center gap-1 truncate text-left hover:text-pc-text"
+              title={t('sops.tools_accordion_hint')}
+            >
+              <span className="text-pc-text-muted">{expanded ? '▾' : '▸'}</span>
+              {toolRows === 0 ? (
+                <span>{t('sops.no_tools')}</span>
+              ) : (
+                <span className="truncate">
+                  {[...allowedTools, ...plannedCalls.map((c) => c.tool)].join(', ')}
+                </span>
+              )}
+            </button>
+            {expanded && toolRows > 0 ? (
+              <ul className="mt-1 space-y-0.5">
+                {allowedTools.map((name) => (
+                  <li key={`allow-${name}`} className="flex items-center gap-1 truncate">
+                    <span className="text-pc-accent-light">•</span>
+                    <span className="text-pc-text-secondary">{name}</span>
+                    <span className="text-pc-text-muted">— {t('sops.tool_allowed')}</span>
+                  </li>
+                ))}
+                {plannedCalls.map((call, ci) => {
+                  const argRows = callArgRows[ci] ?? [];
+                  return (
+                    <li key={`call-${ci}`}>
+                      <div className="flex items-center gap-1 truncate">
+                        <span className="text-pc-accent">⚙</span>
+                        <span className="text-pc-text-secondary">{call.tool}</span>
+                      </div>
+                      {argRows.length > 0 ? (
+                        <ul className="ml-3 space-y-0.5">
+                          {argRows.map(([k, v], ai) => (
+                            <li key={`arg-${ci}-${ai}`} className="flex items-center gap-1 truncate">
+                              {k ? <span className="text-pc-text-muted">{k}:</span> : null}
+                              <span className="truncate text-pc-text-secondary">{v}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : null}
+          </div>
+        </foreignObject>
       </g>
     );
   }

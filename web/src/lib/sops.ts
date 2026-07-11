@@ -128,6 +128,12 @@ export function indexLegend(entries: LegendEntry[] | undefined): Map<string, str
   return map;
 }
 
+export function indexLegendLabels(entries: LegendEntry[] | undefined): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const e of entries ?? []) map.set(e.key, e.label);
+  return map;
+}
+
 export function getSop(name: string): Promise<Sop> {
   return apiFetch<Sop>(`/api/sops/${encodeURIComponent(name)}/full`);
 }
