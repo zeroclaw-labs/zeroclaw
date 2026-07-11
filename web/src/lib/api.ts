@@ -12,6 +12,7 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  SessionStateResponse,
   TuiEntry,
 } from "../types/api";
 import type { components } from "./api-generated";
@@ -2043,6 +2044,13 @@ export function getSessionMessages(
 ): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+/** Resolve the canonical lifecycle state for a gateway chat session. */
+export function getSessionState(id: string): Promise<SessionStateResponse> {
+  return apiFetch<SessionStateResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/state`,
   );
 }
 

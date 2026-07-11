@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, listProps, getStatus, getSessionMessages, getSessionState, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -83,6 +83,7 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
+const SESSION_RECOVERY_POLL_MS = 500;
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -122,6 +123,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
+  const [socketGeneration, setSocketGeneration] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
@@ -134,6 +136,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
+  const recoveryGenerationRef = useRef(0);
+  const recoveryVerifiedRef = useRef(false);
   const localMessageMutationVersionRef = useRef(0);
 
   // Prime the model-provider catalog once so error formatting can resolve
@@ -432,6 +436,87 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     }
   }, []);
 
+  // A reconnect can land while the prior connection's turn is still running.
+  // The gateway deliberately keeps that detached turn alive, so this freshly
+  // constructed socket's Agent was seeded before the final messages existed.
+  // Stay read-only until the canonical session state reaches idle, hydrate the
+  // committed transcript, then recycle the socket exactly once so its Agent is
+  // rebuilt from that completed history.
+  const recoverDetachedTurn = useCallback(async (wsVersion: number) => {
+    const recoveryGeneration = ++recoveryGenerationRef.current;
+    const isCurrent = () => (
+      wsVersion === wsVersionRef.current
+      && recoveryGeneration === recoveryGenerationRef.current
+    );
+
+    // Set this before the first await. React batches it with `connected=true`
+    // from onOpen, so a freshly remounted chat never exposes a writable input
+    // while its session-state request is still in flight.
+    setTyping(true);
+
+    let sessionState;
+    while (isCurrent()) {
+      try {
+        sessionState = await getSessionState(sessionIdRef.current);
+        break;
+      } catch {
+        // Lifecycle uncertainty is fail-closed. The endpoint returns idle for
+        // a genuinely new session, so errors here are transient/auth failures
+        // rather than evidence that it is safe to accept another prompt.
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, SESSION_RECOVERY_POLL_MS);
+        });
+      }
+    }
+    if (!sessionState || !isCurrent()) return;
+    if (sessionState.state === 'running') {
+      setPendingApproval(null);
+
+      while (isCurrent() && sessionState.state === 'running') {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, SESSION_RECOVERY_POLL_MS);
+        });
+        if (!isCurrent()) return;
+        try {
+          sessionState = await getSessionState(sessionIdRef.current);
+        } catch {
+          // Keep the UI read-only while lifecycle state is temporarily unknown.
+          continue;
+        }
+      }
+    }
+    if (!isCurrent()) return;
+
+    try {
+      const res = await getSessionMessages(sessionIdRef.current);
+      if (!isCurrent()) return;
+      if (res.session_persistence) {
+        localMessageMutationVersionRef.current += 1;
+        setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+      }
+    } catch {
+      // The turn is already complete. Keep the local transcript if history
+      // hydration is unavailable; the rebuilt socket still avoids sending a
+      // new prompt through the stale connection-scoped Agent.
+    }
+
+    pendingContentRef.current = '';
+    pendingThinkingRef.current = '';
+    capturedThinkingRef.current = '';
+    setStreamingContent('');
+    setStreamingThinking('');
+
+    if (isCurrent() && !recoveryVerifiedRef.current) {
+      // Keep typing=true across the recycle. The replacement socket will run
+      // this same state check and clear it only after confirming idle, so no
+      // prompt can slip through the stale Agent between hydration and cleanup.
+      recoveryVerifiedRef.current = true;
+      setSocketGeneration((generation) => generation + 1);
+    } else if (isCurrent()) {
+      setTyping(false);
+    }
+  }, []);
+
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: WebSocketClient) => {
     const version = ++wsVersionRef.current;
@@ -440,6 +525,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       if (version !== wsVersionRef.current) return;
       setConnected(true);
       setError(null);
+      void recoverDetachedTurn(version);
 
       // If we just reconnected after a model switch, apply the pending model now.
       if (pendingModelSwitchRef.current) {
@@ -461,6 +547,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // not survive the close.
       setPendingApproval(null);
       if (version !== wsVersionRef.current) return;
+      recoveryVerifiedRef.current = false;
       setConnected(false);
 
       if (pendingModelSwitchRef.current) {
@@ -494,7 +581,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       if (version !== wsVersionRef.current) return;
       handleWsMessage(msg);
     };
-  }, [handleWsMessage]);
+  }, [handleWsMessage, recoverDetachedTurn]);
 
   // WebSocket bound to the configured agent. Re-keys (via the outer
   // <AgentProvider key={alias}>) when the alias changes.
@@ -505,9 +592,17 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     wsRef.current = ws;
 
     return () => {
+      recoveryGenerationRef.current += 1;
+      // Socket-generation recovery deliberately replaces this connection.
+      // Detach callbacks before closing so its expected Close frame cannot
+      // reset `recoveryVerifiedRef` and trigger an infinite recycle loop.
+      ws.onOpen = null;
+      ws.onClose = null;
+      ws.onError = null;
+      ws.onMessage = null;
       ws.disconnect();
     };
-  }, [attachSocketCallbacks, agentAlias]);
+  }, [attachSocketCallbacks, agentAlias, socketGeneration]);
 
   // Fetch current model and available models from config.
   useEffect(() => {

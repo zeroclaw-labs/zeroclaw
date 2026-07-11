@@ -303,6 +303,14 @@ export interface SessionMessagesResponse {
   session_persistence: boolean;
 }
 
+export interface SessionStateResponse {
+  session_id: string;
+  state: 'idle' | 'running' | 'error';
+  session_persistence: boolean;
+  turn_id?: string;
+  turn_started_at?: string;
+}
+
 export interface TuiEntry {
   tui_id: string;
   connected_at: string;

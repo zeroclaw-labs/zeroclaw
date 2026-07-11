@@ -918,6 +918,24 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
+/// Fail closed when the WebSocket viewer can no longer answer supervised-mode
+/// tool prompts. Detaching the viewer must not cancel the whole turn, but it
+/// also must not leave an approval parked until its normal timeout or allow a
+/// later response from a dead connection to authorize the tool.
+fn deny_pending_ws_approvals(pending_approvals: &PendingApprovals) -> usize {
+    let pending: Vec<_> = pending_approvals.lock().drain().collect();
+    let count = pending.len();
+    for (_, response_tx) in pending {
+        let _ = response_tx.send(ChannelApprovalResponse::Deny);
+    }
+    count
+}
+
+fn detach_ws_viewer(client_attached: &mut bool, pending_approvals: &PendingApprovals) -> usize {
+    *client_attached = false;
+    deny_pending_ws_approvals(pending_approvals)
+}
+
 fn needs_onboarding_ws_error(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<serde_json::Value> {
@@ -1131,6 +1149,8 @@ async fn process_chat_message(
     // the timeout fired.
     let forward_fut = async {
         let mut cancel_drained = false;
+        let mut client_attached = true;
+        let mut approval_events_open = true;
         loop {
             tokio::select! {
                 biased;
@@ -1152,17 +1172,32 @@ async fn process_chat_message(
                     // a ToolLoopCancelled error which closes event_rx and
                     // breaks this loop on the `event_rx.recv()` arm below.
                 }
-                client_msg = receiver.next() => {
-                    // On client disconnect, `receiver.next()` returns `None`
-                    // (stream end) or `Err(_)` repeatedly. A bare `continue`
-                    // hot-loops the select; cancel the turn so `turn_fut`
-                    // resolves with `ToolLoopCancelled` and `tokio::join!`
-                    // below can return. See #6514.
+                client_msg = receiver.next(), if client_attached => {
+                    // A WebSocket is a viewer/controller for the turn, not its
+                    // owner. Route changes, browser sleep, and transient
+                    // network loss therefore detach the client without firing
+                    // the turn's cancellation token. Disable this select arm
+                    // after detach so a closed stream cannot recreate #6514's
+                    // immediately-ready hot loop; `event_rx` remains active and
+                    // is drained until the agent finishes naturally.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
+                            let denied =
+                                detach_ws_viewer(&mut client_attached, pending_approvals);
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "session_key": session_key,
+                                    "pending_approvals_denied": denied,
+                                })),
+                                "WebSocket viewer detached; agent turn continues"
+                            );
+                            continue;
                         }
                         _ => continue,
                     };
@@ -1236,14 +1271,26 @@ async fn process_chat_message(
                         _ => {}
                     }
                 }
-                approval = approval_event_rx.recv() => {
-                    let Some(event) = approval else { continue };
+                approval = approval_event_rx.recv(), if approval_events_open => {
+                    let Some(event) = approval else {
+                        // Disable a closed receiver: `recv()` would otherwise
+                        // remain immediately ready and starve `event_rx` in
+                        // this biased select while the turn winds down.
+                        approval_events_open = false;
+                        continue;
+                    };
                     if let TurnEvent::ApprovalRequest {
                         request_id,
                         tool_name,
                         arguments_summary,
                         timeout_secs,
                     } = event {
+                        if !client_attached {
+                            if let Some(tx) = pending_approvals.lock().remove(&request_id) {
+                                let _ = tx.send(ChannelApprovalResponse::Deny);
+                            }
+                            continue;
+                        }
                         let frame = serde_json::json!({
                             "type": "approval_request",
                             "request_id": request_id,
@@ -1251,7 +1298,9 @@ async fn process_chat_message(
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         });
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                            detach_ws_viewer(&mut client_attached, pending_approvals);
+                        }
                     }
                 }
                     event_opt = event_rx.recv() => {
@@ -1295,13 +1344,21 @@ async fn process_chat_message(
                             tool_name,
                             arguments_summary,
                             timeout_secs,
-                        } => serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        }),
+                        } => {
+                            if !client_attached {
+                                if let Some(tx) = pending_approvals.lock().remove(&request_id) {
+                                    let _ = tx.send(ChannelApprovalResponse::Deny);
+                                }
+                                continue;
+                            }
+                            serde_json::json!({
+                                "type": "approval_request",
+                                "request_id": request_id,
+                                "tool": tool_name,
+                                "arguments_summary": arguments_summary,
+                                "timeout_secs": timeout_secs,
+                            })
+                        }
                         TurnEvent::HistoryTrimmed {
                             dropped_messages,
                             kept_turns,
@@ -1317,7 +1374,14 @@ async fn process_chat_message(
                             "entries": entries,
                         }),
                     };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                    if client_attached
+                        && sender
+                            .send(Message::Text(ws_msg.to_string().into()))
+                            .await
+                            .is_err()
+                    {
+                        detach_ws_viewer(&mut client_attached, pending_approvals);
+                    }
                 }
             }
         }
@@ -2008,13 +2072,14 @@ mod tests {
         );
     }
 
-    // Regression for #6514. The mid-turn `client_msg` arm in `forward_fut`
-    // must (a) classify stream-end / close / error frames as "client gone"
-    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
-    // can return — a bare `continue` hot-loops the select forever.
+    // Regression for #6514 and #8559. The mid-turn `client_msg` arm in
+    // `forward_fut` must classify stream-end / close / error frames as a
+    // detach. The production arm then disables itself while continuing to
+    // drain turn events; a bare `continue` would hot-loop, while cancellation
+    // would incorrectly stop work merely because its viewer disappeared.
     #[derive(Debug, PartialEq, Eq)]
     enum DisconnectAction {
-        Break,
+        Detach,
         Continue,
         ProcessText,
     }
@@ -2025,22 +2090,22 @@ mod tests {
         use axum::extract::ws::Message;
         match msg {
             Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Detach,
             _ => DisconnectAction::Continue,
         }
     }
 
     #[test]
-    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
+    fn mid_turn_client_msg_detaches_on_stream_end_close_or_err() {
         use axum::extract::ws::Message;
-        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
+        assert_eq!(classify_client_msg(None), DisconnectAction::Detach);
         assert_eq!(
             classify_client_msg(Some(Ok(Message::Close(None)))),
-            DisconnectAction::Break,
+            DisconnectAction::Detach,
         );
         assert_eq!(
             classify_client_msg(Some(Err("io"))),
-            DisconnectAction::Break,
+            DisconnectAction::Detach,
         );
         assert_eq!(
             classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
@@ -2053,14 +2118,67 @@ mod tests {
     }
 
     #[test]
-    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
+    fn mid_turn_detach_does_not_cancel_the_turn() {
         let token = tokio_util::sync::CancellationToken::new();
         let clone_for_turn = token.clone();
+        let pending = new_pending_approvals();
+        let mut client_attached = true;
         assert!(!clone_for_turn.is_cancelled());
-        token.cancel();
+        let action = classify_client_msg(None);
+        assert_eq!(action, DisconnectAction::Detach);
+        detach_ws_viewer(&mut client_attached, &pending);
+        assert!(!client_attached);
         assert!(
-            clone_for_turn.is_cancelled(),
-            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
+            !clone_for_turn.is_cancelled(),
+            "transport detach must leave the turn's explicit cancellation token live"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_viewer_keeps_bounded_turn_events_draining() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let pending = new_pending_approvals();
+        let mut client_attached = true;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+
+        detach_ws_viewer(&mut client_attached, &pending);
+        let producer = zeroclaw_spawn::spawn!(async move {
+            event_tx.send("first").await.unwrap();
+            event_tx.send("second").await.unwrap();
+        });
+
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("detached forward path must keep draining until the producer closes");
+
+        producer.await.unwrap();
+        assert_eq!(drained, vec!["first", "second"]);
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn detached_viewer_denies_all_pending_approvals() {
+        let pending = new_pending_approvals();
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        pending.lock().insert("first".into(), first_tx);
+        pending.lock().insert("second".into(), second_tx);
+
+        assert_eq!(deny_pending_ws_approvals(&pending), 2);
+        assert!(pending.lock().is_empty());
+        assert_eq!(
+            first_rx.blocking_recv().unwrap(),
+            ChannelApprovalResponse::Deny
+        );
+        assert_eq!(
+            second_rx.blocking_recv().unwrap(),
+            ChannelApprovalResponse::Deny
         );
     }
 

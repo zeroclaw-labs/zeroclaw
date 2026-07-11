@@ -1817,20 +1817,32 @@ pub async fn handle_api_session_state(
         return e.into_response();
     }
 
+    let session_key = format!("gw_{id}");
+    let turn_is_live = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .contains_key(&session_key);
+
+    // Without a durable session backend, the existing cancellation-token map
+    // is still the process-local authority for whether a turn is live. Return
+    // that on-demand view so reconnecting clients can remain read-only until a
+    // detached turn finishes; do not invent a second session-state store.
     let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
+        return Json(serde_json::json!({
+            "session_id": id,
+            "state": if turn_is_live { "running" } else { "idle" },
+            "session_persistence": false,
+        }))
+        .into_response();
     };
 
-    let session_key = format!("gw_{id}");
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
                 "session_id": id,
                 "state": ss.state,
+                "session_persistence": true,
             });
             if let Some(turn_id) = ss.turn_id {
                 resp["turn_id"] = serde_json::Value::String(turn_id);
@@ -1840,11 +1852,17 @@ pub async fn handle_api_session_state(
             }
             Json(resp).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
+        // The state endpoint is intentionally total for an authenticated,
+        // well-formed session id. A missing durable row is a new/idle session
+        // unless its existing process-local turn token says otherwise. This
+        // lets the dashboard distinguish that normal case from a transient
+        // lookup failure without adding another lifecycle store.
+        Ok(None) => Json(serde_json::json!({
+            "session_id": id,
+            "state": if turn_is_live { "running" } else { "idle" },
+            "session_persistence": true,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
@@ -2183,6 +2201,59 @@ pub(crate) mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn session_state_without_persistence_is_derived_from_live_turn_token() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "detached-turn";
+        let session_key = format!("gw_{session_id}");
+
+        let idle = handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let idle = response_json(idle).await;
+        assert_eq!(idle["state"], "idle");
+        assert_eq!(idle["session_persistence"], false);
+
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(session_key, tokio_util::sync::CancellationToken::new());
+
+        let running =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let running = response_json(running).await;
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["session_persistence"], false);
+    }
+
+    #[tokio::test]
+    async fn explicit_session_abort_still_cancels_a_detached_turn() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "detached-abort";
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(format!("gw_{session_id}"), token.clone());
+
+        let response =
+            handle_api_session_abort(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(response["status"], "aborted");
+        assert!(token.is_cancelled());
     }
 
     #[test]
