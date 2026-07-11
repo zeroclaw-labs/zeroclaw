@@ -166,6 +166,7 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
                 mailbox_id,
                 phone_id,
                 agent_id,
+                None,
             )
             .with_context(|| format!("create Inkbox {event} subscription"))?;
         }
@@ -302,6 +303,7 @@ impl Channel for InkboxChannel {
                         None,
                         in_reply_to.as_deref(),
                         None,
+                        false,
                     )?;
                 }
                 ReplyRoute::Sms(id) => {

@@ -4788,9 +4788,9 @@ dependencies = [
 
 [[package]]
 name = "inkbox"
-version = "0.4.15"
+version = "0.4.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f1b6c42edf3613eb516afdd969ad3a66c6a59a098ff570dcb7375156755b907"
+checksum = "ba3098d3f69cd3743a5920011892ba68d85e88cf9ee2721911a66009ff272ec3"
 dependencies = [
  "aes-gcm",
  "argon2",

@@ -272,6 +272,7 @@ impl Tool for InkboxSendEmail {
                     bcc.as_deref(),
                     in_reply_to.as_deref(),
                     None,
+                    false,
                 )?;
                 Ok(serde_json::to_value(msg)?)
             })
