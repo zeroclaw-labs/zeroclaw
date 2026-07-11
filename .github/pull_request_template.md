@@ -15,7 +15,7 @@
 
 ### How you can test (when useful)
 
-Include this subsection when reviewer-run manual verification adds useful signal, especially for user-visible behavior, a non-obvious test path, or a named CI coverage gap. For docs-only, pure-refactor, or trivial changes without useful manual verification, set the first field to `N/A` with a one-line reason and remove the remaining prompts.
+Include this subsection when reviewer-run manual verification adds useful signal, especially for user-visible behavior, a non-obvious test path, or a named CI coverage gap. For changes without useful manual verification, including docs-only, pure-refactor, or trivial changes, set the first field to `N/A` with a one-line reason and remove the remaining prompts.
 
 When reviewer testing is requested, frame it A/B: the same steps should show the old behavior on `master` and the new behavior on this branch, so the reviewer can see the delta themselves.
 
@@ -39,7 +39,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Docs-only changes: replace with markdown lint + link-integrity (`scripts/ci/docs_quality_gate.sh`). Bootstrap scripts: add `bash -n install.sh`.
+Docs-only changes: replace with markdown lint (`scripts/ci/docs_quality_gate.sh`) and added-link integrity (`scripts/ci/docs_links_gate.sh`). Bootstrap scripts: add `bash -n install.sh`.
 
 - **CI checks relied on and why they cover this change:** (for example, `Docs Style` covers the changed Markdown lines)
 - **Known CI coverage gap, if any:** (for example, `None after the docs and links gates`)

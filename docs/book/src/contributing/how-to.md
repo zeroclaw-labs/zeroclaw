@@ -23,7 +23,7 @@ fork → branch → commit → push → open PR → review → merge (squash)
 
 The key checkpoints:
 
-- **PR template**: `.github/pull_request_template.md`. Fill it out. The summary, validation evidence, and compatibility sections are non-negotiable.
+- **PR template**: `.github/pull_request_template.md`. Fill it out. The summary, testing evidence, and compatibility sections are non-negotiable.
 - **CI**: runs on every PR. `ci.yml` is the composite gate; all legs must pass.
 - **Labels**: maintainers use labels to route review depth. You do not need to know every label family before opening a PR. If labels look obviously wrong and you cannot edit them, flag the mismatch in a comment; maintainers or reviewers with label permissions can correct obvious mismatches directly.
 - **Review routing**: make the scope, linked issues, validation, and risk/rollback context clear enough that reviewers can choose the right review path quickly.

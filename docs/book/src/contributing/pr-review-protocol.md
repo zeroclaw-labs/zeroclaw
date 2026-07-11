@@ -141,19 +141,19 @@ verdict:
 - Public text does not include bot/AI attribution footers, local workflow
   mechanics, private paths, unredacted sensitive logs, excessive raw logs,
   irrelevant dumps, or stale lifecycle wording. Concise, relevant command
-  output tails in Validation Evidence are expected when the template asks for
+  output tails in `How I tested` are expected when the template asks for
   them.
 
 ## Verdict decision tree
 
 | Situation | Verdict flag |
 |---|---|
-| Your review is approving, the template/truthfulness checks are satisfied, and active blocks are resolved, dismissed, stale, or explicitly reconciled in your review | `--approve` |
+| Your review is approving, the template/truthfulness checks are satisfied, and prior substantive concerns are resolved, dismissed, stale, or explicitly reconciled in your review | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
-| You have nothing new to block on but other reviewers hold active blocks | `--comment` |
+| You have nothing new to block on but other reviewers hold unresolved substantive concerns | `--comment` |
 | You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions | `--comment` |
 
-Do not ignore another reviewer's active `CHANGES_REQUESTED`. Before approving, check whether the concern is resolved in the current diff, stale, dismissed, or still valid. If you approve while an older block is still visible, explain why that concern has been resolved.
+Do not ignore another reviewer's visible `CHANGES_REQUESTED`. Before approving, check whether the underlying concern is resolved in the current diff, stale, dismissed, or still valid. A review state left on an older head is not automatically an unresolved concern. If you approve while that state is still visible, explain why the concern has been resolved; your approval does not clear the other review state for merge.
 
 ## Validation evidence gaps
 
