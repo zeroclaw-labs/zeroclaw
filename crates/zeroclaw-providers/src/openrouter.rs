@@ -1825,6 +1825,44 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // Regression for #8675: a malformed arguments string in the assistant
+        // history must be normalized to "{}" so the outbound chat-completions
+        // request doesn't 400 on strict upstreams. This test pins that the
+        // openrouter call site of `sanitize_tool_arguments` is wired in; the
+        // helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte so
+        // the openrouter call site cannot accidentally re-encode or strip
+        // good payloads.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),

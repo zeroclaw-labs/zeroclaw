@@ -111,11 +111,20 @@ pub enum AuthStyle {
 /// happens the whole turn fails with HTTP 400 and the user receives the
 /// generic fallback instead of the agent's response. #8675.
 ///
-/// Contract (kept identical to the existing in-line normalization in
-/// `ToolCall::into_provider_tool_call`):
+/// Contract:
 /// - empty / whitespace-only → `"{}"` (every upstream accepts this)
 /// - valid JSON → returned unchanged
-/// - invalid JSON → WARN-logged, then `"{}"`
+/// - invalid JSON → WARN-logged with **safe metadata only** (function name,
+///   payload length, stable error key), then `"{}"`. The raw arguments
+///   string is **never** recorded, because tool-call arguments can contain
+///   commands, URLs, credentials, file paths, or user content and WARN
+///   events enter the broadcast and rolling-persistence path regardless of
+///   the tool/LLM content-capture policy.
+///
+/// This is the single source of truth for the tool-call arguments
+/// normalization contract. The streaming accumulator's
+/// `StreamToolCallAccumulator::into_provider_tool_call` and all typed
+/// providers' outbound `convert_messages` paths route through here.
 pub fn sanitize_tool_arguments(function_name: &str, arguments: &str) -> String {
     if arguments.trim().is_empty() {
         return "{}".to_string();
@@ -127,7 +136,11 @@ pub fn sanitize_tool_arguments(function_name: &str, arguments: &str) -> String {
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"function": function_name, "arguments": arguments})),
+            .with_attrs(::serde_json::json!({
+                "function": function_name,
+                "payload_len": arguments.len(),
+                "error_key": "tool_args_invalid_json",
+            })),
         "Invalid JSON in tool-call arguments being sent to upstream provider, dropping to empty object"
     );
     "{}".to_string()
@@ -1410,24 +1423,11 @@ impl StreamToolCallAccumulator {
         used_tool_call_ids: &mut std::collections::HashSet<String>,
     ) -> Option<ProviderToolCall> {
         let name = self.name?;
-        let arguments = if self.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            self.arguments
-        };
-        let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok()
-        {
-            arguments
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"function": name, "arguments": arguments})),
-                "Invalid JSON in streamed native tool-call arguments, using empty object"
-            );
-            "{}".to_string()
-        };
+        // Route through the shared `sanitize_tool_arguments` helper so the
+        // normalization contract (empty/whitespace → "{}", invalid JSON →
+        // WARN + "{}", valid JSON → passthrough) has a single source of
+        // truth. #8675.
+        let normalized_arguments = sanitize_tool_arguments(&name, &self.arguments);
 
         Some(ProviderToolCall {
             id: reserve_tool_call_id_for_contract(
