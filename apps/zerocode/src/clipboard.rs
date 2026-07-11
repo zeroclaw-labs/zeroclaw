@@ -21,12 +21,16 @@ const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(80);
 /// Try to read image data from the system clipboard.
 ///
 /// Returns `Some((bytes, mime_type))` on success, `None` when the clipboard
-/// genuinely holds no image or no clipboard tool is available. An owner that
-/// advertises only text targets is not recoverable here and lands in `None`
-/// on the first probe, so a text-only clipboard does not pay the retry
-/// budget before the caller falls through to text paste.
+/// genuinely holds no image or no clipboard tool is available. A text-only
+/// clipboard does not pay the retry budget before the caller falls through to
+/// text paste: an enumerating owner that advertises only text targets lands in
+/// `None` on the first probe, and a non-enumerating tool (pngpaste, PowerShell)
+/// that reads nothing bails after its first read since the result cannot change
+/// across attempts. The retry window is spent only by enumerating tools racing
+/// a servable-target export.
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     let tool = which_clipboard_tool()?;
+    let can_enumerate = tool_can_enumerate(&tool);
 
     for attempt in 0..IMAGE_READ_ATTEMPTS {
         // Re-probe every attempt: the servable target set can change between
@@ -34,7 +38,7 @@ pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
         // cannot enumerate (pngpaste, PowerShell) this resolves to image/png,
         // which those tools always emit.
         let targets = image_targets_for_tool(&tool);
-        if targets.is_empty() && tool_can_enumerate(&tool) {
+        if targets.is_empty() && can_enumerate {
             // Enumerable owner is advertising no image target at all. Not a
             // servable-target race — a plain text-only clipboard. Return
             // immediately so the caller falls through to text paste without
@@ -48,6 +52,14 @@ pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
             {
                 return Some((bytes, mime_for_target(&target)));
             }
+        }
+        if !can_enumerate {
+            // Non-enumerating tools (pngpaste, PowerShell) return promptly and
+            // emit nothing for a text-only clipboard; the result will not
+            // change across attempts. Bail after the first read instead of
+            // paying the retry window on every ordinary text paste. The
+            // servable-target race only exists for enumerating tools.
+            return None;
         }
         if attempt + 1 < IMAGE_READ_ATTEMPTS {
             std::thread::sleep(IMAGE_READ_RETRY_DELAY);
