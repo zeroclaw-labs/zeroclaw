@@ -130,15 +130,7 @@ hermes = "none"
 openclaw = "none"
 hermes = "none"
 
-[channels.reddit]
-openclaw = "none"
-hermes = "none"
-
 [channels.bluesky]
-openclaw = "none"
-hermes = "none"
-
-[channels.twitter]
 openclaw = "none"
 hermes = "none"
 
