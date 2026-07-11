@@ -186,6 +186,17 @@ Together with a checkpoint they form a headless review pipeline:
 3. **Post** - kind: capability / capability: forge.comment
 ```
 
+**Where the adapters are wired.** The real adapters (`llm.generate`'s model
+provider, `forge.comment`'s git channel, and a checkpoint policy's out-of-band
+approval route) are injected only on the **daemon / channel-start** path, which
+is the only path with a configured channel map and model of record. Standalone
+agent runs and CLI SOP execution build the engine without them, so these
+capabilities and routes are **fail-closed** there: `llm.generate` /
+`forge.comment` report a clear "requires an injected adapter" failure rather than
+acting, and a checkpoint's route notice is a log-only no-op. This is the same
+fail-closed model as `shell.exec`; run a pipeline that needs these capabilities
+under the daemon.
+
 ### Step Contract Enforcement
 
 Step contracts are optional. When present, `input` and `output` accept a compact

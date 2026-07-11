@@ -267,22 +267,30 @@ impl SopEngine {
             ApprovalDecision::Deny { .. } => {}
         }
 
-        // Audit FIRST, fail-closed: the checkpoint cannot clear, re-draft, or
-        // cancel without its durable ledger row (same rule as the approval-gate
-        // chokepoint).
-        self.record_gate_event(GateLedgerEntry {
-            run_id: run_id.to_string(),
-            step,
-            kind: GateEventKind::Resolved,
-            decision: Some(decision.clone()),
-            principal: principal.clone(),
-            ts: now_iso8601(),
-        })
-        .map_err(|e| {
-            anyhow::Error::msg(format!(
-                "failed to persist checkpoint resolution ledger event (fail-closed): {e}"
-            ))
-        })?;
+        // Audit FIRST, fail-closed: the checkpoint cannot clear or cancel without
+        // its durable ledger row (same rule as the approval-gate chokepoint).
+        //
+        // Revise is the exception: its "apply" includes an irreducibly-fallible
+        // model call (the re-draft), so appending the resolved row HERE would
+        // leave a false `gate_resolved` row if that call fails. Its row is
+        // appended INSIDE `revise_checkpoint_draft` instead — only once the new
+        // draft exists and before the run is mutated — so a failed re-draft
+        // records nothing and leaves the old draft parked.
+        if !matches!(decision, ApprovalDecision::Revise { .. }) {
+            self.record_gate_event(GateLedgerEntry {
+                run_id: run_id.to_string(),
+                step,
+                kind: GateEventKind::Resolved,
+                decision: Some(decision.clone()),
+                principal: principal.clone(),
+                ts: now_iso8601(),
+            })
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "failed to persist checkpoint resolution ledger event (fail-closed): {e}"
+                ))
+            })?;
+        }
 
         match decision {
             ApprovalDecision::Approve => {
@@ -316,7 +324,7 @@ impl SopEngine {
                 ))
             }
             ApprovalDecision::Revise { guidance } => {
-                self.revise_checkpoint_draft(run_id, &guidance)?;
+                self.revise_checkpoint_draft(run_id, &guidance, &principal, step)?;
                 Ok(super::approval::BrokerOutcome::Resolved(
                     ResolveOutcome::Revised,
                 ))
@@ -2031,12 +2039,19 @@ impl SopEngine {
     }
 
     /// Re-run the checkpoint's predecessor `llm.generate` step with the operator's
-    /// guidance framed as reviewer feedback, replace the recorded draft, bump the
-    /// gate revision, and re-present the gate. The run never leaves
-    /// `PausedCheckpoint`: a failed re-draft keeps the OLD draft parked and
-    /// answerable. The model call blocks under the engine lock — the same
-    /// tradeoff as a normal `llm.generate` step.
-    fn revise_checkpoint_draft(&mut self, run_id: &str, guidance: &str) -> Result<()> {
+    /// guidance framed as reviewer feedback, record the resolved ledger row, then
+    /// replace the recorded draft, bump the gate revision, and re-present the gate.
+    /// The run never leaves `PausedCheckpoint`: a failed re-draft keeps the OLD
+    /// draft parked and answerable AND writes no ledger row (the audit records
+    /// only revises that actually happened). The model call blocks under the
+    /// engine lock — the same tradeoff as a normal `llm.generate` step.
+    fn revise_checkpoint_draft(
+        &mut self,
+        run_id: &str,
+        guidance: &str,
+        principal: &super::approval::ApprovalPrincipal,
+        checkpoint_step: u32,
+    ) -> Result<()> {
         let (_, sop) = self.resolve_active_run_sop(run_id)?;
         let pred_number = self.revisable_predecessor(run_id).ok_or_else(|| {
             anyhow::Error::msg(format!(
@@ -2103,6 +2118,28 @@ impl SopEngine {
                 bail!("Run {run_id} re-draft failed (previous draft kept): {e}");
             }
         };
+
+        // Audit-before-mutate: the model produced a valid new draft, so the
+        // revise DID happen — record it now, BEFORE any run mutation. A failed
+        // append leaves the old draft parked (no mutation yet) and releases the
+        // reacquired claim, exactly like a failed model call; it can never leave
+        // a false resolved row (the model-call failures above bailed with none).
+        if let Err(e) = self.record_gate_event(super::approval::GateLedgerEntry {
+            run_id: run_id.to_string(),
+            step: checkpoint_step,
+            kind: super::approval::GateEventKind::Resolved,
+            decision: Some(super::approval::ApprovalDecision::Revise {
+                guidance: guidance.to_string(),
+            }),
+            principal: principal.clone(),
+            ts: now_iso8601(),
+        }) {
+            self.release_claim_on_park(run_id);
+            return Err(anyhow::Error::msg(format!(
+                "Run {run_id} re-draft succeeded but its resolution ledger row could not \
+                 be persisted (fail-closed; previous draft kept): {e}"
+            )));
+        }
 
         {
             let run = self
@@ -8684,6 +8721,45 @@ type = "manual"
         }
     }
 
+    /// A stub `llm.generate` that succeeds on the FIRST draft (no
+    /// `revision_feedback`) but fails on the RE-draft — so the run reaches the
+    /// checkpoint normally, and only the Revise re-run models a provider outage.
+    struct FailsOnlyOnRevise;
+
+    impl super::super::capability::SopCapability for FailsOnlyOnRevise {
+        fn id(&self) -> &'static str {
+            "llm.generate"
+        }
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "stub llm.generate that fails only on re-draft",
+                deterministic: true,
+                idempotent: false,
+                reversible: true,
+                supports_retry: true,
+                required_permissions: vec![],
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: super::super::capability::CapabilityContext,
+            input: serde_json::Value,
+        ) -> Result<super::super::capability::CapabilityResult> {
+            if input.get("revision_feedback").is_some() {
+                Ok(super::super::capability::CapabilityResult::failure(
+                    "model provider unavailable",
+                ))
+            } else {
+                Ok(super::super::capability::CapabilityResult::success(
+                    serde_json::json!({"body": "original draft"}),
+                ))
+            }
+        }
+    }
+
     /// `capability(llm.generate stub) -> checkpoint`: the revisable review-gate
     /// shape, with the stub registered over the fail-closed builtin.
     fn revisable_checkpoint_engine(name: &str) -> SopEngine {
@@ -8693,6 +8769,77 @@ type = "manual"
         let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
         registry.register(StubLlmGenerate);
         engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry))
+    }
+
+    #[test]
+    fn failed_revise_writes_no_resolved_row_and_leaves_the_draft_unchanged() {
+        // Audacity88 blocking finding: the resolved ledger row must NOT be
+        // appended before the re-draft's (fallible) model call. A failed Revise
+        // must leave zero gate_resolved rows, the original draft parked, and the
+        // revision counter untouched — the run stays answerable.
+        let mut sop = capability_checkpoint_sop("cp-revise-fail");
+        sop.steps[0].capability = Some("llm.generate".into());
+        sop.steps.truncate(2);
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(FailsOnlyOnRevise);
+        let mut engine = engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry));
+
+        let first = engine.start_run("cp-revise-fail", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        let original_draft = engine
+            .get_run(&run_id)
+            .unwrap()
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .unwrap()
+            .output
+            .clone();
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            super::super::approval::ApprovalDecision::Revise {
+                guidance: "make it shorter".into(),
+            },
+            super::super::approval::ApprovalPrincipal::cli(None),
+        );
+        assert!(res.is_err(), "a failed re-draft must surface an error");
+
+        let run = engine.get_run(&run_id).expect("run stays parked");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert_eq!(
+            run.revision, 0,
+            "a failed revise must not bump the revision"
+        );
+        assert_eq!(
+            run.step_results
+                .iter()
+                .find(|r| r.step_number == 1)
+                .unwrap()
+                .output,
+            original_draft,
+            "the original draft must remain untouched"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().all(|ev| ev.kind != "gate_resolved"),
+            "a failed revise must leave NO gate_resolved ledger row: {events:?}"
+        );
+
+        // The gate is still answerable: the run must admit a fresh exec claim
+        // (a leaked claim from the failed revise would block this deny).
+        engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny { reason: None },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("the gate is still resolvable after a failed revise");
+        assert_eq!(
+            engine.last_finished_run("cp-revise-fail").unwrap().status,
+            SopRunStatus::Cancelled
+        );
     }
 
     #[test]
