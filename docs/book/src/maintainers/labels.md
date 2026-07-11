@@ -319,8 +319,8 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 
 This section is the canonical operational source for issue stale timing, qualifying activity, exclusions, and re-engagement. Other maintainer docs and skills should link here instead of copying these rules.
 
-- **Entry window:** Apply `status:stale` once 20 or more days have elapsed without qualifying activity.
-- **Response window:** Close only when 10 or more days have elapsed since `status:stale` was applied and no qualifying activity occurred afterward.
+- **Entry window:** Apply `status:stale` once 15 or more days have elapsed without qualifying activity.
+- **Response window:** Close only when 15 or more days have elapsed since `status:stale` was applied and no qualifying activity occurred afterward.
 - **Qualifying activity:** A substantive comment that demonstrates current relevance. It must confirm the issue on a current release or commit, explain why the issue is version-independent, or add useful evidence such as a reproduction, logs or error details, environment information, a concrete affected use case, regression confirmation, or a workaround. A generic `+1`, administrative comment, label change, bot event, or link event does not qualify.
 - **Exclusions:** Do not apply stale handling to `priority:p0`, `type:rfc`, `status:no-stale`, an issue with an open linked PR, an issue with 10 or more 👍 reactions on the opening post, or `status:blocked` while a recorded blocker remains unresolved. If an exclusion begins while an issue carries `status:stale`, remove the stale label. When the exclusion ends, restart the entry clock from that date.
 - **Re-engagement:** Remove `status:stale` when qualifying activity occurs after the label was applied or when the issue is reopened. Reset the clock from that activity or reopen date. After a stale closure, qualifying new evidence in a comment is grounds for a maintainer to reopen the issue and remove `status:stale`; the commenter may instead open a new issue with the updated context.
