@@ -1071,8 +1071,15 @@ impl ResponseMessage {
     /// `reasoning_content` is preserved separately in
     /// `ChatResponse.reasoning_content` for history round-tripping.
     ///
-    /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
-    /// inline in `content` instead of using a separate field.
+    /// Returns the `content` field as-is. Previously this stripped
+    /// `<think>...</think>` blocks that some reasoning models (e.g. MiniMax)
+    /// embedded inline in `content` instead of using a separate field, but
+    /// that unconditional rewrite silently mangled responses whose `content`
+    /// legitimately contained literal `<think>...</think>` markup (HTML, code
+    /// samples, quoted discussion of the tag itself, and unclosed tails).
+    /// Removed in #8615 — model providers that need inline think-block
+    /// filtering should do it downstream of this response shape, with full
+    /// visibility into the model's actual output.
     fn effective_content(&self) -> String {
         self.content
             .as_ref()
@@ -4628,14 +4635,18 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_literal_think_tags() {
-        // The compatible provider must not strip literal <thinking> tags
-        // from model output. See #8615.
-        let json = r#"{"choices":[{"message":{"content":"Here is the HTML: <thinking>internal note</thinking>"}}]}"#;
+        // #8615 — the deleted `strip_think_tags()` helper searched for the
+        // exact substring `<think>` / `</think>` and stripped those blocks
+        // unconditionally. This regression pins that literal `<think>` tags
+        // now round-trip byte-for-byte, including legitimate uses where the
+        // model legitimately discusses the tag (HTML sample, code quoting,
+        // meta-discussion).
+        let json = r#"{"choices":[{"message":{"content":"Here is the HTML: <think>internal note</think>"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(
             msg.effective_content(),
-            "Here is the HTML: <thinking>internal note</thinking>"
+            "Here is the HTML: <think>internal note</think>"
         );
     }
 
@@ -5417,33 +5428,48 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_unclosed_think_tag() {
-        // An unclosed <thinking> must NOT discard the rest of the response.
-        // See #8615.
-        let json = r#"{"choices":[{"message":{"content":"Visible <thinking>hidden tail"}}]}"#;
+        // #8615 — an unclosed literal `<think>` tag must NOT discard the
+        // rest of the response. The old `strip_think_tags()` helper saw no
+        // closing `</think>` and dropped the trailing tail ("Visible <think>"
+        // → "Visible"). The new path returns the input unchanged.
+        let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Visible <thinking>hidden tail");
+        assert_eq!(msg.effective_content(), "Visible <think>hidden tail");
     }
 
     #[test]
     fn effective_content_preserves_multiple_think_blocks() {
-        // Multiple <thinking> blocks in content must survive intact.
-        let json = r#"{"choices":[{"message":{"content":"Answer A <thinking>hidden 1</thinking> and B <thinking>hidden 2</thinking> done"}}]}"#;
+        // #8615 — multiple literal `<think>` blocks in `content` survive
+        // intact. The old `strip_think_tags()` helper would have collapsed
+        // the visible text to "Answer A  and B  done", losing the
+        // inter-block separators and the tag delimiters themselves.
+        let json = r#"{"choices":[{"message":{"content":"Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(
             msg.effective_content(),
-            "Answer A <thinking>hidden 1</thinking> and B <thinking>hidden 2</thinking> done"
+            "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"
         );
     }
     #[test]
     fn effective_content_preserves_think_tags_with_reasoning_content() {
-        // When both content and reasoning_content are present, the
-        // content with literal <thinking> tags is preserved.
-        let json = r#"{"choices":[{"message":{"content":"Visible <thinking>hidden tail"}}]}"#;
+        // #8615 — when both `content` and `reasoning_content` are present,
+        // the literal `<think>` blocks in `content` survive intact while
+        // `reasoning_content` is preserved separately and is NOT leaked
+        // into the response text.
+        let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail</think>","reasoning_content":"reasoning separately"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Visible <thinking>hidden tail");
+        assert_eq!(
+            msg.effective_content(),
+            "Visible <think>hidden tail</think>"
+        );
+        assert!(!msg.effective_content().contains("reasoning separately"));
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("reasoning separately")
+        );
     }
 
     // ----------------------------------------------------------
@@ -5494,15 +5520,20 @@ mod tests {
 
     #[test]
     fn reasoning_content_preserved_when_content_only_think_tags() {
-        // The compatible provider no longer strips <thinking> tags from
-        // content (see #8615), so literal <thinking> blocks are preserved
-        // in effective_content. reasoning_content is still preserved
-        // separately and not leaked into the response text.
-        let json = r#"{"choices":[{"message":{"content":"<thinking>secret</thinking>","reasoning_content":"Thinking text"}}]}"#;
+        // #8615 — the compatible provider no longer strips literal
+        // `<think>...</think>` blocks from `content`. Previously the
+        // `<think>secret</think>`-only content was collapsed to the empty
+        // string by `strip_think_tags()`, and `effective_content()` returned
+        // `""` so the visible-text field was effectively replaced by the
+        // model's chain-of-thought marker. Now the literal `<think>` tags
+        // round-trip into `effective_content()` byte-for-byte, and
+        // `reasoning_content` is still preserved separately and not leaked
+        // into the response text.
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Thinking text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert!(msg.effective_content().contains("secret"));
-        assert!(msg.effective_content().contains("thinking"));
+        assert!(msg.effective_content().contains("<think>"));
         assert!(msg.effective_content_optional().is_some());
         assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking text"));
     }
