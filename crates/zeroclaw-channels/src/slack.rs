@@ -493,7 +493,7 @@ impl SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/chat.postMessage")
+            .post(self.slack_api_url("chat.postMessage"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -523,17 +523,17 @@ impl SlackChannel {
         Ok(ts)
     }
 
+    fn active_assistant_thread_ts(&self, channel_id: &str) -> Option<String> {
+        self.active_assistant_thread
+            .lock()
+            .ok()
+            .and_then(|map| map.get(channel_id).cloned())
+    }
+
     /// Set the Assistants API status bar text for a channel's active thread.
     async fn set_assistant_status(&self, channel_id: &str, status: &str) {
-        let thread_ts = {
-            let map = match self.active_assistant_thread.lock() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            match map.get(channel_id) {
-                Some(ts) => ts.clone(),
-                None => return,
-            }
+        let Some(thread_ts) = self.active_assistant_thread_ts(channel_id) else {
+            return;
         };
 
         let body = serde_json::json!({
@@ -544,7 +544,7 @@ impl SlackChannel {
 
         let _ = self
             .http_client()
-            .post("https://slack.com/api/assistant.threads.setStatus")
+            .post(self.slack_api_url("assistant.threads.setStatus"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -839,7 +839,7 @@ impl SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/chat.update")
+            .post(self.slack_api_url("chat.update"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -4582,6 +4582,7 @@ impl Channel for SlackChannel {
         let client = self.http_client();
         let token = self.bot_token.clone();
         let channel = recipient.to_string();
+        let update_url = self.slack_api_url("chat.update");
         zeroclaw_spawn::spawn!(async move {
             let mut body = serde_json::json!({
                 "channel": channel,
@@ -4595,7 +4596,7 @@ impl Channel for SlackChannel {
                 }]);
             }
             match client
-                .post("https://slack.com/api/chat.update")
+                .post(update_url)
                 .bearer_auth(&token)
                 .json(&body)
                 .send()
@@ -4637,16 +4638,30 @@ impl Channel for SlackChannel {
     async fn update_draft_progress(
         &self,
         recipient: &str,
-        _message_id: &str,
+        message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
         let status_line = text.trim().lines().last().unwrap_or("").trim();
-        // Skip "Thinking..." — the typing indicator already conveys that.
-        // Only show tool-related progress in the status bar.
-        if status_line.is_empty() || status_line.starts_with("\u{1f914}") {
+        if status_line.is_empty() {
             return Ok(());
         }
-        self.set_assistant_status(recipient, status_line).await;
+
+        if self.active_assistant_thread_ts(recipient).is_some() {
+            // Skip "Thinking..." in assistant threads — the Slack status bar
+            // is reserved for concrete tool progress there.
+            if !status_line.starts_with("\u{1f914}") {
+                self.set_assistant_status(recipient, status_line).await;
+            }
+            return Ok(());
+        }
+
+        // Slack assistant-thread status is unavailable in ordinary IM/DM
+        // conversations. Surface the same ephemeral progress by editing the
+        // in-flight draft body; the final response later replaces it.
+        if !Self::is_group_channel_id(recipient) {
+            self.update_draft(recipient, message_id, status_line)
+                .await?;
+        }
         Ok(())
     }
 
@@ -4705,7 +4720,7 @@ impl Channel for SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/chat.update")
+            .post(self.slack_api_url("chat.update"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -6027,6 +6042,78 @@ mod tests {
         )
         .with_workspace_dir(workspace.to_path_buf())
         .with_api_base_url(server.uri())
+    }
+
+    fn test_streaming_slack_channel(
+        server: &wiremock::MockServer,
+        workspace: &Path,
+    ) -> SlackChannel {
+        test_slack_channel(server, workspace).with_streaming(true, 1)
+    }
+
+    #[tokio::test]
+    async fn update_draft_progress_in_dm_materializes_visible_draft_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = test_streaming_slack_channel(&server, tmp.path());
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "D123"))
+            .await
+            .unwrap()
+            .expect("streaming Slack returns a lazy draft id");
+
+        ch.update_draft_progress(
+            "D123",
+            &draft_id,
+            "⏳ shell: cargo test
+",
+        )
+        .await
+        .unwrap();
+        ch.finalize_draft("D123", &draft_id, "final answer", false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("progress should materialize the lazy draft in a DM");
+        let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(post_body["channel"], "D123");
+        assert_eq!(post_body["text"], "⏳ shell: cargo test");
+        assert!(post_body.get("thread_ts").is_none());
+
+        let update = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.update")
+            .expect("finalize should replace the progress draft with the final answer");
+        let update_body: serde_json::Value = serde_json::from_slice(&update.body).unwrap();
+        assert_eq!(update_body["channel"], "D123");
+        assert_eq!(update_body["ts"], "1710000000.000100");
+        assert_eq!(update_body["text"], "final answer");
     }
 
     #[tokio::test]
