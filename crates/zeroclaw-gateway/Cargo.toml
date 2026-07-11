@@ -80,6 +80,7 @@ rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
 
 [features]
 default = ["schema-export", "a2a"]

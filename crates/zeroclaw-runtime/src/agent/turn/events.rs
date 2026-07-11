@@ -155,6 +155,7 @@ mod tests {
             error_reason: None,
             duration: Duration::ZERO,
             receipt: None,
+            output_data: None,
         }
     }
 
@@ -242,6 +243,7 @@ mod tests {
             error_reason: None,
             duration: Duration::ZERO,
             receipt: None,
+            output_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;

@@ -90,6 +90,16 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
     Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
 }
 
+/// Truncate `line` in place to at most `cap` bytes, rounding the cut down to a
+/// UTF-8 char boundary. `String::truncate` panics when the byte index lands
+/// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
+/// is a latent panic (#7828). No-op when the string already fits.
+fn cap_line_utf8_safe(line: &mut String, cap: usize) {
+    if line.len() > cap {
+        line.truncate(line.floor_char_boundary(cap));
+    }
+}
+
 /// Discard bytes from `reader` until the next `\n` or EOF, using only
 /// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
 /// that `read_until(..., &mut Vec::new())` would incur on an oversized
@@ -311,7 +321,10 @@ fn pause_after_no_command_help() {
         .take((STDIN_LINE_CAP + 1) as u64)
         .read_line(&mut line);
     if line.len() > STDIN_LINE_CAP {
-        line.truncate(STDIN_LINE_CAP);
+        // Round down to a UTF-8 char boundary before truncating: a piped
+        // multi-byte payload can land the byte cap inside a character, and
+        // `String::truncate` panics on a non-boundary index (#7828).
+        cap_line_utf8_safe(&mut line, STDIN_LINE_CAP);
     }
 }
 
@@ -403,7 +416,7 @@ use config::Config;
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
     HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands,
+    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -2485,8 +2498,8 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = Config::map_key_sections()
         .into_iter()
-        .filter(|section| section.path.starts_with("providers."))
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
+        .filter(|section| !section.resource_key)
         .filter_map(|section| {
             let key = map_key_for_prop_path(section.path, prop_path)?;
             Some((section.path, key))
@@ -2496,10 +2509,37 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
-    let created = config
-        .create_map_key(section_path, key)
-        .map_err(anyhow::Error::msg)?;
+    // Route through the shared `create_map_key_checked` (not raw
+    // `create_map_key`) so this CLI path inherits the reserved `default`
+    // agent guard from the one place it's defined, rather than re-deriving
+    // `section == "agents" && is_reserved_agent_alias(key)` here too. Without
+    // this, widening past `providers.*` would let `config set
+    // agents.default.enabled ...` auto-create the reserved runtime-fallback
+    // agent alias, which the rename guard then refuses to ever rename.
+    let created =
+        match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
+            Ok(created) => created,
+            Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
+            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        };
     if created {
+        // The section matched and the alias was newly materialized, but the
+        // requested prop path might still not resolve (typo'd trailing field
+        // name, or belt-and-suspenders against a resource-key path that
+        // slipped past the `!resource_key` filter above). Roll back rather
+        // than leave a phantom alias, falling through to the normal
+        // "Unknown property" error exactly as before this alias existed.
+        //
+        // IMPORTANT: this probe/rollback must stay strictly inside the
+        // `if created` branch. `create_map_key` returns `Ok(false)` when the
+        // alias already existed (idempotent case) — never run this rollback
+        // when `created == false`, or a bogus tail-field on an
+        // ALREADY-EXISTING alias would delete a legitimate, pre-existing
+        // config entry that has nothing to do with this call.
+        if config.get_prop(prop_path).is_err() {
+            let _ = config.delete_map_key(section_path, key);
+            return Ok(false);
+        }
         config.mark_dirty(&format!("{section_path}.{key}"));
     }
     Ok(created)
@@ -3077,6 +3117,16 @@ enum DoctorCommands {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
+    /// Update context_window in config.toml from provider /models endpoints
+    UpdateContextWindows {
+        /// Update a specific model_provider only (default: all known model_providers)
+        #[arg(long)]
+        model_provider: Option<String>,
+
+        /// Show what would be updated without writing to config
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3318,9 +3368,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
-    crate::i18n::init(&crate::i18n::detect_locale());
-
     let cmd = apply_i18n_to_command(Cli::command());
 
     if std::env::args_os().len() <= 1 {
@@ -3336,6 +3383,9 @@ async fn main() -> Result<()> {
         // SAFETY: called early in main before any threads are spawned.
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
+
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
 
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.
@@ -3752,6 +3802,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Interactive,
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
             ))
             .await
@@ -3912,11 +3963,11 @@ async fn main() -> Result<()> {
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
                             );
                             println!();
-                            if let Some(message) = message.as_deref() {
-                                if rotating {
-                                    println!("  ✅ {message}");
-                                    println!();
-                                }
+                            if let Some(message) = message.as_deref()
+                                && rotating
+                            {
+                                println!("  ✅ {message}");
+                                println!();
                             }
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
@@ -4133,9 +4184,8 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // Build SOP engine + audit per iteration from current_config.
-                // This ensures reload picks up config changes (new sops_dir,
-                // changed path, or removed sops_dir).
+                // SOP loading is gated on `[sop] sops_dir`: unset disables all
+                // SOP runtime behavior, matching the documented rollback path.
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory(
@@ -4299,6 +4349,11 @@ async fn main() -> Result<()> {
                             "🔄 Daemon reload — re-reading config from disk"
                         );
                         current_config = Box::pin(Config::load_or_init()).await?;
+                        #[cfg(feature = "agent-runtime")]
+                        observability::runtime_trace::init_from_config(
+                            &current_config.observability,
+                            &current_config.data_dir,
+                        );
                         // Stop the stale nag and re-gate against the fresh
                         // config: a repaired posture silences the warning, a
                         // newly-degraded one (still allowed) restarts it. A
@@ -4869,6 +4924,19 @@ async fn main() -> Result<()> {
                 contains.as_deref(),
                 limit,
             ),
+            Some(DoctorCommands::UpdateContextWindows {
+                model_provider,
+                dry_run,
+            }) => {
+                Box::pin(doctor::update_context_windows(
+                    &mut config,
+                    model_provider.as_deref(),
+                    dry_run,
+                    None,
+                ))
+                .await?;
+                Ok(())
+            }
             None => doctor::run(&config).await,
         },
 
@@ -5041,12 +5109,12 @@ async fn main() -> Result<()> {
                 }
 
                 // 2. Same directory as the current executable
-                if found.is_none() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let sibling = exe.with_file_name("zeroclaw-desktop");
-                        if sibling.is_file() {
-                            found = Some(sibling);
-                        }
+                if found.is_none()
+                    && let Ok(exe) = std::env::current_exe()
+                {
+                    let sibling = exe.with_file_name("zeroclaw-desktop");
+                    if sibling.is_file() {
+                        found = Some(sibling);
                     }
                 }
 
@@ -5054,38 +5122,37 @@ async fn main() -> Result<()> {
                 //    Uses directories::UserDirs so HOME (Unix) and USERPROFILE (Windows)
                 //    are both resolved correctly. On Windows the binary is .exe — try
                 //    both names since which::which (step 4) only catches PATH entries.
-                if found.is_none() {
-                    if let Some(home) =
+                if found.is_none()
+                    && let Some(home) =
                         directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
-                    {
-                        let bin_names: &[&str] = if cfg!(windows) {
-                            &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
-                        } else {
-                            &["zeroclaw-desktop"]
-                        };
-                        // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
-                        let dirs: &[&str] = if cfg!(windows) {
-                            &[".cargo/bin"]
-                        } else {
-                            &[".cargo/bin", ".local/bin"]
-                        };
-                        'outer: for dir in dirs {
-                            for name in bin_names {
-                                let candidate = home.join(dir).join(name);
-                                if candidate.is_file() {
-                                    found = Some(candidate);
-                                    break 'outer;
-                                }
+                {
+                    let bin_names: &[&str] = if cfg!(windows) {
+                        &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
+                    } else {
+                        &["zeroclaw-desktop"]
+                    };
+                    // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
+                    let dirs: &[&str] = if cfg!(windows) {
+                        &[".cargo/bin"]
+                    } else {
+                        &[".cargo/bin", ".local/bin"]
+                    };
+                    'outer: for dir in dirs {
+                        for name in bin_names {
+                            let candidate = home.join(dir).join(name);
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break 'outer;
                             }
                         }
                     }
                 }
 
                 // 4. Fallback to PATH lookup
-                if found.is_none() {
-                    if let Ok(path) = which::which("zeroclaw-desktop") {
-                        found = Some(path);
-                    }
+                if found.is_none()
+                    && let Ok(path) = which::which("zeroclaw-desktop")
+                {
+                    found = Some(path);
                 }
 
                 found
@@ -5266,10 +5333,10 @@ async fn main() -> Result<()> {
                     if secrets && !entry.is_secret {
                         continue;
                     }
-                    if let Some(ref f) = filter {
-                        if !entry.name.starts_with(f.as_str()) {
-                            continue;
-                        }
+                    if let Some(ref f) = filter
+                        && !entry.name.starts_with(f.as_str())
+                    {
+                        continue;
                     }
                     if entry.category != current_category {
                         if !current_category.is_empty() {
@@ -5418,8 +5485,22 @@ async fn main() -> Result<()> {
                     // hand. Falls back to free text on `live=false`
                     // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
+                    // Resolve the alias from the config path so the catalog can
+                    // look up the configured api_key and reach the native
+                    // /models endpoint. Path shape is validated by
+                    // `model_path_provider_type`:
+                    // providers.models.<type>.<alias>.model
+                    let provider_ref = path
+                        .split('.')
+                        .nth(3)
+                        .map(|alias| format!("{provider_type}.{alias}"));
+                    let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
                     let (models, _pricing, live) =
-                        zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
+                        zeroclaw_runtime::quickstart::model_catalog_with_config(
+                            Some(&config),
+                            catalog_selector,
+                        )
+                        .await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();
                         let default = models.iter().position(|m| m == &current).unwrap_or(0);
@@ -5750,6 +5831,26 @@ async fn main() -> Result<()> {
                     } else {
                         raw_path.to_string()
                     };
+                    // Mirror `PATCH /api/config`'s alias auto-materialization
+                    // (`handle_patch` in crates/zeroclaw-gateway/src/api_config.rs):
+                    // `add`/`replace` against a leaf under a not-yet-existing map-keyed
+                    // alias (e.g. a brand-new `channels.telegram.<alias>.<field>`)
+                    // creates the alias first. `remove`/`test`/`comment` intentionally
+                    // do not materialize — nothing to remove/test on an alias that
+                    // doesn't exist yet.
+                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    {
+                        let err = ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            "alias `default` is reserved and cannot be created",
+                        )
+                        .with_path(&path)
+                        .with_op_index(idx);
+                        let human = format!(
+                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
+                        );
+                        config_patch_fail_json_or_human(json, err, human)?;
+                    }
                     let comment = match object.get("comment") {
                         Some(value) => match value.as_str() {
                             Some(comment) => Some(comment),
@@ -5793,11 +5894,17 @@ async fn main() -> Result<()> {
                                 ))
                             })?;
                             let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config
-                                .set_prop_persistent(&path, &value_str)
-                                .with_context(|| {
-                                    format!("op[{idx}] `{op_name}` on `{path}` failed")
-                                })?;
+                            match config.set_prop_persistent(&path, &value_str) {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `{op_name}` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -5813,9 +5920,17 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop_persistent(&path, "").with_context(|| {
-                                format!("op[{idx}] `remove` on `{path}` failed")
-                            })?;
+                            match config.set_prop_persistent(&path, "") {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `remove` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -5923,9 +6038,14 @@ async fn main() -> Result<()> {
                     results.push(result_entry);
                 }
 
-                config
-                    .validate()
-                    .context("validation failed after applying patch \u{2014} no changes saved")?;
+                if let Err(err) = config.validate() {
+                    let api_err = ConfigApiError::from_validation(err);
+                    let human = format!(
+                        "validation failed after applying patch \u{2014} no changes saved: {}",
+                        api_err.message
+                    );
+                    config_patch_fail_json_or_human(json, api_err, human)?;
+                }
                 Box::pin(config.save_dirty()).await?;
 
                 if json {
@@ -7776,6 +7896,44 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {
+        // Neutral multi-byte placeholder text; each CJK char is 3 bytes, so a
+        // byte cap can land inside a character. Pre-fix this panicked via the
+        // raw `String::truncate(cap)` (#7828).
+        let mut line = "语言".repeat(64); // 128 chars, 384 bytes, all 3-byte
+        let cap = 10; // byte index 10 is mid-character (10 % 3 != 0)
+        assert!(
+            !line.is_char_boundary(cap),
+            "precondition: cap splits a char"
+        );
+        cap_line_utf8_safe(&mut line, cap);
+        assert!(line.len() <= cap, "must not exceed the byte cap");
+        assert!(
+            line.is_char_boundary(line.len()),
+            "result must end on a valid UTF-8 char boundary"
+        );
+        // cap 10 floors to byte 9 = three whole 3-byte chars.
+        assert_eq!(
+            line, "语言语",
+            "should keep whole chars up to the floored cap"
+        );
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_is_noop_when_within_cap() {
+        let mut line = String::from("héllo"); // 6 bytes
+        cap_line_utf8_safe(&mut line, 1024);
+        assert_eq!(line, "héllo");
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_ascii_exact_cap() {
+        let mut line = String::from("abcdefgh");
+        cap_line_utf8_safe(&mut line, 4);
+        assert_eq!(line, "abcd");
+    }
+
+    #[test]
     #[cfg(feature = "agent-runtime")]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
@@ -8705,11 +8863,85 @@ mod tests {
             &mut config,
             "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
         )
-        .expect("non-provider map paths should be ignored, not rejected");
+        .expect("resource-key map paths should be ignored, not rejected");
 
         assert!(
             !created,
-            "auto-materialization must stay scoped to typed provider aliases"
+            "auto-materialization must stay scoped to alias-keyed sections, excluding #[resource_key] sections"
+        );
+        assert!(
+            config.cost.rates.providers.models.openai.is_empty(),
+            "no bogus model-id key should have been materialized under cost.rates",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_materializes_non_provider_alias_sections() {
+        for (path, value) in [
+            ("risk_profiles.newprofile.level", "supervised"),
+            ("channels.telegram.main.enabled", "true"),
+            ("channels.telegram.main.bot_token", "tok"),
+            ("peer_groups.pi400_owner.channel", "telegram.main"),
+        ] {
+            let mut config = Config::default();
+            assert!(
+                config.set_prop(path, value).is_err(),
+                "precondition: {path} should be unknown on a fresh config"
+            );
+            let created = ensure_map_key_for_prop_path(&mut config, path)
+                .expect("newly-widened alias sections should materialize");
+            assert!(created, "{path}'s alias should be created");
+            assert!(
+                config.set_prop(path, value).is_ok(),
+                "{path} must be settable after map-key materialization"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.default.enabled")
+            .expect("agents is a known map-keyed section; refusal is not an error");
+        assert!(
+            !created,
+            "must refuse to auto-create the reserved `default` agent alias"
+        );
+        assert!(
+            config.agents.is_empty(),
+            "no `agents.default` entry should have been left behind by the refused create"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
+            .expect("non-reserved agent aliases should still materialize");
+        assert!(
+            created,
+            "agents.<non-default> must still auto-materialize like every other widened section"
+        );
+        assert!(
+            config.agents.contains_key("researcher"),
+            "researcher alias should have been created"
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        let path = "risk_profiles.newprofile.not_a_real_field";
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("section resolves; only the tail field is bogus");
+        assert!(
+            !created,
+            "must not report success when the tail field doesn't resolve"
+        );
+        assert!(
+            config
+                .get_map_keys("risk_profiles")
+                .unwrap_or_default()
+                .is_empty(),
+            "the tentatively-created alias must be rolled back, not left dangling",
         );
     }
 
@@ -8747,6 +8979,7 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            agent: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 

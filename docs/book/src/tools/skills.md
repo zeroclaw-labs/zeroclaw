@@ -2,10 +2,16 @@
 
 Skills are reusable instructions and optional tool definitions that ZeroClaw can load into an agent session. Use them for repeatable workflows such as code review checklists, deployment runbooks, support playbooks, or domain-specific tool wrappers.
 
-Skills live in the workspace under `skills/<name>/`. With the default workspace this is:
+Skills live in one of three locations:
+
+- Per-agent workspace skills under `<install>/agents/<alias>/workspace/skills/<name>/`.
+- Shared skill bundles under `<install>/shared/skills/<bundle>/<name>/`. Agents load these when their config lists the bundle in `agents.<alias>.skill_bundles`.
+- The global skill directory under `<install>/data/skills/<name>/`. The CLI can install there as a fallback, but agents do not load global skills automatically.
+
+Use bundles for skills an agent should load during runtime. A bundle is configured under `[skill_bundles.<alias>]`; when its `directory` is omitted, ZeroClaw resolves it to `<install>/shared/skills/<alias>/`.
 
 ```text
-~/.zeroclaw/workspace/skills/<name>/
+<install>/shared/skills/<bundle>/<name>/
 ```
 
 For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` for instructions plus simple metadata. Use `SKILL.toml` when the skill needs structured prompts or tool definitions. ZeroClaw also understands `manifest.toml` for registry-style skill packages, but `SKILL.md` and `SKILL.toml` are the recommended local authoring formats.
@@ -14,18 +20,23 @@ To distribute a set of skills as a signed, versioned, installable package, see [
 
 ## Create a Markdown skill
 
-A minimal instruction-only skill can be just a Markdown file:
+Create a bundle, then scaffold an instruction-only skill into it:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-mkdir -p ~/.zeroclaw/workspace/skills/release-check
-$EDITOR ~/.zeroclaw/workspace/skills/release-check/SKILL.md
+zeroclaw skills bundle add ops
+zeroclaw skills add release-check \
+  --bundle ops \
+  --description "Check release readiness before tagging" \
+  --edit
 ```
 
 </div>
+
+The `skills add` command writes `SKILL.md` under the resolved bundle directory and opens it in your editor. Replace the generated instructions with the workflow you want the agent to follow:
 
 ```markdown
 # Release check
@@ -80,7 +91,7 @@ description_localizations = { fr = "La requête de recherche" }
 
 ## Manage installed skills
 
-List installed skills:
+List the full inventory:
 
 <div class="os-tabs-src">
 
@@ -88,6 +99,30 @@ List installed skills:
 
 ```sh
 zeroclaw skills list
+```
+
+</div>
+
+List exactly what one agent loads at runtime:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills list --agent default
+```
+
+</div>
+
+List one bundle directly:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills list --bundle ops
 ```
 
 </div>
@@ -112,13 +147,21 @@ Install a skill from a local directory, Git URL, registry name, or ClawHub sourc
 #### sh
 
 ```sh
-zeroclaw skills install ./release-check
-zeroclaw skills install https://example.com/zeroclaw-release-check.git
-zeroclaw skills install release-check
-zeroclaw skills install clawhub:release-check
+zeroclaw skills install ./release-check --bundle ops
+zeroclaw skills install https://example.com/zeroclaw-release-check.git --bundle ops
+zeroclaw skills install release-check --agent default
+zeroclaw skills install clawhub:release-check --bundle ops
 ```
 
 </div>
+
+Install destination precedence is:
+
+1. Explicit `--bundle <alias>`.
+2. The target agent's single assigned bundle. `--agent <alias>` chooses the target agent; when omitted, ZeroClaw uses the active runtime agent.
+3. The global directory under `<install>/data/skills/`.
+
+If the target agent has multiple bundles, pass `--bundle` so the destination is unambiguous. If ZeroClaw falls back to the global directory, the skill is installed and listed, but no agent loads it automatically. Attach it to a bundle to make it available at runtime.
 
 Remove an installed skill:
 
@@ -127,10 +170,13 @@ Remove an installed skill:
 #### sh
 
 ```sh
-zeroclaw skills remove release-check
+zeroclaw skills remove release-check --bundle ops
+zeroclaw skills remove release-check --agent default
 ```
 
 </div>
+
+Removing from a bundle archives the skill directory so it can be recovered. Removing from the global directory deletes the global copy after the existing path-containment checks pass.
 
 Run `TEST.sh` validation for one skill, or omit the name to test all installed skills:
 
@@ -146,6 +192,20 @@ zeroclaw skills test --verbose
 </div>
 
 `zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
+
+If `zeroclaw skills list` shows a skill but the agent does not use it, check the runtime view:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills list --agent default
+```
+
+</div>
+
+When the skill appears only in the global group, install it into a bundle and ensure the agent lists that bundle in `agents.<alias>.skill_bundles`.
 
 For a worked example that turns a built-in tool into a reusable operator workflow, see [using relationship memory from skills](./relationship-memory-skill-template.md).
 

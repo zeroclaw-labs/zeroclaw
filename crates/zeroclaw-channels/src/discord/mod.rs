@@ -1238,6 +1238,22 @@ fn channel_passes_filter(
     false
 }
 
+/// Resolve the recipient a Discord send targets. A non-empty per-message
+/// recipient is authoritative; when it is empty (e.g. an escalation alert that
+/// carries no per-message target), fall back to the channel's first configured
+/// `channel_ids` entry so the alert still reaches the operator's channel. When
+/// neither is available there is nowhere to deliver, so the caller must fail
+/// rather than POST to an empty `/channels//messages` path.
+fn effective_discord_recipient<'a>(
+    recipient: &'a str,
+    channel_ids: &'a [String],
+) -> Option<&'a str> {
+    if !recipient.is_empty() {
+        return Some(recipient);
+    }
+    channel_ids.first().map(String::as_str)
+}
+
 /// Pure key-match for the bulk reaction-removal sweep. Reaction rows key as
 /// `discord_reaction_{message_id}_{user_id}_{emoji_key}` (see
 /// [`DiscordChannel::handle_reaction_event`]); `user_id` is a numeric
@@ -2009,6 +2025,23 @@ impl Channel for DiscordChannel {
             };
 
         let mut first_message_id: Option<String> = None;
+        let effective_recipient =
+            match effective_discord_recipient(&message.recipient, &self.channel_ids) {
+                Some(r) => r,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "discord send has no recipient: message.recipient is empty and no \
+                     channel_ids are configured to fall back to"
+                    );
+                    anyhow::bail!(
+                        "discord send has no recipient: message.recipient is empty and no \
+                     channel_ids are configured to fall back to"
+                    );
+                }
+            };
         for (i, chunk) in chunks.iter().enumerate() {
             // Embeds (EPIC C) and interactive components (EPIC B) both ride the
             // FIRST chunk only — Discord attaches embeds and action rows
@@ -2028,7 +2061,7 @@ impl Channel for DiscordChannel {
                     send_discord_message_payload(
                         &client,
                         &self.bot_token,
-                        &message.recipient,
+                        effective_recipient,
                         &payload,
                     )
                     .await?
@@ -2036,7 +2069,7 @@ impl Channel for DiscordChannel {
                     send_discord_message_payload_with_files(
                         &client,
                         &self.bot_token,
-                        &message.recipient,
+                        effective_recipient,
                         &payload,
                         &local_files,
                     )
@@ -2046,13 +2079,13 @@ impl Channel for DiscordChannel {
                 send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
-                    &message.recipient,
+                    effective_recipient,
                     &DiscordOutgoing::text(chunk.clone()),
                     &local_files,
                 )
                 .await?
             } else {
-                send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
+                send_discord_message_json(&client, &self.bot_token, effective_recipient, chunk)
                     .await?
             };
             if first_message_id.is_none() {
@@ -4079,6 +4112,26 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_recipient_prefers_per_message_target() {
+        let ids = vec!["fallback_channel".to_string()];
+        assert_eq!(
+            effective_discord_recipient("explicit_channel", &ids),
+            Some("explicit_channel")
+        );
+    }
+
+    #[test]
+    fn effective_recipient_falls_back_to_first_channel_id_when_empty() {
+        let ids = vec!["first_channel".to_string(), "second_channel".to_string()];
+        assert_eq!(effective_discord_recipient("", &ids), Some("first_channel"));
+    }
+
+    #[test]
+    fn effective_recipient_is_none_when_empty_and_no_channel_ids() {
+        assert_eq!(effective_discord_recipient("", &[]), None);
+    }
     use std::fmt::Write as _;
 
     fn s(items: &[&str]) -> Vec<String> {
@@ -7007,9 +7060,17 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
-            .expect("one failure should produce a note");
-        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        let failures = [DiscordMarkerFailure::NotFound];
+        let note = delivery_failure_note(&failures).expect("one failure should produce a note");
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English string used to live here but the assertion broke on any
+        // CI runner with a non-English `$LANG` (see PR #8488's blocker).
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
         assert!(
             !note.contains("/workspace/missing.png"),
             "user-facing failure note must not echo local marker targets"
@@ -7018,13 +7079,19 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_plural_redacts_targets() {
-        let note = delivery_failure_note(&[
+        let failures = [
             DiscordMarkerFailure::Refused,
             DiscordMarkerFailure::NotFound,
             DiscordMarkerFailure::Refused,
-        ])
-        .expect("multiple failures should produce a note");
-        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        ];
+        let note =
+            delivery_failure_note(&failures).expect("multiple failures should produce a note");
+        // Locale-independent: see singular test for rationale.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
         assert!(
             !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
             "user-facing failure note must not echo failed marker targets"
@@ -7040,7 +7107,14 @@ mod tests {
         let note = delivery_failure_note(&failures);
         let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
 
-        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        // Locale-independent: the body must keep the original `Done` content,
+        // gain exactly one blank-line separator, and never echo the failed
+        // marker path. The previous literal English assertion was
+        // locale-dependent and broke on non-English CI runners.
+        assert!(
+            composed.starts_with("Done\n\n"),
+            "composed body must preserve original content with blank-line separator, got {composed:?}"
+        );
         assert!(
             !composed.contains("/workspace/missing.png"),
             "composed outbound body must not echo failed marker targets"

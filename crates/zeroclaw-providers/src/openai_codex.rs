@@ -63,7 +63,9 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) parameters: Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
 
@@ -257,7 +259,7 @@ pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesT
                 kind: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: std::sync::Arc::clone(&tool.parameters),
                 strict: false,
             })
             .collect(),
@@ -1770,7 +1772,7 @@ mod tests {
             kind: "function".to_string(),
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
             strict: false,
         }
     }
@@ -2424,10 +2426,10 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
@@ -2435,7 +2437,7 @@ data: [DONE]
                 },
                 "required": ["action"]
             }),
-        }];
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
