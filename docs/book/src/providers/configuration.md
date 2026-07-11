@@ -30,7 +30,7 @@ For every family, the URL is resolved in this order:
 
 1. **Operator override**: `uri` field on the alias entry, if set.
 2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
-3. **Templated families**: Azure and Bedrock take typed inputs (`resource`, `deployment`, `api_version` for Azure; `region` for Bedrock) and substitute them into the family's URI template. Missing fields fail loud at runtime.
+3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
 
 ## Family slots
 
@@ -101,6 +101,34 @@ api_version = "2024-10-21"
 ```
 
 The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from Azure-specific environment variables. Use `uri` only when you need to override the computed endpoint completely.
+
+### Amazon Bedrock
+
+Bedrock needs an alias with a model; endpoint region currently comes from the Bedrock auth environment/profile path:
+
+```toml
+[providers.models.bedrock.work]
+model = "anthropic.claude-sonnet-4-6"
+```
+
+The Bedrock provider uses the credential paths implemented in `crates/zeroclaw-providers/src/bedrock.rs`:
+
+1. `api_key` on the Bedrock alias, or `BEDROCK_API_KEY`, uses Bedrock bearer-token auth and takes precedence over SigV4 credentials.
+2. `AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY` uses SigV4. `AWS_SESSION_TOKEN` is optional. `AWS_REGION` or `AWS_DEFAULT_REGION` selects the signing region and falls back to `us-east-1`.
+3. `credential_process` in the active profile from `~/.aws/config`, or from `AWS_CONFIG_FILE`, uses SigV4. `AWS_PROFILE` selects the profile and defaults to `default`.
+4. EC2 IMDSv2 instance credentials are the final SigV4 fallback.
+
+A normal static profile in `~/.aws/credentials` is not read by the current Bedrock implementation. `~/.zeroclaw/secrets` only stores ZeroClaw config secrets such as an alias `api_key`; it does not export `AWS_*` variables for the provider.
+
+To reuse an AWS CLI profile through the implemented profile path, put a `credential_process` in `~/.aws/config`:
+
+```ini
+[profile zeroclaw-bedrock]
+credential_process = /usr/bin/aws configure export-credentials --profile my-existing-profile
+region = us-east-1
+```
+
+Then run ZeroClaw with `AWS_PROFILE=zeroclaw-bedrock`. For a systemd user service, see [Service management](../setup/service.md#environment-overrides-systemd).
 
 ### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
 
