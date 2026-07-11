@@ -1408,12 +1408,19 @@ async fn run_quickstart_cli(
     // discarded rather than left half-built — the user opens the
     // selector and starts fresh.
     if let (Some(mp), Some(m)) = (model_provider.as_deref(), model.as_deref())
-        && let Some(found) = providers.iter().find(|p| p.kind.eq_ignore_ascii_case(mp))
+        && let Some((canonical_provider, codex_auth)) =
+            zeroclaw_runtime::quickstart::resolve_model_provider_type(mp)
+        && let Some(found) = providers
+            .iter()
+            .find(|p| p.kind.eq_ignore_ascii_case(canonical_provider))
     {
-        let needs_key = !found.local && api_key.is_none();
+        let needs_key = !found.local && api_key.is_none() && !codex_auth;
         if !needs_key {
             let mut fields: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            if codex_auth {
+                fields.insert("auth_mode".to_string(), "codex".to_string());
+            }
             if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
                 // Submission field keys are snake_case (`api_key`) — the apply
                 // path round-trips them verbatim into `set_prop_persistent`,
@@ -1718,6 +1725,13 @@ async fn run_quickstart_cli(
                     std::collections::HashMap::new();
                 let mut aborted = false;
                 for d in &descriptors {
+                    if d.key == "api_key"
+                        && field_buf
+                            .get("auth_mode")
+                            .is_some_and(|value| value.trim().eq_ignore_ascii_case("codex"))
+                    {
+                        continue;
+                    }
                     // For the model field, upgrade the descriptor with a
                     // live catalog so `prompt_for_field` renders a picker
                     // instead of a free-text input. Empty catalog (live=false)
