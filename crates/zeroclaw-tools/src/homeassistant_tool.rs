@@ -164,7 +164,7 @@ impl Tool for HomeAssistantTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("Missing required parameter: action".into()),
                 });
             }
@@ -176,7 +176,7 @@ impl Tool for HomeAssistantTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!(
                         "Unknown action: {action}. Valid actions: list_entities, get_state, call_service"
                     )),
@@ -190,7 +190,7 @@ impl Tool for HomeAssistantTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(error),
             });
         }
@@ -206,7 +206,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some("get_state requires entity_id parameter".into()),
                         });
                     }
@@ -219,7 +219,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some("call_service requires domain parameter".into()),
                         });
                     }
@@ -229,7 +229,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: String::new().into(),
                             error: Some("call_service requires service parameter".into()),
                         });
                     }
@@ -243,12 +243,12 @@ impl Tool for HomeAssistantTool {
         match result {
             Ok(value) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()).into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(e.to_string()),
             }),
         }
