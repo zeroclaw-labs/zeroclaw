@@ -335,8 +335,9 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
 
 /// Extract the agent alias from an `agents.<alias>.model_provider` prop path.
 /// A live change to an agent's bound provider must rebuild that agent's live
-/// session boxes the same way a `providers.models.*` edit does, so the zerocode
-/// model picker and the config pane share one refresh path.
+/// session boxes the same way a `providers.models.*` edit does, so any
+/// `config/set agents.<alias>.model_provider` caller (the config pane and other
+/// RPC/config-set clients) gets a live refresh.
 fn agent_alias_from_model_provider_prop(prop: &str) -> Option<String> {
     let rest = prop.strip_prefix("agents.")?;
     let (alias, field) = rest.split_once('.')?;
