@@ -3967,8 +3967,14 @@ impl Config {
     pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
         // Token budget for preemptive context/history trimming (runtime profile override).
         // This is NOT the provider max_tokens output limit and NOT the model's context window.
+        // Resolution chain: runtime_profile.max_context_tokens → provider context_window
+        // (explicitly configured only, no 32_000 stub) → 32_000 stub.
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
+            .or_else(|| {
+                self.resolved_model_provider_for_agent(agent_alias)
+                    .and_then(|(_, _, cfg)| cfg.context_window)
+            })
             .unwrap_or(32_000)
     }
 

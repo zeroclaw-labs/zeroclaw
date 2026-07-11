@@ -5475,6 +5475,121 @@ mod tests {
         );
     }
 
+    /// Regression: profile budget wins over provider context_window when both set.
+    #[test]
+    fn context_usage_max_tokens_profile_wins_over_provider() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "anthropic.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("anthropic", "default")
+            .expect("ensure creates entry")
+            .context_window = Some(200_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            128_000,
+            "runtime profile budget must win over provider context_window"
+        );
+    }
+
+    /// Regression: profile-unset falls back to provider context_window (new chain).
+    #[test]
+    fn context_usage_max_tokens_provider_fallback() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "".into(),
+                model_provider: "anthropic.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("anthropic", "default")
+            .expect("ensure creates entry")
+            .context_window = Some(200_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles: HashMap::new(),
+            providers,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            200_000,
+            "must fall back to provider context_window when runtime profile not set"
+        );
+    }
+
+    /// Regression: both unset falls back to 32_000 stub.
+    #[test]
+    fn context_usage_max_tokens_both_unset() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "".into(),
+                model_provider: "".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles: HashMap::new(),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            32_000,
+            "hard stub fallback when neither profile nor provider is set"
+        );
+    }
+
     #[test]
     fn usage_event_without_input_tokens_emits_null() {
         let event = TurnEvent::Usage {
