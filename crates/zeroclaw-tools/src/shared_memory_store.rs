@@ -167,7 +167,7 @@ impl Tool for SharedMemoryStoreTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(error),
             });
         }
@@ -178,7 +178,7 @@ impl Tool for SharedMemoryStoreTool {
         let Some(writable) = self.memory.as_shared_writable() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!(
                     "{} memory is not available on this backend",
                     self.tier.tier_label()
@@ -193,7 +193,7 @@ impl Tool for SharedMemoryStoreTool {
         if bank.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("no {} bank configured", self.tier.tier_label())),
             });
         }
@@ -205,12 +205,12 @@ impl Tool for SharedMemoryStoreTool {
         match result {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Stored {} memory: {key}", self.tier.tier_label()),
+                output: format!("Stored {} memory: {key}", self.tier.tier_label()).into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!(
                     "Failed to store {} memory: {e}",
                     self.tier.tier_label()
