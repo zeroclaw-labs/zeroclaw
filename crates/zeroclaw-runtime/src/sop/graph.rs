@@ -298,8 +298,9 @@ impl SopGraphExt for SopGraph {
         let mut diagnostics = Vec::new();
 
         for (idx, step) in sop.steps.iter().enumerate() {
+            let switch_supersedes = !step.routing.switch.is_empty();
             match step.routing.next {
-                Some(next) => {
+                Some(next) if !switch_supersedes => {
                     if valid_steps.contains(&next) {
                         wires.push(GraphWire {
                             class: PinClass::Flow,
@@ -317,7 +318,7 @@ impl SopGraphExt for SopGraph {
                         });
                     }
                 }
-                None => {
+                None if !switch_supersedes => {
                     if !step.routing.terminal
                         && let Some(following) = sop.steps.get(idx + 1)
                     {
@@ -331,6 +332,7 @@ impl SopGraphExt for SopGraph {
                         });
                     }
                 }
+                _ => {}
             }
 
             for dep in &step.routing.depends_on {
@@ -845,6 +847,11 @@ mod tests {
             .collect();
         assert_eq!(switch.len(), 1);
         assert_eq!(switch[0].from_pin.as_deref(), Some("pr"));
+
+        assert!(
+            flow_wires(&graph, FlowRole::Sequence).is_empty(),
+            "switch resolution supersedes sequence fallthrough; no sequence wire should be emitted"
+        );
 
         assert!(
             graph

@@ -54,6 +54,16 @@ impl FlowRole {
             FlowRole::Trigger => "Derived from the SOP's triggers; read-only, never hand-wired.",
         }
     }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            FlowRole::Sequence => "next step",
+            FlowRole::Dependency => "waits for",
+            FlowRole::Failure => "on failure",
+            FlowRole::Switch => "branch",
+            FlowRole::Trigger => "trigger",
+        }
+    }
 }
 
 impl PinClass {
@@ -61,6 +71,13 @@ impl PinClass {
         match self {
             PinClass::Flow => "Execution-order edge: which step runs after which.",
             PinClass::Data => "Typed data edge derived from a {{steps.N}} binding.",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PinClass::Flow => "flow",
+            PinClass::Data => "data",
         }
     }
 }
@@ -276,6 +293,16 @@ impl NodeRunState {
             NodeRunState::Skipped => "The step was routed around and never ran.",
         }
     }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            NodeRunState::Pending => "pending",
+            NodeRunState::Active => "running",
+            NodeRunState::Completed => "done",
+            NodeRunState::Failed => "failed",
+            NodeRunState::Skipped => "skipped",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +311,7 @@ impl NodeRunState {
 /// `key` is the snake_case wire value the canvas maps tones/handles against.
 pub struct LegendEntry {
     pub key: String,
+    pub label: String,
     pub description: String,
 }
 
@@ -310,6 +338,7 @@ impl GraphLegend {
         .into_iter()
         .map(|role| LegendEntry {
             key: <&'static str>::from(role).to_string(),
+            label: role.label().to_string(),
             description: role.describe().to_string(),
         })
         .collect();
@@ -317,6 +346,7 @@ impl GraphLegend {
             .into_iter()
             .map(|class| LegendEntry {
                 key: <&'static str>::from(class).to_string(),
+                label: class.label().to_string(),
                 description: class.describe().to_string(),
             })
             .collect();
@@ -330,6 +360,7 @@ impl GraphLegend {
         .into_iter()
         .map(|state| LegendEntry {
             key: run_state_key(state).to_string(),
+            label: state.label().to_string(),
             description: state.describe().to_string(),
         })
         .collect();
