@@ -1478,75 +1478,104 @@ mod tests {
     }
 
     #[test]
-    fn typed_registration_logs_non_local_config_errors() {
+    fn typed_registration_logs_all_family_errors_across_entry_points() {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
         let mut rx = zeroclaw_log::subscribe_or_install();
         while rx.try_recv().is_ok() {}
 
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.providers.transcription.groq.insert(
-            "default".to_string(),
+        let mut typed = TranscriptionProviders::default();
+        typed.groq.insert(
+            "invalid".to_string(),
             zeroclaw_config::schema::GroqTranscriptionProviderConfig::default(),
         );
-        config.providers.transcription.local_whisper.insert(
-            "local".to_string(),
+        typed.openai.insert(
+            "invalid".to_string(),
+            zeroclaw_config::schema::OpenAiTranscriptionProviderConfig::default(),
+        );
+        typed.deepgram.insert(
+            "invalid".to_string(),
+            zeroclaw_config::schema::DeepgramTranscriptionProviderConfig::default(),
+        );
+        typed.assemblyai.insert(
+            "invalid".to_string(),
+            zeroclaw_config::schema::AssemblyAiTranscriptionProviderConfig::default(),
+        );
+        typed.google.insert(
+            "invalid".to_string(),
+            zeroclaw_config::schema::GoogleTranscriptionProviderConfig::default(),
+        );
+        typed.local_whisper.insert(
+            "invalid".to_string(),
             zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig::default(),
         );
 
+        let assert_events = |entry_point: &str, events: Vec<serde_json::Value>| {
+            let expected = [
+                (
+                    "groq.invalid",
+                    "typed transcription provider skipped (config error)",
+                    "[providers.transcription.groq.invalid]",
+                ),
+                (
+                    "openai.invalid",
+                    "typed transcription provider skipped (config error)",
+                    "[providers.transcription.openai.invalid]",
+                ),
+                (
+                    "deepgram.invalid",
+                    "typed transcription provider skipped (config error)",
+                    "[providers.transcription.deepgram.invalid]",
+                ),
+                (
+                    "assemblyai.invalid",
+                    "typed transcription provider skipped (config error)",
+                    "[providers.transcription.assemblyai.invalid]",
+                ),
+                (
+                    "google.invalid",
+                    "typed transcription provider skipped (config error)",
+                    "[providers.transcription.google.invalid]",
+                ),
+                (
+                    "local_whisper.invalid",
+                    "typed local_whisper config invalid, provider skipped",
+                    "local_whisper: `url` must not be empty",
+                ),
+            ];
+
+            for (provider, message, error_fragment) in expected {
+                let event = events
+                    .iter()
+                    .find(|value| value["attributes"]["provider"] == provider)
+                    .unwrap_or_else(|| {
+                        panic!("{entry_point} should log a warning for {provider}: {events:?}")
+                    });
+                assert_eq!(event["message"], message, "provider: {provider}");
+                assert!(
+                    event["attributes"]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains(error_fragment)),
+                    "{entry_point} should include the remediation error for {provider}: {event}"
+                );
+            }
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.transcription = typed.clone();
         TranscriptionManager::from_config_for_agent(&config, None)
             .expect("invalid typed providers should be skipped when transcription is disabled");
-
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        let event = events
-            .iter()
-            .find(|value| {
-                value.get("message").and_then(serde_json::Value::as_str)
-                    == Some("typed transcription provider skipped (config error)")
-            })
-            .expect("typed Groq registration failure should emit a warning");
-        assert_eq!(event["attributes"]["provider"], "groq.default");
-        assert!(
-            event["attributes"]["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("[providers.transcription.groq.default]")),
-            "warning should include the provider registration error: {event}"
-        );
-
-        let local_event = events
-            .iter()
-            .find(|value| {
-                value.get("message").and_then(serde_json::Value::as_str)
-                    == Some("typed local_whisper config invalid, provider skipped")
-            })
-            .expect("typed local Whisper registration failure should preserve its warning");
-        assert_eq!(local_event["attributes"]["provider"], "local_whisper.local");
-    }
-
-    #[test]
-    fn typed_registration_builder_uses_same_error_contract() {
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
-
-        let mut typed = zeroclaw_config::providers::TranscriptionProviders::default();
-        typed.local_whisper.insert(
-            "local".to_string(),
-            zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig::default(),
+        assert_events(
+            "config manager",
+            std::iter::from_fn(|| rx.try_recv().ok()).collect(),
         );
 
         let _manager = TranscriptionManager::empty().with_typed_providers(&typed);
-
-        let event = std::iter::from_fn(|| rx.try_recv().ok())
-            .find(|value| {
-                value.get("message").and_then(serde_json::Value::as_str)
-                    == Some("typed local_whisper config invalid, provider skipped")
-            })
-            .expect("builder path should preserve the local Whisper warning");
-        assert_eq!(event["attributes"]["provider"], "local_whisper.local");
+        assert_events(
+            "builder",
+            std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+        );
     }
 
     #[test]
