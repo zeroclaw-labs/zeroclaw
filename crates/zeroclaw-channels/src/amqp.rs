@@ -822,7 +822,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         let ch = try_channel_with(
             "{name}",
             "name",
-            AmqpDispatch::Sop,
+            SopDispatch::Sop,
             Some(engine),
             Some(audit),
         )
@@ -848,7 +848,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
     fn sop_handles_at_exec_slot_full() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
         use zeroclaw_runtime::sop::SopStepKind;
         use zeroclaw_runtime::sop::types::{
-            Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopTrigger,
         };
         let (engine, audit) = sop_handles();
         {
@@ -879,6 +879,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                 deterministic: false,
                 admission_policy: SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
+                agent: None,
             }]);
             // Fill the single exec slot with an in-flight run.
             eng.start_run(
@@ -887,7 +888,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                     source: SopTriggerSource::Amqp,
                     topic: Some("anitya.update".into()),
                     payload: None,
-                    timestamp: now_iso8601(),
+                    timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
                 },
             )
             .expect("first run fills the slot");
@@ -905,7 +906,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         let ch = try_channel_with(
             "{name}",
             "name",
-            AmqpDispatch::SopAndAgentLoop,
+            SopDispatch::SopAndAgentLoop,
             Some(engine),
             Some(audit),
         )
