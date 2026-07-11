@@ -1078,7 +1078,21 @@ impl TelegramChannel {
         let total_before_cap = commands.len();
         commands.truncate(TELEGRAM_MAX_BOT_COMMANDS);
         if total_before_cap > TELEGRAM_MAX_BOT_COMMANDS {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"TELEGRAM_MAX_BOT_COMMANDS": TELEGRAM_MAX_BOT_COMMANDS, "total_before_cap": total_before_cap})), "Telegram limits bots to commands; configured, registering first . Reduce installed skills to expose more commands.");
+            let registered = commands.len();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "telegram_max_bot_commands": TELEGRAM_MAX_BOT_COMMANDS,
+                        "total_before_cap": total_before_cap,
+                        "registered": registered,
+                    })),
+                &format!(
+                    "Telegram limits bots to {} commands; configured {}, registering first {}. Reduce installed skills to expose more commands.",
+                    TELEGRAM_MAX_BOT_COMMANDS, total_before_cap, registered,
+                )
+            );
         }
 
         let url = self.api_url("setMyCommands");
@@ -7951,6 +7965,110 @@ mod tests {
         .with_tool_command_specs(specs);
 
         ch.register_bot_commands().await;
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_truncates_to_telegram_max() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Build enough tool specs to exceed the 100-command cap: 6 built-ins + 101 tools = 107.
+        let specs: Vec<(String, String)> = (0..101)
+            .map(|i| {
+                (
+                    format!("tool_{i:02}"),
+                    format!("Description for tool {i:02}"),
+                )
+            })
+            .collect();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_respond = captured.clone();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = req.body_json::<serde_json::Value>().unwrap_or_default();
+                *captured_for_respond.lock().unwrap() = Some(body);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true }))
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_tool_command_specs(specs);
+
+        // Install a broadcast hook so we can capture the WARN log event.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        ch.register_bot_commands().await;
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("setMyCommands body captured");
+        let commands = body
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .expect("commands array");
+        assert_eq!(
+            commands.len(),
+            TELEGRAM_MAX_BOT_COMMANDS,
+            "must cap commands at {TELEGRAM_MAX_BOT_COMMANDS}, got {}",
+            commands.len()
+        );
+        // Built-ins are registered first, followed by tools in input order.
+        assert_eq!(commands[0]["command"], "new");
+        assert_eq!(commands[5]["command"], "config");
+        assert_eq!(commands[6]["command"], "tool_00");
+        assert_eq!(
+            commands[TELEGRAM_MAX_BOT_COMMANDS - 1]["command"],
+            "tool_93",
+            "last registered command must be the 94th tool (built-ins + 94 tools = 100)"
+        );
+
+        // Verify the WARN message renders the actual counts, not literal braces.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found_warn = false;
+        while !found_warn && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("Telegram limits bots to 100 commands; configured 107, registering first 100"))
+                        .unwrap_or(false)
+                    {
+                        found_warn = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_timeout) => break,
+            }
+        }
+        assert!(
+            found_warn,
+            "truncation WARN must log the rendered counts, not literal braces"
+        );
     }
 
     // ── Approval inline keyboard tests ────────────────────────
