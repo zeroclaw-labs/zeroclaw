@@ -18,6 +18,7 @@ pub enum TurnEvent {
         id: String,
         name: String,
         args: serde_json::Value,
+        presentation: crate::tool::ToolPresentation,
     },
     /// A tool has returned a result.
     ToolResult {
@@ -41,6 +42,7 @@ pub enum TurnEvent {
         /// Correlation ID. The matching response frame must echo it.
         request_id: String,
         tool_name: String,
+        presentation: crate::tool::ToolPresentation,
         /// Human-readable, secret-redacted summary of the tool arguments.
         /// Synthesised by `crate::approval::summarize_args`; never the raw
         /// `args` value.

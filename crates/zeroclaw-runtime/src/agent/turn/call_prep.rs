@@ -7,7 +7,7 @@ use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{StreamDelta, emit_tool_call_pair};
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{ToolExecutionOutcome, presentation_for_tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -139,7 +139,13 @@ pub(crate) async fn prepare_tool_calls(
                     // hook-cancel outcome as a ToolCall/ToolResult pair,
                     // as the direct execution path always emitted.
                     if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
+                        emit_tool_call_pair(
+                            tx,
+                            call,
+                            &outcome,
+                            presentation_for_tool(ctx.tools_registry, &call.name),
+                        )
+                        .await;
                     }
                     ordered_results[idx] =
                         Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -214,7 +220,13 @@ pub(crate) async fn prepare_tool_calls(
                 // synthesized result (e.g. a DenyWithEdit replacement) as a
                 // ToolCall/ToolResult pair, as the direct path always did.
                 if let Some(tx) = ctx.event_tx {
-                    emit_tool_call_pair(tx, call, &outcome).await;
+                    emit_tool_call_pair(
+                        tx,
+                        call,
+                        &outcome,
+                        presentation_for_tool(ctx.tools_registry, &call.name),
+                    )
+                    .await;
                 }
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), outcome));

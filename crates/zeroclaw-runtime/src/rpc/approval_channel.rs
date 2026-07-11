@@ -330,6 +330,7 @@ mod tests {
 
         let request = ChannelApprovalRequest {
             tool_name: "shell".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "ls /tmp".to_string(),
             raw_arguments: None,
         };
@@ -358,6 +359,7 @@ mod tests {
         let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
         let request = ChannelApprovalRequest {
             tool_name: "shell".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "rm -rf /".to_string(),
             raw_arguments: None,
         };
@@ -390,6 +392,7 @@ mod tests {
         let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
         let request = ChannelApprovalRequest {
             tool_name: "shell".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "sleep 60".to_string(),
             raw_arguments: None,
         };

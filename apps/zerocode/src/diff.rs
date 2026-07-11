@@ -371,6 +371,34 @@ pub fn diff_lines(
     out
 }
 
+pub fn patch_lines(content: &str) -> Vec<Line<'static>> {
+    let lines: Vec<&str> = content.lines().collect();
+    let show = lines.len().min(MAX_WRITE_LINES);
+    let highlighted = ext_to_language("diff")
+        .map(|language| highlight_all(content, language, Color::Reset, ctx_fg()));
+    let mut out = Vec::with_capacity(show + 1);
+    for (index, line) in lines.iter().take(show).enumerate() {
+        let spans = highlighted
+            .as_ref()
+            .and_then(|rows| rows.get(index))
+            .cloned()
+            .unwrap_or_else(|| {
+                vec![Span::styled(
+                    (*line).to_string(),
+                    Style::default().fg(ctx_fg()),
+                )]
+            });
+        out.push(Line::from(spans));
+    }
+    if lines.len() > MAX_WRITE_LINES {
+        out.push(Line::from(Span::styled(
+            format!("  \u{22ef} {} more lines", lines.len() - MAX_WRITE_LINES),
+            Style::default().fg(SEP_FG),
+        )));
+    }
+    out
+}
+
 /// Build ratatui `Line`s showing `content` as entirely new (file_write).
 ///
 /// `lang` is an optional file extension for syntax highlighting.
@@ -450,6 +478,18 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(all.contains("no changes"));
+    }
+
+    #[test]
+    fn patch_lines_preserve_patch_text() {
+        let lines = patch_lines("@@ -1 +1\n-old\n+new\n");
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(text.contains("@@ -1 +1"));
+        assert!(text.contains("-old"));
+        assert!(text.contains("+new"));
     }
 
     #[test]

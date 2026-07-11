@@ -1050,6 +1050,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "git status --short".to_string(),
             raw_arguments: None,
         };
@@ -1094,6 +1095,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "git commit".to_string(),
             raw_arguments: None,
         };
@@ -1124,6 +1126,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "git push".to_string(),
             raw_arguments: None,
         };
@@ -1155,6 +1158,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "old_string: let x = 1;, new_string: let x = 2;".to_string(),
             raw_arguments: Some(serde_json::json!({
                 "path": "src/foo.rs",
@@ -1230,6 +1234,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "edit foo.rs".to_string(),
             raw_arguments: Some(serde_json::json!({
                 "path": "foo.rs",
@@ -1278,6 +1283,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "edit foo.rs".to_string(),
             raw_arguments: Some(serde_json::json!({
                 "path": "foo.rs",
@@ -1320,6 +1326,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "edit foo.rs".to_string(),
             raw_arguments: None,
         };
@@ -1362,6 +1369,7 @@ mod tests {
         );
         let request = ChannelApprovalRequest {
             tool_name: "file_write".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "write bar.rs".to_string(),
             raw_arguments: None,
         };

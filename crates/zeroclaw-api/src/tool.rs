@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::attribution::{Role, ToolKind};
+
 /// Boilerplate-collapsing macro: pair a concrete `Tool` impl with a
 /// matching `Attributable` impl that surfaces the supplied `ToolKind`
 /// and uses the tool's `name()` as its alias.
@@ -182,6 +184,54 @@ impl<'de> Deserialize<'de> for ToolOutput {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentation {
+    Shell,
+    File,
+    Search,
+    Diff,
+    Generic,
+}
+
+pub fn default_tool_presentation(role: Role, parameters: &serde_json::Value) -> ToolPresentation {
+    if role == Role::Tool(ToolKind::Shell) {
+        return ToolPresentation::Shell;
+    }
+    if schema_has_properties(parameters, &["old_string", "new_string"])
+        || schema_has_any_property(parameters, &["patch", "diff"])
+    {
+        return ToolPresentation::Diff;
+    }
+    if schema_has_properties(parameters, &["content"]) {
+        return ToolPresentation::File;
+    }
+    if schema_has_any_property(parameters, &["path", "filePath"]) {
+        return ToolPresentation::File;
+    }
+    if role == Role::Tool(ToolKind::Search)
+        || schema_has_any_property(parameters, &["pattern", "query"])
+    {
+        return ToolPresentation::Search;
+    }
+    ToolPresentation::Generic
+}
+
+fn schema_has_properties(schema: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter().all(|key| schema_has_property(schema, key))
+}
+
+fn schema_has_any_property(schema: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| schema_has_property(schema, key))
+}
+
+fn schema_has_property(schema: &serde_json::Value, key: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|properties| properties.contains_key(key))
+}
+
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -269,6 +319,8 @@ pub struct ToolSpec {
     /// sets come from live config.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub param_domains: std::collections::BTreeMap<String, OptionDomain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ToolPresentation>,
 }
 
 impl ToolSpec {
@@ -285,6 +337,7 @@ impl ToolSpec {
             parameters: std::sync::Arc::new(parameters),
             output: None,
             param_domains: std::collections::BTreeMap::new(),
+            presentation: None,
         }
     }
 }
@@ -389,10 +442,12 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// `Arc::clone` of the stored tree instead of rebuilding it per call
     /// (see `McpToolWrapper`).
     fn spec(&self) -> ToolSpec {
+        let parameters = self.parameters_schema();
         ToolSpec {
             name: self.name().to_string(),
             description: self.description().to_string(),
-            parameters: std::sync::Arc::new(self.parameters_schema()),
+            presentation: Some(default_tool_presentation(self.role(), &parameters)),
+            parameters: std::sync::Arc::new(parameters),
             output: self.output_schema(),
             param_domains: self
                 .param_domains()
@@ -422,6 +477,7 @@ mod tests {
             parameters: std::sync::Arc::new(schema.clone()),
             output: None,
             param_domains: std::collections::BTreeMap::new(),
+            presentation: None,
         };
         let arc_params = serde_json::to_string(&spec.parameters).expect("arc serializes");
         let plain_params = serde_json::to_string(&schema).expect("plain value serializes");
@@ -431,6 +487,36 @@ mod tests {
         let back: ToolSpec = serde_json::from_str(&arc_json).expect("spec deserializes");
         assert_eq!(back.name, spec.name);
         assert_eq!(*back.parameters, *spec.parameters);
+    }
+
+    #[test]
+    fn patch_schema_defaults_to_diff_presentation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": { "type": "string" }
+            }
+        });
+
+        assert_eq!(
+            default_tool_presentation(Role::Tool(ToolKind::Plugin), &schema),
+            ToolPresentation::Diff
+        );
+    }
+
+    #[test]
+    fn diff_schema_defaults_to_diff_presentation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "diff": { "type": "string" }
+            }
+        });
+
+        assert_eq!(
+            default_tool_presentation(Role::Tool(ToolKind::Plugin), &schema),
+            ToolPresentation::Diff
+        );
     }
 
     #[test]

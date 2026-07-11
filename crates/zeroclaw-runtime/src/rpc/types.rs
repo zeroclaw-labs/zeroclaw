@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroclaw_api::tool::ToolPresentation;
 
 // ── Re-exports: types that already derive Serialize + Deserialize ────
 // Consumers can `use zeroclaw_runtime::rpc::types::*` and get everything.
@@ -1357,6 +1358,7 @@ pub enum SessionUpdateEvent {
         tool_call_id: String,
         name: String,
         raw_input: Value,
+        presentation: ToolPresentation,
     },
     ToolResult {
         session_id: String,
@@ -1368,6 +1370,7 @@ pub enum SessionUpdateEvent {
         session_id: String,
         request_id: String,
         tool_name: String,
+        presentation: ToolPresentation,
         arguments_summary: String,
         timeout_secs: u64,
     },

@@ -217,7 +217,7 @@ pub async fn run(
     // again) as a transient disconnect and stays in the loop rather than
     // tearing down the TUI.
     macro_rules! build_panes {
-        ($resume_code:expr) => {
+        ($resume_code:expr, $resume_chat:expr) => {
             async {
                 let mut dashboard_pane =
                     dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
@@ -234,6 +234,8 @@ pub async fn run(
                 code_pane.init().await?;
                 let mut chat_pane =
                     transcript::Transcript::new(rpc.clone(), transcript::PaneKind::Chat);
+                chat_pane.set_resume_session_id($resume_chat.0);
+                chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
                 let pending_start_code = {
                     let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
@@ -276,7 +278,10 @@ pub async fn run(
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
-    ) = build_panes!((None::<String>, None::<String>))?;
+    ) = build_panes!(
+        (None::<String>, None::<String>),
+        (None::<String>, None::<String>)
+    )?;
 
     loop {
         // Draw
@@ -500,7 +505,11 @@ pub async fn run(
                             code_pane.current_session_id().map(String::from),
                             code_pane.current_agent_alias().map(String::from),
                         );
-                        match build_panes!(resume_code) {
+                        let resume_chat = (
+                            chat_pane.current_session_id().map(String::from),
+                            chat_pane.current_agent_alias().map(String::from),
+                        );
+                        match build_panes!(resume_code, resume_chat) {
                             Ok(panes) => {
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
@@ -1164,7 +1173,16 @@ fn draw_reload_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
         Paragraph::new(Span::styled(
             crate::i18n::t_args(
                 "zc-app-reload-confirm-row",
-                &[("confirm_chord", "Enter / y"), ("cancel_chord", "Esc / n")],
+                &[
+                    (
+                        "confirm_chord",
+                        &crate::keymap::action_key_labels(ModalAction::Confirm).join(" / "),
+                    ),
+                    (
+                        "cancel_chord",
+                        &crate::keymap::action_key_labels(ModalAction::Cancel).join(" / "),
+                    ),
+                ],
             ),
             theme::dim_style(),
         ))

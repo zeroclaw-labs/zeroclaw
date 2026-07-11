@@ -981,6 +981,7 @@ mod tests {
         use zeroclaw_api::channel::ChannelApprovalRequest;
         let req = ChannelApprovalRequest {
             tool_name: "shell".into(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "command: ls -la".into(),
             raw_arguments: None,
         };

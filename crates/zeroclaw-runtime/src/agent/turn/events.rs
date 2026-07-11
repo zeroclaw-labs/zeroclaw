@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::tool::ToolPresentation;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -82,12 +83,14 @@ pub(crate) async fn emit_tool_call_pending(
     event_tx: &Sender<TurnEvent>,
     id: &str,
     call: &ParsedToolCall,
+    presentation: ToolPresentation,
 ) {
     let _ = event_tx
         .send(TurnEvent::ToolCall {
             id: id.to_string(),
             name: call.name.clone(),
             args: call.arguments.clone(),
+            presentation,
         })
         .await;
 }
@@ -117,9 +120,10 @@ pub(crate) async fn emit_tool_call_pair(
     event_tx: &Sender<TurnEvent>,
     call: &ParsedToolCall,
     outcome: &ToolExecutionOutcome,
+    presentation: ToolPresentation,
 ) {
     let call_id = resolve_tool_call_id(call);
-    emit_tool_call_pending(event_tx, &call_id, call).await;
+    emit_tool_call_pending(event_tx, &call_id, call, presentation).await;
     emit_tool_result(event_tx, &call_id, &call.name, outcome).await;
 }
 

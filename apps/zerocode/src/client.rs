@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
+use zeroclaw_api::tool::ToolPresentation;
 
 const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -233,6 +234,7 @@ pub enum SessionUpdate {
         tool_call_id: String,
         name: String,
         raw_input: serde_json::Value,
+        presentation: ToolPresentation,
     },
     ToolResult {
         session_id: String,
@@ -243,6 +245,7 @@ pub enum SessionUpdate {
         session_id: String,
         request_id: String,
         tool_name: String,
+        presentation: ToolPresentation,
         arguments_summary: String,
         timeout_secs: u64,
     },
@@ -306,6 +309,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
             name: params.get("name")?.as_str()?.to_string(),
             raw_input: params.get("raw_input")?.clone(),
+            presentation: params
+                .get("presentation")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or(ToolPresentation::Generic),
         }),
         "tool_result" => Some(SessionUpdate::ToolResult {
             session_id: sid,
@@ -316,6 +323,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             request_id: params.get("request_id")?.as_str()?.to_string(),
             tool_name: params.get("tool_name")?.as_str()?.to_string(),
+            presentation: params
+                .get("presentation")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or(ToolPresentation::Generic),
             arguments_summary: params.get("arguments_summary")?.as_str()?.to_string(),
             timeout_secs: params.get("timeout_secs")?.as_u64().unwrap_or(30),
         }),

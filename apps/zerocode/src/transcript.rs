@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
+use zeroclaw_api::tool::ToolPresentation;
 
 // Height of the approval popup anchored to the bottom of the content area.
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
@@ -1618,8 +1619,7 @@ impl Transcript {
             Some(CodeTabAction::ApprovalApproveEdit) if state.pending_approval().is_some() => {
                 let is_edit_tool = state
                     .pending_approval()
-                    .map(|pa| matches!(pa.tool_name.as_str(), "file_edit" | "file_write"))
-                    .unwrap_or(false);
+                    .is_some_and(|pa| pa.presentation == ToolPresentation::Diff);
                 if is_edit_tool && let Some(pa) = state.take_pending_approval() {
                     let initial = pa.arguments_summary.clone();
                     let edited = open_editor_for_content(&initial).await;
@@ -2309,13 +2309,10 @@ impl Transcript {
                 return;
             }
 
-            // Queue sidebar intercepts mouse events over its area before the
-            // conversation handler, so clicks select queued items and the wheel
-            // scrolls the queue rather than the transcript.
-            if state.queue_sidebar_open() && state.point_in_queue_sidebar(col, row) {
+            if state.point_in_adaptive_sidebar(col, row) {
                 match mouse.kind {
-                    MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
-                    MouseEventKind::ScrollDown => state.queue_scroll_by(3),
+                    MouseEventKind::ScrollUp => state.adaptive_sidebar_scroll_by(-3),
+                    MouseEventKind::ScrollDown => state.adaptive_sidebar_scroll_by(3),
                     MouseEventKind::Down(MouseButton::Left) => {
                         state.queue_click_at(col, row);
                     }
@@ -2327,11 +2324,15 @@ impl Transcript {
             match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
+                MouseEventKind::Moved => state.hover_entry_at(col, row),
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(hit) = state.message_action_hit_at(col, row) {
                         match hit.action {
                             MessageAction::Copy(format) => {
                                 state.copy_entry(hit.entry_index, format)
+                            }
+                            MessageAction::ToggleToolDetails => {
+                                state.toggle_tool_details(hit.entry_index)
                             }
                             MessageAction::Retry => {
                                 if state.retry_user_entry(hit.entry_index) {
@@ -2942,15 +2943,17 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 // ── Active code transcript rendering ────────────────────────────────────────
 
 fn render(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
-    let area = if state.queue_sidebar_open() {
+    let area = if state.adaptive_sidebar_open(area.width) {
         let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(20), Constraint::Length(sidebar_w)])
             .split(area);
-        render_queue_sidebar(f, state, cols[1]);
+        render_adaptive_sidebar(f, state, cols[1]);
         cols[0]
     } else {
+        state.queue_item_rects.clear();
+        state.adaptive_sidebar_rect = None;
         area
     };
 
@@ -3189,11 +3192,15 @@ fn cwd_status_text(state: &TranscriptState) -> Option<String> {
     Some(text)
 }
 
-fn render_queue_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
-    let title = crate::i18n::t_args(
-        "zc-queue-title",
-        &[("count", &state.queue_len().to_string())],
-    );
+fn render_adaptive_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
+    let title = if state.queue_sidebar_open() {
+        crate::i18n::t_args(
+            "zc-queue-title",
+            &[("count", &state.queue_len().to_string())],
+        )
+    } else {
+        crate::i18n::t("zc-code-sidebar-title")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(format!(" {title} "), theme::title_style()));
@@ -3201,68 +3208,25 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) 
     f.render_widget(Clear, area);
     f.render_widget(block, area);
     state.queue_item_rects.clear();
-    state.queue_sidebar_rect = None;
+    state.adaptive_sidebar_rect = None;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    state.queue_sidebar_rect = Some(inner);
+    state.adaptive_sidebar_rect = Some(inner);
 
-    // Build the row list, recording which rendered row index owns which queued
-    // message id so a click can be mapped back to an item after scrolling.
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut row_owner: Vec<Option<u64>> = Vec::new();
-
-    if state.message_queue.is_empty() {
-        rows.push(Line::from(Span::styled(
-            crate::i18n::t("zc-queue-empty-list"),
-            theme::dim_style(),
-        )));
-        row_owner.push(None);
-    } else {
-        for (idx, msg) in state.message_queue.iter().enumerate() {
-            let selected = state.queue_sel == Some(msg.id);
-            let marker = if selected { "▶ " } else { "  " };
-            let head_style = if selected {
-                theme::title_style()
-            } else {
-                Style::default()
-            };
-            let preview = first_line_preview(&msg.text, inner.width.saturating_sub(4) as usize);
-            let tag = if msg.status == QueueItemStatus::Injected {
-                format!(" {}", crate::i18n::t("zc-queue-item-injected"))
-            } else {
-                String::new()
-            };
-            rows.push(Line::from(vec![
-                Span::styled(format!("{marker}{}.", idx + 1), head_style),
-                Span::styled(format!(" {preview}"), head_style),
-                Span::styled(tag, theme::dim_style()),
-            ]));
-            row_owner.push(Some(msg.id));
-            for att in &msg.attachments {
-                rows.push(Line::from(Span::styled(
-                    format!("    📎 {}", att.filename),
-                    theme::dim_style(),
-                )));
-                row_owner.push(Some(msg.id));
-            }
-        }
-    }
-
-    // Clamp the scroll offset to the content that overflows the inner height,
-    // then record on-screen rects for the visible item rows.
+    let (rows, row_owner) = adaptive_sidebar_rows_with_owners(state, inner.width);
     let total = rows.len() as u16;
     let max_scroll = total.saturating_sub(inner.height);
-    if state.queue_scroll > max_scroll {
-        state.queue_scroll = max_scroll;
+    if state.adaptive_sidebar_scroll > max_scroll {
+        state.adaptive_sidebar_scroll = max_scroll;
     }
-    let scroll = state.queue_scroll;
-    for (i, owner) in row_owner.iter().enumerate() {
-        let row_i = i as u16;
-        if row_i < scroll {
+    let scroll = state.adaptive_sidebar_scroll;
+    for (index, owner) in row_owner.iter().enumerate() {
+        let row_index = index as u16;
+        if row_index < scroll {
             continue;
         }
-        let screen_y = inner.y + (row_i - scroll);
+        let screen_y = inner.y + (row_index - scroll);
         if screen_y >= inner.y + inner.height {
             break;
         }
@@ -3273,12 +3237,165 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) 
         }
     }
 
-    // No soft wrap: a queued message renders on a single line that the pane
-    // width hard-truncates. Wrapping made long messages spill onto extra rows
-    // and pushed the queue out of alignment; the preview is already clipped to
-    // the inner width above, and ratatui truncates anything still too wide.
     let para = Paragraph::new(rows).scroll((scroll, 0));
     f.render_widget(para, inner);
+}
+
+fn adaptive_sidebar_rows(state: &TranscriptState) -> Vec<Line<'static>> {
+    adaptive_sidebar_rows_with_owners(state, 36)
+        .0
+        .into_iter()
+        .filter(|line| !line.spans.is_empty())
+        .collect()
+}
+
+fn adaptive_sidebar_rows_with_owners(
+    state: &TranscriptState,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Option<u64>>) {
+    let mut rows = Vec::new();
+    let mut row_owner = Vec::new();
+    push_queue_sidebar_rows(state, width, &mut rows, &mut row_owner);
+    push_session_sidebar_rows(state, width, &mut rows, &mut row_owner);
+    push_tool_sidebar_rows(state, width, &mut rows, &mut row_owner);
+    (rows, row_owner)
+}
+
+fn push_sidebar_heading(
+    rows: &mut Vec<Line<'static>>,
+    row_owner: &mut Vec<Option<u64>>,
+    text: String,
+) {
+    if !rows.is_empty() {
+        rows.push(Line::default());
+        row_owner.push(None);
+    }
+    rows.push(Line::from(Span::styled(text, theme::title_style())));
+    row_owner.push(None);
+}
+
+fn push_queue_sidebar_rows(
+    state: &TranscriptState,
+    width: u16,
+    rows: &mut Vec<Line<'static>>,
+    row_owner: &mut Vec<Option<u64>>,
+) {
+    if state.message_queue.is_empty() {
+        return;
+    }
+    push_sidebar_heading(rows, row_owner, crate::i18n::t("zc-code-sidebar-queue"));
+    for (index, message) in state.message_queue.iter().enumerate() {
+        let selected = state.queue_sel == Some(message.id);
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            theme::title_style()
+        } else {
+            Style::default()
+        };
+        let preview = first_line_preview(&message.text, width.saturating_sub(4) as usize);
+        let tag = if message.status == QueueItemStatus::Injected {
+            format!(" {}", crate::i18n::t("zc-queue-item-injected"))
+        } else {
+            String::new()
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("{marker}{}.", index + 1), style),
+            Span::styled(format!(" {preview}"), style),
+            Span::styled(tag, theme::dim_style()),
+        ]));
+        row_owner.push(Some(message.id));
+        for attachment in &message.attachments {
+            rows.push(Line::from(Span::styled(
+                format!("    📎 {}", attachment.filename),
+                theme::dim_style(),
+            )));
+            row_owner.push(Some(message.id));
+        }
+    }
+}
+
+fn push_session_sidebar_rows(
+    state: &TranscriptState,
+    width: u16,
+    rows: &mut Vec<Line<'static>>,
+    row_owner: &mut Vec<Option<u64>>,
+) {
+    let mut details = Vec::new();
+    if let Some(cwd) = cwd_status_text(state) {
+        details.push(cwd);
+    }
+    if details.is_empty() {
+        return;
+    }
+    push_sidebar_heading(rows, row_owner, crate::i18n::t("zc-code-sidebar-session"));
+    for detail in details {
+        rows.push(Line::from(Span::styled(
+            first_line_preview(&detail, width as usize),
+            theme::dim_style(),
+        )));
+        row_owner.push(None);
+    }
+}
+
+fn push_tool_sidebar_rows(
+    state: &TranscriptState,
+    width: u16,
+    rows: &mut Vec<Line<'static>>,
+    row_owner: &mut Vec<Option<u64>>,
+) {
+    let mut active_tools = Vec::new();
+    let mut recent_files = Vec::new();
+    for entry in state.entries.iter().rev() {
+        if let TranscriptEntry::Tool {
+            name,
+            input_json,
+            result,
+            ..
+        } = entry
+        {
+            if result.is_none() && active_tools.len() < 3 {
+                active_tools.push(name.to_string());
+            }
+            if recent_files.len() < 5
+                && let Ok(input) = serde_json::from_str::<serde_json::Value>(input_json)
+                && let Some(path) = string_field(Some(&input), "path")
+                    .or_else(|| string_field(Some(&input), "filePath"))
+            {
+                recent_files.push(path.to_string());
+            }
+        }
+        if active_tools.len() >= 3 && recent_files.len() >= 5 {
+            break;
+        }
+    }
+    if !active_tools.is_empty() {
+        push_sidebar_heading(
+            rows,
+            row_owner,
+            crate::i18n::t("zc-code-sidebar-active-tools"),
+        );
+        for tool in active_tools {
+            rows.push(Line::from(Span::styled(
+                first_line_preview(&tool, width as usize),
+                theme::tool_label_style(),
+            )));
+            row_owner.push(None);
+        }
+    }
+    if !recent_files.is_empty() {
+        push_sidebar_heading(
+            rows,
+            row_owner,
+            crate::i18n::t("zc-code-sidebar-recent-files"),
+        );
+        for path in recent_files {
+            rows.push(Line::from(Span::styled(
+                first_line_preview(&path, width as usize),
+                theme::dim_style(),
+            )));
+            row_owner.push(None);
+        }
+    }
 }
 
 fn first_line_preview(text: &str, max: usize) -> String {
@@ -3310,75 +3427,141 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+enum ToolRenderer {
+    Diff,
+    File,
+    Patch,
+    Generic,
+}
+
+impl ToolRenderer {
+    fn select(presentation: ToolPresentation, input: Option<&serde_json::Value>) -> Self {
+        if string_field(input, "patch").is_some() || string_field(input, "diff").is_some() {
+            return Self::Patch;
+        }
+        match presentation {
+            ToolPresentation::Diff => Self::Diff,
+            ToolPresentation::File => Self::File,
+            _ => Self::Generic,
+        }
+    }
+
+    fn render(
+        self,
+        lines: &mut Vec<Line<'static>>,
+        input: Option<&serde_json::Value>,
+        input_json: &str,
+        result: Option<&str>,
+    ) {
+        match self {
+            Self::Diff => {
+                let old = string_field(input, "old_string").unwrap_or("");
+                let new = string_field(input, "new_string").unwrap_or("");
+                let ext = input.and_then(file_ext);
+                lines.extend(diff::diff_lines(old, new, ext, 1));
+            }
+            Self::File => {
+                if let Some(content) = string_field(input, "content") {
+                    let ext = input.and_then(file_ext);
+                    lines.extend(diff::write_lines(content, ext));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        truncate_display(input_json, 120),
+                        theme::dim_style(),
+                    )));
+                }
+            }
+            Self::Patch => {
+                let patch = string_field(input, "patch")
+                    .or_else(|| string_field(input, "diff"))
+                    .unwrap_or(input_json);
+                lines.extend(diff::patch_lines(patch));
+            }
+            Self::Generic => lines.push(Line::from(Span::styled(
+                truncate_display(input_json, 120),
+                theme::dim_style(),
+            ))),
+        }
+        if let Some(result) = result {
+            lines.push(Line::from(Span::styled(
+                format!("→ {}", truncate_display(result, 200)),
+                theme::dim_style(),
+            )));
+        }
+    }
+}
+
+fn string_field<'a>(input: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    input?.get(key)?.as_str()
+}
+
+fn truncate_display(text: &str, max: usize) -> String {
+    if text.len() > max {
+        format!("{}…", truncate_utf8(text, max))
+    } else {
+        text.to_string()
+    }
+}
+
+fn compact_tool_input(mut input: serde_json::Value) -> String {
+    if let Some(object) = input.as_object_mut() {
+        object.remove("old_string");
+        object.remove("new_string");
+        object.remove("content");
+        object.remove("patch");
+        object.remove("diff");
+    }
+    serde_json::to_string(&input).unwrap_or_default()
+}
+
+fn tool_summary(name: &str, input_json: &str, result: Option<&str>) -> String {
+    let display_input = serde_json::from_str::<serde_json::Value>(input_json)
+        .ok()
+        .map(compact_tool_input)
+        .unwrap_or_else(|| input_json.to_string());
+    let mut summary = format!("{name}: {}", truncate_display(&display_input, 80));
+    if let Some(result) = result {
+        summary.push_str(" → ");
+        summary.push_str(&truncate_display(result, 80));
+    }
+    summary
+}
+
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
     input_json: &str,
+    presentation: ToolPresentation,
     result: Option<&str>,
     is_selected: bool,
+    is_collapsed: bool,
+    show_actions: bool,
 ) {
     let selection = selection_modifier(is_selected);
     let parsed: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
-    let title = tool_title(name, parsed.as_ref());
+    let title = tool_title(name, presentation, parsed.as_ref());
+    let actions = if show_actions {
+        TOOL_MESSAGE_ACTIONS
+    } else {
+        &[]
+    };
     lines.push(rail_header_line(
         TranscriptRail::Tool,
         &title,
         selection,
-        COPY_MESSAGE_ACTIONS,
+        actions,
+        is_collapsed,
     ));
 
     let body_start = lines.len();
-    if name == "file_edit" {
-        let input = parsed.as_ref();
-        let old = input
-            .and_then(|v| v.get("old_string"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let new = input
-            .and_then(|v| v.get("new_string"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
-        let ext = input.and_then(|v| file_ext(v));
-        let start_line = path
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|content| {
-                content
-                    .find(old)
-                    .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
-            })
-            .unwrap_or(1);
-        lines.extend(diff::diff_lines(old, new, ext, start_line));
-    } else if name == "file_write" {
-        let input = parsed.as_ref();
-        let content = input
-            .and_then(|v| v.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let ext = input.and_then(|v| file_ext(v));
-        lines.extend(diff::write_lines(content, ext));
+    if is_collapsed {
+        lines.push(Line::from(Span::styled(
+            tool_summary(name, input_json, result),
+            theme::dim_style().add_modifier(selection),
+        )));
     } else {
-        let truncated = if input_json.len() > 120 {
-            format!("{}…", truncate_utf8(input_json, 120))
-        } else {
-            input_json.to_string()
-        };
-        lines.push(Line::from(Span::styled(
-            truncated,
-            theme::dim_style().add_modifier(selection),
-        )));
-    }
-
-    if let Some(res) = result {
-        let truncated = if res.len() > 200 {
-            format!("{}…", truncate_utf8(res, 200))
-        } else {
-            res.to_string()
-        };
-        lines.push(Line::from(Span::styled(
-            format!("→ {truncated}"),
-            theme::dim_style().add_modifier(selection),
-        )));
+        let renderer = ToolRenderer::select(presentation, parsed.as_ref());
+        renderer.render(lines, parsed.as_ref(), input_json, result);
     }
 
     for line in &mut lines[body_start..] {
@@ -3393,8 +3576,10 @@ fn render_tool_entry(
 fn render_entry_into(
     entry: &TranscriptEntry,
     is_selected: bool,
+    show_actions: bool,
     show_thoughts: bool,
     width: u16,
+    is_collapsed: bool,
     lines: &mut Vec<Line<'static>>,
 ) {
     let selection = selection_modifier(is_selected);
@@ -3404,7 +3589,12 @@ fn render_entry_into(
                 TranscriptRail::User,
                 &crate::i18n::t("zc-code-label-you"),
                 selection,
-                message_actions_for_entry(entry),
+                if show_actions {
+                    message_actions_for_entry(entry)
+                } else {
+                    &[]
+                },
+                false,
             ));
             let body_style = theme::body_style().add_modifier(selection);
             let text_lines: Vec<&str> = text.as_deref().unwrap_or("").split('\n').collect();
@@ -3436,7 +3626,12 @@ fn render_entry_into(
                 TranscriptRail::Agent,
                 &crate::i18n::t("zc-code-label-agent"),
                 selection,
-                message_actions_for_entry(entry),
+                if show_actions {
+                    message_actions_for_entry(entry)
+                } else {
+                    &[]
+                },
+                false,
             ));
             let body_style = theme::body_style().add_modifier(selection);
             let md_lines = markdown_to_lines(text.as_ref(), width);
@@ -3472,6 +3667,7 @@ fn render_entry_into(
         TranscriptEntry::Tool {
             name,
             input_json,
+            presentation,
             result,
             ..
         } => {
@@ -3479,8 +3675,11 @@ fn render_entry_into(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
+                *presentation,
                 result.as_deref().map(|s| s as &str),
                 is_selected,
+                is_collapsed,
+                show_actions,
             );
         }
     }
@@ -3490,6 +3689,7 @@ fn message_action_rects(
     body_area: Rect,
     row: u16,
     actions: &[MessageAction],
+    is_collapsed: bool,
 ) -> Vec<(MessageAction, Rect)> {
     use unicode_width::UnicodeWidthStr;
 
@@ -3498,7 +3698,7 @@ fn message_action_rects(
         .iter()
         .copied()
         .filter_map(|action| {
-            let label = message_action_label(action);
+            let label = message_action_label(action, is_collapsed);
             let width = UnicodeWidthStr::width(label.as_str()) as u16;
             let rect = Rect::new(x, row, width, 1);
             x = x.saturating_add(width).saturating_add(2);
@@ -3512,14 +3712,17 @@ fn message_actions_for_entry(entry: &TranscriptEntry) -> &'static [MessageAction
         TranscriptEntry::UserMessage { attachments, .. } if attachments.is_empty() => {
             EDITABLE_USER_MESSAGE_ACTIONS
         }
+        TranscriptEntry::Tool { .. } => TOOL_MESSAGE_ACTIONS,
         _ => COPY_MESSAGE_ACTIONS,
     }
 }
 
-fn message_action_label(action: MessageAction) -> String {
+fn message_action_label(action: MessageAction, is_collapsed: bool) -> String {
     match action {
         MessageAction::Copy(CopyFormat::Raw) => crate::i18n::t("zc-code-action-copy"),
         MessageAction::Copy(CopyFormat::Markdown) => crate::i18n::t("zc-code-action-copy-md"),
+        MessageAction::ToggleToolDetails if is_collapsed => crate::i18n::t("zc-code-action-expand"),
+        MessageAction::ToggleToolDetails => crate::i18n::t("zc-code-action-collapse"),
         MessageAction::Retry => crate::i18n::t("zc-code-action-retry"),
         MessageAction::Edit => crate::i18n::t("zc-code-action-edit"),
     }
@@ -3609,12 +3812,16 @@ fn rail_header_line(
     label: &str,
     selection: Modifier,
     actions: &[MessageAction],
+    is_collapsed: bool,
 ) -> Line<'static> {
     let muted = theme::dim_style().add_modifier(selection);
     let action_style = theme::accent_style().add_modifier(selection | Modifier::BOLD);
     let mut spans = rail_prefix(rail, selection, false);
     for action in actions {
-        spans.push(Span::styled(message_action_label(*action), action_style));
+        spans.push(Span::styled(
+            message_action_label(*action, is_collapsed),
+            action_style,
+        ));
         spans.push(Span::styled("  ", muted));
     }
     spans.push(Span::styled(
@@ -3624,37 +3831,30 @@ fn rail_header_line(
     Line::from(spans)
 }
 
-fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
+fn tool_title(
+    name: &str,
+    presentation: ToolPresentation,
+    input: Option<&serde_json::Value>,
+) -> String {
     let string_field = |key: &str| {
         input
             .and_then(|value| value.get(key))
             .and_then(|value| value.as_str())
     };
-    const SHELL_TOOL_NAME: &str = "shell";
-    if name == SHELL_TOOL_NAME {
-        return string_field("command")
+    match presentation {
+        ToolPresentation::Shell => string_field("command")
             .map(|command| format!("$ {command}"))
-            .unwrap_or_else(|| format!("$ {name}"));
-    }
-    if name.starts_with("file_") {
-        return file_tool_title(
-            name,
-            string_field("path").or_else(|| string_field("filePath")),
-        );
-    }
-    if name.contains("search") || name == "grep" || name == "glob" {
-        return string_field("pattern")
+            .unwrap_or_else(|| format!("$ {name}")),
+        ToolPresentation::File | ToolPresentation::Diff => string_field("path")
+            .or_else(|| string_field("filePath"))
+            .map(|path| format!("{name} {path}"))
+            .unwrap_or_else(|| format!("⚙ {name}")),
+        ToolPresentation::Search => string_field("pattern")
             .or_else(|| string_field("query"))
             .map(|pattern| format!("✱ {pattern}"))
-            .unwrap_or_else(|| format!("✱ {name}"));
+            .unwrap_or_else(|| format!("✱ {name}")),
+        ToolPresentation::Generic => format!("⚙ {name}"),
     }
-    format!("⚙ {name}")
-}
-
-fn file_tool_title(name: &str, path: Option<&str>) -> String {
-    let action = name.strip_prefix("file_").unwrap_or(name);
-    let title = action.replace('_', " ");
-    path.map(|path| format!("{title} {path}")).unwrap_or(title)
 }
 
 fn rail_body_line(
@@ -3703,6 +3903,7 @@ fn render_streaming_agent_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         &crate::i18n::t("zc-code-label-agent"),
         Modifier::empty(),
         &[],
+        false,
     )];
     lines.extend(markdown_to_lines(text, width).into_iter().map(|line| {
         rail_body_line(
@@ -3868,9 +4069,17 @@ fn render_conversation(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
             let Some(entry) = state.entries.get(entry_idx) else {
                 continue;
             };
-            for (action, rect) in
-                message_action_rects(message_action_area, y, message_actions_for_entry(entry))
-            {
+            let actions = if state.is_entry_highlighted(entry_idx) {
+                message_actions_for_entry(entry)
+            } else {
+                &[]
+            };
+            for (action, rect) in message_action_rects(
+                message_action_area,
+                y,
+                actions,
+                state.collapsed_tool_entries.contains(&entry_idx),
+            ) {
                 state
                     .message_action_hit_regions
                     .push(MessageActionHitRegion {
@@ -3948,19 +4157,29 @@ fn render_approval_overlay(f: &mut Frame, state: &TranscriptState, area: Rect) {
 
     f.render_widget(Clear, overlay_area);
 
-    let is_edit_tool = matches!(pa.tool_name.as_str(), "file_edit" | "file_write");
+    let is_edit_tool = pa.presentation == ToolPresentation::Diff;
     let allow = crate::i18n::t("zc-code-approval-action-allow");
     let always = crate::i18n::t("zc-code-approval-action-always");
     let reject = crate::i18n::t("zc-code-approval-action-reject");
     let edit = crate::i18n::t("zc-code-approval-action-edit");
+    let approve_keys =
+        crate::keymap::action_key_labels(crate::keymap::CodeTabAction::ApprovalApprove).join("/");
+    let always_keys =
+        crate::keymap::action_key_labels(crate::keymap::CodeTabAction::ApprovalApproveAll)
+            .join("/");
+    let reject_keys =
+        crate::keymap::action_key_labels(crate::keymap::CodeTabAction::CancelTurn).join("/");
     let keys = if is_edit_tool {
-        format!("Enter={allow}  a={always}  Ctrl+D={reject}  e={edit}")
+        let edit_keys =
+            crate::keymap::action_key_labels(crate::keymap::CodeTabAction::ApprovalApproveEdit)
+                .join("/");
+        format!(
+            "{approve_keys}={allow}  {always_keys}={always}  {reject_keys}={reject}  {edit_keys}={edit}"
+        )
     } else {
-        format!("Enter={allow}  a={always}  Ctrl+D={reject}")
+        format!("{approve_keys}={allow}  {always_keys}={always}  {reject_keys}={reject}")
     };
 
-    // For file_edit/file_write, strip the bulk content fields — the diff
-    // preview in the conversation already shows old/new content.
     let summary = if is_edit_tool {
         strip_content_fields(&pa.arguments_summary)
     } else {
@@ -4093,13 +4312,33 @@ fn render_elicitation_overlay(f: &mut Frame, state: &TranscriptState, area: Rect
     let list = List::new(items).style(fill);
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 
-    let hint = if e.multi {
-        "↑/↓ move  Space toggle  Enter confirm  Esc cancel"
-    } else {
-        "↑/↓ move  Enter confirm  Esc cancel"
-    };
+    let hint = elicit_footer_hint(e.multi);
     let footer = Paragraph::new(Span::styled(hint, theme::dim_style())).style(fill);
     f.render_widget(footer, chunks[2]);
+}
+
+fn elicit_footer_hint(is_multi: bool) -> String {
+    let move_keys = crate::keymap::action_key_labels(crate::keymap::ModalAction::Up)
+        .into_iter()
+        .chain(crate::keymap::action_key_labels(
+            crate::keymap::ModalAction::Down,
+        ))
+        .collect::<Vec<_>>()
+        .join("/");
+    let confirm_keys =
+        crate::keymap::action_key_labels(crate::keymap::ModalAction::Confirm).join("/");
+    let cancel_keys =
+        crate::keymap::action_key_labels(crate::keymap::ModalAction::Cancel).join("/");
+
+    if is_multi {
+        let toggle_keys =
+            crate::keymap::action_key_labels(crate::keymap::ModalAction::Toggle).join("/");
+        format!(
+            "{move_keys} move  {toggle_keys} toggle  {confirm_keys} confirm  {cancel_keys} cancel"
+        )
+    } else {
+        format!("{move_keys} move  {confirm_keys} confirm  {cancel_keys} cancel")
+    }
 }
 
 /// compact when a diff preview is already shown in the conversation.
@@ -4647,6 +4886,7 @@ fn render_table(
 pub struct PendingApproval {
     pub request_id: String,
     pub tool_name: String,
+    pub presentation: ToolPresentation,
     pub arguments_summary: String,
     pub timeout_secs: u64,
 }
@@ -4757,6 +4997,7 @@ pub enum TranscriptEntry {
         /// drops the per-entry parsed-tree footprint (one
         /// allocation per Value node) to a single `Arc<str>`.
         input_json: Arc<str>,
+        presentation: ToolPresentation,
         /// Tool output. `None` while the call is in flight,
         /// `Some(Arc<str>)` once the result arrives.
         result: Option<Arc<str>>,
@@ -4851,11 +5092,18 @@ enum CopyFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageAction {
     Copy(CopyFormat),
+    ToggleToolDetails,
     Retry,
     Edit,
 }
 
 const COPY_MESSAGE_ACTIONS: &[MessageAction] = &[
+    MessageAction::Copy(CopyFormat::Raw),
+    MessageAction::Copy(CopyFormat::Markdown),
+];
+
+const TOOL_MESSAGE_ACTIONS: &[MessageAction] = &[
+    MessageAction::ToggleToolDetails,
     MessageAction::Copy(CopyFormat::Raw),
     MessageAction::Copy(CopyFormat::Markdown),
 ];
@@ -4942,6 +5190,8 @@ pub struct TranscriptState {
     /// Set by mouse click, cleared on any key press. Separate from
     /// `browse_cursor` so clicking doesn't steal keyboard input.
     highlighted_entry: Option<usize>,
+    hovered_entry: Option<usize>,
+    collapsed_tool_entries: BTreeSet<usize>,
     /// Entry index where mouse went down, reset on up.  Used to distinguish
     /// a plain click (no Drag events → auto-copy single entry on Up) from a
     /// drag gesture (Drag events occurred → auto-copy the range on Up).
@@ -5005,9 +5255,9 @@ pub struct TranscriptState {
     /// message id to its header-row rect. Drives left-click selection.
     queue_item_rects: Vec<(u64, ratatui::layout::Rect)>,
     /// Inner sidebar rect from the last draw, for scroll-wheel hit-testing.
-    queue_sidebar_rect: Option<ratatui::layout::Rect>,
-    /// Scroll offset (in rendered rows) into the queue sidebar.
-    queue_scroll: u16,
+    adaptive_sidebar_rect: Option<ratatui::layout::Rect>,
+    /// Scroll offset (in rendered rows) into the adaptive sidebar.
+    adaptive_sidebar_scroll: u16,
     /// Latest info-bar message (queue/attach notices, model-switch op notes,
     /// errors). `None` hides the bar. Auto-cleared in the tick loop once
     /// [`crate::widgets::INFO_BAR_TTL`] elapses.
@@ -5043,6 +5293,8 @@ impl TranscriptState {
             browse_anchor: None,
             browse_multi: std::collections::BTreeSet::new(),
             highlighted_entry: None,
+            hovered_entry: None,
+            collapsed_tool_entries: BTreeSet::new(),
             mouse_down_entry: None,
             entry_rects: Vec::new(),
             message_action_hit_regions: Vec::new(),
@@ -5073,8 +5325,8 @@ impl TranscriptState {
             queue_sidebar_cols: 36,
             queue_sel: None,
             queue_item_rects: Vec::new(),
-            queue_sidebar_rect: None,
-            queue_scroll: 0,
+            adaptive_sidebar_rect: None,
+            adaptive_sidebar_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
         }
@@ -5092,8 +5344,12 @@ impl TranscriptState {
     }
 
     fn clear_mouse_highlight(&mut self) {
-        if self.highlighted_entry.is_some() || self.mouse_down_entry.is_some() {
+        if self.highlighted_entry.is_some()
+            || self.hovered_entry.is_some()
+            || self.mouse_down_entry.is_some()
+        {
             self.highlighted_entry = None;
+            self.hovered_entry = None;
             self.mouse_down_entry = None;
             self.mark_dirty_full();
         }
@@ -5121,6 +5377,28 @@ impl TranscriptState {
             .iter()
             .find(|hit| mouse::in_rect(col, row, hit.rect))
             .cloned()
+    }
+
+    fn toggle_tool_details(&mut self, idx: usize) {
+        if !matches!(self.entries.get(idx), Some(TranscriptEntry::Tool { .. })) {
+            return;
+        }
+        if !self.collapsed_tool_entries.remove(&idx) {
+            self.collapsed_tool_entries.insert(idx);
+        }
+        self.mark_dirty_full();
+    }
+
+    fn hover_entry_at(&mut self, col: u16, row: u16) {
+        let hit = self
+            .entry_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(col, row, *rect))
+            .map(|(idx, _)| *idx);
+        if self.hovered_entry != hit {
+            self.hovered_entry = hit;
+            self.mark_dirty_full();
+        }
     }
 
     fn copy_entry(&mut self, idx: usize, format: CopyFormat) {
@@ -5310,7 +5588,9 @@ impl TranscriptState {
         if self.is_in_browse_range(idx) {
             return true;
         }
-        self.browse_cursor == Some(idx) || self.highlighted_entry == Some(idx)
+        self.browse_cursor == Some(idx)
+            || self.highlighted_entry == Some(idx)
+            || self.hovered_entry == Some(idx)
     }
 
     /// Total selection: multi-select set ∪ browse range ∪ lone cursor.
@@ -5354,11 +5634,14 @@ impl TranscriptState {
             for (rel_idx, entry) in self.entries[render_from..].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
+                let highlighted = self.is_entry_highlighted(abs_idx);
                 render_entry_into(
                     entry,
-                    self.is_entry_highlighted(abs_idx),
+                    highlighted,
+                    highlighted,
                     show_thoughts,
                     width,
+                    self.collapsed_tool_entries.contains(&abs_idx),
                     &mut new_lines,
                 );
                 let after = new_lines.len();
@@ -5387,11 +5670,14 @@ impl TranscriptState {
         for (rel_idx, entry) in self.entries[start..].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
+            let highlighted = self.is_entry_highlighted(abs_idx);
             render_entry_into(
                 entry,
-                self.is_entry_highlighted(abs_idx),
+                highlighted,
+                highlighted,
                 show_thoughts,
                 width,
+                self.collapsed_tool_entries.contains(&abs_idx),
                 &mut lines,
             );
             let after = lines.len();
@@ -5672,6 +5958,7 @@ impl TranscriptState {
                 tool_call_id,
                 name,
                 raw_input,
+                presentation,
                 ..
             } => {
                 // Flush any accumulated text and thought before the tool call
@@ -5688,6 +5975,7 @@ impl TranscriptState {
                     input_json: Arc::<str>::from(
                         serde_json::to_string(&raw_input).unwrap_or_default(),
                     ),
+                    presentation,
                     result: None,
                 });
                 self.mark_dirty_append();
@@ -5731,6 +6019,7 @@ impl TranscriptState {
             SessionUpdate::ApprovalRequest {
                 request_id,
                 tool_name,
+                presentation,
                 arguments_summary,
                 timeout_secs,
                 ..
@@ -5738,6 +6027,7 @@ impl TranscriptState {
                 self.pending_approval = Some(PendingApproval {
                     request_id,
                     tool_name,
+                    presentation,
                     arguments_summary,
                     timeout_secs,
                 });
@@ -5980,8 +6270,16 @@ impl TranscriptState {
     /// The queue sidebar is open exactly when the queue is non-empty. There is
     /// no manual toggle: it appears with the first queued message and closes
     /// when the queue drains, so its presence always reflects real state.
+    fn adaptive_sidebar_rows(&self) -> Vec<Line<'static>> {
+        adaptive_sidebar_rows(self)
+    }
+
     pub fn queue_sidebar_open(&self) -> bool {
         !self.message_queue.is_empty()
+    }
+
+    fn adaptive_sidebar_open(&self, area_width: u16) -> bool {
+        self.queue_sidebar_open() || (area_width >= 100 && !self.adaptive_sidebar_rows().is_empty())
     }
 
     /// Default the sidebar selection to the front item when nothing is selected
@@ -6022,17 +6320,17 @@ impl TranscriptState {
     }
 
     /// True when the point lies within the last drawn sidebar inner rect.
-    pub fn point_in_queue_sidebar(&self, col: u16, row: u16) -> bool {
-        self.queue_sidebar_rect
-            .is_some_and(|r| mouse::in_rect(col, row, r))
+    pub fn point_in_adaptive_sidebar(&self, col: u16, row: u16) -> bool {
+        self.adaptive_sidebar_rect
+            .is_some_and(|rect| mouse::in_rect(col, row, rect))
     }
 
-    /// Scroll the queue sidebar by `delta` rows (negative = up). Clamped to the
-    /// content overflow recorded on the last draw.
-    pub fn queue_scroll_by(&mut self, delta: i16) {
-        let new = (self.queue_scroll as i32 + delta as i32).max(0) as u16;
-        if new != self.queue_scroll {
-            self.queue_scroll = new;
+    /// Scroll the adaptive sidebar by `delta` rows (negative = up). Clamped to
+    /// the content overflow recorded on the last draw.
+    pub fn adaptive_sidebar_scroll_by(&mut self, delta: i16) {
+        let new = (self.adaptive_sidebar_scroll as i32 + delta as i32).max(0) as u16;
+        if new != self.adaptive_sidebar_scroll {
+            self.adaptive_sidebar_scroll = new;
             self.mark_dirty_full();
         }
     }
@@ -6199,6 +6497,8 @@ impl TranscriptState {
         self.browse_cursor = None;
         self.browse_anchor = None;
         self.highlighted_entry = None;
+        self.hovered_entry = None;
+        self.collapsed_tool_entries.clear();
         self.mouse_down_entry = None;
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
@@ -6351,7 +6651,9 @@ pub async fn open_editor_for_content(content: &str) -> String {
     );
 
     let path = tmp.path().to_owned();
-    let status = tokio::process::Command::new(&editor)
+    let (program, args) = crate::editor::editor_command_parts(&editor);
+    let status = tokio::process::Command::new(program)
+        .args(args)
         .arg(&path)
         .status()
         .await;
@@ -6469,7 +6771,7 @@ mod tests {
 
     fn rendered_entry(entry: &TranscriptEntry, width: u16) -> String {
         let mut lines = Vec::new();
-        render_entry_into(entry, false, true, width, &mut lines);
+        render_entry_into(entry, false, true, true, width, false, &mut lines);
         lines
             .into_iter()
             .map(|line| {
@@ -6501,7 +6803,7 @@ mod tests {
     fn message_rails_are_background_cells_not_glyphs() {
         let entry = TranscriptEntry::AgentMessage(Arc::<str>::from("world"));
         let mut lines = Vec::new();
-        render_entry_into(&entry, false, true, 80, &mut lines);
+        render_entry_into(&entry, false, true, true, 80, false, &mut lines);
 
         assert_eq!(lines[0].spans[0].content.as_ref(), " ");
         assert_eq!(lines[0].spans[1].content.as_ref(), " ");
@@ -6531,12 +6833,13 @@ mod tests {
             tool_call_id: Arc::<str>::from("tool-1"),
             name: Arc::<str>::from("shell"),
             input_json: Arc::<str>::from(r#"{"command":"echo hi"}"#),
+            presentation: ToolPresentation::Shell,
             result: Some(Arc::<str>::from("hi")),
         };
 
         let rail_background = |entry: &TranscriptEntry| {
             let mut lines = Vec::new();
-            render_entry_into(entry, false, true, 80, &mut lines);
+            render_entry_into(entry, false, true, true, 80, false, &mut lines);
             lines[0].spans[0].style.bg
         };
 
@@ -6566,10 +6869,11 @@ mod tests {
             tool_call_id: Arc::<str>::from("tool-1"),
             name: Arc::<str>::from("shell"),
             input_json: Arc::<str>::from(r#"{"command":"echo hi"}"#),
+            presentation: ToolPresentation::Shell,
             result: Some(Arc::<str>::from("hi")),
         };
         let mut lines = Vec::new();
-        render_entry_into(&entry, false, true, 80, &mut lines);
+        render_entry_into(&entry, false, true, true, 80, false, &mut lines);
 
         let tool_rail = rail_span(TranscriptRail::Tool, Modifier::empty(), 1.0)
             .style
@@ -6607,6 +6911,7 @@ mod tests {
             tool_call_id: Arc::<str>::from("tool-1"),
             name: Arc::<str>::from("shell"),
             input_json: Arc::<str>::from(r#"{"command":"cargo test"}"#),
+            presentation: ToolPresentation::Shell,
             result: Some(Arc::<str>::from("ok")),
         });
         state.mark_dirty_full();
@@ -6623,12 +6928,10 @@ mod tests {
         let snapshot = rail_debug_snapshot(terminal.backend().buffer(), area);
         println!("\n{snapshot}");
 
-        assert!(
-            snapshot.contains("copy  md  retry  edit  You:"),
-            "{snapshot}"
-        );
-        assert!(snapshot.contains("copy  md  Agent:"), "{snapshot}");
-        assert!(snapshot.contains("copy  md  $ cargo test"), "{snapshot}");
+        assert!(snapshot.contains("You:"), "{snapshot}");
+        assert!(snapshot.contains("Agent:"), "{snapshot}");
+        assert!(snapshot.contains("$ cargo test"), "{snapshot}");
+        assert!(!snapshot.contains("copy  md"), "{snapshot}");
         assert!(snapshot.contains("→ ok"), "{snapshot}");
     }
 
@@ -6704,7 +7007,7 @@ mod tests {
 
     #[test]
     fn message_action_rects_track_label_widths() {
-        let rects = message_action_rects(Rect::new(10, 0, 80, 10), 3, COPY_MESSAGE_ACTIONS);
+        let rects = message_action_rects(Rect::new(10, 0, 80, 10), 3, COPY_MESSAGE_ACTIONS, false);
         assert_eq!(
             rects[0],
             (MessageAction::Copy(CopyFormat::Raw), Rect::new(12, 3, 4, 1))
@@ -6720,7 +7023,7 @@ mod tests {
 
     #[test]
     fn message_action_rects_clip_to_body_width() {
-        let rects = message_action_rects(Rect::new(10, 0, 7, 10), 3, COPY_MESSAGE_ACTIONS);
+        let rects = message_action_rects(Rect::new(10, 0, 7, 10), 3, COPY_MESSAGE_ACTIONS, false);
         assert_eq!(
             rects,
             vec![(MessageAction::Copy(CopyFormat::Raw), Rect::new(12, 3, 4, 1))]
@@ -6729,8 +7032,12 @@ mod tests {
 
     #[test]
     fn user_action_rects_include_retry_and_edit_in_order() {
-        let rects =
-            message_action_rects(Rect::new(10, 0, 80, 10), 3, EDITABLE_USER_MESSAGE_ACTIONS);
+        let rects = message_action_rects(
+            Rect::new(10, 0, 80, 10),
+            3,
+            EDITABLE_USER_MESSAGE_ACTIONS,
+            false,
+        );
         let actions = rects
             .into_iter()
             .map(|(action, _)| action)
@@ -6751,6 +7058,118 @@ mod tests {
             rendered_entry(&entry, 80),
             "  copy  md  You:\n   see file\n   [file.txt]\n"
         );
+    }
+
+    #[test]
+    fn hidden_actions_appear_when_entry_is_highlighted() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("shell"),
+            input_json: Arc::<str>::from(r#"{"command":"echo hi"}"#),
+            presentation: ToolPresentation::Shell,
+            result: Some(Arc::<str>::from("hi")),
+        };
+
+        let mut plain = Vec::new();
+        render_entry_into(&entry, false, false, true, 80, false, &mut plain);
+        let plain_text = plain
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(!plain_text.contains("hide"));
+
+        let mut highlighted = Vec::new();
+        render_entry_into(&entry, true, true, true, 80, false, &mut highlighted);
+        let highlighted_text = highlighted
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(highlighted_text.contains("hide"));
+        assert!(highlighted_text.contains("copy"));
+    }
+
+    #[test]
+    fn collapsed_tool_entry_hides_bulk_output() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("file_write"),
+            input_json: Arc::<str>::from(r#"{"path":"a.rs","content":"fn main() {}"}"#),
+            presentation: ToolPresentation::File,
+            result: Some(Arc::<str>::from("wrote file")),
+        };
+        let mut expanded = Vec::new();
+        render_entry_into(&entry, true, true, true, 80, false, &mut expanded);
+        let expanded_text = expanded
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(expanded_text.contains("fn main"));
+
+        let mut collapsed = Vec::new();
+        render_entry_into(&entry, true, true, true, 80, true, &mut collapsed);
+        let collapsed_text = collapsed
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(collapsed_text.contains("show"));
+        assert!(!collapsed_text.contains("fn main"));
+    }
+
+    #[test]
+    fn patch_shaped_tools_use_patch_renderer() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("apply_patch"),
+            input_json: Arc::<str>::from(r#"{"patch":"@@ -1 +1\n-old\n+new"}"#),
+            presentation: ToolPresentation::Generic,
+            result: None,
+        };
+        let text = rendered_entry(&entry, 80);
+        assert!(text.contains("@@ -1 +1"), "{text}");
+        assert!(text.contains("+new"), "{text}");
+    }
+
+    #[test]
+    fn patch_like_generic_input_stays_generic() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("shell"),
+            input_json: Arc::<str>::from(r#"{"command":"printf '@@ -1 +1\n-old\n+new'"}"#),
+            presentation: ToolPresentation::Shell,
+            result: None,
+        };
+        let text = rendered_entry(&entry, 80);
+        assert!(text.contains(r#"{"command":"printf"#), "{text}");
+    }
+
+    #[test]
+    fn adaptive_sidebar_derives_session_tools_and_files() {
+        let mut state = state();
+        state.cwd = Some("/repo".to_string());
+        state.git_branch = Some("main".to_string());
+        state.context_input_tokens = Some(42);
+        state.context_max_tokens = Some(100);
+        state.entries.push(TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("file_read"),
+            input_json: Arc::<str>::from(r#"{"path":"src/lib.rs"}"#),
+            presentation: ToolPresentation::File,
+            result: None,
+        });
+
+        let rows = state.adaptive_sidebar_rows();
+        let text = rows
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Session"), "{text}");
+        assert!(text.contains("/repo (main)"), "{text}");
+        assert!(!text.contains("ctx"), "{text}");
+        assert!(text.contains("Active tools"), "{text}");
+        assert!(text.contains("file_read"), "{text}");
+        assert!(text.contains("Recent files"), "{text}");
+        assert!(text.contains("src/lib.rs"), "{text}");
     }
 
     #[test]
@@ -6895,6 +7314,7 @@ mod tests {
             tool_call_id: Arc::<str>::from("tool-1"),
             name: Arc::<str>::from("shell"),
             input_json: Arc::<str>::from(r#"{"command":"echo ```"}"#),
+            presentation: ToolPresentation::Shell,
             result: Some(Arc::<str>::from("before\n```\nafter")),
         };
 
@@ -6999,10 +7419,22 @@ mod tests {
         let read = serde_json::json!({ "path": "Cargo.toml" });
         let search = serde_json::json!({ "pattern": "PaneKind" });
 
-        assert_eq!(tool_title("shell", Some(&shell)), "$ cargo test");
-        assert_eq!(tool_title("file_read", Some(&read)), "read Cargo.toml");
-        assert_eq!(tool_title("content_search", Some(&search)), "✱ PaneKind");
-        assert_eq!(tool_title("sop_execute", None), "⚙ sop_execute");
+        assert_eq!(
+            tool_title("shell", ToolPresentation::Shell, Some(&shell)),
+            "$ cargo test"
+        );
+        assert_eq!(
+            tool_title("file_read", ToolPresentation::File, Some(&read)),
+            "file_read Cargo.toml"
+        );
+        assert_eq!(
+            tool_title("content_search", ToolPresentation::Search, Some(&search)),
+            "✱ PaneKind"
+        );
+        assert_eq!(
+            tool_title("sop_execute", ToolPresentation::Generic, None),
+            "⚙ sop_execute"
+        );
     }
 
     #[test]
@@ -8142,6 +8574,7 @@ mod tests {
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command":"ls"}),
+            presentation: ToolPresentation::Shell,
         });
         s.apply_update(SessionUpdate::ToolResult {
             session_id: "sess-1".to_string(),
@@ -8167,6 +8600,7 @@ mod tests {
             request_id: "req-1".to_string(),
             tool_name: "shell".to_string(),
             arguments_summary: "rm -rf /".to_string(),
+            presentation: ToolPresentation::Shell,
             timeout_secs: 30,
         });
         assert!(s.pending_approval().is_some());
@@ -8193,6 +8627,7 @@ mod tests {
             request_id: "req-1".to_string(),
             tool_name: "shell".to_string(),
             arguments_summary: "command: pwd".to_string(),
+            presentation: ToolPresentation::Shell,
             timeout_secs: 120,
         });
 
@@ -8241,6 +8676,7 @@ mod tests {
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command": "ls"}),
+            presentation: ToolPresentation::Shell,
         });
         // Thought must be committed as an entry before the tool entry.
         assert_eq!(s.entries().len(), 2);
@@ -8316,6 +8752,7 @@ mod tests {
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command": "ls"}),
+            presentation: ToolPresentation::Shell,
         });
 
         // At this point the pre-tool text must be committed as its own entry.
@@ -8358,6 +8795,7 @@ mod tests {
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command": "ls"}),
+            presentation: ToolPresentation::Shell,
         });
         // Tool result.
         s.apply_update(SessionUpdate::ToolResult {
@@ -8413,6 +8851,7 @@ mod tests {
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command": "ls"}),
+            presentation: ToolPresentation::Shell,
         });
 
         // Only the Tool entry should exist — no empty AgentMessage.
@@ -8436,6 +8875,7 @@ mod tests {
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command": "ls"}),
+            presentation: ToolPresentation::Shell,
         });
         // No post-tool text; commit_turn receives the full text but streaming_text is empty.
         s.commit_turn("Before tool.".to_string(), true);
@@ -8737,14 +9177,14 @@ mod tests {
     }
 
     #[test]
-    fn queue_scroll_by_clamps_at_zero() {
+    fn adaptive_sidebar_scroll_by_clamps_at_zero() {
         let mut s = state();
-        s.queue_scroll_by(-5);
-        assert_eq!(s.queue_scroll, 0);
-        s.queue_scroll_by(4);
-        assert_eq!(s.queue_scroll, 4);
-        s.queue_scroll_by(-10);
-        assert_eq!(s.queue_scroll, 0);
+        s.adaptive_sidebar_scroll_by(-5);
+        assert_eq!(s.adaptive_sidebar_scroll, 0);
+        s.adaptive_sidebar_scroll_by(4);
+        assert_eq!(s.adaptive_sidebar_scroll, 4);
+        s.adaptive_sidebar_scroll_by(-10);
+        assert_eq!(s.adaptive_sidebar_scroll, 0);
     }
 
     #[test]

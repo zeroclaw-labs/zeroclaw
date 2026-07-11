@@ -401,6 +401,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     // `turn.context.TurnCtx`).
     let ctx = TurnCtx {
         observer,
+        tools_registry,
         provider_name,
         model,
         temperature,

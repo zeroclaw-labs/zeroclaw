@@ -66,12 +66,17 @@ pub(crate) fn edit_text_in_external_editor(
     result
 }
 
-fn run_editor(editor: &str, path: OsString) -> std::io::Result<std::process::ExitStatus> {
+pub(crate) fn editor_command_parts(editor: &str) -> (String, Vec<String>) {
     let mut parts = shlex::split(editor)
         .filter(|parts| !parts.is_empty())
         .unwrap_or_else(|| vec![editor.to_string()]);
     let program = parts.remove(0);
-    Command::new(program).args(parts).arg(path).status()
+    (program, parts)
+}
+
+fn run_editor(editor: &str, path: OsString) -> std::io::Result<std::process::ExitStatus> {
+    let (program, args) = editor_command_parts(editor);
+    Command::new(program).args(args).arg(path).status()
 }
 
 fn executable_on_path(name: &str) -> bool {

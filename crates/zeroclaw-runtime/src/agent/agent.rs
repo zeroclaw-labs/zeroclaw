@@ -9040,6 +9040,7 @@ mod approval_route_tests {
     fn req() -> ChannelApprovalRequest {
         ChannelApprovalRequest {
             tool_name: "shell".into(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
         }
