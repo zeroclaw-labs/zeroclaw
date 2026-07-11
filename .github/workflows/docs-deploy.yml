@@ -210,14 +210,6 @@ jobs:
       - name: Build docs (refs + rustdoc + all locales)
         env:
           TAG: ${{ steps.version.outputs.TAG }}
-          # Pass the docs-site rustdoc theme through RUSTDOCFLAGS so that the
-          # theme only affects the rustdoc invocation driven by `cargo mdbook
-          # build` (which calls `cargo doc` via xtask). It is intentionally NOT
-          # set via `[build] rustdocflags` in `.cargo/config.toml`, because
-          # that flag is also inherited by `cargo test --doc` and triggers
-          # `Option 'default-theme' given more than once` under Rust 1.96's
-          # stricter rustdoc argument parser (issue #8847).
-          RUSTDOCFLAGS: "--default-theme=ayu"
         run: |
           echo "Building docs for TAG=$TAG"
           cargo mdbook build
