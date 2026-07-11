@@ -4901,6 +4901,67 @@ async fn process_channel_message_body(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+
+    // ── Skill auto-activation: provider switch + image-turn tool blocking ──
+    // Skills can declare in SKILL.toml:
+    //   - `triggers = [...]` natural-language phrases (word-boundary matched)
+    //   - `provider = "..."` to auto-switch the session's provider on match
+    //   - `blocked_tools_with_image = [...]` to forbid the listed tools when
+    //     the current message carries an [IMAGE:] attachment, enforcing
+    //     two-turn protocols architecturally instead of via prompt text
+    // Matching lives in `zeroclaw_runtime::skills::match_skill_activation`.
+    let mut skill_blocked_tools: Vec<String> = Vec::new();
+    {
+        let candidates: Vec<_> = zeroclaw_runtime::skills::load_skills_for_agent(
+            ctx.workspace_dir.as_ref(),
+            ctx.prompt_config.as_ref(),
+            ctx.agent_alias.as_ref(),
+        )
+        .into_iter()
+        .filter(|s| s.provider.is_some() || !s.blocked_tools_with_image.is_empty())
+        .collect();
+
+        let has_image = msg.content.contains("[IMAGE:");
+        if let Some(skill) =
+            zeroclaw_runtime::skills::match_skill_activation(&candidates, &msg.content, has_image)
+        {
+            // 1. Switch the session provider if the skill declares one.
+            if let Some(ref provider_name) = skill.provider {
+                let mut current =
+                    get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+                if current.model_provider != *provider_name {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "skill": skill.name.as_str(),
+                                "provider": provider_name.as_str(),
+                            })),
+                        "Skill auto-activated: switching session provider"
+                    );
+                    current.model_provider = provider_name.clone();
+                    current.model = "default".to_string();
+                    current.api_key = None;
+                    set_route_selection(ctx.as_ref(), &history_key, current, &runtime_defaults);
+                }
+            }
+
+            // 2. Collect blocked_tools_with_image when the message has an image.
+            if has_image && !skill.blocked_tools_with_image.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "skill": skill.name.as_str(),
+                            "blocked": &skill.blocked_tools_with_image,
+                        })),
+                    "Skill image-turn tool block engaged"
+                );
+                skill_blocked_tools.extend(skill.blocked_tools_with_image.iter().cloned());
+            }
+        }
+    }
+
     let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
 
     // ── Query classification: override route when a rule matches ──
@@ -5578,12 +5639,19 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
+            // Combine base channel exclusions with skill-driven image-turn blocks.
+            let mut effective_excluded_tools: Vec<String> =
                 if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
+                    Vec::new()
                 } else {
-                    ctx.non_cli_excluded_tools.as_ref()
+                    ctx.non_cli_excluded_tools.as_ref().clone()
                 };
+            for t in &skill_blocked_tools {
+                if !effective_excluded_tools.iter().any(|e| e == t) {
+                    effective_excluded_tools.push(t.clone());
+                }
+            }
+            let excluded_tools: &[String] = &effective_excluded_tools;
             let tool_loop = run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -18879,6 +18947,9 @@ BTC is currently around $65,000 based on latest tool output."#
             prompts: vec!["Always run cargo test before final response.".into()],
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -18922,6 +18993,9 @@ BTC is currently around $65,000 based on latest tool output."#
             prompts: vec!["Always run cargo test before final response.".into()],
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let prompt = build_system_prompt_with_mode(
@@ -18975,6 +19049,9 @@ BTC is currently around $65,000 based on latest tool output."#
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);

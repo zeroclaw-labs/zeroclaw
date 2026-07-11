@@ -280,6 +280,9 @@ mod tests {
                     prompts: vec![],
                     slash_options: vec![],
                     location: None,
+                    provider: None,
+                    triggers: vec![],
+                    blocked_tools_with_image: vec![],
                 }],
                 dropped: vec![],
             }

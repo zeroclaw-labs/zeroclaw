@@ -91,6 +91,15 @@ pub struct Skill {
     pub slash_options: Vec<SkillSlashOption>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When set, sessions using this skill command are automatically routed to this provider.
+    #[serde(skip)]
+    pub provider: Option<String>,
+    /// Natural-language trigger phrases for auto-activation (from SKILL.toml triggers = [...]).
+    #[serde(skip)]
+    pub triggers: Vec<String>,
+    /// Tools blocked when the current user message contains an image attachment.
+    #[serde(skip)]
+    pub blocked_tools_with_image: Vec<String>,
 }
 
 /// Why the audited resolver dropped a candidate skill directory/file.
@@ -370,6 +379,18 @@ struct SkillMeta {
     prompts: Vec<String>,
     #[serde(default)]
     slash_options: Vec<SkillSlashOption>,
+    #[serde(default)]
+    provider: Option<String>,
+    /// Natural-language trigger phrases; any match activates this skill's provider override.
+    /// Use "__image__" to match any message containing an image attachment.
+    #[serde(default)]
+    triggers: Vec<String>,
+    /// Tools that are forbidden when the current user message contains an image.
+    /// Used to enforce two-turn protocols at the architecture level: e.g. food-logger
+    /// blocks `sparky__sparky_manage_food` on photo turns so auto-logging is
+    /// architecturally impossible, not just prompt-discouraged.
+    #[serde(default)]
+    blocked_tools_with_image: Vec<String>,
 }
 
 /// Provenance metadata emitted by the SkillForge integrator (see
@@ -609,6 +630,74 @@ fn dir_stem(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Match a message against skill auto-activation rules and return the first
+/// matching skill.
+///
+/// Match priority per skill, scanning skills in order:
+/// 1. Slash command: `/skill_name` (hyphen/underscore-insensitive, optional
+///    `@botname` suffix).
+/// 2. Trigger phrases from SKILL.toml `triggers = [...]`, matched
+///    case-insensitively on word boundaries so short triggers like "i had"
+///    cannot fire inside unrelated words.
+/// 3. The `__image__` sentinel trigger, which matches any message that
+///    carries an image attachment (`has_image`).
+///
+/// Callers decide what counts as an image attachment; channel surfaces pass
+/// `content.contains("[IMAGE:")` per the runtime's inline-asset convention.
+pub fn match_skill_activation<'a>(
+    skills: &'a [Skill],
+    message: &str,
+    has_image: bool,
+) -> Option<&'a Skill> {
+    let trimmed = message.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for skill in skills {
+        // 1. Slash command match: /food_logger or /food-logger.
+        if trimmed.starts_with('/') {
+            let cmd = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .strip_prefix('/')
+                .unwrap_or("")
+                .split('@')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let norm_cmd: String = cmd
+                .chars()
+                .map(|c| if c == '-' { '_' } else { c })
+                .collect();
+            let norm_skill: String = skill
+                .name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if c == '-' { '_' } else { c })
+                .collect();
+            if norm_cmd == norm_skill {
+                return Some(skill);
+            }
+        }
+
+        // 2. Trigger phrases, word-boundary matched. 3. `__image__` sentinel.
+        for trigger in &skill.triggers {
+            let matches = if trigger == "__image__" {
+                has_image
+            } else {
+                let pat = format!(r"\b{}\b", regex::escape(&trigger.to_ascii_lowercase()));
+                regex::Regex::new(&pat)
+                    .map(|re| re.is_match(&lower))
+                    .unwrap_or(false)
+            };
+            if matches {
+                return Some(skill);
+            }
+        }
+    }
+    None
 }
 
 /// Load all skills from the workspace skills directory
@@ -1417,6 +1506,9 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         prompts,
         slash_options: manifest.skill.slash_options,
         location: Some(path.to_path_buf()),
+        provider: manifest.skill.provider,
+        triggers: manifest.skill.triggers,
+        blocked_tools_with_image: manifest.skill.blocked_tools_with_image,
     })
 }
 
@@ -1446,6 +1538,9 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
+        provider: None,
+        triggers: vec![],
+        blocked_tools_with_image: vec![],
     })
 }
 
@@ -1488,6 +1583,9 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
+        provider: None,
+        triggers: vec![],
+        blocked_tools_with_image: vec![],
     }))
 }
 
@@ -3887,6 +3985,92 @@ descriptin = "oops"
         );
     }
 
+    /// The auto-activation fields must parse under `deny_unknown_fields`
+    /// and map through to the loaded `Skill`.
+    #[test]
+    fn accepts_auto_activation_fields_in_skill_block() {
+        let toml_str = r#"
+[skill]
+name = "food-logger"
+description = "y"
+provider = "openai-codex"
+triggers = ["__image__", "log food"]
+blocked_tools_with_image = ["sparky__sparky_manage_food"]
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str)
+            .expect("manifest with auto-activation fields should parse under deny_unknown_fields");
+        assert_eq!(manifest.skill.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(manifest.skill.triggers, vec!["__image__", "log food"]);
+        assert_eq!(
+            manifest.skill.blocked_tools_with_image,
+            vec!["sparky__sparky_manage_food"]
+        );
+    }
+
+    fn activation_skill(name: &str, triggers: &[&str]) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: String::new(),
+            description_localizations: Default::default(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            slash_options: vec![],
+            location: None,
+            provider: Some("openai-codex".to_string()),
+            triggers: triggers.iter().map(|s| (*s).to_string()).collect(),
+            blocked_tools_with_image: vec![],
+        }
+    }
+
+    #[test]
+    fn activation_matches_slash_command_with_hyphen_underscore_and_bot_suffix() {
+        let skills = vec![activation_skill("food-logger", &[])];
+        for msg in [
+            "/food_logger",
+            "/food-logger log this",
+            "/food_logger@mybot hi",
+        ] {
+            let hit = match_skill_activation(&skills, msg, false);
+            assert_eq!(hit.map(|s| s.name.as_str()), Some("food-logger"), "{msg}");
+        }
+        assert!(match_skill_activation(&skills, "/other", false).is_none());
+    }
+
+    #[test]
+    fn activation_matches_trigger_on_word_boundary_only() {
+        let skills = vec![activation_skill("food-logger", &["i had"])];
+        assert!(match_skill_activation(&skills, "I had a burger", false).is_some());
+        // "i had" inside other words must not fire.
+        assert!(match_skill_activation(&skills, "trinidad semihadron", false).is_none());
+    }
+
+    #[test]
+    fn activation_matches_image_sentinel_only_with_image() {
+        let skills = vec![activation_skill("food-logger", &["__image__"])];
+        assert!(match_skill_activation(&skills, "[IMAGE:data:...] what is this", true).is_some());
+        assert!(match_skill_activation(&skills, "what is this", false).is_none());
+    }
+
+    #[test]
+    fn activation_returns_none_without_triggers_or_slash() {
+        let skills = vec![activation_skill("food-logger", &[])];
+        assert!(match_skill_activation(&skills, "hello there", false).is_none());
+        assert!(match_skill_activation(&skills, "hello there", true).is_none());
+    }
+
+    #[test]
+    fn activation_prefers_first_matching_skill_in_order() {
+        let skills = vec![
+            activation_skill("first", &["log food"]),
+            activation_skill("second", &["log food"]),
+        ];
+        let hit = match_skill_activation(&skills, "please log food now", false);
+        assert_eq!(hit.map(|s| s.name.as_str()), Some("first"));
+    }
+
     /// Positive control covering the new field × strictness intersection:
     /// after the rebase onto master (which added `prompts: Vec<String>`
     /// to `SkillMeta` per #5972), the field must continue to parse cleanly
@@ -4259,6 +4443,9 @@ mod prompt_callable_name_tests {
             prompts: Vec::new(),
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let prompt = skills_to_prompt_with_mode(
@@ -4336,6 +4523,9 @@ mod prompt_callable_name_tests {
             prompts: Vec::new(),
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let registered: Vec<String> =
@@ -4375,6 +4565,9 @@ mod prompt_callable_name_tests {
             prompts: Vec::new(),
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let prompt = skills_to_prompt_with_mode(
