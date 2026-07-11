@@ -232,10 +232,34 @@ async fn check_codex_auth_wiring(config: &Config) -> Vec<DiagResult> {
 
 /// Run the full Doctor suite and return the structured result used by CLI and RPC.
 pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
+    let (results, _timed_out) = run_structured_with_timeout(config, None).await;
+    results
+}
+
+/// Run diagnostics with a dedicated timeout on the model-probing phase.
+///
+/// `diagnose` and `check_codex_auth_wiring` are always run. `probe_models`
+/// is wrapped in `tokio::time::timeout`; when the timeout fires, the
+/// results collected so far are returned alongside `timed_out = true`.
+/// A `probe_timeout` of `None` disables the timeout (used by the CLI
+/// path, which has no per-phase timeout contract).
+pub async fn run_structured_with_timeout(
+    config: &Config,
+    probe_timeout: Option<std::time::Duration>,
+) -> (Vec<DiagResult>, bool) {
     let mut results = diagnose(config);
     results.extend(check_codex_auth_wiring(config).await);
-    results.extend(probe_models(config).await);
-    results
+    let mut timed_out = false;
+    match probe_timeout {
+        Some(dur) => match tokio::time::timeout(dur, probe_models(config)).await {
+            Ok(probe_results) => results.extend(probe_results),
+            Err(_elapsed) => timed_out = true,
+        },
+        None => {
+            results.extend(probe_models(config).await);
+        }
+    }
+    (results, timed_out)
 }
 
 /// Run diagnostics and print human-readable report to stdout.

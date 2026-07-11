@@ -172,6 +172,16 @@ impl Doctor {
                 crate::i18n::t("zc-doctor-loading"),
                 theme::dim_style(),
             ));
+        } else if self
+            .result
+            .as_ref()
+            .and_then(|r| r.timed_out_phase.as_deref())
+            .is_some()
+        {
+            spans.push(Span::styled(
+                crate::i18n::t("zc-doctor-partial-results"),
+                severity_style(DoctorSeverity::Warn),
+            ));
         } else if let Some(error) = &self.error {
             spans.push(Span::styled(
                 crate::i18n::t_args("zc-doctor-error", &[("error", error)]),
@@ -551,6 +561,7 @@ mod tests {
                 warnings: 1,
                 errors: 1,
             },
+            timed_out_phase: None,
         }
     }
 

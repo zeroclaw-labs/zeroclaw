@@ -826,9 +826,17 @@ impl RpcDispatcher {
 
     async fn handle_doctor_run(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let results = crate::doctor::run_structured(&config).await;
+        let (results, timed_out) = crate::doctor::run_structured_with_timeout(
+            &config,
+            Some(std::time::Duration::from_secs(20)),
+        )
+        .await;
         let summary = doctor_summary(&results);
-        to_result(DoctorRunResult { results, summary })
+        to_result(DoctorRunResult {
+            results,
+            summary,
+            timed_out_phase: timed_out.then(|| "probe_models".to_string()),
+        })
     }
 
     // ── TUI handlers ─────────────────────────────────────────────

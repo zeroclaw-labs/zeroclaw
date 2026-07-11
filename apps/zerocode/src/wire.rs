@@ -48,6 +48,8 @@ pub struct DoctorSummary {
 pub struct DoctorRunResult {
     pub results: Vec<DoctorResultEntry>,
     pub summary: DoctorSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_phase: Option<String>,
 }
 
 #[cfg(test)]

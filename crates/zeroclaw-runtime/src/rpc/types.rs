@@ -134,6 +134,10 @@ rpc_type! {
     pub struct DoctorRunResult {
         pub results: Vec<DiagResult>,
         pub summary: DoctorSummary,
+        /// Set when `probe_models` timed out and partial results are returned.
+        /// `#[serde(default)]` keeps the wire compatible with older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timed_out_phase: Option<String>,
     }
 }
 
