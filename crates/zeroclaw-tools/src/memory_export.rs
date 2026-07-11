@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::traits::ExportFilter;
 use zeroclaw_memory::{Memory, MemoryCategory};
 
@@ -91,13 +91,13 @@ impl Tool for MemoryExportTool {
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
                 Ok(ToolResult {
                     success: true,
-                    output: json_output,
+                    output: json_output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Export failed: {e}")),
             }),
         }

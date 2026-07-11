@@ -20,7 +20,7 @@ use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
-use zeroclaw::tools::{Tool, ToolResult};
+use zeroclaw::tools::{Tool, ToolOutput, ToolResult};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -132,7 +132,7 @@ impl Tool for NoopTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: true,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: None,
         })
     }

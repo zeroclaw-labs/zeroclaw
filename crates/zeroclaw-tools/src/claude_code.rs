@@ -3,7 +3,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeConfig;
@@ -101,7 +101,7 @@ impl Tool for ClaudeCodeTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -161,7 +161,7 @@ impl Tool for ClaudeCodeTool {
                 Err(_) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "working_directory '{}' does not exist or is not accessible",
                             wd
@@ -174,7 +174,7 @@ impl Tool for ClaudeCodeTool {
                 Err(_) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "workspace directory '{}' does not exist or is not accessible",
                             workspace.display()
@@ -185,7 +185,7 @@ impl Tool for ClaudeCodeTool {
             if !canonical_wd.starts_with(&canonical_ws) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "working_directory '{}' is outside the workspace '{}'",
                         wd,
@@ -295,7 +295,7 @@ impl Tool for ClaudeCodeTool {
 
                     Ok(ToolResult {
                         success: output.status.success(),
-                        output: formatted,
+                        output: formatted.into(),
                         error: if stderr.is_empty() {
                             None
                         } else {
@@ -306,7 +306,7 @@ impl Tool for ClaudeCodeTool {
                     // JSON parse failed — return raw stdout (defensive)
                     Ok(ToolResult {
                         success: output.status.success(),
-                        output: stdout,
+                        output: stdout.into(),
                         error: if stderr.is_empty() {
                             None
                         } else {
@@ -327,7 +327,7 @@ impl Tool for ClaudeCodeTool {
                 };
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 })
             }
@@ -336,7 +336,7 @@ impl Tool for ClaudeCodeTool {
                 // when the future is dropped.
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Claude Code timed out after {}s and was killed",
                         self.config.timeout_secs

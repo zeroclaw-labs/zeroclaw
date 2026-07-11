@@ -413,7 +413,7 @@ const PLUGIN_HOST_BIN_FILE: &str = "zeroclaw-plugin-host";
 async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_mins(5))
         .build()?;
 
     let resp = client
@@ -705,13 +705,13 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
     let binary_arch = detect_arch_from_header(&header);
     let host_arch = host_architecture();
 
-    if let (Some(bin), Some(host)) = (binary_arch, host_arch) {
-        if bin != host {
-            bail!(
-                "architecture mismatch: downloaded binary is {bin} but this host is {host} — \
-                 the release asset may be mispackaged"
-            );
-        }
+    if let (Some(bin), Some(host)) = (binary_arch, host_arch)
+        && bin != host
+    {
+        bail!(
+            "architecture mismatch: downloaded binary is {bin} but this host is {host} — \
+             the release asset may be mispackaged"
+        );
     }
 
     Ok(())
@@ -756,17 +756,16 @@ fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
         if let Some(coff) = pe_off
             .checked_add(6)
             .and_then(|end| header.get(pe_off..end))
+            && &coff[0..4] == b"PE\0\0"
         {
-            if &coff[0..4] == b"PE\0\0" {
-                let machine = u16::from_le_bytes([coff[4], coff[5]]);
-                return match machine {
-                    0x8664 => Some("x86_64"),
-                    0xAA64 => Some("aarch64"),
-                    0x014C => Some("x86"),
-                    0x01C0 => Some("arm"),
-                    _ => None,
-                };
-            }
+            let machine = u16::from_le_bytes([coff[4], coff[5]]);
+            return match machine {
+                0x8664 => Some("x86_64"),
+                0xAA64 => Some("aarch64"),
+                0x014C => Some("x86"),
+                0x01C0 => Some("arm"),
+                _ => None,
+            };
         }
     }
 

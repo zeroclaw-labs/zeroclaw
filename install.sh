@@ -672,6 +672,16 @@ install_web_dist() {
   fi
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
+  # Prune files the fresh build no longer ships. Copy-then-prune keeps
+  # index.html present throughout, so a running gateway never 503s
+  # mid-install, while stale hashed chunks still get removed.
+  (
+    cd "$web_data_dir" || exit 0
+    find . -type f | while IFS= read -r f; do
+      [ -f "$src_dist/$f" ] || rm -f "$f"
+    done
+    find . -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+  )
   info "Web dashboard installed to $web_data_dir"
 }
 
@@ -1196,8 +1206,19 @@ See all available features:
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
   if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
-    # --full installs every discovered app (an explicit --apps still wins).
-    WANT_APPS="$APPS"
+    # --full installs every discovered app (an explicit --apps still wins) —
+    # except Tauri-based apps (tauri.conf.json present): they need the Tauri
+    # toolchain + system webview deps (webkit2gtk/GTK on Linux), which most
+    # machines don't have. Request them explicitly via --apps to opt in.
+    WANT_APPS=""
+    for app in $APPS; do
+      app_path=$(app_dir_for "$app") || continue
+      if [ -f "$app_path/tauri.conf.json" ]; then
+        info "Skipping $app: Tauri app needs system webview deps — install explicitly with --apps $app"
+        continue
+      fi
+      WANT_APPS="${WANT_APPS:+$WANT_APPS }$app"
+    done
   elif [ "$USER_APPS" = "none" ]; then
     WANT_APPS=""
   elif [ -n "$USER_APPS" ]; then

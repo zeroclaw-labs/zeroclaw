@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Edit a file by replacing an exact string match with new content.
@@ -76,7 +76,7 @@ impl Tool for FileEditTool {
         // A successful edit on an ephemeral runtime rewrites a file that never
         // reaches the host and is lost at session end; warn loudly (issue #4627).
         if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
         Ok(result)
     }
@@ -129,7 +129,7 @@ impl FileEditTool {
         if old_string.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("old_string must not be empty".into()),
             });
         }
@@ -138,7 +138,7 @@ impl FileEditTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -153,7 +153,7 @@ impl FileEditTool {
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Invalid path: missing parent directory".into()),
             });
         };
@@ -163,7 +163,7 @@ impl FileEditTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
                 });
             }
@@ -173,7 +173,7 @@ impl FileEditTool {
         if !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&resolved_parent),
@@ -184,7 +184,7 @@ impl FileEditTool {
         let Some(file_name) = full_path.file_name() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Invalid path: missing file name".into()),
             });
         };
@@ -194,7 +194,7 @@ impl FileEditTool {
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .runtime_config_violation_message(&resolved_target),
@@ -208,7 +208,7 @@ impl FileEditTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Refusing to edit through symlink: {}",
                     resolved_target.display()
@@ -222,7 +222,7 @@ impl FileEditTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file: {e}")),
                 });
             }
@@ -233,7 +233,7 @@ impl FileEditTool {
         if match_count == 0 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(no_match_diagnostic(&content, old_string)),
             });
         }
@@ -241,7 +241,7 @@ impl FileEditTool {
         if match_count > 1 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "old_string matches {match_count} times; must match exactly once"
                 )),
@@ -256,12 +256,13 @@ impl FileEditTool {
                 output: format!(
                     "Edited {path}: replaced 1 occurrence ({} bytes)",
                     new_content.len()
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to write file: {e}")),
             }),
         }

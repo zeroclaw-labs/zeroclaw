@@ -159,7 +159,7 @@ impl Tool for WasmTool {
         .await?;
         Ok(ToolResult {
             success: wire.success,
-            output: wire.output,
+            output: wire.output.into(),
             error: wire.error,
         })
     }

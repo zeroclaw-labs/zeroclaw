@@ -136,7 +136,7 @@ pub async fn call_execute(
 fn into_tool_result(result: WitToolResult) -> ToolResult {
     ToolResult {
         success: result.success,
-        output: result.output,
+        output: result.output.into(),
         error: result.error,
     }
 }

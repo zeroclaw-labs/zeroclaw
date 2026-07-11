@@ -4,6 +4,8 @@
 /// Consumers that pattern-match on [`TurnEvent::ToolCall`] or
 /// [`TurnEvent::ToolResult`] should preserve the stable `id` field for
 /// call/result correlation.
+use crate::plan::PlanEntry;
+
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
@@ -24,6 +26,12 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
+    /// The agent published or updated its execution plan (TodoWrite).
+    ///
+    /// Whole-list replacement: `entries` is the complete authoritative
+    /// plan; an empty vec clears it. Downstream consumers replace their
+    /// held plan wholesale — no merge.
+    Plan { entries: Vec<PlanEntry> },
     /// The agent is waiting for the operator to approve, deny, or always-allow
     /// a tool call. The transport (e.g. gateway WebSocket) is expected to
     /// surface this to the operator and route the response back through the
@@ -65,4 +73,29 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+}
+
+#[cfg(test)]
+mod plan_event_tests {
+    use super::*;
+    use crate::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+    #[test]
+    fn plan_turn_event_carries_entries() {
+        let ev = TurnEvent::Plan {
+            entries: vec![PlanEntry {
+                content: "Step one".to_string(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            }],
+        };
+        match ev {
+            TurnEvent::Plan { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].content, "Step one");
+            }
+            _ => panic!("expected TurnEvent::Plan"),
+        }
+    }
 }
