@@ -12,6 +12,51 @@ use crate::media::MediaAttachment;
 /// data (email) can keep this reserved namespace out of inbound subjects.
 pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
+/// The single authority for the channel-SOP event topic grammar
+/// `channel.alias:event_type`. The producer that lifts a forge/platform event
+/// into SOP ingress builds the topic here; the SOP engine parses it here. The
+/// grammar lives in one place so the two sides cannot drift.
+///
+/// `alias` separates from `channel` with `.`; `event_type` separates from the
+/// `channel.alias` head with `:`. A bare `channel` (no alias, no event type)
+/// and the `channel/alias` message form are both accepted by `parse` so the
+/// same matcher serves agent-loop message triggers and forge event triggers.
+pub struct ChannelSopTopic;
+
+impl ChannelSopTopic {
+    const ALIAS_SEP: char = '.';
+    const EVENT_SEP: char = ':';
+    const MESSAGE_ALIAS_SEP: char = '/';
+
+    /// Build a forge/platform event topic `channel.alias:event_type`.
+    #[must_use]
+    pub fn build(channel: &str, alias: &str, event_type: &str) -> String {
+        format!(
+            "{channel}{}{alias}{}{event_type}",
+            Self::ALIAS_SEP,
+            Self::EVENT_SEP
+        )
+    }
+
+    /// Parse a channel-SOP topic into `(channel, alias, event_type)`. The head
+    /// before the event separator yields the channel kind and optional alias;
+    /// the tail after it is the optional event type. Accepts both the forge
+    /// form (`channel.alias:event_type`) and the message form (`channel` or
+    /// `channel/alias`).
+    #[must_use]
+    pub fn parse(topic: &str) -> (&str, Option<&str>, Option<&str>) {
+        let (head, event_type) = match topic.split_once(Self::EVENT_SEP) {
+            Some((before, after)) => (before, Some(after)),
+            None => (topic, None),
+        };
+        let (channel, alias) = head
+            .split_once(Self::ALIAS_SEP)
+            .or_else(|| head.split_once(Self::MESSAGE_ALIAS_SEP))
+            .map_or((head, None), |(c, a)| (c, Some(a)));
+        (channel, alias, event_type)
+    }
+}
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Compact description of a tool call presented to the user for approval.
@@ -314,6 +359,28 @@ impl SendMessage {
     }
 }
 
+/// A low-level, provider-relative forge API request routed through a
+/// forge-backed channel. Channel-neutral so the `Channel` trait carries no
+/// forge-specific types; the git channel maps this onto its provider's
+/// `forge_request`. `method` is an uppercase HTTP verb (`GET`/`POST`/`PATCH`/
+/// `PUT`/`DELETE`); `path` is relative to the provider's API base (e.g.
+/// `repos/owner/repo/issues/12/labels`); `body` is an optional JSON payload.
+#[derive(Debug, Clone)]
+pub struct ForgeApiRequest {
+    pub method: String,
+    pub path: String,
+    pub body: Option<serde_json::Value>,
+}
+
+/// The outcome of a forge API request: the HTTP status and decoded JSON body
+/// (`Null` when the response had no body). Non-2xx statuses are carried here
+/// rather than raised, so the caller inspects the forge's own error envelope.
+#[derive(Debug, Clone)]
+pub struct ForgeApiResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -409,6 +476,21 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         let handle_norm = handle.trim_start_matches('@').to_ascii_lowercase();
         let sender_norm = msg.sender.trim_start_matches('@').to_ascii_lowercase();
         !handle_norm.is_empty() && handle_norm == sender_norm
+    }
+
+    /// Perform a low-level, provider-relative forge API call through this
+    /// channel's forge, when supported. The single transport seam every
+    /// higher-level forge operation (the `git_forge` tool's resource/action
+    /// grid and its `raw` catch-all) is built on: forge-backed channels (the
+    /// git channel) override this and delegate to their provider; all other
+    /// channels return the default unsupported error. Non-2xx responses are
+    /// returned in `ForgeApiResponse`, not raised, so the caller inspects the
+    /// forge's own error envelope.
+    async fn forge_request(&self, _request: ForgeApiRequest) -> anyhow::Result<ForgeApiResponse> {
+        anyhow::bail!(
+            "channel '{}' does not support forge API requests",
+            self.name()
+        )
     }
 
     /// Whether an inbound message is a direct, one-to-one conversation
@@ -634,6 +716,29 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_sop_topic_build_parse_roundtrip() {
+        let topic = ChannelSopTopic::build("git", "main", "pull_request.opened");
+        assert_eq!(topic, "git.main:pull_request.opened");
+        let (channel, alias, event_type) = ChannelSopTopic::parse(&topic);
+        assert_eq!(channel, "git");
+        assert_eq!(alias, Some("main"));
+        assert_eq!(event_type, Some("pull_request.opened"));
+    }
+
+    #[test]
+    fn channel_sop_topic_parses_message_forms() {
+        let (channel, alias, event_type) = ChannelSopTopic::parse("telegram");
+        assert_eq!(channel, "telegram");
+        assert_eq!(alias, None);
+        assert_eq!(event_type, None);
+
+        let (channel, alias, event_type) = ChannelSopTopic::parse("telegram/prod");
+        assert_eq!(channel, "telegram");
+        assert_eq!(alias, Some("prod"));
+        assert_eq!(event_type, None);
+    }
 
     /// Stub channel that overrides `self_handle` so the default
     /// `drop_self_messages` implementation can be exercised.
