@@ -374,24 +374,41 @@ fn risk_options() -> [PickerOption; 3] {
     ]
 }
 
-fn runtime_options() -> [PickerOption; 3] {
-    [
-        opt(
-            "tight",
-            crate::i18n::t("zc-quickstart-runtime-tight"),
-            crate::i18n::t("zc-quickstart-runtime-tight-desc"),
-        ),
-        opt(
-            "balanced",
-            crate::i18n::t("zc-quickstart-runtime-balanced"),
-            crate::i18n::t("zc-quickstart-runtime-balanced-desc"),
-        ),
-        opt(
-            "unbounded",
-            crate::i18n::t("zc-quickstart-runtime-unbounded"),
-            crate::i18n::t("zc-quickstart-runtime-unbounded-desc"),
-        ),
-    ]
+fn runtime_picker_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
+    snapshot
+        .into_iter()
+        .flat_map(|snapshot| &snapshot.runtime_presets)
+        .map(|preset| {
+            let localized = match preset.preset_name.as_str() {
+                "tight" => Some((
+                    "zc-quickstart-runtime-tight",
+                    "zc-quickstart-runtime-tight-desc",
+                )),
+                "local_small" => Some((
+                    "zc-quickstart-runtime-local-small",
+                    "zc-quickstart-runtime-local-small-desc",
+                )),
+                "balanced" => Some((
+                    "zc-quickstart-runtime-balanced",
+                    "zc-quickstart-runtime-balanced-desc",
+                )),
+                "unbounded" => Some((
+                    "zc-quickstart-runtime-unbounded",
+                    "zc-quickstart-runtime-unbounded-desc",
+                )),
+                _ => None,
+            };
+            let (label, help) = localized
+                .map(|(label_key, help_key)| {
+                    (
+                        crate::i18n::try_t(label_key).unwrap_or_else(|| preset.label.clone()),
+                        crate::i18n::try_t(help_key).unwrap_or_else(|| preset.help.clone()),
+                    )
+                })
+                .unwrap_or_else(|| (preset.label.clone(), preset.help.clone()));
+            opt(&preset.preset_name, label, help)
+        })
+        .collect()
 }
 
 fn memory_options() -> Vec<PickerOption> {
@@ -1573,7 +1590,7 @@ impl QuickstartPane {
     fn open_picker_modal(&mut self, sel: Selector) {
         let mut options: Vec<PickerOption> = match sel {
             Selector::RiskProfile => risk_options().to_vec(),
-            Selector::RuntimeProfile => runtime_options().to_vec(),
+            Selector::RuntimeProfile => runtime_picker_options(self.state_snapshot.as_ref()),
             Selector::Memory => memory_options(),
             _ => return,
         };
@@ -1597,6 +1614,9 @@ impl QuickstartPane {
                 }
                 options.push(existing_opt(alias.clone()));
             }
+        }
+        if options.is_empty() {
+            return;
         }
         let cursor = match sel {
             Selector::RiskProfile => options
@@ -1646,8 +1666,10 @@ impl QuickstartPane {
                     }
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    if let Some(expanded) = p.options[p.cursor].existing_provider_toggle_expanded()
-                    {
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if let Some(expanded) = option.existing_provider_toggle_expanded() {
                         p.options =
                             model_provider_picker_options(self.state_snapshot.as_ref(), !expanded);
                         p.cursor = p
@@ -1661,11 +1683,14 @@ impl QuickstartPane {
                             });
                         return;
                     }
-                    if !p.options[p.cursor].is_selectable() {
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if !option.is_selectable() {
                         return;
                     }
-                    let chosen = p.options[p.cursor].value.clone();
-                    let use_existing = p.options[p.cursor].use_existing();
+                    let chosen = option.value.clone();
+                    let use_existing = option.use_existing();
                     let selector = p.selector;
                     let purpose = p.purpose;
                     match (purpose, use_existing) {
@@ -3618,6 +3643,70 @@ mod tests {
         assert_eq!(form.provider_mode, SelectorMode::Existing);
         assert_eq!(form.runtime, "local_small");
         assert!(form.runtime_auto_defaulted);
+    }
+
+    #[test]
+    fn runtime_picker_includes_daemon_advertised_local_small_preset() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![crate::client::QuickstartPresetMirror {
+            preset_name: "local_small".into(),
+            label: "Local small".into(),
+            help: "Safe defaults for local models.".into(),
+        }];
+
+        let options = runtime_picker_options(Some(&snapshot));
+        let local_small = options
+            .iter()
+            .find(|option| option.value == "local_small")
+            .expect("daemon-advertised runtime preset should be selectable");
+
+        assert!(!local_small.use_existing());
+    }
+
+    #[test]
+    fn runtime_picker_localizes_known_presets_and_preserves_unknown_daemon_text() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![
+            crate::client::QuickstartPresetMirror {
+                preset_name: "tight".into(),
+                label: "Daemon Tight".into(),
+                help: "Daemon tight help.".into(),
+            },
+            crate::client::QuickstartPresetMirror {
+                preset_name: "future_runtime".into(),
+                label: "Future Runtime".into(),
+                help: "Future runtime help.".into(),
+            },
+        ];
+
+        let options = runtime_picker_options(Some(&snapshot));
+
+        assert_eq!(
+            options[0].label,
+            crate::i18n::t("zc-quickstart-runtime-tight")
+        );
+        assert_eq!(
+            options[0].help,
+            crate::i18n::t("zc-quickstart-runtime-tight-desc")
+        );
+        assert_eq!(options[1].label, "Future Runtime");
+        assert_eq!(options[1].help, "Future runtime help.");
+    }
+
+    #[tokio::test]
+    async fn runtime_picker_does_not_open_without_advertised_presets() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = std::sync::Arc::new(crate::client::RpcClient::with_rpc(std::sync::Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let reconnect_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, reconnect_state);
+
+        pane.open_picker_modal(Selector::RuntimeProfile);
+
+        assert!(pane.active_modal.is_none());
     }
 
     #[test]
