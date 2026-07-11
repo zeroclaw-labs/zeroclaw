@@ -95,6 +95,28 @@ pub fn should_write_daily(
     }
 }
 
+/// In-turn cross-path check: does this turn's Daily `history_entry` say the same
+/// thing as the SAME turn's Core `memory_update`?
+///
+/// Reuses the existing Jaccard similarity ([`conflict::jaccard_similarity`]) and
+/// the same `dedup_jaccard_threshold` used by the Daily/Core dedup gates - no new
+/// similarity function and no new knob. Gated by [`MemoryConfig::daily_dedup`]
+/// (the existing "don't flood Daily" switch): when it is off, this never skips.
+/// Blank sides never match. This closes the gap where a fact was stored once as a
+/// durable Core row and again as a transient Daily row (there was no
+/// cross-category comparison), so recall surfaced it twice.
+pub fn daily_duplicates_core(history_entry: &str, core_update: &str, cfg: &MemoryConfig) -> bool {
+    if !cfg.daily_dedup {
+        return false;
+    }
+    let history = history_entry.trim();
+    let core = core_update.trim();
+    if history.is_empty() || core.is_empty() {
+        return false;
+    }
+    history == core || conflict::jaccard_similarity(history, core) >= cfg.dedup_jaccard_threshold
+}
+
 /// Outcome of the per-turn Daily dedup gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DailyWrite {
@@ -227,6 +249,47 @@ mod tests {
                 dup_of: String::new()
             }
         );
+    }
+
+    #[test]
+    fn daily_duplicates_core_flags_near_identical_paraphrase() {
+        let cfg = MemoryConfig::default();
+        assert!(cfg.daily_dedup);
+        // Same fact, reworded: high token overlap -> treated as a cross-path dup.
+        let core = "Svetlana is the user's mother and grandmother to Ellie and Vitalik";
+        let daily = "Svetlana is the user's mother and also grandmother to Ellie and Vitalik";
+        assert!(daily_duplicates_core(daily, core, &cfg));
+    }
+
+    #[test]
+    fn daily_duplicates_core_ignores_unrelated_fact() {
+        let cfg = MemoryConfig::default();
+        assert!(!daily_duplicates_core(
+            "User asked what the weather is like today",
+            "The user's birthday is February 24, 1990",
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn daily_duplicates_core_off_when_daily_dedup_disabled() {
+        let cfg = MemoryConfig {
+            daily_dedup: false,
+            ..MemoryConfig::default()
+        };
+        // Even an exact match is not flagged when the gate is off.
+        assert!(!daily_duplicates_core(
+            "same fact here",
+            "same fact here",
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn daily_duplicates_core_ignores_blank_sides() {
+        let cfg = MemoryConfig::default();
+        assert!(!daily_duplicates_core("   ", "a real core fact", &cfg));
+        assert!(!daily_duplicates_core("a real daily summary", "", &cfg));
     }
 
     #[test]
