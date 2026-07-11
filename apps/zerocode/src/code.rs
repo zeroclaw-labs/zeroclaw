@@ -6,15 +6,14 @@ use ratatui::layout::Rect;
 use crate::chat;
 use crate::client::RpcClient;
 
-/// ACP pane — displayed as "Code" in the UI; internal name kept for historical reasons.
-pub(crate) struct Acp {
+pub(crate) struct Code {
     inner: chat::Chat,
 }
 
-impl Acp {
+impl Code {
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: chat::Chat::new(rpc, chat::PaneKind::Code),
         }
     }
 
@@ -40,6 +39,10 @@ impl Acp {
 
     pub(crate) async fn refresh_if_inactive(&mut self) {
         self.inner.refresh_if_inactive().await;
+    }
+
+    pub(crate) async fn focus_agent(&mut self, alias: &str) {
+        self.inner.focus_agent(alias).await;
     }
 
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -89,9 +92,13 @@ impl Acp {
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
     }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
+    }
 }
 
-impl crate::widgets::HelpContext for Acp {
+impl crate::widgets::HelpContext for Code {
     fn help_context(&self) -> crate::widgets::HelpNode {
         self.inner.help_context()
     }

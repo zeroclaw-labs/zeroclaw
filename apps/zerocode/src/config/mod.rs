@@ -42,8 +42,8 @@ impl ChordSpec {
 pub(crate) struct ThemeSection {
     #[serde(default = "default_theme")]
     pub name: String,
-    /// Per-agent theme overrides keyed by agent alias. When the Code or Chat
-    /// pane is focused on an agent listed here, that agent's theme replaces
+    /// Per-agent theme overrides keyed by agent alias. When Code is focused on
+    /// an agent listed here, that agent's theme replaces
     /// the base `name` while the pane is active. Sparse: agents not listed use
     /// the base theme.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -63,6 +63,18 @@ impl Default for ThemeSection {
             name: default_theme(),
             agent_override: HashMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct UiSection {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub show_chat_pane: bool,
+}
+
+impl UiSection {
+    fn is_empty(&self) -> bool {
+        !self.show_chat_pane
     }
 }
 
@@ -122,6 +134,8 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
+    #[serde(default, skip_serializing_if = "UiSection::is_empty")]
+    pub ui: UiSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -134,6 +148,7 @@ impl Default for ZerocodeConfig {
             locale: default_locale(),
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
+            ui: UiSection::default(),
             keybindings: HashMap::new(),
         }
     }
@@ -260,6 +275,15 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             Ok(section) => config.connection = section,
             Err(e) => eprintln!(
                 "zerocode: ignoring [connection] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("ui") {
+        match v.clone().try_into::<UiSection>() {
+            Ok(section) => config.ui = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [ui] in {} ({e}); using default",
                 path.display()
             ),
         }

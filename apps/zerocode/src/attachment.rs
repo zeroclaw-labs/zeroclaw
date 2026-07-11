@@ -4,7 +4,7 @@
 //! values for the `session/prompt` RPC call. Transport-aware: sends
 //! `path` over Unix sockets, `data_b64` over WSS.
 //!
-//! Shared between Chat and ACP panes.
+//! Shared by the Code pane's local and WSS transport paths.
 
 use std::path::PathBuf;
 

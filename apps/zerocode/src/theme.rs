@@ -72,8 +72,8 @@ static ACTIVE_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
 
 /// Per-agent theme overrides, keyed by agent alias. A process-global registry
 /// mirroring `ACTIVE`: the Config pane writes here on assign/clear (live, no
-/// restart), and the app loop reads it each frame to tint the Code/Chat pane
-/// for the focused agent. Lazily created so the static stays const-initialised.
+/// restart), and the app loop reads it each frame to tint Code for the focused
+/// agent. Lazily created so the static stays const-initialised.
 static AGENT_OVERRIDES: RwLock<Option<std::collections::HashMap<String, Theme>>> =
     RwLock::new(None);
 

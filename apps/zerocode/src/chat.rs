@@ -40,7 +40,7 @@ const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const SCROLLBAR_VISIBLE_AFTER: Duration = Duration::from_millis(1200);
 
-// ── Chat pane (tab mode) ─────────────────────────────────────────
+// ── Code transcript pane ─────────────────────────────────────────
 
 enum ChatPhase {
     /// Showing agent picker (or loading the list).
@@ -68,11 +68,10 @@ enum ChatPhase {
     Error(String),
 }
 
-/// Distinguishes which kind of chat pane this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneKind {
+    Code,
     Chat,
-    Acp,
 }
 
 impl PaneKind {
@@ -81,11 +80,10 @@ impl PaneKind {
         crate::i18n::t(self.fluent_key())
     }
 
-    /// Stable Fluent key for this pane's display name.
     pub(crate) fn fluent_key(self) -> &'static str {
         match self {
-            PaneKind::Chat => "zc-chat-pane-chat",
-            PaneKind::Acp => "zc-chat-pane-acp",
+            PaneKind::Code => "zc-pane-code",
+            PaneKind::Chat => "zc-pane-chat",
         }
     }
 }
@@ -198,9 +196,9 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
-// Whether returning to a chat-style pane (Code/Chat) should re-fetch the agent
-// list. True for the error screen (e.g. a stale "no agents yet" left over from a
-// fresh install) AND for the agent picker, so an agent created elsewhere —
+// Whether returning to Code should re-fetch the agent list. True for the error
+// screen (e.g. a stale "no agents yet" left over from a fresh install) AND for
+// the agent picker, so an agent created elsewhere —
 // Quickstart or manual Config — shows up without a reconnect. `Active` /
 // `PickCwd` are intentionally excluded: a live session or an in-flight
 // directory pick must not be torn down just to refresh a list.
@@ -423,7 +421,8 @@ impl Chat {
             self.start_session(agent_alias, None).await;
             return;
         }
-        if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
+        if self.pane_kind == PaneKind::Code
+            && self.rpc.transport() == crate::client::Transport::Wss
         {
             // Remote ACP: start from the daemon root, not a local path.
             let start_dir = std::path::PathBuf::from("/");
@@ -441,20 +440,17 @@ impl Chat {
 
     /// Public entry point for "start a session against this specific
     /// agent." Used by the Quickstart pane on Stage 2 to route the
-    /// user into the freshly-created agent's chat.
+    /// user into the freshly-created agent's Code session.
     pub(crate) async fn focus_agent(&mut self, agent_alias: &str) {
         self.pick_or_start_session(agent_alias).await;
     }
 
-    /// Re-sync the agent list when the user returns to a chat-style pane.
+    /// Re-sync the agent list when the user returns to Code.
     ///
-    /// Two cases this covers, both for agents created while the pane sat
-    /// untouched: a stale "no agents" error from a fresh install, and the
-    /// agent picker missing an agent added via Quickstart or manual Config.
-    /// Quickstart's freshly-created agent is handed straight to Chat via
-    /// `focus_agent()`, but the *other* chat-style pane (and the picker in
-    /// general) only learns about new agents through this hook — the
-    /// Dashboard stays current on its own because it polls `agents/status`.
+    /// Covers agents created while the pane sat untouched: a stale "no agents"
+    /// error from a fresh install, or a picker missing an agent added via
+    /// Quickstart or Config. The Dashboard stays current on its own because it
+    /// polls `agents/status`.
     pub(crate) async fn refresh_if_inactive(&mut self) {
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
@@ -482,8 +478,8 @@ impl Chat {
         }
 
         // Reattach to a carried-over session on reconnect (one-shot); else a
-        // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
-        // the daemon-retained session, its persisted history, and its cwd.
+        // fresh session. `session_new_acp` with Some(id) restores the
+        // daemon-retained session, its persisted history, and its cwd.
         let resume = self.resume_session_id.take();
         // A resume must not re-point the session at the TUI's launch directory:
         // pass no cwd so the daemon keeps the retained session's own cwd. Only
@@ -503,7 +499,7 @@ impl Chat {
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
         };
-        let result = if self.pane_kind == PaneKind::Acp {
+        let result = if self.pane_kind == PaneKind::Code {
             self.rpc
                 .session_new_acp(agent_alias, cwd_str.as_deref(), resume.as_deref())
                 .await
@@ -520,8 +516,7 @@ impl Chat {
                     agent_alias.to_string(),
                     self.todo_settings,
                 );
-                // Only ACP shows the working directory above the input bar.
-                if self.pane_kind == PaneKind::Acp {
+                if self.pane_kind == PaneKind::Code {
                     state.cwd = session.workspace_dir;
                 }
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
@@ -590,8 +585,8 @@ impl Chat {
         state: &mut ChatState,
     ) -> Option<ChatPhase> {
         let alias = state.agent_alias.clone();
-        if pane_kind == PaneKind::Acp && rpc.transport() == crate::client::Transport::Wss {
-            // For WSS ACP, go through the CWD picker for new sessions too.
+        if pane_kind == PaneKind::Code && rpc.transport() == crate::client::Transport::Wss {
+            // For WSS Code, go through the CWD picker for new sessions too.
             let _ = rpc.session_close(&state.session_id).await;
             // Remote ACP picker must start from a path the daemon understands.
             let start_dir = std::path::PathBuf::from("/");
@@ -607,7 +602,7 @@ impl Chat {
             None
         };
         let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
-        let new_session = if pane_kind == PaneKind::Acp {
+        let new_session = if pane_kind == PaneKind::Code {
             rpc.session_new_acp(&alias, cwd_str, None).await
         } else {
             rpc.session_new(&alias, cwd_str).await
@@ -617,7 +612,7 @@ impl Chat {
                 let old_session_id = state.session_id.clone();
                 let _ = rpc.session_close(&old_session_id).await;
                 state.reset_for_session(s.session_id, None);
-                if pane_kind == PaneKind::Acp {
+                if pane_kind == PaneKind::Code {
                     state.cwd = s.workspace_dir;
                 }
                 Self::refresh_model_identity(rpc, state).await;
@@ -1551,10 +1546,7 @@ impl Chat {
                 }
                 InputBarAction::RestartSession => {
                     let rpc = self.rpc.clone();
-                    let pane_kind = self.pane_kind;
-                    if let Some(next_phase) =
-                        Self::restart_session_for_state(&rpc, pane_kind, state).await
-                    {
+                    if let Some(next_phase) = Self::restart_session_for_state(&rpc, state).await {
                         self.phase = next_phase;
                     }
                     return false;
@@ -1700,19 +1692,14 @@ impl Chat {
             }
             Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
                 let rpc = self.rpc.clone();
-                let pane_kind = self.pane_kind;
                 if let Some(next_phase) =
-                    Self::restart_session_for_state(&rpc, pane_kind, state).await
+                    Self::restart_session_for_state(&rpc, self.pane_kind, state).await
                 {
                     self.phase = next_phase;
                 }
             }
             Some(ChatTabAction::SwitchSession) if !state.turn_in_flight => {
-                // ACP and Chat live in separate stores and must not cross-pick:
-                //  • Chat → unified session_backend (filter out channel-backed
-                //    sessions; those are owned by the channels pane).
-                //  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
-                let picker_sessions = if self.pane_kind == PaneKind::Acp {
+                let picker_sessions = if self.pane_kind == PaneKind::Code {
                     self.rpc
                         .acp_session_list()
                         .await
@@ -1723,7 +1710,7 @@ impl Chat {
                         Ok(list) => list
                             .sessions
                             .into_iter()
-                            .filter(|s| s.channel_id.is_none())
+                            .filter(|session| session.channel_id.is_none())
                             .collect(),
                         Err(_) => Vec::new(),
                     }
@@ -3103,8 +3090,8 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Transient info-bar messages (queue/attach notices, model-switch notes)
     // render at the app level via InfoBar from `state.info_message`. The paused
-    // queue shows as ghost text in the empty input box below, so the chat pane
-    // hands its full area to the input bar here.
+    // queue shows as ghost text in the empty input box below, so Code hands its
+    // full area to the input bar here.
     let input_area = area;
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
@@ -7112,7 +7099,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         chat.phase = ChatPhase::Active(Box::new(state()));
         if let ChatPhase::Active(s) = &mut chat.phase {
             s.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
@@ -7135,7 +7122,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         chat.phase = ChatPhase::Active(Box::new(state()));
         // Not modal before the prompt arrives (empty input → command mode).
         assert!(!chat.wants_text_input());
@@ -7183,7 +7170,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Chat::new(client, PaneKind::Code);
         // No session yet → None.
         assert_eq!(chat.current_session_id(), None);
         chat.phase = ChatPhase::Active(Box::new(state()));
@@ -7196,7 +7183,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Chat::new(client, PaneKind::Code);
         chat.set_resume_session_id(Some("sess-prev".to_string()));
 
         let init = tokio::spawn(async move {
@@ -7238,7 +7225,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         chat.set_resume_session_id(Some("sess-prev".to_string()));
         chat.set_resume_agent_alias(Some("beta".to_string()));
 
@@ -7276,8 +7263,8 @@ mod tests {
         let id = request["id"].as_str().unwrap().to_string();
         rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
 
-        // Third request must be session_new_with_id carrying the prior id for
-        // the prior agent — NOT a fresh pick / fresh session. This is the whole
+        // Third request must carry the prior id for the prior agent, not a
+        // fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -7654,7 +7641,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         chat.phase = ChatPhase::PickAgent {
@@ -7962,7 +7949,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         let mut state = state();
         state
             .entries
@@ -8123,7 +8110,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         chat.phase = ChatPhase::Error("No enabled agents yet.".to_string());
 
         let refresh = tokio::spawn(async move {
@@ -8169,11 +8156,11 @@ mod tests {
         // Re-entering the pane while parked on the picker must re-fetch the
         // agent list so an agent created elsewhere (Quickstart / Config) shows
         // up — and the existing highlight must survive the refresh. Regression
-        // for "new agent missing from Code/Chat tab when agents already exist".
+        // for "new agent missing from Code when agents already exist".
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Chat::new(client, PaneKind::Code);
         let mut list_state = ListState::default();
         list_state.select(Some(1)); // user has "beta" highlighted
         chat.phase = ChatPhase::PickAgent {

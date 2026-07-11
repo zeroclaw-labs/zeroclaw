@@ -1,8 +1,7 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
 //!
-//! Embedded by both Chat and ACP panes — each pane owns its own
-//! `InputBarState` instance with independent state.
+//! Embedded by the Code pane, which owns its own `InputBarState` instance.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -489,7 +488,7 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
 
 // ── State ────────────────────────────────────────────────────────
 
-/// Input bar state. Each pane (Chat, ACP) owns its own instance.
+/// Input bar state owned by the Code pane.
 #[derive(Debug)]
 pub(crate) struct InputBarState {
     input: String,
@@ -1573,7 +1572,7 @@ impl InputBarState {
                 (String::new(), theme::dim_style())
             } else {
                 (
-                    crate::i18n::t("zc-input-placeholder-chat"),
+                    crate::i18n::t("zc-input-placeholder-code"),
                     theme::dim_style(),
                 )
             };

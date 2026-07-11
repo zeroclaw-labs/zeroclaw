@@ -87,7 +87,7 @@ zc-zerocode-agent-theme-hint = { $assign } assign theme   ·   { $clear } clear 
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
-zc-input-placeholder-chat = Type to chat
+zc-input-placeholder-code = Type a coding request
 
 zc-input-help-slash-commands = Slash commands
 zc-input-help-completions-navigate = Navigate completions
@@ -330,7 +330,7 @@ zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents ca
 zc-quickstart-help-external-peers = Comma- or newline-separated. Blank = no external peers.
 
 zc-quickstart-status-submitting = Submitting…
-zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat will open when reconnected…
+zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Code will open when reconnected…
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
@@ -354,8 +354,6 @@ zc-quickstart-no-template = No template is available for `{ $filename }`
 zc-quickstart-agent-name-field = name
 zc-quickstart-file-bytes = { $bytes } bytes
 
-zc-chat-pane-chat = Chat
-zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }

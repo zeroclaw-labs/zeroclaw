@@ -11,9 +11,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::acp;
 use crate::chat;
 use crate::client::{ConnectionState, RpcClient};
+use crate::code;
 use crate::config;
 use crate::config_manager;
 use crate::dashboard;
@@ -22,13 +22,12 @@ use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
 use crate::quickstart_pane;
-use crate::sop_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
-/// Pending Quickstart chat transition.
+/// Pending Quickstart Code transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingQuickstartChat {
+pub enum PendingQuickstartCode {
     /// Open the created agent after the daemon reconnects.
     AfterReconnect(String),
     /// Open the created agent on the current live connection.
@@ -37,38 +36,45 @@ pub enum PendingQuickstartChat {
 
 /// State that must survive a reconnect — used by Quickstart's
 /// Stage-2 flow to route the user into the freshly-created agent's
-/// chat after the daemon comes back up.
+/// Code after the daemon comes back up.
 #[derive(Debug, Default)]
 pub struct CrossReconnectState {
     /// The single pending handoff target for Quickstart-created agents.
-    pub pending_quickstart_chat: Option<PendingQuickstartChat>,
+    pub pending_quickstart_code: Option<PendingQuickstartCode>,
 }
 
 pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuickstartChatDrain {
-    Immediate,
-    AfterReconnect,
-}
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-/// SOP authoring is not exposed from any build: the web dashboard ships as the
-/// first experimental release while the TUI pane cooks longer. `Mode::Sop` is
-/// deliberately absent here so the pane is unreachable from navigation
-/// regardless of feature selection.
-const MODES: &[Mode] = &[
+const DEFAULT_MODES: [Mode; 6] = [
     Mode::Dashboard,
     Mode::Config,
-    Mode::Acp,
+    Mode::Code,
+    Mode::Logs,
+    Mode::Doctor,
+    Mode::Quickstart,
+];
+
+const CHAT_MODES: [Mode; 7] = [
+    Mode::Dashboard,
+    Mode::Config,
+    Mode::Code,
     Mode::Chat,
     Mode::Logs,
     Mode::Doctor,
     Mode::Quickstart,
 ];
+
+fn visible_modes(show_chat_pane: bool) -> &'static [Mode] {
+    if show_chat_pane {
+        &CHAT_MODES
+    } else {
+        &DEFAULT_MODES
+    }
+}
 
 // ── Mode enum ────────────────────────────────────────────────────
 
@@ -77,12 +83,10 @@ enum Mode {
     Dashboard,
     Config,
     Doctor,
-    Acp, // displayed as "Code" in the UI
+    Code,
     Chat,
     Logs,
     Quickstart,
-    #[allow(dead_code)]
-    Sop,
 }
 
 impl Mode {
@@ -91,22 +95,22 @@ impl Mode {
             Mode::Dashboard => "zc-pane-dashboard",
             Mode::Config => "zc-pane-config",
             Mode::Doctor => "zc-pane-doctor",
-            Mode::Acp => "zc-pane-code",
+            Mode::Code => "zc-pane-code",
             Mode::Chat => "zc-pane-chat",
             Mode::Logs => "zc-pane-logs",
             Mode::Quickstart => "zc-pane-quickstart",
-            Mode::Sop => "zc-pane-sop",
         }
     }
 
-    fn cycle(self, offset: isize) -> Mode {
-        let len = MODES.len() as isize;
-        let cur = MODES
+    fn cycle(self, offset: isize, show_chat_pane: bool) -> Mode {
+        let modes = visible_modes(show_chat_pane);
+        let len = modes.len() as isize;
+        let cur = modes
             .iter()
             .position(|m| *m == self)
-            .expect("mode missing from MODES") as isize;
+            .expect("mode missing from visible modes") as isize;
         let next = ((cur + offset).rem_euclid(len)) as usize;
-        MODES[next]
+        modes[next]
     }
 }
 
@@ -115,59 +119,43 @@ async fn switch_mode(
     next: Mode,
     conn_state: &ConnectionState,
     quickstart: &mut quickstart_pane::QuickstartPane,
-    acp_pane: &mut acp::Acp,
+    code_pane: &mut code::Code,
     chat_pane: &mut chat::Chat,
-    sop_pane: &mut sop_pane::SopPane,
 ) {
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
         quickstart.dismiss_beacon().await;
     }
     if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
         match next {
-            Mode::Acp => acp_pane.refresh_if_inactive().await,
+            Mode::Code => code_pane.refresh_if_inactive().await,
             Mode::Chat => chat_pane.refresh_if_inactive().await,
-            Mode::Sop => sop_pane.refresh().await,
             _ => {}
         }
     }
     *mode = next;
 }
 
-fn take_pending_quickstart_chat(
-    reconnect_state: &SharedReconnectState,
-    drain: QuickstartChatDrain,
-) -> Option<String> {
-    let Ok(mut guard) = reconnect_state.lock() else {
-        return None;
-    };
-    let pending = guard.pending_quickstart_chat.take()?;
-    match (drain, pending) {
-        (QuickstartChatDrain::Immediate, PendingQuickstartChat::Immediate(alias))
-        | (QuickstartChatDrain::AfterReconnect, PendingQuickstartChat::AfterReconnect(alias)) => {
-            Some(alias)
-        }
-        (_, other) => {
-            guard.pending_quickstart_chat = Some(other);
-            None
-        }
-    }
-}
-
-async fn consume_pending_quickstart_chat(
-    conn_state: &ConnectionState,
+async fn consume_immediate_start_code(
     reconnect_state: &SharedReconnectState,
     mode: &mut Mode,
-    chat_pane: &mut chat::Chat,
+    code_pane: &mut code::Code,
 ) {
-    if matches!(conn_state, ConnectionState::Disconnected { .. }) {
-        return;
-    }
-    let Some(alias) = take_pending_quickstart_chat(reconnect_state, QuickstartChatDrain::Immediate)
-    else {
-        return;
+    let alias = {
+        let Ok(mut guard) = reconnect_state.lock() else {
+            return;
+        };
+        match guard.pending_quickstart_code.take() {
+            Some(PendingQuickstartCode::Immediate(alias)) => Some(alias),
+            other => {
+                guard.pending_quickstart_code = other;
+                None
+            }
+        }
     };
-    chat_pane.focus_agent(&alias).await;
-    *mode = Mode::Chat;
+    if let Some(alias) = alias {
+        code_pane.focus_agent(&alias).await;
+        *mode = Mode::Code;
+    }
 }
 
 // ── Top-level entry point ────────────────────────────────────────
@@ -188,10 +176,13 @@ pub async fn run(
     owns_ephemeral: bool,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    let show_chat_pane = config::ensure_and_load(config_dir)
+        .map(|config| config.ui.show_chat_pane)
+        .unwrap_or(false);
     // Per-agent theme overrides live in a process-global registry (theme.rs),
     // mirroring how the global theme works: the Config pane writes there on
     // assign/clear so changes apply live, and the draw loop reads it each frame
-    // to tint the Code/Chat pane for the focused agent. Seed it once from config
+    // to tint the Code pane for the focused agent. Seed it once from config
     // here; an unknown override name resolves to the terminal theme rather than
     // aborting.
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
@@ -218,15 +209,15 @@ pub async fn run(
     // (Re)build the full pane set against the current `rpc`. Used at
     // startup and again after each reconnect so panes re-subscribe to the
     // new client's notification channel (a stale `notif_rx` would leave
-    // chat/logs silently deaf). Consumes any pending Quickstart Stage-2
-    // intent so a freshly-created agent lands directly in Chat.
+    // Code/logs silently deaf). Consumes any pending Quickstart Stage-2
+    // intent so a freshly-created agent lands directly in Code.
     //
     // Evaluates to `anyhow::Result<(panes…)>`: startup unwraps with `?`,
     // but the recovery path treats a mid-init failure (daemon flapped
     // again) as a transient disconnect and stays in the loop rather than
     // tearing down the TUI.
     macro_rules! build_panes {
-        ($resume_chat:expr, $resume_acp:expr) => {
+        ($resume_code:expr) => {
             async {
                 let mut dashboard_pane =
                     dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
@@ -234,40 +225,42 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
-                let mut acp_pane = acp::Acp::new(rpc.clone());
+                let mut code_pane = code::Code::new(rpc.clone());
                 // Carry the pre-disconnect session across a reconnect rebuild so
                 // the rebuilt pane resumes the daemon-retained session (#7182)
                 // instead of minting a fresh one. None on first build.
-                acp_pane.set_resume_session_id($resume_acp.0);
-                acp_pane.set_resume_agent_alias($resume_acp.1);
-                acp_pane.init().await?;
+                code_pane.set_resume_session_id($resume_code.0);
+                code_pane.set_resume_agent_alias($resume_code.1);
+                code_pane.init().await?;
                 let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
-                chat_pane.set_resume_session_id($resume_chat.0);
-                chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
-                let pending_start_chat = take_pending_quickstart_chat(
-                    &reconnect_state,
-                    QuickstartChatDrain::AfterReconnect,
-                );
+                let pending_start_code = {
+                    let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
+                    match guard.pending_quickstart_code.take() {
+                        Some(PendingQuickstartCode::AfterReconnect(alias)) => Some(alias),
+                        other => {
+                            guard.pending_quickstart_code = other;
+                            None
+                        }
+                    }
+                };
                 let mut logs_pane = logs::Logs::new(rpc.clone());
                 logs_pane.init().await?;
                 let mut quickstart =
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
-                let sop_pane = sop_pane::SopPane::new(rpc.clone());
-                if let Some(alias) = pending_start_chat {
-                    chat_pane.focus_agent(&alias).await;
-                    mode = Mode::Chat;
+                if let Some(alias) = pending_start_code {
+                    code_pane.focus_agent(&alias).await;
+                    mode = Mode::Code;
                 }
                 anyhow::Ok((
                     dashboard_pane,
                     config_app,
                     doctor_pane,
-                    acp_pane,
+                    code_pane,
                     chat_pane,
                     logs_pane,
                     quickstart,
-                    sop_pane,
                 ))
             }
             .await
@@ -278,15 +271,11 @@ pub async fn run(
         mut dashboard_pane,
         mut config_app,
         mut doctor_pane,
-        mut acp_pane,
+        mut code_pane,
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
-        mut sop_pane,
-    ) = build_panes!(
-        (None::<String>, None::<String>),
-        (None::<String>, None::<String>)
-    )?;
+    ) = build_panes!((None::<String>, None::<String>))?;
 
     loop {
         // Draw
@@ -295,7 +284,8 @@ pub async fn run(
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
         }
-        // Per-agent theme override: while the Code or Chat pane is focused on
+
+        // Per-agent theme override: while the Code pane is focused on
         // an agent with a configured override, swap that palette in for the
         // whole frame (backdrop, pane, bars) so the pane reads cohesively, then
         // restore the base theme after drawing. The base theme is whatever the
@@ -303,7 +293,7 @@ pub async fn run(
         // still take effect for non-overridden panes.
         let base_theme = theme::active_raw();
         let frame_theme = match mode {
-            Mode::Acp => acp_pane.selected_agent().and_then(theme::agent_override),
+            Mode::Code => code_pane.selected_agent().and_then(theme::agent_override),
             Mode::Chat => chat_pane.selected_agent().and_then(theme::agent_override),
             _ => None,
         };
@@ -325,6 +315,7 @@ pub async fn run(
             // The info bar appears as a dedicated row between the content and
             // the status bar, only while the active pane has a message to show.
             let info_message = match mode {
+                Mode::Code => code_pane.info_message().cloned(),
                 Mode::Chat => chat_pane.info_message().cloned(),
                 _ => None,
             };
@@ -349,18 +340,17 @@ pub async fn run(
                 .split(frame.area());
 
             bar_area = chunks[0];
-            draw_mode_bar(frame, chunks[0], mode);
+            draw_mode_bar(frame, chunks[0], mode, show_chat_pane);
             content_area = chunks[1];
 
             match mode {
                 Mode::Dashboard => dashboard_pane.draw(frame, chunks[1]),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
                 Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
-                Mode::Acp => acp_pane.draw(frame, chunks[1]),
+                Mode::Code => code_pane.draw(frame, chunks[1]),
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
-                Mode::Sop => sop_pane.render(frame, chunks[1]),
             }
 
             let status_idx = if has_info {
@@ -376,13 +366,13 @@ pub async fn run(
             };
 
             let (ctx_input, ctx_max) = match mode {
+                Mode::Code => code_pane.ctx_tokens(),
                 Mode::Chat => chat_pane.ctx_tokens(),
-                Mode::Acp => acp_pane.ctx_tokens(),
                 _ => (None, None),
             };
             let browse_mode = match mode {
+                Mode::Code => code_pane.in_browse_mode(),
                 Mode::Chat => chat_pane.in_browse_mode(),
-                Mode::Acp => acp_pane.in_browse_mode(),
                 _ => false,
             };
             draw_status_bar(
@@ -424,11 +414,10 @@ pub async fn run(
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
                     Mode::Doctor => doctor_pane.help_context(),
-                    Mode::Acp => acp_pane.help_context(),
+                    Mode::Code => code_pane.help_context(),
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
                     Mode::Quickstart => quickstart.help_context(),
-                    Mode::Sop => sop_pane.help_context(),
                 };
                 node.children.push(pane_node);
                 draw_help_modal(frame, frame.area(), &node);
@@ -506,24 +495,18 @@ pub async fn run(
                         // sessions instead of starting fresh. The agent alias
                         // rides along so a multi-agent reconnect reattaches to
                         // the right agent rather than dropping the session.
-                        let resume_chat = (
-                            chat_pane.current_session_id().map(String::from),
-                            chat_pane.current_agent_alias().map(String::from),
+                        let resume_code = (
+                            code_pane.current_session_id().map(String::from),
+                            code_pane.current_agent_alias().map(String::from),
                         );
-                        let resume_acp = (
-                            acp_pane.current_session_id().map(String::from),
-                            acp_pane.current_agent_alias().map(String::from),
-                        );
-                        match build_panes!(resume_chat, resume_acp) {
+                        match build_panes!(resume_code) {
                             Ok(panes) => {
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
                                 doctor_pane = panes.2;
-                                acp_pane = panes.3;
-                                chat_pane = panes.4;
-                                logs_pane = panes.5;
-                                quickstart = panes.6;
-                                sop_pane = panes.7;
+                                code_pane = panes.3;
+                                logs_pane = panes.4;
+                                quickstart = panes.5;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -560,13 +543,6 @@ pub async fn run(
             if mode == Mode::Quickstart {
                 quickstart.tick().await;
             }
-            consume_pending_quickstart_chat(
-                &conn_state,
-                &reconnect_state,
-                &mut mode,
-                &mut chat_pane,
-            )
-            .await;
             continue;
         }
 
@@ -580,11 +556,10 @@ pub async fn run(
                     Mode::Dashboard => dashboard_pane.wants_text_input(),
                     Mode::Config => config_app.wants_text_input(),
                     Mode::Doctor => doctor_pane.wants_text_input(),
-                    Mode::Acp => acp_pane.wants_text_input(),
+                    Mode::Code => code_pane.wants_text_input(),
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
                     Mode::Quickstart => quickstart.wants_text_input(),
-                    Mode::Sop => false,
                 };
                 let global = GlobalAction::from_chord(&key);
 
@@ -606,22 +581,17 @@ pub async fn run(
                     continue;
                 }
 
-                let pane_wants_quit_chord = match mode {
-                    Mode::Chat => chat_pane.wants_quit_chord(),
-                    Mode::Acp => acp_pane.wants_quit_chord(),
-                    _ => false,
-                };
-                if global == Some(GlobalAction::Quit) && !pane_wants_quit_chord {
+                if global == Some(GlobalAction::Quit) {
                     // First Ctrl+C: clear input bar text, clear transient
                     // state (browse mode, overlay, …) and arm the confirm modal.
                     match mode {
+                        Mode::Code => {
+                            code_pane.exit_browse_mode();
+                            code_pane.clear_input();
+                        }
                         Mode::Chat => {
                             chat_pane.exit_browse_mode();
                             chat_pane.clear_input();
-                        }
-                        Mode::Acp => {
-                            acp_pane.exit_browse_mode();
-                            acp_pane.clear_input();
                         }
                         _ => {}
                     }
@@ -669,8 +639,8 @@ pub async fn run(
                 }
 
                 let switch_to: Option<Mode> = match global {
-                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
-                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
+                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1, show_chat_pane)),
+                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1, show_chat_pane)),
                     _ => None,
                 };
                 if let Some(next) = switch_to {
@@ -679,18 +649,15 @@ pub async fn run(
                         next,
                         &conn_state,
                         &mut quickstart,
-                        &mut acp_pane,
+                        &mut code_pane,
                         &mut chat_pane,
-                        &mut sop_pane,
                     )
                     .await;
                     continue;
                 }
 
-                let help_bypasses_text_input = crate::keymap::help_bypasses_text_input(&key);
-                if global == Some(GlobalAction::Help)
-                    && (!in_text_input || help_bypasses_text_input)
-                {
+                // `?` opens help unless pane is in text-input mode.
+                if global == Some(GlobalAction::Help) && !in_text_input {
                     show_help = true;
                     continue;
                 }
@@ -705,11 +672,10 @@ pub async fn run(
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, term).await?,
                     Mode::Doctor => doctor_pane.handle_key(key).await,
-                    Mode::Acp => acp_pane.handle_key(key, term).await,
+                    Mode::Code => code_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
                     Mode::Quickstart => quickstart.handle_key(key).await,
-                    Mode::Sop => sop_pane.handle_key(key).await,
                 };
                 if quit {
                     break;
@@ -720,19 +686,12 @@ pub async fn run(
                         Mode::Dashboard,
                         &conn_state,
                         &mut quickstart,
-                        &mut acp_pane,
+                        &mut code_pane,
                         &mut chat_pane,
-                        &mut sop_pane,
                     )
                     .await;
                 }
-                consume_pending_quickstart_chat(
-                    &conn_state,
-                    &reconnect_state,
-                    &mut mode,
-                    &mut chat_pane,
-                )
-                .await;
+                consume_immediate_start_code(&reconnect_state, &mut mode, &mut code_pane).await;
             }
             Event::Mouse(mouse) => {
                 // Dismiss help on any click
@@ -744,7 +703,8 @@ pub async fn run(
                 }
                 // Mode bar clicks
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    let labels: Vec<(&str, String)> = MODES
+                    let modes = visible_modes(show_chat_pane);
+                    let labels: Vec<(&str, String)> = modes
                         .iter()
                         .map(|m| ("", format!(" {} ", crate::i18n::t(m.fluent_key()))))
                         .collect();
@@ -753,15 +713,14 @@ pub async fn run(
                     if let Some(n) =
                         mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
                     {
-                        let next = MODES[(n - 1) as usize];
+                        let next = modes[(n - 1) as usize];
                         switch_mode(
                             &mut mode,
                             next,
                             &conn_state,
                             &mut quickstart,
-                            &mut acp_pane,
+                            &mut code_pane,
                             &mut chat_pane,
-                            &mut sop_pane,
                         )
                         .await;
                         continue;
@@ -791,9 +750,8 @@ pub async fn run(
                                             Mode::Config,
                                             &conn_state,
                                             &mut quickstart,
-                                            &mut acp_pane,
+                                            &mut code_pane,
                                             &mut chat_pane,
-                                            &mut sop_pane,
                                         )
                                         .await;
                                     }
@@ -809,8 +767,8 @@ pub async fn run(
                         Mode::Logs => {
                             logs_pane.handle_mouse(mouse, content_area);
                         }
-                        Mode::Acp => {
-                            acp_pane.handle_mouse(mouse, content_area).await;
+                        Mode::Code => {
+                            code_pane.handle_mouse(mouse, content_area).await;
                         }
                         Mode::Chat => {
                             chat_pane.handle_mouse(mouse, content_area).await;
@@ -818,37 +776,20 @@ pub async fn run(
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
-                        Mode::Sop => {
-                            sop_pane.handle_mouse(mouse).await;
-                        }
                     }
-                    consume_pending_quickstart_chat(
-                        &conn_state,
-                        &reconnect_state,
-                        &mut mode,
-                        &mut chat_pane,
-                    )
-                    .await;
+                    consume_immediate_start_code(&reconnect_state, &mut mode, &mut code_pane).await;
                 }
             }
             Event::Paste(text) if !matches!(conn_state, ConnectionState::Disconnected { .. }) => {
                 match mode {
+                    Mode::Code => code_pane.handle_paste(&text),
                     Mode::Chat => chat_pane.handle_paste(&text),
-                    Mode::Acp => acp_pane.handle_paste(&text),
                     Mode::Config => config_app.handle_paste(&text),
                     Mode::Doctor => doctor_pane.handle_paste(&text),
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
-                    Mode::Sop => {}
                 }
-                consume_pending_quickstart_chat(
-                    &conn_state,
-                    &reconnect_state,
-                    &mut mode,
-                    &mut chat_pane,
-                )
-                .await;
             }
             _ => {} // Resize, etc. — just redraw on next iteration
         }
@@ -880,11 +821,12 @@ fn resolve_agent_overrides(
 
 // ── Mode bar ─────────────────────────────────────────────────────
 
-fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
+fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode, show_chat_pane: bool) {
     use ratatui::widgets::Tabs;
 
-    let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
-    let titles: Vec<ratatui::text::Line> = MODES
+    let modes = visible_modes(show_chat_pane);
+    let active_idx = modes.iter().position(|m| *m == active).unwrap_or(0);
+    let titles: Vec<ratatui::text::Line> = modes
         .iter()
         .map(|m| {
             let label = crate::i18n::t(m.fluent_key());
@@ -1326,58 +1268,4 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
         Paragraph::new(Span::styled(text, theme::body_style())).style(theme::fill_style()),
         inner,
     );
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quickstart_chat_handoff_consumes_immediate_target() {
-        let state = SharedReconnectState::default();
-        {
-            let mut guard = state.lock().unwrap();
-            guard.pending_quickstart_chat = Some(PendingQuickstartChat::Immediate("scout".into()));
-        }
-
-        assert_eq!(
-            take_pending_quickstart_chat(&state, QuickstartChatDrain::Immediate),
-            Some("scout".into())
-        );
-        assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
-    }
-
-    #[test]
-    fn quickstart_chat_handoff_immediate_drain_preserves_after_reconnect_target() {
-        let state = SharedReconnectState::default();
-        {
-            let mut guard = state.lock().unwrap();
-            guard.pending_quickstart_chat =
-                Some(PendingQuickstartChat::AfterReconnect("scout".into()));
-        }
-
-        assert_eq!(
-            take_pending_quickstart_chat(&state, QuickstartChatDrain::Immediate),
-            None
-        );
-        assert_eq!(
-            state.lock().unwrap().pending_quickstart_chat,
-            Some(PendingQuickstartChat::AfterReconnect("scout".into()))
-        );
-    }
-
-    #[test]
-    fn quickstart_chat_handoff_consumes_after_reconnect_target() {
-        let state = SharedReconnectState::default();
-        {
-            let mut guard = state.lock().unwrap();
-            guard.pending_quickstart_chat =
-                Some(PendingQuickstartChat::AfterReconnect("scout".into()));
-        }
-
-        assert_eq!(
-            take_pending_quickstart_chat(&state, QuickstartChatDrain::AfterReconnect),
-            Some("scout".into())
-        );
-        assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
-    }
 }

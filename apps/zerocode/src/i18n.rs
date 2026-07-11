@@ -230,7 +230,7 @@ mod tests {
     fn en_catalogue_parses() {
         let map = format_ftl_messages(EN_FTL, "en");
         assert!(map.contains_key("zc-pane-dashboard"));
-        assert!(map.contains_key("zc-pane-chat"));
+        assert!(map.contains_key("zc-pane-code"));
         let mismatch = format_ftl_message(
             EN_FTL,
             "en",

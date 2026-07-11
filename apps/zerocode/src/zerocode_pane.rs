@@ -128,7 +128,7 @@ pub(crate) struct ZerocodePane {
     theme_target_agent: Option<String>,
     // Agent theme overrides
     /// Configured agent aliases from the daemon (agents/status), fed by
-    /// config_manager — the same registry the Code/Chat agent pickers walk.
+    /// config_manager — the same registry the Code agent picker walks.
     agents: Vec<String>,
     agent_cursor: usize,
     /// alias -> override theme name, loaded from the local config.
@@ -1202,8 +1202,8 @@ impl ZerocodePane {
                 Ok(()) => {
                     self.agent_overrides.insert(alias.clone(), name.clone());
                     // Live-apply, exactly like the global theme: update the
-                    // process-global override registry so the Code/Chat pane
-                    // picks it up on the next frame without an app restart.
+                    // process-global override registry so Code picks it up on
+                    // the next frame without an app restart.
                     if let Some(t) = theme::theme_by_name(&name) {
                         theme::set_agent_override(&alias, t);
                     }

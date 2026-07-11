@@ -1317,8 +1317,8 @@ impl App {
                 Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
             }
         }
-        // Agent theme overrides: feed the same enabled-agent list the Code/Chat
-        // pickers walk, fetched lazily when the AgentTheme tab is first focused.
+        // Agent theme overrides: feed the same enabled-agent list the Code
+        // picker walks, fetched lazily when the AgentTheme tab is first focused.
         if self.zerocode.agents_needs_list() {
             match self.rpc.agents_status().await {
                 Ok(res) => {

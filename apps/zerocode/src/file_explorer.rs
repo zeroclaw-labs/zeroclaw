@@ -1,7 +1,7 @@
 //! Reusable file explorer modal widget with multi-file selection.
 //!
 //! Browses the local filesystem where the TUI is running. Designed to
-//! be invoked from any pane (Chat, ACP, etc.).
+//! be invoked from the Code pane.
 
 use std::collections::HashSet;
 use std::path::PathBuf;

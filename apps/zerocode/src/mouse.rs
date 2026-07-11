@@ -252,8 +252,8 @@ mod tests {
 
     #[test]
     fn tab_click_index_ascii_unchanged() {
-        let labels = ["Code", "Chat"];
-        // "Code" cols 0..4, sep 4..7, "Chat" cols 7..11.
+        let labels = ["Code", "Logs"];
+        // "Code" cols 0..4, sep 4..7, "Logs" cols 7..11.
         assert_eq!(tab_click_index(0, 0, bar(20), &labels, 3), Some(0));
         assert_eq!(tab_click_index(7, 0, bar(20), &labels, 3), Some(1));
         assert_eq!(tab_click_index(5, 0, bar(20), &labels, 3), None);

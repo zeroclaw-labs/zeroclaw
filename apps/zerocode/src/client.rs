@@ -1328,9 +1328,9 @@ impl RpcClient {
         self.session_new_with_id(agent_alias, cwd, None).await
     }
 
-    /// Like [`Self::session_new_with_id`] but sets `exclude_memory: true` so the
-    /// daemon strips memory tools and uses a NoneMemory backend. Used by the
-    /// ACP pane, which should never have access to persistent memory.
+    /// Sets `exclude_memory: true` so the daemon strips memory tools and uses a
+    /// NoneMemory backend. Used by Code sessions, which should never have access
+    /// to persistent memory.
     pub async fn session_new_acp(
         &self,
         agent_alias: &str,
@@ -1352,9 +1352,6 @@ impl RpcClient {
         .await
     }
 
-    /// Create or rehydrate a session. When `session_id` is `Some`, the daemon
-    /// creates the session with that ID, restoring persisted history if it
-    /// exists — effectively "attaching" to a prior session.
     pub async fn session_new_with_id(
         &self,
         agent_alias: &str,
@@ -1364,7 +1361,12 @@ impl RpcClient {
         let tui_id = self.tui_id.as_deref();
         self.call(
             method::SESSION_NEW,
-            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd, "session_id": session_id, "tui_id": tui_id }),
+            serde_json::json!({
+                "agent_alias": agent_alias,
+                "cwd": cwd,
+                "session_id": session_id,
+                "tui_id": tui_id,
+            }),
         )
         .await
     }
@@ -3242,8 +3244,7 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task =
-            tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
+        let task = tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
 
         let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
             .await
@@ -3253,6 +3254,8 @@ mod session_method_tests {
         assert_eq!(req["method"], "session/new");
         assert_eq!(req["params"]["agent_alias"], "my-agent");
         assert_eq!(req["params"]["cwd"], "/tmp/work");
+        assert!(req["params"].get("exclude_memory").is_none());
+        assert!(req["params"].get("chat_mode").is_none());
 
         let id = req["id"].as_str().unwrap().to_string();
         rpc.dispatch_response(
@@ -3264,6 +3267,43 @@ mod session_method_tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .expect("client.session_new must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.session_id, "s42");
+    }
+
+    #[tokio::test]
+    async fn session_new_acp_sends_memory_exclusion() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client
+                .session_new_acp("my-agent", Some("/tmp/work"), None)
+                .await
+        });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_new_acp must send a wire request; a hang here wedges the TTY")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/new");
+        assert_eq!(req["params"]["agent_alias"], "my-agent");
+        assert_eq!(req["params"]["cwd"], "/tmp/work");
+        assert_eq!(req["params"]["exclude_memory"], true);
+        assert_eq!(req["params"]["chat_mode"], "acp");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s42","agent_alias":"my-agent","message_count":0})),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_new_acp must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
         assert_eq!(result.session_id, "s42");
