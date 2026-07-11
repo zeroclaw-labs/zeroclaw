@@ -1547,10 +1547,10 @@ impl Agent {
             None
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (WebSocket/daemon sessions).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         // If caller provided an engine (daemon path), use it; otherwise
-        // build our own (CLI/standalone path).
+        // build our own (CLI/standalone path) only when the gate is set.
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
             (None, None) if config.sop.sops_dir.is_some() => {
@@ -1596,26 +1596,7 @@ impl Agent {
         // connect_mcp mirrors the old `initialize_mcp && config.mcp.enabled` gate;
         // connect_peripherals is false because from_config never loaded peripheral
         // tools (routing them in would be a widening and would open serial hardware).
-        let crate::tools::scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section`
-            // (the deferred tool-search listing) and `mcp_pinned_section`
-            // (pinned resources). `assemble` surfaces the two atomically, so from_config
-            // threads each into its own slot below - no duplication, and the deferred
-            // advertisement the regression suite asserts is preserved.
-            deferred_section,
-            pinned_section,
-            activated_handle,
-            // from_config performs no per-turn tool_filter_groups filtering
-            // itself (the multi-agent gap tracked as #6699 follow-up scope).
-            mcp_tool_names: _,
-        } = crate::tools::scoped::ScopedToolRegistry::assemble(
+        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
                 agent_alias,
@@ -1632,6 +1613,28 @@ impl Agent {
             },
         )
         .await;
+        // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section` (the
+        // deferred tool-search listing) and `mcp_pinned_section` (pinned resources).
+        // `assemble` surfaces the two atomically, so from_config threads each into its
+        // own slot below - no duplication, and the deferred advertisement the
+        // regression suite asserts is preserved.
+        let deferred_section = assembled.deferred_section().to_string();
+        let pinned_section = assembled.pinned_section().to_string();
+        let crate::tools::scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle,
+            // from_config performs no per-turn tool_filter_groups filtering
+            // itself (the multi-agent gap tracked as #6699 follow-up scope), so
+            // mcp_tool_names is dropped here along with `registry`'s already-
+            // consumed sibling fields via `..`.
+            ..
+        } = assembled;
         let tools = registry.into_inner();
 
         let model_name = match agent_model_provider

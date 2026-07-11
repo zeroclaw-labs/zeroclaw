@@ -3588,16 +3588,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi) in &state.cached_screen_ranges {
+    for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
         if visible_hi <= visible_lo {
             continue;
         }
+        // Width follows the entry's rendered text, not the full panel, so a
+        // click in the blank margin beside a short message misses every rect
+        // and clears the highlight (#8652).
         let rect = Rect::new(
             body_x,
             body_y + (visible_lo - scroll),
-            body_w,
+            content_width.min(body_w),
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
@@ -4694,11 +4697,15 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
-    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end)`.
-    /// Unlike `cached_line_ranges` (unwrapped line indices), these account for
-    /// markdown wrapping so mouse hit-testing (`entry_rects`) lands on the
-    /// correct screen rows for agent messages, code blocks, and tables.
-    cached_screen_ranges: Vec<(usize, u16, u16)>,
+    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
+    /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
+    /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
+    /// lands on the correct screen rows for agent messages, code blocks, and
+    /// tables. `content_width` is the widest rendered column extent of the
+    /// entry (clamped to the viewport), so hit-testing ignores the blank space
+    /// beside short messages — a click there dismisses the highlight instead of
+    /// re-selecting the entry.
+    cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -4948,10 +4955,10 @@ impl ChatState {
     /// top is shown.  Does nothing when `cached_screen_ranges` is empty
     /// (pre-render path).
     fn scroll_entry_into_view(&mut self, entry_idx: usize) {
-        let Some(&(_, lo, _hi)) = self
+        let Some(&(_, lo, _hi, _)) = self
             .cached_screen_ranges
             .iter()
-            .find(|(idx, _, _)| *idx == entry_idx)
+            .find(|(idx, _, _, _)| *idx == entry_idx)
         else {
             return;
         };
@@ -5103,7 +5110,7 @@ impl ChatState {
         let view_end = scroll.saturating_add(height);
         let mut first: Option<usize> = None;
         let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
             if screen_hi > scroll && screen_lo < view_end {
                 if first.is_none() {
                     first = Some(i);
@@ -5127,7 +5134,7 @@ impl ChatState {
         let view_end = scroll.saturating_add(height);
         let mut first: Option<usize> = None;
         let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
             if screen_hi > scroll && screen_lo < view_end {
                 if first.is_none() {
                     first = Some(i);
@@ -5161,13 +5168,24 @@ impl ChatState {
             if entry_lines.is_empty() {
                 continue;
             }
+            // Widest rendered column extent of the entry, clamped to the
+            // viewport. Lines wider than `width` wrap to full-width rows, so the
+            // clamp yields the true on-screen extent. Hit-testing uses this so
+            // the blank space beside a short message is treated as outside the
+            // entry.
+            let content_width = entry_lines
+                .iter()
+                .map(|l| l.width() as u16)
+                .max()
+                .unwrap_or(0)
+                .min(width);
             let wrapped = Paragraph::new(entry_lines)
                 .wrap(Wrap { trim: false })
                 .line_count(width) as u16;
             let screen_lo = screen_cursor;
             screen_cursor += wrapped;
             self.cached_screen_ranges
-                .push((entry_idx, screen_lo, screen_cursor));
+                .push((entry_idx, screen_lo, screen_cursor, content_width));
         }
     }
 
@@ -6692,6 +6710,76 @@ mod tests {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 2,
             row: area.height.saturating_sub(2),
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.mouse_down_entry, None);
+        assert_eq!(
+            state.dirty,
+            LinesDirty::Full,
+            "clearing the highlight must invalidate rendered transcript lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_side_click_clears_transcript_mouse_highlight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hi")));
+        state.highlighted_entry = Some(0);
+        state.mouse_down_entry = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+
+        // The rendered entry rect must hug the text, not span the panel, so
+        // there is blank space beside the short message to click in.
+        let (_, rect) = state
+            .entry_rects
+            .iter()
+            .find(|(idx, _)| *idx == 0)
+            .copied()
+            .expect("entry 0 has a screen rect");
+        assert!(
+            rect.width < area.width - 2,
+            "short message rect must not span the full panel width: {rect:?}"
+        );
+        // A column just past the text but well within the panel — the blank
+        // margin beside the message.
+        let blank_col = rect.x + rect.width + 1;
+        let blank_row = rect.y;
+        assert!(
+            blank_col < area.width - 1,
+            "blank column stays in the panel"
+        );
+
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: blank_col,
+            row: blank_row,
             modifiers: KeyModifiers::NONE,
         };
         chat.handle_mouse(click, area).await;

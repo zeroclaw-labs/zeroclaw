@@ -120,6 +120,7 @@ pub(crate) struct InterpretedResponse {
     /// Whether parsing saw malformed protocol content that should affect loop
     /// decisions or diagnostics.
     pub(crate) parse_issue_detected: bool,
+    pub(crate) input_tokens: Option<u64>,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
@@ -316,6 +317,7 @@ pub(crate) async fn interpret_chat_response(
         assistant_history_content,
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
+        input_tokens: resp_input_tokens,
     }
 }
 

@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
 use crate::sop::types::{SopRunAction, SopRunStatus};
 use crate::sop::{SopAuditLogger, SopEngine};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {
@@ -135,13 +135,13 @@ impl Tool for SopApproveTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Ok(ResolveOutcome::RejectedSelfApproval) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "This SOP gate requires an out-of-band approver \
                      (approval_mode = out_of_band_required). Use `zeroclaw sop approve <run_id>` \
@@ -151,24 +151,24 @@ impl Tool for SopApproveTool {
             }),
             Ok(ResolveOutcome::AlreadyResolved) => Ok(ToolResult {
                 success: true,
-                output: format!("Run {run_id} was already resolved."),
+                output: format!("Run {run_id} was already resolved.").into(),
                 error: None,
             }),
             Ok(ResolveOutcome::Denied) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Run {run_id} was denied.")),
             }),
             Ok(ResolveOutcome::NotWaiting) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Approval failed: {e}")),
             }),
         }
@@ -204,6 +204,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 

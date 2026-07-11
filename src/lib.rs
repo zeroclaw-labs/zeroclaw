@@ -615,6 +615,10 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -641,6 +645,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -666,6 +673,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -692,6 +702,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -733,6 +746,9 @@ Examples:
         /// Replace the agent job allowlist with the specified tool names (repeatable)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
     },
     /// Pause a scheduled task
     Pause {
@@ -931,4 +947,30 @@ pub enum SopCommands {
     },
     /// List SOP runs currently waiting for approval (talks to the running daemon)
     Pending,
+    /// Render an SOP's node graph as text
+    Graph {
+        /// Name of the SOP to render
+        name: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = SopGraphFormat::Outline)]
+        format: SopGraphFormat,
+    },
+    /// Delete an SOP definition from disk
+    Delete {
+        /// Name of the SOP to delete
+        name: String,
+    },
+}
+
+/// Text output format for `sop graph`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum SopGraphFormat {
+    /// One line per node with its outbound flow edges.
+    Outline,
+    /// `from -> to [role]` adjacency, one edge per line.
+    Adjacency,
+    /// Pretty-printed JSON of the whole projection.
+    Json,
 }

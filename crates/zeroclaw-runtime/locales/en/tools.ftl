@@ -125,6 +125,18 @@ tool-goal-resume-success-paused =
 tool-goal-resume-error-missing-context = goal_resume is unavailable because trusted runtime admission context was not supplied.
 tool-goal-resume-error-agent-context-mismatch = goal_resume is unavailable because trusted runtime admission context does not match this agent.
 
+tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
+tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
+tool-git-forge-error-issue-close-reason = issue.close 'reason' must be 'completed' or 'not_planned'.
+tool-git-forge-error-pull-merge-method = pull.merge 'method' must be 'merge', 'squash', or 'rebase'.
+tool-git-forge-error-review-verdict = review.create 'verdict' must be approve|request_changes|comment, got '{ $verdict }'.
+tool-git-forge-error-unknown-cell = unknown or unsupported resource/action '{ $resource }.{ $action }'. Call action 'describe' for the supported grid, or use 'raw' for anything unlisted.
+tool-git-forge-error-no-channels = No channels available yet (channels not initialized).
+tool-git-forge-error-raw-requires-method = 'raw' requires 'method'.
+tool-git-forge-error-raw-requires-path = 'raw' requires 'path'.
+tool-git-forge-error-requires-resource = a typed call requires 'resource' (or use action 'raw'/'describe').
+tool-git-forge-error-missing-repo = Missing 'repo' (expected 'owner/repo').
+
 tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 
 tool-google-workspace = Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) via the gws CLI. Requires gws to be installed and authenticated.

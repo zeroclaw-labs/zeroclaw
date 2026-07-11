@@ -2162,13 +2162,11 @@ mod tests {
 
     #[test]
     fn convert_tools_to_converse_formats_correctly() {
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters:
-                serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
-                    .into(),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "Run commands",
+            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        )];
         let config = BedrockModelProvider::convert_tools_to_converse(Some(&tools));
         assert!(config.is_some());
         let config = config.unwrap();

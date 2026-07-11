@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Computer-use sidecar settings.
@@ -784,7 +784,9 @@ impl BrowserTool {
 
             Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&output).unwrap_or_default(),
+                output: serde_json::to_string_pretty(&output)
+                    .unwrap_or_default()
+                    .into(),
                 error: None,
             })
         }
@@ -946,7 +948,7 @@ impl BrowserTool {
 
                 return Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 });
             }
@@ -963,7 +965,7 @@ impl BrowserTool {
 
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error,
             });
         }
@@ -971,14 +973,14 @@ impl BrowserTool {
         if status.is_success() {
             return Ok(ToolResult {
                 success: true,
-                output: body,
+                output: body.into(),
                 error: None,
             });
         }
 
         Ok(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(format!(
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
@@ -1009,13 +1011,13 @@ impl BrowserTool {
                 .unwrap_or_default();
             Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: resp.error,
             })
         }
@@ -1156,7 +1158,7 @@ impl Tool for BrowserTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -1169,7 +1171,7 @@ impl Tool for BrowserTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error.to_string()),
                 });
             }
@@ -1189,7 +1191,7 @@ impl Tool for BrowserTool {
         if !is_supported_browser_action(action_str) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown action: {action_str}")),
             });
         }
@@ -1201,7 +1203,7 @@ impl Tool for BrowserTool {
         if is_computer_use_only_action(action_str) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
             });
         }
@@ -1211,7 +1213,7 @@ impl Tool for BrowserTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }

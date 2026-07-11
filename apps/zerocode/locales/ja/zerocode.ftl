@@ -5,6 +5,7 @@ zc-pane-code = コード
 zc-pane-chat = チャット
 zc-pane-logs = ログ
 zc-pane-quickstart = クイックスタート
+zc-pane-sop = SOP
 zc-app-help-cycle-mode = モード切り替え
 zc-app-help-reload = デーモンを再読み込み
 zc-app-help-quit = 終了
