@@ -1,6 +1,6 @@
 //! ZeroClaw TUI colour palette and style helpers.
 //!
-//! Shared between the onboarding UI (lib target) and the main chat TUI (binary
+//! Shared between the onboarding UI (lib target) and the main code TUI (binary
 //! target). Not every helper is used by both targets.
 #![allow(dead_code)]
 
@@ -294,14 +294,14 @@ pub(crate) fn input_style() -> Style {
     Style::default().fg(active().body)
 }
 
-/// "You:" label in the chat conversation.
+/// "You:" label in the code transcript.
 pub(crate) fn user_label_style() -> Style {
     Style::default()
         .fg(active().heading)
         .add_modifier(Modifier::BOLD)
 }
 
-/// "Agent:" label in the chat conversation.
+/// "Agent:" label in the code transcript.
 pub(crate) fn agent_label_style() -> Style {
     Style::default()
         .fg(active().title)

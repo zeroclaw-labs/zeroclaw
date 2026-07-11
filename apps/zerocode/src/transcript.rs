@@ -42,7 +42,7 @@ const SCROLLBAR_VISIBLE_AFTER: Duration = Duration::from_millis(1200);
 
 // ── Code transcript pane ─────────────────────────────────────────
 
-enum ChatPhase {
+enum TranscriptPhase {
     /// Showing agent picker (or loading the list).
     PickAgent {
         agents: Vec<String>,
@@ -62,8 +62,8 @@ enum ChatPhase {
         /// Interactive directory picker.
         explorer: FileExplorerState,
     },
-    /// Active chat session.
-    Active(Box<ChatState>),
+    /// Active code session.
+    Active(Box<TranscriptState>),
     /// Unrecoverable error.
     Error(String),
 }
@@ -88,7 +88,7 @@ impl PaneKind {
     }
 }
 
-pub(crate) struct Chat {
+pub(crate) struct Transcript {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
@@ -114,7 +114,7 @@ pub(crate) struct Chat {
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
-    phase: ChatPhase,
+    phase: TranscriptPhase,
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
     /// the app layer across a reconnect so the rebuilt pane resumes the
@@ -135,7 +135,7 @@ pub(crate) struct Chat {
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
     /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
+    /// session start) and applied to every `TranscriptState` this pane
     /// constructs. Defaults until fetched.
     todo_settings: crate::todo_tracker::TodoTrackerSettings,
     /// Guards the one-shot `[todotracker]` config fetch so it doesn't
@@ -168,7 +168,7 @@ struct DeferredInboundRequest {
 }
 
 /// Outcome of attempting to route one inbound `elicitation/create` to the
-/// active session. See `Chat::try_install_elicitation`.
+/// active session. See `Transcript::try_install_elicitation`.
 enum ElicitationRouting {
     /// Modal installed on the active session; it owns the request id.
     Installed,
@@ -202,11 +202,14 @@ struct ModelFetchResult {
 // Quickstart or manual Config — shows up without a reconnect. `Active` /
 // `PickCwd` are intentionally excluded: a live session or an in-flight
 // directory pick must not be torn down just to refresh a list.
-fn should_retry_on_entry(phase: &ChatPhase) -> bool {
-    matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
+fn should_retry_on_entry(phase: &TranscriptPhase) -> bool {
+    matches!(
+        phase,
+        TranscriptPhase::Error(_) | TranscriptPhase::PickAgent { .. }
+    )
 }
 
-impl Chat {
+impl Transcript {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
@@ -220,7 +223,7 @@ impl Chat {
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
-            phase: ChatPhase::PickAgent {
+            phase: TranscriptPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
                 loading: true,
@@ -255,7 +258,7 @@ impl Chat {
     /// before a reconnect rebuild to carry the session across.
     pub(crate) fn current_session_id(&self) -> Option<&str> {
         match &self.phase {
-            ChatPhase::Active(state) => Some(state.session_id.as_str()),
+            TranscriptPhase::Active(state) => Some(state.session_id.as_str()),
             _ => None,
         }
     }
@@ -264,7 +267,7 @@ impl Chat {
     /// reconnect rebuild so the resumed session reattaches to its own agent.
     pub(crate) fn current_agent_alias(&self) -> Option<&str> {
         match &self.phase {
-            ChatPhase::Active(state) => Some(state.agent_alias.as_str()),
+            TranscriptPhase::Active(state) => Some(state.agent_alias.as_str()),
             _ => None,
         }
     }
@@ -280,8 +283,8 @@ impl Chat {
                 .map(|a| a.alias)
                 .collect::<Vec<_>>(),
             Err(e) => {
-                self.phase = ChatPhase::Error(crate::i18n::t_args(
-                    "zc-chat-error-fetch-agents",
+                self.phase = TranscriptPhase::Error(crate::i18n::t_args(
+                    "zc-code-error-fetch-agents",
                     &[("error", &e.to_string())],
                 ));
                 return Ok(());
@@ -289,7 +292,7 @@ impl Chat {
         };
 
         if agents.is_empty() {
-            self.phase = ChatPhase::Error(crate::i18n::t("zc-chat-no-agents"));
+            self.phase = TranscriptPhase::Error(crate::i18n::t("zc-code-no-agents"));
             return Ok(());
         }
 
@@ -334,7 +337,7 @@ impl Chat {
         // Falls back to the first row for a brand-new picker or if the prior
         // selection was removed.
         let prior_alias = match &self.phase {
-            ChatPhase::PickAgent {
+            TranscriptPhase::PickAgent {
                 agents: prev,
                 list_state,
                 ..
@@ -350,7 +353,7 @@ impl Chat {
         // not bleed a stale resume id into a mismatched agent's session.
         self.resume_session_id = None;
         self.resume_agent_alias = None;
-        self.phase = ChatPhase::PickAgent {
+        self.phase = TranscriptPhase::PickAgent {
             agents,
             list_state,
             loading: false,
@@ -358,7 +361,7 @@ impl Chat {
     }
 
     async fn try_show_recent_acp_session_picker(&mut self, agents: &[String]) -> bool {
-        if self.pane_kind != PaneKind::Acp || self.resume_session_id.is_some() || agents.is_empty()
+        if self.pane_kind != PaneKind::Code || self.resume_session_id.is_some() || agents.is_empty()
         {
             return false;
         }
@@ -384,7 +387,7 @@ impl Chat {
 
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        self.phase = ChatPhase::PickSession {
+        self.phase = TranscriptPhase::PickSession {
             sessions,
             list_state,
             agents: agents.to_vec(),
@@ -426,7 +429,7 @@ impl Chat {
         {
             // Remote ACP: start from the daemon root, not a local path.
             let start_dir = std::path::PathBuf::from("/");
-            self.phase = ChatPhase::PickCwd {
+            self.phase = TranscriptPhase::PickCwd {
                 agent_alias: agent_alias.to_string(),
                 explorer: FileExplorerState::new_dir_picker_remote(
                     start_dir,
@@ -464,19 +467,6 @@ impl Chat {
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Fetch the [todotracker] config once, lazily, the first time this
-        // pane starts a session — so the tracker honors enabled /
-        // enabled_at_start / location / width / max_height. Best-effort: a
-        // failure keeps the schema defaults. Done here (not in init()) so the
-        // hot refresh path stays a single agents/status round-trip.
-        if !self.todo_settings_loaded {
-            self.todo_settings_loaded = true;
-            if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
-                self.todo_settings =
-                    crate::todo_tracker::TodoTrackerSettings::from_config_fields(&fields);
-            }
-        }
-
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_acp` with Some(id) restores the
         // daemon-retained session, its persisted history, and its cwd.
@@ -511,11 +501,7 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = ChatState::new(
-                    session.session_id,
-                    agent_alias.to_string(),
-                    self.todo_settings,
-                );
+                let mut state = TranscriptState::new(session.session_id, agent_alias.to_string());
                 if self.pane_kind == PaneKind::Code {
                     state.cwd = session.workspace_dir;
                 }
@@ -528,18 +514,18 @@ impl Chat {
                 {
                     state.load_history(msgs.messages);
                 }
-                self.phase = ChatPhase::Active(Box::new(state));
+                self.phase = TranscriptPhase::Active(Box::new(state));
             }
             Err(e) => {
-                self.phase = ChatPhase::Error(crate::i18n::t_args(
-                    "zc-chat-error-create-session",
+                self.phase = TranscriptPhase::Error(crate::i18n::t_args(
+                    "zc-code-error-create-session",
                     &[("error", &e.to_string())],
                 ));
             }
         }
     }
 
-    async fn confirm_model_picker_selection(rpc: &Arc<RpcClient>, state: &mut ChatState) {
+    async fn confirm_model_picker_selection(rpc: &Arc<RpcClient>, state: &mut TranscriptState) {
         // Resolve the selection, then act. The final switch needs async + `rpc`,
         // so extract owned values before replacing the overlay.
         match &state.model_picker {
@@ -582,15 +568,15 @@ impl Chat {
     async fn restart_session_for_state(
         rpc: &Arc<RpcClient>,
         pane_kind: PaneKind,
-        state: &mut ChatState,
-    ) -> Option<ChatPhase> {
+        state: &mut TranscriptState,
+    ) -> Option<TranscriptPhase> {
         let alias = state.agent_alias.clone();
         if pane_kind == PaneKind::Code && rpc.transport() == crate::client::Transport::Wss {
             // For WSS Code, go through the CWD picker for new sessions too.
             let _ = rpc.session_close(&state.session_id).await;
             // Remote ACP picker must start from a path the daemon understands.
             let start_dir = std::path::PathBuf::from("/");
-            return Some(ChatPhase::PickCwd {
+            return Some(TranscriptPhase::PickCwd {
                 agent_alias: alias,
                 explorer: FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(rpc)),
             });
@@ -616,11 +602,11 @@ impl Chat {
                     state.cwd = s.workspace_dir;
                 }
                 Self::refresh_model_identity(rpc, state).await;
-                state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
+                state.set_info_notice(crate::i18n::t("zc-code-session-restarted"));
             }
             Err(e) => {
                 state.set_info_notice(crate::i18n::t_args(
-                    "zc-chat-session-restart-error",
+                    "zc-code-session-restart-error",
                     &[("error", &e.to_string())],
                 ));
             }
@@ -635,7 +621,7 @@ impl Chat {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == "session/update" => {
-                    if let ChatPhase::Active(ref mut state) = self.phase
+                    if let TranscriptPhase::Active(ref mut state) = self.phase
                         && let Some(update) = parse_session_update(&notif.params)
                     {
                         state.apply_update(update);
@@ -655,17 +641,15 @@ impl Chat {
     /// `elicitation/create`) and dispatch them so the daemon's tool call
     /// doesn't stall.
     ///
-    /// An `elicitation/create` targeting the active session with a schema we
-    /// understand is installed as an interactive picker modal (via
-    /// `route_inbound_elicitation` → `try_install_elicitation`); the user's
-    /// selection is sent back as the JSON-RPC response. A request whose schema
-    /// won't parse is answered `{"action": "cancel"}` immediately. A request
-    /// that parses but does not target the active session — the pane may be
-    /// mid resume/reset/switch — is *deferred* and retried for a short grace
-    /// window before it is cancelled, so a legitimately-owned prompt is never
-    /// dropped during a transition. `cancel` collapses to `Ok(None)` in the
-    /// daemon's `RpcApprovalChannel::request_choice`, letting the calling tool
-    /// fall back to its non-channel path. See the ACP elicitation RFD
+    /// An `elicitation/create` targeting the active session with a schema
+    /// we understand is installed as an interactive picker modal
+    /// (`handle_inbound_elicitation`); the user's selection is sent back as
+    /// the JSON-RPC response. A request we can't match to the active
+    /// session, or whose schema won't parse, is auto-answered with
+    /// `{"action": "cancel"}`, which the daemon's
+    /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
+    /// calling tool can fall back to its non-channel path. See the ACP
+    /// elicitation RFD
     /// (https://agentclientprotocol.com/rfds/elicitation).
     ///
     /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
@@ -674,30 +658,11 @@ impl Chat {
         loop {
             let req = match self.inbound_rx.try_recv() {
                 Ok(req) => req,
-                // A `Lagged` receiver has irrecoverably lost frames from the
-                // broadcast buffer. For response-bearing requests (today:
-                // `elicitation/create`) a lost frame means the daemon parks
-                // its tool call until `session_timeout_secs` (default 3600s) —
-                // the user sees `ask_user` hang. We cannot recover the dropped
-                // ids here, but we MUST NOT swallow it silently: surface a
-                // system message so the hang is diagnosable, then keep draining
-                // the frames still buffered. The capacity bump on the sender
-                // side (`INBOUND_REQUEST_CHANNEL_CAPACITY`) makes this rare.
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    if let ChatPhase::Active(ref mut state) = self.phase {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-chat-elicitation-dropped",
-                            ))));
-                        state.mark_dirty_append();
-                    }
-                    continue;
-                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
             match req.method.as_str() {
-                "elicitation/create" => self.route_inbound_elicitation(req),
+                "elicitation/create" => self.handle_inbound_elicitation(req),
                 other => {
                     let method = other.to_string();
                     let id = req.id.clone();
@@ -717,110 +682,50 @@ impl Chat {
                 }
             }
         }
-
-        // Retry any elicitations that arrived before their session was
-        // installable, and cancel the ones whose grace window has elapsed.
-        self.drain_deferred_elicitations();
     }
 
-    /// Route one inbound `elicitation/create`: install it if its session is
-    /// active, defer it if the pane is mid-transition (so a legitimately-owned
-    /// prompt is not dropped during a session switch/resume), or cancel it
-    /// outright if its schema is unparseable.
-    fn route_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
-        match self.try_install_elicitation(req) {
-            ElicitationRouting::Installed => {}
-            ElicitationRouting::Unparseable(id) => Self::answer_cancel(&self.rpc, id),
-            ElicitationRouting::Defer(req) => {
-                self.deferred_elicitations.push(DeferredInboundRequest {
-                    req,
-                    first_seen: Instant::now(),
-                });
-            }
-        }
-    }
-
-    /// Retry deferred elicitations. Each is re-attempted once per drain; when
-    /// its session becomes active the modal installs, and when its grace
-    /// deadline lapses it is answered `cancel` so the daemon's tool call never
-    /// stalls indefinitely on a session that never materialised in this pane.
-    fn drain_deferred_elicitations(&mut self) {
-        if self.deferred_elicitations.is_empty() {
-            return;
-        }
-        let pending = std::mem::take(&mut self.deferred_elicitations);
-        for entry in pending {
-            let expired = entry.first_seen.elapsed() >= ELICITATION_ROUTE_GRACE;
-            match self.try_install_elicitation(entry.req) {
-                ElicitationRouting::Installed => {}
-                ElicitationRouting::Unparseable(id) => Self::answer_cancel(&self.rpc, id),
-                ElicitationRouting::Defer(req) => {
-                    if expired {
-                        Self::answer_cancel(&self.rpc, req.id);
-                    } else {
-                        self.deferred_elicitations.push(DeferredInboundRequest {
-                            req,
-                            first_seen: entry.first_seen,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    /// Answer an inbound request with `{"action":"cancel"}`, which the daemon's
-    /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
-    /// calling tool takes its non-channel fallback path.
-    fn answer_cancel(rpc: &Arc<RpcClient>, id: serde_json::Value) {
-        let rpc = rpc.clone();
-        tokio::spawn(async move {
-            let _ = rpc
-                .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
-                .await;
-        });
-    }
-
-    /// Try to install an inbound elicitation as a modal on the active session.
+    /// Decode an inbound elicitation and install an interactive modal on
+    /// the matching session so the user can pick an answer.
     ///
-    /// Returns [`ElicitationRouting`]:
-    /// - `Installed` — the request targets the active session and parsed; a
-    ///   modal was installed and owns the request id.
-    /// - `Unparseable(id)` — the schema could not be decoded; the caller must
-    ///   answer `cancel` (retrying would never succeed).
-    /// - `Defer(req)` — the request parsed but does not (yet) target the
-    ///   active session; the caller should retry it briefly rather than
-    ///   cancelling a possibly-owned prompt during a session transition.
+    /// The modal owns the JSON-RPC request id; the response is sent later
+    /// from the key handler (`confirm_elicitation` / `cancel_elicitation`)
+    /// once the user acts. If the request can't be matched to the active
+    /// session, or its schema is unparseable, we answer `cancel`
+    /// immediately so the daemon's tool call doesn't stall.
     ///
     /// Wire shape per the ACP elicitation RFD
     /// (https://agentclientprotocol.com/rfds/elicitation).
-    fn try_install_elicitation(
-        &mut self,
-        req: crate::client::RpcInboundRequest,
-    ) -> ElicitationRouting {
+    fn handle_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
         let params: Option<crate::wire::ElicitationRequestParams> =
             serde_json::from_value(req.params.clone()).ok();
         let shape = params
             .as_ref()
             .and_then(|p| crate::wire::ElicitationShape::from_schema(&p.requested_schema));
 
-        // A request we can't decode (missing params or an unknown schema)
-        // can never install — cancel it immediately, no retry.
-        let (params, shape) = match (params, shape) {
-            (Some(p), Some(s)) => (p, s),
-            _ => return ElicitationRouting::Unparseable(req.id),
+        // The request must target the active session AND carry a schema
+        // we understand. Anything else gets an immediate `cancel`.
+        let installable = match (&params, &shape) {
+            (Some(p), Some(_)) => matches!(
+                &self.phase,
+                TranscriptPhase::Active(state) if state.session_id == p.session_id
+            ),
+            _ => false,
         };
 
-        // Must target THIS pane's active session. If not, it may simply be
-        // that the pane is mid resume/reset/switch — defer and retry rather
-        // than cancel a prompt this pane will shortly own.
-        let matches_active = matches!(
-            &self.phase,
-            ChatPhase::Active(state) if state.session_id == params.session_id
-        );
-        if !matches_active {
-            return ElicitationRouting::Defer(req);
+        if !installable {
+            let id = req.id;
+            let rpc = self.rpc.clone();
+            tokio::spawn(async move {
+                let _ = rpc
+                    .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
+                    .await;
+            });
+            return;
         }
 
+        // Unwraps are safe: `installable` proved both are `Some`.
+        let params = params.unwrap();
+        let shape = shape.unwrap();
         let pending = match shape {
             crate::wire::ElicitationShape::Single { choices, .. } => PendingElicitation {
                 request_id: req.id,
@@ -854,26 +759,25 @@ impl Chat {
             }
         };
 
-        if let ChatPhase::Active(ref mut state) = self.phase {
+        if let TranscriptPhase::Active(ref mut state) = self.phase {
             state.set_pending_elicitation(pending);
         }
-        ElicitationRouting::Installed
     }
 
     fn settle_stuck_cancel(&mut self) {
         let expired = matches!(
             self.phase,
-            ChatPhase::Active(ref s) if s.cancel_watchdog_expired()
+            TranscriptPhase::Active(ref s) if s.cancel_watchdog_expired()
         );
         if !expired {
             return;
         }
-        if let ChatPhase::Active(ref mut state) = self.phase {
+        if let TranscriptPhase::Active(ref mut state) = self.phase {
             state
                 .entries
-                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-cancel-timed-out",
-                ))));
+                .push(TranscriptEntry::SystemMessage(Arc::<str>::from(
+                    crate::i18n::t("zc-cancel-timed-out"),
+                )));
             state.mark_dirty_append();
             state.commit_turn(String::new(), false);
         }
@@ -883,16 +787,16 @@ impl Chat {
     fn after_enqueue(&mut self, enq: Result<(), String>) {
         match enq {
             Ok(()) => {
-                if let ChatPhase::Active(ref mut state) = self.phase {
+                if let TranscriptPhase::Active(ref mut state) = self.phase {
                     state.ensure_queue_selection();
                 }
                 self.pump_queue();
             }
             Err(msg) => {
-                if let ChatPhase::Active(ref mut state) = self.phase {
+                if let TranscriptPhase::Active(ref mut state) = self.phase {
                     state
                         .entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(msg)));
+                        .push(TranscriptEntry::SystemMessage(Arc::<str>::from(msg)));
                     state.mark_dirty_append();
                 }
             }
@@ -901,12 +805,12 @@ impl Chat {
 
     fn pump_queue(&mut self) {
         let next = match self.phase {
-            ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
+            TranscriptPhase::Active(ref mut state) => state.take_next_dispatchable(),
             _ => None,
         };
         let Some(msg) = next else { return };
         let sid = match self.phase {
-            ChatPhase::Active(ref state) => state.session_id.clone(),
+            TranscriptPhase::Active(ref state) => state.session_id.clone(),
             _ => return,
         };
 
@@ -917,10 +821,10 @@ impl Chat {
             match build_attachments_json(&msg.attachments, transport) {
                 Ok(json) => json,
                 Err(e) => {
-                    if let ChatPhase::Active(ref mut state) = self.phase {
+                    if let TranscriptPhase::Active(ref mut state) = self.phase {
                         state
                             .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                            .push(TranscriptEntry::SystemMessage(Arc::<str>::from(
                                 crate::i18n::t_args(
                                     "zc-queue-dispatch-failed",
                                     &[("error", &e.to_string())],
@@ -933,7 +837,7 @@ impl Chat {
             }
         };
 
-        if let ChatPhase::Active(ref mut state) = self.phase {
+        if let TranscriptPhase::Active(ref mut state) = self.phase {
             let att_names: Vec<String> =
                 msg.attachments.iter().map(|a| a.filename.clone()).collect();
             let text = if msg.text.is_empty() {
@@ -963,7 +867,7 @@ impl Chat {
     fn drain_git_branch_results(&mut self) {
         while let Ok(update) = self.git_branch_rx.try_recv() {
             self.git_branch_inflight = false;
-            if let ChatPhase::Active(ref mut state) = self.phase
+            if let TranscriptPhase::Active(ref mut state) = self.phase
                 && state.session_id == update.session_id
             {
                 state.git_branch = update.branch;
@@ -981,13 +885,13 @@ impl Chat {
 
     /// Spawn a background `session/git_branch` poll when the cache is stale.
     /// Gated by `git_branch_inflight` so we never have more than one fetch
-    /// outstanding per Chat — the daemon walks the filesystem each call and
+    /// outstanding per Transcript — the daemon walks the filesystem each call and
     /// the user only sees one result at a time anyway.
     fn maybe_refresh_git_branch(&mut self) {
         if self.git_branch_inflight {
             return;
         }
-        let ChatPhase::Active(ref state) = self.phase else {
+        let TranscriptPhase::Active(ref state) = self.phase else {
             return;
         };
         if state.cwd.is_none() {
@@ -1030,7 +934,7 @@ impl Chat {
         self.maybe_refresh_git_branch();
 
         match &mut self.phase {
-            ChatPhase::PickAgent {
+            TranscriptPhase::PickAgent {
                 agents,
                 list_state,
                 loading,
@@ -1045,7 +949,7 @@ impl Chat {
                 );
                 self.pick_agent_list_area = list_area;
             }
-            ChatPhase::PickSession {
+            TranscriptPhase::PickSession {
                 sessions,
                 list_state,
                 ..
@@ -1055,16 +959,16 @@ impl Chat {
                     area,
                     sessions,
                     list_state,
-                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    crate::i18n::t("zc-code-session-list-resume-title"),
                 );
             }
-            ChatPhase::PickCwd { explorer, .. } => {
+            TranscriptPhase::PickCwd { explorer, .. } => {
                 explorer.render(frame, area);
             }
-            ChatPhase::Active(state) => {
+            TranscriptPhase::Active(state) => {
                 render(frame, state, area);
             }
-            ChatPhase::Error(msg) => {
+            TranscriptPhase::Error(msg) => {
                 draw_error(frame, area, msg, &self.pane_kind.name());
             }
         }
@@ -1080,7 +984,7 @@ impl Chat {
         // Determine which phase we're in without holding a borrow on self.
         // For the picker, extract what we need; for active, delegate below.
         match &mut self.phase {
-            ChatPhase::PickAgent {
+            TranscriptPhase::PickAgent {
                 agents,
                 list_state,
                 loading,
@@ -1088,7 +992,7 @@ impl Chat {
                 if *loading {
                     return false;
                 }
-                use crate::keymap::{ChatTabAction, GlobalAction, ModalAction};
+                use crate::keymap::{CodeTabAction, GlobalAction, ModalAction};
                 // Three action types in scope here — explicit short-circuit
                 // chain instead of one mixed match.
                 match ModalAction::from_chord(&key) {
@@ -1106,12 +1010,12 @@ impl Chat {
                 if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
                     return true;
                 }
-                match ChatTabAction::from_chord(&key) {
-                    Some(ChatTabAction::BrowseUp) | Some(ChatTabAction::BrowseUpVim) => {
+                match CodeTabAction::from_chord(&key) {
+                    Some(CodeTabAction::BrowseUp) | Some(CodeTabAction::BrowseUpVim) => {
                         let i = list_state.selected().unwrap_or(0);
                         list_state.select(Some(i.saturating_sub(1)));
                     }
-                    Some(ChatTabAction::BrowseDown) | Some(ChatTabAction::BrowseDownVim) => {
+                    Some(CodeTabAction::BrowseDown) | Some(CodeTabAction::BrowseDownVim) => {
                         let i = list_state.selected().unwrap_or(0);
                         if i + 1 < agents.len() {
                             list_state.select(Some(i + 1));
@@ -1121,12 +1025,12 @@ impl Chat {
                 }
                 return false;
             }
-            ChatPhase::PickSession {
+            TranscriptPhase::PickSession {
                 sessions,
                 list_state,
                 agents,
             } => {
-                use crate::keymap::{ChatTabAction, ModalAction};
+                use crate::keymap::{CodeTabAction, ModalAction};
                 if ModalAction::from_chord(&key) == Some(ModalAction::Confirm) {
                     if let Some(i) = list_state.selected()
                         && let Some(entry) = sessions.get(i).cloned()
@@ -1136,7 +1040,7 @@ impl Chat {
                     return false;
                 }
                 if ModalAction::from_chord(&key) == Some(ModalAction::Cancel)
-                    || ChatTabAction::from_chord(&key) == Some(ChatTabAction::NewSession)
+                    || CodeTabAction::from_chord(&key) == Some(CodeTabAction::NewSession)
                 {
                     let agents = agents.clone();
                     self.start_fresh_from_picker(agents).await;
@@ -1157,7 +1061,7 @@ impl Chat {
                 }
                 return false;
             }
-            ChatPhase::PickCwd {
+            TranscriptPhase::PickCwd {
                 agent_alias,
                 explorer,
             } => {
@@ -1169,7 +1073,7 @@ impl Chat {
                         self.start_session(&alias, cwd_str.as_deref()).await;
                     }
                     ExplorerAction::Cancel => {
-                        self.phase = ChatPhase::PickAgent {
+                        self.phase = TranscriptPhase::PickAgent {
                             agents: Vec::new(),
                             list_state: ListState::default(),
                             loading: true,
@@ -1181,16 +1085,16 @@ impl Chat {
                 }
                 return false;
             }
-            ChatPhase::Error(_) => {
-                use crate::keymap::{ChatTabAction, GlobalAction};
+            TranscriptPhase::Error(_) => {
+                use crate::keymap::{CodeTabAction, GlobalAction};
                 return GlobalAction::from_chord(&key) == Some(GlobalAction::Quit)
-                    || ChatTabAction::from_chord(&key) == Some(ChatTabAction::ErrorDismiss);
+                    || CodeTabAction::from_chord(&key) == Some(CodeTabAction::ErrorDismiss);
             }
-            ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
+            TranscriptPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
         }
 
         // Active phase — borrow state directly to avoid double &mut self.
-        let ChatPhase::Active(ref mut state) = self.phase else {
+        let TranscriptPhase::Active(ref mut state) = self.phase else {
             return false;
         };
 
@@ -1242,7 +1146,7 @@ impl Chat {
         // ── Elicitation modal key handling ───────────────────────
         // Highest-priority Active-phase overlay after the model picker:
         // an outstanding agent question must be answered before normal
-        // chat keys resume. Navigation mutates the modal in place;
+        // code keys resume. Navigation mutates the modal in place;
         // confirm/cancel answer the daemon's JSON-RPC request id and
         // clear the modal.
         if state.pending_elicitation.is_some() {
@@ -1373,7 +1277,7 @@ impl Chat {
         }
 
         {
-            use crate::keymap::ChatTabAction as QAction;
+            use crate::keymap::CodeTabAction as QAction;
             let qaction = QAction::from_chord(&key);
             match qaction {
                 Some(QAction::PauseResumeQueue) => {
@@ -1406,9 +1310,9 @@ impl Chat {
                     if bar_busy {
                         state
                             .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-edit-busy",
-                            ))));
+                            .push(TranscriptEntry::SystemMessage(Arc::<str>::from(
+                                crate::i18n::t("zc-queue-edit-busy"),
+                            )));
                         state.mark_dirty_append();
                     } else if let Some((text, attachments)) = state.take_selected_for_edit() {
                         state.input_bar.load_for_edit(text, attachments);
@@ -1437,19 +1341,19 @@ impl Chat {
         // so they can type without an extra Esc press.
         if state.in_browse_mode() {
             let is_browse_key = {
-                use crate::keymap::ChatTabAction;
+                use crate::keymap::CodeTabAction;
                 matches!(
-                    ChatTabAction::from_chord(&key),
+                    CodeTabAction::from_chord(&key),
                     Some(
-                        ChatTabAction::BrowseEnter
-                            | ChatTabAction::BrowseUp
-                            | ChatTabAction::BrowseDown
-                            | ChatTabAction::BrowseUpVim
-                            | ChatTabAction::BrowseDownVim
-                            | ChatTabAction::BrowseSelectExtend
-                            | ChatTabAction::BrowseSelectExtendDown
-                            | ChatTabAction::BrowseExitSelection
-                            | ChatTabAction::CopySelection
+                        CodeTabAction::BrowseEnter
+                            | CodeTabAction::BrowseUp
+                            | CodeTabAction::BrowseDown
+                            | CodeTabAction::BrowseUpVim
+                            | CodeTabAction::BrowseDownVim
+                            | CodeTabAction::BrowseSelectExtend
+                            | CodeTabAction::BrowseSelectExtendDown
+                            | CodeTabAction::BrowseExitSelection
+                            | CodeTabAction::CopySelection
                     )
                 )
             };
@@ -1471,8 +1375,8 @@ impl Chat {
         // input bar, because the textarea consumes Ctrl+K as "kill to end of
         // line" and never passes it through to the action dispatch.
         if state.pending_approval().is_none() && !state.turn_in_flight {
-            use crate::keymap::ChatTabAction;
-            if let Some(ChatTabAction::BrowseEnter) = ChatTabAction::from_chord(&key) {
+            use crate::keymap::CodeTabAction;
+            if let Some(CodeTabAction::BrowseEnter) = CodeTabAction::from_chord(&key) {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, false);
                 } else {
@@ -1510,7 +1414,7 @@ impl Chat {
                     {
                         let sid = state.session_id.clone();
                         let res = self.rpc.session_cancel(&sid).await;
-                        if let ChatPhase::Active(ref mut state) = self.phase {
+                        if let TranscriptPhase::Active(ref mut state) = self.phase {
                             if res.is_ok() {
                                 state.enter_cancelling();
                             } else {
@@ -1529,13 +1433,13 @@ impl Chat {
                     state.show_thoughts = !state.show_thoughts;
                     state.mark_dirty_full();
                     let status = if state.show_thoughts {
-                        crate::i18n::t("zc-chat-thinking-visible")
+                        crate::i18n::t("zc-code-thinking-visible")
                     } else {
-                        crate::i18n::t("zc-chat-thinking-hidden")
+                        crate::i18n::t("zc-code-thinking-hidden")
                     };
                     state
                         .entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(status)));
+                        .push(TranscriptEntry::SystemMessage(Arc::<str>::from(status)));
                     state.mark_dirty_append();
                     return false;
                 }
@@ -1546,7 +1450,9 @@ impl Chat {
                 }
                 InputBarAction::RestartSession => {
                     let rpc = self.rpc.clone();
-                    if let Some(next_phase) = Self::restart_session_for_state(&rpc, state).await {
+                    if let Some(next_phase) =
+                        Self::restart_session_for_state(&rpc, self.pane_kind, state).await
+                    {
                         self.phase = next_phase;
                     }
                     return false;
@@ -1596,13 +1502,13 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::Consumed => return false,
-                InputBarAction::NotHandled => { /* fall through to chat-specific keys */ }
+                InputBarAction::NotHandled => { /* fall through to code-specific keys */ }
             }
         }
 
-        // ── Chat-specific key handling ───────────────────────────
-        use crate::keymap::{ChatTabAction, GlobalAction};
-        // Quit chord wins (chat overrides conditionally on turn state below).
+        // ── Transcript-specific key handling ───────────────────────────
+        use crate::keymap::{CodeTabAction, GlobalAction};
+        // Quit chord wins (code overrides conditionally on turn state below).
         if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
             if state.turn_in_flight {
                 if !matches!(state.turn_status, TurnStatus::Cancelling) {
@@ -1618,8 +1524,8 @@ impl Chat {
             }
             return false;
         }
-        match ChatTabAction::from_chord(&key) {
-            Some(ChatTabAction::BrowseExitSelection) => {
+        match CodeTabAction::from_chord(&key) {
+            Some(CodeTabAction::BrowseExitSelection) => {
                 if state.in_browse_mode() {
                     state.exit_browse_mode();
                 } else if state.turn_in_flight
@@ -1633,7 +1539,7 @@ impl Chat {
                     }
                 }
             }
-            Some(ChatTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
+            Some(CodeTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -1645,7 +1551,7 @@ impl Chat {
                         .await;
                 }
             }
-            Some(ChatTabAction::CancelTurn) if state.pending_approval().is_some() => {
+            Some(CodeTabAction::CancelTurn) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -1657,7 +1563,7 @@ impl Chat {
                         .await;
                 }
             }
-            Some(ChatTabAction::ApprovalApproveAll) if state.pending_approval().is_some() => {
+            Some(CodeTabAction::ApprovalApproveAll) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -1669,7 +1575,7 @@ impl Chat {
                         .await;
                 }
             }
-            Some(ChatTabAction::ApprovalApproveEdit) if state.pending_approval().is_some() => {
+            Some(CodeTabAction::ApprovalApproveEdit) if state.pending_approval().is_some() => {
                 let is_edit_tool = state
                     .pending_approval()
                     .map(|pa| matches!(pa.tool_name.as_str(), "file_edit" | "file_write"))
@@ -1690,7 +1596,7 @@ impl Chat {
                         .await;
                 }
             }
-            Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
+            Some(CodeTabAction::NewSession) if !state.turn_in_flight => {
                 let rpc = self.rpc.clone();
                 if let Some(next_phase) =
                     Self::restart_session_for_state(&rpc, self.pane_kind, state).await
@@ -1698,7 +1604,7 @@ impl Chat {
                     self.phase = next_phase;
                 }
             }
-            Some(ChatTabAction::SwitchSession) if !state.turn_in_flight => {
+            Some(CodeTabAction::SwitchSession) if !state.turn_in_flight => {
                 let picker_sessions = if self.pane_kind == PaneKind::Code {
                     self.rpc
                         .acp_session_list()
@@ -1725,7 +1631,7 @@ impl Chat {
                     list_state: ls,
                 };
             }
-            Some(ChatTabAction::ToggleThoughts)
+            Some(CodeTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
                     && state.pending_approval().is_none()
                     && !state.in_browse_mode() =>
@@ -1733,93 +1639,71 @@ impl Chat {
                 state.show_thoughts = !state.show_thoughts;
                 state.mark_dirty_full();
             }
-            Some(ChatTabAction::TodoToggle) => {
-                state.todo_tracker.toggle();
-                state.mark_dirty_full();
-            }
-            Some(ChatTabAction::BrowseEnter) => {
+            Some(CodeTabAction::BrowseEnter) => {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, false);
                 } else {
                     state.enter_browse_mode();
                 }
             }
-            Some(ChatTabAction::BrowseExit) if state.in_browse_mode() => {
+            Some(CodeTabAction::BrowseExit) if state.in_browse_mode() => {
                 state.exit_browse_mode();
             }
-            Some(ChatTabAction::BrowseUp) => {
+            Some(CodeTabAction::BrowseUp) => {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, false);
                 } else if !state.pinned_to_bottom {
                     state.scroll_up(1);
                 }
             }
-            Some(ChatTabAction::BrowseDown) => {
+            Some(CodeTabAction::BrowseDown) => {
                 if state.in_browse_mode() {
                     state.browse_move_down(1, false);
                 } else if !state.pinned_to_bottom {
                     state.scroll_down(1);
                 }
             }
-            Some(ChatTabAction::BrowseSelectExtend) => {
+            Some(CodeTabAction::BrowseSelectExtend) => {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, true);
                 } else {
                     state.scroll_up(1);
                 }
             }
-            Some(ChatTabAction::BrowseSelectExtendDown) => {
+            Some(CodeTabAction::BrowseSelectExtendDown) => {
                 if state.in_browse_mode() {
                     state.browse_move_down(1, true);
                 } else {
                     state.scroll_down(1);
                 }
             }
-            Some(ChatTabAction::FastScrollUp) => {
+            Some(CodeTabAction::FastScrollUp) => {
                 state.scroll_up(5);
             }
-            Some(ChatTabAction::FastScrollDown) => {
+            Some(CodeTabAction::FastScrollDown) => {
                 state.scroll_down(5);
             }
-            Some(ChatTabAction::ScrollUp) => {
-                state.scroll_up(1);
-            }
-            Some(ChatTabAction::ScrollDown) => {
-                state.scroll_down(1);
-            }
-            Some(ChatTabAction::PageUp) => {
-                state.page_up();
-            }
-            Some(ChatTabAction::PageDown) => {
-                state.page_down();
-            }
-            Some(ChatTabAction::JumpStart) => {
-                state.scroll_to_top();
-            }
-            Some(ChatTabAction::JumpEnd) => {
-                state.scroll_to_bottom();
-            }
-            Some(ChatTabAction::BrowseUpVim)
+            Some(CodeTabAction::BrowseUpVim)
                 if state.in_browse_mode()
                     && state.pending_approval().is_none()
                     && !state.turn_in_flight =>
             {
                 state.browse_move_up(1, false);
             }
-            Some(ChatTabAction::BrowseDownVim)
+            Some(CodeTabAction::BrowseDownVim)
                 if state.in_browse_mode()
                     && state.pending_approval().is_none()
                     && !state.turn_in_flight =>
             {
                 state.browse_move_down(1, false);
             }
-            Some(ChatTabAction::CopySelection) if state.has_selection() => {
+            Some(CodeTabAction::CopySelection) if state.has_selection() => {
                 let text = state.yank_selection();
                 if !text.is_empty() {
                     crate::mouse::copy_osc52(&text);
                 }
             }
-            Some(ChatTabAction::CopyAllVisible) if state.has_selection() => {
+            Some(CodeTabAction::CopyAllVisible) if state.has_selection() => {
                 let text = state.yank_selection();
                 if !text.is_empty() {
                     crate::mouse::copy_osc52(&text);
@@ -1834,7 +1718,7 @@ impl Chat {
         rpc: &Arc<RpcClient>,
         mouse: MouseEvent,
         area: Rect,
-        state: &mut ChatState,
+        state: &mut TranscriptState,
     ) {
         let Some(modal_rect) = model_picker_overlay_area(&state.model_picker, area) else {
             return;
@@ -1877,7 +1761,7 @@ impl Chat {
     async fn switch_to_session_entry(
         rpc: &Arc<RpcClient>,
         pane_kind: PaneKind,
-        state: &mut ChatState,
+        state: &mut TranscriptState,
         entry: crate::client::SessionEntry,
     ) {
         let new_sid = entry.session_id;
@@ -1891,7 +1775,7 @@ impl Chat {
             return;
         }
 
-        let rehydrate_result = if pane_kind == PaneKind::Acp {
+        let rehydrate_result = if pane_kind == PaneKind::Code {
             rpc.session_new_acp(&agent_alias, None, Some(&new_sid))
                 .await
         } else {
@@ -1903,7 +1787,7 @@ impl Chat {
             Err(e) => {
                 state.session_overlay = SessionOverlay::None;
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                    "zc-chat-session-switch-error",
+                    "zc-code-session-switch-error",
                     &[("error", &e.to_string())],
                 )));
                 state.mark_dirty_full();
@@ -1915,7 +1799,7 @@ impl Chat {
         state.session_overlay = SessionOverlay::None;
         state.reset_for_session(new_sid.clone(), new_name);
         state.agent_alias = agent_alias.clone();
-        if pane_kind == PaneKind::Acp {
+        if pane_kind == PaneKind::Code {
             state.cwd = rehydrated.workspace_dir;
         }
 
@@ -1930,7 +1814,7 @@ impl Chat {
     /// On a model_provider switch the daemon rebuilds the provider box live.
     async fn apply_session_override(
         rpc: &RpcClient,
-        state: &mut ChatState,
+        state: &mut TranscriptState,
         overrides: crate::client::SessionOverrides,
     ) {
         let waiting = crate::widgets::InfoMessage::info(crate::i18n::t("zc-model-switch-applying"));
@@ -1975,7 +1859,7 @@ impl Chat {
         state.mark_dirty_full();
     }
 
-    async fn refresh_model_identity(rpc: &RpcClient, state: &mut ChatState) {
+    async fn refresh_model_identity(rpc: &RpcClient, state: &mut TranscriptState) {
         if let Some(provider_ref) = Self::resolve_model_provider_ref(rpc, &state.agent_alias).await
         {
             let model = Self::configured_model(rpc, &provider_ref).await;
@@ -2022,7 +1906,7 @@ impl Chat {
     async fn open_model_picker(
         rpc: &Arc<RpcClient>,
         model_fetch_tx: &mpsc::Sender<ModelFetchResult>,
-        state: &mut ChatState,
+        state: &mut TranscriptState,
     ) {
         let active_provider = match state.model_provider_ref.clone() {
             Some(r) => Some(r),
@@ -2096,7 +1980,7 @@ impl Chat {
     /// autocomplete cache. Ignores results for a session that has since
     /// changed or a picker the user already dismissed.
     fn apply_model_fetch(&mut self, res: ModelFetchResult) {
-        let ChatPhase::Active(state) = &mut self.phase else {
+        let TranscriptPhase::Active(state) = &mut self.phase else {
             return;
         };
         if state.session_id != res.session_id {
@@ -2126,7 +2010,7 @@ impl Chat {
     }
 
     /// Open stage 1 of the two-stage model_provider picker.
-    async fn open_provider_picker(rpc: &RpcClient, state: &mut ChatState) {
+    async fn open_provider_picker(rpc: &RpcClient, state: &mut TranscriptState) {
         match rpc.quickstart_state().await {
             Ok(snap) => {
                 let providers = snap.model_providers;
@@ -2166,10 +2050,10 @@ impl Chat {
                 .map(|agent| agent.alias)
                 .collect::<Vec<_>>(),
             Err(e) => {
-                if let ChatPhase::Active(state) = &mut self.phase {
+                if let TranscriptPhase::Active(state) = &mut self.phase {
                     state.info_message =
                         Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                            "zc-chat-error-fetch-agents",
+                            "zc-code-error-fetch-agents",
                             &[("error", &e.to_string())],
                         )));
                     state.mark_dirty_full();
@@ -2191,7 +2075,7 @@ impl Chat {
 
         self.resume_session_id = None;
         self.resume_agent_alias = None;
-        self.phase = ChatPhase::PickAgent {
+        self.phase = TranscriptPhase::PickAgent {
             agents,
             list_state,
             loading: false,
@@ -2200,14 +2084,14 @@ impl Chat {
 
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
-        if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
+        if let TranscriptPhase::PickCwd { explorer, .. } = &mut self.phase {
             explorer.handle_mouse(mouse);
             return;
         }
 
-        if matches!(self.phase, ChatPhase::PickSession { .. }) {
+        if matches!(self.phase, TranscriptPhase::PickSession { .. }) {
             let mut confirm_session: Option<SessionEntry> = None;
-            if let ChatPhase::PickSession {
+            if let TranscriptPhase::PickSession {
                 sessions,
                 list_state,
                 ..
@@ -2251,9 +2135,12 @@ impl Chat {
 
         // Agent picker: click highlights a row, double-click confirms (enters
         // the session), wheel moves the selection.
-        if matches!(self.phase, ChatPhase::PickAgent { loading: false, .. }) {
+        if matches!(
+            self.phase,
+            TranscriptPhase::PickAgent { loading: false, .. }
+        ) {
             let mut confirm_alias: Option<String> = None;
-            if let ChatPhase::PickAgent {
+            if let TranscriptPhase::PickAgent {
                 agents, list_state, ..
             } = &mut self.phase
             {
@@ -2286,7 +2173,7 @@ impl Chat {
             return;
         }
 
-        if let ChatPhase::Active(state) = &self.phase
+        if let TranscriptPhase::Active(state) = &self.phase
             && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
             && !state.turn_in_flight
             && !state.input_bar.has_file_explorer()
@@ -2299,7 +2186,7 @@ impl Chat {
             return;
         }
 
-        if let ChatPhase::Active(ref mut state) = self.phase {
+        if let TranscriptPhase::Active(ref mut state) = self.phase {
             // Let the file explorer handle mouse events first when open.
             if state.input_bar.handle_mouse(mouse) {
                 state.clear_mouse_highlight();
@@ -2452,7 +2339,7 @@ impl Chat {
                                 // Ctrl+click outside browse mode: copy silently
                                 state.browse_multi.clear();
                                 state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
+                                TranscriptState::copy_entry_silently(state, idx);
                                 state.mark_dirty_full();
                             }
                         } else if shift {
@@ -2467,7 +2354,7 @@ impl Chat {
                                 // Shift+click outside browse mode: copy silently
                                 state.browse_multi.clear();
                                 state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
+                                TranscriptState::copy_entry_silently(state, idx);
                                 state.mark_dirty_full();
                             }
                         } else {
@@ -2483,7 +2370,7 @@ impl Chat {
                             } else {
                                 // Out of browse mode: copy silently, brief highlight
                                 state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
+                                TranscriptState::copy_entry_silently(state, idx);
                             }
                         }
                     } else {
@@ -2552,7 +2439,7 @@ impl Chat {
 
     /// Handle a bracketed paste event.
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        let ChatPhase::Active(state) = &mut self.phase else {
+        let TranscriptPhase::Active(state) = &mut self.phase else {
             return;
         };
         if state.turn_in_flight {
@@ -2566,14 +2453,14 @@ impl Chat {
 
     /// Returns true when the pane is accepting text input (blocks `?` help).
     ///
-    /// In active chat: text input mode is on when the user has started typing
+    /// In active code session: text input mode is on when the user has started typing
     /// (non-empty input buffer) and is not in selection mode or an overlay.
     /// When input is empty we're in "command" mode — single-char keybindings
     /// like `t`, `j`, `k`, `y`, `?` should work.
     /// Return the current context token counts for the status bar.
     pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
+            TranscriptPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
             _ => (None, None),
         }
     }
@@ -2583,8 +2470,8 @@ impl Chat {
     /// `None` in the agent-picker phase, where no agent is yet chosen.
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         match &self.phase {
-            ChatPhase::Active(s) => Some(s.agent_alias.as_str()),
-            ChatPhase::PickCwd { agent_alias, .. } => Some(agent_alias.as_str()),
+            TranscriptPhase::Active(s) => Some(s.agent_alias.as_str()),
+            TranscriptPhase::PickCwd { agent_alias, .. } => Some(agent_alias.as_str()),
             _ => None,
         }
     }
@@ -2592,7 +2479,7 @@ impl Chat {
     /// Active info-bar message for the app-level `InfoBar`, expiring it first if
     /// it has outlived [`crate::widgets::INFO_BAR_TTL`] so the bar auto-hides.
     pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
-        if let ChatPhase::Active(s) = &mut self.phase {
+        if let TranscriptPhase::Active(s) = &mut self.phase {
             if s.info_message.as_ref().is_some_and(|m| m.is_expired()) {
                 s.info_message = None;
             }
@@ -2601,44 +2488,35 @@ impl Chat {
         None
     }
 
-    /// Whether the active chat session is in browse mode.
+    /// Whether the active code session is in browse mode.
     pub(crate) fn in_browse_mode(&self) -> bool {
         match &self.phase {
-            ChatPhase::Active(s) => s.in_browse_mode(),
+            TranscriptPhase::Active(s) => s.in_browse_mode(),
             _ => false,
         }
     }
 
     /// Exit browse / selection mode if active. No-op otherwise.
     pub(crate) fn exit_browse_mode(&mut self) {
-        if let ChatPhase::Active(s) = &mut self.phase {
+        if let TranscriptPhase::Active(s) = &mut self.phase {
             s.exit_browse_mode();
         }
     }
 
     /// Clear the input bar text (called when Ctrl+C arms the quit modal).
     pub(crate) fn clear_input(&mut self) {
-        if let ChatPhase::Active(s) = &mut self.phase {
+        if let TranscriptPhase::Active(s) = &mut self.phase {
             s.input_bar.reset();
             s.mark_dirty_full();
-        }
-    }
-
-    pub(crate) fn wants_quit_chord(&self) -> bool {
-        match &self.phase {
-            ChatPhase::Active(s) => {
-                s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling)
-            }
-            _ => false,
         }
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
-            ChatPhase::PickCwd { .. } => true,
-            ChatPhase::PickSession { .. } => false,
-            ChatPhase::Active(s) => {
+            TranscriptPhase::PickCwd { .. } => true,
+            TranscriptPhase::PickSession { .. } => false,
+            TranscriptPhase::Active(s) => {
                 // The model picker is modal: claim text-input so global keys
                 // (`?`, reload) are suppressed; its own handler swallows keys.
                 if s.model_picker.is_open() {
@@ -2669,17 +2547,17 @@ impl Chat {
     }
 }
 
-impl crate::widgets::HelpContext for Chat {
+impl crate::widgets::HelpContext for Transcript {
     fn help_context(&self) -> crate::widgets::HelpNode {
-        use crate::keymap::{ChatTabAction, RebindableActions};
+        use crate::keymap::{CodeTabAction, RebindableActions};
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
-            ChatPhase::PickAgent { loading, .. } => {
+            TranscriptPhase::PickAgent { loading, .. } => {
                 use crate::keymap::{
-                    ChatTabAction as C, GlobalAction, ModalAction, action_key_labels,
+                    CodeTabAction as C, GlobalAction, ModalAction, action_key_labels,
                 };
                 if *loading {
-                    HelpNode::entries(vec![E::key("", crate::i18n::t("zc-chat-loading-agents"))])
+                    HelpNode::entries(vec![E::key("", crate::i18n::t("zc-code-loading-agents"))])
                 } else {
                     let nav = action_key_labels(C::BrowseUp)
                         .into_iter()
@@ -2687,46 +2565,46 @@ impl crate::widgets::HelpContext for Chat {
                         .chain(action_key_labels(C::BrowseUpVim))
                         .chain(action_key_labels(C::BrowseDownVim));
                     HelpNode::entries(vec![
-                        E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                        E::new(nav, crate::i18n::t("zc-code-help-navigate")),
                         E::new(
                             action_key_labels(ModalAction::Confirm),
-                            crate::i18n::t("zc-chat-help-select-agent"),
+                            crate::i18n::t("zc-code-help-select-agent"),
                         ),
                         E::new(
                             action_key_labels(GlobalAction::Quit),
-                            crate::i18n::t("zc-chat-help-quit"),
+                            crate::i18n::t("zc-code-help-quit"),
                         ),
                     ])
                 }
             }
-            ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
-            ChatPhase::PickSession { .. } => {
-                use crate::keymap::{ChatTabAction as C, ModalAction as M, action_key_labels};
+            TranscriptPhase::PickCwd { explorer, .. } => explorer.help_context(),
+            TranscriptPhase::PickSession { .. } => {
+                use crate::keymap::{CodeTabAction as C, ModalAction as M, action_key_labels};
                 let nav = action_key_labels(M::Up)
                     .into_iter()
                     .chain(action_key_labels(M::Down));
                 HelpNode::entries(vec![
-                    E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                    E::new(nav, crate::i18n::t("zc-code-help-navigate")),
                     E::new(
                         action_key_labels(M::Confirm),
-                        crate::i18n::t("zc-chat-help-switch-session"),
+                        crate::i18n::t("zc-code-help-switch-session"),
                     ),
                     E::new(
                         action_key_labels(M::Cancel)
                             .into_iter()
                             .chain(action_key_labels(C::NewSession)),
-                        crate::i18n::t("zc-chat-help-new-session"),
+                        crate::i18n::t("zc-code-help-new-session"),
                     ),
                 ])
             }
-            ChatPhase::Error(_) => {
-                use crate::keymap::{ChatTabAction as C, GlobalAction, action_key_labels};
+            TranscriptPhase::Error(_) => {
+                use crate::keymap::{CodeTabAction as C, GlobalAction, action_key_labels};
                 let keys = action_key_labels(C::ErrorDismiss)
                     .into_iter()
                     .chain(action_key_labels(GlobalAction::Quit));
-                HelpNode::entries(vec![E::new(keys, crate::i18n::t("zc-chat-help-quit"))])
+                HelpNode::entries(vec![E::new(keys, crate::i18n::t("zc-code-help-quit"))])
             }
-            ChatPhase::Active(state) => {
+            TranscriptPhase::Active(state) => {
                 match &state.session_overlay {
                     SessionOverlay::List { .. } => {
                         use crate::keymap::{ModalAction as M, action_key_labels};
@@ -2734,14 +2612,14 @@ impl crate::widgets::HelpContext for Chat {
                             .into_iter()
                             .chain(action_key_labels(M::Down));
                         return HelpNode::entries(vec![
-                            E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                            E::new(nav, crate::i18n::t("zc-code-help-navigate")),
                             E::new(
                                 action_key_labels(M::Confirm),
-                                crate::i18n::t("zc-chat-help-switch-session"),
+                                crate::i18n::t("zc-code-help-switch-session"),
                             ),
                             E::new(
                                 action_key_labels(M::Cancel),
-                                crate::i18n::t("zc-chat-help-close"),
+                                crate::i18n::t("zc-code-help-close"),
                             ),
                         ]);
                     }
@@ -2760,7 +2638,7 @@ impl crate::widgets::HelpContext for Chat {
                         action_key_labels(M::Up)
                             .into_iter()
                             .chain(action_key_labels(M::Down)),
-                        crate::i18n::t("zc-chat-help-move-up"),
+                        crate::i18n::t("zc-code-help-move-up"),
                     )];
                     if multi {
                         entries.push(E::new(
@@ -2779,28 +2657,28 @@ impl crate::widgets::HelpContext for Chat {
                     return HelpNode::entries(entries);
                 }
                 if state.pending_approval().is_some() {
-                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    use crate::keymap::{CodeTabAction as C, action_key_labels};
                     return HelpNode::entries(vec![
                         E::new(
                             action_key_labels(C::ApprovalApprove),
-                            crate::i18n::t("zc-chat-help-approve"),
+                            crate::i18n::t("zc-code-help-approve"),
                         ),
                         E::new(
                             action_key_labels(C::ApprovalApproveAll),
-                            crate::i18n::t("zc-chat-help-always-approve"),
+                            crate::i18n::t("zc-code-help-always-approve"),
                         ),
                         E::new(
                             action_key_labels(C::CancelTurn),
-                            crate::i18n::t("zc-chat-help-deny"),
+                            crate::i18n::t("zc-code-help-deny"),
                         ),
                         E::new(
                             action_key_labels(C::CancelTurn),
-                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                            crate::i18n::t("zc-code-help-cancel-turn"),
                         ),
                     ]);
                 }
                 if state.in_browse_mode() {
-                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    use crate::keymap::{CodeTabAction as C, action_key_labels};
                     let mut return_keys = action_key_labels(C::BrowseExit);
                     return_keys.extend(action_key_labels(C::BrowseExitSelection));
                     return HelpNode::entries(vec![
@@ -2808,33 +2686,33 @@ impl crate::widgets::HelpContext for Chat {
                             action_key_labels(C::BrowseUp)
                                 .into_iter()
                                 .chain(action_key_labels(C::BrowseUpVim)),
-                            crate::i18n::t("zc-chat-help-move-up"),
+                            crate::i18n::t("zc-code-help-move-up"),
                         ),
                         E::new(
                             action_key_labels(C::BrowseDown)
                                 .into_iter()
                                 .chain(action_key_labels(C::BrowseDownVim)),
-                            crate::i18n::t("zc-chat-help-move-down"),
+                            crate::i18n::t("zc-code-help-move-down"),
                         ),
                         E::new(
                             action_key_labels(C::BrowseSelectExtend)
                                 .into_iter()
                                 .chain(action_key_labels(C::BrowseSelectExtendDown)),
-                            crate::i18n::t("zc-chat-help-extend-selection"),
+                            crate::i18n::t("zc-code-help-extend-selection"),
                         ),
                         E::new(
                             action_key_labels(C::CopySelection),
-                            crate::i18n::t("zc-chat-help-yank-selection"),
+                            crate::i18n::t("zc-code-help-yank-selection"),
                         ),
-                        E::new(return_keys, crate::i18n::t("zc-chat-help-return-to-input")),
+                        E::new(return_keys, crate::i18n::t("zc-code-help-return-to-input")),
                     ]);
                 }
                 if state.turn_in_flight {
-                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    use crate::keymap::{CodeTabAction as C, action_key_labels};
                     let mut cancel_keys = action_key_labels(C::CancelTurn);
                     cancel_keys.extend(action_key_labels(C::BrowseExitSelection));
                     let mut entries = vec![
-                        E::new(cancel_keys, crate::i18n::t("zc-chat-help-cancel-turn")),
+                        E::new(cancel_keys, crate::i18n::t("zc-code-help-cancel-turn")),
                         E::new(
                             action_key_labels(crate::keymap::InputBarAction::Submit),
                             crate::i18n::t("zc-queue-help-enqueue"),
@@ -2860,29 +2738,33 @@ impl crate::widgets::HelpContext for Chat {
                     // rebinds always stay in sync — see also the browse-mode
                     // dispatch code in `handle_key`.
                     E::new(
-                        ChatTabAction::BrowseEnter
+                        CodeTabAction::BrowseEnter
                             .resolved()
                             .iter()
                             .map(|c| c.display().to_string()),
-                        crate::i18n::t("zc-chat-help-browse-mode"),
+                        crate::i18n::t("zc-code-help-browse-mode"),
                     ),
                     E::key(
                         "Shift+↑/↓",
-                        crate::i18n::t("zc-chat-help-scroll-conversation"),
+                        crate::i18n::t("zc-code-help-scroll-conversation"),
                     ),
-                    E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
-                    E::spacer(),
+                    E::key("t", crate::i18n::t("zc-code-help-toggle-thoughts")),
                     E::key(
-                        chord_label(ChatTabAction::NewSession),
-                        crate::i18n::t("zc-chat-help-new-session"),
-                    ),
-                    E::key(
-                        chord_label(ChatTabAction::SwitchSession),
-                        crate::i18n::t("zc-chat-help-switch-session"),
+                        "/toggle-thinking",
+                        crate::i18n::t("zc-code-help-toggle-thinking-cmd"),
                     ),
                     E::spacer(),
                     E::key(
-                        chord_label(ChatTabAction::PauseResumeQueue),
+                        chord_label(CodeTabAction::NewSession),
+                        crate::i18n::t("zc-code-help-new-session"),
+                    ),
+                    E::key(
+                        chord_label(CodeTabAction::SwitchSession),
+                        crate::i18n::t("zc-code-help-session-list"),
+                    ),
+                    E::spacer(),
+                    E::key(
+                        chord_label(CodeTabAction::PauseResumeQueue),
                         crate::i18n::t("zc-queue-help-resume"),
                     ),
                 ];
@@ -2899,7 +2781,7 @@ impl crate::widgets::HelpContext for Chat {
 /// Build the agent-picker nav hint from the live keymap (browse up/down + the
 /// modal confirm chord), never hardcoded literals.
 fn picker_nav_keys() -> String {
-    use crate::keymap::{ChatTabAction, Chord, ModalAction, RebindableActions};
+    use crate::keymap::{Chord, CodeTabAction, ModalAction, RebindableActions};
     let mut parts: Vec<String> = Vec::new();
     let mut push = |c: &Chord| {
         let d = c.display();
@@ -2907,10 +2789,10 @@ fn picker_nav_keys() -> String {
             parts.push(d);
         }
     };
-    for c in ChatTabAction::BrowseUp.resolved() {
+    for c in CodeTabAction::BrowseUp.resolved() {
         push(&c);
     }
-    for c in ChatTabAction::BrowseDown.resolved() {
+    for c in CodeTabAction::BrowseDown.resolved() {
         push(&c);
     }
     for c in ModalAction::Confirm.resolved() {
@@ -2936,7 +2818,7 @@ fn draw_agent_picker(
     frame.render_widget(block, area);
 
     if loading {
-        let p = Paragraph::new(crate::i18n::t("zc-chat-loading-agents-msg"))
+        let p = Paragraph::new(crate::i18n::t("zc-code-loading-agents-msg"))
             .alignment(Alignment::Center)
             .style(theme::dim_style());
         let vert = Layout::default()
@@ -2962,12 +2844,12 @@ fn draw_agent_picker(
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!("{} ", crate::i18n::t("zc-chat-picker-header")),
+            format!("{} ", crate::i18n::t("zc-code-picker-header")),
             theme::body_style(),
         ),
         Span::styled(
             crate::i18n::t_args(
-                "zc-chat-picker-header-hint",
+                "zc-code-picker-header-hint",
                 &[("keys", &picker_nav_keys())],
             ),
             theme::dim_style(),
@@ -3017,59 +2899,9 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
     frame.render_widget(p, chunks[1]);
 }
 
-// ── Active chat rendering ────────────────────────────────────────
+// ── Active code transcript rendering ────────────────────────────────────────
 
-/// Split `area` into (body, optional tracker area) based on the
-/// tracker's location and visibility. Side panels (`Left`/`Right`) take
-/// the configured column width clamped to at most half the pane width;
-/// the bottom strip grows with the plan up to the configured max height,
-/// clamped to at most half the pane height. Returns `None` for the
-/// tracker area when it wants no space — the body then gets the whole
-/// area (existing layout untouched).
-fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (Rect, Option<Rect>) {
-    if !tracker.wants_space() {
-        return (area, None);
-    }
-    match tracker.location() {
-        crate::todo_tracker::TodoLocation::Right => {
-            let w = tracker.width().min(area.width / 2);
-            let body = Rect::new(area.x, area.y, area.width.saturating_sub(w), area.height);
-            let panel = Rect::new(area.x + body.width, area.y, w, area.height);
-            (body, Some(panel))
-        }
-        crate::todo_tracker::TodoLocation::Left => {
-            let w = tracker.width().min(area.width / 2);
-            let panel = Rect::new(area.x, area.y, w, area.height);
-            let body = Rect::new(
-                area.x + w,
-                area.y,
-                area.width.saturating_sub(w),
-                area.height,
-            );
-            (body, Some(panel))
-        }
-        crate::todo_tracker::TodoLocation::Bottom => {
-            // Grow up to the configured cap (+2 rows for the bordered
-            // block), but never exceed half the pane height.
-            let want = (tracker.total() as u16 + 2).min(tracker.max_height());
-            let h = want.min(area.height / 2);
-            let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(h));
-            let panel = Rect::new(area.x, area.y + body.height, area.width, h);
-            (body, Some(panel))
-        }
-    }
-}
-
-fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
-    // Carve the TodoWrite tracker's area first (outermost split), so the
-    // rest of the pane (queue sidebar, transcript, input) lays out in the
-    // remaining body. When the tracker wants no space, `body == area` and
-    // the existing layout is untouched.
-    let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
-    if let Some(panel) = todo_area {
-        state.todo_tracker.render(f, panel);
-    }
-
+fn render(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
     let area = if state.queue_sidebar_open() {
         let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
@@ -3152,7 +2984,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 area,
                 sessions,
                 list_state,
-                crate::i18n::t("zc-chat-session-list-switch-title"),
+                crate::i18n::t("zc-code-session-list-switch-title"),
             );
         }
         SessionOverlay::None => {}
@@ -3214,7 +3046,7 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
 }
 
 fn resume_queue_chord_label() -> String {
-    crate::keymap::ChatTabAction::PauseResumeQueue
+    crate::keymap::CodeTabAction::PauseResumeQueue
         .default_chords()
         .first()
         .map(|c| c.display())
@@ -3226,7 +3058,7 @@ fn resume_queue_chord_label() -> String {
 /// from drifting apart. Every key label is derived from the keymap registry,
 /// never hardcoded, so rebinds stay reflected in help.
 fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
-    use crate::keymap::ChatTabAction as A;
+    use crate::keymap::CodeTabAction as A;
     use crate::widgets::HelpEntry as E;
     vec![
         E::key(
@@ -3252,7 +3084,7 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
 /// Render an action's primary bound chord as a `&'static str` for help entries.
 /// `HelpEntry::key` requires `'static`, and chord display is computed at
 /// runtime, so the label is leaked — help is built once per popup open.
-fn chord_label(action: crate::keymap::ChatTabAction) -> &'static str {
+fn chord_label(action: crate::keymap::CodeTabAction) -> &'static str {
     let label = action
         .default_chords()
         .first()
@@ -3264,10 +3096,10 @@ fn chord_label(action: crate::keymap::ChatTabAction) -> &'static str {
 /// Like `chord_label` but joins two actions' chords as `A/B` (e.g. the up/down
 /// or widen/narrow pairs that share one help row).
 fn chord_label_pair(
-    a: crate::keymap::ChatTabAction,
-    b: crate::keymap::ChatTabAction,
+    a: crate::keymap::CodeTabAction,
+    b: crate::keymap::CodeTabAction,
 ) -> &'static str {
-    let render = |action: crate::keymap::ChatTabAction| {
+    let render = |action: crate::keymap::CodeTabAction| {
         action
             .default_chords()
             .first()
@@ -3277,7 +3109,7 @@ fn chord_label_pair(
     Box::leak(format!("{}/{}", render(a), render(b)).into_boxed_str())
 }
 
-fn render_session_status_row(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_session_status_row(f: &mut Frame, state: &TranscriptState, area: Rect) {
     let text = session_status_text(state, area.width as usize);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(text, theme::dim_style())))
@@ -3286,7 +3118,7 @@ fn render_session_status_row(f: &mut Frame, state: &ChatState, area: Rect) {
     );
 }
 
-fn session_status_text(state: &ChatState, width: usize) -> String {
+fn session_status_text(state: &TranscriptState, width: usize) -> String {
     let mut parts = vec![state.agent_alias.clone()];
     if let Some(provider) = &state.model_provider_ref {
         let model = state.model.as_deref().unwrap_or("model");
@@ -3301,7 +3133,7 @@ fn session_status_text(state: &ChatState, width: usize) -> String {
     if let Some(cwd) = cwd_status_text(state) {
         parts.push(cwd);
     }
-    parts.push(crate::i18n::t("zc-chat-status-help"));
+    parts.push(crate::i18n::t("zc-code-status-help"));
     let line = format!(" {} ", parts.join(" · "));
     first_line_preview(&line, width)
 }
@@ -3318,7 +3150,7 @@ fn context_status_text(input: Option<u64>, max: Option<u64>) -> Option<String> {
     }
 }
 
-fn cwd_status_text(state: &ChatState) -> Option<String> {
+fn cwd_status_text(state: &TranscriptState) -> Option<String> {
     let cwd = state.cwd.as_ref()?;
     let mut text = cwd.clone();
     if let Some(branch) = &state.git_branch {
@@ -3346,7 +3178,7 @@ fn compact_number(value: u64) -> String {
     output.chars().rev().collect()
 }
 
-fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
+fn render_queue_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
     let title = crate::i18n::t_args(
         "zc-queue-title",
         &[("count", &state.queue_len().to_string())],
@@ -3474,19 +3306,13 @@ fn render_tool_entry(
     result: Option<&str>,
     is_selected: bool,
 ) {
-    let sel_mod = if is_selected {
-        Modifier::REVERSED
-    } else {
-        Modifier::empty()
-    };
+    let selection = selection_modifier(is_selected);
     let parsed: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
     let title = tool_title(name, parsed.as_ref());
-    let rail_style = theme::tool_label_style().add_modifier(sel_mod);
-    lines.push(action_header_line(
+    lines.push(rail_header_line(
+        TranscriptRail::Tool,
         &title,
-        theme::tool_label_style().add_modifier(sel_mod),
-        rail_style,
-        sel_mod,
+        selection,
         COPY_MESSAGE_ACTIONS,
     ));
 
@@ -3531,7 +3357,7 @@ fn render_tool_entry(
             };
             lines.push(Line::from(Span::styled(
                 truncated,
-                theme::dim_style().add_modifier(sel_mod),
+                theme::dim_style().add_modifier(selection),
             )));
         }
     }
@@ -3544,53 +3370,44 @@ fn render_tool_entry(
         };
         lines.push(Line::from(Span::styled(
             format!("→ {truncated}"),
-            theme::dim_style().add_modifier(sel_mod),
+            theme::dim_style().add_modifier(selection),
         )));
     }
 
-    prepend_rail_to_lines(&mut lines[body_start..], rail_style);
-
-    // Apply REVERSED to body lines from diff_lines/write_lines too.
-    if is_selected {
-        for line in &mut lines[body_start..] {
-            let spans = std::mem::take(&mut line.spans);
-            line.spans = spans
-                .into_iter()
-                .map(|s| s.patch_style(Style::default().add_modifier(Modifier::REVERSED)))
-                .collect();
-        }
+    for line in &mut lines[body_start..] {
+        *line = apply_line_selection(std::mem::take(line), selection);
     }
+    prepend_rail_to_lines(&mut lines[body_start..], TranscriptRail::Tool, selection);
 }
 
 /// Render a single committed entry into `lines`.
 /// Extracted so both the incremental-append and full-rebuild paths in
 /// `rebuild_lines` share identical rendering logic.
 fn render_entry_into(
-    entry: &ChatEntry,
+    entry: &TranscriptEntry,
     is_selected: bool,
     show_thoughts: bool,
     width: u16,
     lines: &mut Vec<Line<'static>>,
 ) {
-    let sel_mod = if is_selected {
-        Modifier::REVERSED
-    } else {
-        Modifier::empty()
-    };
+    let selection = selection_modifier(is_selected);
     match entry {
-        ChatEntry::UserMessage { text, attachments } => {
-            let rail_style = theme::user_label_style().add_modifier(sel_mod);
-            lines.push(action_header_line(
-                &crate::i18n::t("zc-chat-label-you"),
-                theme::user_label_style().add_modifier(sel_mod),
-                rail_style,
-                sel_mod,
+        TranscriptEntry::UserMessage { text, attachments } => {
+            lines.push(rail_header_line(
+                TranscriptRail::User,
+                &crate::i18n::t("zc-code-label-you"),
+                selection,
                 message_actions_for_entry(entry),
             ));
-            let body_style = theme::body_style().add_modifier(sel_mod);
+            let body_style = theme::body_style().add_modifier(selection);
             let text_lines: Vec<&str> = text.as_deref().unwrap_or("").split('\n').collect();
             for line_text in text_lines {
-                lines.push(plain_indented_line(line_text, body_style, rail_style));
+                lines.push(rail_plain_body_line(
+                    TranscriptRail::User,
+                    line_text,
+                    body_style,
+                    selection,
+                ));
             }
             if !attachments.is_empty() {
                 let label = attachments
@@ -3598,58 +3415,54 @@ fn render_entry_into(
                     .map(|attachment| attachment.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
-                lines.push(plain_indented_line(
+                lines.push(rail_plain_body_line(
+                    TranscriptRail::User,
                     &format!("[{label}]"),
-                    theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
-                    rail_style,
+                    theme::warn_style().add_modifier(Modifier::ITALIC | selection),
+                    selection,
                 ));
             }
             lines.push(Line::default());
         }
-        ChatEntry::AgentMessage(text) => {
-            let rail_style = theme::agent_label_style().add_modifier(sel_mod);
-            lines.push(action_header_line(
-                &crate::i18n::t("zc-chat-label-agent"),
-                theme::agent_label_style().add_modifier(sel_mod),
-                rail_style,
-                sel_mod,
+        TranscriptEntry::AgentMessage(text) => {
+            lines.push(rail_header_line(
+                TranscriptRail::Agent,
+                &crate::i18n::t("zc-code-label-agent"),
+                selection,
                 message_actions_for_entry(entry),
             ));
-            let body_style = theme::body_style().add_modifier(sel_mod);
+            let body_style = theme::body_style().add_modifier(selection);
             let md_lines = markdown_to_lines(text.as_ref(), width);
-            for mut line in md_lines {
-                if is_selected {
-                    line = Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|span| {
-                                span.patch_style(Style::default().add_modifier(Modifier::REVERSED))
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .style(line.style);
-                }
-                lines.push(indented_line(line, body_style, rail_style));
+            for line in md_lines {
+                lines.push(rail_body_line(
+                    TranscriptRail::Agent,
+                    apply_line_selection(line, selection),
+                    body_style,
+                    selection,
+                ));
             }
             lines.push(Line::default());
         }
-        ChatEntry::AgentThought(text) => {
+        TranscriptEntry::AgentThought(text) => {
             if show_thoughts {
                 lines.push(Line::from(vec![
-                    Span::styled("(thinking) ", theme::thought_style().add_modifier(sel_mod)),
-                    Span::styled(text.to_string(), theme::dim_style().add_modifier(sel_mod)),
+                    Span::styled(
+                        "(thinking) ",
+                        theme::thought_style().add_modifier(selection),
+                    ),
+                    Span::styled(text.to_string(), theme::dim_style().add_modifier(selection)),
                 ]));
             }
         }
-        ChatEntry::SystemMessage(text) => {
+        TranscriptEntry::SystemMessage(text) => {
             for line_text in text.lines() {
                 lines.push(Line::from(Span::styled(
                     line_text.to_string(),
-                    theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
+                    theme::warn_style().add_modifier(Modifier::ITALIC | selection),
                 )));
             }
         }
-        ChatEntry::Tool {
+        TranscriptEntry::Tool {
             name,
             input_json,
             result,
@@ -3687,9 +3500,9 @@ fn message_action_rects(
         .collect()
 }
 
-fn message_actions_for_entry(entry: &ChatEntry) -> &'static [MessageAction] {
+fn message_actions_for_entry(entry: &TranscriptEntry) -> &'static [MessageAction] {
     match entry {
-        ChatEntry::UserMessage { attachments, .. } if attachments.is_empty() => {
+        TranscriptEntry::UserMessage { attachments, .. } if attachments.is_empty() => {
             EDITABLE_USER_MESSAGE_ACTIONS
         }
         _ => COPY_MESSAGE_ACTIONS,
@@ -3698,10 +3511,10 @@ fn message_actions_for_entry(entry: &ChatEntry) -> &'static [MessageAction] {
 
 fn message_action_label(action: MessageAction) -> String {
     match action {
-        MessageAction::Copy(CopyFormat::Raw) => crate::i18n::t("zc-chat-action-copy"),
-        MessageAction::Copy(CopyFormat::Markdown) => crate::i18n::t("zc-chat-action-copy-md"),
-        MessageAction::Retry => crate::i18n::t("zc-chat-action-retry"),
-        MessageAction::Edit => crate::i18n::t("zc-chat-action-edit"),
+        MessageAction::Copy(CopyFormat::Raw) => crate::i18n::t("zc-code-action-copy"),
+        MessageAction::Copy(CopyFormat::Markdown) => crate::i18n::t("zc-code-action-copy-md"),
+        MessageAction::Retry => crate::i18n::t("zc-code-action-retry"),
+        MessageAction::Edit => crate::i18n::t("zc-code-action-edit"),
     }
 }
 
@@ -3714,7 +3527,33 @@ fn clip_rect_horizontally(rect: Rect, bounds: Rect) -> Option<Rect> {
     (right > left).then(|| Rect::new(left, rect.y, right - left, rect.height))
 }
 
-fn rail_span(rail_style: Style, strength: f32) -> Span<'static> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRail {
+    User,
+    Agent,
+    Tool,
+}
+
+impl TranscriptRail {
+    fn style(self) -> Style {
+        match self {
+            Self::User => theme::user_label_style(),
+            Self::Agent => theme::agent_label_style(),
+            Self::Tool => theme::tool_label_style(),
+        }
+    }
+}
+
+fn selection_modifier(is_selected: bool) -> Modifier {
+    if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    }
+}
+
+fn rail_span(rail: TranscriptRail, selection: Modifier, strength: f32) -> Span<'static> {
+    let rail_style = rail.style().add_modifier(selection);
     let rail_color = rail_color(rail_style, strength);
     Span::styled(
         " ",
@@ -3724,18 +3563,15 @@ fn rail_span(rail_style: Style, strength: f32) -> Span<'static> {
     )
 }
 
-fn rail_glow_span(rail_style: Style) -> Span<'static> {
-    let glow_color = rail_color(rail_style, 0.28);
-    Span::styled(
-        " ",
-        Style::default()
-            .bg(glow_color)
-            .add_modifier(rail_style.add_modifier),
-    )
+fn rail_glow_span(rail: TranscriptRail, selection: Modifier) -> Span<'static> {
+    rail_span(rail, selection, 0.28)
 }
 
-fn rail_prefix(rail_style: Style, body_line: bool) -> Vec<Span<'static>> {
-    let mut spans = vec![rail_span(rail_style, 1.0), rail_glow_span(rail_style)];
+fn rail_prefix(rail: TranscriptRail, selection: Modifier, body_line: bool) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        rail_span(rail, selection, 1.0),
+        rail_glow_span(rail, selection),
+    ];
     if body_line {
         spans.push(Span::raw(" "));
     }
@@ -3761,21 +3597,23 @@ fn blend_channel(value: u8, background: u8, strength: f32) -> u8 {
     blended.round() as u8
 }
 
-fn action_header_line(
+fn rail_header_line(
+    rail: TranscriptRail,
     label: &str,
-    label_style: Style,
-    rail_style: Style,
     selection: Modifier,
     actions: &[MessageAction],
 ) -> Line<'static> {
     let muted = theme::dim_style().add_modifier(selection);
     let action_style = theme::accent_style().add_modifier(selection | Modifier::BOLD);
-    let mut spans = rail_prefix(rail_style, false);
+    let mut spans = rail_prefix(rail, selection, false);
     for action in actions {
         spans.push(Span::styled(message_action_label(*action), action_style));
         spans.push(Span::styled("  ", muted));
     }
-    spans.push(Span::styled(label.to_string(), label_style));
+    spans.push(Span::styled(
+        label.to_string(),
+        rail.style().add_modifier(selection),
+    ));
     Line::from(spans)
 }
 
@@ -3815,22 +3653,62 @@ fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn indented_line(mut line: Line<'static>, style: Style, rail_style: Style) -> Line<'static> {
-    let mut spans = rail_prefix(rail_style, true);
+fn rail_body_line(
+    rail: TranscriptRail,
+    mut line: Line<'static>,
+    style: Style,
+    selection: Modifier,
+) -> Line<'static> {
+    let mut spans = rail_prefix(rail, selection, true);
     spans.append(&mut line.spans);
     Line::from(spans).style(style)
 }
 
-fn plain_indented_line(text: &str, style: Style, rail_style: Style) -> Line<'static> {
-    let mut spans = rail_prefix(rail_style, true);
+fn rail_plain_body_line(
+    rail: TranscriptRail,
+    text: &str,
+    style: Style,
+    selection: Modifier,
+) -> Line<'static> {
+    let mut spans = rail_prefix(rail, selection, true);
     spans.push(Span::styled(text.to_string(), style));
     Line::from(spans)
 }
 
-fn prepend_rail_to_lines(lines: &mut [Line<'static>], rail_style: Style) {
+fn prepend_rail_to_lines(lines: &mut [Line<'static>], rail: TranscriptRail, selection: Modifier) {
     for line in lines {
-        line.spans.splice(0..0, rail_prefix(rail_style, true));
+        line.spans.splice(0..0, rail_prefix(rail, selection, true));
     }
+}
+
+fn apply_line_selection(mut line: Line<'static>, selection: Modifier) -> Line<'static> {
+    if selection.is_empty() {
+        return line;
+    }
+    let spans = std::mem::take(&mut line.spans);
+    line.spans = spans
+        .into_iter()
+        .map(|span| span.patch_style(Style::default().add_modifier(selection)))
+        .collect();
+    line
+}
+
+fn render_streaming_agent_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![rail_header_line(
+        TranscriptRail::Agent,
+        &crate::i18n::t("zc-code-label-agent"),
+        Modifier::empty(),
+        &[],
+    )];
+    lines.extend(markdown_to_lines(text, width).into_iter().map(|line| {
+        rail_body_line(
+            TranscriptRail::Agent,
+            line,
+            theme::body_style(),
+            Modifier::empty(),
+        )
+    }));
+    lines
 }
 
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
@@ -3846,7 +3724,7 @@ fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
     out
 }
 
-fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
+fn render_conversation(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
     state.refresh_title_hit_rects(area);
 
     // Width must be computed before cache rebuild — table column budgets
@@ -3901,18 +3779,10 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let transient_lines: Vec<Line<'static>> = if transient {
         let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
         if has_stream_text {
-            let rail_style = theme::agent_label_style();
-            let mut header = rail_prefix(rail_style, false);
-            header.push(Span::styled(
-                crate::i18n::t("zc-chat-label-agent"),
-                rail_style,
+            lines.extend(render_streaming_agent_lines(
+                &state.streaming_text,
+                inner_width,
             ));
-            lines.push(Line::from(header));
-            lines.extend(
-                markdown_to_lines(&state.streaming_text, inner_width)
-                    .into_iter()
-                    .map(|line| indented_line(line, theme::body_style(), rail_style)),
-            );
         }
         if has_stream_thought {
             lines.push(Line::from(vec![
@@ -3976,19 +3846,16 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_h = inner_height;
     state.entry_rects.clear();
     state.message_action_hit_regions.clear();
-    for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
+    for &(entry_idx, screen_lo, screen_hi) in &state.cached_screen_ranges {
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
         if visible_hi <= visible_lo {
             continue;
         }
-        // Width follows the entry's rendered text, not the full panel, so a
-        // click in the blank margin beside a short message misses every rect
-        // and clears the highlight (#8652).
         let rect = Rect::new(
             body_x,
             body_y + (visible_lo - scroll),
-            content_width.min(body_w),
+            body_w,
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
@@ -4052,7 +3919,7 @@ fn scrollbar_hit_rect(body_area: Rect) -> Option<Rect> {
     ))
 }
 
-fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_approval_overlay(f: &mut Frame, state: &TranscriptState, area: Rect) {
     let pa = match state.pending_approval() {
         Some(p) => p,
         None => return,
@@ -4078,10 +3945,10 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(Clear, overlay_area);
 
     let is_edit_tool = matches!(pa.tool_name.as_str(), "file_edit" | "file_write");
-    let allow = crate::i18n::t("zc-chat-approval-action-allow");
-    let always = crate::i18n::t("zc-chat-approval-action-always");
-    let reject = crate::i18n::t("zc-chat-approval-action-reject");
-    let edit = crate::i18n::t("zc-chat-approval-action-edit");
+    let allow = crate::i18n::t("zc-code-approval-action-allow");
+    let always = crate::i18n::t("zc-code-approval-action-always");
+    let reject = crate::i18n::t("zc-code-approval-action-reject");
+    let edit = crate::i18n::t("zc-code-approval-action-edit");
     let keys = if is_edit_tool {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}  e={edit}")
     } else {
@@ -4098,7 +3965,7 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
 
     let secs = pa.timeout_secs.to_string();
     let title = crate::i18n::t_args(
-        "zc-chat-approval-title",
+        "zc-code-approval-title",
         &[("tool", &pa.tool_name), ("secs", &secs)],
     );
     let text = if summary.is_empty() {
@@ -4129,7 +3996,7 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
 /// area so a long list scrolls rather than overflowing. Mirrors the
 /// bottom-anchored, horizontally-inset geometry of
 /// [`render_approval_overlay`].
-fn render_elicitation_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_elicitation_overlay(f: &mut Frame, state: &TranscriptState, area: Rect) {
     let e = match state.pending_elicitation() {
         Some(e) => e,
         None => return,
@@ -4310,7 +4177,7 @@ fn render_session_list_overlay(
 /// When max is unknown, shows: `ctx: 12,345 tokens`
 /// Render a markdown blob into terminal lines.
 ///
-/// `width` is the available rendering width in cells (the chat-area inner
+/// `width` is the available rendering width in cells (the transcript inner
 /// width). It only matters for tables, which compute their column budgets
 /// from it; non-table content ignores it.
 /// Emit the body lines of a code fence into `lines`, two-space indented to
@@ -4770,7 +4637,7 @@ fn render_table(
     out
 }
 
-// ── ChatState / ChatEntry ─────────────────────────────────────────
+// ── TranscriptState / TranscriptEntry ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
@@ -4801,7 +4668,7 @@ pub struct PendingElicitation {
     /// Session this elicitation belongs to. Captured at install time so a
     /// future mouse handler (or a cross-session correctness assert) can
     /// confirm the modal still targets the active session. Read indirectly
-    /// today via the install-time match in `try_install_elicitation`.
+    /// today via the install-time match in `handle_inbound_elicitation`.
     #[allow(dead_code)]
     pub session_id: String,
     /// Prompt text shown above the choice list.
@@ -4860,7 +4727,7 @@ impl PendingElicitation {
     }
 }
 
-/// One row in the chat / code-tab transcript. Heavy payloads
+/// One row in the code-tab transcript. Heavy payloads
 /// (agent messages, tool inputs, tool outputs) are refcounted via
 /// `Arc<str>` so cloning is O(1) — the renderer and the
 /// `cached_lines` line cache both hold cheap refs into the same
@@ -4869,7 +4736,7 @@ impl PendingElicitation {
 /// has exactly one heap allocation regardless of how many places
 /// borrow it.
 #[derive(Debug, Clone)]
-pub enum ChatEntry {
+pub enum TranscriptEntry {
     AgentMessage(Arc<str>),
     AgentThought(Arc<str>),
     /// Local system/info message (e.g. "Attached: photo.png").
@@ -5018,7 +4885,7 @@ pub(crate) struct QueuedMessage {
 }
 
 #[derive(Debug)]
-pub struct ChatState {
+pub struct TranscriptState {
     pub session_id: String,
     pub agent_alias: String,
     session_name: Option<String>,
@@ -5041,7 +4908,7 @@ pub struct ChatState {
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
     pub input_bar: InputBarState,
-    entries: Vec<ChatEntry>,
+    entries: Vec<TranscriptEntry>,
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
@@ -5096,15 +4963,11 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
-    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
-    /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
-    /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
-    /// lands on the correct screen rows for agent messages, code blocks, and
-    /// tables. `content_width` is the widest rendered column extent of the
-    /// entry (clamped to the viewport), so hit-testing ignores the blank space
-    /// beside short messages — a click there dismisses the highlight instead of
-    /// re-selecting the entry.
-    cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
+    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end)`.
+    /// Unlike `cached_line_ranges` (unwrapped line indices), these account for
+    /// markdown wrapping so mouse hit-testing (`entry_rects`) lands on the
+    /// correct screen rows for agent messages, code blocks, and tables.
+    cached_screen_ranges: Vec<(usize, u16, u16)>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -5147,17 +5010,10 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
-    /// Live TodoWrite tracker panel for this session. Read-only; fed by
-    /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
-    todo_tracker: crate::todo_tracker::TodoTracker,
 }
 
-impl ChatState {
-    pub fn new(
-        session_id: String,
-        agent_alias: String,
-        todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    ) -> Self {
+impl TranscriptState {
+    pub fn new(session_id: String, agent_alias: String) -> Self {
         Self {
             session_id,
             agent_alias,
@@ -5217,7 +5073,6 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
-            todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
     }
 
@@ -5253,7 +5108,7 @@ impl ChatState {
     }
 
     /// Copy a single entry to clipboard silently (no browse mode, just OSC 52).
-    fn copy_entry_silently(state: &mut ChatState, idx: usize) {
+    fn copy_entry_silently(state: &mut TranscriptState, idx: usize) {
         state.copy_entry(idx, CopyFormat::Raw);
     }
 
@@ -5279,7 +5134,7 @@ impl ChatState {
         };
         match self.enqueue_message(text, Vec::new()) {
             Ok(()) => {
-                self.set_info_notice(crate::i18n::t("zc-chat-retry-queued"));
+                self.set_info_notice(crate::i18n::t("zc-code-retry-queued"));
                 true
             }
             Err(error) => {
@@ -5294,16 +5149,16 @@ impl ChatState {
             return;
         };
         if !self.input_bar.input().is_empty() || self.input_bar.has_pending_attachments() {
-            self.set_info_notice(crate::i18n::t("zc-chat-edit-input-busy"));
+            self.set_info_notice(crate::i18n::t("zc-code-edit-input-busy"));
             return;
         }
         self.input_bar.load_for_edit(text, Vec::new());
-        self.set_info_notice(crate::i18n::t("zc-chat-edit-loaded"));
+        self.set_info_notice(crate::i18n::t("zc-code-edit-loaded"));
         self.mark_dirty_full();
     }
 
     fn editable_user_entry_text(&self, idx: usize) -> Option<String> {
-        let ChatEntry::UserMessage { text, attachments } = self.entries.get(idx)? else {
+        let TranscriptEntry::UserMessage { text, attachments } = self.entries.get(idx)? else {
             return None;
         };
         if !attachments.is_empty() {
@@ -5408,10 +5263,10 @@ impl ChatState {
     /// top is shown.  Does nothing when `cached_screen_ranges` is empty
     /// (pre-render path).
     fn scroll_entry_into_view(&mut self, entry_idx: usize) {
-        let Some(&(_, lo, _hi, _)) = self
+        let Some(&(_, lo, _hi)) = self
             .cached_screen_ranges
             .iter()
-            .find(|(idx, _, _, _)| *idx == entry_idx)
+            .find(|(idx, _, _)| *idx == entry_idx)
         else {
             return;
         };
@@ -5469,7 +5324,7 @@ impl ChatState {
 
     /// Rebuild (or incrementally extend) the cached rendered lines from committed entries.
     ///
-    /// `width` is the chat-area inner width in cells. A change in width
+    /// `width` is the transcript inner width in cells. A change in width
     /// invalidates the table layouts inside the cached lines, so a width
     /// change forces a full rebuild.
     fn rebuild_lines(&mut self, width: u16) {
@@ -5563,7 +5418,7 @@ impl ChatState {
         let view_end = scroll.saturating_add(height);
         let mut first: Option<usize> = None;
         let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
+        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
             if screen_hi > scroll && screen_lo < view_end {
                 if first.is_none() {
                     first = Some(i);
@@ -5595,24 +5450,13 @@ impl ChatState {
             if entry_lines.is_empty() {
                 continue;
             }
-            // Widest rendered column extent of the entry, clamped to the
-            // viewport. Lines wider than `width` wrap to full-width rows, so the
-            // clamp yields the true on-screen extent. Hit-testing uses this so
-            // the blank space beside a short message is treated as outside the
-            // entry.
-            let content_width = entry_lines
-                .iter()
-                .map(|l| l.width() as u16)
-                .max()
-                .unwrap_or(0)
-                .min(width);
             let wrapped = Paragraph::new(entry_lines)
                 .wrap(Wrap { trim: false })
                 .line_count(width) as u16;
             let screen_lo = screen_cursor;
             screen_cursor += wrapped;
             self.cached_screen_ranges
-                .push((entry_idx, screen_lo, screen_cursor, content_width));
+                .push((entry_idx, screen_lo, screen_cursor));
         }
     }
 
@@ -5640,25 +5484,6 @@ impl ChatState {
         if self.scroll_offset >= max {
             self.pinned_to_bottom = true;
         }
-    }
-
-    pub fn page_up(&mut self) {
-        self.scroll_up(self.last_inner_height.max(1));
-    }
-
-    pub fn page_down(&mut self) {
-        self.scroll_down(self.last_inner_height.max(1));
-    }
-
-    pub fn scroll_to_top(&mut self) {
-        self.pinned_to_bottom = false;
-        self.scroll_offset = 0;
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
-        self.scroll_offset = max;
-        self.pinned_to_bottom = true;
     }
 
     fn mark_scrollbar_active(&mut self) {
@@ -5738,7 +5563,7 @@ impl ChatState {
     }
 
     #[cfg(test)]
-    pub fn entries(&self) -> &[ChatEntry] {
+    pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
     }
 
@@ -5785,7 +5610,7 @@ impl ChatState {
         let thought = std::mem::take(&mut self.streaming_thought);
         if !thought.is_empty() {
             self.entries
-                .push(ChatEntry::AgentThought(Arc::<str>::from(thought)));
+                .push(TranscriptEntry::AgentThought(Arc::<str>::from(thought)));
             self.mark_dirty_append();
         }
     }
@@ -5797,7 +5622,7 @@ impl ChatState {
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
             self.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
+                .push(TranscriptEntry::AgentMessage(Arc::<str>::from(text)));
             self.mark_dirty_append();
         }
     }
@@ -5811,8 +5636,7 @@ impl ChatState {
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
-            | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::TurnComplete { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -5854,7 +5678,7 @@ impl ChatState {
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
-                self.entries.push(ChatEntry::Tool {
+                self.entries.push(TranscriptEntry::Tool {
                     tool_call_id: Arc::<str>::from(tool_call_id),
                     name: Arc::<str>::from(name),
                     input_json: Arc::<str>::from(
@@ -5879,7 +5703,7 @@ impl ChatState {
                     raw_output
                 };
                 for entry in self.entries.iter_mut().rev() {
-                    if let ChatEntry::Tool {
+                    if let TranscriptEntry::Tool {
                         tool_call_id: id,
                         result,
                         ..
@@ -5949,17 +5773,13 @@ impl ChatState {
                     }
                     TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
                         self.entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
+                            .push(TranscriptEntry::SystemMessage(Arc::<str>::from(
+                                content.as_str(),
+                            )));
                         self.mark_dirty_append();
                         self.commit_turn(String::new(), false);
                     }
                 }
-            }
-            // Whole-list replace: hand the authoritative plan to the
-            // tracker, which runs the auto-pop rule. Session routing is
-            // already enforced by the session_id check above.
-            SessionUpdate::Plan { entries, .. } => {
-                self.todo_tracker.set_plan(entries);
             }
         }
     }
@@ -5998,7 +5818,7 @@ impl ChatState {
         {
             self.first_message = Some(t.clone());
         }
-        self.entries.push(ChatEntry::UserMessage {
+        self.entries.push(TranscriptEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
         });
@@ -6014,7 +5834,7 @@ impl ChatState {
     const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
     const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
     const QUEUE_SIDEBAR_COLS_STEP: u16 = 4;
-    const QUEUE_CHAT_COLS_MIN: u16 = 20;
+    const QUEUE_TRANSCRIPT_COLS_MIN: u16 = 20;
 
     fn alloc_queue_id(&mut self) -> u64 {
         let id = self.next_queue_id;
@@ -6227,12 +6047,12 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    /// Queue sidebar width in columns for a given chat area width. The stored
+    /// Queue sidebar width in columns for a given transcript area width. The stored
     /// column width is clamped to the absolute range, then to whatever leaves
-    /// the chat column its floor on a terminal too narrow for both.
+    /// the transcript column its floor on a terminal too narrow for both.
     pub fn queue_sidebar_width(&self, area_width: u16) -> u16 {
-        let upper =
-            Self::QUEUE_SIDEBAR_COLS_MAX.min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
+        let upper = Self::QUEUE_SIDEBAR_COLS_MAX
+            .min(area_width.saturating_sub(Self::QUEUE_TRANSCRIPT_COLS_MIN));
         let lower = Self::QUEUE_SIDEBAR_COLS_MIN.min(upper);
         self.queue_sidebar_cols.clamp(lower, upper)
     }
@@ -6338,14 +6158,14 @@ impl ChatState {
                     if self.first_message.is_none() {
                         self.first_message = Some(m.content.clone());
                     }
-                    self.entries.push(ChatEntry::UserMessage {
+                    self.entries.push(TranscriptEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
                         attachments: vec![],
                     });
                 }
                 crate::client::MessageRole::Assistant => {
                     self.entries
-                        .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                        .push(TranscriptEntry::AgentMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
@@ -6393,15 +6213,15 @@ impl ChatState {
 
 fn copy_notice(format: CopyFormat) -> String {
     match format {
-        CopyFormat::Raw => crate::i18n::t("zc-chat-copied-clipboard"),
-        CopyFormat::Markdown => crate::i18n::t("zc-chat-copied-markdown"),
+        CopyFormat::Raw => crate::i18n::t("zc-code-copied-clipboard"),
+        CopyFormat::Markdown => crate::i18n::t("zc-code-copied-markdown"),
     }
 }
 
 /// Body-only clipboard text.
-fn clipboard_text(entry: &ChatEntry) -> String {
+fn clipboard_text(entry: &TranscriptEntry) -> String {
     match entry {
-        ChatEntry::UserMessage { text, attachments } => {
+        TranscriptEntry::UserMessage { text, attachments } => {
             let base = text.as_deref().unwrap_or("");
             if attachments.is_empty() {
                 base.to_string()
@@ -6414,10 +6234,10 @@ fn clipboard_text(entry: &ChatEntry) -> String {
                 format!("{base} [{label}]")
             }
         }
-        ChatEntry::AgentMessage(t) => markdown_plain_text(t),
-        ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
-        ChatEntry::SystemMessage(t) => t.to_string(),
-        ChatEntry::Tool {
+        TranscriptEntry::AgentMessage(t) => markdown_plain_text(t),
+        TranscriptEntry::AgentThought(t) => format!("(thinking) {t}"),
+        TranscriptEntry::SystemMessage(t) => t.to_string(),
+        TranscriptEntry::Tool {
             name,
             input_json,
             result,
@@ -6429,10 +6249,10 @@ fn clipboard_text(entry: &ChatEntry) -> String {
     }
 }
 
-fn markdown_clipboard_text(entry: &ChatEntry) -> String {
+fn markdown_clipboard_text(entry: &TranscriptEntry) -> String {
     match entry {
-        ChatEntry::AgentMessage(text) => text.to_string(),
-        ChatEntry::Tool {
+        TranscriptEntry::AgentMessage(text) => text.to_string(),
+        TranscriptEntry::Tool {
             name,
             input_json,
             result,
@@ -6490,13 +6310,13 @@ fn markdown_plain_text(markdown: &str) -> String {
 }
 
 /// Role-prefixed clipboard text. Used when ≥2 entries are yanked.
-fn labelled_clipboard_text(entry: &ChatEntry) -> String {
+fn labelled_clipboard_text(entry: &TranscriptEntry) -> String {
     match entry {
-        ChatEntry::UserMessage { .. } => {
-            crate::i18n::t_args("zc-chat-clipboard-you", &[("text", &clipboard_text(entry))])
+        TranscriptEntry::UserMessage { .. } => {
+            crate::i18n::t_args("zc-code-clipboard-you", &[("text", &clipboard_text(entry))])
         }
-        ChatEntry::AgentMessage(_) => crate::i18n::t_args(
-            "zc-chat-clipboard-agent",
+        TranscriptEntry::AgentMessage(_) => crate::i18n::t_args(
+            "zc-code-clipboard-agent",
             &[("text", &clipboard_text(entry))],
         ),
         _ => clipboard_text(entry),
@@ -6561,12 +6381,8 @@ pub async fn open_editor_for_content(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn state() -> ChatState {
-        ChatState::new(
-            "sess-1".to_string(),
-            "myagent".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        )
+    fn state() -> TranscriptState {
+        TranscriptState::new("sess-1".to_string(), "myagent".to_string())
     }
 
     #[test]
@@ -6646,7 +6462,7 @@ mod tests {
         );
     }
 
-    fn rendered_entry(entry: &ChatEntry, width: u16) -> String {
+    fn rendered_entry(entry: &TranscriptEntry, width: u16) -> String {
         let mut lines = Vec::new();
         render_entry_into(entry, false, true, width, &mut lines);
         lines
@@ -6662,12 +6478,12 @@ mod tests {
     }
 
     #[test]
-    fn chat_entries_render_compact_colored_boundaries() {
-        let user = ChatEntry::UserMessage {
+    fn transcript_entries_render_compact_colored_boundaries() {
+        let user = TranscriptEntry::UserMessage {
             text: Some(Arc::<str>::from("hello")),
             attachments: vec![],
         };
-        let agent = ChatEntry::AgentMessage(Arc::<str>::from("world"));
+        let agent = TranscriptEntry::AgentMessage(Arc::<str>::from("world"));
 
         assert_eq!(
             rendered_entry(&user, 80),
@@ -6678,7 +6494,7 @@ mod tests {
 
     #[test]
     fn message_rails_are_background_cells_not_glyphs() {
-        let entry = ChatEntry::AgentMessage(Arc::<str>::from("world"));
+        let entry = TranscriptEntry::AgentMessage(Arc::<str>::from("world"));
         let mut lines = Vec::new();
         render_entry_into(&entry, false, true, 80, &mut lines);
 
@@ -6691,11 +6507,155 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_and_tool_entries_use_typed_rails() {
+        let user = TranscriptEntry::UserMessage {
+            text: Some(Arc::<str>::from("hello")),
+            attachments: vec![],
+        };
+        let agent = TranscriptEntry::AgentMessage(Arc::<str>::from("world"));
+        let tool = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("shell"),
+            input_json: Arc::<str>::from(r#"{"command":"echo hi"}"#),
+            result: Some(Arc::<str>::from("hi")),
+        };
+
+        let rail_background = |entry: &TranscriptEntry| {
+            let mut lines = Vec::new();
+            render_entry_into(entry, false, true, 80, &mut lines);
+            lines[0].spans[0].style.bg
+        };
+
+        assert_eq!(
+            rail_background(&user),
+            rail_span(TranscriptRail::User, Modifier::empty(), 1.0)
+                .style
+                .bg
+        );
+        assert_eq!(
+            rail_background(&agent),
+            rail_span(TranscriptRail::Agent, Modifier::empty(), 1.0)
+                .style
+                .bg
+        );
+        assert_eq!(
+            rail_background(&tool),
+            rail_span(TranscriptRail::Tool, Modifier::empty(), 1.0)
+                .style
+                .bg
+        );
+    }
+
+    #[test]
+    fn tool_body_and_result_share_tool_rail() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("shell"),
+            input_json: Arc::<str>::from(r#"{"command":"echo hi"}"#),
+            result: Some(Arc::<str>::from("hi")),
+        };
+        let mut lines = Vec::new();
+        render_entry_into(&entry, false, true, 80, &mut lines);
+
+        let tool_rail = rail_span(TranscriptRail::Tool, Modifier::empty(), 1.0)
+            .style
+            .bg;
+        assert_eq!(lines[1].spans[0].style.bg, tool_rail);
+        assert_eq!(lines[2].spans[0].style.bg, tool_rail);
+    }
+
+    #[test]
+    fn streaming_agent_output_uses_agent_rail() {
+        let lines = render_streaming_agent_lines("hello", 80);
+        let agent_rail = rail_span(TranscriptRail::Agent, Modifier::empty(), 1.0)
+            .style
+            .bg;
+
+        assert_eq!(lines[0].spans[0].style.bg, agent_rail);
+        assert_eq!(lines[1].spans[0].style.bg, agent_rail);
+    }
+
+    #[test]
+    fn visual_snapshot_renders_entry_rails() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state.entries.push(TranscriptEntry::UserMessage {
+            text: Some(Arc::<str>::from("build the rail UI")),
+            attachments: vec![],
+        });
+        state
+            .entries
+            .push(TranscriptEntry::AgentMessage(Arc::<str>::from(
+                "working on it",
+            )));
+        state.entries.push(TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("shell"),
+            input_json: Arc::<str>::from(r#"{"command":"cargo test"}"#),
+            result: Some(Arc::<str>::from("ok")),
+        });
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 16);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
+            })
+            .expect("draw conversation");
+
+        let snapshot = rail_debug_snapshot(terminal.backend().buffer(), area);
+        println!("\n{snapshot}");
+
+        assert!(
+            snapshot.contains("copy  md  retry  edit  You:"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("copy  md  Agent:"), "{snapshot}");
+        assert!(snapshot.contains("copy  md  $ cargo test"), "{snapshot}");
+        assert!(snapshot.contains("→ ok"), "{snapshot}");
+    }
+
+    fn rail_debug_snapshot(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+        let user = rail_span(TranscriptRail::User, Modifier::empty(), 1.0)
+            .style
+            .bg;
+        let agent = rail_span(TranscriptRail::Agent, Modifier::empty(), 1.0)
+            .style
+            .bg;
+        let tool = rail_span(TranscriptRail::Tool, Modifier::empty(), 1.0)
+            .style
+            .bg;
+        let mut rows = Vec::new();
+        for y in area.y..area.y + area.height {
+            let mut row = String::new();
+            for x in area.x..area.x + area.width {
+                let cell = &buffer[(x, y)];
+                let symbol = cell.symbol();
+                if symbol == " " {
+                    match cell.style().bg {
+                        bg if bg == user => row.push('U'),
+                        bg if bg == agent => row.push('A'),
+                        bg if bg == tool => row.push('T'),
+                        _ => row.push(' '),
+                    }
+                } else {
+                    row.push_str(symbol);
+                }
+            }
+            rows.push(row.trim_end().to_string());
+        }
+        rows.join("\n")
+    }
+
+    #[test]
     fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
         let mut s = state();
         for i in 0..400 {
             s.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                .push(TranscriptEntry::AgentMessage(Arc::<str>::from(format!(
                     "line entry number {i}"
                 ))));
         }
@@ -6767,7 +6727,7 @@ mod tests {
 
     #[test]
     fn attached_user_messages_are_copy_only() {
-        let entry = ChatEntry::UserMessage {
+        let entry = TranscriptEntry::UserMessage {
             text: Some(Arc::<str>::from("see file")),
             attachments: vec![Arc::<str>::from("file.txt")],
         };
@@ -6811,7 +6771,7 @@ mod tests {
         let mut state = state();
         state
             .entries
-            .push(ChatEntry::AgentMessage(Arc::<str>::from("short")));
+            .push(TranscriptEntry::AgentMessage(Arc::<str>::from("short")));
         state.mark_dirty_full();
 
         let area = Rect::new(0, 0, 80, 12);
@@ -6858,7 +6818,7 @@ mod tests {
         for entry_index in 0..50 {
             state
                 .entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                .push(TranscriptEntry::AgentMessage(Arc::<str>::from(format!(
                     "entry {entry_index}"
                 ))));
         }
@@ -6888,7 +6848,7 @@ mod tests {
         for entry_index in 0..50 {
             state
                 .entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                .push(TranscriptEntry::AgentMessage(Arc::<str>::from(format!(
                     "entry {entry_index}"
                 ))));
         }
@@ -6917,7 +6877,7 @@ mod tests {
 
     #[test]
     fn markdown_tool_copy_uses_longer_fences() {
-        let entry = ChatEntry::Tool {
+        let entry = TranscriptEntry::Tool {
             tool_call_id: Arc::<str>::from("tool-1"),
             name: Arc::<str>::from("shell"),
             input_json: Arc::<str>::from(r#"{"command":"echo ```"}"#),
@@ -6935,7 +6895,7 @@ mod tests {
         let mut s = state();
         for i in 0..50 {
             s.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                .push(TranscriptEntry::AgentMessage(Arc::<str>::from(format!(
                     "entry {i}"
                 ))));
         }
@@ -6954,10 +6914,9 @@ mod tests {
 
     #[test]
     fn title_shows_agent_uid_provider_model() {
-        let mut s = ChatState::new(
+        let mut s = TranscriptState::new(
             "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
             "personal_code".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
         );
         s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
         assert_eq!(
@@ -6968,21 +6927,13 @@ mod tests {
 
     #[test]
     fn title_falls_back_before_identity_resolved() {
-        let s = ChatState::new(
-            "abcdef1234".to_string(),
-            "myagent".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let s = TranscriptState::new("abcdef1234".to_string(), "myagent".to_string());
         assert_eq!(s.title(), "myagent  abcdef1");
     }
 
     #[test]
     fn set_model_identity_keeps_full_ref_and_updates_live() {
-        let mut s = ChatState::new(
-            "abcdef1234".to_string(),
-            "ag".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5");
         s.set_model_identity(None, Some("gpt-5-mini"));
@@ -6996,11 +6947,7 @@ mod tests {
 
     #[test]
     fn title_hit_rects_target_provider_and_model_segments() {
-        let mut s = ChatState::new(
-            "abcdef1234".to_string(),
-            "ag".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         let area = Rect::new(10, 4, 80, 20);
 
@@ -7017,11 +6964,7 @@ mod tests {
 
     #[test]
     fn title_hit_rects_target_agent_before_model_identity_resolves() {
-        let mut s = ChatState::new(
-            "abcdef1234".to_string(),
-            "ag".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
 
@@ -7032,11 +6975,7 @@ mod tests {
 
     #[test]
     fn title_hit_rects_clip_at_pane_edge() {
-        let mut s = ChatState::new(
-            "abcdef1234".to_string(),
-            "ag".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut s = TranscriptState::new("abcdef1234".to_string(), "ag".to_string());
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 25, 20));
@@ -7093,75 +7032,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_picker_makes_chat_claim_text_input() {
+    async fn open_picker_makes_transcript_claim_text_input() {
         // While the picker is open the pane is modal (claims text-input so
         // global keys are suppressed and routed to the picker handler).
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
-        chat.phase = ChatPhase::Active(Box::new(state()));
-        if let ChatPhase::Active(s) = &mut chat.phase {
+        let mut transcript = Transcript::new(client, PaneKind::Code);
+        transcript.phase = TranscriptPhase::Active(Box::new(state()));
+        if let TranscriptPhase::Active(s) = &mut transcript.phase {
             s.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
                 vec!["a".into(), "b".into()],
                 None,
             ));
         }
-        assert!(chat.wants_text_input());
+        assert!(transcript.wants_text_input());
     }
 
     #[tokio::test]
-    async fn pending_elicitation_makes_chat_claim_text_input() {
+    async fn pending_elicitation_makes_transcript_claim_text_input() {
         // Regression: while an `elicitation/create` prompt is pending the
         // pane MUST be modal — it has to claim
         // text-input so `app.rs` suppresses global chords (`?` help,
         // `Ctrl+R` reload) and routes every key to the modal handler. If
         // this returns `false`, those globals fire over an in-flight
         // prompt while the daemon waits on the JSON-RPC response, breaking
-        // modality. Mirrors `open_picker_makes_chat_claim_text_input`.
+        // modality. Mirrors `open_picker_makes_transcript_claim_text_input`.
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
-        chat.phase = ChatPhase::Active(Box::new(state()));
+        let mut transcript = Transcript::new(client, PaneKind::Code);
+        transcript.phase = TranscriptPhase::Active(Box::new(state()));
         // Not modal before the prompt arrives (empty input → command mode).
-        assert!(!chat.wants_text_input());
-        if let ChatPhase::Active(s) = &mut chat.phase {
+        assert!(!transcript.wants_text_input());
+        if let TranscriptPhase::Active(s) = &mut transcript.phase {
             s.set_pending_elicitation(single_elicitation());
         }
         assert!(
-            chat.wants_text_input(),
+            transcript.wants_text_input(),
             "an active pending elicitation must claim modal focus"
-        );
-    }
-
-    #[tokio::test]
-    async fn wants_quit_chord_tracks_in_flight_turn_state() {
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
-        chat.phase = ChatPhase::Active(Box::new(state()));
-
-        assert!(
-            !chat.wants_quit_chord(),
-            "idle pane must leave Ctrl+C to the quit modal"
-        );
-
-        if let ChatPhase::Active(s) = &mut chat.phase {
-            s.turn_in_flight = true;
-        }
-        assert!(
-            chat.wants_quit_chord(),
-            "an in-flight turn must consume Ctrl+C to cancel before quit"
-        );
-
-        if let ChatPhase::Active(s) = &mut chat.phase {
-            s.enter_cancelling();
-        }
-        assert!(
-            !chat.wants_quit_chord(),
-            "an already-cancelling turn must not re-consume Ctrl+C"
         );
     }
 
@@ -7170,12 +7079,12 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
+        let mut transcript = Transcript::new(client, PaneKind::Code);
         // No session yet → None.
-        assert_eq!(chat.current_session_id(), None);
-        chat.phase = ChatPhase::Active(Box::new(state()));
+        assert_eq!(transcript.current_session_id(), None);
+        transcript.phase = TranscriptPhase::Active(Box::new(state()));
         // Active → the live session id (the `state()` helper's id).
-        assert!(chat.current_session_id().is_some());
+        assert!(transcript.current_session_id().is_some());
     }
 
     #[tokio::test]
@@ -7183,12 +7092,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
-        chat.set_resume_session_id(Some("sess-prev".to_string()));
+        let mut transcript = Transcript::new(client, PaneKind::Code);
+        transcript.set_resume_session_id(Some("sess-prev".to_string()));
 
         let init = tokio::spawn(async move {
-            let _ = chat.init().await;
-            chat
+            let _ = transcript.init().await;
+            transcript
         });
 
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -7209,15 +7118,18 @@ mod tests {
             None,
         );
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+        let transcript = tokio::time::timeout(Duration::from_secs(2), init)
             .await
             .expect("init should finish")
             .unwrap();
         // A carried resume id with no matching agent must not survive into the
         // picker, or a manual pick of a different agent would reattach a
         // mismatched session.
-        assert_eq!(chat.resume_session_id, None);
-        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+        assert_eq!(transcript.resume_session_id, None);
+        assert!(matches!(
+            transcript.phase,
+            TranscriptPhase::PickAgent { .. }
+        ));
     }
 
     #[tokio::test]
@@ -7225,13 +7137,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
-        chat.set_resume_session_id(Some("sess-prev".to_string()));
-        chat.set_resume_agent_alias(Some("beta".to_string()));
+        let mut transcript = Transcript::new(client, PaneKind::Code);
+        transcript.set_resume_session_id(Some("sess-prev".to_string()));
+        transcript.set_resume_agent_alias(Some("beta".to_string()));
 
         let init = tokio::spawn(async move {
-            let _ = chat.init().await;
-            chat
+            let _ = transcript.init().await;
+            transcript
         });
 
         // First request: the agent list.
@@ -7252,18 +7164,7 @@ mod tests {
             None,
         );
 
-        // Second request: the one-shot [todotracker] config fetch fired on the
-        // first session start. Respond with an empty field set (defaults apply).
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("start_session should fetch todotracker config")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "config/list");
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
-
-        // Third request must carry the prior id for the prior agent, not a
+        // Second request must carry the prior id for the prior agent — NOT a
         // fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -7284,7 +7185,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Transcript::new(client, PaneKind::Code);
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -7339,7 +7240,7 @@ mod tests {
             .await
             .expect("init should finish")
             .unwrap();
-        let ChatPhase::PickSession {
+        let TranscriptPhase::PickSession {
             sessions,
             list_state,
             agents,
@@ -7359,7 +7260,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Transcript::new(client, PaneKind::Code);
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -7403,11 +7304,11 @@ mod tests {
             .await
             .expect("init should finish")
             .unwrap();
-        assert!(matches!(chat.phase, ChatPhase::PickSession { .. }));
+        assert!(matches!(chat.phase, TranscriptPhase::PickSession { .. }));
 
         let resume = tokio::spawn(async move {
             let entry = match &chat.phase {
-                ChatPhase::PickSession { sessions, .. } => sessions[0].clone(),
+                TranscriptPhase::PickSession { sessions, .. } => sessions[0].clone(),
                 _ => panic!("expected saved-session picker"),
             };
             chat.resume_session_entry(entry).await;
@@ -7460,7 +7361,7 @@ mod tests {
             .await
             .expect("resume should finish")
             .unwrap();
-        let ChatPhase::Active(state) = chat.phase else {
+        let TranscriptPhase::Active(state) = chat.phase else {
             panic!("Enter should enter the saved ACP session");
         };
         assert_eq!(state.session_id, "sess-beta");
@@ -7473,7 +7374,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Transcript::new(client, PaneKind::Code);
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -7517,11 +7418,11 @@ mod tests {
             .await
             .expect("init should finish")
             .unwrap();
-        assert!(matches!(chat.phase, ChatPhase::PickSession { .. }));
+        assert!(matches!(chat.phase, TranscriptPhase::PickSession { .. }));
 
         let fresh = tokio::spawn(async move {
             let agents = match &chat.phase {
-                ChatPhase::PickSession { agents, .. } => agents.clone(),
+                TranscriptPhase::PickSession { agents, .. } => agents.clone(),
                 _ => panic!("expected saved-session picker"),
             };
             chat.start_fresh_from_picker(agents).await;
@@ -7558,7 +7459,7 @@ mod tests {
             .await
             .expect("fresh start should finish")
             .unwrap();
-        let ChatPhase::Active(state) = chat.phase else {
+        let TranscriptPhase::Active(state) = chat.phase else {
             panic!("Esc should enter a fresh ACP session");
         };
         assert_eq!(state.session_id, "sess-fresh");
@@ -7569,7 +7470,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Transcript::new(client, PaneKind::Code);
         chat.resume_session_id = Some("sess-prev".to_string());
         chat.resume_agent_alias = Some("beta".to_string());
 
@@ -7628,7 +7529,7 @@ mod tests {
             .await
             .expect("init should finish")
             .unwrap();
-        let ChatPhase::Active(state) = chat.phase else {
+        let TranscriptPhase::Active(state) = chat.phase else {
             panic!("stale carried resume should still enter a fresh ACP session");
         };
         assert_eq!(state.session_id, "sess-fresh");
@@ -7641,17 +7542,17 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
+        let mut transcript = Transcript::new(client, PaneKind::Code);
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        chat.phase = ChatPhase::PickAgent {
+        transcript.phase = TranscriptPhase::PickAgent {
             agents: vec!["alpha".into(), "beta".into(), "gamma".into()],
             list_state,
             loading: false,
         };
         // Stored rect is the draw's shifted form: list_click_index treats (y+1)
         // as the first item. With y=1, first item maps to row 2.
-        chat.pick_agent_list_area = Rect::new(1, 1, 20, 6);
+        transcript.pick_agent_list_area = Rect::new(1, 1, 20, 6);
         // Click the third item → row 2 + 2 = 4.
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7659,8 +7560,10 @@ mod tests {
             row: 4,
             modifiers: KeyModifiers::NONE,
         };
-        chat.handle_mouse(click, Rect::new(0, 0, 40, 10)).await;
-        if let ChatPhase::PickAgent { list_state, .. } = &chat.phase {
+        transcript
+            .handle_mouse(click, Rect::new(0, 0, 40, 10))
+            .await;
+        if let TranscriptPhase::PickAgent { list_state, .. } = &transcript.phase {
             assert_eq!(
                 list_state.selected(),
                 Some(2),
@@ -7678,10 +7581,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Transcript::new(client, PaneKind::Code);
         let area = Rect::new(0, 0, 100, 30);
         let overlay_area = session_list_overlay_area(area);
-        let mut state = ChatState::new(
+        let mut state = TranscriptState::new(
             "sess-old".to_string(),
             "alpha".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
@@ -7701,7 +7604,7 @@ mod tests {
             }],
             list_state,
         };
-        chat.phase = ChatPhase::Active(Box::new(state));
+        chat.phase = TranscriptPhase::Active(Box::new(state));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7759,7 +7662,7 @@ mod tests {
             .await
             .expect("double-click switch should finish")
             .unwrap();
-        let ChatPhase::Active(state) = chat.phase else {
+        let TranscriptPhase::Active(state) = chat.phase else {
             panic!("double-click should leave the chat active");
         };
         assert_eq!(state.session_id, "sess-new");
@@ -7775,10 +7678,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut chat = Transcript::new(client, PaneKind::Code);
         let area = Rect::new(0, 0, 100, 30);
         let overlay_area = session_list_overlay_area(area);
-        let mut state = ChatState::new(
+        let mut state = TranscriptState::new(
             "sess-old".to_string(),
             "alpha".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
@@ -7798,7 +7701,7 @@ mod tests {
             }],
             list_state,
         };
-        chat.phase = ChatPhase::Active(Box::new(state));
+        chat.phase = TranscriptPhase::Active(Box::new(state));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7828,7 +7731,7 @@ mod tests {
             .await
             .expect("failed switch should finish")
             .unwrap();
-        let ChatPhase::Active(state) = chat.phase else {
+        let TranscriptPhase::Active(state) = chat.phase else {
             panic!("failed switch should keep the chat active");
         };
         assert_eq!(state.session_id, "sess-old");
@@ -7849,15 +7752,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Transcript::new(client, PaneKind::Chat);
         let area = Rect::new(10, 4, 80, 20);
-        let mut state = ChatState::new(
-            "abcdef1234".to_string(),
-            "beta".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut state = TranscriptState::new("abcdef1234".to_string(), "beta".to_string());
         state.refresh_title_hit_rects(area);
-        chat.phase = ChatPhase::Active(Box::new(state));
+        chat.phase = TranscriptPhase::Active(Box::new(state));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7893,7 +7792,7 @@ mod tests {
             .await
             .expect("agent picker should open after agents/status response")
             .unwrap();
-        let ChatPhase::PickAgent {
+        let TranscriptPhase::PickAgent {
             agents, list_state, ..
         } = chat.phase
         else {
@@ -7910,16 +7809,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut chat = Transcript::new(client, PaneKind::Chat);
         let area = Rect::new(10, 4, 80, 20);
-        let mut state = ChatState::new(
-            "abcdef1234".to_string(),
-            "beta".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut state = TranscriptState::new("abcdef1234".to_string(), "beta".to_string());
         state.turn_in_flight = true;
         state.refresh_title_hit_rects(area);
-        chat.phase = ChatPhase::Active(Box::new(state));
+        chat.phase = TranscriptPhase::Active(Box::new(state));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7936,7 +7831,7 @@ mod tests {
             "in-flight agent title click must not call agents/status"
         );
         assert!(
-            matches!(chat.phase, ChatPhase::Active(_)),
+            matches!(chat.phase, TranscriptPhase::Active(_)),
             "in-flight agent title click must leave the active session visible"
         );
     }
@@ -7949,11 +7844,11 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
+        let mut transcript = Transcript::new(client, PaneKind::Code);
         let mut state = state();
         state
             .entries
-            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+            .push(TranscriptEntry::AgentMessage(Arc::<str>::from("hello")));
         state.highlighted_entry = Some(0);
         state.mouse_down_entry = Some(0);
         state.mark_dirty_full();
@@ -7965,10 +7860,10 @@ mod tests {
             .draw(|frame| {
                 render(frame, &mut state, area);
             })
-            .expect("draw chat");
+            .expect("draw transcript");
 
         state.dirty = LinesDirty::Clean;
-        chat.phase = ChatPhase::Active(Box::new(state));
+        transcript.phase = TranscriptPhase::Active(Box::new(state));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7976,10 +7871,10 @@ mod tests {
             row: area.height.saturating_sub(2),
             modifiers: KeyModifiers::NONE,
         };
-        chat.handle_mouse(click, area).await;
+        transcript.handle_mouse(click, area).await;
 
-        let ChatPhase::Active(state) = &chat.phase else {
-            panic!("expected active chat");
+        let TranscriptPhase::Active(state) = &transcript.phase else {
+            panic!("expected active transcript");
         };
         assert_eq!(state.highlighted_entry, None);
         assert_eq!(state.mouse_down_entry, None);
@@ -7990,77 +7885,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn blank_side_click_clears_transcript_mouse_highlight() {
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        use ratatui::{Terminal, backend::TestBackend};
-
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
-        let mut state = state();
-        state
-            .entries
-            .push(ChatEntry::AgentMessage(Arc::<str>::from("hi")));
-        state.highlighted_entry = Some(0);
-        state.mouse_down_entry = Some(0);
-        state.mark_dirty_full();
-
-        let area = Rect::new(0, 0, 80, 20);
-        let backend = TestBackend::new(area.width, area.height);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        terminal
-            .draw(|frame| {
-                render(frame, &mut state, area);
-            })
-            .expect("draw chat");
-
-        // The rendered entry rect must hug the text, not span the panel, so
-        // there is blank space beside the short message to click in.
-        let (_, rect) = state
-            .entry_rects
-            .iter()
-            .find(|(idx, _)| *idx == 0)
-            .copied()
-            .expect("entry 0 has a screen rect");
-        assert!(
-            rect.width < area.width - 2,
-            "short message rect must not span the full panel width: {rect:?}"
-        );
-        // A column just past the text but well within the panel — the blank
-        // margin beside the message.
-        let blank_col = rect.x + rect.width + 1;
-        let blank_row = rect.y;
-        assert!(
-            blank_col < area.width - 1,
-            "blank column stays in the panel"
-        );
-
-        state.dirty = LinesDirty::Clean;
-        chat.phase = ChatPhase::Active(Box::new(state));
-
-        let click = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: blank_col,
-            row: blank_row,
-            modifiers: KeyModifiers::NONE,
-        };
-        chat.handle_mouse(click, area).await;
-
-        let ChatPhase::Active(state) = &chat.phase else {
-            panic!("expected active chat");
-        };
-        assert_eq!(state.highlighted_entry, None);
-        assert_eq!(state.mouse_down_entry, None);
-        assert_eq!(
-            state.dirty,
-            LinesDirty::Full,
-            "clearing the highlight must invalidate rendered transcript lines"
-        );
-    }
-
-    fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
+    fn authoritative_rows(s: &TranscriptState, width: u16) -> u16 {
         Paragraph::new(s.cached_lines.iter().map(borrow_line).collect::<Vec<_>>())
             .wrap(Wrap { trim: false })
             .line_count(width) as u16
@@ -8106,16 +7931,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_entry_refresh_reloads_agents_from_error_phase() {
+    async fn transcript_entry_refresh_reloads_agents_from_error_phase() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
-        chat.phase = ChatPhase::Error("No enabled agents yet.".to_string());
+        let mut transcript = Transcript::new(client, PaneKind::Code);
+        transcript.phase = TranscriptPhase::Error("No enabled agents yet.".to_string());
 
         let refresh = tokio::spawn(async move {
-            chat.refresh_if_inactive().await;
-            chat
+            transcript.refresh_if_inactive().await;
+            transcript
         });
 
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -8137,13 +7962,13 @@ mod tests {
             None,
         );
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), refresh)
+        let transcript = tokio::time::timeout(Duration::from_secs(2), refresh)
             .await
             .expect("refresh should finish after agents/status response")
             .unwrap();
-        let ChatPhase::PickAgent {
+        let TranscriptPhase::PickAgent {
             agents, loading, ..
-        } = chat.phase
+        } = transcript.phase
         else {
             panic!("refresh should leave stale error state");
         };
@@ -8152,7 +7977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_entry_refresh_reloads_agents_from_pick_phase() {
+    async fn transcript_entry_refresh_reloads_agents_from_pick_phase() {
         // Re-entering the pane while parked on the picker must re-fetch the
         // agent list so an agent created elsewhere (Quickstart / Config) shows
         // up — and the existing highlight must survive the refresh. Regression
@@ -8160,18 +7985,18 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Code);
+        let mut transcript = Transcript::new(client, PaneKind::Code);
         let mut list_state = ListState::default();
         list_state.select(Some(1)); // user has "beta" highlighted
-        chat.phase = ChatPhase::PickAgent {
+        transcript.phase = TranscriptPhase::PickAgent {
             agents: vec!["alpha".to_string(), "beta".to_string()],
             list_state,
             loading: false,
         };
 
         let refresh = tokio::spawn(async move {
-            chat.refresh_if_inactive().await;
-            chat
+            transcript.refresh_if_inactive().await;
+            transcript
         });
 
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -8194,13 +8019,13 @@ mod tests {
             None,
         );
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), refresh)
+        let transcript = tokio::time::timeout(Duration::from_secs(2), refresh)
             .await
             .expect("refresh should finish after agents/status response")
             .unwrap();
-        let ChatPhase::PickAgent {
+        let TranscriptPhase::PickAgent {
             agents, list_state, ..
-        } = chat.phase
+        } = transcript.phase
         else {
             panic!("refresh should keep the agent picker");
         };
@@ -8267,7 +8092,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             &entries[0],
-            ChatEntry::Tool {
+            TranscriptEntry::Tool {
                 result: Some(_),
                 ..
             }
@@ -8360,9 +8185,9 @@ mod tests {
         // Thought must be committed as an entry before the tool entry.
         assert_eq!(s.entries().len(), 2);
         assert!(
-            matches!(&s.entries()[0], ChatEntry::AgentThought(t) if t.as_ref() == "plan: run ls")
+            matches!(&s.entries()[0], TranscriptEntry::AgentThought(t) if t.as_ref() == "plan: run ls")
         );
-        assert!(matches!(&s.entries()[1], ChatEntry::Tool { .. }));
+        assert!(matches!(&s.entries()[1], TranscriptEntry::Tool { .. }));
         // streaming_thought is now clear.
         assert!(s.current_thought_text().is_empty());
     }
@@ -8381,7 +8206,9 @@ mod tests {
         });
         // Thought entry committed before streaming text starts.
         assert_eq!(s.entries().len(), 1);
-        assert!(matches!(&s.entries()[0], ChatEntry::AgentThought(t) if t.as_ref() == "thinking"));
+        assert!(
+            matches!(&s.entries()[0], TranscriptEntry::AgentThought(t) if t.as_ref() == "thinking")
+        );
         assert_eq!(s.current_agent_text(), "Here is");
         assert!(s.current_thought_text().is_empty());
     }
@@ -8439,11 +8266,11 @@ mod tests {
             s.entries()
         );
         assert!(
-            matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "I will run ls."),
+            matches!(&s.entries()[0], TranscriptEntry::AgentMessage(t) if t.as_ref() == "I will run ls."),
             "first entry must be AgentMessage with pre-tool text"
         );
         assert!(
-            matches!(&s.entries()[1], ChatEntry::Tool { .. }),
+            matches!(&s.entries()[1], TranscriptEntry::Tool { .. }),
             "second entry must be Tool"
         );
         // streaming_text must be cleared after the flush.
@@ -8495,13 +8322,13 @@ mod tests {
             "expected 3 entries: pre-tool AgentMessage, Tool, post-tool AgentMessage"
         );
         assert!(
-            matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Running ls."),
+            matches!(&s.entries()[0], TranscriptEntry::AgentMessage(t) if t.as_ref() == "Running ls."),
             "first entry must be pre-tool AgentMessage"
         );
         assert!(
             matches!(
                 &s.entries()[1],
-                ChatEntry::Tool {
+                TranscriptEntry::Tool {
                     result: Some(_),
                     ..
                 }
@@ -8509,7 +8336,7 @@ mod tests {
             "second entry must be Tool with result"
         );
         assert!(
-            matches!(&s.entries()[2], ChatEntry::AgentMessage(t) if t.as_ref() == "Done."),
+            matches!(&s.entries()[2], TranscriptEntry::AgentMessage(t) if t.as_ref() == "Done."),
             "third entry must be post-tool AgentMessage"
         );
     }
@@ -8530,7 +8357,7 @@ mod tests {
 
         // Only the Tool entry should exist — no empty AgentMessage.
         assert_eq!(s.entries().len(), 1);
-        assert!(matches!(&s.entries()[0], ChatEntry::Tool { .. }));
+        assert!(matches!(&s.entries()[0], TranscriptEntry::Tool { .. }));
     }
 
     /// commit_turn must not push a duplicate AgentMessage for text already
@@ -8561,9 +8388,9 @@ mod tests {
             "commit_turn must not add a duplicate AgentMessage for already-flushed text"
         );
         assert!(
-            matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Before tool.")
+            matches!(&s.entries()[0], TranscriptEntry::AgentMessage(t) if t.as_ref() == "Before tool.")
         );
-        assert!(matches!(&s.entries()[1], ChatEntry::Tool { .. }));
+        assert!(matches!(&s.entries()[1], TranscriptEntry::Tool { .. }));
     }
 
     #[test]
@@ -8578,7 +8405,7 @@ mod tests {
         assert!(
             s.entries()
                 .iter()
-                .any(|e| matches!(e, ChatEntry::AgentMessage(t) if t.as_ref() == "Done"))
+                .any(|e| matches!(e, TranscriptEntry::AgentMessage(t) if t.as_ref() == "Done"))
         );
     }
 
@@ -8899,7 +8726,7 @@ mod tests {
     fn retry_user_entry_queues_message() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.entries.push(ChatEntry::UserMessage {
+        s.entries.push(TranscriptEntry::UserMessage {
             text: Some(Arc::<str>::from("again")),
             attachments: vec![],
         });
@@ -8912,7 +8739,7 @@ mod tests {
     #[test]
     fn edit_user_entry_loads_input_when_empty() {
         let mut s = state();
-        s.entries.push(ChatEntry::UserMessage {
+        s.entries.push(TranscriptEntry::UserMessage {
             text: Some(Arc::<str>::from("revise me")),
             attachments: vec![],
         });
@@ -8925,7 +8752,7 @@ mod tests {
     #[test]
     fn retry_user_entry_rejects_attached_messages() {
         let mut s = state();
-        s.entries.push(ChatEntry::UserMessage {
+        s.entries.push(TranscriptEntry::UserMessage {
             text: Some(Arc::<str>::from("again")),
             attachments: vec![Arc::<str>::from("file.txt")],
         });
@@ -8938,7 +8765,7 @@ mod tests {
     fn edit_user_entry_does_not_overwrite_whitespace_input() {
         let mut s = state();
         s.input_bar.insert_text("   ");
-        s.entries.push(ChatEntry::UserMessage {
+        s.entries.push(TranscriptEntry::UserMessage {
             text: Some(Arc::<str>::from("revise me")),
             attachments: vec![],
         });
@@ -9247,7 +9074,7 @@ mod tests {
     fn queue_cap_enforced() {
         let mut s = state();
         s.turn_in_flight = true;
-        for i in 0..ChatState::QUEUE_CAP {
+        for i in 0..TranscriptState::QUEUE_CAP {
             s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
         }
         assert!(
@@ -9257,42 +9084,22 @@ mod tests {
     }
 
     #[test]
-    fn page_and_jump_scroll_move_the_viewport() {
-        let mut s = state();
-        s.last_total_rows = 100;
-        s.last_inner_height = 10;
-        s.scroll_to_bottom();
-        let bottom = s.scroll_offset;
-        assert_eq!(bottom, 90);
-        assert!(s.pinned_to_bottom);
-
-        s.page_up();
-        assert_eq!(s.scroll_offset, 80);
-        assert!(!s.pinned_to_bottom);
-
-        s.scroll_to_top();
-        assert_eq!(s.scroll_offset, 0);
-        assert!(!s.pinned_to_bottom);
-
-        s.page_down();
-        assert_eq!(s.scroll_offset, 10);
-
-        s.scroll_to_bottom();
-        assert_eq!(s.scroll_offset, bottom);
-        assert!(s.pinned_to_bottom);
-    }
-
-    #[test]
     fn queue_sidebar_resize_clamps_to_bounds() {
         let mut s = state();
         for _ in 0..40 {
             s.widen_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MAX);
+        assert_eq!(
+            s.queue_sidebar_cols,
+            TranscriptState::QUEUE_SIDEBAR_COLS_MAX
+        );
         for _ in 0..40 {
             s.narrow_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MIN);
+        assert_eq!(
+            s.queue_sidebar_cols,
+            TranscriptState::QUEUE_SIDEBAR_COLS_MIN
+        );
     }
 
     #[test]
@@ -9313,34 +9120,27 @@ mod tests {
         let s = state();
         let wide = s.queue_sidebar_width(400);
         assert!(
-            wide <= ChatState::QUEUE_SIDEBAR_COLS_MAX,
+            wide <= TranscriptState::QUEUE_SIDEBAR_COLS_MAX,
             "sidebar exceeded absolute column cap"
         );
-        // Narrow terminal: chat column keeps its minimum, sidebar shrinks.
+        // Narrow terminal: transcript column keeps its minimum, sidebar shrinks.
         let tight = s.queue_sidebar_width(40);
         assert!(
-            tight <= 40u16.saturating_sub(ChatState::QUEUE_CHAT_COLS_MIN),
-            "sidebar starved the chat column on a narrow terminal"
+            tight <= 40u16.saturating_sub(TranscriptState::QUEUE_TRANSCRIPT_COLS_MIN),
+            "sidebar starved the transcript column on a narrow terminal"
         );
     }
 
     #[test]
     fn title_includes_short_session_hash() {
-        let s = ChatState::new(
-            "40be7731122334455".to_string(),
-            "personal_code".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let s = TranscriptState::new("40be7731122334455".to_string(), "personal_code".to_string());
         assert_eq!(s.title(), "personal_code  40be773");
     }
 
     #[test]
     fn title_with_session_name_keeps_hash() {
-        let mut s = ChatState::new(
-            "40be7731122334455".to_string(),
-            "personal_code".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut s =
+            TranscriptState::new("40be7731122334455".to_string(), "personal_code".to_string());
         s.session_name = Some("my work".to_string());
         assert_eq!(s.title(), "personal_code  — my work  40be773");
     }
@@ -9517,164 +9317,5 @@ mod tests {
             s.pending_elicitation().is_none(),
             "a session switch must drop any stale elicitation modal"
         );
-    }
-
-    // ── Inbound elicitation routing (ask_user intermittent-failure fix) ──
-
-    /// Build an inbound `elicitation/create` request for `session_id` with a
-    /// canonical single-select schema (the shape the daemon emits).
-    fn inbound_single_elicitation(id: &str, session_id: &str) -> crate::client::RpcInboundRequest {
-        crate::client::RpcInboundRequest {
-            id: serde_json::json!(id),
-            method: "elicitation/create".to_string(),
-            params: serde_json::json!({
-                "sessionId": session_id,
-                "mode": "form",
-                "message": "Pick one",
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {
-                        "choice": {
-                            "type": "string",
-                            "oneOf": [
-                                { "const": "choice-0", "title": "Yes" },
-                                { "const": "choice-1", "title": "No" }
-                            ]
-                        }
-                    }
-                }
-            }),
-        }
-    }
-
-    fn test_chat() -> (Chat, mpsc::Receiver<String>) {
-        let (tx, rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(rpc));
-        (Chat::new(client, PaneKind::Chat), rx)
-    }
-
-    /// An elicitation whose session matches the active pane installs a modal
-    /// immediately and sends no response (the user answers it later).
-    #[tokio::test]
-    async fn elicitation_matching_active_session_installs_modal() {
-        let (mut chat, mut rx) = test_chat();
-        chat.phase = ChatPhase::Active(Box::new(state())); // session_id = "sess-1"
-
-        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-1"));
-
-        // Modal installed.
-        match &chat.phase {
-            ChatPhase::Active(s) => assert!(
-                s.pending_elicitation().is_some(),
-                "matching-session elicitation must install a modal"
-            ),
-            _ => panic!("expected Active phase"),
-        }
-        // Nothing deferred, and no auto-response was written.
-        assert!(chat.deferred_elicitations.is_empty());
-        assert!(
-            rx.try_recv().is_err(),
-            "an installed elicitation must not be auto-answered"
-        );
-    }
-
-    /// An elicitation for a *different* session must NOT be auto-cancelled on
-    /// arrival — the pane may be mid-transition. It is deferred for retry.
-    #[tokio::test]
-    async fn elicitation_for_other_session_is_deferred_not_cancelled() {
-        let (mut chat, mut rx) = test_chat();
-        chat.phase = ChatPhase::Active(Box::new(state())); // active = "sess-1"
-
-        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-OTHER"));
-
-        assert_eq!(
-            chat.deferred_elicitations.len(),
-            1,
-            "a non-matching elicitation must be deferred, not cancelled outright"
-        );
-        // Give the (non-)spawned responder a chance — nothing must be sent yet.
-        tokio::task::yield_now().await;
-        assert!(
-            rx.try_recv().is_err(),
-            "a deferred elicitation must not be answered during its grace window"
-        );
-    }
-
-    /// A deferred elicitation installs as soon as its session becomes active.
-    #[tokio::test]
-    async fn deferred_elicitation_installs_once_session_becomes_active() {
-        let (mut chat, _rx) = test_chat();
-        // No active session yet (still picking an agent) → defer.
-        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-1"));
-        assert_eq!(chat.deferred_elicitations.len(), 1);
-
-        // Session comes up.
-        chat.phase = ChatPhase::Active(Box::new(state())); // "sess-1"
-        chat.drain_deferred_elicitations();
-
-        assert!(
-            chat.deferred_elicitations.is_empty(),
-            "the deferred elicitation must be consumed once installable"
-        );
-        match &chat.phase {
-            ChatPhase::Active(s) => assert!(s.pending_elicitation().is_some()),
-            _ => panic!("expected Active"),
-        }
-    }
-
-    /// A deferred elicitation whose grace window elapses without becoming
-    /// installable is answered `cancel` so the daemon's tool call unblocks.
-    #[tokio::test]
-    async fn expired_deferred_elicitation_is_cancelled() {
-        let (mut chat, mut rx) = test_chat();
-        chat.phase = ChatPhase::Active(Box::new(state())); // active = "sess-1"
-
-        // Defer an elicitation for a session this pane will never own, with an
-        // already-expired arrival time.
-        chat.deferred_elicitations.push(DeferredInboundRequest {
-            req: inbound_single_elicitation("e1", "sess-GONE"),
-            first_seen: Instant::now() - (ELICITATION_ROUTE_GRACE + Duration::from_millis(1)),
-        });
-
-        chat.drain_deferred_elicitations();
-
-        assert!(
-            chat.deferred_elicitations.is_empty(),
-            "an expired deferral must be dropped from the retry buffer"
-        );
-        // A `{"action":"cancel"}` response must have been written.
-        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("expired deferral must emit a cancel response")
-            .expect("writer channel open");
-        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(frame["id"], serde_json::json!("e1"));
-        assert_eq!(frame["result"]["action"], "cancel");
-    }
-
-    /// An unparseable elicitation (unknown schema) is cancelled immediately —
-    /// deferring it would never succeed.
-    #[tokio::test]
-    async fn unparseable_elicitation_is_cancelled_immediately() {
-        let (mut chat, mut rx) = test_chat();
-        chat.phase = ChatPhase::Active(Box::new(state()));
-
-        let mut req = inbound_single_elicitation("e1", "sess-1");
-        // Corrupt the schema so `ElicitationShape::from_schema` returns None.
-        req.params["requestedSchema"] = serde_json::json!({ "type": "object" });
-
-        chat.route_inbound_elicitation(req);
-
-        assert!(
-            chat.deferred_elicitations.is_empty(),
-            "an unparseable elicitation must not be deferred"
-        );
-        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("unparseable elicitation must emit a cancel response")
-            .expect("writer channel open");
-        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(frame["result"]["action"], "cancel");
     }
 }

@@ -3,17 +3,17 @@ use std::sync::Arc;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
-use crate::chat;
 use crate::client::RpcClient;
+use crate::transcript;
 
 pub(crate) struct Code {
-    inner: chat::Chat,
+    inner: transcript::Transcript,
 }
 
 impl Code {
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Code),
+            inner: transcript::Transcript::new(rpc, transcript::PaneKind::Code),
         }
     }
 

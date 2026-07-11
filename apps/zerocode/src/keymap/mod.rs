@@ -1,7 +1,7 @@
 //! Keymap abstraction for zerocode.
 //!
 //! Each leaf action enum carries its own default bindings inline.
-//! Consumers call `ChatTabAction::from_chord(&key)` directly — no
+//! Consumers call `CodeTabAction::from_chord(&key)` directly — no
 //! `Keymap` struct, no plumbed argument.
 //!
 //! On darwin, `Chord::matches` translates the `CTRL` modifier to
@@ -116,16 +116,16 @@ mod tests {
     #[test]
     fn labels_are_human_readable() {
         assert_eq!(GlobalAction::Quit.label(), "quit");
-        assert_eq!(ChatTabAction::BrowseUpVim.label(), "browse prev (vim)");
+        assert_eq!(CodeTabAction::BrowseUpVim.label(), "browse prev (vim)");
         assert_eq!(InputBarAction::Submit.label(), "send");
     }
 
     #[test]
     fn actions_serde_round_trip() {
-        let action = ChatTabAction::ScrollUp;
+        let action = CodeTabAction::ScrollUp;
         let json = serde_json::to_string(&action).unwrap();
         assert_eq!(json, "\"scroll_up\"");
-        let back: ChatTabAction = serde_json::from_str(&json).unwrap();
+        let back: CodeTabAction = serde_json::from_str(&json).unwrap();
         assert_eq!(action, back);
     }
 
@@ -145,7 +145,7 @@ mod tests {
             }
         }
         check(GlobalAction::TAG, GlobalAction::bindings());
-        check(ChatTabAction::TAG, ChatTabAction::bindings());
+        check(CodeTabAction::TAG, CodeTabAction::bindings());
         check(LogsTabAction::TAG, LogsTabAction::bindings());
         check(DashboardTabAction::TAG, DashboardTabAction::bindings());
         check(ConfigTabAction::TAG, ConfigTabAction::bindings());
@@ -173,8 +173,8 @@ mod tests {
         let global = GlobalAction::bindings();
         let panes: &[(&str, Vec<Chord>)] = &[
             (
-                "chat",
-                ChatTabAction::bindings()
+                "code",
+                CodeTabAction::bindings()
                     .into_iter()
                     .map(|(c, _)| c)
                     .collect(),
@@ -248,7 +248,7 @@ mod tests {
             }
         }
         check::<GlobalAction>();
-        check::<ChatTabAction>();
+        check::<CodeTabAction>();
         check::<LogsTabAction>();
         check::<DashboardTabAction>();
         check::<ConfigTabAction>();

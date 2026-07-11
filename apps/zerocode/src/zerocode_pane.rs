@@ -1574,13 +1574,13 @@ fn theme_swatch_roles(name: &str) -> Option<[ratatui::style::Color; SWATCH_ROLE_
 /// per `(tag, variant)`, chords grouped.
 fn collect_binding_rows() -> Vec<BindingRow> {
     use crate::keymap::{
-        ChatTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+        CodeTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
         GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction,
     };
 
     let mut rows = Vec::new();
     rows_from::<GlobalAction>(&mut rows);
-    rows_from::<ChatTabAction>(&mut rows);
+    rows_from::<CodeTabAction>(&mut rows);
     rows_from::<LogsTabAction>(&mut rows);
     rows_from::<DashboardTabAction>(&mut rows);
     rows_from::<ConfigTabAction>(&mut rows);
@@ -1607,12 +1607,12 @@ fn rows_from<A: crate::keymap::RebindableActions>(out: &mut Vec<BindingRow>) {
 /// by walking the enums for a matching action key.
 fn default_chords_for(action_key: &str) -> Vec<Chord> {
     use crate::keymap::{
-        ChatTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+        CodeTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
         GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction,
     };
     let mut found = None;
     defaults_in::<GlobalAction>(action_key, &mut found);
-    defaults_in::<ChatTabAction>(action_key, &mut found);
+    defaults_in::<CodeTabAction>(action_key, &mut found);
     defaults_in::<LogsTabAction>(action_key, &mut found);
     defaults_in::<DashboardTabAction>(action_key, &mut found);
     defaults_in::<ConfigTabAction>(action_key, &mut found);

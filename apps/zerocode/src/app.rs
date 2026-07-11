@@ -11,8 +11,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::chat;
 use crate::client::{ConnectionState, RpcClient};
+use crate::transcript;
 use crate::code;
 use crate::config;
 use crate::config_manager;
@@ -120,7 +120,7 @@ async fn switch_mode(
     conn_state: &ConnectionState,
     quickstart: &mut quickstart_pane::QuickstartPane,
     code_pane: &mut code::Code,
-    chat_pane: &mut chat::Chat,
+    chat_pane: &mut transcript::Transcript,
 ) {
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
         quickstart.dismiss_beacon().await;
@@ -232,7 +232,7 @@ pub async fn run(
                 code_pane.set_resume_session_id($resume_code.0);
                 code_pane.set_resume_agent_alias($resume_code.1);
                 code_pane.init().await?;
-                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                let mut chat_pane = transcript::Transcript::new(rpc.clone(), transcript::PaneKind::Chat);
                 chat_pane.init().await?;
                 let pending_start_code = {
                     let mut guard = reconnect_state.lock().expect("reconnect state poisoned");

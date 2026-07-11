@@ -196,7 +196,7 @@ pub struct RpcNotification {
 /// The daemon issues these for ACP `elicitation/create` calls when
 /// the TUI advertised `clientCapabilities.elicitation.form` during
 /// `initialize`. The recipient of an `RpcInboundRequest` is the
-/// `Chat` widget for the targeted session — it surfaces a modal,
+/// `Transcript` widget for the targeted session — it surfaces a modal,
 /// waits for the user's choice, and writes a JSON-RPC response back
 /// via `RpcClient::respond_to_inbound_request`.
 #[derive(Debug, Clone)]
@@ -517,7 +517,7 @@ pub struct RpcClient {
     pub server_version: String,
     notifications_bcast: broadcast::Sender<RpcNotification>,
     /// Broadcast channel for server-initiated requests that expect a
-    /// response (today: `elicitation/create`). The Chat widget for the
+    /// response (today: `elicitation/create`). The Transcript widget for the
     /// targeted session subscribes and answers via
     /// [`RpcClient::respond_to_inbound_request`].
     inbound_requests_bcast: broadcast::Sender<RpcInboundRequest>,
@@ -610,7 +610,7 @@ impl RpcClient {
             // / `request_multi_choice` over `elicitation/create` instead of
             // silently returning `Ok(None)`. The Code tab handles inbound
             // `elicitation/create` requests via `route_inbound_frame` →
-            // the chat widget's pending-elicitation modal.
+            // the transcript widget's pending-elicitation modal.
             "clientCapabilities": {
                 "elicitation": { "form": {} }
             }
@@ -915,7 +915,7 @@ impl RpcClient {
     }
 
     /// Get a receiver for server-initiated JSON-RPC requests that
-    /// expect a response (today: `elicitation/create`). The Chat
+    /// expect a response (today: `elicitation/create`). The Transcript
     /// widget subscribes per Code tab, filters by `params.sessionId`,
     /// surfaces a modal, and answers via [`Self::respond_to_inbound_request`].
     pub fn subscribe_inbound_requests(&self) -> broadcast::Receiver<RpcInboundRequest> {
@@ -1493,7 +1493,7 @@ impl RpcClient {
 
     /// List ACP sessions from the dedicated ACP session store. The Code (ACP)
     /// pane's picker uses this so its list only contains ACP-origin sessions
-    /// — chat sessions live in a separate backend and must not show up here.
+    /// — non-ACP sessions live in a separate backend and must not show up here.
     pub async fn acp_session_list(&self) -> Result<SessionListResult> {
         self.call(method::SESSION_LIST_ACP, serde_json::json!({}))
             .await

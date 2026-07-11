@@ -3140,13 +3140,13 @@ mod tests {
 
         f.channels.push(ChannelDraft {
             channel_type: "telegram".into(),
-            alias: "chat".into(),
+            alias: "code".into(),
             token: None,
             mode: SelectorMode::Fresh,
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {
             name: "crew".into(),
-            channel: "telegram.chat".into(),
+            channel: "telegram.code".into(),
             external_peers: vec!["123".into()],
             ignore: Vec::new(),
         });

@@ -100,7 +100,7 @@ All zerocode keys are prefixed `zc-` and never collide with the runtime's `cli-`
 
 - `zc-pane-<name>`: top-level mode bar labels
 - `zc-app-<purpose>`: strings owned by `app.rs` (dialogs, help, status)
-- `zc-<pane>-<purpose>`: strings local to a specific pane (`zc-dashboard-*`, `zc-chat-*`, …)
+- `zc-<pane>-<purpose>`: strings local to a specific pane (`zc-dashboard-*`, `zc-code-*`, …)
 
 ### Chord literals are not translated
 

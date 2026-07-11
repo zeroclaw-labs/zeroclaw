@@ -133,7 +133,7 @@ keyactions! {
 }
 
 keyactions! {
-    pub enum ChatTabAction ("chat") {
+    pub enum CodeTabAction ("code") {
         ScrollUp                [] => "scroll up",
         ScrollDown              [] => "scroll down",
         PageUp                  [Chord::key(KeyCode::PageUp)] => "page up",
