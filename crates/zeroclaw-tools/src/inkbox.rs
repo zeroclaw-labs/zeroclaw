@@ -53,7 +53,7 @@ impl InkboxCtx {
         match joined {
             Ok(Ok(value)) => ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()).into(),
                 error: None,
             },
             Ok(Err(e)) => fail(e.to_string()),
@@ -73,7 +73,7 @@ impl InkboxCtx {
         match joined {
             Ok(Ok(value)) => ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()).into(),
                 error: None,
             },
             Ok(Err(e)) => fail(e.to_string()),
@@ -134,7 +134,7 @@ fn text_recipients(args: &Value) -> Option<TextRecipients> {
 fn fail(msg: impl Into<String>) -> ToolResult {
     ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(msg.into()),
     }
 }

@@ -58,14 +58,14 @@ async fn resolve_device_port(
                 [] => {
                     return Err(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some("no device found — is a board connected via USB?".to_string()),
                     });
                 }
                 multiple => {
                     return Err(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!(
                             "multiple devices found ({}); specify the \"device\" parameter",
                             multiple.join(", ")
@@ -78,7 +78,7 @@ async fn resolve_device_port(
 
     let device = reg.get_device(&alias).ok_or_else(|| ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(format!("device '{alias}' not found in registry")),
     })?;
 
@@ -86,7 +86,7 @@ async fn resolve_device_port(
 
     let port = device.port().ok_or_else(|| ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(format!(
             "device '{alias}' has no serial port — is it connected?"
         )),
@@ -99,7 +99,7 @@ async fn resolve_device_port(
 fn unsupported_runtime(runtime: &DeviceRuntime, tool: &str) -> ToolResult {
     ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(format!(
             "{runtime} runtime is not yet supported for {tool} — coming soon"
         )),
@@ -206,12 +206,13 @@ impl Tool for DeviceReadCodeTool {
             Ok((stdout, _stderr)) => Ok(ToolResult {
                 success: true,
                 output: if stdout.trim().is_empty() {
-                    format!("main.py on {alias} is empty or not found.")
+                    format!("main.py on {alias} is empty or not found.").into()
                 } else {
                     format!(
                         "Current main.py on {alias}:\n\n```python\n{}\n```",
                         stdout.trim()
                     )
+                    .into()
                 },
                 error: None,
             }),
@@ -222,13 +223,14 @@ impl Tool for DeviceReadCodeTool {
                         success: true,
                         output: format!(
                             "No main.py found on {alias} — the device has no program yet."
-                        ),
+                        )
+                        .into(),
                         error: None,
                     })
                 } else {
                     Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!("Failed to read code from {alias}: {e}")),
                     })
                 }
@@ -288,7 +290,7 @@ impl Tool for DeviceWriteCodeTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: code".to_string()),
                 });
             }
@@ -297,7 +299,7 @@ impl Tool for DeviceWriteCodeTool {
         if code.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some("code parameter is empty — provide a program to write".to_string()),
             });
         }
@@ -330,14 +332,14 @@ impl Tool for DeviceWriteCodeTool {
             Ok(Err(e)) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("failed to create temp file: {e}")),
                 });
             }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("temp file task failed: {e}")),
                 });
             }
@@ -349,7 +351,7 @@ impl Tool for DeviceWriteCodeTool {
             // named_tmp dropped here — auto-removes the file.
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("failed to write temp file: {e}")),
             });
         }
@@ -396,7 +398,8 @@ impl Tool for DeviceWriteCodeTool {
                         output: format!(
                             "Code deployed to {alias} — main.py updated and device reset. \
                              {alias} is back online."
-                        ),
+                        )
+                        .into(),
                         error: None,
                     })
                 } else {
@@ -406,14 +409,15 @@ impl Tool for DeviceWriteCodeTool {
                             "Code deployed to {alias} — main.py updated and device reset. \
                              Note: serial port did not reappear within {PORT_WAIT_SECS}s; \
                              the device may still be booting."
-                        ),
+                        )
+                        .into(),
                         error: None,
                     })
                 }
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("Failed to deploy code to {alias}: {e}")),
             }),
         }
@@ -470,7 +474,7 @@ impl Tool for DeviceExecTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: code".to_string()),
                 });
             }
@@ -479,7 +483,7 @@ impl Tool for DeviceExecTool {
         if code.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     "code parameter is empty — provide a code snippet to execute".to_string(),
                 ),
@@ -514,14 +518,14 @@ impl Tool for DeviceExecTool {
             Ok(Err(e)) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("failed to create temp file: {e}")),
                 });
             }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("temp file task failed: {e}")),
                 });
             }
@@ -533,7 +537,7 @@ impl Tool for DeviceExecTool {
             // named_tmp dropped here — auto-removes the file.
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("failed to write temp file: {e}")),
             });
         }
@@ -565,16 +569,16 @@ impl Tool for DeviceExecTool {
                 Ok(ToolResult {
                     success: true,
                     output: if output.is_empty() {
-                        format!("Code executed on {alias} — no output produced.")
+                        format!("Code executed on {alias}: no output produced.").into()
                     } else {
-                        format!("Output from {alias}:\n{output}")
+                        format!("Output from {alias}:\n{output}").into()
                     },
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("Failed to execute code on {alias}: {e}")),
             }),
         }

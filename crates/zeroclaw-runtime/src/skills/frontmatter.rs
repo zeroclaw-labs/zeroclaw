@@ -115,6 +115,7 @@ impl SkillFrontmatter {
                 tab: zeroclaw_config::config::ConfigTab::None,
                 quickstart: zeroclaw_config::config::QuickstartVisibility::Hidden,
                 alias_source: None,
+                multiline: false,
             },
         ]
     }
@@ -144,6 +145,7 @@ fn field(
         tab: zeroclaw_config::config::ConfigTab::None,
         quickstart: zeroclaw_config::config::QuickstartVisibility::Hidden,
         alias_source: None,
+        multiline: false,
     }
 }
 

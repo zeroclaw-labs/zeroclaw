@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 use zeroclaw_log::scope;
 
@@ -107,7 +107,7 @@ impl Tool for SpawnSubagentTool {
         if self.is_subagent_caller {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"
                         .into(),
@@ -131,7 +131,7 @@ impl Tool for SpawnSubagentTool {
             if excluded || !allowed_when_listed {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "spawn_subagent: refused — agent '{}' risk_profile does not list spawn_subagent in allowed_tools",
                         self.parent_alias
@@ -154,7 +154,7 @@ impl Tool for SpawnSubagentTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing or empty 'prompt' parameter".into()),
                 });
             }
@@ -175,7 +175,7 @@ impl Tool for SpawnSubagentTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -191,7 +191,7 @@ impl Tool for SpawnSubagentTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("subagent spawn failed: {e:#}")),
                 });
             }
@@ -214,6 +214,12 @@ impl Tool for SpawnSubagentTool {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
             is_subagent: true,
+            // Sub-turn origin already skips memory injection; explicit for
+            // the same future-proofing reason as `is_subagent` above.
+            suppress_memory_inject: true,
+            // Subagents keep a live memory backend and the memory tools; only
+            // the injected context preamble is suppressed above.
+            memory_free: false,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
@@ -261,6 +267,7 @@ impl Tool for SpawnSubagentTool {
                 false,
                 Some(session_path),
                 None,
+                zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
         ))
@@ -290,15 +297,15 @@ impl Tool for SpawnSubagentTool {
             Ok(response) => Ok(ToolResult {
                 success: true,
                 output: if response.trim().is_empty() {
-                    "subagent completed without output".to_string()
+                    "subagent completed without output".to_string().into()
                 } else {
-                    response
+                    response.into()
                 },
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("subagent run failed: {e}")),
             }),
         }

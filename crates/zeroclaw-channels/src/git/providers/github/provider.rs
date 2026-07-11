@@ -33,12 +33,12 @@ pub struct GithubProvider {
 impl GithubProvider {
     pub fn new(
         app_id: u64,
-        private_key_path: String,
+        private_key_pem: Option<String>,
         installation_id: Option<u64>,
         proxy_url: Option<String>,
     ) -> Self {
         Self {
-            auth: AppAuth::new(app_id, private_key_path),
+            auth: AppAuth::new(app_id, private_key_pem),
             api: GithubApi::new(proxy_url),
             configured_installation: installation_id,
             slug: parking_lot::Mutex::new(None),
@@ -388,6 +388,19 @@ impl GitProvider for GithubProvider {
             }
         }
     }
+
+    async fn forge_request(
+        &self,
+        req: crate::git::types::ForgeRequest,
+    ) -> Result<crate::git::types::ForgeResponse, GitChannelError> {
+        let token = self.token().await?;
+        let method = crate::git::providers::forge_method_to_reqwest(req.method);
+        let (status, body) = self
+            .api
+            .forge_call(&token, method, &req.path, req.body.as_ref())
+            .await?;
+        Ok(crate::git::types::ForgeResponse { status, body })
+    }
 }
 
 #[cfg(test)]
@@ -447,7 +460,7 @@ mod tests {
                 .await;
         }
 
-        let provider = GithubProvider::new(0, String::new(), Some(1), None)
+        let provider = GithubProvider::new(0, None, Some(1), None)
             .with_api(GithubApi::with_base(server.uri()));
         let repo = RepoRef::parse("octo/repo").unwrap();
         let page = provider.fetch_issues("t", &repo, start).await.unwrap();

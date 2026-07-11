@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 pub use zeroclaw_config::scattered_types::BrowserDelegateConfig;
@@ -185,14 +185,14 @@ impl Tool for BrowserDelegateTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("browser_delegate tool is denied by security policy".into()),
             });
         }
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("browser_delegate action rate-limited".into()),
             });
         }
@@ -206,7 +206,7 @@ impl Tool for BrowserDelegateTool {
         if task.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'task' parameter is required and cannot be empty".into()),
             });
         }
@@ -223,7 +223,7 @@ impl Tool for BrowserDelegateTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("URL validation failed: {e}")),
             });
         }
@@ -234,7 +234,7 @@ impl Tool for BrowserDelegateTool {
         if let Err(e) = self.validate_task_urls(task) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("task text contains a disallowed URL: {e}")),
             });
         }
@@ -248,7 +248,7 @@ impl Tool for BrowserDelegateTool {
         if !VALID_EXTRACT_FORMATS.contains(&extract_format) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "unsupported extract_format '{}': allowed values are 'text', 'json', 'summary'",
                     extract_format
@@ -279,7 +279,7 @@ impl Tool for BrowserDelegateTool {
                 if output.status.success() {
                     Ok(ToolResult {
                         success: true,
-                        output: stdout,
+                        output: stdout.into(),
                         error: if stderr_truncated.is_empty() {
                             None
                         } else {
@@ -289,7 +289,7 @@ impl Tool for BrowserDelegateTool {
                 } else {
                     Ok(ToolResult {
                         success: false,
-                        output: stdout,
+                        output: stdout.into(),
                         error: Some(format!(
                             "CLI exited with status {}: {}",
                             output.status, stderr_truncated
@@ -299,12 +299,12 @@ impl Tool for BrowserDelegateTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("failed to spawn browser CLI: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "browser task timed out after {}s",
                     self.config.task_timeout_secs

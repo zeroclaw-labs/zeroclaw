@@ -68,6 +68,7 @@ cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
 
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
+cli-skills-audit-failed = Skill audit failed.
 cli-skills-install-about = Install a new skill from a URL or local path
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
@@ -75,8 +76,16 @@ cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
 cli-skills-install-start = Installing skill from: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
 cli-skills-install-resolving-extra-registry = { "  " }Resolving '{$source}' from registry '{$registry}'...
+cli-skills-install-git-failed = failed to install git skill source: {$source}
+cli-skills-install-registry-failed = failed to install skill from registry: {$source}
+cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}
+cli-skills-install-local-failed = failed to install local skill source: {$source}
 cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
 cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
+cli-skills-install-into-bundle = { "  " }Installed into bundle '{$alias}'. Agents that list this bundle in skill_bundles will load it.
+cli-skills-install-global-note = { "  " }Note: installed into the global skills dir, which no agent loads automatically. Re-run with --bundle <alias>, or assign a bundle to an agent, to make it loadable.
+cli-skills-removed-archived = { "  " }{$status} Skill '{$name}' removed from bundle '{$bundle}' (archived under shared/skills/_deleted/).
+cli-skills-removed-global = { "  " }{$status} Skill '{$name}' removed from the global skills dir.
 cli-skills-install-tier-official = Installing {$name} v{$version} — Official (zeroclaw-labs maintained)
 cli-skills-install-tier-community =
     Installing {$name} v{$version} — Community submission
@@ -459,9 +468,16 @@ cli-peripherals-nucleo-needs-hardware = Nucleo flash requires the 'hardware' fea
 
 # ── skills (zeroclaw skills list) ──
 cli-skills-none-installed = No skills installed.
-cli-skills-create-hint = {"  "}Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill
+cli-skills-create-hint = {"  "}Create one: zeroclaw skills add my-skill --bundle <alias>
 cli-skills-install-hint = {"  "}Or install: zeroclaw skills install <source>
 cli-skills-installed-header = Installed skills ({$count}):
+cli-skills-list-group-bundle = bundle: {$alias}
+cli-skills-list-group-agent = loaded by agent '{$alias}'
+cli-skills-list-group-global = global / open-skills / plugins (not from a bundle)
+cli-skills-agent-not-configured = agent '{$alias}' is not configured
+cli-skills-agent-multiple-bundles = agent '{$alias}' has multiple skill bundles ({$bundles}); pass --bundle to choose one
+cli-skills-multiple-locations-bundle = skill '{$name}' exists in multiple locations ({$locations}); pass --bundle to choose one
+cli-skills-multiple-locations-path = skill '{$name}' exists in multiple locations ({$locations}); pass an explicit path to disambiguate
 cli-skills-tags = Tags:  {$tags}
 cli-skills-skipped-header = Skipped ({$count}):
 cli-skills-skipped-reason = {"    "}Reason: {$reason}
@@ -482,6 +498,7 @@ cli-sop-create-hint-2 = {"              "}then add SOP.toml and SOP.md
 cli-sop-loaded-header = Loaded SOPs ({$count}):
 cli-sop-none-to-validate = No SOPs found to validate.
 cli-sop-valid = ✅ {$name} — valid
+cli-sop-deleted = Deleted SOP: {$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} warning(s):
 cli-sop-all-passed = All SOPs passed validation.
 cli-sop-priority = {"  "}Priority:       {$value}
@@ -528,6 +545,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
+cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, or --uses-memory must be provided
 cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
@@ -864,6 +882,10 @@ turn-stream-interrupted = [stream interrupted]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+# Remediation surfaced when the system prompt + inlined tool definitions alone
+# meet or exceed the context budget, so no amount of conversation trimming can
+# fit the request (#5808).
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
@@ -877,6 +899,7 @@ channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
+channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──

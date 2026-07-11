@@ -1226,7 +1226,7 @@ fn apply_memory(
                     return None;
                 }
             };
-            if !section_has_alias(config, "storage", family, alias) {
+            if !storage_has_ref(config, reference) {
                 let path = format!("storage.{family}.{alias}");
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1797,10 +1797,23 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
+fn storage_has_ref(config: &Config, reference: &str) -> bool {
+    collect_aliased_refs(&config.storage)
+        .iter()
+        .any(|configured| configured == reference)
+}
+
 /// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
 /// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
 /// first, then the family catalog table (no pricing for fallbacks).
+///
+/// Credential-blind: builds the provider with no API key, so OpenAI-compatible
+/// families (xai, groq, deepseek, …) whose native `/models` endpoint requires
+/// auth fall back to the models.dev / OpenRouter catalog. Brand-new native-only
+/// models therefore do not appear until those public catalogs catch up. Callers
+/// with config in scope should prefer [`model_catalog_with_config`], which
+/// resolves the alias credential and lets the native endpoint list appear.
 pub async fn model_catalog(
     model_provider: &str,
 ) -> (
@@ -1808,7 +1821,67 @@ pub async fn model_catalog(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 ) {
-    if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
+    model_catalog_with_config(None, model_provider).await
+}
+
+/// Config-aware variant of [`model_catalog`]. When `config` is supplied and
+/// `model_provider` resolves to a configured alias (`<family>.<alias>` or a
+/// bare alias), the alias's `api_key` is threaded into provider construction.
+/// That lets credentialed OpenAI-compatible families (xai/grok, groq, deepseek,
+/// …) hit their native `/models` endpoint — which returns models the models.dev
+/// snapshot may not carry yet (e.g. a freshly released Grok) — instead of
+/// silently falling back to the public catalog.
+///
+/// The raw (possibly encrypted) `api_key` is passed straight through; the
+/// factory's `resolve_model_provider_credential` performs any secret
+/// decryption, matching the inference path in `main.rs`.
+pub async fn model_catalog_with_config(
+    config: Option<&Config>,
+    model_provider: &str,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
+    // Resolve the configured alias credential when config is available so the
+    // native /models endpoint (which needs auth for most compat families) is
+    // reachable. `model_provider` may be a bare family (`xai`) or a
+    // `<family>.<alias>` ref (`xai.default`); `find_by_name` accepts both and
+    // yields the canonical family plus the alias's config, whose api_key we
+    // thread into provider construction. Falls back to `None` for
+    // unconfigured / unknown providers.
+    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
+    let api_key = resolved
+        .as_ref()
+        .and_then(|(_family, _alias, base)| base.api_key.clone());
+    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
+    // deployments list from their own `/models` rather than the family default.
+    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
+        base.uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(ToString::to_string)
+    });
+    // `create_model_provider` and the chat-catalog ranker expect a bare family
+    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
+    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
+    // ourselves so a dotted selector still constructs.
+    let family: &str = resolved
+        .as_ref()
+        .map(|(family, _alias, _base)| *family)
+        .unwrap_or_else(|| {
+            model_provider
+                .split_once('.')
+                .map_or(model_provider, |(f, _)| f)
+        });
+
+    let handle = zeroclaw_providers::create_model_provider_with_url(
+        family,
+        api_key.as_deref(),
+        api_url.as_deref(),
+    );
+    if let Ok(handle) = handle
         && let Ok(models) = zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
             .list_models_with_pricing()
             .await
@@ -1822,8 +1895,7 @@ pub async fn model_catalog(
             .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
             .collect();
         let ids = models.into_iter().map(|m| m.id).collect();
-        let Some(ids) =
-            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, ids)
+        let Some(ids) = zeroclaw_providers::catalog::sort_model_catalog_for_chat(family, ids)
         else {
             return (Vec::new(), None, false);
         };
@@ -1838,9 +1910,9 @@ pub async fn model_catalog(
         };
         return (ids, pricing, true);
     }
-    match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
+    match zeroclaw_providers::catalog::list_models_for_family(family).await {
         Ok(models) if !models.is_empty() => (
-            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, models)
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(family, models)
                 .unwrap_or_default(),
             None,
             true,
@@ -1926,6 +1998,56 @@ mod tests {
                 personality_file: None,
                 personality_files: vec![],
             },
+        }
+    }
+
+    #[test]
+    fn existing_postgres_memory_storage_ref_is_accepted() {
+        let mut cfg = Config::default();
+        cfg.storage.postgres.insert(
+            "default".into(),
+            zeroclaw_config::schema::PostgresStorageConfig::default(),
+        );
+        let choice = SelectorChoice::Existing("postgres.default".to_string());
+        let mut errors = Vec::new();
+
+        let applied = apply_memory(&mut cfg, &choice, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply_memory errors: {errors:?}");
+        assert_eq!(applied.as_deref(), Some("postgres.default"));
+        assert_eq!(cfg.memory.backend, "postgres.default");
+    }
+
+    #[test]
+    fn memory_storage_refs_from_snapshot_are_accepted() {
+        let mut cfg = Config::default();
+        cfg.storage.postgres.insert(
+            "default".into(),
+            zeroclaw_config::schema::PostgresStorageConfig::default(),
+        );
+        let snapshot = snapshot_state(&cfg);
+
+        assert!(
+            snapshot
+                .storage
+                .iter()
+                .any(|ref_| ref_ == "postgres.default"),
+            "snapshot should expose configured postgres storage: {:?}",
+            snapshot.storage
+        );
+        for reference in snapshot.storage {
+            let mut candidate = cfg.clone();
+            let choice = SelectorChoice::Existing(reference.clone());
+            let mut errors = Vec::new();
+
+            let applied = apply_memory(&mut candidate, &choice, &mut errors, None);
+
+            assert!(
+                errors.is_empty(),
+                "snapshot storage ref {reference:?} should apply without errors: {errors:?}"
+            );
+            assert_eq!(applied.as_deref(), Some(reference.as_str()));
+            assert_eq!(candidate.memory.backend, reference);
         }
     }
 
@@ -2333,5 +2455,94 @@ mod tests {
             .expect("peer group persisted");
         assert_eq!(group.channel, "telegram.tg");
         assert_eq!(group.external_peers, vec!["*".to_string()]);
+    }
+
+    /// Regression for the missing-Grok-in-dropdown bug: when a configured
+    /// OpenAI-compatible alias carries an `api_key` (and here a custom `uri`),
+    /// `model_catalog_with_config` must reach the provider's **native**
+    /// `/models` endpoint — surfacing brand-new models the models.dev snapshot
+    /// does not carry yet — instead of the credential-blind models.dev fallback
+    /// that `model_catalog` uses.
+    #[tokio::test]
+    async fn model_catalog_with_config_uses_native_endpoint_when_credentialed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Native /models endpoint advertising a model that is NOT in the
+        // static models.dev snapshot (a freshly released Grok).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "grok-4.5-native-only"},
+                    {"id": "grok-4.3"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        config.providers.models.xai.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::XaiModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("xai-test-key".to_string()),
+                    uri: Some(server.uri()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let (models, _pricing, live) =
+            model_catalog_with_config(Some(&config), "xai.default").await;
+
+        assert!(live, "credentialed native listing must report live=true");
+        assert!(
+            models.iter().any(|m| m == "grok-4.5-native-only"),
+            "native /models result must surface the freshly-released model \
+             that models.dev does not carry; got {models:?}"
+        );
+    }
+
+    /// A dotted `<family>.<alias>` selector must resolve **that specific
+    /// alias's** credential + endpoint (not a bare-family guess), so multi-alias
+    /// setups list from the intended account. Guards the `find_by_name` dotted
+    /// path that the RPC/gateway/CLI call sites actually pass.
+    #[tokio::test]
+    async fn model_catalog_with_config_resolves_named_alias_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "grok-named-alias-native"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        // Non-default alias name to prove the dotted ref targets it precisely.
+        config.providers.models.xai.insert(
+            "prod".to_string(),
+            zeroclaw_config::schema::XaiModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("xai-test-key".to_string()),
+                    uri: Some(server.uri()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let (models, _pricing, live) = model_catalog_with_config(Some(&config), "xai.prod").await;
+
+        assert!(live);
+        assert!(
+            models.iter().any(|m| m == "grok-named-alias-native"),
+            "dotted `<family>.<alias>` selector must resolve that alias's \
+             configured endpoint; got {models:?}"
+        );
     }
 }

@@ -43,7 +43,40 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         return NextStep::Complete;
     }
 
+    // ── Switch: evaluate ports top to bottom; first passing rule routes. A
+    // rule with no `when` is the catch-all. No rule matches → Complete.
+    if !current.routing.switch.is_empty() {
+        let payload = ctx.run_data.to_payload().to_string();
+        for rule in &current.routing.switch {
+            let matched = match rule.when.as_deref() {
+                Some(when) => evaluate_condition(when, Some(&payload)),
+                None => true,
+            };
+            if !matched {
+                continue;
+            }
+            let Some(target) = rule.goto else {
+                return NextStep::Fail(format!("switch port '{}' has no target", rule.name));
+            };
+            let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
+                return NextStep::Fail(format!("step {target} does not exist"));
+            };
+            if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
+                return NextStep::Fail(format!("step {target} visit limit reached"));
+            }
+            return if eligible(step, ctx.run_data) {
+                NextStep::Step(target)
+            } else {
+                NextStep::Wait(target)
+            };
+        }
+        return NextStep::Complete;
+    }
+
     let explicit_next = current.routing.next;
+    if explicit_next.is_none() && current.routing.terminal {
+        return NextStep::Complete;
+    }
     let next_step = explicit_next.unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
     let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
         return if explicit_next.is_none() && next_step > ctx.run.total_steps {
@@ -74,26 +107,15 @@ pub fn eligible(step: &SopStep, run_data: &RunData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sop::step_contract::StepRouting;
     use crate::sop::types::{
-        SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStepKind, SopTriggerSource,
+        SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopTriggerSource,
     };
 
     fn step(number: u32) -> SopStep {
         SopStep {
             number,
             title: format!("Step {number}"),
-            body: String::new(),
-            suggested_tools: Vec::new(),
-            requires_confirmation: false,
-            kind: SopStepKind::Execute,
-            schema: None,
-            scope: None,
-            routing: StepRouting::default(),
-            on_failure: Default::default(),
-            mode: None,
-            capability: None,
-            capability_input: None,
+            ..SopStep::default()
         }
     }
 
@@ -110,6 +132,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 

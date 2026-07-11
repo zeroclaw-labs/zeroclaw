@@ -10,12 +10,23 @@ fi
 echo "==> rust quality: cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
+CLIPPY_WORKSPACE_ARGS=(--workspace --exclude zeroclaw-desktop --all-targets)
+
 if [ "$MODE" = "strict" ]; then
-    echo "==> rust quality: cargo clippy --locked --all-targets -- -D warnings"
-    cargo clippy --locked --all-targets -- -D warnings
+    # Local `--strict` path: same lint set and feature surface as required
+    # CI (both compile with `--features ci-all`). Remaining deltas vs CI
+    # are runner, scheduling, and reporting only — see #8843 for the full
+    # divergence inventory.
+    echo "==> rust quality: cargo clippy --locked --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings"
+    cargo clippy --locked "${CLIPPY_WORKSPACE_ARGS[@]}" --features ci-all -- -D warnings
 else
-    echo "==> rust quality: cargo clippy --locked --all-targets -- -D clippy::correctness"
-    cargo clippy --locked --all-targets -- -D clippy::correctness
+    # Local `--correctness` path: deny `clippy::correctness` only on the
+    # default-feature surface. Intentionally lighter than both `--strict`
+    # and required CI, which compile the `ci-all` feature set. This path
+    # is meant for fast local feedback; full-surface validation happens
+    # via `--strict` or in CI. See #8843 for the full divergence inventory.
+    echo "==> rust quality: cargo clippy --locked --workspace --exclude zeroclaw-desktop --all-targets -- -D clippy::correctness"
+    cargo clippy --locked "${CLIPPY_WORKSPACE_ARGS[@]}" -- -D clippy::correctness
 fi
 
 echo "==> rust quality: provider dispatch gate (no direct ModelProvider method calls outside ProviderDispatch)"

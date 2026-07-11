@@ -4,7 +4,7 @@
 ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:b31e7a42fdf8b8aa5f5ed477c72d694301273f1069c5a2f71d53c6482e99a2fc
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-bookworm from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_BOOKWORM=rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
+ARG ZEROCLAW_BASE_RUST_BOOKWORM=rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
 # >>> end generated:base-arg-rust-bookworm <<<
 
 # ── Stage 0: Frontend build ─────────────────────────────────────

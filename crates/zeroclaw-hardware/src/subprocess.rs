@@ -24,7 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use zeroclaw_api::attribution::ToolKind;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 tool_attribution!(SubprocessTool, ToolKind::Plugin);
@@ -202,7 +202,7 @@ impl Tool for SubprocessTool {
                 let _ = child.kill().await;
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "plugin '{}': could not attach stdout pipe",
                         self.manifest.tool.name
@@ -231,7 +231,7 @@ impl Tool for SubprocessTool {
                 let stderr_msg = collect_stderr(stderr_handle).await;
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "plugin '{}' timed out after {}s{}",
                         self.manifest.tool.name,
@@ -252,7 +252,7 @@ impl Tool for SubprocessTool {
                 let stderr_msg = collect_stderr(stderr_handle).await;
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "plugin '{}': I/O error reading stdout: {}{}",
                         self.manifest.tool.name,
@@ -281,7 +281,7 @@ impl Tool for SubprocessTool {
                 if line.is_empty() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "plugin '{}': empty stdout{}",
                             self.manifest.tool.name,
@@ -303,7 +303,7 @@ impl Tool for SubprocessTool {
                         {
                             return Ok(ToolResult {
                                 success: false,
-                                output: String::new(),
+                                output: ToolOutput::default(),
                                 error: Some(format!(
                                     "plugin '{}' exited with {}{}",
                                     self.manifest.tool.name,
@@ -320,7 +320,7 @@ impl Tool for SubprocessTool {
                     }
                     Err(parse_err) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "plugin '{}': failed to parse output as ToolResult: {} (got: {:?})",
                             self.manifest.tool.name,
