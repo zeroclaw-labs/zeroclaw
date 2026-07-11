@@ -206,6 +206,13 @@ pub(crate) async fn finish_after_max_iterations(
     }
     history.push(summary_msg);
     accumulated_display_text.push_str(&text);
+    let max_iter_str = max_iterations.to_string();
+    let stop_note = crate::i18n::get_required_cli_string_with_args(
+        "turn-max-iterations-reached",
+        &[("max_iterations", &max_iter_str)],
+    );
+    accumulated_display_text.push('\n');
+    accumulated_display_text.push_str(&stop_note);
     Ok(accumulated_display_text)
 }
 
@@ -344,6 +351,26 @@ mod graceful_summary_metering_tests {
             calls.load(Ordering::SeqCst),
             0,
             "budget gate must fire before the provider call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod max_iteration_tests {
+
+    #[test]
+    fn max_iterations_message_includes_count() {
+        let msg = crate::i18n::get_required_cli_string_with_args(
+            "turn-max-iterations-reached",
+            &[("max_iterations", "42")],
+        );
+        assert!(
+            msg.contains("42"),
+            "stop-reason message must include the iteration count, got: {msg}"
+        );
+        assert!(
+            msg.contains("Maximum tool iterations"),
+            "stop-reason message must describe the reason, got: {msg}"
         );
     }
 }

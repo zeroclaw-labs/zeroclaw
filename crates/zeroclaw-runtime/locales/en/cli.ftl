@@ -967,3 +967,5 @@ cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
 
+turn-max-iterations-reached = { " " }[Maximum tool iterations ({ $max_iterations }) reached — stopping.]
+
