@@ -2817,6 +2817,17 @@ impl SopEngine {
         self.sops = sops;
     }
 
+    /// Replace the live `[sop.approval]` config (for testing a mid-flight reload from
+    /// other modules) - so a test can revoke a group membership while a quorum gate is
+    /// parked and assert the earlier voter stops counting.
+    #[cfg(test)]
+    pub(crate) fn set_approval_config_for_test(
+        &mut self,
+        approval: zeroclaw_config::schema::SopApprovalConfig,
+    ) {
+        self.config.approval = approval;
+    }
+
     // ── Internal helpers ────────────────────────────────────────
 
     pub fn last_finished_run(&self, sop_name: &str) -> Option<&SopRun> {
@@ -2957,6 +2968,7 @@ impl SopEngine {
         &self,
         run_id: &str,
         step: u32,
+        policy: &str,
         principal: &super::approval::ApprovalPrincipal,
     ) -> Result<(), StoreError> {
         let ev = SopEventRecord {
@@ -2970,30 +2982,37 @@ impl SopEngine {
             // voter_key`'s own doc for the full canonicalization rationale.
             actor: Some(principal.voter_key()),
             reason: None,
+            // `policy` scopes the vote to the policy in effect when it was cast, and
+            // `source`/`identity` capture enough to REVALIDATE the voter against the
+            // current required group at count time - so a mid-flight policy or group
+            // change cannot let a stale vote count toward the new quorum.
             payload: serde_json::json!({
                 "step": step,
                 "source": principal.source_label(),
+                "policy": policy,
+                "identity": principal.identity,
             }),
         };
         self.store.append_event(&ev).map(|_| ())
     }
 
-    /// EPIC G (broker quorum): count the DISTINCT approver identities that have voted
-    /// to approve the gate on `run_id` AT `step` (from the append-only `gate_vote`
-    /// ledger rows). Votes are scoped to the current step, so a multi-gate SOP does
-    /// not carry step-1 votes into step 2; the voter key is source-qualified, so a
-    /// repeat vote by the same identity on the same source counts once. Returns 0 on
-    /// a store error (fail-closed: an unreadable ledger cannot satisfy a quorum).
-    pub(crate) fn distinct_gate_voters(
+    /// EPIC G (broker quorum): the recorded approval votes on `run_id` AT `step`, read
+    /// from the append-only `gate_vote` ledger rows. Each row carries the canonical
+    /// `voter_key` (source-qualified, `Http`/`Ws` collapsed - see
+    /// [`super::approval::ApprovalPrincipal::voter_key`]) plus the `policy` in effect
+    /// when the vote was cast and the `source`/`identity` needed to REVALIDATE the
+    /// voter against the current required group. The broker owns the tally (scope to
+    /// the current policy, revalidate membership, then dedup by `voter_key`) because
+    /// the policy/group/resolver live there; the engine only surfaces the durable rows.
+    ///
+    /// A read failure is SURFACED, never collapsed to an empty tally: an unreadable
+    /// ledger must fail the resolve closed (gate stays waiting for a retry), not report
+    /// a bogus zero quorum after a vote was durably appended.
+    pub(crate) fn gate_votes_for_step(
         &self,
         run_id: &str,
         step: u32,
-    ) -> Result<usize, StoreError> {
-        // A read failure here must NOT collapse to 0 votes: that would report a bogus
-        // `PendingQuorum { have: 0 }` after a vote was durably appended, silently
-        // swallowing the store error. Surface it so the broker fails the resolve
-        // (leaving the gate waiting) and a retry re-counts. Actors are deduped, so a
-        // retried vote does not double-count.
+    ) -> Result<Vec<GateVote>, StoreError> {
         let events = self.store.list_events(run_id).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3008,16 +3027,27 @@ impl SopEngine {
             );
             e
         })?;
-        let mut voters: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut votes: Vec<GateVote> = Vec::new();
         for ev in events {
             if ev.kind == "gate_vote"
                 && ev.payload.get("step").and_then(|s| s.as_u64()) == Some(u64::from(step))
-                && let Some(actor) = ev.actor
+                && let Some(voter_key) = ev.actor
             {
-                voters.insert(actor);
+                let str_field = |k: &str| {
+                    ev.payload
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                };
+                votes.push(GateVote {
+                    voter_key,
+                    policy: str_field("policy"),
+                    source: str_field("source"),
+                    identity: str_field("identity"),
+                });
             }
         }
-        Ok(voters.len())
+        Ok(votes)
     }
 
     /// Record the approval completion metric at the gate-clearing chokepoint, so
@@ -3049,6 +3079,25 @@ impl SopEngine {
     ) -> Result<super::approval::ResolveOutcome> {
         super::approval::resolve::resolve_gate(self, run_id, decision, principal)
     }
+}
+
+/// A recorded approval vote on a waiting gate (one `gate_vote` ledger row), as
+/// surfaced by [`SopEngine::gate_votes_for_step`]. The broker scopes the tally to
+/// the current `policy`, revalidates each voter (`source` + `identity`) against the
+/// current required group, then dedups by `voter_key`.
+pub(crate) struct GateVote {
+    /// Canonical quorum-distinctness key (`Http`/`Ws` collapsed to `gateway`).
+    pub voter_key: String,
+    /// The `[sop.approval].policies.<name>` in effect when the vote was cast, or
+    /// `None` for a vote recorded before this field existed (never counts toward a
+    /// named current policy).
+    pub policy: Option<String>,
+    /// The voter's transport source label (`http`/`ws`/`cli`/`agent`), for membership
+    /// revalidation.
+    pub source: Option<String>,
+    /// The voter's recorded identity (paired-token subject / agent alias / OS user),
+    /// for membership revalidation. Recorded, not trusted.
+    pub identity: Option<String>,
 }
 
 /// Classification of a run's approval-gate state (EPIC C `resolve_gate`).
@@ -4940,54 +4989,77 @@ mod tests {
 
     #[test]
     fn gate_votes_are_per_step_and_canonical_per_subject() {
-        // Broker quorum reads distinct_gate_voters(run_id, step). Votes are scoped to
-        // the current step (a two-gate SOP does not reuse step-1 votes), and the voter
-        // key is the CANONICAL subject: HTTP and WS share the paired credential, so the
-        // same subject over both transports counts ONCE (cannot inflate quorum), while
-        // a genuinely different source (CLI) is a distinct voter.
+        // The broker tallies quorum from gate_votes_for_step(run_id, step). Votes are
+        // scoped to the current step (a two-gate SOP does not reuse step-1 votes), and
+        // the stored voter key is the CANONICAL subject: HTTP and WS share the paired
+        // credential, so the same subject over both transports records ONE voter_key
+        // (cannot inflate quorum), while a genuinely different source (CLI) is distinct.
         use crate::sop::approval::ApprovalPrincipal;
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let engine = engine_with_sops(vec![]).with_store(store);
 
         // Same subject "alice" over HTTP then WS: collapses to gateway:alice.
         engine
-            .record_gate_vote("run-1", 1, &ApprovalPrincipal::http(Some("alice".into())))
+            .record_gate_vote(
+                "run-1",
+                1,
+                "p",
+                &ApprovalPrincipal::http(Some("alice".into())),
+            )
             .unwrap();
         engine
             .record_gate_vote(
                 "run-1",
                 1,
+                "p",
                 &ApprovalPrincipal::ws("c".into(), Some("alice".into())),
             )
             .unwrap();
         // A repeat over HTTP: still the same canonical voter.
         engine
-            .record_gate_vote("run-1", 1, &ApprovalPrincipal::http(Some("alice".into())))
+            .record_gate_vote(
+                "run-1",
+                1,
+                "p",
+                &ApprovalPrincipal::http(Some("alice".into())),
+            )
             .unwrap();
         // A CLI actor is a genuinely distinct source (cli:bob).
         engine
-            .record_gate_vote("run-1", 1, &ApprovalPrincipal::cli(Some("bob".into())))
+            .record_gate_vote("run-1", 1, "p", &ApprovalPrincipal::cli(Some("bob".into())))
             .unwrap();
         // A vote on step 2 is a separate tally.
         engine
-            .record_gate_vote("run-1", 2, &ApprovalPrincipal::cli(Some("carol".into())))
+            .record_gate_vote(
+                "run-1",
+                2,
+                "p",
+                &ApprovalPrincipal::cli(Some("carol".into())),
+            )
             .unwrap();
 
+        // Engine surfaces the raw rows; the distinct voter_key count is the broker's
+        // dedup, reproduced here to prove per-step scoping + subject canonicalization.
+        let distinct = |step| {
+            engine
+                .gate_votes_for_step("run-1", step)
+                .unwrap()
+                .into_iter()
+                .map(|v| v.voter_key)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 1).unwrap(),
+            distinct(1),
             2,
             "gateway:alice (http+ws collapsed) + cli:bob = 2 distinct step-1 voters"
         );
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 2).unwrap(),
+            distinct(2),
             1,
             "step-2 quorum does not include step-1 voters"
         );
-        assert_eq!(
-            engine.distinct_gate_voters("run-1", 3).unwrap(),
-            0,
-            "no votes recorded for step 3"
-        );
+        assert_eq!(distinct(3), 0, "no votes recorded for step 3");
     }
 
     #[test]

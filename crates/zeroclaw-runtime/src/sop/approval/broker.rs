@@ -19,7 +19,7 @@ use zeroclaw_config::schema::{ApprovalPolicyConfig, SopApprovalConfig};
 
 use super::decision::{ApprovalDecision, ResolveOutcome};
 use super::identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResolver};
-use super::principal::ApprovalPrincipal;
+use super::principal::{ApprovalPrincipal, ApprovalSource};
 use crate::sop::engine::{GateState, SopEngine};
 
 /// Deliver an approval notice to a named route (channel). The seam that lets
@@ -93,8 +93,13 @@ impl BrokerOutcome {
 enum StepPolicy {
     /// The step names no policy: unpoliced, quorum-1 pass-through (old behavior).
     Unpoliced,
-    /// The step names a policy present in config.
-    Named(ApprovalPolicyConfig),
+    /// The step names a policy present in config. Carries the policy NAME (the
+    /// `[sop.approval].policies.<name>` map key) so a quorum vote can be scoped to the
+    /// policy in effect when it was cast.
+    Named {
+        name: String,
+        config: ApprovalPolicyConfig,
+    },
     /// The step names a policy ABSENT from config: fail closed, never treat as
     /// unpoliced.
     MissingNamed(String),
@@ -167,7 +172,10 @@ impl ApprovalBroker {
             return StepPolicy::Unpoliced;
         };
         match engine.approval_config().policies.get(&name) {
-            Some(p) => StepPolicy::Named(p.clone()),
+            Some(p) => StepPolicy::Named {
+                name,
+                config: p.clone(),
+            },
             None => StepPolicy::MissingNamed(name),
         }
     }
@@ -192,10 +200,11 @@ impl ApprovalBroker {
 
         // FAIL CLOSED: a step that names a policy absent from config leaves the gate
         // waiting rather than falling through to an unpoliced (quorum-1) resolution.
-        let policy = match self.step_policy(engine, run_id) {
+        let policy: Option<(String, ApprovalPolicyConfig)> = match self.step_policy(engine, run_id)
+        {
             StepPolicy::MissingNamed(name) => return Ok(BrokerOutcome::PolicyMissing { name }),
             StepPolicy::Unpoliced => None,
-            StepPolicy::Named(p) => Some(p),
+            StepPolicy::Named { name, config } => Some((name, config)),
         };
 
         // Required-group membership gates BOTH approve and deny: only an authorized
@@ -205,7 +214,7 @@ impl ApprovalBroker {
         // does not lock every principal out of a policy nobody could ever satisfy.
         if let Some(group) = policy
             .as_ref()
-            .and_then(|p| p.required_group.as_deref())
+            .and_then(|(_, p)| p.required_group.as_deref())
             .filter(|g| !g.is_empty())
             && !self
                 .resolver
@@ -222,10 +231,13 @@ impl ApprovalBroker {
                 engine.resolve_gate(run_id, decision, principal)?,
             )),
             ApprovalDecision::Approve => {
-                let need = policy
-                    .as_ref()
-                    .map(|p| (p.quorum.max(1)) as usize)
-                    .unwrap_or(1);
+                // Unpoliced (no named policy) clears immediately - quorum-1 pass-through.
+                let Some((policy_name, cfg)) = policy.as_ref() else {
+                    return Ok(BrokerOutcome::Resolved(
+                        engine.resolve_gate(run_id, decision, principal)?,
+                    ));
+                };
+                let need = (cfg.quorum.max(1)) as usize;
                 if need <= 1 {
                     return Ok(BrokerOutcome::Resolved(
                         engine.resolve_gate(run_id, decision, principal)?,
@@ -260,13 +272,22 @@ impl ApprovalBroker {
                         "cannot record approval vote for run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
                     );
                 }
-                // Quorum > 1: durably record this vote, then count distinct approvers
-                // FOR THE CURRENT STEP so a multi-gate run does not reuse earlier votes.
-                engine.record_gate_vote(run_id, step, &principal)?;
-                // Propagate a gate-ledger read failure instead of counting it as 0
-                // votes: the vote above is durably recorded, so failing here leaves
-                // the gate waiting for a retry rather than reporting a bogus quorum.
-                let have = engine.distinct_gate_voters(run_id, step)?;
+                // Quorum > 1: durably record this vote (scoped to the CURRENT policy),
+                // then count distinct approvers FOR THE CURRENT STEP so a multi-gate run
+                // does not reuse earlier votes.
+                engine.record_gate_vote(run_id, step, policy_name, &principal)?;
+                // Count only votes cast under the current policy whose voter is STILL a
+                // member of the current required group - so a mid-flight policy or group
+                // change cannot let a stale vote count toward the new quorum. Propagates
+                // a gate-ledger read failure (the vote above is durably recorded, so
+                // failing here leaves the gate waiting for a retry, not a bogus quorum).
+                let have = self.count_qualified_voters(
+                    engine,
+                    run_id,
+                    step,
+                    policy_name,
+                    cfg.required_group.as_deref().filter(|g| !g.is_empty()),
+                )?;
                 if have >= need {
                     Ok(BrokerOutcome::Resolved(
                         engine.resolve_gate(run_id, decision, principal)?,
@@ -277,6 +298,66 @@ impl ApprovalBroker {
             }
         }
     }
+
+    /// Count the distinct approvers whose recorded vote (a) was cast under the
+    /// `policy_name` currently enforced for this step AND (b) is STILL a member of the
+    /// current `required_group`. Scoping to the policy name means a mid-flight policy
+    /// change resets the tally (a stale vote under the old policy no longer counts);
+    /// revalidating membership against the LIVE config means a voter removed from the
+    /// group mid-flight stops counting. Dedup is by the canonical `voter_key`, so one
+    /// paired token presented over HTTP and WS still counts once. A vote with no
+    /// recorded policy (cast before this field existed) matches no named policy and is
+    /// therefore never counted - it cannot silently satisfy the new policy.
+    fn count_qualified_voters(
+        &self,
+        engine: &SopEngine,
+        run_id: &str,
+        step: u32,
+        policy_name: &str,
+        required_group: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        let votes = engine.gate_votes_for_step(run_id, step)?;
+        let cfg = engine.approval_config();
+        let mut qualified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for vote in votes {
+            // Scope to the policy in effect NOW.
+            if vote.policy.as_deref() != Some(policy_name) {
+                continue;
+            }
+            // Revalidate the recorded voter against the CURRENT required group.
+            if let Some(group) = required_group {
+                let Some(principal) = vote_principal(vote.source.as_deref(), vote.identity.clone())
+                else {
+                    continue;
+                };
+                if !self.resolver.is_member(cfg, &principal, group) {
+                    continue;
+                }
+            }
+            qualified.insert(vote.voter_key);
+        }
+        Ok(qualified.len())
+    }
+}
+
+/// Reconstruct the minimal principal needed to REVALIDATE a recorded vote against the
+/// current required group. Membership (`groups_for`) keys only on the source label and
+/// identity, so the back-channel is irrelevant and dropped. Returns `None` for an
+/// unrecognized source label (a vote we cannot re-authorize does not count).
+fn vote_principal(source: Option<&str>, identity: Option<String>) -> Option<ApprovalPrincipal> {
+    let source = match source? {
+        "agent" => ApprovalSource::Agent,
+        "cli" => ApprovalSource::Cli,
+        "ws" => ApprovalSource::Ws,
+        "http" => ApprovalSource::Http,
+        "system" => ApprovalSource::System,
+        _ => return None,
+    };
+    Some(ApprovalPrincipal {
+        source,
+        identity,
+        channel: None,
+    })
 }
 
 #[cfg(test)]
@@ -452,6 +533,113 @@ mod tests {
             second,
             BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
         ));
+    }
+
+    #[test]
+    fn stale_vote_under_old_policy_does_not_count_after_policy_change() {
+        // Finding (Audacity88 #8880 round-2): a run parks under policy `old` (quorum 2)
+        // and one `old` member votes; a SOP reload re-points the step at policy `new`
+        // (a DIFFERENT group). Before the fix the old vote shared the (run, step) key and
+        // counted toward `new`, so a SINGLE `new` approver cleared a quorum-2 gate. Votes
+        // are now scoped to the policy in effect when they were cast.
+        let mut groups = HashMap::new();
+        groups.insert(
+            "g_old".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["alice".into()],
+            },
+        );
+        groups.insert(
+            "g_new".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["bob".into()],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "old".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("g_old".into()),
+                quorum: 2,
+                ..Default::default()
+            },
+        );
+        policies.insert(
+            "new".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("g_new".into()),
+                quorum: 2,
+                ..Default::default()
+            },
+        );
+        let (mut e, id) = engine_with_broker_step("old", SopApprovalConfig { groups, policies });
+
+        // alice (a g_old member) votes under `old`: recorded, quorum not yet met.
+        let first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+
+        // A SOP reload re-points the parked step at policy `new` (group g_new).
+        e.set_sops_for_test(vec![policy_sop("new")]);
+
+        // bob (a g_new member) votes under `new`. alice's stale `old` vote must NOT count.
+        let second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(second, BrokerOutcome::PendingQuorum { have: 1, need: 2 }),
+            "a vote cast under the old policy must not count toward the new policy's quorum, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_member_vote_does_not_count_after_config_reload() {
+        // Finding (Audacity88 #8880 round-2), membership half: alice votes under `prod`
+        // (group `release`), then a live config reload revokes alice from `release` while
+        // the gate is parked. Her earlier vote is REVALIDATED against the live group at
+        // count time, so it stops counting - the one remaining member cannot alone clear
+        // a quorum of two.
+        let (mut e, id) = engine_with_broker(approval_cfg(&["alice", "bob"], 2));
+        let first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+
+        // Live config reload revokes alice from the release group (bob remains).
+        e.set_approval_config_for_test(approval_cfg(&["bob"], 2));
+
+        // bob votes. alice's earlier vote is revalidated against the CURRENT group and
+        // dropped (she is no longer a member), so quorum is still not met.
+        let second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(second, BrokerOutcome::PendingQuorum { have: 1, need: 2 }),
+            "a voter revoked from the required group must stop counting toward quorum, got {second:?}"
+        );
     }
 
     /// Delegates to an in-memory store but fails every `save_run`, to prove a
@@ -784,7 +972,7 @@ mod tests {
             "the vote must be refused while the park's snapshot is not yet durably persisted"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1).unwrap(),
+            e.gate_votes_for_step(&id, 1).unwrap().len(),
             0,
             "no gate_vote row must be recorded for a refused vote attempt"
         );
@@ -839,7 +1027,7 @@ mod tests {
             "the agent principal must be rejected under OutOfBandRequired, got {out:?}"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1).unwrap(),
+            e.gate_votes_for_step(&id, 1).unwrap().len(),
             0,
             "no gate_vote row must be recorded for a principal approval_mode rejects"
         );
