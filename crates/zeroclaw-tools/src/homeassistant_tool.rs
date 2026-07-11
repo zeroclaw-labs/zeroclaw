@@ -243,7 +243,9 @@ impl Tool for HomeAssistantTool {
         match result {
             Ok(value) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()).into(),
+                output: serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string())
+                    .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
