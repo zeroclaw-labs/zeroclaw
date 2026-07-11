@@ -70,9 +70,10 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 7] = [
+    const ALL: [Selector; 8] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
+        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -4145,6 +4146,19 @@ mod tests {
     #[test]
     fn completed_selector_advances_to_next_row() {
         let form = FormState::default_form();
+        assert_eq!(
+            Selector::ALL,
+            [
+                Selector::ModelProvider,
+                Selector::RiskProfile,
+                Selector::RuntimeProfile,
+                Selector::Memory,
+                Selector::Channels,
+                Selector::PeerGroups,
+                Selector::Agent,
+                Selector::Submit,
+            ],
+        );
         assert_eq!(
             next_selector_index_after(Selector::ModelProvider, &form),
             Some(1)
