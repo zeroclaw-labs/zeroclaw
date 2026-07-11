@@ -385,11 +385,9 @@ impl Method {
             M::SopsCreate => (Resource::Sops, Verb::Create),
             M::SopsSave => (Resource::Sops, Verb::Update),
             M::SopsDelete => (Resource::Sops, Verb::Delete),
-            M::SopsRun
-            | M::SopsDecide
-            | M::SopsValidate
-            | M::SopsWireDraft
-            | M::SopsGraphDraft => (Resource::Sops, Verb::Execute),
+            M::SopsRun | M::SopsDecide | M::SopsValidate | M::SopsWireDraft | M::SopsGraphDraft => {
+                (Resource::Sops, Verb::Execute)
+            }
 
             M::ToolsParamOptions => (Resource::Tools, Verb::Read),
         })
