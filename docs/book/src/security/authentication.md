@@ -211,3 +211,13 @@ remote posture (WSS becomes authenticate-or-deny); local socket behavior for
 the daemon's own uid is preserved throughout. Sessions created before the
 upgrade have no owning principal: the operator and admin principals see them
 as always, scoped principals do not.
+
+### Migrating from Nevis
+
+The legacy `[nevis]` config section is no longer loaded. Nevis identity and
+role mapping are superseded by the `[oidc.<alias>]` provider: point the OIDC
+`issuer` at your former Nevis issuer, move the client credentials to
+`[oidc.<alias>]`, and translate each Nevis role mapping into an
+`[oidc.<alias>].role_map` entry that names a `[permission_profiles.<alias>]`
+grant set. A `[nevis]` section left in `config.toml` is ignored and logs a
+migration warning at load; it does not authenticate anyone until ported.
