@@ -280,12 +280,22 @@ Adds a Telegram username (without the '@' prefix) or numeric user \
 ID to the channel allowlist so the agent will respond to messages \
 from that identity.
 
+Use --alias to target a non-default Telegram channel — it must match \
+the alias in the channels.telegram.<alias> section the agent uses. \
+Without it the identity is bound to the `default` alias and a \
+non-default agent will keep asking for approval.
+
 Examples:
   zeroclaw channel bind-telegram zeroclaw_user
-  zeroclaw channel bind-telegram 123456789")]
+  zeroclaw channel bind-telegram 123456789
+  zeroclaw channel bind-telegram 123456789 --alias alerts")]
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
+        /// Telegram channel alias to bind to (the <alias> in
+        /// channels.telegram.<alias>). Defaults to `default`.
+        #[arg(long, default_value = "default")]
+        alias: String,
     },
     /// Send a message to a configured channel
     // i18n-exempt: clap derive help — framework requires a compile-time literal
