@@ -2871,3 +2871,56 @@ api_key = "sk-openai-lead"
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// V4 fixture: the committed at-rest V4 config loads and is idempotent
+// ─────────────────────────────────────────────────────────────
+
+const V4_FIXTURE: &str = include_str!("../fixtures/v4.toml");
+
+#[test]
+fn v4_fixture_is_at_current_version() {
+    let v: toml::Value = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as TOML");
+    assert_eq!(detect_version(&v).expect("detect V4"), 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+}
+
+#[test]
+fn v4_fixture_loads_as_config() {
+    let cfg: Config = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as Config");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn v4_fixture_is_migration_idempotent() {
+    assert!(
+        migrate_file(V4_FIXTURE)
+            .expect("migrate_file on V4 succeeds")
+            .is_none(),
+        "a config already at CURRENT_SCHEMA_VERSION must not be rewritten"
+    );
+}
+
+#[test]
+fn v1_to_v4_round_trip_matches_committed_fixture() {
+    let migrated = migrate_file(V1_FIXTURE)
+        .expect("migrate_file succeeds")
+        .expect("migration ran (V1 -> V4)");
+    let migrated_cfg: Config = toml::from_str(&migrated).expect("migrated output parses");
+    let fixture_cfg: Config = toml::from_str(V4_FIXTURE).expect("V4 fixture parses");
+    assert_eq!(migrated_cfg.schema_version, fixture_cfg.schema_version);
+    assert_eq!(
+        migrated_cfg.agents.len(),
+        fixture_cfg.agents.len(),
+        "V1->V4 agent count must match the committed V4 fixture"
+    );
+}
+
+#[test]
+fn v3_to_v4_round_trips_to_current() {
+    let v3_input = migrate_file(V1_FIXTURE)
+        .expect("migrate V1")
+        .expect("V1 migrated");
+    let cfg: Config = migrate_to_current(&v3_input).expect("re-migrate current-shape input");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+}

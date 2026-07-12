@@ -35,7 +35,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Signal | `channel-signal` | [Signal](./signal.md) |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
-| Discord, Slack, Telegram, iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| Discord, Slack, Telegram, iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
@@ -45,8 +45,6 @@ One-to-many or public-feed integrations.
 |---|---|---|
 | Bluesky | `channel-bluesky` | AT Protocol |
 | Nostr | `channel-nostr` | NIP-01 relays |
-| Twitter / X | `channel-twitter` | API v2 |
-| Reddit | `channel-reddit` | JSON API |
 
 See [Social channels](./social.md).
 

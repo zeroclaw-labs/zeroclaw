@@ -201,6 +201,14 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Make screenshot expectations platform-aware (#8183); make process fixtures portable on Windows (#7956).
 - Pin the system prompt in the cache-hit test to kill a date flake (#8036).
 
+## Breaking Changes
+
+- **Config schema V4 cut** (#8310): a breaking schema migration that removes retired surfaces. `zeroclaw` auto-migrates configs from V1/V2/V3 to V4 on load; the dropped keys and integrations are pruned during migration. Removed in this cut:
+  - **Channels:** `notion`, `twitter`/`x`, and `reddit` channel implementations and their `[channels.*]` config blocks.
+  - **Tools:** the SaaS/CLI integration tools `jira`, `notion`, `linkedin`, `composio`, `google_workspace`, `microsoft365`, `project_intel`, and the external-CLI runners `claude_code`, `codex_cli`, `gemini_cli`, `opencode_cli`.
+  - **Config:** the `ZEROCLAW_WORKSPACE` env override, the external SaaS config/tool surfaces, and legacy inert tunables and `summary_model` cruft.
+  - Documentation, navigation, and the generated config reference are updated to stop advertising the removed channels and tools. A `fixtures/v4.toml` acceptance fixture and V1→V4 / V3→V4 migration round-trip tests pin the new schema.
+
 ## Contributors
 
 @Alix-007

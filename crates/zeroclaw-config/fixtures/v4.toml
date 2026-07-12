@@ -1,0 +1,743 @@
+locale = "en"
+schema_version = 4
+[[model_routes]]
+hint = "fast"
+model = "gpt-4o-mini"
+model_provider = "openai.default"
+[[embedding_routes]]
+dimensions = 1536
+hint = "default"
+model = "text-embedding-3-small"
+model_provider = "openai.default"
+[cron.heartbeat_ping]
+command = "curl -fsS https://uptime.example.com/ping"
+enabled = true
+job_type = "shell"
+[cron.morning_briefing]
+enabled = true
+job_type = "agent"
+model = "gpt-4o-mini"
+name = "Morning briefing"
+prompt = "Summarize overnight events."
+session_target = "isolated"
+[storage.qdrant.default]
+collection = "zeroclaw_memories"
+url = "http://127.0.0.1:6333"
+[agents.simple_agent.identity]
+format = "openclaw"
+[agents.complex_agent.identity]
+format = "openclaw"
+[channels]
+ack_reactions = true
+cli = true
+debounce_ms = 0
+max_concurrent_per_channel = 4
+message_timeout_secs = 300
+session_backend = "sqlite"
+session_persistence = true
+session_ttl_hours = 0
+show_tool_calls = false
+[peer_groups.dingtalk_default]
+agents = ["complex_agent"]
+channel = "dingtalk"
+external_peers = ["staff-001"]
+[providers.models.anthropic.agent_complex_agent]
+api_key = "sk-ant-complex"
+model = "claude-sonnet-4-5"
+temperature = 0.3
+timeout_secs = 180
+[risk_profiles.agent_complex_agent]
+allowed_tools = ["shell", "memory"]
+[runtime_profiles.agent_complex_agent]
+agentic = true
+agentic_timeout_secs = 600
+max_delegation_depth = 4
+max_tool_iterations = 25
+[skill_bundles.agent_complex_agent]
+
+[[model_routes]]
+hint = "deep"
+model = "claude-sonnet-4-6"
+model_provider = "anthropic.default"
+
+[cron.heartbeat_ping.schedule]
+every_ms = 60000
+kind = "every"
+
+[cron.morning_briefing.schedule]
+expr = "0 7 * * *"
+kind = "cron"
+tz = "UTC"
+
+[channels.bluesky.default]
+app_password = "bluesky-app-password"
+enabled = false
+handle = "zeroclaw.bsky.social"
+
+[peer_groups.discord_default]
+agents = ["complex_agent"]
+channel = "discord"
+external_peers = ["222233334444"]
+
+[providers.models.anthropic.custom]
+max_tokens = 8192
+name = "anthropic-custom"
+uri = "https://api.z.ai/api/anthropic"
+
+[risk_profiles.default]
+allowed_commands = ["ls", "git", "cat"]
+allowed_roots = ["~/workspace"]
+always_ask = []
+auto_approve = ["weather"]
+block_high_risk_commands = true
+excluded_tools = ["browser"]
+forbidden_paths = ["/etc", "/root"]
+level = "supervised"
+require_approval_for_medium_risk = true
+shell_env_passthrough = ["PATH", "HOME"]
+workspace_only = true
+
+[runtime_profiles.default]
+compact_context = false
+keep_tool_context_turns = 2
+max_actions_per_hour = 100
+max_context_tokens = 32000
+max_cost_per_day_cents = 1000
+max_history_messages = 50
+max_system_prompt_chars = 0
+max_tool_iterations = 10
+max_tool_result_chars = 50000
+parallel_tools = true
+shell_timeout_secs = 60
+tool_call_dedup_exempt = []
+tool_dispatcher = "auto"
+
+[channels.clawdtalk.default]
+api_key = "clawdtalk-api-key"
+connection_id = "clawdtalk-connection-id"
+enabled = false
+from_number = "+15555550110"
+
+[peer_groups.imessage_default]
+agents = ["complex_agent"]
+channel = "imessage"
+external_peers = ["+15551234567"]
+
+[providers.models.anthropic.default]
+name = "anthropic"
+uri = "https://api.anthropic.com"
+
+[channels.dingtalk.default]
+client_id = "ding-client-id"
+client_secret = "ding-client-secret"
+enabled = false
+
+[peer_groups.irc_default]
+agents = ["complex_agent"]
+channel = "irc"
+external_peers = ["operator"]
+
+[providers.models.azure.default]
+azure_openai_api_version = "2024-08-01-preview"
+azure_openai_deployment = "gpt-4o"
+azure_openai_resource = "my-resource"
+name = "openai"
+requires_openai_auth = true
+
+[channels.discord.default]
+archive = true
+bot_token = "discord-v1-bot-token"
+channel_ids = ["555566667777"]
+draft_update_interval_ms = 1000
+enabled = true
+guild_ids = ["111122223333"]
+listen_to_bots = false
+mention_only = true
+multi_message_delay_ms = 500
+respond_to_dms = true
+stall_timeout_secs = 0
+store_dms = true
+stream_mode = "off"
+
+[peer_groups.lark_default]
+agents = ["complex_agent"]
+channel = "lark"
+external_peers = ["ou_admin"]
+
+[providers.models.ollama.default]
+merge_system_into_user = true
+name = "ollama"
+uri = "http://127.0.0.1:11434"
+
+[channels.email.default]
+enabled = false
+from_address = "zeroclaw@example.com"
+imap_host = "imap.example.com"
+password = "email-password"
+smtp_host = "smtp.example.com"
+username = "zeroclaw@example.com"
+
+[peer_groups.linq_default]
+agents = ["complex_agent"]
+channel = "linq"
+external_peers = ["+15555550104"]
+
+[providers.models.openai.agent_simple_agent]
+model = "gpt-4o-mini"
+
+[channels.gmail_push.default]
+enabled = false
+topic = "projects/zeroclaw-fixture/topics/inbox"
+
+[peer_groups.matrix_default]
+agents = ["complex_agent"]
+channel = "matrix"
+external_peers = ["@operator:matrix.example.org"]
+
+[providers.models.openai.default]
+api_key = "sk-v1-test-global"
+max_tokens = 4096
+model = "gpt-4o-mini"
+name = "openai"
+temperature = 0.5
+timeout_secs = 90
+uri = "https://api.openai.com/v1/chat/completions"
+wire_api = "chat_completions"
+
+[channels.imessage.default]
+enabled = false
+
+[peer_groups.mattermost_default]
+agents = ["complex_agent"]
+channel = "mattermost"
+external_peers = ["mm-user-1"]
+
+[providers.models.openai.default.extra_headers]
+HTTP-Referer = "https://zeroclaw.test"
+X-Title = "zeroclaw-v1-fixture"
+
+[channels.irc.default]
+channels = ["#zeroclaw"]
+enabled = false
+nickname = "zeroclaw"
+port = 6697
+server = "irc.example.org"
+username = "zeroclaw"
+
+[peer_groups.mochat_default]
+agents = ["complex_agent"]
+channel = "mochat"
+external_peers = ["mochat-user-1"]
+
+[observability]
+backend = "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw-fixture"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
+
+[channels.lark.default]
+app_id = "cli_lark_v1"
+app_secret = "lark-v1-app-secret"
+enabled = true
+encrypt_key = "lark-encrypt-key"
+mention_only = false
+receive_mode = "websocket"
+use_feishu = false
+verification_token = "lark-verify-token"
+
+[peer_groups.nextcloud_talk_default]
+agents = ["complex_agent"]
+channel = "nextcloud_talk"
+external_peers = ["user1"]
+
+[channels.lark.feishu]
+allowed_users = ["ou_feishu_admin"]
+app_id = "cli_feishu_v1"
+app_secret = "feishu-v1-app-secret"
+enabled = true
+encrypt_key = "feishu-encrypt-key"
+receive_mode = "websocket"
+use_feishu = true
+verification_token = "feishu-verify-token"
+
+[peer_groups.qq_default]
+agents = ["complex_agent"]
+channel = "qq"
+external_peers = ["qq-user-1"]
+
+[trust]
+
+[channels.linq.default]
+api_token = "linq-api-token"
+enabled = false
+from_phone = "+15555550103"
+
+[peer_groups.signal_default]
+agents = ["complex_agent"]
+channel = "signal"
+external_peers = ["+15555550101"]
+
+[backup]
+enabled = true
+max_keep = 10
+include_dirs = ["config", "memory", "audit", "knowledge"]
+destination_dir = "state/backups"
+compress = true
+encrypt = false
+
+[channels.matrix.default]
+access_token = "matrix-v1-access-token"
+allowed_rooms = ["!fixture-room:matrix.example.org"]
+device_id = "ZEROCLAW_FIXTURE"
+draft_update_interval_ms = 2000
+enabled = true
+homeserver = "https://matrix.example.org"
+interrupt_on_new_message = false
+multi_message_delay_ms = 500
+stream_mode = "off"
+user_id = "@zeroclaw:matrix.example.org"
+
+[peer_groups.slack_default]
+agents = ["complex_agent"]
+channel = "slack"
+external_peers = ["U9999999"]
+
+[data_retention]
+enabled = false
+retention_days = 90
+dry_run = false
+categories = []
+
+[channels.mattermost.default]
+bot_token = "mattermost-v1-token"
+channel_ids = ["mm-channel-abc"]
+enabled = true
+interrupt_on_new_message = false
+mention_only = false
+url = "https://mattermost.example.com"
+
+[peer_groups.telegram_default]
+agents = ["complex_agent"]
+channel = "telegram"
+external_peers = ["@v1_admin", "12345678"]
+
+[cloud_ops]
+enabled = false
+default_cloud = "aws"
+supported_clouds = ["aws", "azure", "gcp"]
+iac_tools = ["terraform"]
+cost_threshold_monthly_usd = 100.0
+well_architected_frameworks = ["aws-waf"]
+
+[channels.mochat.default]
+api_token = "mochat-api-token"
+api_url = "https://mochat.example.com"
+enabled = false
+poll_interval_secs = 5
+
+[peer_groups.wati_default]
+agents = ["complex_agent"]
+channel = "wati"
+external_peers = ["+15555550105"]
+
+[security]
+
+[channels.mqtt.default]
+broker_url = "mqtt://broker.example.com:1883"
+client_id = "zeroclaw-fixture"
+enabled = true
+keep_alive_secs = 30
+qos = 1
+topics = ["zeroclaw/sop/v1"]
+use_tls = false
+
+[peer_groups.wecom_default]
+agents = ["complex_agent"]
+channel = "wecom"
+external_peers = ["wecom-user-1"]
+
+[security_ops]
+enabled = false
+playbooks_dir = "~/.zeroclaw/playbooks"
+auto_triage = false
+require_approval_for_actions = true
+max_auto_severity = "low"
+report_output_dir = "~/.zeroclaw/security-reports"
+
+[channels.nextcloud_talk.default]
+app_token = "nextcloud-app-token"
+base_url = "https://cloud.example.com"
+bot_name = "zeroclaw"
+enabled = false
+webhook_secret = "nextcloud-webhook-secret"
+
+[peer_groups.whatsapp_default]
+agents = ["complex_agent"]
+channel = "whatsapp"
+external_peers = ["+15555550102"]
+
+[runtime]
+kind = "native"
+reasoning_enabled = false
+reasoning_effort = "medium"
+
+[channels.qq.default]
+app_id = "qq-app-id"
+app_secret = "qq-app-secret"
+enabled = false
+
+[runtime.docker]
+image = "alpine:3.20"
+network = "none"
+memory_limit_mb = 512
+cpu_limit = 1.0
+read_only_rootfs = true
+mount_workspace = true
+allowed_workspace_roots = []
+
+[channels.signal.default]
+account = "+15555550100"
+enabled = false
+http_url = "http://127.0.0.1:8686"
+ignore_attachments = false
+ignore_stories = false
+
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 500
+api_keys = []
+channel_initial_backoff_secs = 2
+channel_max_backoff_secs = 60
+scheduler_poll_secs = 15
+scheduler_retries = 2
+
+[channels.slack.default]
+app_token = "xapp-v1-slack-token"
+bot_token = "xoxb-v1-slack-token"
+channel_ids = ["C0123456789"]
+draft_update_interval_ms = 1200
+enabled = true
+interrupt_on_new_message = false
+mention_only = true
+stream_drafts = false
+use_markdown_blocks = false
+
+[channels.telegram.default]
+ack_reactions = false
+bot_token = "telegram-v1-bot-token"
+draft_update_interval_ms = 1000
+enabled = true
+interrupt_on_new_message = false
+mention_only = false
+stream_mode = "partial"
+
+[scheduler]
+enabled = true
+max_tasks = 64
+max_concurrent = 4
+catch_up_on_startup = true
+max_run_history = 50
+
+[channels.voice_call.default]
+account_id = "voice-call-account-id"
+auth_token = "voice-call-auth-token"
+enabled = false
+from_number = "+15555550111"
+
+[channels.wati.default]
+api_token = "wati-api-token"
+api_url = "https://live-mt-server.wati.io"
+enabled = false
+
+[pacing]
+loop_ignore_tools = []
+loop_detection_enabled = true
+loop_detection_window_size = 20
+loop_detection_max_repeats = 3
+
+[channels.webhook.default]
+enabled = true
+listen_path = "/webhook"
+port = 8080
+send_method = "POST"
+send_url = "https://hooks.example.com/inbound"
+
+[skills]
+open_skills_enabled = false
+allow_scripts = false
+
+[channels.wecom.default]
+enabled = false
+webhook_key = "wecom-webhook-key"
+
+[skills.skill_creation]
+enabled = false
+max_skills = 500
+similarity_threshold = 0.85
+
+[channels.whatsapp.default]
+access_token = "wa-access"
+app_secret = "wa-app-secret"
+dm_policy = "allowlist"
+enabled = false
+group_policy = "allowlist"
+mention_only = false
+mode = "business"
+phone_number_id = "1234567890"
+self_chat_mode = false
+verify_token = "wa-verify"
+
+[skills.skill_improvement]
+enabled = true
+cooldown_secs = 3600
+
+[pipeline]
+enabled = false
+max_steps = 20
+allowed_tools = []
+
+[query_classification]
+enabled = false
+rules = []
+
+[heartbeat]
+enabled = true
+interval_minutes = 30
+two_phase = true
+agent = "complex_agent"
+
+[cron]
+
+[memory]
+backend = "sqlite"
+auto_save = true
+hygiene_enabled = true
+archive_after_days = 7
+purge_after_days = 30
+conversation_retention_days = 30
+embedding_provider = "none"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
+vector_weight = 0.7
+keyword_weight = 0.3
+search_mode = "hybrid"
+min_relevance_score = 0.4
+embedding_cache_size = 10000
+chunk_max_tokens = 512
+response_cache_enabled = false
+response_cache_ttl_minutes = 60
+response_cache_max_entries = 5000
+response_cache_hot_entries = 256
+snapshot_enabled = false
+snapshot_on_hygiene = false
+auto_hydrate = true
+retrieval_stages = ["cache", "fts", "vector"]
+rerank_enabled = false
+rerank_threshold = 5
+fts_early_return_score = 0.85
+default_namespace = "default"
+conflict_threshold = 0.85
+audit_enabled = false
+audit_retention_days = 30
+
+[memory.policy]
+max_entries_per_namespace = 0
+max_entries_per_category = 0
+read_only_namespaces = []
+
+[storage]
+
+[tunnel]
+tunnel_provider = "none"
+
+[gateway]
+port = 42617
+host = "127.0.0.1"
+require_pairing = true
+allow_public_bind = false
+paired_tokens = []
+pair_rate_limit_per_minute = 10
+webhook_rate_limit_per_minute = 60
+trust_forwarded_headers = false
+rate_limit_max_keys = 10000
+idempotency_ttl_secs = 300
+idempotency_max_keys = 10000
+session_persistence = true
+session_ttl_hours = 0
+
+[gateway.pairing_dashboard]
+code_length = 8
+code_ttl_secs = 3600
+max_pending_codes = 3
+max_failed_attempts = 5
+lockout_secs = 300
+
+[secrets]
+encrypt = true
+
+[browser]
+enabled = true
+allowed_domains = ["*"]
+backend = "agent_browser"
+native_headless = true
+native_webdriver_url = "http://127.0.0.1:9515"
+allowed_private_hosts = []
+
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions"
+timeout_ms = 15000
+allow_remote_endpoint = false
+window_allowlist = []
+
+[browser_delegate]
+enabled = false
+cli_binary = "claude"
+chrome_profile_dir = ""
+allowed_domains = []
+blocked_domains = []
+task_timeout_secs = 120
+
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+max_response_size = 1000000
+timeout_secs = 30
+allow_private_hosts = false
+allowed_private_hosts = []
+
+[multimodal]
+max_images = 4
+max_image_size_mb = 5
+allow_remote_fetch = false
+
+[media_pipeline]
+enabled = false
+transcribe_audio = true
+describe_images = true
+summarize_video = true
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+allowed_private_hosts = []
+max_response_size = 500000
+timeout_secs = 30
+
+[web_fetch.firecrawl]
+enabled = false
+api_key_env = "FIRECRAWL_API_KEY"
+api_url = "https://api.firecrawl.dev/v1"
+mode = "scrape"
+
+[link_enricher]
+enabled = false
+max_links = 3
+timeout_secs = 10
+
+[text_browser]
+enabled = false
+timeout_secs = 30
+allowed_private_hosts = []
+
+[web_search]
+enabled = true
+max_results = 5
+timeout_secs = 15
+search_provider = "duckduckgo"
+
+[proxy]
+
+[cost]
+enabled = true
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+
+[cost.enforcement]
+mode = "warn"
+reserve_percent = 10
+
+[peripherals]
+
+[delegate]
+timeout_secs = 120
+agentic_timeout_secs = 300
+
+[agents.simple_agent]
+model_provider = "openai.agent_simple_agent"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.complex_agent]
+channels = ["dingtalk.default", "discord.default", "imessage.default", "irc.default", "lark.default", "lark.feishu", "linq.default", "matrix.default", "mattermost.default", "mochat.default", "nextcloud_talk.default", "qq.default", "signal.default", "slack.default", "telegram.default", "wati.default", "wecom.default", "whatsapp.default"]
+model_provider = "anthropic.agent_complex_agent"
+risk_profile = "agent_complex_agent"
+runtime_profile = "agent_complex_agent"
+skill_bundles = ["agent_complex_agent"]
+
+[hooks]
+enabled = true
+
+[hooks.builtin]
+command_logger = false
+
+[hooks.builtin.webhook_audit]
+enabled = false
+url = ""
+tool_patterns = []
+include_args = false
+max_args_bytes = 4096
+
+[hardware]
+enabled = false
+transport = "None"
+
+[transcription]
+
+[tts]
+
+[mcp]
+
+[nodes]
+
+[workspace]
+enabled = false
+workspaces_dir = "~/.zeroclaw/workspaces"
+isolate_memory = true
+isolate_secrets = true
+isolate_audit = true
+cross_workspace_search = false
+
+[node_transport]
+enabled = true
+shared_secret = ""
+max_request_age_secs = 300
+require_https = true
+allowed_peers = []
+mutual_tls = false
+connection_pool_size = 4
+
+[knowledge]
+enabled = false
+db_path = "knowledge.db"
+max_nodes = 100000
+auto_capture = false
+suggest_on_query = true
+cross_workspace_search = false
+
+[image_gen]
+enabled = false
+
+[plugins]
+enabled = false
+
+[verifiable_intent]
+
+[sop]
+
+[shell_tool]
+timeout_secs = 60

@@ -49,10 +49,6 @@ Classic IRC. Supports SASL, NickServ auth, and multiple channels.
 
 ## Mochat
 
-## Notion
-
-Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
-
 ---
 
 ## When to prefer a dedicated guide
