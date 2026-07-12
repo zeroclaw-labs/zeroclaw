@@ -200,17 +200,6 @@ impl WebSearchTool {
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
 
         if !status.is_success() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "search_provider": "duckduckgo",
-                        "search_status": SearchStatus::Blocked.as_str(),
-                        "http_status": status.as_u16(),
-                    })),
-                "web_search provider request blocked"
-            );
             if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
                 anyhow::bail!(message);
             }
@@ -1031,30 +1020,38 @@ fn duckduckgo_block_message(
     }
 }
 
-/// Build a provider HTTP-failure error tagged with `search_status=blocked` and
-/// emit a structured log record. Used when a provider returns a non-2xx status
-/// code — the status is already in hand, so we can classify it directly as
-/// `Blocked` without inferring from an `anyhow::Error`.
+/// Classify a non-2xx HTTP status into a structured search status. Called only
+/// on the failure path (`!status.is_success()`); 2xx never reaches here.
+fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
+    match status.as_u16() {
+        403 => SearchStatus::Blocked,
+        429 => SearchStatus::Unavailable,
+        400 | 401 | 404 => SearchStatus::ClientError,
+        500..=599 => SearchStatus::Unavailable,
+        _ => SearchStatus::ClientError, // other 4xx -> request-side problem
+    }
+}
+
+/// Build a provider HTTP-failure error whose message carries a precise
+/// `search_status` tag (blocked / unavailable / client_error) and an actionable
+/// hint matching the class. The central tool executor owns the failure log
+/// record; this helper emits no log of its own.
 ///
 /// The runtime (`tool_execution.rs`) forwards the `Err` returned by `execute`
 /// to the agent as readable text, so placing actionable hints in the message
 /// makes them visible to the agent.
 fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "search_provider": provider,
-                "search_status": SearchStatus::Blocked.as_str(),
-                "http_status": status.as_u16(),
-            })),
-        "web_search provider request blocked"
-    );
+    let search_status = classify_http_status(status);
+    let hint = match search_status {
+        SearchStatus::Blocked | SearchStatus::Unavailable => {
+            "Try a different provider (SearXNG, Brave, or Tavily)."
+        }
+        SearchStatus::ClientError => "Check the query and API key for this provider.",
+        _ => "Try a different provider.",
+    };
     anyhow::Error::msg(format!(
-        "{provider} search failed (search_status={}, http={status}). \
-         Try a different provider (SearXNG, Brave, or Tavily).",
-        SearchStatus::Blocked.as_str()
+        "{provider} search failed (search_status={}, http={status}). {hint}",
+        search_status.as_str()
     ))
 }
 
@@ -1252,31 +1249,87 @@ mod tests {
     }
 
     #[test]
-    fn http_search_failure_marks_status_blocked_and_lists_alternatives() {
-        // 403 is a typical signal of active provider blocking.
+    fn http_search_failure_classifies_forbidden_as_blocked_with_provider_hint() {
+        // 403 is the canonical signal of active provider blocking.
         let err = http_search_failure("brave", reqwest::StatusCode::FORBIDDEN);
         let msg = format!("{err}");
         assert!(
             msg.contains("search_status=blocked"),
-            "message must tag search_status=blocked for agent routing, got: {msg}"
+            "403 must tag search_status=blocked, got: {msg}"
         );
         assert!(
             msg.contains("http=403"),
             "message must include the HTTP status code, got: {msg}"
         );
         assert!(
-            msg.contains("SearXNG") && msg.contains("Tavily"),
-            "message must suggest alternative providers, got: {msg}"
+            msg.contains("different provider"),
+            "blocked status must suggest switching providers, got: {msg}"
         );
     }
 
     #[test]
-    fn http_search_failure_tags_server_errors_as_blocked() {
-        // 5xx is also classified as Blocked (provider unavailable; switching
-        // provider is the right suggestion).
+    fn http_search_failure_classifies_server_error_as_unavailable() {
+        // 5xx is a provider-side outage; switching provider is the right suggestion.
         let err = http_search_failure("searxng", reqwest::StatusCode::BAD_GATEWAY);
-        assert!(format!("{err}").contains("search_status=blocked"));
-        assert!(format!("{err}").contains("http=502"));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search_status=unavailable"),
+            "5xx must classify as unavailable, got: {msg}"
+        );
+        assert!(msg.contains("http=502"));
+        assert!(
+            msg.contains("different provider"),
+            "unavailable status must suggest switching providers, got: {msg}"
+        );
+
+        // 500 is also Unavailable.
+        let err500 = http_search_failure("searxng", reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        let msg500 = format!("{err500}");
+        assert!(msg500.contains("search_status=unavailable"));
+        assert!(msg500.contains("http=500"));
+    }
+
+    #[test]
+    fn http_search_failure_classifies_rate_limit_as_unavailable() {
+        // 429 is provider-side rate limiting; switching provider helps.
+        let err = http_search_failure("jina", reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search_status=unavailable"),
+            "429 must classify as unavailable, got: {msg}"
+        );
+        assert!(msg.contains("http=429"));
+        assert!(msg.contains("different provider"));
+    }
+
+    #[test]
+    fn http_search_failure_classifies_client_errors_as_client_error() {
+        // 400/401/404 are request/credential problems; switching provider may
+        // NOT help, so the hint must direct at query/key, not "different provider".
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::NOT_FOUND,
+        ] {
+            let err = http_search_failure("tavily", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=client_error"),
+                "{status} must classify as client_error, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("Check the query and API key"),
+                "client_error hint must direct at query/key, got: {msg}"
+            );
+            assert!(
+                !msg.contains("different provider"),
+                "client_error must NOT suggest switching providers, got: {msg}"
+            );
+        }
     }
 
     #[tokio::test]

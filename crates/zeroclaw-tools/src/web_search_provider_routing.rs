@@ -8,11 +8,14 @@ pub enum WebSearchProviderRoute {
     Bocha,
 }
 
-/// Structured search status: distinguishes provider failure from a genuine empty result.
+/// Structured search status: distinguishes provider failure classes from a
+/// genuine empty result and from each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStatus {
     Ok,
     Blocked,
+    Unavailable,
+    ClientError,
     Timeout,
     Empty,
     ParseError,
@@ -24,6 +27,8 @@ impl SearchStatus {
         match self {
             Self::Ok => "ok",
             Self::Blocked => "blocked",
+            Self::Unavailable => "unavailable",
+            Self::ClientError => "client_error",
             Self::Timeout => "timeout",
             Self::Empty => "empty",
             Self::ParseError => "parse_error",
@@ -211,6 +216,8 @@ mod tests {
         // strings — drifting one silently breaks agent routing heuristics.
         assert_eq!(SearchStatus::Ok.as_str(), "ok");
         assert_eq!(SearchStatus::Blocked.as_str(), "blocked");
+        assert_eq!(SearchStatus::Unavailable.as_str(), "unavailable");
+        assert_eq!(SearchStatus::ClientError.as_str(), "client_error");
         assert_eq!(SearchStatus::Timeout.as_str(), "timeout");
         assert_eq!(SearchStatus::Empty.as_str(), "empty");
         assert_eq!(SearchStatus::ParseError.as_str(), "parse_error");
