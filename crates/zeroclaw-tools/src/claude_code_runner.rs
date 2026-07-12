@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::process::Command;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
@@ -103,7 +103,7 @@ impl Tool for ClaudeCodeRunnerTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -134,7 +134,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 Err(_) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "working_directory '{}' does not exist or is not accessible",
                             wd
@@ -147,7 +147,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 Err(_) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "workspace directory '{}' does not exist or is not accessible",
                             workspace.display()
@@ -158,7 +158,7 @@ impl Tool for ClaudeCodeRunnerTool {
             if !canonical_wd.starts_with(&canonical_ws) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "working_directory '{}' is outside the workspace '{}'",
                         wd,
@@ -231,14 +231,14 @@ impl Tool for ClaudeCodeRunnerTool {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to create tmux session: {stderr}")),
                 });
             }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "tmux not found or failed to execute: {e}. Install tmux to use claude_code_runner."
                     )),
@@ -271,7 +271,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 .await;
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to send command to tmux session: {e}")),
             });
         }
@@ -314,7 +314,7 @@ impl Tool for ClaudeCodeRunnerTool {
 
         Ok(ToolResult {
             success: true,
-            output: output_parts.join("\n"),
+            output: output_parts.join("\n").into(),
             error: None,
         })
     }

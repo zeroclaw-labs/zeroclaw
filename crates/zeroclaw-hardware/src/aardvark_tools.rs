@@ -42,7 +42,7 @@ async fn resolve(
     let reg = registry.read().await;
     reg.resolve_aardvark_device(args).map_err(|msg| ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(msg),
     })
 }
@@ -111,13 +111,13 @@ impl Tool for I2cScanTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "i2c_scan: device returned ok:false".to_string()),
@@ -125,7 +125,7 @@ impl Tool for I2cScanTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("transport error: {e}")),
             }),
         }
@@ -188,7 +188,7 @@ impl Tool for I2cReadTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: addr".to_string()),
                 });
             }
@@ -221,13 +221,13 @@ impl Tool for I2cReadTool {
                     .unwrap_or_else(|| "?".to_string());
                 Ok(ToolResult {
                     success: true,
-                    output: format!("I2C read from addr {addr:#04x}: [{hex}]"),
+                    output: format!("I2C read from addr {addr:#04x}: [{hex}]").into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "i2c_read: device returned ok:false".to_string()),
@@ -235,7 +235,7 @@ impl Tool for I2cReadTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("transport error: {e}")),
             }),
         }
@@ -293,7 +293,7 @@ impl Tool for I2cWriteTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: addr".to_string()),
                 });
             }
@@ -303,7 +303,7 @@ impl Tool for I2cWriteTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: bytes".to_string()),
                 });
             }
@@ -325,13 +325,13 @@ impl Tool for I2cWriteTool {
                     .unwrap_or(bytes.len() as u64);
                 Ok(ToolResult {
                     success: true,
-                    output: format!("I2C write to addr {addr:#04x}: {n} byte(s) written"),
+                    output: format!("I2C write to addr {addr:#04x}: {n} byte(s) written").into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "i2c_write: device returned ok:false".to_string()),
@@ -339,7 +339,7 @@ impl Tool for I2cWriteTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("transport error: {e}")),
             }),
         }
@@ -394,7 +394,7 @@ impl Tool for SpiTransferTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: bytes".to_string()),
                 });
             }
@@ -422,13 +422,13 @@ impl Tool for SpiTransferTool {
                     .unwrap_or_else(|| "?".to_string());
                 Ok(ToolResult {
                     success: true,
-                    output: format!("SPI transfer complete. Received: [{hex}]"),
+                    output: format!("SPI transfer complete. Received: [{hex}]").into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "spi_transfer: device returned ok:false".to_string()),
@@ -436,7 +436,7 @@ impl Tool for SpiTransferTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("transport error: {e}")),
             }),
         }
@@ -502,7 +502,7 @@ impl Tool for GpioAardvarkTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: action".to_string()),
                 });
             }
@@ -526,7 +526,7 @@ impl Tool for GpioAardvarkTool {
             other => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("unknown action '{other}'; use 'set' or 'get'")),
                 });
             }
@@ -548,13 +548,13 @@ impl Tool for GpioAardvarkTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "gpio_aardvark: device returned ok:false".to_string()),
@@ -562,7 +562,7 @@ impl Tool for GpioAardvarkTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("transport error: {e}")),
             }),
         }

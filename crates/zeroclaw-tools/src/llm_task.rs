@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::model_provider::ModelProvider;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_providers::ProviderDispatch;
@@ -96,7 +96,7 @@ impl Tool for LlmTaskTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -107,7 +107,7 @@ impl Tool for LlmTaskTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing or empty required parameter: prompt".to_string()),
                 });
             }
@@ -151,7 +151,7 @@ impl Tool for LlmTaskTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to create model_provider: {e}")),
                     });
                 }
@@ -168,7 +168,7 @@ impl Tool for LlmTaskTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("LLM call failed: {e}")),
                 });
             }
@@ -180,19 +180,19 @@ impl Tool for LlmTaskTool {
             match validate_json_response(&response, &schema_value) {
                 Ok(validated_json) => Ok(ToolResult {
                     success: true,
-                    output: validated_json,
+                    output: validated_json.into(),
                     error: None,
                 }),
                 Err(validation_error) => Ok(ToolResult {
                     success: false,
-                    output: response,
+                    output: response.into(),
                     error: Some(format!("Schema validation failed: {validation_error}")),
                 }),
             }
         } else {
             Ok(ToolResult {
                 success: true,
-                output: response,
+                output: response.into(),
                 error: None,
             })
         }

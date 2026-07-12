@@ -2,7 +2,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -89,7 +89,7 @@ impl Tool for FileReadTool {
         let is_base64 = args.get("encoding").and_then(|v| v.as_str()) == Some("base64");
         let mut result = self.read_path(args).await?;
         if !self.persistent_writes && result.success && !is_base64 {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
         Ok(result)
     }
@@ -118,7 +118,7 @@ impl FileReadTool {
                 let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -131,7 +131,7 @@ impl FileReadTool {
                 let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
                 });
             }
@@ -142,7 +142,7 @@ impl FileReadTool {
         if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Path escapes workspace directory: {path}")),
             });
         }
@@ -153,7 +153,7 @@ impl FileReadTool {
                 if meta.len() > MAX_FILE_SIZE_BYTES {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
                             meta.len()
@@ -164,7 +164,7 @@ impl FileReadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
@@ -183,7 +183,7 @@ impl FileReadTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to read file: {e}")),
                     });
                 }
@@ -192,13 +192,13 @@ impl FileReadTool {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return Ok(ToolResult {
                 success: true,
-                output: encoded,
+                output: encoded.into(),
                 error: None,
             });
         } else if encoding != "utf8" {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported encoding '{encoding}' (expected 'utf8' or 'base64')"
                 )),
@@ -213,7 +213,7 @@ impl FileReadTool {
                 if total == 0 {
                     return Ok(ToolResult {
                         success: true,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: None,
                     });
                 }
@@ -240,7 +240,7 @@ impl FileReadTool {
                 if start >= end {
                     return Ok(ToolResult {
                         success: true,
-                        output: format!("[No lines in range, file has {total} lines]"),
+                        output: format!("[No lines in range, file has {total} lines]").into(),
                         error: None,
                     });
                 }
@@ -261,7 +261,7 @@ impl FileReadTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("{numbered}{summary}"),
+                    output: format!("{numbered}{summary}").into(),
                     error: None,
                 })
             }
@@ -289,7 +289,7 @@ impl FileReadTool {
                 if let Some(kind) = detect_image_format(&bytes) {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Binary image file detected ({kind}): {}. Use the image_info \
                              tool for images, or encoding=\"base64\" to read the raw bytes.",
@@ -302,7 +302,7 @@ impl FileReadTool {
                 if looks_binary(&bytes) {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Binary file detected: {}. Use encoding=\"base64\" to read the \
                              raw bytes.",
@@ -317,7 +317,7 @@ impl FileReadTool {
                 let lossy = String::from_utf8_lossy(&bytes).into_owned();
                 Ok(ToolResult {
                     success: true,
-                    output: lossy,
+                    output: lossy.into(),
                     error: None,
                 })
             }

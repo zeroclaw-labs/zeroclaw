@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -271,7 +271,9 @@ impl GitOperationsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result).unwrap_or_default(),
+            output: serde_json::to_string_pretty(&result)
+                .unwrap_or_default()
+                .into(),
             error: None,
         })
     }
@@ -354,7 +356,9 @@ impl GitOperationsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result).unwrap_or_default(),
+            output: serde_json::to_string_pretty(&result)
+                .unwrap_or_default()
+                .into(),
             error: None,
         })
     }
@@ -398,7 +402,8 @@ impl GitOperationsTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({ "commits": commits }))
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
             error: None,
         })
     }
@@ -437,7 +442,8 @@ impl GitOperationsTool {
                 "current": current,
                 "branches": branches
             }))
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .into(),
             error: None,
         })
     }
@@ -510,12 +516,12 @@ impl GitOperationsTool {
         match output {
             Ok(_) => Ok(ToolResult {
                 success: true,
-                output: format!("Committed: {message}"),
+                output: format!("Committed: {message}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Commit failed: {e}")),
             }),
         }
@@ -553,12 +559,12 @@ impl GitOperationsTool {
         match output {
             Ok(_) => Ok(ToolResult {
                 success: true,
-                output: format!("Staged: {}", sanitized.join(" ")),
+                output: format!("Staged: {}", sanitized.join(" ")).into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Add failed: {e}")),
             }),
         }
@@ -601,12 +607,12 @@ impl GitOperationsTool {
         match output {
             Ok(_) => Ok(ToolResult {
                 success: true,
-                output: format!("Switched to branch: {branch_name}"),
+                output: format!("Switched to branch: {branch_name}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Checkout failed: {e}")),
             }),
         }
@@ -686,12 +692,12 @@ impl GitOperationsTool {
         match output {
             Ok(out) => Ok(ToolResult {
                 success: true,
-                output: out,
+                output: out.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Stash {action} failed: {e}")),
             }),
         }
@@ -764,7 +770,9 @@ impl GitOperationsTool {
                 let parsed = self.parse_worktree_list(&output);
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&parsed).unwrap_or_default(),
+                    output: serde_json::to_string_pretty(&parsed)
+                        .unwrap_or_default()
+                        .into(),
                     error: None,
                 })
             }
@@ -799,7 +807,7 @@ impl GitOperationsTool {
                 self.run_git_command(&git_args, working_dir).await?;
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Worktree added at: {worktree_path}"),
+                    output: format!("Worktree added at: {worktree_path}").into(),
                     error: None,
                 })
             }
@@ -824,7 +832,7 @@ impl GitOperationsTool {
                     .await?;
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Worktree removed: {worktree_path}"),
+                    output: format!("Worktree removed: {worktree_path}").into(),
                     error: None,
                 })
             }
@@ -833,7 +841,7 @@ impl GitOperationsTool {
                     .await?;
                 Ok(ToolResult {
                     success: true,
-                    output: "Worktree prune completed".to_string(),
+                    output: "Worktree prune completed".to_string().into(),
                     error: None,
                 })
             }
@@ -928,7 +936,7 @@ impl Tool for GitOperationsTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'operation' parameter".into()),
                 });
             }
@@ -940,7 +948,7 @@ impl Tool for GitOperationsTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Invalid path: {e}")),
                 });
             }
@@ -967,7 +975,7 @@ impl Tool for GitOperationsTool {
                 );
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error_msg),
                 });
             }
@@ -978,7 +986,7 @@ impl Tool for GitOperationsTool {
             if !self.security.can_act() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
                         "Action blocked: git write operations require higher autonomy level".into(),
                     ),
@@ -989,7 +997,7 @@ impl Tool for GitOperationsTool {
                 AutonomyLevel::ReadOnly => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("Action blocked: read-only mode".into()),
                     });
                 }
@@ -1001,7 +1009,7 @@ impl Tool for GitOperationsTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -1019,7 +1027,7 @@ impl Tool for GitOperationsTool {
             "worktree" => self.git_worktree(args, &working_dir).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown operation: {operation}")),
             }),
         }

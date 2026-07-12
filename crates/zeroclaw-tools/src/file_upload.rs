@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileUploadConfig;
 
@@ -171,7 +171,7 @@ impl Tool for FileUploadTool {
         else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_upload is disabled: [file_upload].url is not configured".into()),
             });
         };
@@ -180,7 +180,7 @@ impl Tool for FileUploadTool {
         if method != "POST" && method != "PUT" {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported HTTP method '{method}'. Only POST and PUT are allowed."
                 )),
@@ -190,7 +190,7 @@ impl Tool for FileUploadTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -198,7 +198,7 @@ impl Tool for FileUploadTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -213,7 +213,7 @@ impl Tool for FileUploadTool {
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
             });
         }
@@ -221,7 +221,7 @@ impl Tool for FileUploadTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
@@ -233,7 +233,7 @@ impl Tool for FileUploadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
                 });
             }
@@ -242,7 +242,7 @@ impl Tool for FileUploadTool {
         if !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&resolved_path),
@@ -255,7 +255,7 @@ impl Tool for FileUploadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
@@ -264,7 +264,7 @@ impl Tool for FileUploadTool {
         if !metadata.is_file() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Not a regular file: {}", resolved_path.display())),
             });
         }
@@ -272,7 +272,7 @@ impl Tool for FileUploadTool {
         if metadata.len() > self.config.max_file_size_bytes {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "File too large: {} bytes (limit: {} bytes)",
                     metadata.len(),
@@ -286,7 +286,7 @@ impl Tool for FileUploadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file: {e}")),
                 });
             }
@@ -299,7 +299,7 @@ impl Tool for FileUploadTool {
         if bytes.len() as u64 > self.config.max_file_size_bytes {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "File too large after read: {} bytes (limit: {} bytes)",
                     bytes.len(),
@@ -323,7 +323,7 @@ impl Tool for FileUploadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to build multipart part: {e}")),
                 });
             }
@@ -352,7 +352,7 @@ impl Tool for FileUploadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Upload request failed: {e}")),
                 });
             }
@@ -366,13 +366,13 @@ impl Tool for FileUploadTool {
         if status.is_success() {
             Ok(ToolResult {
                 success: true,
-                output: format!("Uploaded {file_name} ({status}). Response: {truncated}"),
+                output: format!("Uploaded {file_name} ({status}). Response: {truncated}").into(),
                 error: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
-                output: truncated,
+                output: truncated.into(),
                 error: Some(format!("Upload endpoint returned status {status}")),
             })
         }

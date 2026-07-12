@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileDownloadConfig;
 
@@ -138,7 +138,7 @@ impl Tool for FileDownloadTool {
         else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg("tool-file-download-error-disabled")),
             });
         };
@@ -146,7 +146,7 @@ impl Tool for FileDownloadTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg("tool-file-download-error-read-only")),
             });
         }
@@ -154,7 +154,7 @@ impl Tool for FileDownloadTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg("tool-file-download-error-rate-limited-hour")),
             });
         }
@@ -202,7 +202,7 @@ impl Tool for FileDownloadTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-invalid-file-name",
                         &[("dest_path", dest_path)],
@@ -214,7 +214,7 @@ impl Tool for FileDownloadTool {
         let Some(parent) = full.parent() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-file-download-error-no-parent",
                     &[("dest_path", dest_path)],
@@ -230,7 +230,7 @@ impl Tool for FileDownloadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-resolve-dir",
                         &[("dest_path", dest_path), ("err", &e.to_string())],
@@ -242,7 +242,7 @@ impl Tool for FileDownloadTool {
         if !self.security.is_resolved_path_allowed(&canonical_parent) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&canonical_parent),
@@ -254,7 +254,7 @@ impl Tool for FileDownloadTool {
         if !self.security.is_resolved_path_allowed(&dest) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(self.security.resolved_path_violation_message(&dest)),
             });
         }
@@ -264,7 +264,7 @@ impl Tool for FileDownloadTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg(
                     "tool-file-download-error-rate-limited-budget",
                 )),
@@ -285,7 +285,7 @@ impl Tool for FileDownloadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-client-build",
                         &[("err", &e.to_string())],
@@ -304,7 +304,7 @@ impl Tool for FileDownloadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-request",
                         &[("err", &e.to_string())],
@@ -332,7 +332,7 @@ impl Tool for FileDownloadTool {
             };
             return Ok(ToolResult {
                 success: false,
-                output: truncated,
+                output: truncated.into(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-file-download-error-status",
                     &[("status", &status.to_string())],
@@ -347,7 +347,7 @@ impl Tool for FileDownloadTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-file-download-error-too-large-reported",
                     &[
@@ -388,7 +388,7 @@ impl Tool for FileDownloadTool {
                     };
                     Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     })
                 }
@@ -396,7 +396,7 @@ impl Tool for FileDownloadTool {
                     let _ = tokio::fs::remove_file(&temp_path).await;
                     Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(Self::tool_msg_with_args(
                             "tool-file-download-error-move",
                             &[("err", &e.to_string())],
@@ -408,7 +408,7 @@ impl Tool for FileDownloadTool {
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 })
             }

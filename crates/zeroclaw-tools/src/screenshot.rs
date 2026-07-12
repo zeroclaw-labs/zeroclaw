@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Maximum time to wait for a screenshot command to complete.
@@ -74,7 +74,7 @@ impl ScreenshotTool {
         if safe_name.contains(SHELL_UNSAFE) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Filename contains characters unsafe for shell execution".into()),
             });
         }
@@ -85,7 +85,7 @@ impl ScreenshotTool {
         let Some(mut cmd_args) = Self::screenshot_command(&output_str) else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Screenshot not supported on this platform".into()),
             });
         };
@@ -117,7 +117,7 @@ impl ScreenshotTool {
                     if stderr.contains("NO_SCREENSHOT_TOOL") {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "No screenshot tool found. Install gnome-screenshot, scrot, or ImageMagick."
                                     .into(),
@@ -126,7 +126,7 @@ impl ScreenshotTool {
                     }
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Screenshot command failed: {stderr}")),
                     });
                 }
@@ -135,12 +135,12 @@ impl ScreenshotTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to execute screenshot command: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s"
                 )),
@@ -161,7 +161,8 @@ impl ScreenshotTool {
                     "Screenshot saved to: {}\nSize: {} bytes (too large to base64-encode inline)",
                     output_path.display(),
                     meta.len(),
-                ),
+                )
+                .into(),
                 error: None,
             });
         }
@@ -201,13 +202,13 @@ impl ScreenshotTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: output_msg,
+                    output: output_msg.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: format!("Screenshot saved to: {}", output_path.display()),
+                output: format!("Screenshot saved to: {}", output_path.display()).into(),
                 error: Some(format!("Failed to read screenshot file: {e}")),
             }),
         }
@@ -244,7 +245,7 @@ impl Tool for ScreenshotTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }

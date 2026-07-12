@@ -6,7 +6,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -92,7 +92,7 @@ impl Tool for AskUserTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -141,7 +141,7 @@ impl Tool for AskUserTool {
             if channels.is_empty() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("No channels available yet (channels not initialized)".to_string()),
                 });
             }
@@ -194,7 +194,7 @@ impl Tool for AskUserTool {
                 Ok(Some(answer)) => {
                     return Ok(ToolResult {
                         success: true,
-                        output: answer,
+                        output: answer.into(),
                         error: None,
                     });
                 }
@@ -202,7 +202,7 @@ impl Tool for AskUserTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Failed to ask question on channel '{channel_name}': {e}"
                         )),
@@ -212,7 +212,7 @@ impl Tool for AskUserTool {
         } else if !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Channel '{channel_name}' requires `choices` for ask_user \
                      (free-form questions await ACP elicitation Phase 2)"
@@ -226,7 +226,7 @@ impl Tool for AskUserTool {
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send question to channel '{channel_name}': {e}"
                 )),
@@ -248,17 +248,17 @@ impl Tool for AskUserTool {
         match response {
             Ok(Some(msg)) => Ok(ToolResult {
                 success: true,
-                output: msg.content,
+                output: msg.content.into(),
                 error: None,
             }),
             Ok(None) => Ok(ToolResult {
                 success: false,
-                output: "TIMEOUT".to_string(),
+                output: "TIMEOUT".to_string().into(),
                 error: Some("Channel closed before receiving a response".to_string()),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: "TIMEOUT".to_string(),
+                output: "TIMEOUT".to_string().into(),
                 error: Some(format!(
                     "No response received within {timeout_secs} seconds"
                 )),

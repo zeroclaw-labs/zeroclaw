@@ -122,6 +122,7 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -140,8 +141,9 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13)",
+                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
+                uses_memory
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 expression,
@@ -156,6 +158,7 @@ pub fn add_agent_job(
                 agent_alias,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                if uses_memory { 1 } else { 0 },
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -1865,6 +1868,7 @@ mod tests {
             }),
             false,
             None,
+            true,
         )
         .unwrap_err();
 
@@ -2033,6 +2037,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into(), "web_search".into()]),
+            true,
         )
         .unwrap();
 
@@ -2061,6 +2066,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 

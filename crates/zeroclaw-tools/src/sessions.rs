@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::session_backend::SessionBackend;
@@ -30,7 +30,7 @@ impl SessionValidationError {
     fn into_tool_result(self) -> ToolResult {
         ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(self.message().into()),
         }
     }
@@ -192,7 +192,7 @@ impl Tool for SessionsListTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -246,7 +246,7 @@ impl Tool for SessionsHistoryTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -280,7 +280,7 @@ impl Tool for SessionsHistoryTool {
         if messages.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: format!("No messages found for session '{session_id}'."),
+                output: format!("No messages found for session '{session_id}'.").into(),
                 error: None,
             });
         }
@@ -301,7 +301,7 @@ impl Tool for SessionsHistoryTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -355,7 +355,7 @@ impl Tool for SessionsSendTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -395,7 +395,7 @@ impl Tool for SessionsSendTool {
         if message.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Message content must not be empty.".into()),
             });
         }
@@ -405,7 +405,7 @@ impl Tool for SessionsSendTool {
         else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
                 )),
@@ -425,13 +425,13 @@ impl Tool for SessionsSendTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to send message: {e}")),
             }),
         }
@@ -479,7 +479,7 @@ impl Tool for SessionsCurrentTool {
         let Some(key) = session_key else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "No active session context. This tool is only available during a gateway session.".into(),
                 ),
@@ -498,7 +498,7 @@ impl Tool for SessionsCurrentTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -567,7 +567,7 @@ impl Tool for SessionResetTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -596,7 +596,7 @@ impl Tool for SessionResetTool {
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -608,17 +608,18 @@ impl Tool for SessionResetTool {
         match self.backend.clear_messages(&target_session_key) {
             Ok(0) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{target_session_key}' is already empty."),
+                output: format!("Session '{target_session_key}' is already empty.").into(),
                 error: None,
             }),
             Ok(count) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{target_session_key}' reset ({count} messages cleared)."),
+                output: format!("Session '{target_session_key}' reset ({count} messages cleared).")
+                    .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to reset session: {e}")),
             }),
         }
@@ -687,7 +688,7 @@ impl Tool for SessionDeleteTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -716,7 +717,7 @@ impl Tool for SessionDeleteTool {
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -730,19 +731,20 @@ impl Tool for SessionDeleteTool {
         match self.backend.delete_session(&target_session_key) {
             Ok(true) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{target_session_key}' deleted."),
+                output: format!("Session '{target_session_key}' deleted.").into(),
                 error: None,
             }),
             Ok(false) if !existed => Ok(ToolResult {
                 success: true,
                 output: format!(
                     "Session '{target_session_key}' not found (may have already been deleted)."
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Ok(false) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Session '{target_session_key}' exists but could not be deleted \
                      — the storage backend may not support this operation."
@@ -750,7 +752,7 @@ impl Tool for SessionDeleteTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to delete session: {e}")),
             }),
         }

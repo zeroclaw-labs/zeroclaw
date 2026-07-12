@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -288,7 +288,7 @@ impl Tool for ShellTool {
             Err(reason) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(reason),
                 });
             }
@@ -305,7 +305,7 @@ impl Tool for ShellTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to build runtime command: {e}")),
                 });
             }
@@ -377,7 +377,7 @@ impl Tool for ShellTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to spawn command: {e}")),
                 });
             }
@@ -412,7 +412,7 @@ impl Tool for ShellTool {
 
                     ToolResult {
                         success: status.success(),
-                        output: stdout,
+                        output: stdout.into(),
                         error: if stderr.is_empty() {
                             None
                         } else {
@@ -424,7 +424,7 @@ impl Tool for ShellTool {
                     tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
                     ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to execute command: {e}")),
                     }
                 }
@@ -433,7 +433,7 @@ impl Tool for ShellTool {
                     tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
                     ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Command timed out after {timeout_secs}s and was killed"
                         )),
@@ -446,7 +446,7 @@ impl Tool for ShellTool {
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
             if let Some(err) = result.error.take() {
                 result.error = Some(with_ephemeral_workspace_warning(&err));
             }

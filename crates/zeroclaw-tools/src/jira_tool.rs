@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
@@ -150,7 +150,9 @@ impl JiraTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            output: serde_json::to_string_pretty(&shaped)
+                .unwrap_or_else(|_| shaped.to_string())
+                .into(),
             error: None,
         })
     }
@@ -172,7 +174,9 @@ impl JiraTool {
         let output = json!(issues);
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            output: serde_json::to_string_pretty(&output)
+                .unwrap_or_else(|_| output.to_string())
+                .into(),
             error: None,
         })
     }
@@ -388,7 +392,9 @@ impl JiraTool {
         let shaped = shape_comment_response(&response);
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            output: serde_json::to_string_pretty(&shaped)
+                .unwrap_or_else(|_| shaped.to_string())
+                .into(),
             error: None,
         })
     }
@@ -584,7 +590,9 @@ impl JiraTool {
         let output = json!({ "projects": shaped_projects, "users": shaped_users });
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            output: serde_json::to_string_pretty(&output)
+                .unwrap_or_else(|_| output.to_string())
+                .into(),
             error: None,
         })
     }
@@ -637,7 +645,9 @@ impl JiraTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            output: serde_json::to_string_pretty(&shaped)
+                .unwrap_or_else(|_| shaped.to_string())
+                .into(),
             error: None,
         })
     }
@@ -725,7 +735,9 @@ impl JiraTool {
         let output = json!({ "transitions": transitions });
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            output: serde_json::to_string_pretty(&output)
+                .unwrap_or_else(|_| output.to_string())
+                .into(),
             error: None,
         })
     }
@@ -813,7 +825,9 @@ impl JiraTool {
         });
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            output: serde_json::to_string_pretty(&output)
+                .unwrap_or_else(|_| output.to_string())
+                .into(),
             error: None,
         })
     }
@@ -921,7 +935,9 @@ impl JiraTool {
         });
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            output: serde_json::to_string_pretty(&output)
+                .unwrap_or_else(|_| output.to_string())
+                .into(),
             error: None,
         })
     }
@@ -1025,7 +1041,7 @@ impl Tool for JiraTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: action".into()),
                 });
             }
@@ -1046,7 +1062,7 @@ impl Tool for JiraTool {
         ) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket"
                 )),
@@ -1056,7 +1072,7 @@ impl Tool for JiraTool {
         if !self.is_action_allowed(action) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Action '{action}' is not enabled. Add it to jira.allowed_actions in config.toml. \
                      Currently allowed: {}",
@@ -1076,7 +1092,7 @@ impl Tool for JiraTool {
         if let Err(error) = self.security.enforce_tool_operation(operation, "jira") {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -1088,7 +1104,7 @@ impl Tool for JiraTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("get_ticket requires issue_key parameter".into()),
                         });
                     }
@@ -1107,7 +1123,7 @@ impl Tool for JiraTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("search_tickets requires jql parameter".into()),
                         });
                     }
@@ -1126,7 +1142,7 @@ impl Tool for JiraTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("comment_ticket requires issue_key parameter".into()),
                         });
                     }
@@ -1136,7 +1152,7 @@ impl Tool for JiraTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "comment_ticket requires a non-empty comment parameter".into(),
                             ),
@@ -1151,7 +1167,7 @@ impl Tool for JiraTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("list_transitions requires issue_key parameter".into()),
                         });
                     }
@@ -1164,7 +1180,7 @@ impl Tool for JiraTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("transition_ticket requires issue_key parameter".into()),
                         });
                     }
@@ -1180,7 +1196,7 @@ impl Tool for JiraTool {
                 if transition_id.is_none() && transition_name.is_none() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(
                             "transition_ticket requires either transition_id or transition_name"
                                 .into(),
@@ -1190,7 +1206,7 @@ impl Tool for JiraTool {
                 if transition_id.is_some() && transition_name.is_some() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(
                             "transition_ticket accepts only one of transition_id or transition_name, not both".into(),
                         ),
@@ -1205,7 +1221,7 @@ impl Tool for JiraTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "create_ticket requires a non-empty project_key parameter".into(),
                             ),
@@ -1217,7 +1233,7 @@ impl Tool for JiraTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "create_ticket requires a non-empty issue_type parameter".into(),
                             ),
@@ -1229,7 +1245,7 @@ impl Tool for JiraTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "create_ticket requires a non-empty summary parameter".into(),
                             ),
@@ -1273,7 +1289,7 @@ impl Tool for JiraTool {
             Ok(tool_result) => Ok(tool_result),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }

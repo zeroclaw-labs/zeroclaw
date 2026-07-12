@@ -17,7 +17,6 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use serde_json::Value;
 
 const QUEUE_CAPACITY: usize = 1024;
@@ -63,8 +62,6 @@ type WorkerDead = Arc<AtomicBool>;
 /// [`WriterState`].
 struct WorkerState {
     policy: ResolvedPolicy,
-    #[allow(dead_code)]
-    write_lock: Mutex<()>,
     worker_dead: WorkerDead,
 }
 
@@ -73,9 +70,6 @@ struct WorkerState {
 /// exit path can fire once the last producer drops their sender.
 struct WriterState {
     policy: ResolvedPolicy,
-    /// Reserved for future serialized-rotation paths.
-    #[allow(dead_code)]
-    write_lock: Mutex<()>,
     tx: SyncSender<WriterJob>,
     worker_dead: WorkerDead,
 }
@@ -116,7 +110,6 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     if policy.storage.is_enabled() {
         let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
-            write_lock: Mutex::new(()),
             worker_dead: Arc::clone(&worker_dead),
         });
         spawn_worker(rx, worker_state);
@@ -129,7 +122,6 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
 
     let state = Arc::new(WriterState {
         policy,
-        write_lock: Mutex::new(()),
         tx,
         worker_dead,
     });
@@ -558,8 +550,9 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
     let (base, ext) = split_base_ext(file_name);
     let stamp = when.format("%Y%m%d-%H%M%S").to_string();
 
-    // Callers hold the writer `write_lock` across the existence check and the
-    // subsequent `fs::rename`, so the check-then-rename has no in-process race.
+    // The existence check and subsequent `fs::rename` are called from
+    // the single-threaded worker, so the check-then-rename has no
+    // in-process race.
     let mut candidate = dir.join(format!("{base}.{stamp}{ext}"));
     let mut n = 1u32;
     while candidate.exists() {

@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -167,7 +167,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -195,7 +195,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
             Err(msg) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 });
             }
@@ -274,7 +274,8 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                             "answers": answers,
                             "channel": channel_name,
                         })
-                        .to_string(),
+                        .to_string()
+                        .into(),
                         error: None,
                     });
                 }
@@ -282,7 +283,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Interactive poll failed: {e}")),
                     });
                 }
@@ -300,7 +301,8 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                             "answer": answer,
                             "channel": channel_name,
                         })
-                        .to_string(),
+                        .to_string()
+                        .into(),
                         error: None,
                     });
                 }
@@ -308,7 +310,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Interactive poll failed: {e}")),
                     });
                 }
@@ -323,7 +325,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send poll to channel '{channel_name}': {e}"
                 )),
@@ -344,7 +346,8 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                  Options: {}\n\
                  Duration: {duration_minutes} min | Multi-select: {multi_select}",
                 options.join(", ")
-            ),
+            )
+            .into(),
             error: None,
         })
     }

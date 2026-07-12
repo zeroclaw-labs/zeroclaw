@@ -7,7 +7,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use zeroclaw_api::attribution::ToolKind;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 tool_attribution!(GpioWriteTool, ToolKind::Plugin);
@@ -63,7 +63,7 @@ impl Tool for GpioWriteTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing required parameter: pin".to_string()),
                 });
             }
@@ -73,7 +73,7 @@ impl Tool for GpioWriteTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing required parameter: value".to_string()),
                 });
             }
@@ -82,7 +82,7 @@ impl Tool for GpioWriteTool {
         if value > 1 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("value must be 0 or 1".to_string()),
             });
         }
@@ -96,7 +96,7 @@ impl Tool for GpioWriteTool {
                 Err(msg) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(msg),
                     });
                 }
@@ -115,13 +115,13 @@ impl Tool for GpioWriteTool {
                     .unwrap_or(if value == 1 { "HIGH" } else { "LOW" });
                 Ok(ToolResult {
                     success: true,
-                    output: format!("GPIO {} set {} on {}", pin, state, device_alias),
+                    output: format!("GPIO {} set {} on {}", pin, state, device_alias).into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "device returned ok:false".to_string()),
@@ -129,7 +129,7 @@ impl Tool for GpioWriteTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("transport error: {}", e)),
             }),
         }
@@ -184,7 +184,7 @@ impl Tool for GpioReadTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing required parameter: pin".to_string()),
                 });
             }
@@ -199,7 +199,7 @@ impl Tool for GpioReadTool {
                 Err(msg) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(msg),
                     });
                 }
@@ -219,13 +219,14 @@ impl Tool for GpioReadTool {
                     .unwrap_or(if value == 1 { "HIGH" } else { "LOW" });
                 Ok(ToolResult {
                     success: true,
-                    output: format!("GPIO {} is {} ({}) on {}", pin, state, value, device_alias),
+                    output: format!("GPIO {} is {} ({}) on {}", pin, state, value, device_alias)
+                        .into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "device returned ok:false".to_string()),
@@ -233,7 +234,7 @@ impl Tool for GpioReadTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("transport error: {}", e)),
             }),
         }

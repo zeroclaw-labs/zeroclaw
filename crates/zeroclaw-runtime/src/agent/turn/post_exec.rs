@@ -55,7 +55,7 @@ pub(crate) async fn record_executed_outcomes(
         if let Some(hooks) = ctx.hooks {
             let tool_result_obj = crate::tools::ToolResult {
                 success: outcome.success,
-                output: outcome.output.clone(),
+                output: outcome.output.clone().into(),
                 error: None,
             };
             hooks
@@ -80,6 +80,19 @@ pub(crate) async fn record_executed_outcomes(
                 "Sending progress complete to draft"
             );
             let _ = tx.send(StreamDelta::Status(progress_msg)).await;
+        }
+
+        // Capture into the innermost live SOP step scope (no-op otherwise).
+        if crate::sop::executor::step_capture_active() {
+            crate::sop::executor::record_step_tool_call(
+                &call.name,
+                &call.arguments,
+                outcome.success,
+                outcome.output.clone(),
+                outcome.output_data.clone(),
+                outcome.error_reason.as_deref(),
+                u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            );
         }
 
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));

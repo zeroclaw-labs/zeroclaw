@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Maximum response body size (1 MB).
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -90,7 +90,7 @@ impl Tool for SkillHttpTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Invalid URL: {e}")),
                 });
             }
@@ -98,14 +98,14 @@ impl Tool for SkillHttpTool {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("URL userinfo is not allowed".to_string()),
             });
         }
         if !matches!(parsed.scheme(), "http" | "https") {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Only http:// and https:// URLs are allowed, got: {url}"
                 )),
@@ -131,7 +131,7 @@ impl Tool for SkillHttpTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("HTTP request failed: {e}")),
                 });
             }
@@ -154,7 +154,7 @@ impl Tool for SkillHttpTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read response body: {e}")),
                 });
             }
@@ -162,7 +162,7 @@ impl Tool for SkillHttpTool {
 
         Ok(ToolResult {
             success: status.is_success(),
-            output: body,
+            output: body.into(),
             error: if status.is_success() {
                 None
             } else {

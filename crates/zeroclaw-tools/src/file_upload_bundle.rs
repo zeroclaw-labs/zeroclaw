@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileUploadBundleConfig;
 
@@ -223,7 +223,7 @@ impl Tool for FileUploadBundleTool {
         else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "file_upload_bundle is disabled: [file_upload_bundle].url is not configured"
                         .into(),
@@ -235,7 +235,7 @@ impl Tool for FileUploadBundleTool {
         if method != "POST" && method != "PUT" {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported HTTP method '{method}'. Only POST and PUT are allowed."
                 )),
@@ -245,7 +245,7 @@ impl Tool for FileUploadBundleTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -253,7 +253,7 @@ impl Tool for FileUploadBundleTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -266,14 +266,14 @@ impl Tool for FileUploadBundleTool {
         if raw_paths.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_paths must not be empty".into()),
             });
         }
         if raw_paths.len() as u64 > self.config.max_files as u64 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Too many files: {} (limit: {})",
                     raw_paths.len(),
@@ -308,7 +308,7 @@ impl Tool for FileUploadBundleTool {
             if !self.security.is_path_allowed(p) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Path not allowed by security policy: {p}")),
                 });
             }
@@ -318,7 +318,7 @@ impl Tool for FileUploadBundleTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
@@ -334,7 +334,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to resolve file path {path}: {e}")),
                     });
                 }
@@ -343,7 +343,7 @@ impl Tool for FileUploadBundleTool {
             if !self.security.is_resolved_path_allowed(&resolved_path) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
                         self.security
                             .resolved_path_violation_message(&resolved_path),
@@ -356,7 +356,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to read file metadata for {path}: {e}")),
                     });
                 }
@@ -365,7 +365,7 @@ impl Tool for FileUploadBundleTool {
             if !metadata.is_file() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Not a regular file: {}", resolved_path.display())),
                 });
             }
@@ -375,7 +375,7 @@ impl Tool for FileUploadBundleTool {
             if metadata.len() > self.config.max_file_size_bytes {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "File too large: {} is {} bytes (per-file limit: {} bytes)",
                         resolved_path.display(),
@@ -393,7 +393,7 @@ impl Tool for FileUploadBundleTool {
             if !seen_names.insert(file_name.clone()) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Duplicate file name in bundle: {file_name} (filenames must be unique)"
                     )),
@@ -405,7 +405,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to read {}: {e}", resolved_path.display())),
                     });
                 }
@@ -417,7 +417,7 @@ impl Tool for FileUploadBundleTool {
             if actual_len > self.config.max_file_size_bytes {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "File too large: {} is {} bytes (per-file limit: {} bytes)",
                         resolved_path.display(),
@@ -431,7 +431,7 @@ impl Tool for FileUploadBundleTool {
             if total_bytes > self.config.max_total_size_bytes {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Bundle too large: cumulative {} bytes exceeds limit {} bytes",
                         total_bytes, self.config.max_total_size_bytes
@@ -452,7 +452,7 @@ impl Tool for FileUploadBundleTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "entry_file_name '{name}' does not match any file in file_paths"
                 )),
@@ -469,7 +469,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to build multipart part: {e}")),
                     });
                 }
@@ -504,7 +504,7 @@ impl Tool for FileUploadBundleTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Bundle upload request failed: {e}")),
                 });
             }
@@ -526,13 +526,14 @@ impl Tool for FileUploadBundleTool {
                 success: true,
                 output: format!(
                     "Uploaded bundle of {file_count} files ({status}). Response: {truncated}"
-                ),
+                )
+                .into(),
                 error: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
-                output: truncated,
+                output: truncated.into(),
                 error: Some(format!(
                     "Upload endpoint returned status {status} for bundle of {file_count} files"
                 )),

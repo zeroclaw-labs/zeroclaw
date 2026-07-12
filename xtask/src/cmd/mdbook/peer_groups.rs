@@ -115,6 +115,7 @@ fn expand_directives(
         "{{#channel-streaming-matrix",
         "{{#thread-context ",
         "{{#config-fields ",
+        "{{#config-set ",
         "{{#sop-trigger-index",
         "{{#sop-trigger ",
         "{{#streaming ",
@@ -142,6 +143,7 @@ fn expand_directives(
         let rendered = match marker {
             "{{#config-where " => render_config_where(arg, depth)?,
             "{{#config-fields " => render_config_fields(arg)?,
+            "{{#config-set " => render_config_set(arg),
             "{{#sop-trigger-index" => render_sop_trigger_index()?,
             "{{#sop-trigger " => render_sop_trigger(arg)?,
             "{{#secret-config " => render_secret_config(arg),
@@ -407,6 +409,46 @@ zeroclaw config set {path}    # prompts for masked input, stores encrypted
     )
 }
 
+/// Render a set-it-any-surface widget for a single non-secret config field.
+/// Same three-surface tabs as `secret-config` (gateway dashboard, zerocode,
+/// `zeroclaw config set`) minus the masked-secret framing. The arg is the full
+/// dotted path to the field, e.g. `channels.git.<alias>.app_id`. Used by setup
+/// guides that walk each required field individually.
+fn render_config_set(path: &str) -> String {
+    let path = path.trim();
+    let section = dashboard_section(path);
+    let display_path = display_config_path(path);
+    format!(
+        r#"<div class="os-tabs-src">
+
+#### Gateway dashboard
+
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
+
+#### zerocode
+
+In the **Config** pane, set the `{display_path}` field.
+
+#### zeroclaw config
+
+```sh
+zeroclaw config set {path} <value>
+```
+
+</div>"#,
+    )
+}
+/// `<alias>` placeholder and the trailing field name, slash-joining the rest:
+/// `channels.matrix.<alias>.password` -> `channels/matrix`. A bare section like
+/// `acp.foo` -> `acp`. The gateway resolves these `/config/<section>` routes.
+/// Dashboard deep-link path from a dotted config field path. The web dashboard
+/// routes `/config/<section>/<type>` where `<type>` is the map key (the segment
+/// just before `<alias>`) and `<section>` is everything before it, dot-joined.
+/// `channels.mattermost.<alias>.thread_replies` -> `channels/mattermost`;
+/// `providers.models.venice.<alias>.api_key` -> `providers.models/venice`. A
+/// bare section with no `<alias>` (e.g. `acp.default_agent`) keeps its dotted
+/// prefix and drops the field: `acp.default_agent` -> `acp`. The gateway
+/// resolves these `/config/<...>` routes.
 fn dashboard_section(field_path: &str) -> String {
     let segs: Vec<&str> = field_path.split('.').collect();
     if let Some(alias_idx) = segs.iter().position(|s| *s == "<alias>") {
@@ -625,7 +667,7 @@ fn parse_kv_args(arg: &str) -> std::collections::HashMap<String, String> {
 }
 
 fn display_config_path(path: &str) -> String {
-    path.replace('<', "&lt;").replace('>', "&gt;")
+    path.to_string()
 }
 
 fn render_example(p: &PeerParams) -> String {
@@ -1038,16 +1080,26 @@ mod generated_prose_gate {
     }
 
     #[test]
-    fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
-        let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
+    fn sop_trigger_channel_renders_live_and_appears_in_index() {
+        let single = super::render_sop_trigger("channel").expect("channel trigger renders");
+        assert!(single.contains("Live: delivered by the channel orchestrator"));
+        assert!(single.contains("channel"));
 
-        assert!(rendered.contains("`channels.discord.&lt;alias&gt;.bot_token`"));
-        assert!(rendered.contains("zeroclaw config set channels.discord.<alias>.bot_token"));
-        assert!(!rendered.contains("`channels.discord.<alias>.bot_token`"));
+        let index = super::render_sop_trigger_index().expect("trigger index renders");
+        assert!(index.contains("| `channel` |"));
+        assert!(index.contains("| `amqp` |"));
     }
 
     #[test]
-    fn config_explainers_escape_alias_placeholder_in_rendered_markdown() {
+    fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
+        let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
+
+        assert!(rendered.contains("`channels.discord.<alias>.bot_token`"));
+        assert!(rendered.contains("zeroclaw config set channels.discord.<alias>.bot_token"));
+    }
+
+    #[test]
+    fn config_explainers_keep_alias_placeholder_raw_in_markdown() {
         let thread = super::render_thread_context(
             r#"channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread""#,
         )
@@ -1057,16 +1109,14 @@ mod generated_prose_gate {
         )
         .expect("streaming context should render");
 
-        assert!(thread.contains("`channels.matrix.&lt;alias&gt;.reply_in_thread`"));
+        assert!(thread.contains("`channels.matrix.<alias>.reply_in_thread`"));
         assert!(
             thread.contains("zeroclaw config set channels.matrix.<alias>.reply_in_thread true")
         );
-        assert!(!thread.contains("`channels.matrix.<alias>.reply_in_thread`"));
-        assert!(streaming.contains("`channels.slack.&lt;alias&gt;.stream_drafts`"));
+        assert!(streaming.contains("`channels.slack.<alias>.stream_drafts`"));
         assert!(
             streaming.contains("zeroclaw config set channels.slack.<alias>.stream_drafts <value>")
         );
-        assert!(!streaming.contains("`channels.slack.<alias>.stream_drafts`"));
     }
 
     #[test]

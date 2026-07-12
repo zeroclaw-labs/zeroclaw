@@ -1210,7 +1210,7 @@ impl OpenAiCodexModelProvider {
                         "openai_codex: auth profile present but no usable access token"
                     );
                     anyhow::Error::msg(
-                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --provider openai-codex` to sign in again.",
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --model-provider openai-codex` to sign in again.",
                     )
                 } else {
                     ::zeroclaw_log::record!(
@@ -1224,7 +1224,7 @@ impl OpenAiCodexModelProvider {
                         "openai_codex: no auth profile found"
                     );
                     anyhow::Error::msg(
-                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --provider openai-codex` to sign in.",
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --model-provider openai-codex` to sign in.",
                     )
                 }
             })?)
@@ -1242,7 +1242,7 @@ impl OpenAiCodexModelProvider {
                     "openai_codex: account_id not found in profile/token"
                 );
                 anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --model-provider openai-codex` again.",
                 )
             })?)
         };
@@ -2399,19 +2399,18 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
                     "issue_key": { "type": "string" }
                 },
                 "required": ["action"]
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");

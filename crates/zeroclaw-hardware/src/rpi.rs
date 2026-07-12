@@ -423,7 +423,7 @@ impl Tool for GpioRpiWriteTool {
             fs::write(path, brightness)?;
             return Ok(ToolResult {
                 success: true,
-                output: format!("ACT LED (GPIO {}) → {} (via sysfs)", pin, state),
+                output: format!("ACT LED (GPIO {}) → {} (via sysfs)", pin, state).into(),
                 error: None,
             });
         }
@@ -445,7 +445,7 @@ impl Tool for GpioRpiWriteTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("GPIO {} → {}", pin, state),
+            output: format!("GPIO {} → {}", pin, state).into(),
             error: None,
         })
     }
@@ -509,7 +509,8 @@ impl Tool for GpioRpiReadTool {
             return Ok(ToolResult {
                 success: true,
                 output: json!({ "pin": pin, "value": value, "state": state, "source": "sysfs" })
-                    .to_string(),
+                    .to_string()
+                    .into(),
                 error: None,
             });
         }
@@ -527,7 +528,7 @@ impl Tool for GpioRpiReadTool {
 
         Ok(ToolResult {
             success: true,
-            output: json!({ "pin": pin, "value": value, "state": if value == 0 { "LOW" } else { "HIGH" } }).to_string(),
+            output: json!({ "pin": pin, "value": value, "state": if value == 0 { "LOW" } else { "HIGH" } }).to_string().into(),
             error: None,
         })
     }
@@ -624,7 +625,8 @@ impl Tool for GpioRpiBlinkTool {
                 output: format!(
                     "Blinked ACT LED (GPIO {}) × {} ({}/{}ms) via sysfs",
                     pin, times, on_ms, off_ms
-                ),
+                )
+                .into(),
                 error: None,
             });
         }
@@ -645,7 +647,7 @@ impl Tool for GpioRpiBlinkTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Blinked GPIO {} × {} ({}/{}ms)", pin, times, on_ms, off_ms),
+            output: format!("Blinked GPIO {} × {} ({}/{}ms)", pin, times, on_ms, off_ms).into(),
             error: None,
         })
     }
@@ -700,7 +702,7 @@ impl Tool for RpiSystemInfoTool {
 
         Ok(ToolResult {
             success: true,
-            output: info.to_string(),
+            output: info.to_string().into(),
             error: None,
         })
     }

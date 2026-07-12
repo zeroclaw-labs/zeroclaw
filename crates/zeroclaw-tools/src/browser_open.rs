@@ -2,7 +2,7 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use serde_json::json;
 use std::{process::Stdio, sync::Arc, time::Duration};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const BROWSER_OPEN_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -120,7 +120,7 @@ impl Tool for BrowserOpenTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -128,7 +128,7 @@ impl Tool for BrowserOpenTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -138,7 +138,7 @@ impl Tool for BrowserOpenTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -147,12 +147,12 @@ impl Tool for BrowserOpenTool {
         match open_in_system_browser(&url).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Opened in system browser: {url}"),
+                output: format!("Opened in system browser: {url}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to open system browser: {e}")),
             }),
         }

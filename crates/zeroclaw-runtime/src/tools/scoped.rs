@@ -8,9 +8,9 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 use crate::agent::loop_::{
-    apply_policy_tool_filter, eager_mcp_tool_allowed, load_peripheral_tools,
-    mcp_allowed_tool_count, mcp_tool_access_policy, preactivate_always_filter_groups,
-    register_eager_mcp_tool_if_allowed,
+    append_pinned_mcp_section, apply_policy_tool_filter, eager_mcp_tool_allowed,
+    load_peripheral_tools, mcp_allowed_tool_count, mcp_tool_access_policy,
+    preactivate_always_filter_groups, register_eager_mcp_tool_if_allowed,
 };
 use crate::skills::Skill;
 use crate::tools::{
@@ -80,16 +80,60 @@ pub struct ScopedAssembled {
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
     pub channel_room_handle: Option<PerToolChannelHandle>,
-    pub deferred_section: String,
+    /// The deferred-MCP tool-search listing on its own (deferred mode only): the
+    /// `## Deferred Tools` section that names the policy-admitted `<server>__<tool>`
+    /// stubs and instructs the model to call `tool_search`. Empty when deferred loading
+    /// is off, no stubs are admitted, or `tool_search` itself is in `excluded_tools`
+    /// (the registry and prompt surfaces move together).
+    ///
+    /// Private - deliberately not destructurable. Every caller that has ever needed
+    /// this field also needs [`Self::pinned_section`] threaded correctly alongside it,
+    /// and a `..` (or an unaware full destructure) silently drops it - which is exactly
+    /// how the independent-delegate path lost `pinned_section` when the field was split
+    /// out. Use [`Self::combined_mcp_prompt_section`] for the
+    /// single-block shape (`run`, `process_message`, independent delegation) or
+    /// [`Self::deferred_section`]/[`Self::pinned_section`] for the two-slot shape
+    /// (`from_config`'s `Agent`, which injects each separately per-turn).
+    deferred_section: String,
     /// The pinned-MCP-resources system-prompt section on its own. Empty when no pinned
-    /// resources are granted. Kept separate from [`Self::deferred_section`] so callers
-    /// with two distinct prompt slots (`from_config`'s Agent) inject each without
-    /// duplication; single-block callers append it onto `deferred_section`.
-    pub pinned_section: String,
+    /// resources are granted. Private for the same reason as [`Self::deferred_section`]
+    /// above - access via the same two accessor patterns.
+    pinned_section: String,
     /// Live handle to the activated deferred-MCP set (present only when a deferred
     /// `tool_search` tool was registered).
     pub activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub mcp_tool_names: HashSet<String>,
+}
+
+impl ScopedAssembled {
+    /// The deferred-MCP tool-search listing and the pinned-MCP-resources section,
+    /// composed into ONE prompt block. For callers that inject a single combined MCP
+    /// prompt section: `run`, `process_message`, and independent delegation.
+    ///
+    /// Centralizing the composition here (instead of each caller hand-rolling
+    /// `append_pinned_mcp_section(&mut deferred_section, &pinned_section)` after its own
+    /// destructure) is what makes dropping `pinned_section` a thing that can no longer
+    /// happen silently - the field isn't reachable except through this method or
+    /// [`Self::pinned_section`], so a caller must consciously pick one.
+    pub fn combined_mcp_prompt_section(&self) -> String {
+        let mut combined = self.deferred_section.clone();
+        append_pinned_mcp_section(&mut combined, &self.pinned_section);
+        combined
+    }
+
+    /// The deferred-MCP tool-search listing on its own, for callers with two distinct
+    /// prompt slots that inject each separately (`Agent::from_config`'s `Agent`, whose
+    /// prompt is composed per-turn later rather than at `assemble`-call time). See
+    /// [`Self::pinned_section`] for its counterpart, and
+    /// [`Self::combined_mcp_prompt_section`] for the single-block shape.
+    pub fn deferred_section(&self) -> &str {
+        &self.deferred_section
+    }
+
+    /// The pinned-MCP-resources section on its own. See [`Self::deferred_section`].
+    pub fn pinned_section(&self) -> &str {
+        &self.pinned_section
+    }
 }
 
 impl ScopedToolRegistry {
@@ -444,7 +488,7 @@ impl ScopedToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolResult;
+    use crate::tools::{ToolOutput, ToolResult};
     use async_trait::async_trait;
 
     struct MockTool(&'static str);
@@ -472,7 +516,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: None,
             })
         }
@@ -795,6 +839,53 @@ mod tests {
             vec!["shell".to_string()],
             "caller_allowed narrows: {names:?}"
         );
+    }
+
+    fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
+        ScopedAssembled {
+            registry: ScopedToolRegistry(Vec::new()),
+            delegate_handle: None,
+            ask_user_handle: None,
+            reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            channel_room_handle: None,
+            deferred_section: deferred.to_string(),
+            pinned_section: pinned.to_string(),
+            activated_handle: None,
+            mcp_tool_names: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn combined_mcp_prompt_section_composes_both_when_present() {
+        let assembled = assembled_with_sections("## Deferred Tools\n- x__y", "## Pinned\n- z");
+        // Exact-string, not just contains()+ordering: pins the precise
+        // `deferred + "\n\n" + pinned` format `append_pinned_mcp_section` produces, so a
+        // regression in the separator or a stray transformation fails this test directly.
+        assert_eq!(
+            assembled.combined_mcp_prompt_section(),
+            "## Deferred Tools\n- x__y\n\n## Pinned\n- z"
+        );
+    }
+
+    #[test]
+    fn combined_mcp_prompt_section_is_deferred_only_when_pinned_empty() {
+        let assembled = assembled_with_sections("## Deferred Tools\n- x__y", "");
+        assert_eq!(
+            assembled.combined_mcp_prompt_section(),
+            "## Deferred Tools\n- x__y"
+        );
+    }
+
+    #[test]
+    fn deferred_and_pinned_accessors_return_the_raw_unmerged_sections() {
+        // The two-slot shape (`from_config`'s Agent) must get each section on its own,
+        // NOT the combined block - this is what makes it safe for a caller with two
+        // separate prompt-injection points to avoid duplicating pinned content.
+        let assembled = assembled_with_sections("deferred-only", "pinned-only");
+        assert_eq!(assembled.deferred_section(), "deferred-only");
+        assert_eq!(assembled.pinned_section(), "pinned-only");
     }
 
     #[tokio::test]

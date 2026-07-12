@@ -753,6 +753,12 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
+/// `agent_alias`, when the caller has resolved one, is threaded onto the
+/// inner `ToolLoop` so lifecycle observer events (llm_request, llm_response,
+/// tool_call_start, tool_call) carry the full `(channel, agent_alias,
+/// turn_id)` correlation triple that observer consumers (Prometheus, OTel,
+/// the gateway `/api/events` stream) rely on for per-agent attribution.
+/// `None` opts out for callers without a resolved alias (tests, benches).
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
@@ -779,6 +785,7 @@ pub async fn agent_turn(
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
+    agent_alias: Option<&str>,
 ) -> Result<String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
     run_tool_call_loop(ToolLoop {
@@ -829,7 +836,7 @@ pub async fn agent_turn(
         // per-transport stamping lands.
         memory,
         ingress: IngressContext::from_origin(origin),
-        agent_alias: None,
+        agent_alias,
         turn_id: &turn_id,
     })
     .await
@@ -1135,8 +1142,8 @@ pub async fn run(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (CLI agent run).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
@@ -1175,19 +1182,7 @@ pub async fn run(
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            mut deferred_section,
-            pinned_section,
-            activated_handle,
-            mcp_tool_names,
-        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
             security: &security,
@@ -1205,10 +1200,22 @@ pub async fn run(
             emit_assembly_logs: true,
         })
         .await;
+        // run injects one combined MCP prompt block: deferred tool-search listing +
+        // pinned resources, composed by the harness.
+        let deferred_section = assembled.combined_mcp_prompt_section();
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle,
+            mcp_tool_names,
+            ..
+        } = assembled;
         let tools_registry = registry.into_inner();
-        // run injects one combined MCP prompt block: fold the pinned-resources section
-        // onto the deferred tool-search listing (the seam now surfaces them separately).
-        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -2701,8 +2708,8 @@ pub async fn process_message(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (process_message CLI agent).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
@@ -2739,19 +2746,7 @@ pub async fn process_message(
             None,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-        let scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            mut deferred_section,
-            pinned_section,
-            activated_handle: activated_handle_pm,
-            mcp_tool_names: mcp_tool_names_pm,
-        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
             security: &security,
@@ -2766,10 +2761,23 @@ pub async fn process_message(
             emit_assembly_logs: true,
         })
         .await;
+        // process_message injects one combined MCP prompt block: deferred tool-search
+        // listing + pinned resources, composed by the harness. `mut` because the
+        // text-tool prompt policy below may clear it for a non-native strict target.
+        let mut deferred_section = assembled.combined_mcp_prompt_section();
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle: activated_handle_pm,
+            mcp_tool_names: mcp_tool_names_pm,
+            ..
+        } = assembled;
         let tools_registry = registry.into_inner();
-        // process_message injects one combined MCP prompt block: fold pinned resources
-        // onto the deferred tool-search listing (the seam surfaces them separately).
-        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -3113,6 +3121,7 @@ pub async fn process_message(
                             ..Default::default()
                         },
                     }),
+                    Some(agent_alias),
                 ),
             )
             .await
@@ -4526,7 +4535,7 @@ mod tests {
                 .unwrap_or_default();
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: format!("counted:{value}"),
+                output: format!("counted:{value}").into(),
                 error: None,
             })
         }
@@ -4606,7 +4615,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string(),
+                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string().into(),
                 error: None,
             })
         }
@@ -4637,7 +4646,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: crate::tools::ToolOutput::default(),
                 error: None,
             })
         }
@@ -4688,7 +4697,7 @@ mod tests {
                 .push(args.clone());
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: args.to_string(),
+                output: args.to_string().into(),
                 error: None,
             })
         }
@@ -4756,7 +4765,7 @@ mod tests {
 
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: format!("ok:{value}"),
+                output: format!("ok:{value}").into(),
                 error: None,
             })
         }
@@ -4802,7 +4811,7 @@ mod tests {
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: false,
-                output: String::new(),
+                output: crate::tools::ToolOutput::default(),
                 error: Some(self.error_reason.clone()),
             })
         }
@@ -6077,6 +6086,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
@@ -6218,6 +6228,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
             step_scope_enforce: true,
@@ -6457,7 +6468,7 @@ mod tests {
             }
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: "fast-done".to_string(),
+                output: "fast-done".to_string().into(),
                 error: None,
             })
         }
@@ -9809,11 +9820,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -9895,11 +9906,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -9972,11 +9983,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10012,11 +10023,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10351,11 +10362,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10961,11 +10972,11 @@ This is an example, not an invocation."#;
                 ],
             )]);
         let messages = vec![ChatMessage::user("hi")];
-        let tools = [crate::tools::ToolSpec {
-            name: "count_tool".to_string(),
-            description: "Count values".to_string(),
-            parameters: serde_json::json!({"type": "object"}).into(),
-        }];
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
         let outcome = consume_provider_streaming_response(
@@ -11169,6 +11180,7 @@ This is an example, not an invocation."#;
                 None,  // channel
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11239,6 +11251,7 @@ This is an example, not an invocation."#;
                 None,  // channel
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11307,7 +11320,7 @@ This is an example, not an invocation."#;
             );
             Ok(crate::tools::ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         }
@@ -11366,6 +11379,7 @@ This is an example, not an invocation."#;
                 None,
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("agent_turn should complete");
@@ -11444,6 +11458,7 @@ This is an example, not an invocation."#;
                 None,
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("agent_turn should complete");
@@ -12839,11 +12854,7 @@ Let me check the result."#;
     }
 
     fn make_spec(name: &str) -> crate::tools::ToolSpec {
-        crate::tools::ToolSpec {
-            name: name.to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({}).into(),
-        }
+        crate::tools::ToolSpec::new(name.to_string(), String::new(), serde_json::json!({}))
     }
 
     fn mcp_set(names: &[&str]) -> HashSet<String> {
@@ -14242,7 +14253,7 @@ Let me check the result."#;
         ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: crate::tools::ToolOutput::default(),
                 error: None,
             })
         }
@@ -15071,6 +15082,68 @@ Let me check the result."#;
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
     }
 
+    #[tokio::test]
+    async fn agent_turn_propagates_resolved_agent_alias_to_observer_events() {
+        // Regression guard: process_message resolves agent_alias but
+        // agent_turn hardcoded `agent_alias: None` in the ToolLoop it built,
+        // so every lifecycle event on this path violated the
+        // (channel, agent_alias, turn_id) contract that
+        // assert_all_events_share_turn_id enforces.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = agent_turn(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            0,
+            0,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+        )
+        .await
+        .expect("agent_turn should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+        let events = capturing.events.lock();
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `read_capped_line` returns a full line and [`CappedLine::Line`]
+    /// when the input is under the cap. EOF with no bytes returns
+    /// [`CappedLine::Eof`]. Regression guard for the happy path.
     #[test]
     fn read_capped_line_returns_full_line_under_cap() {
         let mut cursor = std::io::Cursor::new(b"hello\n".to_vec());

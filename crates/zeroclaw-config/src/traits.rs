@@ -370,6 +370,10 @@ pub struct PropFieldInfo {
     pub tab: ConfigTab,
     /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
     pub alias_source: Option<AliasSource>,
+    /// Whether this field is marked `#[multiline]`, a hint that surfaces
+    /// should render a multi-line text area (e.g. a PEM key body) rather
+    /// than a single-line input.
+    pub multiline: bool,
 }
 
 impl PropKind {
@@ -832,6 +836,10 @@ pub struct ConfigFieldEntry {
     pub tab: ConfigTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_source: Option<AliasSource>,
+    /// Surface hint from `#[multiline]`: render a multi-line text area
+    /// instead of a single-line input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiline: bool,
 }
 
 impl ConfigFieldEntry {
@@ -864,6 +872,7 @@ impl ConfigFieldEntry {
             section,
             tab: info.tab,
             alias_source: info.alias_source,
+            multiline: info.multiline,
         }
     }
 }

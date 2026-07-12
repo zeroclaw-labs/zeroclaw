@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
@@ -171,7 +171,7 @@ impl Tool for ImageInfoTool {
                 };
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error),
                 });
             }
@@ -180,7 +180,7 @@ impl Tool for ImageInfoTool {
         if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Resolved image path is outside the allowed readable roots.".to_string(),
                 ),
@@ -206,7 +206,7 @@ impl Tool for ImageInfoTool {
         if file_size > MAX_IMAGE_BYTES {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Image too large: {file_size} bytes (max {MAX_IMAGE_BYTES} bytes)"
                 )),
@@ -242,7 +242,7 @@ impl Tool for ImageInfoTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

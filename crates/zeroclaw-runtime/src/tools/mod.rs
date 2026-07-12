@@ -11,6 +11,7 @@ pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
 pub mod model_switch;
+pub mod param_options;
 pub mod read_skill;
 pub mod schedule;
 pub mod scoped;
@@ -60,6 +61,7 @@ pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
+pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
@@ -115,7 +117,7 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
-pub use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
+pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 // Local tool re-exports (tools with root deps, kept in misc)
 pub use cron_add::CronAddTool;
@@ -186,6 +188,14 @@ impl Tool for ArcToolRef {
         self.0.parameters_schema()
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.0.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
+        self.0.param_domains()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -223,6 +233,14 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1209,6 +1227,12 @@ pub fn all_tools_with_runtime(
     let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(reaction_tool));
+
+    // Unified forge operations tool, routes through the git channel via the
+    // same late-bound channel map as the reaction tool. Resource/action grid
+    // plus a raw catch-all over the channel's single forge_request transport.
+    let git_forge_tool = GitForgeTool::new(security.clone(), Arc::clone(&reaction_handle));
+    tool_arcs.push(Arc::new(git_forge_tool));
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
     let channel_room_handle: Option<PerToolChannelHandle> =
@@ -2299,7 +2323,7 @@ mod tests {
     fn tool_result_with_error_serde() {
         let result = ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("boom".into()),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -2310,11 +2334,7 @@ mod tests {
 
     #[test]
     fn tool_spec_serde() {
-        let spec = ToolSpec {
-            name: "test".into(),
-            description: "A test tool".into(),
-            parameters: serde_json::json!({"type": "object"}).into(),
-        };
+        let spec = ToolSpec::new("test", "A test tool", serde_json::json!({"type": "object"}));
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: ToolSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "test");

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
-use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
 /// The `prefixed_name` (e.g. `filesystem__read_file`) is what the agent loop
@@ -63,6 +63,8 @@ impl Tool for McpToolWrapper {
             name: self.prefixed_name.clone(),
             description: self.description.clone(),
             parameters: Arc::clone(&self.input_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
         }
     }
 
@@ -77,12 +79,12 @@ impl Tool for McpToolWrapper {
         match self.registry.call_tool(&self.prefixed_name, args).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -213,7 +215,7 @@ mod tests {
         // A real happy-path requires a live MCP server; that is covered by E2E tests.
         let _: ToolResult = ToolResult {
             success: true,
-            output: "hello".to_string(),
+            output: "hello".to_string().into(),
             error: None,
         };
     }

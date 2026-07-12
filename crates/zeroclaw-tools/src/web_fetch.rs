@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FirecrawlConfig;
 
@@ -181,7 +181,7 @@ impl WebFetchTool {
             let error_body = response.text().await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Firecrawl API error: HTTP {} - {}",
                     status.as_u16(),
@@ -213,7 +213,7 @@ impl WebFetchTool {
         if markdown.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Firecrawl returned empty markdown content".into()),
             });
         }
@@ -222,7 +222,7 @@ impl WebFetchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -234,7 +234,7 @@ impl WebFetchTool {
             Err(e) => {
                 return ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("HTTP request failed: {e}")),
                 };
             }
@@ -244,7 +244,7 @@ impl WebFetchTool {
         if !status.is_success() {
             return ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "HTTP {} {}",
                     status.as_u16(),
@@ -271,7 +271,7 @@ impl WebFetchTool {
         } else {
             return ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
@@ -284,7 +284,7 @@ impl WebFetchTool {
             Err(e) => {
                 return ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read response body: {e}")),
                 };
             }
@@ -300,7 +300,7 @@ impl WebFetchTool {
 
         ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         }
     }
@@ -349,7 +349,7 @@ impl Tool for WebFetchTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -362,7 +362,7 @@ impl Tool for WebFetchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -417,7 +417,7 @@ impl Tool for WebFetchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
                 });
             }
@@ -1246,7 +1246,7 @@ mod tests {
         let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
         let result = ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
         };
         assert!(!tool.should_fallback_to_firecrawl(&result));
@@ -1260,7 +1260,7 @@ mod tests {
         });
         let result = ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
@@ -1274,7 +1274,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: None,
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
@@ -1302,7 +1302,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: "A".repeat(200), // well above 100 chars
+            output: "A".repeat(200).into(), // well above 100 chars
             error: None,
         };
         assert!(!tool.should_fallback_to_firecrawl(&result));
@@ -1368,7 +1368,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: "A".repeat(99),
+            output: "A".repeat(99).into(),
             error: None,
         };
         assert!(
@@ -1385,7 +1385,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: "A".repeat(100),
+            output: "A".repeat(100).into(),
             error: None,
         };
         assert!(

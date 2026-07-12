@@ -111,7 +111,7 @@ impl Tool for ReportTemplateTool {
 
         Ok(ToolResult {
             success: true,
-            output: rendered,
+            output: rendered.into(),
             error: None,
         })
     }

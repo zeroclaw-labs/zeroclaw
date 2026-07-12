@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 /// Compact-mode helper for loading a skill's source file on demand.
@@ -80,7 +80,7 @@ impl Tool for ReadSkillTool {
 
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown skill '{requested}'. Available skills: {available}"
                 )),
@@ -90,7 +90,7 @@ impl Tool for ReadSkillTool {
         let Some(location) = skill.location.as_ref() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Skill '{}' has no readable source location.",
                     skill.name
@@ -101,12 +101,12 @@ impl Tool for ReadSkillTool {
         match tokio::fs::read_to_string(location).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             }),
             Err(err) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to read skill '{}' from {}: {err}",
                     skill.name,
