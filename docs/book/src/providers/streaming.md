@@ -63,11 +63,19 @@ When a model decides to call a tool, the provider either emits a structured
 inside the text stream to be parsed downstream from the accumulated response
 (`streams_text_with_tools`). In both cases the runtime:
 
-1. Pauses reading from the provider's stream
-2. Flushes any buffered text to the channel
-3. Runs the tool (subject to security validation, see [Security → Overview](../security/overview.md))
-4. Resumes the conversation with the tool result appended
-5. Opens a new streaming call to the provider for the next assistant turn
+1. Reads the stream to completion: it collects any structured `ToolCall`
+   events and accumulates visible text through the same read loop until `Final`
+2. Flushes buffered text to the channel as it arrives
+3. Recovers the tool calls once the stream ends — from the collected `ToolCall`
+   events, or by parsing them out of the accumulated response for the
+   `streams_text_with_tools` path
+4. Runs the tools (subject to security validation, see [Security → Overview](../security/overview.md))
+5. Opens a new streaming call to the provider for the next assistant turn, with
+   the tool results appended to the conversation
+
+The current provider stream is never paused and resumed mid-read; tool
+execution happens after that stream reaches `Final`, and the next turn is a
+fresh streaming call.
 
 From the user's perspective: text, then a visible indicator that the agent ran a tool (via channel-specific hints), then more text. For channels without typing indicators, the gap between the tool call and the next text chunk is the only signal.
 
