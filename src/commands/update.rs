@@ -275,9 +275,14 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     );
     match smoke_test(&current_exe).await {
         Ok(()) => {
+            if let Err(e) = install_plugin_host_sidecar(&download_path, &current_exe).await {
+                rollback_binary(&backup_path, &current_exe)
+                    .await
+                    .context("rollback after sidecar install failure")?;
+                bail!("Update rolled back — plugin-host sidecar install failed: {e}");
+            }
             // Cleanup backup on success
             let _ = tokio::fs::remove_file(&backup_path).await;
-            install_plugin_host_sidecar(&download_path, &current_exe).await;
             println!("{}", update_success_message(&update_info.latest_version));
             println!("{}", prebuilt_channel_note_message());
             Ok(())
@@ -470,33 +475,35 @@ async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -
 }
 
 /// Install the plugin-host sidecar extracted next to `download_path` (if the
-/// release archive carried one) beside the main binary. Best-effort: the main
-/// update has already succeeded, so failures here only warn.
-async fn install_plugin_host_sidecar(download_path: &Path, current_exe: &Path) {
+/// release archive carried one) beside the main binary. Returns an error when
+/// the archive advertised a sidecar but it could not be installed and verified,
+/// so the caller can roll the main binary back rather than report success with a
+/// version-mismatched or missing host.
+async fn install_plugin_host_sidecar(download_path: &Path, current_exe: &Path) -> Result<()> {
     let extracted = download_path.with_file_name(PLUGIN_HOST_BIN_FILE);
     if !extracted.exists() {
-        return;
+        return Ok(());
     }
     let target = current_exe.with_file_name(PLUGIN_HOST_BIN_FILE);
-    match tokio::fs::copy(&extracted, &target).await {
-        Ok(_) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"path": target.display().to_string()})),
-                "Updated zeroclaw-plugin-host sidecar"
-            );
-        }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Failed to update zeroclaw-plugin-host sidecar; plugin execution may version-mismatch until it is reinstalled"
-            );
-        }
+    tokio::fs::copy(&extracted, &target)
+        .await
+        .with_context(|| format!("copy plugin-host sidecar to {}", target.display()))?;
+    let installed = tokio::fs::metadata(&target)
+        .await
+        .with_context(|| format!("stat installed plugin-host sidecar at {}", target.display()))?;
+    if installed.len() == 0 {
+        bail!(
+            "plugin-host sidecar installed at {} is empty",
+            target.display()
+        );
     }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"path": target.display().to_string()})),
+        "Updated zeroclaw-plugin-host sidecar"
+    );
+    Ok(())
 }
 
 async fn verify_download_checksum(
