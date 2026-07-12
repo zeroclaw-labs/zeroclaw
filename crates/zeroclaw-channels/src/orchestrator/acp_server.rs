@@ -806,7 +806,7 @@ impl AcpServer {
             }
         };
 
-        agent.seed_conversation_history(data.messages.clone());
+        let restore_trim_event = agent.seed_conversation_history_with_event(data.messages.clone());
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -842,6 +842,12 @@ impl AcpServer {
                         .unwrap_or_default(),
                 })),
             );
+        }
+
+        if let Some(event) = restore_trim_event
+            && let Some(notification) = notification_for_turn_event(&session_id, &event)
+        {
+            self.write_notification(&notification).await;
         }
 
         // Stream conversation history to client as session/update notifications
@@ -1017,7 +1023,7 @@ impl AcpServer {
             }
         };
 
-        agent.seed_conversation_history(data.messages);
+        let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -1053,6 +1059,12 @@ impl AcpServer {
                         .unwrap_or_default(),
                 })),
             );
+        }
+
+        if let Some(event) = restore_trim_event
+            && let Some(notification) = notification_for_turn_event(&session_id, &event)
+        {
+            self.write_notification(&notification).await;
         }
 
         let mp = self
@@ -2017,15 +2029,14 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             reason,
         } => JsonRpcNotification {
             jsonrpc: "2.0",
-            method: "session/update",
+            // ACP's SessionUpdate union is closed. Custom notifications use
+            // underscore-prefixed methods so clients can safely ignore them.
+            method: "_zeroclaw/history_trimmed",
             params: serde_json::json!({
                 "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "history_trimmed",
-                    "droppedMessages": dropped_messages,
-                    "keptTurns": kept_turns,
-                    "reason": reason,
-                }
+                "droppedMessages": dropped_messages,
+                "keptTurns": kept_turns,
+                "reason": reason,
             }),
         },
         TurnEvent::Plan { entries } => JsonRpcNotification {
@@ -3040,6 +3051,33 @@ mod tests {
         assert_eq!(map_tool_kind("web_fetch"), "other");
         assert_eq!(map_tool_kind("file_write"), "edit");
         assert_eq!(map_tool_kind("unknown_tool"), "other");
+    }
+
+    #[test]
+    fn restore_trim_event_maps_to_extension_notification() {
+        let notification = notification_for_turn_event(
+            "restored-session",
+            &TurnEvent::HistoryTrimmed {
+                dropped_messages: 12,
+                kept_turns: 3,
+                reason: "message limit".to_string(),
+            },
+        )
+        .expect("history trim must produce an ACP notification");
+        let value = serde_json::to_value(notification).unwrap();
+
+        assert_eq!(value["method"], "_zeroclaw/history_trimmed");
+        assert_eq!(
+            value["params"],
+            serde_json::json!({
+                "sessionId": "restored-session",
+                "droppedMessages": 12,
+                "keptTurns": 3,
+                "reason": "message limit",
+            })
+        );
+        assert!(value["params"].get("update").is_none());
+        assert!(!value.to_string().contains("sessionUpdate"));
     }
 
     #[test]

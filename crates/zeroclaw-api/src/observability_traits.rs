@@ -256,10 +256,10 @@ pub enum ObserverEvent {
     },
     /// Recovery from a failed deployment has completed.
     RecoveryCompleted { deploy_id: String },
-    /// The agent trimmed oldest whole turns from history to fit the context
-    /// token budget. Carries the cut accounting so dashboards and clients can
-    /// surface a visible "context was trimmed" signal instead of the agent
-    /// silently losing earlier turns.
+    /// The agent trimmed oldest whole turns from history to fit either the
+    /// context token budget or the configured message limit. Carries the cut
+    /// accounting so dashboards and clients can surface a visible "context was
+    /// trimmed" signal instead of the agent silently losing earlier turns.
     HistoryTrimmed {
         dropped_messages: usize,
         kept_turns: usize,

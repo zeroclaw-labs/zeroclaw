@@ -493,6 +493,14 @@ impl RpcDispatcher {
         }
     }
 
+    async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
+        if let Some(event) = event
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+        {
+            let _ = self.rpc.send_raw(notification).await;
+        }
+    }
+
     /// Flush dirty config paths to disk. Clone the config out of the
     /// lock (parking_lot guards are !Send), save to disk, then write
     /// the clone (with cleared dirty set) back.
@@ -1137,10 +1145,17 @@ impl RpcDispatcher {
                             ));
                         }
                         message_count = data.messages.len();
-                        self.ctx
+                        let seed_event = self
+                            .ctx
                             .sessions
-                            .seed_conversation_history(&session_id, data.messages)
+                            .seed_conversation_history_with_event(&session_id, data.messages)
                             .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
                         if let Some(ref store) = self.ctx.acp_session_store {
                             let store = store.clone();
                             let sid = session_id.clone();
@@ -1207,7 +1222,12 @@ impl RpcDispatcher {
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
-                        self.ctx.sessions.seed_history(&session_id, &stored).await;
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_history_with_event(&session_id, &stored)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
                         message_count = stored.len();
                     }
                 }
@@ -1484,10 +1504,12 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
-        self.ctx
+        let seed_event = self
+            .ctx
             .sessions
-            .seed_conversation_history(sid, data.messages)
+            .seed_conversation_history_with_event(sid, data.messages)
             .await;
+        self.forward_seed_event(sid, seed_event).await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -1599,12 +1621,6 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        let pre_history_len = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            self.ctx.sessions.history_len(sid).await.unwrap_or(0)
-        } else {
-            0
-        };
-
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1780,40 +1796,15 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && matches!(
-                        outcome,
-                        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. })
-                    )
-                    && let Some(new_msgs) = self
-                        .ctx
-                        .sessions
-                        .history_slice_from(sid, pre_history_len)
-                        .await
-                    && !new_msgs.is_empty()
+                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
                 {
-                    let store = store.clone();
-                    let sid_owned = sid.to_string();
-                    let persisted = tokio::task::spawn_blocking(move || {
-                        store.append_turn(&sid_owned, &new_msgs)
-                    })
-                    .await;
-                    let error = match persisted {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(join) => Some(join.to_string()),
-                    };
-                    if let Some(detail) = error {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                            "Failed to persist ACP turn"
-                        );
-                    }
+                        "Failed to persist ACP turn"
+                    );
                 }
             }
             crate::rpc::types::ChatMode::Chat => {
@@ -4422,6 +4413,31 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
     cfg.effective_max_context_tokens(agent_alias) as u64
 }
 
+/// Persist the exact turn delta captured before structured history trimming.
+/// Empty and failed turns intentionally remain no-ops.
+async fn persist_acp_turn(
+    store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: &str,
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<String> {
+    let messages = match outcome {
+        Ok(TurnOutcome::Completed { messages, .. })
+        | Ok(TurnOutcome::Cancelled { messages, .. })
+            if !messages.is_empty() =>
+        {
+            messages.clone()
+        }
+        _ => return None,
+    };
+    let store = Arc::clone(store);
+    let session_id = session_id.to_string();
+    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join) => Some(join.to_string()),
+    }
+}
+
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
 /// reconnect — or a later `session/resume` — reads a consistent plan.
 /// Writes both the in-memory live cache (`sessions`) and, when an ACP
@@ -6396,6 +6412,93 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    #[tokio::test]
+    async fn seed_trim_event_is_forwarded_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 1,
+            reason: "message cap".into(),
+        };
+
+        dispatcher
+            .forward_seed_event("restored-session", Some(event))
+            .await;
+
+        let raw = rx
+            .try_recv()
+            .expect("restored history trim must notify the active client");
+        let notification: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], "restored-session");
+        assert_eq!(notification["params"]["dropped_messages"], 4);
+        assert!(
+            rx.try_recv().is_err(),
+            "one seed trim must emit exactly one notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_appends_complete_pretrim_delta_at_cap() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "trim-at-cap";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let existing = (0..50)
+            .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
+            .collect::<Vec<_>>();
+        store.append_turn(sid, &existing).unwrap();
+
+        let new_messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("new-user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new-assistant")),
+        ];
+        let outcome = Ok(TurnOutcome::Completed {
+            text: "new-assistant".into(),
+            messages: new_messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(restored.messages.len(), 52);
+        assert_eq!(
+            serde_json::to_value(&restored.messages[50..]).unwrap(),
+            serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_skips_empty_and_failed_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "no-turn-delta";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let empty = Ok(TurnOutcome::Cancelled {
+            partial_text: String::new(),
+            messages: Vec::new(),
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+
+        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
     }
 
     fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
