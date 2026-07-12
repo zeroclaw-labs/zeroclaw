@@ -1652,6 +1652,7 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::types::{DoctorRunResult, DoctorSummary};
     use tempfile::TempDir;
 
     #[test]
@@ -2423,5 +2424,83 @@ mod tests {
             Some(4096),
             "alias2 context_window should be set to mock fetch value"
         );
+    }
+
+    #[tokio::test]
+    async fn run_structured_with_timeout_returns_partial_results_when_probe_hangs() {
+        // Start a TCP blackhole that accepts but never responds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        // Keep accepted streams alive so the client hangs waiting for a
+        // response instead of getting an immediate RST.
+        let _jh = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    sockets.push(stream);
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .expect("known model_provider type");
+        profile.api_key = Some("key".to_string());
+        profile.uri = Some(format!("http://{addr}/v1"));
+
+        // Use a short timeout so the test doesn't actually wait 20s.
+        let (results, timed_out) =
+            run_structured_with_timeout(&config, Some(std::time::Duration::from_secs(2)))
+                .await;
+
+        assert!(timed_out, "timeout must fire against a blackhole endpoint");
+        // diagnose and codex_auth_wiring must still be present.
+        assert!(
+            !results.is_empty(),
+            "partial results from earlier phases must be returned, got empty"
+        );
+    }
+
+    #[test]
+    fn timed_out_phase_serializes_as_null_when_absent() {
+        let r = DoctorRunResult {
+            results: vec![],
+            summary: DoctorSummary {
+                ok: 0,
+                warnings: 0,
+                errors: 0,
+            },
+            timed_out_phase: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(
+            !json.contains("timed_out_phase"),
+            "absent field must be skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn timed_out_phase_serializes_when_populated() {
+        let r = DoctorRunResult {
+            results: vec![],
+            summary: DoctorSummary {
+                ok: 0,
+                warnings: 0,
+                errors: 0,
+            },
+            timed_out_phase: Some("probe_models".to_string()),
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(
+            json.contains(r#""timed_out_phase":"probe_models""#),
+            "populated field must be present: {json}"
+        );
+        let back: DoctorRunResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.timed_out_phase.as_deref(), Some("probe_models"));
     }
 }
