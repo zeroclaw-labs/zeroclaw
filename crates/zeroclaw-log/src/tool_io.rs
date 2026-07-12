@@ -200,6 +200,15 @@ mod tests {
     }
 
     #[test]
+    fn llm_request_redacted_truncation_respects_utf8_char_boundaries() {
+        let cap = capture_llm_request(LlmRequestPayloadPolicy::Redacted, 3, "éé").unwrap();
+        assert_eq!(cap.text, "é");
+        assert_eq!(cap.original_bytes, 4);
+        assert!(cap.truncated);
+        assert!(cap.text.len() <= 3);
+    }
+
+    #[test]
     fn llm_request_full_keeps_everything() {
         let cap = capture_llm_request(LlmRequestPayloadPolicy::Full, 4, "hello world").unwrap();
         assert_eq!(cap.text, "hello world");

@@ -156,6 +156,7 @@ keyactions! {
         CopySelection           [Chord::char('y')] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
+        TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
         DeleteSession           [] => "delete session",
@@ -276,6 +277,37 @@ keyactions! {
         Enter  [Chord::key(KeyCode::Enter)] => "open",
         Back   [Chord::char('q'), Chord::key(KeyCode::Esc)] => "leave",
         Create [Chord::char('c'), Chord::char('C')] => "create agent",
+    }
+}
+
+keyactions! {
+    pub enum SopTabAction ("sop") {
+        Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
+        Enter  [Chord::key(KeyCode::Enter)] => "load graph",
+        Run    [Chord::char('r'), Chord::char('R')] => "run manual",
+        Watch  [Chord::char('w'), Chord::char('W')] => "watch run",
+        New    [Chord::char('n')] => "new sop",
+        Edit   [Chord::char('e')] => "edit sop",
+        Delete [Chord::char('d')] => "delete sop",
+        Approve [Chord::char('a'), Chord::char('A')] => "approve checkpoint",
+        Deny    [Chord::char('x'), Chord::char('X')] => "deny checkpoint",
+        Toggle [Chord::char('v')] => "toggle layer",
+        PanLeft  [Chord::shift(KeyCode::Left)] => "pan left",
+        PanRight [Chord::shift(KeyCode::Right)] => "pan right",
+        PanUp    [Chord::shift(KeyCode::Up)] => "pan up",
+        PanDown  [Chord::shift(KeyCode::Down)] => "pan down",
+    }
+}
+
+keyactions! {
+    pub enum SopEditorAction ("sop_editor") {
+        SourcePrev  [Chord::with(KeyCode::Left, KeyModifiers::ALT)]  => "prev trigger source",
+        SourceNext  [Chord::with(KeyCode::Right, KeyModifiers::ALT)] => "next trigger source",
+        ChannelNext [Chord::with(KeyCode::Char('c'), KeyModifiers::ALT)] => "cycle channel",
+        AliasNext   [Chord::with(KeyCode::Char('a'), KeyModifiers::ALT)] => "cycle alias",
+        Add         [Chord::with(KeyCode::Char('n'), KeyModifiers::ALT)] => "add trigger",
+        Remove      [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "remove trigger",
     }
 }
 

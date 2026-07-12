@@ -5,6 +5,7 @@ zc-pane-code = Código
 zc-pane-chat = Chat
 zc-pane-logs = Registros
 zc-pane-quickstart = Inicio rápido
+zc-pane-sop = SOPs
 zc-app-help-cycle-mode = Modo cíclico
 zc-app-help-reload = Recargar daemon
 zc-app-help-quit = Salir

@@ -41,7 +41,6 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use serde_json::Value;
 
 /// Capacity of the bounded mpsc between `record_event` and the worker.
@@ -66,6 +65,12 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 /// honoured even when no events are flowing.
 const IDLE_TICK: Duration = Duration::from_millis(50);
 
+/// Upper bound on how long re-init waits for a previous worker thread to
+/// observe channel disconnect and exit. Sized well above `IDLE_TICK` so a
+/// healthy worker always exits before the deadline; a stuck worker is
+/// logged and abandoned rather than blocking config reload forever.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
+
 /// A unit of work sent from the async runtime to the disk-persistence
 /// worker. The `Value` payload is unavoidable because we serialize once
 /// on the producer side to keep the queue small.
@@ -86,13 +91,6 @@ type WorkerDead = Arc<AtomicBool>;
 /// [`WriterState`].
 struct WorkerState {
     policy: ResolvedPolicy,
-    /// Reserved for future serialized-rotation paths. The worker thread
-    /// is the sole owner of the file handle for the active path today,
-    /// so this lock is currently unheld; kept on the struct so a future
-    /// refactor that needs to pause the worker for atomic file swaps
-    /// has a place to acquire it.
-    #[allow(dead_code)]
-    write_lock: Mutex<()>,
     worker_dead: WorkerDead,
 }
 
@@ -101,9 +99,6 @@ struct WorkerState {
 /// exit path can fire once the last producer drops their sender.
 struct WriterState {
     policy: ResolvedPolicy,
-    /// Reserved for future serialized-rotation paths.
-    #[allow(dead_code)]
-    write_lock: Mutex<()>,
     tx: SyncSender<WriterJob>,
     worker_dead: WorkerDead,
 }
@@ -122,6 +117,11 @@ fn current_state() -> Option<Arc<WriterState>> {
 /// When enabled, runs a streaming in-place migration of any schema-1 rows
 /// in the existing file before resuming appends, then spawns the disk
 /// worker thread.
+///
+/// Re-init replaces any previously installed writer: the prior worker is
+/// shut down (its channel closed and its exit observed) before the new
+/// policy is installed, so a config reload cannot leave two workers
+/// racing on the same path or leak threads across reloads.
 pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
@@ -137,25 +137,61 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
         );
     }
 
+    // Tear down any previous writer before installing the new one. Taking
+    // the slot first stops new producers from cloning the old Arc; dropping
+    // the Arc drops its SyncSender and disconnects the old worker.
+    shutdown_current_writer();
+
     let (tx, rx) = sync_channel::<WriterJob>(QUEUE_CAPACITY);
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
 
     if policy.storage.is_enabled() {
         let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
-            write_lock: Mutex::new(()),
             worker_dead: Arc::clone(&worker_dead),
         });
         spawn_worker(rx, worker_state);
+    } else {
+        // No worker will ever run for a disabled policy; mark dead so
+        // flush_for_test / re-init waiters do not spin on a false flag.
+        worker_dead.store(true, Ordering::Release);
+        drop(rx);
     }
 
     let state = Arc::new(WriterState {
         policy,
-        write_lock: Mutex::new(()),
         tx,
         worker_dead,
     });
     *slot().write() = Some(state);
+}
+
+/// Remove the currently installed writer (if any) and wait for its worker
+/// thread to exit. Best-effort: if another thread still holds an
+/// `Arc<WriterState>` clone the channel stays open until that clone drops,
+/// and we only wait up to [`SHUTDOWN_WAIT`] before proceeding.
+fn shutdown_current_writer() {
+    let previous = slot().write().take();
+    let Some(prev) = previous else {
+        return;
+    };
+    let dead = Arc::clone(&prev.worker_dead);
+    // Dropping `prev` drops the last slot-owned SyncSender. Any in-flight
+    // `record_event` that already cloned the Arc may keep the channel open
+    // briefly; the wait below covers the common case.
+    drop(prev);
+
+    let start = Instant::now();
+    while !dead.load(Ordering::Acquire) && start.elapsed() < SHUTDOWN_WAIT {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if !dead.load(Ordering::Acquire) {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            "log: previous writer worker did not exit within {:?}; continuing with re-init",
+            SHUTDOWN_WAIT
+        );
+    }
 }
 
 /// Spawn the disk-persistence worker thread. The worker owns the active
@@ -619,8 +655,9 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
     let (base, ext) = split_base_ext(file_name);
     let stamp = when.format("%Y%m%d-%H%M%S").to_string();
 
-    // Callers hold the writer `write_lock` across the existence check and the
-    // subsequent `fs::rename`, so the check-then-rename has no in-process race.
+    // The existence check and subsequent `fs::rename` are called from
+    // the single-threaded worker, so the check-then-rename has no
+    // in-process race.
     let mut candidate = dir.join(format!("{base}.{stamp}{ext}"));
     let mut n = 1u32;
     while candidate.exists() {
@@ -856,6 +893,7 @@ mod tests {
         install_rotating(tmp.path(), 0, false, 0, 0);
 
         emit("before-reload");
+        flush_for_test().unwrap();
 
         let path = runtime_trace_path().unwrap();
         assert!(
@@ -866,6 +904,7 @@ mod tests {
 
         install_rotating(tmp.path(), 1, false, 1, 0);
         emit("after-reload");
+        flush_for_test().unwrap();
 
         let archives = list_archives(&path).unwrap();
         assert_eq!(
@@ -887,6 +926,7 @@ mod tests {
         install_writer(tmp.path(), 10);
 
         emit("persisted-before-disable");
+        flush_for_test().unwrap();
 
         let path = runtime_trace_path().unwrap();
         assert_eq!(count_lines(&path), 1);
@@ -898,11 +938,51 @@ mod tests {
         init_from_config(&cfg, tmp.path());
 
         emit("not-persisted-after-disable");
+        // Disabled policy has no worker; flush is a no-op. Prior writes were
+        // drained by the shutdown path inside init_from_config.
+        flush_for_test().unwrap();
 
         assert_eq!(
             count_lines(&path),
             1,
             "disabled persistence after re-init should stop appending without deleting existing logs"
+        );
+    }
+
+    #[test]
+    fn reinit_shuts_down_previous_worker_before_installing_new() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        let first = current_state().expect("writer installed");
+        let first_dead = Arc::clone(&first.worker_dead);
+        assert!(
+            !first_dead.load(Ordering::Acquire),
+            "fresh worker should be alive"
+        );
+        // Drop our Arc clone so shutdown can close the channel. Holding it
+        // would keep the SyncSender alive and prevent the worker from exiting.
+        drop(first);
+
+        // Re-init with a different policy must tear down the first worker
+        // (channel disconnect → worker_dead) before installing the second.
+        install_rotating(tmp.path(), 0, false, 0, 0);
+
+        assert!(
+            first_dead.load(Ordering::Acquire),
+            "previous worker must exit during re-init so it cannot race the new policy"
+        );
+        let second = current_state().expect("replacement writer installed");
+        assert!(
+            !second.worker_dead.load(Ordering::Acquire),
+            "replacement worker should be alive"
+        );
+        // The replacement must not share the previous worker_dead flag —
+        // that would mean the old Arc was reused rather than replaced.
+        assert!(
+            !Arc::ptr_eq(&first_dead, &second.worker_dead),
+            "re-init must install a fresh WriterState, not mutate the old one"
         );
     }
 
