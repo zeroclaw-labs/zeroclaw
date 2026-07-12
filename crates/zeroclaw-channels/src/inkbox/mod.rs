@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
+mod delivery_failure;
 mod inbound;
 mod realtime;
 mod voice;
@@ -91,6 +92,9 @@ pub struct InkboxChannel {
     /// OpenAI Realtime bridge config for calls, when enabled + credentialed.
     /// `None` falls back to Inkbox STT/TTS for voice.
     realtime: Option<RealtimeConfig>,
+    /// Delivery-failure retry loop: shared budget between the send path and
+    /// the inbound webhook server, so both failure surfaces draw one cap.
+    failure: Arc<delivery_failure::FailureTracker>,
 }
 
 impl InkboxChannel {
@@ -104,11 +108,13 @@ impl InkboxChannel {
         alias: impl Into<String>,
         realtime: Option<RealtimeConfig>,
     ) -> Self {
+        let alias = alias.into();
         Self {
             inkbox,
             identity: identity.into(),
             signing_key: signing_key.into(),
-            alias: alias.into(),
+            failure: Arc::new(delivery_failure::FailureTracker::new(alias.clone())),
+            alias,
             realtime,
         }
     }
@@ -118,7 +124,10 @@ impl InkboxChannel {
 /// loopback server: idempotently ensure webhook subscriptions (mail / text /
 /// iMessage) target the tunnel's public host, and route inbound calls to the
 /// call-media WebSocket. Safe to re-run on every reconnect — an existing
-/// subscription for the same `(owner, url, event)` is left untouched.
+/// subscription for the same `(owner, url)` with the desired event set is
+/// left untouched; one with a drifted event set is patched in place (the
+/// server enforces one subscription per `(owner, url)`), so deployments that
+/// predate the delivery-failure events pick them up on the next start.
 ///
 /// # Arguments
 /// * `inkbox` - the API client (needed as `&Arc` for `get_identity`).
@@ -142,10 +151,11 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
 
     let ns = inkbox.webhooks();
     let subs = ns.subscriptions();
-    // Create only when nothing already targets this (owner, url, event). `list`
-    // filters by url + event and omits deleted rows, so an empty result means
-    // we must create.
-    let ensure = |event: &str,
+    // Reconcile the owner's subscription to the desired event set: adopt a
+    // matching row verbatim, patch a drifted event set in place (never
+    // delete-recreate — the owner must keep a receiver throughout), create
+    // only when nothing targets this (owner, url) yet.
+    let ensure = |events: &[&str],
                   mailbox_id: Option<uuid::Uuid>,
                   phone_id: Option<uuid::Uuid>,
                   agent_id: Option<uuid::Uuid>|
@@ -156,28 +166,45 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
                 phone_id,
                 agent_id,
                 Some(webhook_url.as_str()),
-                Some(event),
-            )
-            .with_context(|| format!("list Inkbox {event} subscriptions"))?;
-        if existing.is_empty() {
-            subs.create(
-                &webhook_url,
-                &[event.to_string()],
-                mailbox_id,
-                phone_id,
-                agent_id,
                 None,
             )
-            .with_context(|| format!("create Inkbox {event} subscription"))?;
+            .with_context(|| format!("list Inkbox {events:?} subscriptions"))?;
+        let desired: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+        match existing.first() {
+            // Compare as sets: the server may reorder the stored event list.
+            Some(sub)
+                if sub.event_types.len() == desired.len()
+                    && desired.iter().all(|e| sub.event_types.contains(e)) => {}
+            Some(sub) => {
+                subs.update(sub.id, None, Some(&desired), None)
+                    .with_context(|| format!("update Inkbox {events:?} subscription"))?;
+            }
+            None => {
+                subs.create(&webhook_url, &desired, mailbox_id, phone_id, agent_id, None)
+                    .with_context(|| format!("create Inkbox {events:?} subscription"))?;
+            }
         }
         Ok(())
     };
 
     if let Some(mailbox) = identity.mailbox() {
-        ensure("message.received", Some(mailbox.id), None, None)?;
+        // Bounce/failure transitions feed the delivery-failure retry loop.
+        // Success transitions stay unsubscribed — no consumer for them.
+        ensure(
+            &["message.received", "message.bounced", "message.failed"],
+            Some(mailbox.id),
+            None,
+            None,
+        )?;
     }
     if let Some(phone) = identity.phone_number() {
-        ensure("text.received", None, Some(phone.id), None)?;
+        // `delivered` resets the retry budget; `delivery_failed` draws it down.
+        ensure(
+            &["text.received", "text.delivered", "text.delivery_failed"],
+            None,
+            Some(phone.id),
+            None,
+        )?;
         // Route inbound calls through the incoming-call webhook (not auto_accept)
         // so Inkbox hits `/incoming-call`, which answers with a call-media WS URL
         // carrying `?call_id=`. That id is what lets the realtime bridge resolve
@@ -196,7 +223,16 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
             .context("set Inkbox incoming-call webhook + WebSocket URL")?;
     }
     if identity.imessage_enabled() {
-        ensure("imessage.received", None, None, Some(identity.id()))?;
+        ensure(
+            &[
+                "imessage.received",
+                "imessage.delivered",
+                "imessage.delivery_failed",
+            ],
+            None,
+            None,
+            Some(identity.id()),
+        )?;
     }
     Ok(())
 }
@@ -253,6 +289,21 @@ impl Channel for InkboxChannel {
     /// inbound handlers: `"email:<addr>"`, `"sms:<conversation_id>"`, or
     /// `"imessage:<conversation_id>"`. Routes to the matching Inkbox API call.
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        // The delivery-failure wake-up offers `[SILENT]` as its escape hatch:
+        // an exact-match reply means "nothing sensible to send" and must not
+        // reach the recipient.
+        if message.content.trim() == "[SILENT]" {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                format!(
+                    "[inkbox] suppressed [SILENT] reply to {}",
+                    message.recipient
+                ),
+            );
+            return Ok(());
+        }
+
         // Non-REST targets are handled before the blocking path: live-call audio
         // replies go to the open socket (a miss means the call already ended —
         // drop quietly), consult answers go back to the realtime bridge, and
@@ -286,7 +337,7 @@ impl Channel for InkboxChannel {
         let inkbox = self.inkbox.clone();
         let handle = self.identity.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
             let identity = inkbox
                 .get_identity(&handle)
                 .with_context(|| format!("resolve Inkbox identity {handle:?}"))?;
@@ -330,7 +381,17 @@ impl Channel for InkboxChannel {
             Ok(())
         })
         .await
-        .context("Inkbox send task panicked")?
+        .context("Inkbox send task panicked")?;
+
+        // Send-time failure surface of the delivery-failure retry loop: a
+        // rejected send (content policy, opt-out, bad address) wakes the agent
+        // to fix and resend. The error still bubbles so the orchestrator logs
+        // the failed delivery as usual.
+        if let Err(e) = &result {
+            self.failure
+                .note_send_rejection(&message.recipient, &message.content, e);
+        }
+        result
     }
 
     /// Run the inbound side: bind a loopback HTTP/WebSocket server, then open
@@ -386,9 +447,14 @@ impl Channel for InkboxChannel {
             );
         }
 
+        // Give the delivery-failure loop the inbound sink so both failure
+        // surfaces (send rejections + delivery webhooks) can wake the agent.
+        self.failure.set_sender(tx.clone());
+
         // Loopback server that receives the tunnel-forwarded webhooks + call WS.
         let app = inbound::router(inbound::AppState {
             tx,
+            failure: self.failure.clone(),
             signing_key: self.signing_key.clone(),
             alias: self.alias.clone(),
             realtime: self.realtime.clone(),

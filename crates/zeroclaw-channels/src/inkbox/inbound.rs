@@ -23,6 +23,9 @@ use zeroclaw_api::channel::ChannelMessage;
 pub struct AppState {
     /// Inbound message sink consumed by the orchestrator.
     pub tx: mpsc::Sender<ChannelMessage>,
+    /// Delivery-failure retry loop (shared with the channel's send path):
+    /// delivery webhooks draw down / reset its budget.
+    pub failure: std::sync::Arc<super::delivery_failure::FailureTracker>,
     /// Webhook signing key (`whsec_...`) for HMAC verification.
     pub signing_key: String,
     /// ZeroClaw channel alias, stamped onto every inbound message.
@@ -152,7 +155,16 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         Err(_) => return StatusCode::BAD_REQUEST,
     };
 
+    // Feed the delivery-failure retry loop first: outbound failure events wake
+    // the agent, delivered receipts and fresh inbounds reset its budget.
+    state.failure.observe_event(&payload);
+
     if let Some(msg) = map_event(&payload, &state.alias) {
+        // Sessions are sender-scoped: stash the resolved label so a later
+        // delivery-failure wake-up for this reply target joins this session.
+        state
+            .failure
+            .remember_sender(&msg.reply_target, &msg.sender);
         // A full inbound queue must not wedge the tunnel, so we drop on
         // backpressure — but a silently lost inbound message is exactly the kind
         // of failure worth seeing, so log it.

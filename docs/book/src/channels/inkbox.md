@@ -76,6 +76,19 @@ port needs to be open. Inkbox signs each webhook with an HMAC over the body;
 configure `signing_key` so the channel can verify and reject unsigned or forged
 traffic.
 
+## Delivery failures
+
+An outbound message can be rejected at send time (an outbound content-policy
+block, an opted-out recipient, a bad address) or fail after acceptance (the
+carrier flags it, or the receiving mail server bounces it, reported via the
+delivery-lifecycle webhooks). Both cases wake the agent in the same
+conversation with the exact error and its own undelivered body, so it can fix
+and resend. Guardrails: a hard cap of three total sends per logical reply, a
+budget that resets on a fresh inbound message, a delivered receipt, or after
+30 minutes, and webhook replays deduped per failed message. When there is
+nothing sensible to resend, the agent replies `[SILENT]` and nothing is
+delivered to the recipient.
+
 ## Realtime calls (optional)
 
 By default, voice calls use Inkbox speech-to-text and text-to-speech. Set
