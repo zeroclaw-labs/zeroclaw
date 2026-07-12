@@ -31,39 +31,63 @@ const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(80);
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     let tool = which_clipboard_tool()?;
     let can_enumerate = tool_can_enumerate(&tool);
+    read_clipboard_image_with(
+        can_enumerate,
+        || image_targets_for_tool(&tool),
+        |target| run_clipboard_tool(&tool, target),
+        |attempt| {
+            if attempt + 1 < IMAGE_READ_ATTEMPTS {
+                std::thread::sleep(IMAGE_READ_RETRY_DELAY);
+            }
+        },
+    )
+}
 
+/// Probe+read retry loop for the clipboard image path, parameterized on the
+/// probe, read, and inter-attempt wait so the retry/fallback contract is
+/// testable without a live clipboard.
+///
+/// `probe` re-enumerates the servable image targets for one attempt; `read`
+/// fetches the bytes for a target (empty vec = nothing there yet). `wait`
+/// runs between attempts for enumerating tools. `can_enumerate` distinguishes
+/// target-enumerating tools (xclip, wl-paste), which may race a servable-target
+/// export, from direct-PNG tools (pngpaste, PowerShell), which bail after one
+/// read since their result cannot change across attempts.
+fn read_clipboard_image_with<P, R, W>(
+    can_enumerate: bool,
+    probe: P,
+    read: R,
+    mut wait: W,
+) -> Option<(Vec<u8>, String)>
+where
+    P: Fn() -> Vec<String>,
+    R: Fn(&str) -> Option<Vec<u8>>,
+    W: FnMut(u32),
+{
     for attempt in 0..IMAGE_READ_ATTEMPTS {
-        // Re-probe every attempt: the servable target set can change between
-        // attempts when another client re-grabs the selection. For tools that
-        // cannot enumerate (pngpaste, PowerShell) this resolves to image/png,
-        // which those tools always emit.
-        let targets = image_targets_for_tool(&tool);
+        let targets = probe();
         if targets.is_empty() && can_enumerate {
             // Enumerable owner is advertising no image target at all. Not a
             // servable-target race — a plain text-only clipboard. Return
             // immediately so the caller falls through to text paste without
-            // burning the full IMAGE_READ_ATTEMPTS * IMAGE_READ_RETRY_DELAY
-            // window (~720ms) on every ordinary text paste.
+            // burning the full retry window on every ordinary text paste.
             return None;
         }
-        for target in targets {
-            if let Some(bytes) = run_clipboard_tool(&tool, &target)
+        for target in &targets {
+            if let Some(bytes) = read(target)
                 && !bytes.is_empty()
             {
-                return Some((bytes, mime_for_target(&target)));
+                return Some((bytes, mime_for_target(target)));
             }
         }
         if !can_enumerate {
             // Non-enumerating tools (pngpaste, PowerShell) return promptly and
             // emit nothing for a text-only clipboard; the result will not
             // change across attempts. Bail after the first read instead of
-            // paying the retry window on every ordinary text paste. The
-            // servable-target race only exists for enumerating tools.
+            // paying the retry window on every ordinary text paste.
             return None;
         }
-        if attempt + 1 < IMAGE_READ_ATTEMPTS {
-            std::thread::sleep(IMAGE_READ_RETRY_DELAY);
-        }
+        wait(attempt);
     }
     None
 }
@@ -388,6 +412,92 @@ pub(crate) fn clipboard_temp_path(ext: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn non_enumerating_tool_bails_after_one_empty_read() {
+        // pngpaste / PowerShell: one empty read must return None without
+        // paying the retry window.
+        let reads = Cell::new(0u32);
+        let waits = Cell::new(0u32);
+        let out = read_clipboard_image_with(
+            false,
+            || vec!["image/png".to_string()],
+            |_| {
+                reads.set(reads.get() + 1);
+                Some(Vec::new())
+            },
+            |_| waits.set(waits.get() + 1),
+        );
+        assert!(out.is_none());
+        assert_eq!(reads.get(), 1, "must not re-read a non-enumerating tool");
+        assert_eq!(waits.get(), 0, "must not pay the retry window");
+    }
+
+    #[test]
+    fn enumerating_tool_with_no_image_returns_immediately() {
+        // xclip / wl-paste advertising no image target: return without reading.
+        let reads = Cell::new(0u32);
+        let waits = Cell::new(0u32);
+        let out = read_clipboard_image_with(
+            true,
+            Vec::new,
+            |_| {
+                reads.set(reads.get() + 1);
+                Some(vec![1, 2, 3])
+            },
+            |_| waits.set(waits.get() + 1),
+        );
+        assert!(out.is_none());
+        assert_eq!(reads.get(), 0, "no advertised image means no read");
+        assert_eq!(waits.get(), 0);
+    }
+
+    #[test]
+    fn enumerating_tool_retries_until_advertised_image_reads() {
+        // Image is advertised but the first read races empty; a later attempt
+        // succeeds. The bounded retry window recovers it.
+        let attempt = Cell::new(0u32);
+        let out = read_clipboard_image_with(
+            true,
+            || vec!["image/png".to_string()],
+            |target| {
+                let n = attempt.get();
+                attempt.set(n + 1);
+                if n < 2 {
+                    Some(Vec::new())
+                } else {
+                    assert_eq!(target, "image/png");
+                    Some(vec![0x89, b'P', b'N', b'G'])
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(
+            out,
+            Some((vec![0x89, b'P', b'N', b'G'], "image/png".to_string()))
+        );
+    }
+
+    #[test]
+    fn enumerating_tool_stops_at_bounded_attempts_when_unreadable() {
+        // Image stays advertised but never reads; must stop at the bounded
+        // attempt count, not spin forever.
+        let reads = Cell::new(0u32);
+        let waits = Cell::new(0u32);
+        let out = read_clipboard_image_with(
+            true,
+            || vec!["image/png".to_string()],
+            |_| {
+                reads.set(reads.get() + 1);
+                Some(Vec::new())
+            },
+            |_| waits.set(waits.get() + 1),
+        );
+        assert!(out.is_none());
+        assert_eq!(reads.get(), IMAGE_READ_ATTEMPTS);
+        assert_eq!(waits.get(), IMAGE_READ_ATTEMPTS);
+    }
 
     #[test]
     fn looks_like_path_absolute() {
