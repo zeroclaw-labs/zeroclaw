@@ -1848,8 +1848,8 @@ mod tests {
 
     #[test]
     fn convert_messages_passes_through_valid_tool_arguments() {
-        // Companion regression: valid JSON must round-trip byte-for-byte so
-        // the openrouter call site cannot accidentally re-encode or strip
+        // Companion regression: valid JSON object must round-trip byte-for-byte
+        // so the openrouter call site cannot accidentally re-encode or strip
         // good payloads.
         let messages = vec![ChatMessage {
             role: "assistant".into(),
@@ -1860,6 +1860,25 @@ mod tests {
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_rejects_non_object_tool_arguments() {
+        // Strict providers (Cohere, OpenRouter auto-exacto) require a JSON
+        // object for tool-call arguments. Null, arrays, strings, numbers, and
+        // booleans are valid JSON but must not reach the upstream.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        for tc in tool_calls {
+            assert_eq!(tc.function.arguments, "{}", "non-object arg for {} must normalize to empty object", tc.function.name);
+        }
     }
 
     #[test]

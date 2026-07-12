@@ -125,12 +125,31 @@ pub enum AuthStyle {
 /// normalization contract. The streaming accumulator's
 /// `StreamToolCallAccumulator::into_provider_tool_call` and all typed
 /// providers' outbound `convert_messages` paths route through here.
-pub fn sanitize_tool_arguments(function_name: &str, arguments: &str) -> String {
+pub(crate) fn sanitize_tool_arguments(function_name: &str, arguments: &str) -> String {
     if arguments.trim().is_empty() {
         return "{}".to_string();
     }
-    if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
-        return arguments.to_string();
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(serde_json::Value::Object(_)) => return arguments.to_string(),
+        Ok(_non_object) => {
+            // Accept only JSON objects; null, arrays, strings, numbers, and
+            // booleans do not satisfy a strict-provider function-arguments
+            // contract (reported by Cohere, tracked by OpenRouter's
+            // auto-exacto validator).
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "function": function_name,
+                        "payload_len": arguments.len(),
+                        "error_key": "tool_args_not_object",
+                    })),
+                "Non-object tool-call arguments being sent to strict upstream provider, dropping to empty object"
+            );
+            return "{}".to_string();
+        }
+        Err(_) => {}
     }
     ::zeroclaw_log::record!(
         WARN,
@@ -3539,14 +3558,24 @@ mod tests {
         assert_eq!(sanitize_tool_arguments("f", "   \n\t  "), "{}");
     }
 
-    /// Well-formed JSON returns untouched — we never want to mutate valid input.
+    /// Well-formed JSON object returns untouched — only object-shaped arguments
+    /// satisfy the strict-provider function-arguments contract.
     #[test]
     fn sanitize_tool_arguments_valid_json_is_passthrough() {
         let args = r#"{"path":"/tmp/x","recursive":true}"#;
         assert_eq!(sanitize_tool_arguments("file_read", args), args);
-        // Bare JSON arrays / null are also "valid JSON" and pass through.
-        assert_eq!(sanitize_tool_arguments("f", "null"), "null");
-        assert_eq!(sanitize_tool_arguments("f", "[]"), "[]");
+    }
+
+    /// Non-object JSON values (null, array, string, number, boolean) are
+    /// rejected to `"{}"` because strict providers require a JSON object for
+    /// tool-call arguments.
+    #[test]
+    fn sanitize_tool_arguments_non_object_becomes_empty_object() {
+        assert_eq!(sanitize_tool_arguments("f", "null"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "[]"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "42"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "\"hello\""), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "true"), "{}");
     }
 
     /// Malformed arguments are dropped to `"{}"` so strict upstreams (Cohere,
