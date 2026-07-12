@@ -32,6 +32,7 @@
   - [Platform install files](./setup/dist-files.md)
 - [Architecture](./architecture/overview.md)
   - [Request lifecycle](./architecture/request-lifecycle.md)
+  - [Channel runtime lifecycle](./architecture/channel-runtime-lifecycle.md)
   - [Tool execution lifecycle](./architecture/tool-execution-lifecycle.md)
   - [Crates](./architecture/crates.md)
   - [Architecture Decision Records](./architecture/decisions/index.md)
