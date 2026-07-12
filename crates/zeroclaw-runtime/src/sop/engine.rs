@@ -5539,7 +5539,7 @@ type = "manual"
 
     #[tokio::test]
     async fn sop_approve_tool_resumes_deterministic_checkpoint() {
-        // Regression guardreview): the sop_approve tool must route a
+        // Regression guard: the sop_approve tool must route a
         // PausedCheckpoint to approve_step, because resolve_gate reports NotWaiting
         // for it. Without that routing the tool answers "not waiting for approval"
         // and a deterministic run is stuck unresumable through every surface.
