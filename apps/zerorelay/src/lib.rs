@@ -21,6 +21,10 @@
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption.
 #![allow(clippy::disallowed_methods)]
 
+mod frontdoor;
+mod frontdoor_assets;
+mod frontdoor_tls_assets;
+
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -41,8 +45,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, TokenBucket, decode_data,
-    encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, TokenBucket,
+    decode_data, encode_data,
 };
 
 /// How far a client may drive its send window negative before the relay treats it
@@ -180,6 +184,21 @@ enum ConnEvent {
     Window(u32),
     /// Daemon -> client `DataAck { consumed }`: replenish the client's send window.
     Ack(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientRoute {
+    Wss,
+    Enrollment,
+}
+
+impl ClientRoute {
+    fn peer_hint(self) -> Option<&'static str> {
+        match self {
+            Self::Wss => None,
+            Self::Enrollment => Some(PEER_HINT_ENROLL),
+        }
+    }
 }
 
 /// Per-node usage counters for the read-only status surface. Counts only - never
@@ -383,46 +402,15 @@ impl RelayServer {
                 } else {
                     None
                 };
-                // Echo our subprotocol so a client that offered it does not fail
-                // the handshake (RFC 6455 / tungstenite enforces this on the client).
-                let ws = match tokio_tungstenite::accept_hdr_async(tls, select_subprotocol).await {
-                    Ok(w) => w,
+                let ws = match frontdoor::accept_or_serve(tls).await {
+                    Ok(frontdoor::Frontdoor::WebSocket(w)) => w,
+                    Ok(frontdoor::Frontdoor::ServedHttp) => return,
                     Err(_) => return,
                 };
                 let _ = handle_conn(inner, ws, cert_node_id).await;
             });
         }
     }
-}
-
-/// WebSocket handshake callback: select `zeroclaw.relay.v1` in the response when
-/// the client offered it, so the client's required-subprotocol check passes.
-// The Result type is dictated by tungstenite's `accept_hdr_async` callback trait
-// (its error variant carries an http Response); we cannot box it.
-#[allow(clippy::result_large_err)]
-fn select_subprotocol(
-    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-    mut resp: tokio_tungstenite::tungstenite::handshake::server::Response,
-) -> std::result::Result<
-    tokio_tungstenite::tungstenite::handshake::server::Response,
-    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
-> {
-    let offered = req
-        .headers()
-        .get_all("Sec-WebSocket-Protocol")
-        .iter()
-        .any(|v| {
-            v.to_str()
-                .map(|s| s.split(',').any(|p| p.trim() == SUBPROTOCOL))
-                .unwrap_or(false)
-        });
-    if offered {
-        resp.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            tokio_tungstenite::tungstenite::http::HeaderValue::from_static(SUBPROTOCOL),
-        );
-    }
-    Ok(resp)
 }
 
 /// The target node-id for a client: the outer client cert CN (outer-mTLS variant)
@@ -451,7 +439,22 @@ where
             relay_token,
         }) => handle_daemon(inner, ws, daemon_pubkey, node_id, relay_token).await,
         Some(Control::Connect { node_id }) => {
-            handle_client(inner, ws, resolve_target_node(cert_node_id, node_id)).await
+            handle_client(
+                inner,
+                ws,
+                resolve_target_node(cert_node_id, node_id),
+                ClientRoute::Wss,
+            )
+            .await
+        }
+        Some(Control::Enroll { node_id }) => {
+            handle_client(
+                inner,
+                ws,
+                resolve_target_node(cert_node_id, node_id),
+                ClientRoute::Enrollment,
+            )
+            .await
         }
         Some(other) => {
             let _ = send_control(
@@ -662,6 +665,7 @@ async fn handle_client<S>(
     inner: Arc<Inner>,
     mut ws: WebSocketStream<S>,
     node_id: String,
+    route: ClientRoute,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -713,7 +717,7 @@ where
         .send(Message::text(
             Control::Open {
                 conn_id,
-                peer_hint: None,
+                peer_hint: route.peer_hint().map(str::to_string),
             }
             .to_json(),
         ))

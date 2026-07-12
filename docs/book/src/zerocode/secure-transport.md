@@ -300,7 +300,7 @@ reaches clients in-band on their next certificate renewal. Force one now with
 `zeroclaw security relay-rotate-node-id` (auto-mint mode only; a pinned `node_id`
 is never rotated).
 
-For a managed relay that authenticates daemons on the outer layer too, set the
+For a relay that authenticates daemons on the outer layer too, set the
 relay's `[admission].outer_client_auth = "required"` + `outer_client_ca`, and on
 the daemon `[relay].outer_client_cert` / `outer_client_key`. This is additive on
 the outer TLS and never touches the inner mTLS.
@@ -435,7 +435,7 @@ listener; the relay address is only the TCP dial target.
 | `relay_host` | (empty) | Expected outer-cert SAN; empty derives from `url` |
 | `relay_insecure` | `false` | Skip outer-cert verification (dev only) |
 | `tofu` | `false` | Pin the relay leaf on first use to `<data_dir>/relay/relay_pin` |
-| `outer_client_cert` | (empty) | Daemon's outer-mTLS client cert (managed relay) |
+| `outer_client_cert` | (empty) | Daemon's outer-mTLS client cert for relay admission |
 | `outer_client_key` | (empty) | Key for `outer_client_cert` |
 | `node_id_rotation_days` | `0` | Auto-rotate the auto-minted node-id every N days (0 = never) |
 

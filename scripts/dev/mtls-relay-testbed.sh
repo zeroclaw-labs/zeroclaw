@@ -25,7 +25,7 @@
 # dir, and the mTLS/relay code is inert in normal daemon config (no [wss]).
 #
 # Usage:
-#   scripts/dev/mtls-relay-testbed.sh [--check-only] [--skip-build] [-h]
+#   scripts/dev/mtls-relay-testbed.sh [--check-only] [--skip-build] [--browser-check|--browser-manual] [-h]
 #
 # Environment overrides:
 #   ZC_TESTBED_DIR    workspace dir         (default: ${TMPDIR:-/tmp}/zc-mtls-testbed)
@@ -33,10 +33,16 @@
 #   ZC_RELAY_PORT     relay listen port     (default: 8459)
 #   ZC_NODE_ID        relay node-id         (default: testbed-daemon)
 #   ZC_PROFILE        cargo profile         (release|debug, default: release)
+#   CARGO_TARGET_DIR  cargo output/cache dir (default: /opt/cargo-build)
+#   ZC_CARGO_TOOLCHAIN cargo toolchain flag  (default: +1.96.1 when installed)
 #
 # Flags:
 #   --check-only      run both self-checks, tear everything down, exit (CI smoke)
 #   --skip-build      reuse already-built binaries (same as ZC_TESTBED_SKIP_BUILD=1)
+#   --browser-check   spend the pairing code on a headless browser frontdoor E2E
+#   --browser-manual  leave the pairing code unused and print browser instructions
+#   --browser PATH    Chrome/Chromium path for --browser-check
+#   --headed          run --browser-check with a visible browser
 #   -h, --help        this help
 
 set -euo pipefail
@@ -48,13 +54,25 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # --- options -----------------------------------------------------------------
 CHECK_ONLY=0
 SKIP_BUILD="${ZC_TESTBED_SKIP_BUILD:-0}"
-for arg in "$@"; do
-  case "$arg" in
+BROWSER_CHECK=0
+BROWSER_MANUAL=0
+BROWSER_E2E_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --check-only) CHECK_ONLY=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
+    --browser-check) BROWSER_CHECK=1 ;;
+    --browser-manual) BROWSER_MANUAL=1 ;;
+    --browser)
+      shift
+      [ "$#" -gt 0 ] || { echo "--browser requires a value" >&2; exit 2; }
+      BROWSER_E2E_ARGS+=(--browser "$1")
+      ;;
+    --headed) BROWSER_E2E_ARGS+=(--headed) ;;
     -h|--help) sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
+    *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
   esac
+  shift
 done
 
 TB="${ZC_TESTBED_DIR:-${TMPDIR:-/tmp}/zc-mtls-testbed}"
@@ -65,10 +83,18 @@ NODE_ID="${ZC_NODE_ID:-testbed-daemon}"
 PROFILE="${ZC_PROFILE:-release}"
 RELAY_TOKEN="testbed-token"
 RELAY_TLS_DIR="$TB/relay-tls"   # where the relay self-provisions its CA + cert
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/opt/cargo-build}"
+CARGO_TOOLCHAIN="${ZC_CARGO_TOOLCHAIN:-}"
+CARGO_CMD=(cargo)
+if [ -n "$CARGO_TOOLCHAIN" ]; then
+  CARGO_CMD=(cargo "$CARGO_TOOLCHAIN")
+elif command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q '^1\.96\.1-'; then
+  CARGO_CMD=(cargo +1.96.1)
+fi
 
 case "$PROFILE" in
-  release) BIN_DIR="$REPO_ROOT/target/release"; CARGO_PROFILE_FLAG="--release" ;;
-  debug)   BIN_DIR="$REPO_ROOT/target/debug";   CARGO_PROFILE_FLAG="" ;;
+  release) BIN_DIR="$CARGO_TARGET_DIR/release"; CARGO_PROFILE_FLAG="--release" ;;
+  debug)   BIN_DIR="$CARGO_TARGET_DIR/debug";   CARGO_PROFILE_FLAG="" ;;
   *) echo "ZC_PROFILE must be 'release' or 'debug' (got '$PROFILE')" >&2; exit 2 ;;
 esac
 ZEROCLAW="$BIN_DIR/zeroclaw"
@@ -78,6 +104,11 @@ ZERORELAY="$BIN_DIR/zerorelay"
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+
+[ "$BROWSER_CHECK" = "1" ] && [ "$BROWSER_MANUAL" = "1" ] \
+  && die "--browser-check and --browser-manual are mutually exclusive"
+[ "$BROWSER_MANUAL" = "1" ] && [ "$CHECK_ONLY" = "1" ] \
+  && die "--browser-manual keeps the testbed alive; do not combine it with --check-only"
 
 # --- teardown ----------------------------------------------------------------
 DAEMON_PID=""
@@ -96,8 +127,8 @@ if [ "$SKIP_BUILD" = "1" ]; then
     [ -x "$b" ] || die "missing binary $b (drop --skip-build to build it)"
   done
 else
-  say "building zeroclaw, zerocode, zerorelay ($PROFILE) ..."
-  ( cd "$REPO_ROOT" && cargo build $CARGO_PROFILE_FLAG \
+  say "building zeroclaw, zerocode, zerorelay ($PROFILE) with ${CARGO_CMD[*]} ..."
+  ( cd "$REPO_ROOT" && CARGO_TARGET_DIR="$CARGO_TARGET_DIR" "${CARGO_CMD[@]}" build $CARGO_PROFILE_FLAG \
       --features channels-full \
       -p zeroclawlabs -p zerocode -p zerorelay ) \
     || die "build failed"
@@ -233,9 +264,11 @@ ok "relay outer TLS verified against its own CA; daemon bridge running (deep e2e
 # Prove the headline frictionless flow: a CERTLESS client fetches its first
 # certificate from the enrollment endpoint using the daemon's one-time pairing
 # code, caches it, and that cert then completes the mutually-authenticated WSS
-# handshake. Driven non-interactively (the pairing code + SAS confirmation are
-# piped on stdin; the SAS human-compare step is trusted for the local testbed).
-say "self-check D: over-the-wire enrollment (certless client -> pairing code -> cert)"
+# handshake. The default check drives zerocode non-interactively. --browser-check
+# spends the same one-time code on the browser frontdoor flow instead, so it can
+# prove service-worker availability, CSR generation, SAS confirmation, and the
+# browser mTLS RPC tunnel against the real daemon/relay pair.
+say "preparing one-time enrollment code"
 for _ in $(seq 1 40); do
   ss -ltn 2>/dev/null | grep -q ":$ENROLL_PORT" && break
   sleep 0.25
@@ -243,22 +276,39 @@ done
 ss -ltn 2>/dev/null | grep -q ":$ENROLL_PORT" || die "enroll endpoint never bound :$ENROLL_PORT"
 CODE="$(grep -oE 'pairing code[[:space:]]*:[[:space:]]*[A-Za-z0-9]+' "$TB/daemon.log" | head -1 | awk '{print $NF}')"
 [ -n "$CODE" ] || { tail -30 "$TB/daemon.log" >&2; die "could not read the pairing code from daemon.log"; }
-ENROLL_DIR="$TB/enrolled"
-# --enroll enrolls and then proceeds to the normal connect flow; that post-enroll
-# connect (here, via the cached relay whose self-signed outer cert this fresh
-# client does not yet trust) is irrelevant to validating ENROLLMENT itself, so we
-# ignore the exit code and assert the cert was cached, then verify it below.
-printf '%s\ny\n' "$CODE" | ZEROCLAW_CONFIG_DIR="$ENROLL_DIR" "$ZEROCODE" \
-  --enroll --enroll-host 127.0.0.1 --enroll-port "$ENROLL_PORT" \
-  --config-dir "$ENROLL_DIR" > "$TB/enroll.log" 2>&1 || true
-ENR_CRT="$ENROLL_DIR/tls/client.crt"; ENR_KEY="$ENROLL_DIR/tls/client.key"
-[ -f "$ENR_CRT" ] && [ -f "$ENR_KEY" ] \
-  || { cat "$TB/enroll.log" >&2; die "enrollment did not cache a client cert at $ENROLL_DIR/tls"; }
-out="$(echo Q | openssl s_client -connect "127.0.0.1:$WSS_PORT" -tls1_3 \
-  -CAfile "$CA" -cert "$ENR_CRT" -key "$ENR_KEY" 2>&1 || true)"
-echo "$out" | grep -q "Verify return code: 0 (ok)" \
-  || { echo "$out" | tail -20 >&2; die "the ENROLLED cert did not complete the mTLS handshake"; }
-ok "enrolled over the wire and the enrolled cert verifies (TLS 1.3, Verify OK)"
+
+if [ "$BROWSER_MANUAL" = "1" ]; then
+  say "self-check D: browser manual mode (pairing code left unused)"
+  ok "browser pairing code reserved for manual use"
+elif [ "$BROWSER_CHECK" = "1" ]; then
+  say "self-check D: browser frontdoor enrollment and mTLS RPC tunnel"
+  ZC_BROWSER_E2E_URL="https://127.0.0.1:$RELAY_PORT/" \
+    ZC_BROWSER_E2E_NODE_ID="$NODE_ID" \
+    ZC_BROWSER_E2E_PAIRING_CODE="$CODE" \
+    ZC_BROWSER_E2E_PROFILE_DIR="$TB/browser-profile" \
+    node "$REPO_ROOT/scripts/dev/browser-relay-frontdoor-e2e.mjs" \
+      "${BROWSER_E2E_ARGS[@]}" > "$TB/browser-e2e.log" 2>&1 \
+    || { cat "$TB/browser-e2e.log" >&2; die "browser frontdoor E2E failed"; }
+  ok "browser frontdoor paired, confirmed SAS, and opened the mTLS RPC tunnel"
+else
+  say "self-check D: over-the-wire enrollment (certless client -> pairing code -> cert)"
+  ENROLL_DIR="$TB/enrolled"
+  # --enroll enrolls and then proceeds to the normal connect flow; that post-enroll
+  # connect (here, via the cached relay whose self-signed outer cert this fresh
+  # client does not yet trust) is irrelevant to validating ENROLLMENT itself, so we
+  # ignore the exit code and assert the cert was cached, then verify it below.
+  printf '%s\ny\n' "$CODE" | ZEROCLAW_CONFIG_DIR="$ENROLL_DIR" "$ZEROCODE" \
+    --enroll --enroll-host 127.0.0.1 --enroll-port "$ENROLL_PORT" \
+    --config-dir "$ENROLL_DIR" > "$TB/enroll.log" 2>&1 || true
+  ENR_CRT="$ENROLL_DIR/tls/client.crt"; ENR_KEY="$ENROLL_DIR/tls/client.key"
+  [ -f "$ENR_CRT" ] && [ -f "$ENR_KEY" ] \
+    || { cat "$TB/enroll.log" >&2; die "enrollment did not cache a client cert at $ENROLL_DIR/tls"; }
+  out="$(echo Q | openssl s_client -connect "127.0.0.1:$WSS_PORT" -tls1_3 \
+    -CAfile "$CA" -cert "$ENR_CRT" -key "$ENR_KEY" 2>&1 || true)"
+  echo "$out" | grep -q "Verify return code: 0 (ok)" \
+    || { echo "$out" | tail -20 >&2; die "the ENROLLED cert did not complete the mTLS handshake"; }
+  ok "enrolled over the wire and the enrolled cert verifies (TLS 1.3, Verify OK)"
+fi
 
 # --- 7c. self-check: UN-MIGRATED CLIENT gets an actionable error -------------
 # A certless client that connects to the always-mTLS WSS plane (non-interactive,
@@ -279,7 +329,11 @@ ok "certless client fails with an actionable enroll-first message (exit $rc)"
 
 # --- 8. done -----------------------------------------------------------------
 echo
-say "ALL SELF-CHECKS PASSED"
+if [ "$BROWSER_MANUAL" = "1" ]; then
+  say "BROWSER TESTBED READY"
+else
+  say "ALL SELF-CHECKS PASSED"
+fi
 
 if [ "$CHECK_ONLY" = "1" ]; then
   say "--check-only: tearing down"
@@ -311,6 +365,30 @@ cat <<EOF
 
  Logs:   daemon $TB/daemon.log   relay $TB/relay.log
  Config: $TB/config.toml
+
+EOF
+
+if [ "$BROWSER_MANUAL" = "1" ]; then
+cat <<EOF
+ BROWSER FRONTDOOR (pairing code is still unused):
+   URL:          https://127.0.0.1:$RELAY_PORT/
+   Server ID:    $NODE_ID
+   Pairing Code: $CODE
+
+ Automated browser proof against this live testbed:
+   node $REPO_ROOT/scripts/dev/browser-relay-frontdoor-e2e.mjs \\
+     --url https://127.0.0.1:$RELAY_PORT/ \\
+     --node-id $NODE_ID \\
+     --pairing-code $CODE \\
+     --browser /path/to/chromium
+
+ The automated harness launches Chrome/Chromium with local certificate errors
+ ignored for this self-provisioned test relay.
+
+EOF
+fi
+
+cat <<EOF
 
  Press Ctrl-C to stop the daemon and relay and clean up.
 ------------------------------------------------------------------------------

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Message};
-use zeroclaw_relay_proto::{Control, SUBPROTOCOL, decode_data, encode_data};
+use zeroclaw_relay_proto::{Control, PEER_HINT_ENROLL, SUBPROTOCOL, decode_data, encode_data};
 use zerorelay::{Admission, RelayConfig, RelayServer};
 
 type RelayWs =
@@ -273,6 +273,41 @@ async fn pair_daemon_and_client(
         other => panic!("client did not see Opened: {other:?}"),
     }
     (daemon, client, conn_id)
+}
+
+#[tokio::test]
+async fn enrollment_client_opens_daemon_with_enroll_hint() {
+    let addr = start_relay(RelayConfig::default()).await;
+    let key = gen_key();
+    let (mut daemon, term) = handshake(addr, "node-enroll", &key, None, true).await;
+    assert!(matches!(term, Control::Registered { .. }), "got {term:?}");
+
+    let mut client = connect_ws(addr).await;
+    client
+        .send(Message::text(
+            Control::Enroll {
+                node_id: "node-enroll".into(),
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+
+    let conn_id = match next_wire(&mut daemon).await {
+        Some(Wire::Ctrl(Control::Open { conn_id, peer_hint })) => {
+            assert_eq!(peer_hint.as_deref(), Some(PEER_HINT_ENROLL));
+            conn_id
+        }
+        other => panic!("daemon did not receive an enrollment Open: {other:?}"),
+    };
+    daemon
+        .send(Message::text(Control::Opened { conn_id }.to_json()))
+        .await
+        .unwrap();
+    match next_wire(&mut client).await {
+        Some(Wire::Ctrl(Control::Opened { conn_id: c })) => assert_eq!(c, conn_id),
+        other => panic!("client did not see enrollment Opened: {other:?}"),
+    }
 }
 
 #[tokio::test]

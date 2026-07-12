@@ -696,7 +696,35 @@ fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>>
 /// the caller runs the INNER WSS + mTLS. A pump task bridges that byte stream
 /// to/from the relay's binary `DATA` frames; the relay only ever forwards the
 /// (still-encrypted) inner bytes and never sees plaintext.
-async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream> {
+// `client.rs` also compiles as part of the reusable `zerocode` library target;
+// relay enrollment is wired only by the binary's enrollment module.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum RelayRoute {
+    Wss,
+    Enrollment,
+}
+
+impl RelayRoute {
+    fn open_control(self, node_id: String) -> zeroclaw_relay_proto::Control {
+        match self {
+            Self::Wss => zeroclaw_relay_proto::Control::Connect { node_id },
+            Self::Enrollment => zeroclaw_relay_proto::Control::Enroll { node_id },
+        }
+    }
+
+    fn send_context(self) -> &'static str {
+        match self {
+            Self::Wss => "sending relay Connect",
+            Self::Enrollment => "sending relay Enroll",
+        }
+    }
+}
+
+async fn dial_through_relay(
+    relay: &RelayDial,
+    route: RelayRoute,
+) -> Result<tokio::io::DuplexStream> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -796,13 +824,10 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
     let (mut sink, mut stream) = relay_ws.split();
 
     sink.send(Message::text(
-        Control::Connect {
-            node_id: relay.node_id.clone(),
-        }
-        .to_json(),
+        route.open_control(relay.node_id.clone()).to_json(),
     ))
     .await
-    .context("sending relay Connect")?;
+    .context(route.send_context())?;
 
     // Wait for the relay to pair us with the daemon (answer pings while waiting).
     let conn_id = loop {
@@ -907,6 +932,16 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
     });
 
     Ok(client_io)
+}
+
+/// Open the daemon's narrow enrollment endpoint through the nominated relay.
+/// The returned byte stream is still plaintext only to the caller; the caller
+/// must run the enrollment TLS client over it before sending pairing material.
+#[allow(dead_code)]
+pub(crate) async fn dial_enrollment_through_relay(
+    relay: &RelayDial,
+) -> Result<tokio::io::DuplexStream> {
+    dial_through_relay(relay, RelayRoute::Enrollment).await
 }
 
 impl RpcClient {
@@ -1090,7 +1125,7 @@ impl RpcClient {
         tls: &ClientTls,
         relay: &RelayDial,
     ) -> Result<Self> {
-        let client_io = dial_through_relay(relay).await?;
+        let client_io = dial_through_relay(relay, RelayRoute::Wss).await?;
         let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
         let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
             inner_url,

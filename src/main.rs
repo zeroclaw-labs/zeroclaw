@@ -3100,10 +3100,37 @@ fn issue_wss_client_cert(
         let _ = zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem);
     }
 
-    println!("Issued client certificate for '{name}':");
-    println!("  cert: {}", cert_path.display());
-    println!("  key:  {}", key_path.display());
-    println!("  CA:   {}", ca_cert.display());
+    let cert_path_display = cert_path.display().to_string();
+    let key_path_display = key_path.display().to_string();
+    let ca_cert_display = ca_cert.display().to_string();
+    println!(
+        "{}",
+        ta("cli-mtls-issued-client-cert", &[("name", name)], "issued")
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-cert-path",
+            &[("path", &cert_path_display)],
+            "cert"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-key-path",
+            &[("path", &key_path_display)],
+            "key"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-ca-path",
+            &[("path", &ca_cert_display)],
+            "CA"
+        )
+    );
 
     let relay = &config.relay;
     // node_id is auto-minted when unset, so resolve the real one (persisted) for
@@ -3117,9 +3144,9 @@ fn issue_wss_client_cert(
     };
     if has_out_dir {
         println!();
-        println!("Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /");
-        println!("  client.key). Copy it to the client as <config-dir>/tls and zerocode finds");
-        println!("  the material automatically - no --tls-* flags needed.");
+        println!("{}", t("cli-mtls-dropin-line-1", "drop-in TLS dir"));
+        println!("{}", t("cli-mtls-dropin-line-2", "client key"));
+        println!("{}", t("cli-mtls-dropin-line-3", "automatic TLS material"));
     }
     println!();
     if relay_ready {
@@ -3138,7 +3165,7 @@ fn issue_wss_client_cert(
         } else {
             relay_flags.push_str(" --relay-ca <relay-ca.crt>");
         }
-        println!("Reach this daemon THROUGH its configured relay:");
+        println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
         if has_out_dir {
             println!(
                 "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
@@ -3155,10 +3182,10 @@ fn issue_wss_client_cert(
                 key_path.display()
             );
         }
-        println!("  (--relay-ca is the RELAY's CA - copy it from the relay to the client;");
-        println!("   --tls-ca-cert is the DAEMON's CA, already in the bundle.)");
+        println!("{}", t("cli-mtls-relay-ca-note-1", "relay CA note"));
+        println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
     } else {
-        println!("Connect with zerocode (direct):");
+        println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
         println!(
             "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
             ca_cert.display(),
@@ -3186,26 +3213,54 @@ fn revoke_wss_client_cert(
     let changed = if let Some(fp) = fingerprint {
         let fp = fp.trim().to_ascii_lowercase();
         if ledger.mark_revoked(&fp, ACTOR)? {
-            println!("Revoked certificate {fp}.");
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoked-certificate",
+                    &[("fingerprint", &fp)],
+                    "revoked"
+                )
+            );
             true
         } else {
             println!(
-                "No active certificate with fingerprint {fp} (already revoked or never issued)."
+                "{}",
+                ta(
+                    "cli-mtls-revoke-no-active-fingerprint",
+                    &[("fingerprint", &fp)],
+                    "not found"
+                )
             );
             false
         }
     } else if let Some(device_id) = device {
         let n = ledger.revoke_device(&device_id, ACTOR)?;
-        println!("Revoked {n} active certificate(s) for device '{device_id}'.");
+        let n_s = n.to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-device-certs",
+                &[("count", &n_s), ("device", &device_id)],
+                "revoked"
+            )
+        );
         n > 0
     } else {
         // clap requires exactly one of --fingerprint / --device; defensive only.
         anyhow::bail!("provide --fingerprint <hex> or --device <id>");
     };
     if changed {
+        let revoked_path =
+            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&config.data_dir)
+                .display()
+                .to_string();
         println!(
-            "Updated {}; the daemon refuses the revoked certificate(s) at the next connection.",
-            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&config.data_dir).display()
+            "{}",
+            ta(
+                "cli-mtls-revoked-list-updated",
+                &[("path", &revoked_path)],
+                "updated"
+            )
         );
     }
     Ok(())
@@ -3237,10 +3292,18 @@ fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
         return Ok(());
     }
     if active.is_empty() {
-        println!("No active client certificates issued by this daemon's CA.");
+        println!("{}", t("cli-mtls-list-no-active-certs", "no active certs"));
         return Ok(());
     }
-    println!("Active client certificates ({}):", active.len());
+    let active_len = active.len().to_string();
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-list-active-header",
+            &[("count", &active_len)],
+            "active certs"
+        )
+    );
     for e in &active {
         println!(
             "  {}  device={}  not_after={}  actor={}",
@@ -4741,9 +4804,14 @@ async fn main() -> Result<()> {
                 // inner mTLS terminates; it never decrypts anything.
                 registry.register_relay(Box::new(|ctx, cancel, _client_count| {
                     Box::pin(async move {
-                        let (relay_cfg, wss_cfg, data_dir) = {
+                        let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
                             let cfg = ctx.config.read();
-                            (cfg.relay.clone(), cfg.wss.clone(), cfg.data_dir.clone())
+                            (
+                                cfg.relay.clone(),
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.data_dir.clone(),
+                            )
                         };
                         if !relay_cfg.enabled {
                             cancel.cancelled().await;
@@ -4802,6 +4870,9 @@ async fn main() -> Result<()> {
                             node_id,
                             relay_token: Some(relay_cfg.token).filter(|t| !t.is_empty()),
                             local_wss_addr: format!("127.0.0.1:{}", wss_cfg.port),
+                            local_enroll_addr: enroll_cfg
+                                .enabled
+                                .then(|| format!("127.0.0.1:{}", enroll_cfg.port)),
                             signing_key_pkcs8,
                             relay_ca_path: Some(relay_cfg.relay_ca_path)
                                 .filter(|p| !p.is_empty()),
@@ -4940,17 +5011,27 @@ async fn main() -> Result<()> {
                         ));
                         if let Some(code) = pairing.pairing_code() {
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
+                            let enroll_bind = enroll_cfg.bind.to_string();
+                            let enroll_port = enroll_cfg.port.to_string();
                             println!();
                             println!(
-                                "Enrollment endpoint ready on {}:{}. To enroll a client, give it",
-                                enroll_cfg.bind, enroll_cfg.port
+                                "{}",
+                                ta(
+                                    "cli-enroll-endpoint-ready",
+                                    &[("bind", &enroll_bind), ("port", &enroll_port)],
+                                    "enrollment ready"
+                                )
                             );
                             println!(
-                                "this one-time pairing code and confirm the short-auth-string (SAS)"
+                                "{}",
+                                t("cli-enroll-confirm-sas-line-1", "confirm SAS")
                             );
-                            println!("matches on both ends before trusting the daemon:");
-                            println!("    pairing code : {code}");
-                            println!("    SAS          : {sas}");
+                            println!("{}", t("cli-enroll-confirm-sas-line-2", "match SAS"));
+                            println!(
+                                "{}",
+                                ta("cli-enroll-pairing-code", &[("code", &code)], "code")
+                            );
+                            println!("{}", ta("cli-enroll-sas", &[("sas", &sas)], "SAS"));
                             println!();
                         }
 

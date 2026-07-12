@@ -721,6 +721,7 @@ pub async fn run(
             "relay",
             initial_backoff,
             max_backoff,
+            relay_cancel.clone(),
             move || {
                 let ctx = rpc_ctx.clone();
                 let start = relay_start.clone();
@@ -745,6 +746,7 @@ pub async fn run(
             "enroll",
             initial_backoff,
             max_backoff,
+            enroll_cancel.clone(),
             move || {
                 let ctx = rpc_ctx.clone();
                 let start = enroll_start.clone();

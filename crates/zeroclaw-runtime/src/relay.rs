@@ -29,8 +29,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, TokenBucket, decode_data,
-    encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, SUBPROTOCOL,
+    TokenBucket, decode_data, encode_data,
 };
 
 /// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
@@ -73,6 +73,8 @@ pub struct RelayBridgeConfig {
     pub relay_token: Option<String>,
     /// Loopback address of the daemon's own WSS listener (e.g. `127.0.0.1:9781`).
     pub local_wss_addr: String,
+    /// Optional loopback address of the daemon's narrow enrollment listener.
+    pub local_enroll_addr: Option<String>,
     /// PKCS#8 of the daemon's Ed25519 registration key.
     pub signing_key_pkcs8: Vec<u8>,
     /// PEM CA to trust for the relay's outer cert; `None` uses public roots.
@@ -530,7 +532,7 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
                         match Control::from_json(t.as_str()) {
-                            Ok(Control::Open { conn_id, .. }) => {
+                            Ok(Control::Open { conn_id, peer_hint }) => {
                                 // Fast-reject an OPEN flood before allocating conn
                                 // state or dialing a loopback mTLS handshake (A6).
                                 if !open_bucket.try_take() {
@@ -542,6 +544,18 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
                                         .await;
                                     continue;
                                 }
+                                let local = match open_route_target(cfg, peer_hint.as_deref()) {
+                                    Ok(addr) => addr.to_string(),
+                                    Err(reason) => {
+                                        let _ = to_relay
+                                            .send(tungstenite_text(&Control::Close {
+                                                conn_id,
+                                                reason: reason.into(),
+                                            }))
+                                            .await;
+                                        continue;
+                                    }
+                                };
                                 let mut cs = conns.lock().await;
                                 if cs.len() >= cfg.max_conns {
                                     drop(cs);
@@ -556,7 +570,6 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
                                     cs.insert(conn_id, tx);
                                     drop(cs);
                                     let to_relay = to_relay.clone();
-                                    let local = cfg.local_wss_addr.clone();
                                     let link_dead = link_dead.clone();
                                     let conns = conns.clone();
                                     zeroclaw_spawn::spawn!(async move {
@@ -609,17 +622,27 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
     result
 }
 
-/// Bridge one logical connection: dial the loopback WSS listener, accept the
+fn open_route_target<'a>(
+    cfg: &'a RelayBridgeConfig,
+    peer_hint: Option<&str>,
+) -> std::result::Result<&'a str, &'static str> {
+    match peer_hint {
+        Some(PEER_HINT_ENROLL) => cfg.local_enroll_addr.as_deref().ok_or("enroll_unavailable"),
+        _ => Ok(&cfg.local_wss_addr),
+    }
+}
+
+/// Bridge one logical connection: dial the selected loopback listener, accept the
 /// `Open`, and shuttle bytes both ways until either side ends.
 async fn bridge_conn(
     conn_id: u64,
-    local_wss_addr: &str,
+    local_addr: &str,
     to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
     mut inbound: mpsc::Receiver<ConnMsg>,
     link_dead: CancellationToken,
     conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>>,
 ) {
-    let local = match TcpStream::connect(local_wss_addr).await {
+    let local = match TcpStream::connect(local_addr).await {
         Ok(s) => s,
         Err(_) => {
             let _ = to_relay
@@ -845,6 +868,58 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod node_id_tests {
     use super::*;
+
+    fn route_test_config() -> RelayBridgeConfig {
+        RelayBridgeConfig {
+            relay_addr: "127.0.0.1:8443".into(),
+            relay_host: "localhost".into(),
+            node_id: "node".into(),
+            relay_token: None,
+            local_wss_addr: "127.0.0.1:9781".into(),
+            local_enroll_addr: Some("127.0.0.1:9782".into()),
+            signing_key_pkcs8: Vec::new(),
+            relay_ca_path: None,
+            relay_insecure: true,
+            relay_tofu: false,
+            outer_client_cert: None,
+            outer_client_key: None,
+            max_conns: 16,
+            open_burst: 60,
+            open_rate_per_sec: 20.0,
+            data_dir: std::path::PathBuf::from("/tmp"),
+            node_id_rotation_days: 0,
+            rotation_allowed: false,
+        }
+    }
+
+    #[test]
+    fn open_route_defaults_to_wss() {
+        let cfg = route_test_config();
+        assert_eq!(open_route_target(&cfg, None).unwrap(), "127.0.0.1:9781");
+        assert_eq!(
+            open_route_target(&cfg, Some("unknown")).unwrap(),
+            "127.0.0.1:9781"
+        );
+    }
+
+    #[test]
+    fn open_route_selects_enrollment_when_available() {
+        let cfg = route_test_config();
+        assert_eq!(
+            open_route_target(&cfg, Some(PEER_HINT_ENROLL)).unwrap(),
+            "127.0.0.1:9782"
+        );
+    }
+
+    #[test]
+    fn open_route_rejects_enrollment_when_disabled() {
+        let mut cfg = route_test_config();
+        cfg.local_enroll_addr = None;
+        assert_eq!(
+            open_route_target(&cfg, Some(PEER_HINT_ENROLL)).unwrap_err(),
+            "enroll_unavailable"
+        );
+    }
 
     #[test]
     fn mint_node_id_is_128_bit_hex_and_unique() {

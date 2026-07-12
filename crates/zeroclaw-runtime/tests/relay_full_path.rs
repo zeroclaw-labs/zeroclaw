@@ -21,6 +21,21 @@ use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Message};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_relay_proto::{Control, SUBPROTOCOL, decode_data, encode_data};
 
+#[derive(Debug, Clone, Copy)]
+enum RelayClientRoute {
+    Wss,
+    Enrollment,
+}
+
+impl RelayClientRoute {
+    fn open_control(self, node_id: String) -> Control {
+        match self {
+            Self::Wss => Control::Connect { node_id },
+            Self::Enrollment => Control::Enroll { node_id },
+        }
+    }
+}
+
 /// Accept any server cert: the test pins nothing, it asserts the handshake and
 /// byte round-trip, not the PKI (covered by the dedicated mTLS tests).
 #[derive(Debug)]
@@ -152,6 +167,7 @@ async fn zerocode_to_relay_to_daemon_full_path() {
             node_id: "relay-device".into(),
             relay_token: None,
             local_wss_addr: format!("127.0.0.1:{}", wss_addr.port()),
+            local_enroll_addr: None,
             signing_key_pkcs8: signing_key,
             relay_ca_path: None,
             relay_insecure: true, // self-signed relay outer cert in the test
@@ -171,7 +187,7 @@ async fn zerocode_to_relay_to_daemon_full_path() {
     // Client: outer TLS + WS to the relay, request the node-id, then run the inner
     // WSS + mTLS over a duplex bridge to the relay's DATA frames. Retry the whole
     // dial until the asynchronously-spawned bridge has registered the node-id.
-    let client_io = dial_relay_with_retry(relay_addr, "relay-device").await;
+    let client_io = dial_relay_with_retry(relay_addr, "relay-device", RelayClientRoute::Wss).await;
 
     let inner_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -204,15 +220,133 @@ async fn zerocode_to_relay_to_daemon_full_path() {
     cancel.cancel();
 }
 
+#[tokio::test]
+async fn enrollment_post_round_trips_through_relay_route() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mats = zeroclaw_tls::ensure_server_materials(dir.path(), &[]).unwrap();
+    let enroll_acceptor = zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+        cert_path: mats.server_cert_path.to_string_lossy().into_owned(),
+        key_path: mats.server_key_path.to_string_lossy().into_owned(),
+        client_auth: None,
+    })
+    .unwrap();
+    let pairing = zeroclaw_config::pairing::PairingGuard::new(true, &[]);
+    let pairing_code = pairing.pairing_code().unwrap();
+    let enroll_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let enroll_addr = enroll_listener.local_addr().unwrap();
+    let enroll_cancel = CancellationToken::new();
+    let enroll_server = Arc::new(zeroclaw_runtime::enroll::EnrollServer {
+        bind_addr: enroll_addr,
+        acceptor: enroll_acceptor,
+        ca_cert_pem: std::fs::read_to_string(&mats.ca_cert_path).unwrap(),
+        ca_key_pem: zeroize::Zeroizing::new(std::fs::read_to_string(&mats.ca_key_path).unwrap()),
+        ledger: Arc::new(
+            zeroclaw_runtime::security::cert_ledger::CertLedger::open_in_memory(None).unwrap(),
+        ),
+        pairing: Arc::new(pairing),
+        allow_unpaired_until: None,
+        relay_profile: zeroclaw_runtime::enroll::RelayProfile::default(),
+    });
+    let enroll_ledger = enroll_server.ledger.clone();
+    let enroll_task = tokio::spawn(zeroclaw_runtime::enroll::serve_on(
+        enroll_listener,
+        enroll_server,
+        enroll_cancel.clone(),
+    ));
+
+    // Relay with its own outer TLS identity (open admission).
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+    let relay_acceptor = relay_outer_acceptor();
+    tokio::spawn(
+        zerorelay::RelayServer::new(zerorelay::RelayConfig::default())
+            .serve(relay_listener, relay_acceptor),
+    );
+
+    // The bridge has only the enrollment target for this test; a normal WSS route
+    // is not needed to prove certless bootstrap over the narrow route.
+    let signing_key = zeroclaw_runtime::relay::ensure_signing_key(dir.path()).unwrap();
+    let bridge_cancel = CancellationToken::new();
+    tokio::spawn(zeroclaw_runtime::relay::run_relay_bridge(
+        zeroclaw_runtime::relay::RelayBridgeConfig {
+            relay_addr: relay_addr.to_string(),
+            relay_host: "localhost".into(),
+            node_id: "relay-device".into(),
+            relay_token: None,
+            local_wss_addr: "127.0.0.1:9".into(),
+            local_enroll_addr: Some(format!("127.0.0.1:{}", enroll_addr.port())),
+            signing_key_pkcs8: signing_key,
+            relay_ca_path: None,
+            relay_insecure: true,
+            relay_tofu: false,
+            outer_client_cert: None,
+            outer_client_key: None,
+            max_conns: 16,
+            open_burst: 60,
+            open_rate_per_sec: 20.0,
+            data_dir: std::path::PathBuf::from("/nonexistent-rotation-off"),
+            node_id_rotation_days: 0,
+            rotation_allowed: false,
+        },
+        bridge_cancel.clone(),
+    ));
+
+    let client_io =
+        dial_relay_with_retry(relay_addr, "relay-device", RelayClientRoute::Enrollment).await;
+
+    let inner_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoServerVerify))
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(inner_cfg));
+    let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let mut tls = connector.connect(server_name, client_io).await.unwrap();
+
+    let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+    let body = serde_json::json!({ "pairing_code": pairing_code, "csr_pem": csr }).to_string();
+    let request = format!(
+        "POST /enroll HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    tls.write_all(request.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
+
+    let mut resp = Vec::new();
+    tls.read_to_end(&mut resp).await.unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "expected enrollment 200, got: {text}"
+    );
+    assert!(
+        text.contains("BEGIN CERTIFICATE"),
+        "no cert in response: {text}"
+    );
+    assert!(text.contains("device_id"), "no device_id in response");
+    assert_eq!(enroll_ledger.list_active().unwrap().len(), 1);
+
+    bridge_cancel.cancel();
+    enroll_cancel.cancel();
+    let _ = enroll_task.await;
+}
+
 /// Mirror of zerocode's `dial_through_relay`: outer TLS + WS to the relay, send
 /// `Connect`, await `Opened`, then bridge a duplex byte stream to/from the DATA
 /// frames. Retries the full dial until the bridge has registered the node-id.
 async fn dial_relay_with_retry(
     relay_addr: std::net::SocketAddr,
     node_id: &str,
+    route: RelayClientRoute,
 ) -> tokio::io::DuplexStream {
     for _ in 0..100 {
-        if let Some(io) = try_dial_relay(relay_addr, node_id).await {
+        if let Some(io) = try_dial_relay(relay_addr, node_id, route).await {
             return io;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -223,6 +357,7 @@ async fn dial_relay_with_retry(
 async fn try_dial_relay(
     relay_addr: std::net::SocketAddr,
     node_id: &str,
+    route: RelayClientRoute,
 ) -> Option<tokio::io::DuplexStream> {
     let outer = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -245,10 +380,7 @@ async fn try_dial_relay(
     .ok()?;
     let (mut sink, mut stream) = relay_ws.split();
     sink.send(Message::text(
-        Control::Connect {
-            node_id: node_id.to_string(),
-        }
-        .to_json(),
+        route.open_control(node_id.to_string()).to_json(),
     ))
     .await
     .ok()?;

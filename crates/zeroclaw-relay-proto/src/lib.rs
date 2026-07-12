@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 /// The WebSocket subprotocol identifier offered/selected on every relay session.
 pub const SUBPROTOCOL: &str = "zeroclaw.relay.v1";
 
+/// `Open.peer_hint` value for the narrow daemon enrollment route.
+pub const PEER_HINT_ENROLL: &str = "enroll";
+
 /// Maximum control-frame size (JSON text) a peer should accept. Control frames
 /// are tiny; anything larger is hostile or a bug.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
@@ -72,6 +75,11 @@ pub enum Control {
 
     /// Client -> relay: request a route to `node_id`.
     Connect { node_id: String },
+    /// Client -> relay: request a route to the daemon's enrollment endpoint for
+    /// `node_id`. The pairing code, CSR, and enrollment response are carried as
+    /// opaque DATA on the resulting logical connection; the relay only asks the
+    /// daemon bridge for its narrow enrollment loopback target.
+    Enroll { node_id: String },
 
     /// Relay -> daemon: a new client arrived; open a logical connection.
     /// `peer_hint` is optional coarse, untrusted metadata (never authoritative).
@@ -301,6 +309,9 @@ mod tests {
                 lease_ttl_secs: 120,
             },
             Control::Connect {
+                node_id: "n1".into(),
+            },
+            Control::Enroll {
                 node_id: "n1".into(),
             },
             Control::Open {

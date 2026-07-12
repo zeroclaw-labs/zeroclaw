@@ -356,6 +356,92 @@ fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> b
     cli_skip_verify || cfg_wss.tls.skip_verify
 }
 
+fn should_enroll_via_relay(cli: &Cli, cfg_wss: &config::WssSection, relay_available: bool) -> bool {
+    relay_available
+        && cli.enroll_host.is_none()
+        && cli.enroll_port.is_none()
+        && (cli.relay.is_some() || (cli.connect.is_none() && cfg_wss.uri.is_none()))
+}
+
+async fn resolve_relay_dial(
+    cli: &Cli,
+    cfg_wss: &config::WssSection,
+    cached_relay: Option<&enroll::RelayProfile>,
+    config_dir: &std::path::Path,
+) -> anyhow::Result<Option<client::RelayDial>> {
+    // Relay coordinates: CLI -> config -> cached enrollment profile.
+    let relay_addr = cli
+        .relay
+        .clone()
+        .or_else(|| cfg_wss.relay_url.clone())
+        .or_else(|| {
+            cached_relay
+                .map(|r| r.relay_url.clone())
+                .filter(|s| !s.is_empty())
+        });
+    let relay_node = cli
+        .relay_node
+        .clone()
+        .or_else(|| cfg_wss.relay_node.clone())
+        .or_else(|| {
+            cached_relay
+                .map(|r| r.node_id.clone())
+                .filter(|s| !s.is_empty())
+        });
+
+    // Relay outer-leaf pin: --relay-pin -> the enrollment-delivered pin -> a
+    // previously TOFU'd pin. TOFU persists here for the next run.
+    let pin_store = config_dir.join("relay").join("relay_pin");
+    let relay_pin = cli
+        .relay_pin
+        .clone()
+        .or_else(|| {
+            cached_relay
+                .map(|r| r.relay_cert_pin.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::fs::read_to_string(&pin_store)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    match (relay_addr, relay_node) {
+        (Some(relay_addr), Some(node_id)) => {
+            // Default the relay's expected cert name to its host:port host.
+            let relay_host = cli.relay_host.clone().unwrap_or_else(|| {
+                relay_addr
+                    .rsplit_once(':')
+                    .map(|(h, _)| h.to_string())
+                    .unwrap_or_else(|| relay_addr.clone())
+            });
+            // Resolve the relay outer-cert trust: explicit flags/remembered pin
+            // win; otherwise offer interactive trust-on-first-use instead of a
+            // bare UnknownIssuer at connect/enrollment time.
+            let relay_pin =
+                resolve_relay_trust(relay_pin, &relay_addr, &relay_host, cli, &pin_store).await?;
+            Ok(Some(client::RelayDial {
+                relay_addr,
+                relay_host,
+                node_id,
+                relay_ca_path: cli.relay_ca.clone(),
+                relay_insecure: cli.relay_insecure,
+                relay_pin,
+                relay_tofu: cli.relay_tofu,
+                pin_store: Some(pin_store),
+                outer_client_cert: cli.relay_client_cert.clone(),
+                outer_client_key: cli.relay_client_key.clone(),
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(anyhow::Error::msg(
+            "relay routing needs both a relay address and a node-id \
+             (--relay + --relay-node, or wss.relay_url + wss.relay_node)",
+        )),
+    }
+}
+
 /// A default client-TLS file under `<config_dir>/tls/<name>`, if it exists, so a
 /// client provisioned the conventional way needs no explicit `--tls-*` flags.
 fn default_tls_path(config_dir: &std::path::Path, name: &str) -> Option<String> {
@@ -619,6 +705,9 @@ async fn run() -> anyhow::Result<()> {
         use std::io::IsTerminal as _;
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
         let cfg_wss = &loaded_config.connection.wss;
+        let cached = enroll::cached_profile(&config_dir);
+        let cached_relay = cached.as_ref().map(|p| &p.relay);
+        let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
         let wss_intended = cli.connect.is_some()
             || cfg_wss.uri.is_some()
             || cli.relay.is_some()
@@ -631,18 +720,26 @@ async fn run() -> anyhow::Result<()> {
         let auto =
             wss_intended && certless && cli.connect.is_some() && std::io::stderr().is_terminal();
         if cli.enroll || auto {
-            let host = cli
-                .enroll_host
-                .clone()
-                .or_else(|| enroll_host_from(cli.connect.as_deref()))
-                .or_else(|| enroll_host_from(cfg_wss.uri.as_deref()))
-                .ok_or_else(|| {
-                    anyhow::Error::msg(
-                        "enrollment needs a host: pass --enroll-host or --connect wss://<host>:<port>",
-                    )
-                })?;
-            let port = cli.enroll_port.unwrap_or(enroll::DEFAULT_ENROLL_PORT);
-            enroll::enroll(&host, port, &config_dir).await?;
+            if should_enroll_via_relay(&cli, cfg_wss, relay.is_some()) {
+                enroll::enroll_via_relay(
+                    relay.as_ref().expect("checked relay.is_some()"),
+                    &config_dir,
+                )
+                .await?;
+            } else {
+                let host = cli
+                    .enroll_host
+                    .clone()
+                    .or_else(|| enroll_host_from(cli.connect.as_deref()))
+                    .or_else(|| enroll_host_from(cfg_wss.uri.as_deref()))
+                    .ok_or_else(|| {
+                        anyhow::Error::msg(
+                            "enrollment needs a host: pass --enroll-host, --connect wss://<host>:<port>, or --relay with --relay-node",
+                        )
+                    })?;
+                let port = cli.enroll_port.unwrap_or(enroll::DEFAULT_ENROLL_PORT);
+                enroll::enroll(&host, port, &config_dir).await?;
+            }
         }
     }
 
@@ -658,80 +755,7 @@ async fn run() -> anyhow::Result<()> {
         let direct_url = resolve_direct_url(cli.connect.clone(), cfg_wss);
         let skip_verify = resolve_skip_verify(cli.tls_skip_verify, cfg_wss);
 
-        // Relay coordinates: CLI -> config -> cached enrollment profile.
-        let relay_addr = cli
-            .relay
-            .clone()
-            .or_else(|| cfg_wss.relay_url.clone())
-            .or_else(|| {
-                cached_relay
-                    .map(|r| r.relay_url.clone())
-                    .filter(|s| !s.is_empty())
-            });
-        let relay_node = cli
-            .relay_node
-            .clone()
-            .or_else(|| cfg_wss.relay_node.clone())
-            .or_else(|| {
-                cached_relay
-                    .map(|r| r.node_id.clone())
-                    .filter(|s| !s.is_empty())
-            });
-
-        // Relay outer-leaf pin: --relay-pin -> the enrollment-delivered pin -> a
-        // previously TOFU'd pin. TOFU persists here for the next run.
-        let pin_store = config_dir.join("relay").join("relay_pin");
-        let relay_pin = cli
-            .relay_pin
-            .clone()
-            .or_else(|| {
-                cached_relay
-                    .map(|r| r.relay_cert_pin.clone())
-                    .filter(|s| !s.is_empty())
-            })
-            .or_else(|| {
-                std::fs::read_to_string(&pin_store)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            });
-
-        let relay = match (relay_addr, relay_node) {
-            (Some(relay_addr), Some(node_id)) => {
-                // Default the relay's expected cert name to its host:port host.
-                let relay_host = cli.relay_host.clone().unwrap_or_else(|| {
-                    relay_addr
-                        .rsplit_once(':')
-                        .map(|(h, _)| h.to_string())
-                        .unwrap_or_else(|| relay_addr.clone())
-                });
-                // Resolve the relay outer-cert trust: explicit flags/remembered pin
-                // win; otherwise offer interactive trust-on-first-use instead of a
-                // bare UnknownIssuer at connect time.
-                let relay_pin =
-                    resolve_relay_trust(relay_pin, &relay_addr, &relay_host, &cli, &pin_store)
-                        .await?;
-                Some(client::RelayDial {
-                    relay_addr,
-                    relay_host,
-                    node_id,
-                    relay_ca_path: cli.relay_ca.clone(),
-                    relay_insecure: cli.relay_insecure,
-                    relay_pin,
-                    relay_tofu: cli.relay_tofu,
-                    pin_store: Some(pin_store.clone()),
-                    outer_client_cert: cli.relay_client_cert.clone(),
-                    outer_client_key: cli.relay_client_key.clone(),
-                })
-            }
-            (None, None) => None,
-            _ => {
-                return Err(anyhow::Error::msg(
-                    "relay routing needs both a relay address and a node-id \
-                     (--relay + --relay-node, or wss.relay_url + wss.relay_node)",
-                ));
-            }
-        };
+        let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
 
         // A WSS route is chosen when a direct address OR a relay is available;
         // otherwise the local IPC socket.
@@ -1009,6 +1033,45 @@ mod connection_tests {
         assert_eq!(resolve_direct_url(None, &cfg), None);
         assert!(cfg.relay_url.is_some() && cfg.relay_node.is_some());
     }
+
+    #[test]
+    fn explicit_relay_enroll_uses_relay_route() {
+        let cli = Cli::parse_from([
+            "zerocode",
+            "--enroll",
+            "--relay",
+            "relay.example:9783",
+            "--relay-node",
+            "node-abc",
+        ]);
+        assert!(should_enroll_via_relay(&cli, &WssSection::default(), true));
+    }
+
+    #[test]
+    fn explicit_enroll_host_keeps_direct_enrollment() {
+        let cli = Cli::parse_from([
+            "zerocode",
+            "--enroll",
+            "--relay",
+            "relay.example:9783",
+            "--relay-node",
+            "node-abc",
+            "--enroll-host",
+            "daemon.example",
+        ]);
+        assert!(!should_enroll_via_relay(&cli, &WssSection::default(), true));
+    }
+
+    #[test]
+    fn relay_only_config_enroll_uses_relay_route() {
+        let cli = Cli::parse_from(["zerocode", "--enroll"]);
+        let cfg = WssSection {
+            relay_url: Some("relay.example:9783".to_string()),
+            relay_node: Some("node-abc".to_string()),
+            ..Default::default()
+        };
+        assert!(should_enroll_via_relay(&cli, &cfg, true));
+    }
 }
 
 #[cfg(test)]
@@ -1183,9 +1246,9 @@ mod confirm_insecure_tls_tests {
     #[test]
     fn abort_arm_of_confirm_match_must_not_call_persist() {
         const MAIN_SRC: &str = include_str!("main.rs");
-        const MATCH_OPEN: &str = "match confirm_insecure_tls(url)? {";
+        const MATCH_OPEN: &str = "match confirm_insecure_tls(&ack_key)? {";
         const ABORT_ARM_LABEL: &str = "InsecureTlsChoice::Abort";
-        const PERSIST_CALL: &str = "persist_wss_route_ack(&local_config_dir, url)?";
+        const PERSIST_CALL: &str = "persist_wss_route_ack(&local_config_dir, &ack_key)?";
 
         let match_open_idx = MAIN_SRC
             .find(MATCH_OPEN)
@@ -1238,7 +1301,7 @@ mod confirm_insecure_tls_tests {
         let abort_arm_body = &match_block[arm_tail_start..match_block.len() - 1];
         assert!(
             !abort_arm_body.contains(PERSIST_CALL),
-            "Abort arm of `match confirm_insecure_tls(url)?` MUST NOT call \
+            "Abort arm of `match confirm_insecure_tls(&ack_key)?` MUST NOT call \
              `{PERSIST_CALL}` — persisting on Abort would silently store an \
              insecure-TLS choice the operator declined. Found in arm body:\n\
              {abort_arm_body}"

@@ -18,12 +18,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use zeroclaw_tls::{ClientKey, CsrSigner, SoftwareP256Signer};
 
 /// The daemon's default enrollment endpoint port (`[enroll].port`).
 pub const DEFAULT_ENROLL_PORT: u16 = 9782;
+/// Inner TLS server name used when the enrollment endpoint is reached through a
+/// relay. The daemon's generated server certificate includes this loopback SAN.
+const RELAY_ENROLL_SERVER_NAME: &str = "127.0.0.1";
 
 /// Relay coordinates the daemon hands back at enrollment.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -58,6 +61,33 @@ pub struct CachedProfile {
 /// on the terminal.
 pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
     eprintln!("Enrolling with the ZeroClaw daemon at {host}:{port} ...");
+    let (code, csr_pem, key_pem) = prepare_enrollment_request()?;
+
+    let resp = post_enroll(host, port, &code, &csr_pem)
+        .await
+        .context("enrollment request failed")?;
+
+    confirm_and_cache(config_dir, &code, &resp, &key_pem)
+}
+
+/// Run the interactive enrollment flow through a nominated relay. The relay only
+/// opens the daemon's narrow enrollment route; the pairing code and CSR are sent
+/// inside the inner enrollment TLS stream.
+pub async fn enroll_via_relay(relay: &crate::client::RelayDial, config_dir: &Path) -> Result<()> {
+    eprintln!(
+        "Enrolling with the ZeroClaw daemon through relay {} -> {} ...",
+        relay.relay_addr, relay.node_id
+    );
+    let (code, csr_pem, key_pem) = prepare_enrollment_request()?;
+
+    let resp = post_enroll_via_relay(relay, &code, &csr_pem)
+        .await
+        .context("relay enrollment request failed")?;
+
+    confirm_and_cache(config_dir, &code, &resp, &key_pem)
+}
+
+fn prepare_enrollment_request() -> Result<(String, String, zeroize::Zeroizing<String>)> {
     let code = prompt_line("Enter the daemon enrollment pairing code: ")?;
     let code = code.trim().to_string();
     if code.is_empty() {
@@ -67,14 +97,18 @@ pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
     // The private key stays here; only the CSR is sent. Desktop generates a
     // software P-256 key; a mobile build swaps in a hardware-keystore CsrSigner.
     let (csr_pem, key_pem) = software_csr("zerocode")?;
+    Ok((code, csr_pem, key_pem))
+}
 
-    let resp = post_enroll(host, port, &code, &csr_pem)
-        .await
-        .context("enrollment request failed")?;
-
+fn confirm_and_cache(
+    config_dir: &Path,
+    code: &str,
+    resp: &EnrollResponse,
+    key_pem: &str,
+) -> Result<()> {
     // Confirm the CA out of band via the short-auth-string before trusting it.
     let ca_fp = ca_fingerprint(&resp.ca_chain_pem)?;
-    let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fp);
+    let sas = zeroclaw_tls::enrollment_sas(code, &ca_fp);
     eprintln!();
     eprintln!("The daemon CA's short-auth-string (SAS) is:");
     eprintln!("    {sas}");
@@ -85,7 +119,7 @@ pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
         anyhow::bail!("SAS not confirmed; enrollment aborted (no certificate was trusted)");
     }
 
-    cache_materials(config_dir, &resp, &key_pem)?;
+    cache_materials(config_dir, resp, key_pem)?;
     eprintln!();
     eprintln!(
         "Enrolled as device {}. Cached the client certificate + daemon CA under {}/tls.",
@@ -181,6 +215,38 @@ pub fn cached_profile(config_dir: &Path) -> Option<CachedProfile> {
 /// POST the CSR to the enrollment endpoint over a provisionally-trusted TLS
 /// connection (trust is confirmed afterwards by the SAS).
 async fn post_enroll(host: &str, port: u16, code: &str, csr_pem: &str) -> Result<EnrollResponse> {
+    let tcp = TcpStream::connect((host, port))
+        .await
+        .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
+    post_enroll_on_stream(tcp, host, host, code, csr_pem).await
+}
+
+async fn post_enroll_via_relay(
+    relay: &crate::client::RelayDial,
+    code: &str,
+    csr_pem: &str,
+) -> Result<EnrollResponse> {
+    let stream = crate::client::dial_enrollment_through_relay(relay).await?;
+    post_enroll_on_stream(
+        stream,
+        RELAY_ENROLL_SERVER_NAME,
+        RELAY_ENROLL_SERVER_NAME,
+        code,
+        csr_pem,
+    )
+    .await
+}
+
+async fn post_enroll_on_stream<S>(
+    stream: S,
+    server_name: &str,
+    host_header: &str,
+    code: &str,
+    csr_pem: &str,
+) -> Result<EnrollResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -191,19 +257,16 @@ async fn post_enroll(host: &str, port: u16, code: &str, csr_pem: &str) -> Result
     .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-    let tcp = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .with_context(|| format!("invalid enrollment host {host}"))?;
+    let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .with_context(|| format!("invalid enrollment TLS server name {server_name}"))?;
     let mut tls = connector
-        .connect(server_name, tcp)
+        .connect(server_name, stream)
         .await
         .context("enrollment TLS handshake")?;
 
     let body = serde_json::json!({ "pairing_code": code, "csr_pem": csr_pem }).to_string();
     let request = format!(
-        "POST /enroll HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /enroll HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );

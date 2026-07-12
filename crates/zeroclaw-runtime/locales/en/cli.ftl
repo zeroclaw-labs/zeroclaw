@@ -947,6 +947,30 @@ cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
 
+# ── daemon mTLS and enrollment operator output ──
+cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
+cli-mtls-issued-cert-path = {"  "}cert: {$path}
+cli-mtls-issued-key-path = {"  "}key:  {$path}
+cli-mtls-issued-ca-path = {"  "}CA:   {$path}
+cli-mtls-dropin-line-1 = Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and zerocode finds
+cli-mtls-dropin-line-3 = {"  "}the material automatically - no --tls-* flags needed.
+cli-mtls-relay-connect-header = Reach this daemon THROUGH its configured relay:
+cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca is the RELAY's CA - copy it from the relay to the client;
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert is the DAEMON's CA, already in the bundle.)
+cli-mtls-direct-connect-header = Connect with zerocode (direct):
+cli-mtls-revoked-certificate = Revoked certificate {$fingerprint}.
+cli-mtls-revoke-no-active-fingerprint = No active certificate with fingerprint {$fingerprint} (already revoked or never issued).
+cli-mtls-revoked-device-certs = Revoked {$count} active certificate(s) for device '{$device}'.
+cli-mtls-revoked-list-updated = Updated {$path}; the daemon refuses the revoked certificate(s) at the next connection.
+cli-mtls-list-no-active-certs = No active client certificates issued by this daemon's CA.
+cli-mtls-list-active-header = Active client certificates ({$count}):
+cli-enroll-endpoint-ready = Enrollment endpoint ready on {$bind}:{$port}. To enroll a client, give it
+cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short-auth-string (SAS)
+cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
+cli-enroll-pairing-code = {"    "}pairing code : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
@@ -960,4 +984,3 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-
