@@ -1148,10 +1148,9 @@ impl QuickstartPane {
     pub fn wants_text_input(&self) -> bool {
         match self.active_modal.as_ref() {
             Some(Modal::TextInput(_)) => true,
-            Some(Modal::FieldForm(f)) => f
-                .fields
-                .get(f.cursor)
-                .is_some_and(|row| field_row_variants(row).is_none()),
+            Some(Modal::FieldForm(f)) => f.fields.get(f.cursor).is_some_and(|row| {
+                field_form_row_visible(f, f.cursor) && field_row_variants(row).is_none()
+            }),
             Some(Modal::Agent(a)) => a.editor.is_some() || a.cursor == 0,
             _ => false,
         }
@@ -1258,7 +1257,8 @@ impl QuickstartPane {
         match modal {
             Modal::TextInput(t) => t.buf.push_str(text),
             Modal::FieldForm(f) => {
-                if let Some(row) = f.fields.get_mut(f.cursor)
+                if field_form_row_visible(f, f.cursor)
+                    && let Some(row) = f.fields.get_mut(f.cursor)
                     && row.descriptor.enum_variants.is_none()
                 {
                     row.buf.push_str(text);
@@ -1380,12 +1380,19 @@ impl QuickstartPane {
             p.cursor = wrapped_selectable_option_index(&p.options, p.cursor, delta);
             return;
         }
+        if let Modal::FieldForm(f) = modal {
+            if delta >= 0 {
+                move_field_form_cursor(f, 1);
+            } else {
+                move_field_form_cursor(f, -1);
+            }
+            return;
+        }
         let (cur, len) = match modal {
-            Modal::FieldForm(f) => (&mut f.cursor, f.fields.len()),
             Modal::ChannelList(cl) => (&mut cl.cursor, self.modal_row_rects.len()),
             Modal::PeerGroupList(pl) => (&mut pl.cursor, self.modal_row_rects.len()),
             Modal::Agent(a) => (&mut a.cursor, self.modal_row_rects.len()),
-            Modal::Picker(_) | Modal::TextInput(_) => return,
+            Modal::Picker(_) | Modal::FieldForm(_) | Modal::TextInput(_) => return,
         };
         if len == 0 {
             return;
@@ -1409,6 +1416,7 @@ impl QuickstartPane {
             Modal::FieldForm(f) => {
                 if idx < f.fields.len() {
                     f.cursor = idx;
+                    normalize_field_form_cursor(f);
                 }
             }
             Modal::ChannelList(cl) => {
@@ -1584,6 +1592,9 @@ impl QuickstartPane {
         };
         use crate::keymap::QuickstartModalAction;
         let action = QuickstartModalAction::from_chord(&key);
+        if let Modal::FieldForm(form) = modal {
+            normalize_field_form_cursor(form);
+        }
         match modal {
             Modal::Picker(p) => match action {
                 Some(QuickstartModalAction::Cancel) => {
@@ -1730,21 +1741,13 @@ impl QuickstartPane {
                             e.step != QuickstartStep::ModelProvider || e.field != "alias"
                         });
                     }
-                    if f.cursor + 1 < f.fields.len() {
-                        f.cursor += 1;
-                    } else {
-                        f.cursor = 0;
-                    }
+                    move_field_form_cursor(f, 1);
                 }
                 Some(QuickstartModalAction::PrevField) | Some(QuickstartModalAction::Up) => {
-                    if f.cursor == 0 {
-                        f.cursor = f.fields.len().saturating_sub(1);
-                    } else {
-                        f.cursor -= 1;
-                    }
+                    move_field_form_cursor(f, -1);
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    if f.cursor + 1 < f.fields.len() {
+                    if !field_form_cursor_is_last_visible(f) {
                         if let Some(error) =
                             current_field_form_duplicate_error(self.state_snapshot.as_ref(), f)
                         {
@@ -1756,7 +1759,7 @@ impl QuickstartPane {
                                 e.step != QuickstartStep::ModelProvider || e.field != "alias"
                             });
                         }
-                        f.cursor += 1;
+                        move_field_form_cursor(f, 1);
                         return;
                     }
                     let selector = f.selector;
@@ -2272,8 +2275,13 @@ impl QuickstartPane {
         let missing: Vec<&str> = f
             .fields
             .iter()
-            .filter(|r| r.descriptor.required && r.buf.trim().is_empty())
-            .map(|r| r.descriptor.key.as_str())
+            .enumerate()
+            .filter(|(index, r)| {
+                field_form_row_visible(f, *index)
+                    && r.descriptor.required
+                    && r.buf.trim().is_empty()
+            })
+            .map(|(_, r)| r.descriptor.key.as_str())
             .collect();
         if !missing.is_empty() {
             self.last_errors = missing
@@ -2309,7 +2317,10 @@ impl QuickstartPane {
                 };
                 let mut provider_fields: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
-                for row in &f.fields {
+                for (index, row) in f.fields.iter().enumerate() {
+                    if !field_form_row_visible(f, index) {
+                        continue;
+                    }
                     // `model` and `alias` are hoisted to FormState
                     // fields; every other descriptor flows through
                     // `provider_fields` keyed by its schema identifier
@@ -2855,6 +2866,56 @@ fn field_row_variants(row: &FieldFormRow) -> Option<&[String]> {
     None
 }
 
+fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
+    matches!(form.selector, Selector::ModelProvider)
+        && form.type_key.trim().eq_ignore_ascii_case("openai")
+        && form.fields.iter().any(|row| {
+            row.descriptor.key == "auth_mode" && row.buf.trim().eq_ignore_ascii_case("codex")
+        })
+}
+
+fn field_form_row_visible(form: &FieldFormModal, index: usize) -> bool {
+    let Some(row) = form.fields.get(index) else {
+        return false;
+    };
+    !(field_form_uses_openai_codex_auth(form) && row.descriptor.key == "api_key")
+}
+
+fn visible_field_form_indices(
+    form: &FieldFormModal,
+) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    (0..form.fields.len()).filter(|index| field_form_row_visible(form, *index))
+}
+
+fn normalize_field_form_cursor(form: &mut FieldFormModal) {
+    if field_form_row_visible(form, form.cursor) {
+        return;
+    }
+    let first_visible = visible_field_form_indices(form).next();
+    if let Some(index) = first_visible {
+        form.cursor = index;
+    }
+}
+
+fn move_field_form_cursor(form: &mut FieldFormModal, delta: i32) {
+    let visible: Vec<usize> = visible_field_form_indices(form).collect();
+    if visible.is_empty() {
+        return;
+    }
+    let current_pos = visible
+        .iter()
+        .position(|index| *index == form.cursor)
+        .unwrap_or(0);
+    let next_pos = (current_pos as i32 + delta).rem_euclid(visible.len() as i32);
+    form.cursor = visible[next_pos as usize];
+}
+
+fn field_form_cursor_is_last_visible(form: &FieldFormModal) -> bool {
+    visible_field_form_indices(form)
+        .next_back()
+        .is_none_or(|index| index == form.cursor)
+}
+
 fn missing_template_error(filename: &str) -> QuickstartError {
     QuickstartError {
         step: QuickstartStep::Agent,
@@ -2957,6 +3018,10 @@ fn draw_modal(
             ]));
             lines.push(Line::from(""));
             for (i, row) in f.fields.iter().enumerate() {
+                if !field_form_row_visible(f, i) {
+                    cursor_lines.push(usize::MAX);
+                    continue;
+                }
                 cursor_lines.push(lines.len());
                 let is_cursor = i == f.cursor;
                 let glyph = if is_cursor { " › " } else { "   " };
@@ -3373,7 +3438,10 @@ fn draw_modal(
     // maps it into wrapped-row space so the scroll math survives wrapping.
     let selected_line = match modal {
         Modal::Picker(p) => cursor_lines.get(p.cursor).copied(),
-        Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
+        Modal::FieldForm(f) => cursor_lines
+            .get(f.cursor)
+            .copied()
+            .filter(|line| *line != usize::MAX),
         Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
         Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
         Modal::Agent(a) => {
@@ -3439,6 +3507,9 @@ fn draw_modal(
     let row_rects: Vec<Rect> = cursor_lines
         .into_iter()
         .map(|line_idx| {
+            if line_idx == usize::MAX {
+                return Rect::new(0, 0, 0, 0);
+            }
             let start = row_starts.get(line_idx).copied().unwrap_or(0);
             let height = body_heights.get(line_idx).copied().unwrap_or(1).max(1);
             match start.checked_sub(scroll_offset) {
@@ -3870,6 +3941,73 @@ mod tests {
         assert_eq!(rows[2].descriptor.key, "api_key");
         assert_eq!(rows[2].buf, "sk-test-value-that-is-long-enough-to-wrap");
         assert!(masked_secret(&rows[2].buf).contains("(+"));
+    }
+
+    #[test]
+    fn openai_codex_auth_hides_api_key_row_in_tui_form() {
+        let fields = vec![
+            QuickstartFieldDescriptor {
+                key: "model".into(),
+                label: "model".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: false,
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            QuickstartFieldDescriptor {
+                key: "auth_mode".into(),
+                label: "Authentication".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::Enum,
+                is_secret: false,
+                enum_variants: Some(vec!["api_key".into(), "codex".into()]),
+                required: true,
+                default: Some("codex".into()),
+            },
+            QuickstartFieldDescriptor {
+                key: "api_key".into(),
+                label: "api_key".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: true,
+                enum_variants: None,
+                required: false,
+                default: None,
+            },
+        ];
+        let mut form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openai".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::Empty,
+            model_catalog_attempts: 0,
+            fields: build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None),
+            cursor: 2,
+        };
+
+        let keys: Vec<&str> = visible_field_form_indices(&form)
+            .map(|index| form.fields[index].descriptor.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["alias", "model", "auth_mode"]);
+
+        move_field_form_cursor(&mut form, 1);
+        assert_eq!(
+            form.fields[form.cursor].descriptor.key, "alias",
+            "next from auth_mode must skip the hidden api_key row"
+        );
+
+        let auth_mode = form
+            .fields
+            .iter_mut()
+            .find(|row| row.descriptor.key == "auth_mode")
+            .expect("auth_mode row");
+        auth_mode.buf = "api_key".into();
+        let keys: Vec<&str> = visible_field_form_indices(&form)
+            .map(|index| form.fields[index].descriptor.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["alias", "model", "auth_mode", "api_key"]);
     }
 
     #[test]

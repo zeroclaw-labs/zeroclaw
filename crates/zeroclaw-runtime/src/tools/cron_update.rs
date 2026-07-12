@@ -6,7 +6,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronUpdateTool {
@@ -33,7 +33,7 @@ impl CronUpdateTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
@@ -43,7 +43,7 @@ impl CronUpdateTool {
         if self.security.is_rate_limited() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
             });
         }
@@ -51,7 +51,7 @@ impl CronUpdateTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
             });
         }
@@ -202,7 +202,7 @@ impl Tool for CronUpdateTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
@@ -212,7 +212,7 @@ impl Tool for CronUpdateTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
                 });
             }
@@ -224,7 +224,7 @@ impl Tool for CronUpdateTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(e.to_string()),
                     });
                 }
@@ -236,7 +236,7 @@ impl Tool for CronUpdateTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'patch' parameter".to_string()),
                 });
             }
@@ -247,7 +247,7 @@ impl Tool for CronUpdateTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error),
                 });
             }
@@ -270,12 +270,12 @@ impl Tool for CronUpdateTool {
         ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&cron_job_output(&job)?)?,
+                output: serde_json::to_string_pretty(&cron_job_output(&job)?)?.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }

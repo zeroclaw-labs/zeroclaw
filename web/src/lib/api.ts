@@ -428,6 +428,12 @@ export interface ListResponseEntry {
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
+  /**
+   * Surface hint from the schema's `#[multiline]` attribute: render a
+   * multi-line text area (e.g. a PEM key body) instead of a single-line
+   * input. Absent/false on single-line fields.
+   */
+  multiline?: boolean;
 }
 
 export interface DriftEntry {
@@ -2071,6 +2077,33 @@ export function getChannels(): Promise<ChannelDetail[]> {
   ).then((data) => {
     const result = unwrapField(data, "channels");
     return Array.isArray(result) ? result : [];
+  });
+}
+
+export interface BindChannelRequest {
+  channel_type: string;
+  alias: string;
+  identity: string;
+}
+
+export interface BindChannelResponse {
+  saved: boolean;
+  already_bound?: boolean;
+  group?: string;
+  channel?: string;
+}
+
+/**
+ * Authorize an inbound identity on a pairing channel (telegram/wechat/line)
+ * — the GUI equivalent of `zeroclaw channel bind-<type> <id> --alias <alias>`.
+ * The bound user can message the bot immediately, with no `/bind` round trip.
+ */
+export function bindChannelIdentity(
+  body: BindChannelRequest,
+): Promise<BindChannelResponse> {
+  return apiFetch<BindChannelResponse>("/api/channels/bind", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 

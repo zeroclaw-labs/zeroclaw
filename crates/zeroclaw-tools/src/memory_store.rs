@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_memory::{Memory, MemoryCategory};
@@ -88,7 +88,7 @@ impl Tool for MemoryStoreTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -96,12 +96,12 @@ impl Tool for MemoryStoreTool {
         match self.memory.store(key, content, category, None).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Stored memory: {key}"),
+                output: format!("Stored memory: {key}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to store memory: {e}")),
             }),
         }

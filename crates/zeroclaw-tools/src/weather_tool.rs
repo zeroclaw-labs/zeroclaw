@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 const WTTR_BASE_URL: &str = "https://wttr.in";
 const WTTR_TIMEOUT_SECS: u64 = 15;
@@ -411,7 +411,7 @@ impl Tool for WeatherTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter 'location'".into()),
                 });
             }
@@ -434,13 +434,13 @@ impl Tool for WeatherTool {
                 let output = Self::format_output(&data, metric, days);
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }

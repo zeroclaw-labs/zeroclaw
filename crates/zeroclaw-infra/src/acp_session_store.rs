@@ -302,19 +302,62 @@ impl AcpSessionStore {
     /// Killed rows keep their transcript for history/export but are terminal
     /// for runtime restore paths.
     pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
-        if self.is_session_killed(session_uuid)? {
+        let conn = self.conn.lock();
+
+        let row = conn.query_row(
+            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+             FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        );
+
+        let (
+            session_id,
+            agent_alias,
+            workspace_dir,
+            token_count,
+            created_at_s,
+            last_activity_s,
+            killed_at,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
+            Err(e) => return Err(e).context("Failed to query ACP session for restore"),
+        };
+
+        if killed_at.is_some() {
             return Ok(AcpSessionRestore::Killed);
         }
 
-        match self.load_session(session_uuid)? {
-            Some(data) => Ok(AcpSessionRestore::Restorable(data)),
-            None => Ok(AcpSessionRestore::Missing),
-        }
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let messages = Self::load_messages(&conn, session_id)?;
+
+        Ok(AcpSessionRestore::Restorable(AcpSessionData {
+            session_uuid: session_uuid.to_string(),
+            agent_alias,
+            workspace_dir,
+            token_count: token_count.max(0) as u64,
+            created_at,
+            last_activity,
+            messages,
+        }))
     }
 
-    /// List all sessions as lightweight summaries, ordered by most recent
+    /// List restorable sessions as lightweight summaries, ordered by most recent
     /// activity first. This is the picker-facing read: it avoids the full
-    /// message-history hydration that `load_session` performs.
+    /// message-history hydration that `load_session` performs. Killed rows keep
+    /// history/export data but are terminal and must not be offered for restore.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
         let conn = self.conn.lock();
         let mut stmt = conn
@@ -327,6 +370,7 @@ impl AcpSessionStore {
                         s.last_activity,
                         (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
                  FROM acp_sessions s
+                 WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
             )
             .context("Failed to prepare ACP session list query")?;
@@ -1396,6 +1440,23 @@ mod tests {
     fn list_sessions_empty_when_no_sessions() {
         let (_tmp, store) = open_store();
         assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_omits_killed_sessions() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-live", "alpha", "/tmp/live")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .create_session("sess-killed", "alpha", "/tmp/killed")
+            .unwrap();
+        store.mark_session_killed("sess-killed").unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_uuid, "sess-live");
     }
 
     #[test]
