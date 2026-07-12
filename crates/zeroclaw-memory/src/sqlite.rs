@@ -736,6 +736,18 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::fts5_search_for_session(conn, query, limit, None)
+    }
+
+    /// FTS5 BM25 search constrained to the rows a live vector-stage recall
+    /// may return for a session. Applying this predicate inside FTS keeps
+    /// excluded rows out of BM25 ranking, limiting, and normalization.
+    fn fts5_search_for_session(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
             .split_whitespace()
@@ -747,18 +759,42 @@ impl SqliteMemory {
             return Ok(Vec::new());
         }
 
-        let sql = "SELECT m.id, bm25(memories_fts) as score
-                   FROM memories_fts f
-                   JOIN memories m ON m.rowid = f.rowid
-                   WHERE memories_fts MATCH ?1
-                   ORDER BY score
-                   LIMIT ?2";
+        let mut sql = "SELECT m.id, bm25(memories_fts) as score
+                       FROM memories_fts f
+                       JOIN memories m ON m.rowid = f.rowid
+                       WHERE memories_fts MATCH ?1"
+            .to_string();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(fts_query)];
+        let mut param_idx = 2;
 
-        let mut stmt = conn.prepare(sql)?;
+        if let Some(sid) = session_id {
+            let category_placeholders = Self::DURABLE_GLOBAL_CATEGORIES
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| format!("?{}", param_idx + 1 + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                sql,
+                " AND (m.session_id = ?{param_idx} OR \
+                 (m.session_id IS NULL AND m.category IN ({category_placeholders})))"
+            );
+            param_values.push(Box::new(sid.to_string()));
+            for category in &Self::DURABLE_GLOBAL_CATEGORIES {
+                param_values.push(Box::new(Self::category_to_str(category)));
+            }
+            param_idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+        }
+
+        let _ = write!(sql, " ORDER BY score LIMIT ?{param_idx}");
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
+        param_values.push(Box::new(limit_i64));
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(AsRef::as_ref).collect();
 
-        let rows = stmt.query_map(params![fts_query, limit_i64], |row| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let id: String = row.get(0)?;
             let score: f64 = row.get(1)?;
             // BM25 returns negative scores (lower = better), negate for ranking
@@ -1085,6 +1121,9 @@ impl Memory for SqliteMemory {
             // FTS5 BM25 keyword search (skip for embedding-only mode)
             let keyword_results = if search_mode == SearchMode::Embedding {
                 Vec::new()
+            } else if vector_live {
+                Self::fts5_search_for_session(&conn, &query, limit * 2, session_ref)
+                    .unwrap_or_default()
             } else {
                 Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
             };
@@ -3129,6 +3168,50 @@ mod tests {
         (tmp, mem)
     }
 
+    /// Deterministic test embedder for a keyword-only result alongside an
+    /// unrelated weak vector-only result.
+    struct MissingModalityEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for MissingModalityEmbedding {
+        fn name(&self) -> &str {
+            "missing-modality"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if *text == "needle query-axis" {
+                        vec![1.0, 0.0]
+                    } else if text.contains("weak-vector") {
+                        vec![0.1, 0.994_987_4]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn temp_sqlite_missing_modality() -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(MissingModalityEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
     /// Repro shape from the 2026-07-09 injection-scope finding: with
     /// embeddings live, a session-scoped recall (what per-turn injection
     /// issues) must surface a global core fact written outside the session,
@@ -3386,6 +3469,57 @@ mod tests {
         assert!(
             hits.iter().all(|e| (0.0..=1.0).contains(&e.score.unwrap())),
             "normalized keyword scores must stay on the [0, 1] axis"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_only_score_survives_a_weak_vector_only_candidate() {
+        let (_tmp, mem) = temp_sqlite_missing_modality();
+        mem.store(
+            "exact_keyword",
+            "needle exact-keyword",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let without_vector = mem
+            .recall("needle query-axis", 10, None, None, None)
+            .await
+            .unwrap();
+        let baseline = without_vector
+            .iter()
+            .find(|entry| entry.key == "exact_keyword")
+            .and_then(|entry| entry.score)
+            .expect("the FTS candidate must be recalled without vector candidates");
+        assert!((baseline - 1.0).abs() < 1e-6);
+
+        mem.store(
+            "weak_vector",
+            "weak-vector semantic-only",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let with_vector = mem
+            .recall("needle query-axis", 10, None, None, None)
+            .await
+            .unwrap();
+        let score = with_vector
+            .iter()
+            .find(|entry| entry.key == "exact_keyword")
+            .and_then(|entry| entry.score)
+            .expect("the FTS candidate must survive alongside a weak vector candidate");
+        assert!(
+            (score - baseline).abs() < 1e-6,
+            "a missing vector modality must not reduce an FTS-only score: baseline={baseline}, with_vector={score}"
+        );
+        assert!(
+            score >= 0.4,
+            "the FTS-only candidate must remain above the default relevance floor, got {score}"
         );
     }
 
