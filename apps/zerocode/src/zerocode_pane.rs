@@ -374,9 +374,7 @@ impl ZerocodePane {
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.conn_edit.is_some()
-            || self.tracker_edit.is_some()
-            || self.queue_edit.is_some()
+        self.conn_edit.is_some() || self.tracker_edit.is_some() || self.queue_edit.is_some()
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -832,12 +830,18 @@ impl ZerocodePane {
 
     fn tracker_field_value(&self, field: TrackerField) -> String {
         match field {
-            TrackerField::Enabled => {
-                if self.tracker.enabled { "true" } else { "false" }.to_string()
+            TrackerField::Enabled => if self.tracker.enabled {
+                "true"
+            } else {
+                "false"
             }
-            TrackerField::EnabledAtStart => {
-                if self.tracker.enabled_at_start { "true" } else { "false" }.to_string()
+            .to_string(),
+            TrackerField::EnabledAtStart => if self.tracker.enabled_at_start {
+                "true"
+            } else {
+                "false"
             }
+            .to_string(),
             TrackerField::Location => match self.tracker.location {
                 config::TodoTrackerLocation::Bottom => "bottom",
                 config::TodoTrackerLocation::Left => "left",
@@ -928,12 +932,18 @@ impl ZerocodePane {
             QueueField::MinWidth => self.queue.min_width.to_string(),
             QueueField::MaxWidth => self.queue.max_width.to_string(),
             QueueField::WidthStep => self.queue.width_step.to_string(),
-            QueueField::AutoOpen => {
-                if self.queue.auto_open { "true" } else { "false" }.to_string()
+            QueueField::AutoOpen => if self.queue.auto_open {
+                "true"
+            } else {
+                "false"
             }
-            QueueField::StayOpenWhenEmpty => {
-                if self.queue.stay_open_when_empty { "true" } else { "false" }.to_string()
+            .to_string(),
+            QueueField::StayOpenWhenEmpty => if self.queue.stay_open_when_empty {
+                "true"
+            } else {
+                "false"
             }
+            .to_string(),
         }
     }
 

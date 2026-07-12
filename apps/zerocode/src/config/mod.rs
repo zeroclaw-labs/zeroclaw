@@ -807,24 +807,31 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     let existing = table[*leaf].clone();
     let new_value = match existing {
         toml::Value::String(_) => toml::Value::String(value.to_string()),
-        toml::Value::Boolean(_) => toml::Value::Boolean(value.parse().with_context(|| {
-            format!("failed to parse '{value}' as bool for {path}")
-        })?),
-        toml::Value::Integer(_) => toml::Value::Integer(value.parse().with_context(|| {
-            format!("failed to parse '{value}' as integer for {path}")
-        })?),
-        toml::Value::Float(_) => toml::Value::Float(value.parse().with_context(|| {
-            format!("failed to parse '{value}' as float for {path}")
-        })?),
+        toml::Value::Boolean(_) => toml::Value::Boolean(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as bool for {path}"))?,
+        ),
+        toml::Value::Integer(_) => toml::Value::Integer(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as integer for {path}"))?,
+        ),
+        toml::Value::Float(_) => toml::Value::Float(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as float for {path}"))?,
+        ),
         toml::Value::Array(_) => {
-            let parsed: Vec<toml::Value> = toml::from_str(value).with_context(|| {
-                format!("failed to parse '{value}' as array for {path}")
-            })?;
+            let parsed: Vec<toml::Value> = toml::from_str(value)
+                .with_context(|| format!("failed to parse '{value}' as array for {path}"))?;
             toml::Value::Array(parsed)
         }
-        toml::Value::Datetime(_) => toml::Value::Datetime(value.parse().with_context(|| {
-            format!("failed to parse '{value}' as datetime for {path}")
-        })?),
+        toml::Value::Datetime(_) => toml::Value::Datetime(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as datetime for {path}"))?,
+        ),
         toml::Value::Table(_) => {
             anyhow::bail!("cannot set a table field via set_prop: {path}")
         }
@@ -1315,8 +1322,7 @@ mod tests {
             dir.path(),
             "[todotracker]\nenabled = true\nwidth = 32\n\n[theme]\nname = \"nord\"\n",
         );
-        persist_todotracker_field(dir.path(), "width", toml::Value::Integer(50))
-            .unwrap();
+        persist_todotracker_field(dir.path(), "width", toml::Value::Integer(50)).unwrap();
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(true));
         assert_eq!(doc["todotracker"]["width"].as_integer(), Some(50));
@@ -1407,8 +1413,7 @@ mod tests {
             dir.path(),
             "[message_queue]\ncap = 32\ndefault_width = 36\n\n[theme]\nname = \"nord\"\n",
         );
-        persist_message_queue_field(dir.path(), "cap", toml::Value::Integer(128))
-            .unwrap();
+        persist_message_queue_field(dir.path(), "cap", toml::Value::Integer(128)).unwrap();
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(128));
         assert_eq!(doc["message_queue"]["default_width"].as_integer(), Some(36));

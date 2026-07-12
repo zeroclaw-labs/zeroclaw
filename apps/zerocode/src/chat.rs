@@ -4772,9 +4772,6 @@ pub struct ChatState {
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
-    /// Local UI settings for the TodoWrite tracker (width, location, etc.).
-    /// Retained across session resets.
-    pub(crate) todo_tracker_settings: crate::todo_tracker::TodoTrackerSettings,
     /// Local UI settings for the message queue (cap, widths, auto-open, etc.).
     /// Retained across session resets.
     pub(crate) message_queue_settings: crate::config::MessageQueueSettings,
@@ -4846,7 +4843,6 @@ impl ChatState {
             info_message: None,
             model_picker: ModelPickerOverlay::None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
-            todo_tracker_settings: todo_settings,
             message_queue_settings: queue_settings,
         }
     }
@@ -5646,10 +5642,6 @@ impl ChatState {
         self.turn_started_at = Instant::now();
     }
 
-    const QUEUE_CAP: usize = 32;
-    const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
-    const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
-    const QUEUE_SIDEBAR_COLS_STEP: u16 = 4;
     const QUEUE_CHAT_COLS_MIN: u16 = 20;
 
     fn alloc_queue_id(&mut self) -> u64 {
@@ -5667,10 +5659,10 @@ impl ChatState {
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         let pending = self.message_queue.len();
-        if pending >= Self::QUEUE_CAP {
+        if pending >= self.message_queue_settings.cap {
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
+                &[("cap", &self.message_queue_settings.cap.to_string())],
             ));
         }
         let id = self.alloc_queue_id();
@@ -5691,10 +5683,10 @@ impl ChatState {
         if text.trim().is_empty() && attachments.is_empty() {
             return Err(crate::i18n::t("zc-queue-empty"));
         }
-        if self.message_queue.len() >= Self::QUEUE_CAP {
+        if self.message_queue.len() >= self.message_queue_settings.cap {
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
+                &[("cap", &self.message_queue_settings.cap.to_string())],
             ));
         }
         let id = self.alloc_queue_id();
@@ -5789,11 +5781,11 @@ impl ChatState {
         }
     }
 
-    /// The queue sidebar is open exactly when the queue is non-empty. There is
-    /// no manual toggle: it appears with the first queued message and closes
-    /// when the queue drains, so its presence always reflects real state.
+    /// The queue sidebar is open when auto_open is enabled and either the
+    /// queue has items or stay_open_when_empty is set.
     pub fn queue_sidebar_open(&self) -> bool {
-        !self.message_queue.is_empty()
+        let s = self.message_queue_settings;
+        s.auto_open && (!self.message_queue.is_empty() || s.stay_open_when_empty)
     }
 
     /// Default the sidebar selection to the front item when nothing is selected
@@ -5850,16 +5842,17 @@ impl ChatState {
     }
 
     pub fn widen_queue_sidebar(&mut self) {
-        self.queue_sidebar_cols = (self.queue_sidebar_cols + Self::QUEUE_SIDEBAR_COLS_STEP)
-            .min(Self::QUEUE_SIDEBAR_COLS_MAX);
+        self.queue_sidebar_cols = (self.queue_sidebar_cols
+            + self.message_queue_settings.width_step)
+            .min(self.message_queue_settings.max_width);
         self.mark_dirty_full();
     }
 
     pub fn narrow_queue_sidebar(&mut self) {
         self.queue_sidebar_cols = self
             .queue_sidebar_cols
-            .saturating_sub(Self::QUEUE_SIDEBAR_COLS_STEP)
-            .max(Self::QUEUE_SIDEBAR_COLS_MIN);
+            .saturating_sub(self.message_queue_settings.width_step)
+            .max(self.message_queue_settings.min_width);
         self.mark_dirty_full();
     }
 
@@ -5867,9 +5860,11 @@ impl ChatState {
     /// column width is clamped to the absolute range, then to whatever leaves
     /// the chat column its floor on a terminal too narrow for both.
     pub fn queue_sidebar_width(&self, area_width: u16) -> u16 {
-        let upper =
-            Self::QUEUE_SIDEBAR_COLS_MAX.min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
-        let lower = Self::QUEUE_SIDEBAR_COLS_MIN.min(upper);
+        let s = self.message_queue_settings;
+        let upper = s
+            .max_width
+            .min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
+        let lower = s.min_width.min(upper);
         self.queue_sidebar_cols.clamp(lower, upper)
     }
 
@@ -8091,7 +8086,8 @@ mod tests {
     fn queue_cap_enforced() {
         let mut s = state();
         s.turn_in_flight = true;
-        for i in 0..ChatState::QUEUE_CAP {
+        let cap = s.message_queue_settings.cap;
+        for i in 0..cap {
             s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
         }
         assert!(
@@ -8132,11 +8128,11 @@ mod tests {
         for _ in 0..40 {
             s.widen_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MAX);
+        assert_eq!(s.queue_sidebar_cols, s.message_queue_settings.max_width);
         for _ in 0..40 {
             s.narrow_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MIN);
+        assert_eq!(s.queue_sidebar_cols, s.message_queue_settings.min_width);
     }
 
     #[test]
@@ -8157,7 +8153,7 @@ mod tests {
         let s = state();
         let wide = s.queue_sidebar_width(400);
         assert!(
-            wide <= ChatState::QUEUE_SIDEBAR_COLS_MAX,
+            wide <= s.message_queue_settings.max_width,
             "sidebar exceeded absolute column cap"
         );
         // Narrow terminal: chat column keeps its minimum, sidebar shrinks.
