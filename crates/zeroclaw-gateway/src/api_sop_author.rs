@@ -420,8 +420,8 @@ pub async fn handle_sop_decide(
         match status {
             Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
                 use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
-                // EPIC G: route through the broker (membership + quorum), NOT
-                // `resolve_gate` directly - otherwise this authoring surface would
+                // Route through the broker (membership + quorum), not `resolve_gate`
+                // directly, otherwise this authoring surface would
                 // clear a policied approval gate without enforcing group membership or
                 // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
                 match guard.resolve_via_broker(&run_id, decision, principal) {
