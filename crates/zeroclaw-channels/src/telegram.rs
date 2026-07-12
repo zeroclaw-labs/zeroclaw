@@ -1084,7 +1084,7 @@ impl TelegramChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
-                        "telegram_max_bot_commands": TELEGRAM_MAX_BOT_COMMANDS,
+                        "TELEGRAM_MAX_BOT_COMMANDS": TELEGRAM_MAX_BOT_COMMANDS,
                         "total_before_cap": total_before_cap,
                         "registered": registered,
                     })),
@@ -8043,7 +8043,7 @@ mod tests {
             "last registered command must be the 94th tool (built-ins + 94 tools = 100)"
         );
 
-        // Verify the WARN message renders the actual counts, not literal braces.
+        // Verify the WARN event: rendered message, structured attributes, and known keys.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut found_warn = false;
         while !found_warn && std::time::Instant::now() < deadline {
@@ -8058,6 +8058,29 @@ mod tests {
                         .unwrap_or(false)
                     {
                         found_warn = true;
+                        // Pin the structured attribute keys and values so that
+                        // a silent rename or schema drift is caught.
+                        let attrs = value.get("attributes");
+                        assert!(
+                            attrs.is_some(),
+                            "WARN event must carry structured attributes"
+                        );
+                        let attrs = attrs.unwrap();
+                        assert_eq!(
+                            attrs.get("TELEGRAM_MAX_BOT_COMMANDS").and_then(|v| v.as_u64()),
+                            Some(TELEGRAM_MAX_BOT_COMMANDS as u64),
+                            "structured attribute TELEGRAM_MAX_BOT_COMMANDS"
+                        );
+                        assert_eq!(
+                            attrs.get("total_before_cap").and_then(|v| v.as_u64()),
+                            Some(107),
+                            "structured attribute total_before_cap"
+                        );
+                        assert_eq!(
+                            attrs.get("registered").and_then(|v| v.as_u64()),
+                            Some(100),
+                            "structured attribute registered"
+                        );
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
