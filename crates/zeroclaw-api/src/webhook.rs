@@ -10,7 +10,7 @@
 //! decodes + authenticates it inside its own `parse-webhook` export.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -53,7 +53,7 @@ impl PluginWebhookRegistry {
     /// a duplicate path is rejected (returns `false`) so two plugins can't claim
     /// one route.
     pub fn insert(&self, path: String, sink: mpsc::Sender<RawWebhook>) -> bool {
-        let mut routes = self.routes.lock().expect("webhook registry poisoned");
+        let mut routes = self.lock_routes();
         if routes.contains_key(&path) {
             return false;
         }
@@ -63,10 +63,38 @@ impl PluginWebhookRegistry {
 
     /// The sink for `path`, if any plugin serves it.
     pub fn get(&self, path: &str) -> Option<mpsc::Sender<RawWebhook>> {
-        self.routes
-            .lock()
-            .expect("webhook registry poisoned")
-            .get(path)
-            .cloned()
+        self.lock_routes().get(path).cloned()
+    }
+
+    fn lock_routes(&self) -> MutexGuard<'_, HashMap<String, mpsc::Sender<RawWebhook>>> {
+        match self.routes.lock() {
+            Ok(routes) => routes,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PluginWebhookRegistry;
+
+    #[test]
+    fn registry_recovers_after_a_poisoned_lock() {
+        let registry = PluginWebhookRegistry::new();
+        let poison_target = registry.clone();
+        let poisoner = std::thread::spawn(move || {
+            let routes = poison_target
+                .routes
+                .lock()
+                .expect("test obtains registry lock");
+            assert!(routes.is_empty());
+            panic!("poison registry for recovery test");
+        });
+        assert!(poisoner.join().is_err());
+
+        let (sink, receiver) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+        assert!(registry.get("fixture").is_some());
+        drop(receiver);
     }
 }
