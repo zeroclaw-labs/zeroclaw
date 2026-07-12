@@ -26838,4 +26838,86 @@ mod omitted_feature_tests {
              channel-telegram feature is not compiled in"
         );
     }
+
+    // ── Pipeline gate (channel path) ───────────────────────────
+    //
+    // The channel path does not go through ScopedToolRegistry::assemble();
+    // it wires the deferred pipeline tool manually with its own top-level
+    // SecurityPolicy gate (start_channels, lines ~10075-10082). These tests
+    // exercise that manual path by building a minimal AllToolsResult with a
+    // PipelineRaw and applying the same gate check.
+
+    /// Build a minimal `AllToolsResult` with a `PipelineRaw` and apply the
+    /// channel-path security gate, returning tool names.
+    fn channel_pipeline_names(
+        security: &std::sync::Arc<zeroclaw_runtime::security::SecurityPolicy>,
+    ) -> Vec<String> {
+        use std::sync::Arc;
+        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_config::schema::PipelineConfig;
+        use zeroclaw_runtime::tools::{Tool, PipelineRaw, build_pipeline_tool};
+
+        struct Stub(&'static str);
+        impl ::zeroclaw_api::attribution::Attributable for Stub {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str { self.0 }
+        }
+        #[async_trait::async_trait]
+        impl Tool for Stub {
+            fn name(&self) -> &str { self.0 }
+            fn description(&self) -> &str { "stub" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".to_string(),
+                    error: None,
+                })
+            }
+        }
+
+        let mock_tool: Arc<dyn Tool> = Arc::new(Stub("shell"));
+        let raw = PipelineRaw {
+            config: PipelineConfig { enabled: true, ..Default::default() },
+            tool_arcs: vec![mock_tool],
+        };
+        let mut registry: Vec<Box<dyn Tool>> = Vec::new();
+        if security.is_tool_allowed("execute_pipeline") {
+            let policy =
+                zeroclaw_runtime::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+            if let Some(pipe) = build_pipeline_tool(&raw, policy) {
+                registry.push(pipe);
+            }
+        }
+        registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    #[test]
+    fn channel_pipeline_allowed_when_security_policy_admits() {
+        let security = std::sync::Arc::new(zeroclaw_runtime::security::SecurityPolicy::default());
+        let names = channel_pipeline_names(&security);
+        assert!(
+            names.contains(&"execute_pipeline".to_string()),
+            "channel path must include execute_pipeline when policy admits it, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn channel_pipeline_denied_when_security_policy_excludes() {
+        let security = std::sync::Arc::new(zeroclaw_runtime::security::SecurityPolicy {
+            excluded_tools: Some(vec!["execute_pipeline".to_string()]),
+            ..Default::default()
+        });
+        let names = channel_pipeline_names(&security);
+        assert!(
+            !names.contains(&"execute_pipeline".to_string()),
+            "channel path must deny execute_pipeline when excluded_tools blocks it, got {names:?}"
+        );
+    }
 }

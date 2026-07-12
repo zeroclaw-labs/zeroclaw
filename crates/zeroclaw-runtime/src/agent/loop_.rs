@@ -15792,15 +15792,17 @@ Let me check the result."#;
 
     // ── execute_pipeline top-level gate ───────────────────────────
     //
-    // Audacity88 review blocker: the deferred construction moved
-    // PipelineTool after apply_policy_tool_filter, so the top-level
-    // execute_pipeline tool name was never gated. The fix is a
-    // security.is_tool_allowed("execute_pipeline") check before
-    // build_pipeline_tool. These tests prove the gate works and fail
-    // when it is removed.
+    // The deferred construction moved PipelineTool after
+    // apply_policy_tool_filter, so the top-level execute_pipeline
+    // tool name must be gated by both the SecurityPolicy and the
+    // caller-supplied allowlist. These tests exercise
+    // ScopedToolRegistry::assemble() — the one production seam — so
+    // removing the gate from the assembly boundary fails these tests.
 
-    #[test]
-    fn execute_pipeline_denied_when_not_in_allowed_tools() {
+    async fn assemble_with_pipeline(
+        policy: TestPolicy,
+        caller_allowed: Option<&[String]>,
+    ) -> Vec<String> {
         let mut config = zeroclaw_config::schema::Config::default();
         config.pipeline.enabled = true;
         let security = Arc::new(TestPolicy {
@@ -15811,208 +15813,90 @@ Let me check the result."#;
         let mem: Arc<dyn zeroclaw_memory::Memory> =
             Arc::new(zeroclaw_memory::NoneMemory::new("test"));
 
+        let all = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        );
+
+        let policy_arc = Arc::new(policy);
+        let out = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "test",
+                security: &policy_arc,
+                built: all,
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+            },
+        )
+        .await;
+        out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn execute_pipeline_denied_when_not_in_allowed_tools() {
         let policy = TestPolicy {
             allowed_tools: Some(vec!["file_read".into()]),
             ..TestPolicy::default()
         };
-
-        let all = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        );
-
-        let mut registry = all.tools;
-        if let Some(ref raw) = all.pipeline_raw
-            && policy.is_tool_allowed("execute_pipeline")
-        {
-            let access = super::mcp_tool_access_policy(&policy, None);
-            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
-                registry.push(pipe);
-            }
-        }
-
-        let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
+        let names = assemble_with_pipeline(policy, None).await;
         assert!(
-            !names.contains(&"execute_pipeline"),
+            !names.contains(&"execute_pipeline".to_string()),
             "execute_pipeline must be denied when not in allowed_tools, got {names:?}"
         );
     }
 
-    #[test]
-    fn execute_pipeline_denied_when_in_excluded_tools() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.pipeline.enabled = true;
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
-
+    #[tokio::test]
+    async fn execute_pipeline_denied_when_in_excluded_tools() {
         let policy = TestPolicy {
             excluded_tools: Some(vec!["execute_pipeline".into()]),
             ..TestPolicy::default()
         };
-
-        let all = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        );
-
-        let mut registry = all.tools;
-        if let Some(ref raw) = all.pipeline_raw
-            && policy.is_tool_allowed("execute_pipeline")
-        {
-            let access = super::mcp_tool_access_policy(&policy, None);
-            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
-                registry.push(pipe);
-            }
-        }
-
-        let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
+        let names = assemble_with_pipeline(policy, None).await;
         assert!(
-            !names.contains(&"execute_pipeline"),
+            !names.contains(&"execute_pipeline".to_string()),
             "execute_pipeline must be denied when in excluded_tools, got {names:?}"
         );
     }
 
-    #[test]
-    fn execute_pipeline_allowed_when_policy_admits_it() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.pipeline.enabled = true;
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
-
-        // Unrestricted policy must admit execute_pipeline when
-        // the pipeline config is enabled.
+    #[tokio::test]
+    async fn execute_pipeline_allowed_when_policy_admits_it() {
         let policy = TestPolicy::default();
-
-        let all = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        );
-
-        let mut registry = all.tools;
-        if let Some(ref raw) = all.pipeline_raw
-            && policy.is_tool_allowed("execute_pipeline")
-        {
-            let access = super::mcp_tool_access_policy(&policy, None);
-            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
-                registry.push(pipe);
-            }
-        }
-
-        let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
+        let names = assemble_with_pipeline(policy, None).await;
         assert!(
-            names.contains(&"execute_pipeline"),
+            names.contains(&"execute_pipeline".to_string()),
             "execute_pipeline must be present when policy admits it, got {names:?}"
         );
     }
 
-    #[test]
-    fn execute_pipeline_denied_when_caller_allowed_tools_omits_it() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.pipeline.enabled = true;
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
-
-        // SecurityPolicy admits execute_pipeline (unrestricted default),
-        // but the caller-supplied allowed_tools narrows to file_read only.
+    #[tokio::test]
+    async fn execute_pipeline_denied_when_caller_allowed_tools_omits_it() {
         let policy = TestPolicy::default();
-        let caller_allowed: Option<Vec<String>> = Some(vec!["file_read".into()]);
-
-        let all = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        );
-
-        let mut registry = all.tools;
-        if let Some(ref raw) = all.pipeline_raw
-            && policy.is_tool_allowed("execute_pipeline")
-            && caller_allowed
-                .as_deref()
-                .is_none_or(|v| v.iter().any(|t| t == "execute_pipeline"))
-        {
-            let access = super::mcp_tool_access_policy(&policy, caller_allowed.as_deref());
-            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
-                registry.push(pipe);
-            }
-        }
-
-        let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
+        let caller_allowed = vec!["file_read".to_string()];
+        let names = assemble_with_pipeline(policy, Some(&caller_allowed)).await;
         assert!(
-            !names.contains(&"execute_pipeline"),
+            !names.contains(&"execute_pipeline".to_string()),
             "execute_pipeline must be denied when caller allowed_tools omits it, got {names:?}"
         );
     }
