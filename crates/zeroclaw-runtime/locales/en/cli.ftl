@@ -82,6 +82,7 @@ cli-skills-install-tier-community =
     and run `zeroclaw skills audit {$name}` before granting any
     permissions or running it in production.
 
+cli-skills-test-no-sandbox = { "  " }warning: running TEST.sh for '{$context}' without OS-level sandboxing — skill commands run with only environment scrubbing, a timeout, and output caps.
 cli-skills-git-scheme-rejected = Refusing to install skill from '{$source}': the '{$scheme}://' transport provides no integrity in transit (cleartext or unauthenticated). Use an https:// or ssh:// (git@...) remote instead.
 cli-skills-git-bad-host = Refusing to install skill from '{$source}': the remote host begins with '-', which git/ssh would interpret as a command-line option.
 cli-skills-git-clone-timeout = Git clone of '{$source}' exceeded the {$seconds}s budget and was terminated.
