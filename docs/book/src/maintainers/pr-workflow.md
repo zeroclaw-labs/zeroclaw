@@ -70,18 +70,22 @@ If none of those exists and the issue is not an active tracker or RFC, the issue
 
 ### Named milestone policy
 
-Named milestones are finite delivery cohorts, not permanent domain backlogs. For this policy, a named milestone is organized around a capability or outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Its domain is the capability area named at the start of its title. A combined title occupies each domain it names.
+Named milestones are finite delivery cohorts for bounded outcomes within capability domains, not permanent domain backlogs. For this policy, a named milestone is organized around an outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Its domain is the capability area named at the start of its title. A combined title occupies each domain it names.
 
-Keep no more than eight named milestones open as a soft cap. Exceeding the cap requires an explicit maintainer decision that records why another active planning surface is worth the added coordination cost. Keep at most one named milestone open per domain.
+Treat every open named milestone as active. Target no more than eight active named milestones so planning surfaces stay within maintainer coordination and review bandwidth. A ninth or tenth requires an explicit maintainer decision that records why the cohort cannot wait and which current milestone is expected to close next. Do not open an eleventh until another named milestone closes or the proposed work is consolidated into an existing cohort.
 
-Every named milestone needs an explicit scope and close criteria, though a due date is optional. Do not open a successor for a domain until its current named milestone closes. Before closing, close or reroute every unfinished issue. Closed named milestones stay closed. Follow-on work can form a new named milestone only when enough coherent scope exists to define another finite outcome. Name that milestone for the outcome; do not create rolling `v2`, `v2.1`, or similar successors by default.
+Keep at most one active named milestone per domain. An explicit maintainer exception may allow independent outcomes in the same domain to proceed in parallel when the decision records why the added coordination cost is justified.
+
+Every named milestone needs an explicit scope and close criteria, though a due date is optional. Do not leave a paused cohort open: reroute its unfinished work and close the milestone. Before closing any named milestone, close or reroute every unfinished issue and add a closure note stating whether the outcome was completed, canceled, or superseded. Closed named milestones stay closed. Follow-on work can form a new named milestone only when enough coherent scope exists to define another finite outcome. Name that milestone for the outcome; do not create rolling `v2`, `v2.1`, or similar successors by default.
+
+GitHub allows an issue or pull request to belong to only one milestone. Work required to complete a named cohort stays in that named milestone through completion, even when it ships in a numbered release. Record release inclusion in the release tracker and changelog. Use numbered release milestones for urgent bugs, maintenance, and other release-bound work outside a named cohort.
 
 Once a named milestone is active, limit new intake to work required to finish its stated cohort: direct scope, blockers, dependencies, and regressions. Route other work by intent:
 
 | Destination | Use for |
 |---|---|
 | Current named milestone | Work required to complete the milestone's defined cohort. |
-| Numbered release milestone | Urgent bugs, maintenance, or release-bound work that fits that release. |
+| Numbered release milestone | Urgent bugs, maintenance, or other release-bound work outside a named cohort. |
 | RFC or design issue | Work whose design or governance direction is not settled. |
 | `Parking Lot` | Short-term routing while maintainers decide the next concrete home. |
 | `Icebox` | Valid future work for a domain with an active named milestone when it is outside the current cohort and is not scheduled soon. |
