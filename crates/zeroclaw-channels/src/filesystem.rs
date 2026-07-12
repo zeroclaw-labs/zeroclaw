@@ -183,6 +183,10 @@ impl Channel for FilesystemChannel {
         Ok(())
     }
 
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         self.watch_and_dispatch().await
     }

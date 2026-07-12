@@ -21525,11 +21525,12 @@ pub struct ApprovalPolicyConfig {
     /// request notice (today's behavior: only the originating surface is notified).
     /// This is a DISTINCT lifecycle event from `escalation_route`: the request goes
     /// out when the run parks; the escalation goes out only if it later times out.
+    /// When configured, the route must use the `channel:recipient` format.
     #[serde(default)]
     pub request_route: Option<String>,
     /// Route to escalate to on timeout (the distinct "second route"). `None`/empty
-    /// re-surfaces to the same route (today's `Escalate` behavior). Same
-    /// `channel[:recipient]` format as `request_route`.
+    /// re-surfaces to the same route (today's `Escalate` behavior). When configured,
+    /// the route must use the `channel:recipient` format.
     #[serde(default)]
     pub escalation_route: Option<String>,
 }

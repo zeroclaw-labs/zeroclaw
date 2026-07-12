@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use zeroclaw_api::channel::{Channel, SendMessage};
 
-use super::broker::ApprovalRouteAdapter;
+use super::broker::{ApprovalNoticeKind, ApprovalRouteAdapter};
 
 /// A route adapter that delivers approval notices to configured channels.
 ///
@@ -37,6 +37,23 @@ use super::broker::ApprovalRouteAdapter;
 pub struct ChannelRouteAdapter {
     channels: HashMap<String, Arc<dyn Channel>>,
     handle: Handle,
+}
+
+/// A route configuration problem reported at daemon startup before a parked gate
+/// would otherwise discover it during delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalRouteIssue {
+    Malformed {
+        policy: String,
+        route_kind: &'static str,
+        route: String,
+    },
+    UndeliverableChannel {
+        policy: String,
+        route_kind: &'static str,
+        route: String,
+        channel_key: String,
+    },
 }
 
 impl ChannelRouteAdapter {
@@ -69,12 +86,12 @@ fn parse_route(route: &str) -> Option<(&str, &str)> {
 /// runtime SOP handles the adapter lacks) OR present but inbound-only (its `send` is a
 /// no-op). The daemon logs these at STARTUP so the drift between "configured route" and
 /// "deliverable channel" surfaces at boot, not silently on the first parked gate.
-/// Malformed routes are NOT flagged here - they fail loudly at delivery with a precise
-/// parse error. Returns `(policy_name, route_kind, route, channel_key)` per route.
+/// A route must have non-empty `channel:recipient` halves; malformed values are also
+/// surfaced at startup. Returns one [`ApprovalRouteIssue`] per invalid route.
 pub fn unresolvable_approval_routes(
     approval: &zeroclaw_config::schema::SopApprovalConfig,
     channel_keys: &std::collections::HashSet<String>,
-) -> Vec<(String, &'static str, String, String)> {
+) -> Vec<ApprovalRouteIssue> {
     let mut unresolvable = Vec::new();
     for (policy_name, policy) in &approval.policies {
         for (kind, route) in [
@@ -85,15 +102,20 @@ pub fn unresolvable_approval_routes(
                 continue;
             };
             let Some((channel_key, _)) = parse_route(route) else {
+                unresolvable.push(ApprovalRouteIssue::Malformed {
+                    policy: policy_name.clone(),
+                    route_kind: kind,
+                    route: route.to_string(),
+                });
                 continue;
             };
             if !channel_keys.contains(channel_key) {
-                unresolvable.push((
-                    policy_name.clone(),
-                    kind,
-                    route.to_string(),
-                    channel_key.to_string(),
-                ));
+                unresolvable.push(ApprovalRouteIssue::UndeliverableChannel {
+                    policy: policy_name.clone(),
+                    route_kind: kind,
+                    route: route.to_string(),
+                    channel_key: channel_key.to_string(),
+                });
             }
         }
     }
@@ -103,18 +125,27 @@ pub fn unresolvable_approval_routes(
 /// Render the approval-request notice body. Identifies the run so an approver can
 /// act on it through their normal approval surface; the return path (approve/deny)
 /// is the existing HTTP/WS/tool -> broker -> chokepoint flow, not this adapter.
-fn render_notice(run_id: &str, sop_name: &str, step: u32) -> String {
-    format!(
-        "SOP approval needed: '{sop_name}' run `{run_id}` is waiting for approval at step {step}. \
-         Approve or deny it through your approval surface (e.g. `zeroclaw sop approve {run_id}` / \
-         `zeroclaw sop deny {run_id}`, or the gateway approve/deny route)."
-    )
+fn render_notice(notice: ApprovalNoticeKind, run_id: &str, sop_name: &str, step: u32) -> String {
+    match notice {
+        ApprovalNoticeKind::Request => format!(
+            "SOP approval needed: '{sop_name}' run `{run_id}` is waiting for approval at step {step}. \
+             Approve or deny it through your approval surface (e.g. `zeroclaw sop approve {run_id}` / \
+             `zeroclaw sop deny {run_id}`, or the gateway approve/deny route)."
+        ),
+        ApprovalNoticeKind::Escalation => format!(
+            "SOP approval escalation: '{sop_name}' run `{run_id}` is still waiting for approval at \
+             step {step}; its approval timeout elapsed. Please approve or deny it through your approval \
+             surface (e.g. `zeroclaw sop approve {run_id}` / `zeroclaw sop deny {run_id}`, or the \
+             gateway approve/deny route)."
+        ),
+    }
 }
 
 /// Build the (channel_key, message) delivery pair from a route + run identity, or an
 /// error describing why it can't be built. PURE (no I/O, no spawn) so the parse +
 /// message-shaping is unit-testable without a runtime.
 fn build_delivery(
+    notice: ApprovalNoticeKind,
     route: &str,
     run_id: &str,
     sop_name: &str,
@@ -126,13 +157,21 @@ fn build_delivery(
              'discord.ops:123456789') - both halves must be non-empty"
         );
     };
-    let msg = SendMessage::new(render_notice(run_id, sop_name, step), recipient).suppress_voice();
+    let msg =
+        SendMessage::new(render_notice(notice, run_id, sop_name, step), recipient).suppress_voice();
     Ok((channel_key.to_string(), msg))
 }
 
 impl ApprovalRouteAdapter for ChannelRouteAdapter {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()> {
-        let (channel_key, msg) = build_delivery(route, run_id, sop_name, step)?;
+    fn deliver(
+        &self,
+        notice: ApprovalNoticeKind,
+        route: &str,
+        run_id: &str,
+        sop_name: &str,
+        step: u32,
+    ) -> anyhow::Result<()> {
+        let (channel_key, msg) = build_delivery(notice, route, run_id, sop_name, step)?;
         let Some(channel) = self.channels.get(&channel_key).cloned() else {
             // A misconfigured route (names a channel that isn't configured) is a real
             // operator error worth surfacing: return Err so the broker logs it. It
@@ -204,10 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_routes_flags_only_well_formed_absent_channels() {
+    fn unresolvable_routes_flag_malformed_and_undeliverable_routes() {
         // Startup validation for the channel-map drift: a route naming a channel the
         // send-only adapter lacks is surfaced; a route naming a present channel is not;
-        // a malformed route is left for the delivery-time parse error, not flagged here.
+        // a malformed route is surfaced before a gate can discover it at delivery time.
         use std::collections::{HashMap, HashSet};
         use zeroclaw_config::schema::{ApprovalPolicyConfig, SopApprovalConfig};
 
@@ -223,7 +262,7 @@ mod tests {
                 escalation_route: Some("discord.ops:123".into()),
             },
         );
-        // A malformed route (no recipient) must NOT be flagged here.
+        // A malformed route is also reported at startup, before a gate parks.
         policies.insert(
             "p2".to_string(),
             ApprovalPolicyConfig {
@@ -242,29 +281,40 @@ mod tests {
         let un = unresolvable_approval_routes(&approval, &keys);
         assert_eq!(
             un.len(),
-            1,
-            "only the well-formed route whose channel is absent is flagged, got {un:?}"
+            2,
+            "the absent channel and malformed route are both flagged, got {un:?}"
         );
-        let (policy_name, kind, route, channel_key) = &un[0];
-        assert_eq!(policy_name, "prod");
-        assert_eq!(*kind, "request_route");
-        assert_eq!(route, "amqp.sopq:runs");
-        assert_eq!(channel_key, "amqp.sopq");
+        assert!(un.iter().any(|issue| {
+            matches!(issue, ApprovalRouteIssue::UndeliverableChannel {
+                policy, route_kind: "request_route", route, channel_key
+            } if policy == "prod" && route == "amqp.sopq:runs" && channel_key == "amqp.sopq")
+        }));
+        assert!(un.iter().any(|issue| {
+            matches!(issue, ApprovalRouteIssue::Malformed {
+                policy, route_kind: "request_route", route
+            } if policy == "p2" && route == "discord.ops")
+        }));
 
-        // With NO channels at all, every WELL-FORMED route is unresolvable (both of
-        // prod's routes; p2's malformed route is still skipped). The daemon runs this
-        // before its empty-channel-map early return so the drift is surfaced at boot.
+        // With NO channels at all, every configured route is reported. The daemon runs
+        // this before its empty-channel-map early return so the drift is surfaced at boot.
         let empty: HashSet<String> = HashSet::new();
         assert_eq!(
             unresolvable_approval_routes(&approval, &empty).len(),
-            2,
-            "with no deliverable channels, every well-formed configured route is flagged"
+            3,
+            "with no deliverable channels, every configured route is flagged"
         );
     }
 
     #[test]
     fn build_delivery_shapes_the_message_and_targets_the_recipient() {
-        let (key, msg) = build_delivery("discord.ops:98765", "run-7", "triage", 3).unwrap();
+        let (key, msg) = build_delivery(
+            ApprovalNoticeKind::Request,
+            "discord.ops:98765",
+            "run-7",
+            "triage",
+            3,
+        )
+        .unwrap();
         assert_eq!(key, "discord.ops");
         assert_eq!(msg.recipient, "98765");
         assert!(msg.content.contains("run-7"), "identifies the run");
@@ -274,8 +324,18 @@ mod tests {
     }
 
     #[test]
+    fn render_notice_distinguishes_an_escalation_from_the_initial_request() {
+        let request = render_notice(ApprovalNoticeKind::Request, "run-7", "triage", 3);
+        let escalation = render_notice(ApprovalNoticeKind::Escalation, "run-7", "triage", 3);
+        assert!(request.contains("approval needed"));
+        assert!(escalation.contains("approval escalation"));
+        assert!(escalation.contains("timeout elapsed"));
+        assert_ne!(request, escalation);
+    }
+
+    #[test]
     fn build_delivery_errors_on_a_route_without_a_recipient() {
-        assert!(build_delivery("discord.ops", "r", "s", 1).is_err());
+        assert!(build_delivery(ApprovalNoticeKind::Request, "discord.ops", "r", "s", 1).is_err());
     }
 
     // ── a stub Channel that records what it was asked to send ─────
@@ -350,7 +410,13 @@ mod tests {
         channels.insert("amqp.q".to_string(), Arc::new(InboundOnlyChannel));
         let adapter = ChannelRouteAdapter::new(channels, Handle::current());
         let err = adapter
-            .deliver("amqp.q:runs", "run-1", "triage", 1)
+            .deliver(
+                ApprovalNoticeKind::Request,
+                "amqp.q:runs",
+                "run-1",
+                "triage",
+                1,
+            )
             .expect_err("an inbound-only channel cannot deliver");
         assert!(
             err.to_string().contains("does not support outbound"),
@@ -367,7 +433,13 @@ mod tests {
         let adapter = ChannelRouteAdapter::new(channels, Handle::current());
 
         adapter
-            .deliver("discord.ops:98765", "run-7", "triage", 3)
+            .deliver(
+                ApprovalNoticeKind::Request,
+                "discord.ops:98765",
+                "run-7",
+                "triage",
+                3,
+            )
             .expect("a registered channel delivers");
 
         // deliver() spawns the send; poll until the recording channel observes it.
@@ -390,7 +462,13 @@ mod tests {
     async fn deliver_errors_when_the_route_channel_is_not_configured() {
         let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
         let err = adapter
-            .deliver("discord.ops:98765", "run-7", "triage", 3)
+            .deliver(
+                ApprovalNoticeKind::Request,
+                "discord.ops:98765",
+                "run-7",
+                "triage",
+                3,
+            )
             .expect_err("an unregistered channel is a real misconfiguration");
         assert!(err.to_string().contains("not a configured channel"));
     }
@@ -400,7 +478,13 @@ mod tests {
         let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
         assert!(
             adapter
-                .deliver("discord.ops", "run-7", "triage", 3)
+                .deliver(
+                    ApprovalNoticeKind::Request,
+                    "discord.ops",
+                    "run-7",
+                    "triage",
+                    3,
+                )
                 .is_err(),
             "a route with no ':recipient' cannot be delivered"
         );

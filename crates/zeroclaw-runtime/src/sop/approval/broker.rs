@@ -22,13 +22,37 @@ use super::identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResol
 use super::principal::{ApprovalPrincipal, ApprovalSource};
 use crate::sop::engine::{GateState, SopEngine};
 
+/// Why an approval notice is being delivered. Route adapters render this so an
+/// on-call escalation cannot be mistaken for the initial request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalNoticeKind {
+    Request,
+    Escalation,
+}
+
+impl ApprovalNoticeKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Escalation => "escalation",
+        }
+    }
+}
+
 /// Deliver an approval notice to a named route (channel). The seam that lets
 /// approvals reach approvers beyond the originating channel (the cross-channel HITL
 /// gap) and that escalation uses to reach a distinct SECOND route on timeout.
 /// Delivery is best-effort: a route error must never clear or block a gate (the gate
 /// state is the source of truth; the route is only a notice).
 pub trait ApprovalRouteAdapter: Send + Sync {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()>;
+    fn deliver(
+        &self,
+        notice: ApprovalNoticeKind,
+        route: &str,
+        run_id: &str,
+        sop_name: &str,
+        step: u32,
+    ) -> anyhow::Result<()>;
 }
 
 /// A no-op route adapter: logs the delivery intent but sends nowhere. The default
@@ -37,15 +61,26 @@ pub trait ApprovalRouteAdapter: Send + Sync {
 pub struct NoopRouteAdapter;
 
 impl ApprovalRouteAdapter for NoopRouteAdapter {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()> {
+    fn deliver(
+        &self,
+        notice: ApprovalNoticeKind,
+        route: &str,
+        run_id: &str,
+        sop_name: &str,
+        step: u32,
+    ) -> anyhow::Result<()> {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
-                    "route": route, "run_id": run_id, "sop_name": sop_name, "step": step
+                    "notice_kind": notice.label(), "route": route, "run_id": run_id,
+                    "sop_name": sop_name, "step": step
                 })
             ),
-            &format!("approval route delivery (noop): run {run_id} step {step} -> route '{route}'")
+            &format!(
+                "approval {} route delivery (noop): run {run_id} step {step} -> route '{route}'",
+                notice.label()
+            )
         );
         Ok(())
     }
@@ -151,7 +186,13 @@ impl ApprovalBroker {
 
     /// Deliver an escalation notice to a route (best-effort).
     pub fn deliver_escalation(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
-        if let Err(e) = self.route.deliver(route, run_id, sop_name, step) {
+        if let Err(e) = self.route.deliver(
+            ApprovalNoticeKind::Escalation,
+            route,
+            run_id,
+            sop_name,
+            step,
+        ) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -181,7 +222,10 @@ impl ApprovalBroker {
     /// when a run parks at a policied gate; a delivery failure never blocks or clears
     /// the gate (the gate is the source of truth, this is only a notice).
     pub fn deliver_request(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
-        if let Err(e) = self.route.deliver(route, run_id, sop_name, step) {
+        if let Err(e) =
+            self.route
+                .deliver(ApprovalNoticeKind::Request, route, run_id, sop_name, step)
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

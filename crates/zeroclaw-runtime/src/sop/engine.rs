@@ -5422,8 +5422,14 @@ mod tests {
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
     }
 
-    /// A recorded `deliver` call: `(route, run_id, sop_name, step)`.
-    type RecordedRouteCall = (String, String, String, u32);
+    /// A recorded `deliver` call: `(notice, route, run_id, sop_name, step)`.
+    type RecordedRouteCall = (
+        crate::sop::approval::ApprovalNoticeKind,
+        String,
+        String,
+        String,
+        u32,
+    );
 
     /// A route adapter that records every `deliver` call, so a test can assert the
     /// engine fired an out-of-band approval-request notice on park.
@@ -5435,12 +5441,14 @@ mod tests {
     impl crate::sop::approval::ApprovalRouteAdapter for RecordingRouteAdapter {
         fn deliver(
             &self,
+            notice: crate::sop::approval::ApprovalNoticeKind,
             route: &str,
             run_id: &str,
             sop_name: &str,
             step: u32,
         ) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push((
+                notice,
                 route.to_string(),
                 run_id.to_string(),
                 sop_name.to_string(),
@@ -5495,7 +5503,12 @@ mod tests {
             1,
             "exactly one out-of-band request-route delivery fired on park"
         );
-        let (route, delivered_run, sop_name, step) = &recorded[0];
+        let (notice, route, delivered_run, sop_name, step) = &recorded[0];
+        assert_eq!(
+            *notice,
+            crate::sop::approval::ApprovalNoticeKind::Request,
+            "parking sends the initial request notice"
+        );
         assert_eq!(route, "discord.ops:123456789", "the policy's request_route");
         assert_eq!(delivered_run, &run_id, "carries the parked run id");
         assert_eq!(sop_name, "s1", "carries the SOP name");
