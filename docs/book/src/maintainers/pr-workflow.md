@@ -19,7 +19,7 @@ The control loop that delivers this is layered on purpose:
 - **Risk-based review depth**: high-risk paths get deep review, low-risk paths stay fast.
 - **Rollback-first merge contract**: every merge path includes a concrete recovery story.
 
-Automation handles path/scope labels and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors.
+Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors.
 
 ## Project board contract
 
@@ -27,11 +27,15 @@ The Project board is an automated planning board, not the authoritative PR revie
 
 Use the board for issue readiness, routing evidence, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
 
-A draft JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as design input for future board refresh automation, not as an active GitHub Project integration yet.
+The current automation is manual and report-only. [`project-dashboard-plan.yml`](../../../../.github/workflows/project-dashboard-plan.yml) runs on `workflow_dispatch` for a single issue number, reads the issue payload, and writes a step summary proposing the existing Project Status value that best matches the issue's live labels and state. It does not write Project fields, edit issues, add labels, post comments, or run automatically on issue events.
+
+A JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as the contract for the report-only planner and future board refresh automation, not as approval for automatic issue-event runs or active GitHub Project mutation yet. Live ProjectV2 writes need an approved field mapping, a project-scoped credential or app installation, and readback that compares planned status with live Project state before maintainers rely on it.
 
 Do not mirror native PR review state into manual board lanes. GitHub PR state owns review decision, required checks, mergeability, conflicts, stale approvals, and merge readiness. If the board later displays derived PR routing such as `DIRTY`, `BEHIND`, or `APPROVED`, treat it as a dashboard view of GitHub state, not a separate source of truth.
 
 This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
+
+Risk and size auto-labeling is a separate workflow question. If it is added later, it should recalculate on PR updates so labels describe the current diff, and risk automation must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
 
 ### Issue routing evidence
 
