@@ -86,12 +86,15 @@ pub(crate) fn resolve_display_text(
 /// Returns the suffix of `display_text` past `streamed_visible_text` when the
 /// latter is a genuine prefix. `display_text` is a whitespace-trimmed
 /// rendering (`strip_think_tags` trims) of the same buffer the stream
-/// forwarded byte-exact, so when the exact prefix fails the trimmed streamed
-/// text is tried before concluding divergence — otherwise a trailing `\n\n`
-/// before a tool call re-relays (duplicates) the whole turn. On genuine
-/// divergence the whole `display_text` is relayed: duplicate output is
-/// recoverable noise, a dropped tail is permanent loss, so the total function
-/// never truncates.
+/// forwarded byte-exact, so when the exact prefix fails only the leading edge
+/// of the streamed text is normalized before retrying — trailing whitespace on
+/// a partial prefix is a real, already-forwarded interior byte, and trimming
+/// it would re-relay that byte and double it at the join. Trailing whitespace
+/// only matters in the fully-streamed case (a trailing `\n\n` before a tool
+/// call must not re-relay the whole turn), so the both-edge trim is used
+/// solely as a whole-string equality check. On genuine divergence the whole
+/// `display_text` is relayed: duplicate output is recoverable noise, a dropped
+/// tail is permanent loss, so the total function never truncates.
 pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
@@ -99,11 +102,14 @@ pub(crate) fn unforwarded_narration<'a>(
     if let Some(rest) = display_text.strip_prefix(streamed_visible_text) {
         return rest;
     }
-    let stream_core = streamed_visible_text.trim();
-    if !stream_core.is_empty()
-        && let Some(rest) = display_text.strip_prefix(stream_core)
+    let stream_lead_normalized = streamed_visible_text.trim_start();
+    if !stream_lead_normalized.is_empty()
+        && let Some(rest) = display_text.strip_prefix(stream_lead_normalized)
     {
         return rest;
+    }
+    if streamed_visible_text.trim() == display_text {
+        return "";
     }
     display_text
 }
@@ -388,6 +394,17 @@ mod tests {
         assert_eq!(
             unforwarded_narration("About to check.", "\nAbout to"),
             " check."
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_prefix_space_when_only_the_leading_edge_diverges() {
+        // The leading newline is the trim mismatch; the trailing space is a
+        // real, already-forwarded interior byte of the partial prefix.
+        // Relaying " check." would double the space at the join.
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to "),
+            "check."
         );
     }
 }
