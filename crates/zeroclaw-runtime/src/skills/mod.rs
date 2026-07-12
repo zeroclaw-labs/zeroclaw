@@ -2538,7 +2538,9 @@ pub fn install_local_skill_source(
 
 /// Directory name `git clone <url>` would produce: the last path segment of
 /// the remote, minus a `.git` suffix. Used to key the per-skill install lock
-/// and the final destination before the clone runs.
+/// and the final destination before the clone runs. Names that could act as
+/// path components (`.`/`..`), hide from the skills walk, or collide with
+/// staging bookkeeping (leading `.`) are rejected.
 fn git_clone_dir_name(source: &str) -> Result<String> {
     let trimmed = source.trim_end_matches('/');
     // SCP-like remotes (git@host:owner/repo.git) keep only the path half.
@@ -2552,10 +2554,124 @@ fn git_clone_dir_name(source: &str) -> Result<String> {
         .next()
         .unwrap_or_default()
         .trim_end_matches(".git");
-    if base.is_empty() {
+    if base.is_empty() || base.starts_with('.') || base.contains('\\') {
         anyhow::bail!("could not derive a skill directory name from git source: {source}");
     }
     Ok(base.to_string())
+}
+
+/// Hard wall-clock budget for `git clone` of a skill source.
+const GIT_CLONE_TIMEOUT_SECS: u64 = 120;
+
+/// Reject git transports that provide no integrity in transit: `http://`
+/// (cleartext, tamperable) and `git://` (unauthenticated daemon protocol).
+/// `https://` and `ssh://`/`git@` remotes pass through.
+fn validate_git_transport(source: &str) -> Result<()> {
+    let scheme = if source.starts_with("http://") {
+        Some("http")
+    } else if source.starts_with("git://") {
+        Some("git")
+    } else {
+        None
+    };
+    if let Some(scheme) = scheme {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-git-scheme-rejected",
+                &[("source", source), ("scheme", scheme)],
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Spawn `cmd`, enforcing a hard wall-clock timeout. On timeout the child is
+/// killed and a localized error naming `source` is returned. `label` names
+/// the operation in non-timeout failure messages.
+fn run_command_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+    source: &str,
+    label: &str,
+) -> Result<()> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to run {label}"))?;
+
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                if status.success() {
+                    return Ok(());
+                }
+                anyhow::bail!("{label} failed: {stderr}");
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-skills-git-clone-timeout",
+                            &[
+                                ("source", source),
+                                ("seconds", &timeout.as_secs().to_string()),
+                            ],
+                        )
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err).with_context(|| format!("failed to wait for {label}"));
+            }
+        }
+    }
+}
+
+/// Total on-disk size of the regular files under `dir`.
+fn dir_tree_size_bytes(dir: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for path in audit::collect_paths_depth_first(dir)? {
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!("failed to read metadata for {}", path.display().to_string())
+        })?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Reject a cloned skill tree that exceeds the same size budget enforced for
+/// ClawHub zip downloads, before any audit work is spent on it.
+fn ensure_tree_within_budget(dir: &Path, max_bytes: u64) -> Result<()> {
+    let tree_bytes = dir_tree_size_bytes(dir)?;
+    if tree_bytes > max_bytes {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-git-tree-too-large",
+                &[
+                    ("bytes", &tree_bytes.to_string()),
+                    ("max", &max_bytes.to_string()),
+                ],
+            )
+        );
+    }
+    Ok(())
 }
 
 pub fn install_git_skill_source(
@@ -2563,6 +2679,7 @@ pub fn install_git_skill_source(
     skills_path: &Path,
     allow_scripts: bool,
 ) -> Result<(PathBuf, usize)> {
+    validate_git_transport(source)?;
     let name = git_clone_dir_name(source)?;
     let (_lock, staged, dest) = begin_skill_install(skills_path, &name)?;
 
@@ -2570,19 +2687,22 @@ pub fn install_git_skill_source(
         // Clone into an explicit target under the private staging directory —
         // the final path never sees unaudited content.
         let clone_target = staged.join(&name);
-        let output = std::process::Command::new("git")
+        let mut clone_cmd = std::process::Command::new("git");
+        clone_cmd
             .args(["clone", "--depth", "1", source])
-            .arg(&clone_target)
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Git clone failed: {stderr}");
-        }
+            .arg(&clone_target);
+        run_command_with_timeout(
+            &mut clone_cmd,
+            Duration::from_secs(GIT_CLONE_TIMEOUT_SECS),
+            source,
+            "git clone",
+        )?;
 
         // Defense-in-depth: the staged tree must contain exactly the one
         // directory the clone was asked to create.
         let cloned_dir = detect_newly_installed_directory(&staged, &HashSet::new())?;
         remove_git_metadata(&cloned_dir)?;
+        ensure_tree_within_budget(&cloned_dir, MAX_SKILL_ZIP_BYTES)?;
         let report = enforce_skill_security_audit(&cloned_dir, allow_scripts)?;
         let digest = staged_tree_digest(&cloned_dir)?;
         finish_skill_install(&cloned_dir, &dest, &digest)?;
@@ -2797,6 +2917,54 @@ fn extract_validated_skill_zip<R: Read + Seek>(
     Ok(())
 }
 
+/// Render a URL with credentials and query string stripped: userinfo may
+/// carry tokens, query strings may carry signed parameters. Every log line,
+/// banner, and (once task-2A lands) receipt that shows a fetched URL must go
+/// through this.
+fn sanitized_display_url(url: &Url) -> String {
+    let mut clean = url.clone();
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.set_query(None);
+    clean.to_string()
+}
+
+/// Maximum redirect hops the ClawHub download client will follow.
+const CLAWHUB_MAX_REDIRECT_HOPS: usize = 10;
+
+/// Redirect admission rule for ClawHub downloads: stay on the pinned ClawHub
+/// hosts, bounded hop count. Pure so the policy is unit-testable.
+fn clawhub_redirect_allowed(next_host: Option<&str>, previous_hops: usize) -> bool {
+    previous_hops < CLAWHUB_MAX_REDIRECT_HOPS && next_host.is_some_and(is_clawhub_host)
+}
+
+/// HTTP client for ClawHub downloads: https-pinned, redirects constrained to
+/// the ClawHub domain. `enforce_https` exists only so the redirect policy can
+/// be exercised against a plain-HTTP local mock in tests; production always
+/// passes `true`.
+fn build_clawhub_http_client(enforce_https: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let hops = attempt.previous().len();
+            let host = attempt.url().host_str().map(str::to_string);
+            if clawhub_redirect_allowed(host.as_deref(), hops) {
+                attempt.follow()
+            } else {
+                let target = sanitized_display_url(attempt.url());
+                attempt.error(format!(
+                    "redirect to {target} leaves the pinned ClawHub domain"
+                ))
+            }
+        }));
+    if enforce_https {
+        builder = builder.https_only(true);
+    }
+    builder
+        .build()
+        .context("failed to build ClawHub download client")
+}
+
 pub async fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
@@ -2808,15 +2976,24 @@ pub async fn install_clawhub_skill_source(
     let (_lock, staged, dest) = begin_skill_install(skills_path, &skill_dir_name)?;
 
     let result = async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = build_clawhub_http_client(true)?;
 
         let resp = client
             .get(&download_url)
             .send()
             .await
             .with_context(|| format!("failed to fetch zip from {download_url}"))?;
+
+        // Final resolved URL, sanitized (no userinfo/query). Recorded in the
+        // install receipt once task-2A lands.
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({
+                    "resolved_url": sanitized_display_url(resp.url()),
+                })),
+            "clawhub skill download resolved"
+        );
 
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
@@ -4154,6 +4331,158 @@ mod install_transaction_tests {
             "got: {err}"
         );
         assert!(!dest.exists(), "no content may reach the final path");
+    }
+
+    #[test]
+    fn git_transport_rejects_cleartext_and_daemon_schemes() {
+        let (_tmp, skills, staging) = setup();
+        for source in [
+            "http://example.invalid/owner/repo.git",
+            "git://example.invalid/owner/repo.git",
+        ] {
+            let err = install_git_skill_source(source, &skills, false)
+                .expect_err("insecure git transport must be rejected before any clone");
+            assert!(
+                err.to_string().contains("no integrity in transit"),
+                "{source}: got: {err}"
+            );
+        }
+        // Rejection happens before any staging or network work.
+        assert!(staging_entries(&staging).is_empty());
+    }
+
+    #[test]
+    fn git_transport_allows_https_and_ssh_forms() {
+        assert!(validate_git_transport("https://github.com/a/b.git").is_ok());
+        assert!(validate_git_transport("ssh://git@github.com/a/b.git").is_ok());
+        assert!(validate_git_transport("git@github.com:a/b.git").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_budget_kills_command_after_timeout() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_millis(200),
+            "https://slow.example/repo.git",
+            "git clone",
+        )
+        .expect_err("command exceeding the budget must be killed");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout must not wait for the child to finish"
+        );
+        assert!(err.to_string().contains("exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn command_timeout_passes_through_success_and_failure() {
+        let mut ok = std::process::Command::new("git");
+        ok.arg("--version");
+        if run_command_with_timeout(&mut ok, Duration::from_secs(30), "src", "git clone").is_err() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let mut fail = std::process::Command::new("false");
+            let err =
+                run_command_with_timeout(&mut fail, Duration::from_secs(30), "src", "git clone")
+                    .expect_err("non-zero exit must be an error");
+            assert!(err.to_string().contains("git clone failed"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn tree_budget_rejects_oversized_clone() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("tree");
+        write_clean_skill(&dir);
+        fs::write(dir.join("blob.bin"), vec![0_u8; 4096]).unwrap();
+
+        assert!(ensure_tree_within_budget(&dir, 1024 * 1024).is_ok());
+        let err = ensure_tree_within_budget(&dir, 1024)
+            .expect_err("tree above the budget must be rejected");
+        assert!(err.to_string().contains("install budget"), "got: {err}");
+        assert!(dir_tree_size_bytes(&dir).unwrap() > 4096);
+    }
+
+    #[test]
+    fn sanitized_display_url_strips_credentials_and_query() {
+        let url = Url::parse("https://user:hunter2@clawhub.ai/dl?token=SECRET&x=1#frag").unwrap();
+        let shown = sanitized_display_url(&url);
+        assert!(!shown.contains("user"), "userinfo leaked: {shown}");
+        assert!(!shown.contains("hunter2"), "password leaked: {shown}");
+        assert!(!shown.contains("SECRET"), "query leaked: {shown}");
+        assert!(shown.contains("clawhub.ai/dl"), "path kept: {shown}");
+    }
+
+    #[test]
+    fn clawhub_redirect_policy_is_domain_and_hop_bounded() {
+        assert!(clawhub_redirect_allowed(Some("clawhub.ai"), 0));
+        assert!(clawhub_redirect_allowed(Some("www.clawhub.ai"), 3));
+        assert!(!clawhub_redirect_allowed(Some("evil.example"), 0));
+        assert!(!clawhub_redirect_allowed(
+            Some("clawhub.ai.evil.example"),
+            0
+        ));
+        assert!(!clawhub_redirect_allowed(None, 0));
+        assert!(!clawhub_redirect_allowed(
+            Some("clawhub.ai"),
+            CLAWHUB_MAX_REDIRECT_HOPS
+        ));
+    }
+
+    /// End-to-end proof the redirect policy is wired into the client: a mock
+    /// server redirecting off-domain must fail the request. Uses the
+    /// non-https client variant because the mock is plain HTTP; the policy
+    /// under test is identical.
+    #[tokio::test]
+    async fn clawhub_client_refuses_off_domain_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/download"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "http://evil.example/zip"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = build_clawhub_http_client(false).unwrap();
+        let err = client
+            .get(format!("{}/api/v1/download", server.uri()))
+            .send()
+            .await
+            .expect_err("off-domain redirect must abort the download");
+        let chain = format!("{err:?}");
+        assert!(
+            chain.contains("pinned ClawHub domain"),
+            "expected the policy error in the chain: {chain}"
+        );
+    }
+
+    #[test]
+    fn clawhub_production_client_is_https_only() {
+        // https_only rejects plain-http URLs at request time; assert the
+        // production client refuses an http:// URL without any network I/O.
+        let client = build_clawhub_http_client(true).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(client.get("http://127.0.0.1:9/x").send())
+            .expect_err("plain-http request must be refused by the pinned client");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("scheme"),
+            "expected an URL-scheme rejection: {err:?}"
+        );
     }
 
     #[test]

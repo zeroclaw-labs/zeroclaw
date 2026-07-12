@@ -82,6 +82,9 @@ cli-skills-install-tier-community =
     and run `zeroclaw skills audit {$name}` before granting any
     permissions or running it in production.
 
+cli-skills-git-scheme-rejected = Refusing to install skill from '{$source}': the '{$scheme}://' transport provides no integrity in transit (cleartext or unauthenticated). Use an https:// or ssh:// (git@...) remote instead.
+cli-skills-git-clone-timeout = Git clone of '{$source}' exceeded the {$seconds}s budget and was terminated.
+cli-skills-git-tree-too-large = Cloned skill tree rejected: {$bytes} bytes exceeds the {$max} byte install budget.
 cli-skills-install-locked = Another install of skill '{$name}' appears to be in progress (lock file: {$path}). Wait for it to finish, or remove the lock file if no install is running.
 cli-skills-install-stale-lock-reclaimed = warning: reclaimed a stale install lock for skill '{$name}' left behind by an interrupted install.
 cli-skills-install-staging-mutated = Staged skill content changed after the security checks ran ({$path}); aborting the install. Retry the install.
