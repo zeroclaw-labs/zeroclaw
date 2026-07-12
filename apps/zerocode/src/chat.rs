@@ -2522,18 +2522,17 @@ impl Chat {
     }
 
     pub(crate) fn wants_mouse_capture(&self) -> bool {
-        match &self.phase {
-            ChatPhase::PickAgent { .. } | ChatPhase::PickCwd { .. } => true,
-            ChatPhase::Active(s) => {
-                s.in_browse_mode()
-                    || s.input_bar.has_file_explorer()
-                    || s.model_picker.is_open()
-                    || s.pending_elicitation().is_some()
-                    || s.pending_approval().is_some()
-                    || s.queue_sidebar_open()
-                    || !matches!(s.session_overlay, SessionOverlay::None)
-            }
+        if let ChatPhase::Active(s) = &self.phase {
+            return s.in_browse_mode()
+                || s.input_bar.has_file_explorer()
+                || s.model_picker.is_open()
+                || s.pending_elicitation().is_some()
+                || s.pending_approval().is_some()
+                || s.queue_sidebar_open()
+                || !matches!(s.session_overlay, SessionOverlay::None);
         }
+
+        !matches!(self.phase, ChatPhase::Error(_))
     }
 }
 
@@ -6328,6 +6327,36 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn wants_mouse_capture_follows_terminal_selection_contract() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let mut active = state();
+        active
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        chat.phase = ChatPhase::Active(Box::new(active));
+        assert!(!chat.wants_mouse_capture());
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.enter_browse_mode();
+        }
+        assert!(chat.wants_mouse_capture());
+
+        chat.phase = ChatPhase::Error("No enabled agents yet.".to_string());
+        assert!(!chat.wants_mouse_capture());
+
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
+        assert!(chat.wants_mouse_capture());
     }
 
     #[test]
