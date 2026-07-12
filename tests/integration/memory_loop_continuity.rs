@@ -277,7 +277,7 @@ async fn agent_survives_large_tool_output() {
             let output = "x".repeat(100_000);
             Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         }

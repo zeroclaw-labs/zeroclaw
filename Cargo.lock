@@ -13571,6 +13571,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
  "sys-locale",
  "sysinfo",
  "tar",
@@ -13598,10 +13600,22 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-sop-graph",
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
  "zip",
+]
+
+[[package]]
+name = "zeroclaw-sop-graph"
+version = "0.8.2"
+dependencies = [
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
 ]
 
 [[package]]

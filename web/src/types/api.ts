@@ -48,10 +48,20 @@ export interface ComponentHealth {
   restart_count: number;
 }
 
+export type OptionDomain =
+  | "channel_refs"
+  | "peer_targets"
+  | "peer_groups"
+  | "agent_aliases"
+  | "tool_names"
+  | "memory_categories";
+
 export interface ToolSpec {
   name: string;
   description: string;
   parameters: any;
+  output?: any;
+  param_domains?: Record<string, OptionDomain>;
 }
 
 export interface CronDeliveryConfig {
@@ -77,6 +87,7 @@ export interface CronJob {
   enabled: boolean;
   delivery: CronDeliveryConfig;
   delete_after_run: boolean;
+  uses_memory: boolean;
   session_target: string | null;
   model: string | null;
   allowed_tools: string[] | null;

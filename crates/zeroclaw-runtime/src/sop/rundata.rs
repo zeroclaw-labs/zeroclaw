@@ -86,6 +86,7 @@ mod tests {
                 output: r#"{"failed":true}"#.into(),
                 started_at: "now".into(),
                 completed_at: Some("now".into()),
+                tool_calls: Vec::new(),
             },
             SopStepResult {
                 step_number: 2,
@@ -93,6 +94,7 @@ mod tests {
                 output: r#"{"skipped":true}"#.into(),
                 started_at: "now".into(),
                 completed_at: Some("now".into()),
+                tool_calls: Vec::new(),
             },
             SopStepResult {
                 step_number: 3,
@@ -100,6 +102,7 @@ mod tests {
                 output: r#"{"ok":true}"#.into(),
                 started_at: "now".into(),
                 completed_at: Some("now".into()),
+                tool_calls: Vec::new(),
             },
         ];
 

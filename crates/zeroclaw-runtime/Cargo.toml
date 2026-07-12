@@ -15,6 +15,7 @@ zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
+zeroclaw-sop-graph.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 fluent = "0.16"
@@ -52,6 +53,8 @@ rustls-pki-types = "1.14.0"
 schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+strum = "0.28"
+strum_macros = "0.28"
 sha2 = "0.10"
 shellexpand = "3.1"
 sys-locale.workspace = true
@@ -100,7 +103,7 @@ default = ["observability-prometheus", "schema-export"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 sandbox-landlock = ["dep:landlock"]
-schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
+schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-graph/schema-export"]
 
 
 browser-native = []
