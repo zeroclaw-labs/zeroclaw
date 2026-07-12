@@ -120,7 +120,7 @@ keyactions! {
         Quit         [Chord::ctrl('c')]                                 => "quit",
         Help         [
             Chord::char('?'),
-            Chord::with(KeyCode::Char('?'), KeyModifiers::CONTROL),
+            Chord::ctrl('g'),
         ]                                                              => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
@@ -143,7 +143,6 @@ keyactions! {
         BrowseEnter             [
             Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)),
             Chord::ctrl('k'),
-            Chord::with(KeyCode::Char('/'), KeyModifiers::CONTROL),
         ] => "enter browse mode",
         BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",

@@ -1,4 +1,11 @@
 //! Keymap abstraction for zerocode.
+//!
+//! Each leaf action enum carries its own default bindings inline.
+//! Consumers call `ChatTabAction::from_chord(&key)` directly — no
+//! `Keymap` struct, no plumbed argument.
+//!
+//! On darwin, `Chord::matches` translates most `CTRL` modifiers to
+//! `SUPER`; terminal-owned control chords remain literal.
 
 pub mod actions;
 mod chord;
@@ -61,7 +68,7 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
 }
 
 /// Rendered, OS-aware key labels for an action's currently-resolved
-/// chords (e.g. `["Tab"]`, `["⌘K"]`). Help surfaces use this so the keys
+/// chords (e.g. `["Tab"]`, `["⌘x"]`). Help surfaces use this so the keys
 /// they advertise track the live keybinding registry instead of literals.
 pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
     action.resolved().iter().map(Chord::display).collect()
@@ -79,16 +86,16 @@ mod tests {
     }
 
     #[test]
-    fn global_help_resolves_from_question_mark_and_control_question_mark() {
+    fn global_help_resolves_from_question_mark_and_control_g() {
         let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
         assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
-        let ctrl_q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
-        assert_eq!(GlobalAction::from_chord(&ctrl_q), Some(GlobalAction::Help));
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_g), Some(GlobalAction::Help));
     }
 
     #[test]
-    fn browse_enter_resolves_from_control_slash() {
-        let ev = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL);
+    fn browse_enter_resolves_from_control_k() {
+        let ev = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
         assert_eq!(
             ChatTabAction::from_chord(&ev),
             Some(ChatTabAction::BrowseEnter)
