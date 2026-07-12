@@ -540,17 +540,18 @@ pub struct RelayDial {
     pub relay_host: String,
     /// Node-id of the target daemon to request from the relay.
     pub node_id: String,
-    /// PEM CA to trust for the relay's outer certificate. When unset (and not
-    /// insecure) the built-in public webpki roots are used.
+    /// PEM CA to trust for the relay's outer certificate. When set, this wins
+    /// over remembered pins and TOFU; when unset (and not insecure) the built-in
+    /// public webpki roots are used.
     pub relay_ca_path: Option<String>,
     /// Skip verification of the relay's outer certificate (self-signed dev only).
     pub relay_insecure: bool,
     /// Expected relay OUTER-leaf SHA-256 pin (`--relay-pin` or the enrollment-
-    /// delivered `relay_cert_pin`). When set, the relay's outer cert must match it
-    /// (A2). Takes precedence over a CA / public roots.
+    /// delivered `relay_cert_pin`). Used only when no `relay_ca_path` is set.
     pub relay_pin: Option<String>,
     /// Opt-in trust-on-first-use for the relay's outer leaf: accept the first cert
-    /// and persist its pin to `pin_store` so later runs pin it. Never silent.
+    /// and persist its pin to `pin_store` so later runs pin it. Ignored when a
+    /// relay CA or pin is configured.
     pub relay_tofu: bool,
     /// Where to persist a TOFU-observed pin (`<config_dir>/relay/relay_pin`).
     pub pin_store: Option<std::path::PathBuf>,
@@ -693,6 +694,20 @@ fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'s
         .with_context(|| format!("parsing PEM certificates from {path}"))
 }
 
+/// Load the daemon CA cached by enrollment. The enrollment SAS binds exactly one
+/// daemon trust anchor, so the connect path must not later broaden trust by
+/// accepting every PEM block in the cached file.
+fn load_single_daemon_ca_cert(path: &str) -> Result<rustls::pki_types::CertificateDer<'static>> {
+    let certs = load_pem_certs(path)?;
+    match certs.len() {
+        0 => anyhow::bail!("no daemon CA certificate found in {path}"),
+        1 => Ok(certs.into_iter().next().expect("checked exactly one cert")),
+        n => anyhow::bail!(
+            "cached daemon CA file {path} must contain exactly one daemon CA certificate, got {n}"
+        ),
+    }
+}
+
 /// Load a PEM private key from a file into DER.
 fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     let pem = std::fs::read(path).with_context(|| format!("reading key file {path}"))?;
@@ -730,26 +745,17 @@ impl RelayRoute {
     }
 }
 
-async fn dial_through_relay(
+fn relay_outer_connector(
     relay: &RelayDial,
-    route: RelayRoute,
-) -> Result<tokio::io::DuplexStream> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_tungstenite::tungstenite::Message;
-    use zeroclaw_relay_proto::{
-        ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
-        encode_data,
-    };
-
-    let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
-        .await
-        .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
-
+) -> Result<(
+    Option<tokio_tungstenite::Connector>,
+    Option<Arc<zeroclaw_tls::RelayPinVerifier>>,
+)> {
     // Outer TLS connector verifying the relay's OWN certificate (distinct from the
-    // inner mTLS to the daemon). Precedence: insecure (dev) > a leaf pin (explicit
-    // or enrollment-delivered) > opt-in TOFU > a CA file > the public roots
-    // (`None`). The outer TLS is a metadata boundary, not the RPC boundary (A2).
+    // inner mTLS to the daemon). Precedence: insecure (dev) > configured CA > a
+    // leaf pin (explicit, enrollment-delivered, or remembered) > opt-in TOFU >
+    // the public roots (`None`). The outer TLS is a metadata boundary, not the
+    // RPC boundary (A2).
     let builder = || {
         rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -783,6 +789,12 @@ async fn dial_through_relay(
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerify)),
         )?)
+    } else if let Some(ca) = &relay.relay_ca_path {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_pem_certs(ca)? {
+            roots.add(cert).context("adding relay CA to root store")?;
+        }
+        Some(finish(builder().with_root_certificates(roots))?)
     } else if let Some(pin) = relay.relay_pin.as_deref().filter(|p| !p.is_empty()) {
         let v = Arc::new(zeroclaw_tls::RelayPinVerifier::pinned(pin.to_string()));
         Some(finish(
@@ -794,12 +806,6 @@ async fn dial_through_relay(
         Some(finish(
             builder().dangerous().with_custom_certificate_verifier(v),
         )?)
-    } else if let Some(ca) = &relay.relay_ca_path {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in load_pem_certs(ca)? {
-            roots.add(cert).context("adding relay CA to root store")?;
-        }
-        Some(finish(builder().with_root_certificates(roots))?)
     } else if relay.outer_client_cert.is_some() {
         // Public-CA relay that also requires an outer client cert: build an
         // explicit public-roots connector (the plain default below cannot carry a
@@ -810,6 +816,26 @@ async fn dial_through_relay(
     } else {
         None
     };
+    Ok((outer, tofu_verifier))
+}
+
+async fn dial_through_relay(
+    relay: &RelayDial,
+    route: RelayRoute,
+) -> Result<tokio::io::DuplexStream> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use zeroclaw_relay_proto::{
+        ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
+        encode_data,
+    };
+
+    let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
+        .await
+        .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
+
+    let (outer, tofu_verifier) = relay_outer_connector(relay)?;
 
     let relay_uri: tokio_tungstenite::tungstenite::http::Uri =
         format!("wss://{}/", relay.relay_host)
@@ -1298,12 +1324,11 @@ impl RpcClient {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerify))
         } else if let Some(ca_path) = &tls.ca_cert_path {
+            let daemon_ca = load_single_daemon_ca_cert(ca_path)?;
             let mut roots = rustls::RootCertStore::empty();
-            for cert in load_pem_certs(ca_path)? {
-                roots
-                    .add(cert)
-                    .context("adding daemon CA to the client root store")?;
-            }
+            roots
+                .add(daemon_ca)
+                .context("adding daemon CA to the client root store")?;
             builder.with_root_certificates(roots)
         } else {
             anyhow::bail!(
@@ -4109,6 +4134,48 @@ mod tls_tests {
         assert!(
             cfg.client_auth_cert_resolver.has_certs(),
             "skip_verify must not drop the presented client certificate"
+        );
+    }
+
+    #[test]
+    fn cached_daemon_ca_requires_single_certificate() {
+        let (daemon_ca, _) = zeroclaw_tls::testing::gen_ca();
+        let (extra_ca, _) = zeroclaw_tls::testing::gen_ca();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, format!("{daemon_ca}\n{extra_ca}")).unwrap();
+
+        let tls = ClientTls {
+            ca_cert_path: Some(ca_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = RpcClient::wss_tls_config(&tls).unwrap_err().to_string();
+        assert!(
+            err.contains("exactly one daemon CA certificate"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_ca_path_takes_precedence_over_pins_and_tofu() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_ca = dir.path().join("relay-ca.pem");
+        let relay = RelayDial {
+            relay_addr: "127.0.0.1:443".into(),
+            relay_host: "localhost".into(),
+            node_id: "node".into(),
+            relay_ca_path: Some(missing_ca.to_string_lossy().into_owned()),
+            relay_insecure: false,
+            relay_pin: Some("00".into()),
+            relay_tofu: true,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        };
+
+        assert!(
+            relay_outer_connector(&relay).is_err(),
+            "configured relay CA must be loaded before stored pins or TOFU can be used"
         );
     }
 }

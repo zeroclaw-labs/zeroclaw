@@ -5,15 +5,17 @@
 //! stays mutually authenticated with no weakenable path). It is a separate,
 //! minimal, server-authenticated-TLS endpoint with its own auth model:
 //!
-//! 1. The client opens server-auth TLS (the daemon presents its server cert; the
-//!    client confirms the daemon CA out of band via the pairing short-auth-string
-//!    [`zeroclaw_tls::enrollment_sas`], so there is no blind trust-on-first-use).
-//! 2. The client submits a pairing code + a CSR. The CA reads ONLY the CSR public
-//!    key (the private key never leaves the device) and signs a `clientAuth`-only
-//!    leaf bound to a daemon-minted device id ([`zeroclaw_tls::sign_csr`]).
-//! 3. The daemon records the issuance in its ledger + audit trail and returns the
-//!    signed cert + CA chain + the relay profile, so the client can immediately
-//!    open the mutually authenticated RPC plane (directly or via the relay).
+//! 1. The client opens provisional server-auth TLS only to fetch the daemon CA.
+//! 2. The operator confirms that CA out of band via the pairing short-auth-string
+//!    [`zeroclaw_tls::enrollment_sas`], then the client reconnects pinned to that
+//!    confirmed CA.
+//! 3. Only after that trust step does the client submit a pairing code + CSR. The CA
+//!    reads ONLY the CSR public key (the private key never leaves the device) and
+//!    signs a `clientAuth`-only leaf bound to a daemon-minted device id
+//!    ([`zeroclaw_tls::sign_csr`]).
+//! 4. The daemon records the issuance in its ledger + audit trail and returns the
+//!    signed cert + CA chain + the relay profile, so the client can immediately open
+//!    the mutually authenticated RPC plane (directly or via the relay).
 //!
 //! The daemon owns the CA, so this endpoint works with no gateway. The HTTP is
 //! hand-rolled (one fixed route) to keep the runtime free of any gateway-shaped
@@ -80,8 +82,8 @@ pub fn relay_profile(
 /// The enrollment request body (`POST /enroll`).
 #[derive(Debug, Deserialize)]
 struct EnrollRequest {
-    /// One-time pairing code. Optional only inside an open `allow_unpaired`
-    /// migration window; otherwise required.
+    /// One-time pairing code. Required for the first FOSS release; the reserved
+    /// code-less migration knob is rejected at daemon startup.
     #[serde(default)]
     pairing_code: String,
     /// PEM-encoded PKCS#10 certificate signing request. The CA reads only its
@@ -105,6 +107,14 @@ struct EnrollResponse {
     relay_profile: RelayProfile,
 }
 
+/// The preflight response body (`GET /enroll/ca`). It intentionally contains only
+/// the daemon CA needed for SAS confirmation; it does not consume or receive a
+/// pairing code.
+#[derive(Debug, Serialize)]
+struct EnrollTrustResponse {
+    ca_chain_pem: String,
+}
+
 /// Everything the enrollment endpoint needs to serve requests.
 pub struct EnrollServer {
     pub bind_addr: SocketAddr,
@@ -118,6 +128,9 @@ pub struct EnrollServer {
     pub ca_key_pem: zeroize::Zeroizing<String>,
     pub ledger: Arc<CertLedger>,
     pub pairing: Arc<PairingGuard>,
+    /// Static WSS pin allowlists cannot admit freshly issued in-band certs unless
+    /// the operator updates the canonical pin source out of band.
+    pub static_client_pins_configured: bool,
     /// RFC3339 instant before which a code-less ("unpaired") enrollment is
     /// accepted - the time-boxed migration window. `None` means closed.
     pub allow_unpaired_until: Option<chrono::DateTime<chrono::Utc>>,
@@ -126,13 +139,6 @@ pub struct EnrollServer {
 }
 
 impl EnrollServer {
-    /// Is the code-less migration window currently open?
-    fn unpaired_window_open(&self) -> bool {
-        self.allow_unpaired_until
-            .map(|deadline| chrono::Utc::now() < deadline)
-            .unwrap_or(false)
-    }
-
     /// Authenticate, sign, record, and build the response. Returns `(status,
     /// json_error)` on any failure so the caller writes a clean HTTP error.
     async fn process(
@@ -140,29 +146,34 @@ impl EnrollServer {
         req: &EnrollRequest,
         peer: &str,
     ) -> Result<EnrollResponse, (u16, String)> {
-        // 1. Authenticate: a pairing code (consumed, brute-force-protected) or an
-        //    open migration window. Never both silently.
-        let token_hash = if !req.pairing_code.trim().is_empty() {
-            match self.pairing.try_pair(req.pairing_code.trim(), peer).await {
-                Ok(Some(token)) => PairingGuard::token_hash(&token),
-                Ok(None) => {
-                    return Err((401, "invalid or already-used pairing code".to_string()));
-                }
-                Err(secs) => {
-                    return Err((429, format!("too many attempts; retry in {secs}s")));
-                }
-            }
-        } else if self.unpaired_window_open() {
-            // Migration window: enroll without a code. Recorded distinctly so the
-            // audit trail shows it was an unpaired-window issuance.
-            "unpaired-window".to_string()
-        } else {
+        // 1. Authenticate: the pairing code is consumed and brute-force protected
+        //    before any certificate is signed.
+        let pairing_code = req.pairing_code.trim();
+        if self.static_client_pins_configured {
+            return Err((
+                409,
+                "in-band enrollment is disabled because [wss.client_auth].pinned_certs is \
+                 configured; provision pinned client certificates out of band"
+                    .to_string(),
+            ));
+        }
+        if pairing_code.is_empty() {
             return Err((
                 401,
                 "a pairing code is required; ask the operator for the daemon enrollment code"
                     .to_string(),
             ));
+        }
+        let pairing = match self.pairing.reserve_pair(pairing_code, peer).await {
+            Ok(Some(pairing)) => pairing,
+            Ok(None) => {
+                return Err((401, "invalid or already-used pairing code".to_string()));
+            }
+            Err(secs) => {
+                return Err((429, format!("too many attempts; retry in {secs}s")));
+            }
         };
+        let token_hash = pairing.token_hash();
 
         // 2. The daemon assigns the device identity (never the client/CSR): a
         //    stable, unguessable id that becomes the cert CN and the ledger key.
@@ -195,6 +206,7 @@ impl EnrollServer {
         self.ledger
             .record_issued(&entry, false)
             .map_err(|e| (500, format!("ledger error: {e}")))?;
+        pairing.commit();
 
         Ok(EnrollResponse {
             cert_pem: issued.cert_pem,
@@ -281,6 +293,14 @@ async fn handle_conn(server: &EnrollServer, tcp: tokio::net::TcpStream, peer: &s
             return;
         }
     };
+    if method == "GET" && path == "/enroll/ca" {
+        let json = serde_json::to_vec(&EnrollTrustResponse {
+            ca_chain_pem: server.ca_cert_pem.clone(),
+        })
+        .unwrap_or_default();
+        let _ = write_json(&mut tls, 200, "OK", &json).await;
+        return;
+    }
     if method != "POST" || path != "/enroll" {
         let _ = write_json(&mut tls, 404, "Not Found", b"{\"error\":\"unknown route\"}").await;
         return;
@@ -464,6 +484,18 @@ mod tests {
         pairing: PairingGuard,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> EnrollServer {
+        test_server_with_ledger(
+            pairing,
+            deadline,
+            Arc::new(CertLedger::open_in_memory(None).unwrap()),
+        )
+    }
+
+    fn test_server_with_ledger(
+        pairing: PairingGuard,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        ledger: Arc<CertLedger>,
+    ) -> EnrollServer {
         let (ca_cert, ca_key) = zeroclaw_tls::testing::gen_ca();
         // A throwaway server-auth acceptor (not exercised by process()).
         let (srv_cert, srv_key) =
@@ -484,8 +516,9 @@ mod tests {
             acceptor,
             ca_cert_pem: ca_cert,
             ca_key_pem: zeroize::Zeroizing::new(ca_key),
-            ledger: Arc::new(CertLedger::open_in_memory(None).unwrap()),
+            ledger,
             pairing: Arc::new(pairing),
+            static_client_pins_configured: false,
             allow_unpaired_until: deadline,
             relay_profile: RelayProfile::default(),
         }
@@ -511,6 +544,92 @@ mod tests {
         let fps = server.ledger.list_active().unwrap();
         assert_eq!(fps.len(), 1);
         assert_eq!(fps[0].device_id, resp.device_id);
+    }
+
+    #[tokio::test]
+    async fn process_propagates_certificate_audit_write_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::security::audit::AuditLogger::new(
+            zeroclaw_config::schema::AuditConfig {
+                enabled: true,
+                log_path: "missing/audit.log".to_string(),
+                max_size_mb: 100,
+                sign_events: false,
+            },
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let ledger = Arc::new(CertLedger::open_in_memory(Some(Arc::new(audit))).unwrap());
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let server = test_server_with_ledger(pairing, None, ledger);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let req = EnrollRequest {
+            pairing_code: code,
+            csr_pem: csr,
+        };
+
+        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        assert_eq!(err.0, 500);
+        assert!(err.1.contains("certificate audit event"), "got: {}", err.1);
+        assert!(
+            server.pairing.pairing_code().is_some(),
+            "ledger/audit failure must not consume the one-time pairing code"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_in_band_enrollment_when_static_pins_are_configured() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let mut server = test_server(pairing, None);
+        server.static_client_pins_configured = true;
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let req = EnrollRequest {
+            pairing_code: code.clone(),
+            csr_pem: csr,
+        };
+
+        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        assert_eq!(err.0, 409);
+        assert!(err.1.contains("pinned_certs"), "got: {}", err.1);
+        assert_eq!(
+            server.pairing.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "static-pin refusal must not consume the one-time pairing code"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_allows_retry_after_valid_code_with_bad_csr() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let server = test_server(pairing, None);
+        let bad = EnrollRequest {
+            pairing_code: code.clone(),
+            csr_pem: "not a csr".to_string(),
+        };
+
+        let err = server.process(&bad, "1.2.3.4").await.unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(
+            server.pairing.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "CSR rejection must leave the one-time code retryable"
+        );
+
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let good = EnrollRequest {
+            pairing_code: code,
+            csr_pem: csr,
+        };
+        assert!(
+            server.process(&good, "1.2.3.4").await.is_ok(),
+            "the restored code should work on retry"
+        );
     }
 
     #[tokio::test]
@@ -574,6 +693,21 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, tcp).await.unwrap();
+        let req = "GET /enroll/ca HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        tls.write_all(req.as_bytes()).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut ca_resp = Vec::new();
+        tls.read_to_end(&mut ca_resp).await.unwrap();
+        let ca_text = String::from_utf8_lossy(&ca_resp);
+        assert!(
+            ca_text.starts_with("HTTP/1.1 200") && ca_text.contains("ca_chain_pem"),
+            "expected CA preflight 200, got: {ca_text}"
+        );
+
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let mut tls = connector.connect(name, tcp).await.unwrap();
@@ -608,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_allows_codeless_enroll_inside_open_window() {
+    async fn process_rejects_codeless_enroll_even_when_reserved_window_is_configured() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let pairing = PairingGuard::new(true, &[]);
         let future = chrono::Utc::now() + chrono::Duration::minutes(10);
@@ -618,8 +752,8 @@ mod tests {
             pairing_code: String::new(),
             csr_pem: csr,
         };
-        let resp = server.process(&req, "1.2.3.4").await.unwrap();
-        assert!(resp.device_id.starts_with("dev_"));
-        assert_eq!(server.ledger.list_active().unwrap().len(), 1);
+        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(server.ledger.list_active().unwrap().is_empty());
     }
 }

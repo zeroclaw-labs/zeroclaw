@@ -7023,8 +7023,9 @@ pub struct RelayConfig {
     #[secret]
     #[credential_class = "encrypted_secret"]
     pub token: String,
-    /// PEM CA to trust for the relay's OWN (outer) TLS certificate. Empty uses the
-    /// built-in public roots (for a relay fronted by a public-CA certificate).
+    /// PEM CA to trust for the relay's OWN (outer) TLS certificate. When set,
+    /// this explicit CA takes precedence over remembered/TOFU relay pins. Empty
+    /// uses the built-in public roots unless a stored pin or `tofu` is active.
     #[serde(default)]
     pub relay_ca_path: String,
     /// Server name to expect on the relay's outer certificate. Empty derives it
@@ -7037,8 +7038,9 @@ pub struct RelayConfig {
     /// Trust-on-first-use for the relay's OUTER certificate (default false): accept
     /// the first leaf seen and pin it at `<data_dir>/relay/relay_pin` thereafter
     /// (the pin is also handed to enrolling clients). Opt-in; ignored once a pin is
-    /// stored or `relay_ca_path` is set. The outer TLS is a metadata boundary, not
-    /// the RPC boundary (the inner mTLS is); see threat A2.
+    /// stored or `relay_ca_path` is set. A configured relay CA also bypasses any
+    /// previously stored TOFU pin. The outer TLS is a metadata boundary, not the
+    /// RPC boundary (the inner mTLS is); see threat A2.
     #[serde(default)]
     pub tofu: bool,
     /// PEM cert/key the daemon presents to the relay on the OUTER TLS layer
@@ -7100,10 +7102,10 @@ pub struct EnrollConfig {
     /// Port the enrollment endpoint listens on.
     #[serde(default = "default_enroll_port")]
     pub port: u16,
-    /// Time-boxed migration window: an RFC3339 deadline before which a client may
-    /// enroll WITHOUT a pairing code (so existing plaintext clients are not
-    /// stranded on upgrade). Empty/absent disables the window (the normal,
-    /// pairing-code-gated path). Enrollment-only; never relaxes the RPC plane.
+    /// Reserved for a future migration flow. The first FOSS release rejects any
+    /// non-empty value because code-less enrollment needs an explicit client-side
+    /// trust anchor before certs can be cached. Leave empty to require the normal
+    /// pairing-code-gated path.
     #[serde(default)]
     pub allow_unpaired_enrollment: String,
 }

@@ -37,4 +37,5 @@ zeroclaw-log.workspace = true
 testing = []
 
 [dev-dependencies]
+filetime = "0.2"
 tempfile = "3.26"

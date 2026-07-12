@@ -273,6 +273,17 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       return this.readHttpResponse();
     }
 
+    async getJson(path, host = '127.0.0.1') {
+      const request = textEncoder.encode(
+        `GET ${path} HTTP/1.1\r\n` +
+        `Host: ${host}\r\n` +
+        'Connection: close\r\n' +
+        '\r\n'
+      );
+      await this.writeApplicationData(request);
+      return this.readHttpResponse();
+    }
+
     async openWebSocket(path = '/', host = '127.0.0.1') {
       const nonce = crypto.getRandomValues(new Uint8Array(16));
       const key = b64(nonce);
@@ -432,9 +443,25 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     }
   }
 
-  async function enroll(transport, options) {
+  async function fetchEnrollmentTrust(transport, options) {
     const tls = await BrowserTls13Client.connect(transport, {
       serverName: options.serverName || '127.0.0.1'
+    });
+    const response = await tls.getJson('/enroll/ca', options.host || '127.0.0.1');
+    if (response.status < 200 || response.status >= 300) {
+      const detail = response.json?.error || response.bodyText || `HTTP ${response.status}`;
+      throw new Error(`enrollment trust fetch failed: ${detail}`);
+    }
+    return response.json;
+  }
+
+  async function enroll(transport, options) {
+    if (!options.caChainPem) {
+      throw new Error('confirmed daemon CA is required before browser enrollment POST');
+    }
+    const tls = await BrowserTls13Client.connect(transport, {
+      serverName: options.serverName || '127.0.0.1',
+      caChainPem: options.caChainPem
     });
     const response = await tls.postJson('/enroll', {
       pairing_code: options.pairingCode,
@@ -828,31 +855,31 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     if (roots.length === 0) {
       throw new Error('enrolled profile has no daemon CA certificate');
     }
+    if (roots.length !== 1) {
+      throw new Error(`enrolled profile must contain exactly one daemon CA certificate, got ${roots.length}`);
+    }
     const leaf = parseCertificate(leafDer);
     assertCertificateValidity(leaf, now, 'server certificate');
     assertServerCertificate(leaf, serverName);
     if (leaf.signatureAlgorithmOid !== OID_ECDSA_SHA256) {
       throw new Error(`unsupported server certificate signature algorithm ${leaf.signatureAlgorithmOid}`);
     }
-    for (const rootDer of roots) {
-      const root = parseCertificate(rootDer);
-      if (!constantTimeEqual(leaf.issuerDer, root.subjectDer)) {
-        continue;
-      }
-      assertCertificateValidity(root, now, 'daemon CA certificate');
-      assertCertificateAuthority(root);
-      const publicKey = await importEcdsaPublicKey(root.spkiDer);
-      const ok = await crypto.subtle.verify(
-        { name: 'ECDSA', hash: 'SHA-256' },
-        publicKey,
-        ecdsaDerSignatureToRaw(leaf.signatureValue),
-        leaf.tbsDer
-      );
-      if (ok) {
-        return;
-      }
+    const root = parseCertificate(roots[0]);
+    if (!constantTimeEqual(leaf.issuerDer, root.subjectDer)) {
+      throw new Error('server certificate is not signed by the enrolled daemon CA');
     }
-    throw new Error('server certificate is not signed by the enrolled daemon CA');
+    assertCertificateValidity(root, now, 'daemon CA certificate');
+    assertCertificateAuthority(root);
+    const publicKey = await importEcdsaPublicKey(root.spkiDer);
+    const ok = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      publicKey,
+      ecdsaDerSignatureToRaw(leaf.signatureValue),
+      leaf.tbsDer
+    );
+    if (!ok) {
+      throw new Error('server certificate is not signed by the enrolled daemon CA');
+    }
   }
 
   function assertCertificateValidity(cert, now, label) {
@@ -1419,6 +1446,7 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     JsonRpcClient,
     TlsWebSocket,
     connectRpc,
+    fetchEnrollmentTrust,
     enroll,
     _internals: {
       parseServerHello,

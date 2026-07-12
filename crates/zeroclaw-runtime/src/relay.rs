@@ -29,8 +29,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, SUBPROTOCOL,
-    TokenBucket, decode_data, encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_CONTROL_FRAME, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL,
+    SUBPROTOCOL, TokenBucket, decode_data, encode_data,
 };
 
 /// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
@@ -86,7 +86,7 @@ pub struct RelayBridgeConfig {
     pub relay_insecure: bool,
     /// Opt-in trust-on-first-use for the relay's OUTER leaf cert (A2): accept the
     /// first leaf and record its pin to `<data_dir>/relay/relay_pin`, pinning it
-    /// thereafter. Never silently enabled; a stored/explicit pin takes precedence.
+    /// thereafter. Never silently enabled; ignored when a relay CA is configured.
     pub relay_tofu: bool,
     /// Outer-mTLS variant: PEM cert/key the daemon presents to the relay on the
     /// OUTER layer (needed when the relay sets `outer_client_auth = required`).
@@ -459,8 +459,9 @@ async fn serve_once(
         .map_err(|e| anyhow::Error::msg(format!("loading relay signing key: {e}")))?;
     let pubkey = keypair.public_key().as_ref().to_vec();
 
-    // Outer TLS + WS to the relay. A stored pin (explicit or previously TOFU'd)
-    // wins; otherwise opt-in TOFU records the leaf for next time (A2).
+    // Outer TLS + WS to the relay. An operator-configured CA wins over remembered
+    // TOFU state; otherwise a stored pin wins, or opt-in TOFU records the leaf for
+    // next time (A2).
     let stored_pin = std::fs::read_to_string(relay_pin_path(&cfg.data_dir))
         .ok()
         .map(|s| s.trim().to_string())
@@ -806,9 +807,7 @@ where
 {
     while let Some(msg) = ws.next().await {
         match msg {
-            Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
-                return Control::from_json(t.as_str()).ok();
-            }
+            Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => return parse_control_text(&t),
             Ok(tokio_tungstenite::tungstenite::Message::Ping(p)) => {
                 let _ = ws
                     .send(tokio_tungstenite::tungstenite::Message::Pong(p))
@@ -821,10 +820,18 @@ where
     None
 }
 
+fn parse_control_text(text: &str) -> Option<Control> {
+    if text.len() > MAX_CONTROL_FRAME {
+        return None;
+    }
+
+    Control::from_json(text).ok()
+}
+
 /// Build the client TLS config used to verify the relay's OUTER certificate, plus
 /// the pin verifier handle when one is used (so the caller can persist a
-/// TOFU-observed pin after the handshake). Precedence: insecure (test) > an
-/// explicit/stored leaf pin > opt-in TOFU > a CA file > the built-in public roots.
+/// TOFU-observed pin after the handshake). Precedence: insecure (test) > a CA
+/// file > a stored leaf pin > opt-in TOFU > the built-in public roots.
 fn relay_client_config(
     ca_path: Option<&str>,
     insecure: bool,
@@ -850,6 +857,12 @@ fn relay_client_config(
                 .with_custom_certificate_verifier(Arc::new(NoVerify)),
             None,
         )
+    } else if let Some(ca) = ca_path {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in zeroclaw_tls::load_certs(ca)? {
+            roots.add(cert).context("adding relay CA to root store")?;
+        }
+        (builder.with_root_certificates(roots), None)
     } else if let Some(pin) = pin.filter(|p| !p.is_empty()) {
         let v = Arc::new(zeroclaw_tls::RelayPinVerifier::pinned(pin.to_string()));
         (
@@ -866,12 +879,6 @@ fn relay_client_config(
                 .with_custom_certificate_verifier(v.clone()),
             Some(v),
         )
-    } else if let Some(ca) = ca_path {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in zeroclaw_tls::load_certs(ca)? {
-            roots.add(cert).context("adding relay CA to root store")?;
-        }
-        (builder.with_root_certificates(roots), None)
     } else {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -992,6 +999,24 @@ mod node_id_tests {
     }
 
     #[test]
+    fn relay_ca_path_takes_precedence_over_tofu_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_ca = dir.path().join("relay-ca.pem");
+        let result = relay_client_config(
+            Some(missing_ca.to_string_lossy().as_ref()),
+            false,
+            Some("00"),
+            true,
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "configured relay CA must be loaded instead of falling back to stored/TOFU pins"
+        );
+    }
+
+    #[test]
     fn mint_node_id_is_128_bit_hex_and_unique() {
         let a = mint_node_id().unwrap();
         let b = mint_node_id().unwrap();
@@ -1064,5 +1089,23 @@ mod node_id_tests {
             wait_for_new_link_registration(receiver, &cancel).await,
             RotationRegistration::Registered
         );
+    }
+}
+
+#[cfg(test)]
+mod control_frame_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_control_frame_is_rejected_before_json_parse() {
+        let oversized = Control::Hello {
+            daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
+            node_id: "node".into(),
+            relay_token: None,
+        }
+        .to_json();
+
+        assert!(oversized.len() > MAX_CONTROL_FRAME);
+        assert!(parse_control_text(&oversized).is_none());
     }
 }

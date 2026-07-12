@@ -903,19 +903,32 @@ impl RpcDispatcher {
             .and_then(Value::as_str)
             .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
 
-        let (data_dir, audit_cfg, relay_cfg) = {
+        let (data_dir, audit_cfg, relay_cfg, static_client_pins_configured) = {
             let cfg = self.ctx.config.read();
             (
                 cfg.data_dir.clone(),
                 cfg.security.audit.clone(),
                 cfg.relay.clone(),
+                cfg.wss
+                    .client_auth
+                    .as_ref()
+                    .map(|auth| !auth.pinned_certs.is_empty())
+                    .unwrap_or(false),
             )
         };
 
-        let audit = crate::security::audit::AuditLogger::new(audit_cfg, data_dir.clone())
-            .ok()
-            .map(Arc::new);
-        let ledger = CertLedger::open(&data_dir, audit)
+        if static_client_pins_configured {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "certificate renewal is disabled because [wss.client_auth].pinned_certs is configured; provision pinned client certificates out of band",
+            ));
+        }
+
+        let audit = Arc::new(
+            crate::security::audit::AuditLogger::new(audit_cfg, data_dir.clone())
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("certificate audit logger: {e}")))?,
+        );
+        let ledger = CertLedger::open(&data_dir, Some(audit))
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("cert ledger: {e}")))?;
 
         // Gate on ledger status (A5): revoked cannot self-renew; an unknown cert
@@ -5602,6 +5615,133 @@ mod tests {
         assert!(
             nocert_disp.handle_renew_cert(&params).await.is_err(),
             "renewal requires the mutually authenticated WSS plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_refuses_static_pinned_wss_policy() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-static-pin");
+        let active =
+            zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-static-pin", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-static-pin".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.wss.client_auth = Some(zeroclaw_config::schema::WssClientAuthConfig {
+            pinned_certs: vec![active.fingerprint.clone()],
+            ..Default::default()
+        });
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        let err = disp
+            .handle_renew_cert(&params)
+            .await
+            .expect_err("static WSS pins must disable in-band renewal");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("[wss.client_auth].pinned_certs"),
+            "got: {}",
+            err.message
+        );
+
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            ledger.status_of(&active.fingerprint).unwrap(),
+            Some(CertStatus::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_propagates_certificate_audit_write_failure() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.security.audit.log_path = "missing/audit.log".to_string();
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-active");
+        let active = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-active", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-active".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint));
+        let err = disp
+            .handle_renew_cert(&params)
+            .await
+            .expect_err("audit write failure must fail renewal");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message.contains("certificate audit event"),
+            "got: {}",
+            err.message
         );
     }
 

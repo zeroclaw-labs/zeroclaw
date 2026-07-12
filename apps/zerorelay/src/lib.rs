@@ -45,8 +45,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL, TokenBucket,
-    decode_data, encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_CONTROL_FRAME, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL,
+    TokenBucket, decode_data, encode_data,
 };
 
 /// How far a client may drive its send window negative before the relay treats it
@@ -912,7 +912,7 @@ where
 {
     while let Some(msg) = ws.next().await {
         match msg {
-            Ok(Message::Text(t)) => return Control::from_json(&t).ok(),
+            Ok(Message::Text(t)) => return parse_control_text(&t),
             Ok(Message::Ping(p)) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
@@ -921,6 +921,14 @@ where
         }
     }
     None
+}
+
+fn parse_control_text(text: &str) -> Option<Control> {
+    if text.len() > MAX_CONTROL_FRAME {
+        return None;
+    }
+
+    Control::from_json(text).ok()
 }
 
 #[cfg(test)]
@@ -941,5 +949,18 @@ mod tests {
             resolve_target_node(Some("".into()), "from-frame".into()),
             "from-frame"
         );
+    }
+
+    #[test]
+    fn oversized_control_frame_is_rejected_before_json_parse() {
+        let oversized = Control::Hello {
+            daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
+            node_id: "node".into(),
+            relay_token: None,
+        }
+        .to_json();
+
+        assert!(oversized.len() > MAX_CONTROL_FRAME);
+        assert!(parse_control_text(&oversized).is_none());
     }
 }

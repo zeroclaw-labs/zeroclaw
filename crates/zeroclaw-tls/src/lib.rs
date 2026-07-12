@@ -196,30 +196,32 @@ pub fn build_client_verifier(params: &ClientAuthParams) -> Result<Arc<dyn Client
         });
     }
     if !params.crl_path.trim().is_empty() {
-        verifier = Arc::new(RevocationCheckVerifier::new(
-            verifier,
-            params.crl_path.trim().into(),
-        ));
+        verifier = Arc::new(
+            RevocationCheckVerifier::new(verifier, params.crl_path.trim().into())
+                .context("failed to load client certificate revocation list")?,
+        );
     }
     Ok(verifier)
 }
 
 /// Read a revoked-fingerprint file (one SHA-256 hex per line; blank lines and
-/// `#` comments ignored) into a normalized set. A missing file is an empty set
-/// (no revocations), not an error - so revocation simply has no effect until the
-/// first revoke materializes the file.
-pub fn load_revoked_fingerprints(path: &std::path::Path) -> std::collections::HashSet<String> {
+/// `#` comments ignored) into a normalized set. Missing/unreadable files are
+/// errors: a configured revocation boundary must fail closed, not silently become
+/// an empty revocation set.
+pub fn load_revoked_fingerprints(
+    path: &std::path::Path,
+) -> Result<std::collections::HashSet<String>> {
     let mut set = std::collections::HashSet::new();
-    if let Ok(text) = std::fs::read_to_string(path) {
-        for line in text.lines() {
-            let fp = line.trim();
-            if fp.is_empty() || fp.starts_with('#') {
-                continue;
-            }
-            set.insert(fp.replace(':', "").to_lowercase());
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read revoked fingerprint list {}", path.display()))?;
+    for line in text.lines() {
+        let fp = line.trim();
+        if fp.is_empty() || fp.starts_with('#') {
+            continue;
         }
+        set.insert(fp.replace(':', "").to_lowercase());
     }
-    set
+    Ok(set)
 }
 
 /// Compute the SHA-256 fingerprint of a DER-encoded certificate.
@@ -342,44 +344,34 @@ impl ClientCertVerifier for PinnedCertVerifier {
 /// file (threat A5: a stolen-but-unexpired cert is rejected at the handshake).
 ///
 /// The file is the daemon's materialized revocation list (the issued-cert ledger
-/// rewrites it on every revoke). It is re-read only when its modification time
-/// changes, so the steady state is a cheap stat per handshake and a revoke takes
-/// effect on the next connection without restarting the listener.
+/// rewrites it on every revoke). It is intentionally re-read on every handshake:
+/// the file is tiny, and this avoids stale accepts on filesystems with coarse or
+/// preserved mtimes.
 #[derive(Debug)]
 struct RevocationCheckVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     crl_path: std::path::PathBuf,
-    cache: std::sync::Mutex<RevokedCache>,
-}
-
-#[derive(Default, Debug)]
-struct RevokedCache {
-    mtime: Option<std::time::SystemTime>,
-    set: std::collections::HashSet<String>,
 }
 
 impl RevocationCheckVerifier {
-    fn new(inner: Arc<dyn ClientCertVerifier>, crl_path: std::path::PathBuf) -> Self {
-        Self {
-            inner,
-            crl_path,
-            cache: std::sync::Mutex::new(RevokedCache::default()),
-        }
+    fn new(inner: Arc<dyn ClientCertVerifier>, crl_path: std::path::PathBuf) -> Result<Self> {
+        let _ = load_revoked_fingerprints(&crl_path)?;
+        Ok(Self { inner, crl_path })
     }
 
-    /// True if `fingerprint` (normalized) is currently revoked, reloading the file
-    /// only when its mtime changed since the last read.
-    fn is_revoked(&self, fingerprint: &str) -> bool {
-        let mtime = std::fs::metadata(&self.crl_path)
-            .and_then(|m| m.modified())
-            .ok();
-        let mut cache = self.cache.lock().expect("revocation cache lock");
-        if cache.mtime != mtime {
-            cache.set = load_revoked_fingerprints(&self.crl_path);
-            cache.mtime = mtime;
-        }
-        cache.set.contains(fingerprint)
+    /// True if `fingerprint` (normalized) is currently revoked.
+    fn is_revoked(&self, fingerprint: &str) -> std::result::Result<bool, rustls::Error> {
+        let revoked = load_revoked_fingerprints(&self.crl_path)
+            .map_err(|e| revocation_error(&self.crl_path, e))?;
+        Ok(revoked.contains(fingerprint))
     }
+}
+
+fn revocation_error(path: &std::path::Path, error: impl std::fmt::Display) -> rustls::Error {
+    rustls::Error::General(format!(
+        "client certificate revocation list {} is unavailable: {error}",
+        path.display()
+    ))
 }
 
 impl ClientCertVerifier for RevocationCheckVerifier {
@@ -404,7 +396,7 @@ impl ClientCertVerifier for RevocationCheckVerifier {
         self.inner
             .verify_client_cert(end_entity, intermediates, now)?;
         let fingerprint = cert_sha256_fingerprint(end_entity.as_ref());
-        if self.is_revoked(&fingerprint) {
+        if self.is_revoked(&fingerprint)? {
             return Err(rustls::Error::General(
                 "client certificate has been revoked".to_string(),
             ));
@@ -612,12 +604,14 @@ mod tests {
             "# a comment\nAA:BB:CC\n\n  deadBEEF  \n# another\n",
         )
         .unwrap();
-        let set = load_revoked_fingerprints(f.path());
+        let set = load_revoked_fingerprints(f.path()).unwrap();
         assert!(set.contains("aabbcc"), "colons + case normalized");
         assert!(set.contains("deadbeef"), "trimmed + lowercased");
         assert_eq!(set.len(), 2, "comments + blanks skipped");
-        // A missing file is an empty set, not an error.
-        assert!(load_revoked_fingerprints(std::path::Path::new("/no/such/crl")).is_empty());
+        let err = load_revoked_fingerprints(std::path::Path::new("/no/such/crl"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revoked fingerprint list"), "got: {err}");
     }
 
     #[test]
@@ -668,6 +662,75 @@ mod tests {
             allowing.verify_client_cert(&leaf_der, &[], now).is_ok(),
             "an un-revoked client cert passes"
         );
+    }
+
+    #[test]
+    fn revocation_verifier_fails_closed_when_crl_file_disappears() {
+        ensure_crypto_provider();
+        let (ca_crt, ca_key) = testing::gen_ca();
+        let (csr, _key) = testing::gen_client_csr("dev_revoke");
+        let leaf = sign_csr(&ca_crt, &ca_key, "dev_revoke", &csr).unwrap();
+        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &ca_crt).unwrap();
+        let crl = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(crl.path(), "").unwrap();
+        let verifier = build_client_verifier(&ClientAuthParams {
+            ca_cert_path: ca_file.path().to_string_lossy().into_owned(),
+            require_client_cert: true,
+            pinned_certs: vec![],
+            crl_path: crl.path().to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        std::fs::remove_file(crl.path()).unwrap();
+
+        let err = verifier
+            .verify_client_cert(&leaf_der, &[], rustls::pki_types::UnixTime::now())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revocation list"), "got: {err}");
+    }
+
+    #[test]
+    fn revocation_verifier_reloads_when_contents_change_but_mtime_does_not() {
+        ensure_crypto_provider();
+        let (ca_crt, ca_key) = testing::gen_ca();
+        let (csr, _key) = testing::gen_client_csr("dev_revoke");
+        let leaf = sign_csr(&ca_crt, &ca_key, "dev_revoke", &csr).unwrap();
+        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let fp = cert_sha256_fingerprint(leaf_der.as_ref());
+
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &ca_crt).unwrap();
+        let crl = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(crl.path(), "").unwrap();
+        let fixed_mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(crl.path()).unwrap(),
+        );
+        let verifier = build_client_verifier(&ClientAuthParams {
+            ca_cert_path: ca_file.path().to_string_lossy().into_owned(),
+            require_client_cert: true,
+            pinned_certs: vec![],
+            crl_path: crl.path().to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        assert!(verifier.verify_client_cert(&leaf_der, &[], now).is_ok());
+
+        std::fs::write(crl.path(), format!("{fp}\n")).unwrap();
+        filetime::set_file_mtime(crl.path(), fixed_mtime).unwrap();
+        let err = verifier
+            .verify_client_cert(&leaf_der, &[], now)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revoked"), "got: {err}");
     }
 
     #[test]

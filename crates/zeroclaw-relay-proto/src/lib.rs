@@ -120,6 +120,13 @@ impl Control {
 
     /// Parse one control frame from a WS Text message (trailing newline tolerated).
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        if s.len() > MAX_CONTROL_FRAME {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "relay control frame exceeds MAX_CONTROL_FRAME",
+            )));
+        }
+
         serde_json::from_str(s.trim_end_matches(['\n', '\r']))
     }
 
@@ -400,6 +407,18 @@ mod tests {
         assert!(Control::from_json("not json").is_err());
         // Known tag but missing required field is a parse error, not a panic.
         assert!(Control::from_json("{\"t\":\"open\"}").is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_oversized_control_frame_before_parse() {
+        let oversized = Control::Hello {
+            daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
+            node_id: "node".into(),
+            relay_token: None,
+        }
+        .to_json();
+        assert!(oversized.len() > MAX_CONTROL_FRAME);
+        assert!(Control::from_json(&oversized).is_err());
     }
 
     #[test]

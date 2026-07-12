@@ -520,6 +520,7 @@ let ws = null;
 let dbPromise = null;
 let route = null;
 let pendingEnrollment = null;
+let pendingEnrollmentPost = null;
 let activeProfile = null;
 let rpcClient = null;
 let rpcConnecting = null;
@@ -548,6 +549,7 @@ async function connectEnrollment(relayUrl, nodeId, pairingCode) {
 
   closeExisting();
   pendingEnrollment = null;
+  pendingEnrollmentPost = null;
   self.postMessage({ type: 'connecting' });
 
   let material;
@@ -567,6 +569,11 @@ async function connectEnrollment(relayUrl, nodeId, pairingCode) {
     csrBytes: material.csrPem.length
   });
 
+  openEnrollmentRoute(material);
+}
+
+function openEnrollmentRoute(material) {
+  const { relayUrl, nodeId } = material;
   const socket = new WebSocket(relayUrl, 'zeroclaw.relay.v1');
   ws = socket;
   socket.binaryType = 'arraybuffer';
@@ -622,12 +629,43 @@ async function connectEnrollment(relayUrl, nodeId, pairingCode) {
         return;
       }
       self.postMessage({ type: 'route-open', connId: route.connId });
-      beginBrowserEnrollment(route, material);
+      if (pendingEnrollmentPost) {
+        const pending = pendingEnrollmentPost;
+        pendingEnrollmentPost = null;
+        finishBrowserEnrollment(route, pending);
+      } else {
+        beginBrowserEnrollment(route, material);
+      }
     } else if (frame.t === 'error') {
       self.postMessage({ type: 'route-error', reason: frame.code || 'relay error' });
       closeExisting();
     } else if (frame.t === 'close') {
+      let closedConnId = null;
+      try {
+        closedConnId =
+          frame.conn_id !== undefined && frame.conn_id !== null ? normalizeConnId(frame.conn_id) : null;
+      } catch (error) {
+        self.postMessage({
+          type: 'route-error',
+          reason: error?.message || 'invalid relay connection id'
+        });
+        closeExisting();
+        return;
+      }
+      if (closedConnId !== null && route && closedConnId !== route.connId) {
+        return;
+      }
+      if (closedConnId !== null && !route && pendingEnrollmentPost) {
+        return;
+      }
       self.postMessage({ type: 'route-closed', reason: frame.reason || 'closed' });
+      if (pendingEnrollment && !pendingEnrollmentPost) {
+        if (route) {
+          route.close(frame.reason || 'closed');
+          route = null;
+        }
+        return;
+      }
       closeExisting();
     }
   });
@@ -651,7 +689,7 @@ async function connectEnrollment(relayUrl, nodeId, pairingCode) {
 }
 
 async function beginBrowserEnrollment(_transport, _material) {
-  if (!self.ZeroClawEnrollmentTls?.enroll) {
+  if (!self.ZeroClawEnrollmentTls?.fetchEnrollmentTrust || !self.ZeroClawEnrollmentTls?.enroll) {
     self.postMessage({
       type: 'tls-engine-missing',
       reason: TLS_ENGINE_UNAVAILABLE
@@ -659,28 +697,25 @@ async function beginBrowserEnrollment(_transport, _material) {
     return;
   }
   try {
-    const response = await self.ZeroClawEnrollmentTls.enroll(_transport, {
-      pairingCode: _material.pairingCode,
-      csrPem: _material.csrPem,
+    const trust = await self.ZeroClawEnrollmentTls.fetchEnrollmentTrust(_transport, {
       serverName: '127.0.0.1',
       host: '127.0.0.1'
     });
-    const caFingerprint = await firstCertificateFingerprintHex(response.ca_chain_pem);
+    const caFingerprint = await singleCertificateFingerprintHex(trust.ca_chain_pem);
     const sas = await enrollmentSas(_material.pairingCode, caFingerprint);
     pendingEnrollment = {
       material: _material,
-      response,
+      trust,
       sas
     };
     self.postMessage({
       type: 'enrollment-sas',
-      sas,
-      deviceId: response.device_id
+      sas
     });
   } catch (error) {
     self.postMessage({
       type: 'route-error',
-      reason: error?.message || 'secure enrollment failed'
+      reason: error?.message || 'secure enrollment trust fetch failed'
     });
     closeExisting();
   }
@@ -691,8 +726,61 @@ async function confirmEnrollment() {
     self.postMessage({ type: 'enrollment-aborted', reason: 'No enrollment is waiting for confirmation' });
     return;
   }
-  const { material, response, sas } = pendingEnrollment;
-  pendingEnrollment = null;
+  const pending = pendingEnrollment;
+  try {
+    pendingEnrollment = null;
+    pendingEnrollmentPost = pending;
+    if (route) {
+      route.close('enrollment SAS confirmed');
+      route = null;
+    }
+    if (ws) {
+      const old = ws;
+      ws = null;
+      try {
+        old.close();
+      } catch (_) {
+        // The provisional control socket may already be gone after /enroll/ca.
+      }
+    }
+    openEnrollmentRoute(pending.material);
+    self.postMessage({ type: 'route-opening-confirmed-enrollment' });
+  } catch (error) {
+    pendingEnrollmentPost = null;
+    self.postMessage({
+      type: 'route-error',
+      reason: error?.message || 'failed to open confirmed enrollment route'
+    });
+    closeExisting();
+  }
+}
+
+async function finishBrowserEnrollment(_transport, pending) {
+  const { material, trust, sas } = pending;
+  try {
+    const response = await self.ZeroClawEnrollmentTls.enroll(_transport, {
+      pairingCode: material.pairingCode,
+      csrPem: material.csrPem,
+      caChainPem: trust.ca_chain_pem,
+      serverName: '127.0.0.1',
+      host: '127.0.0.1'
+    });
+    const confirmedFingerprint = await singleCertificateFingerprintHex(trust.ca_chain_pem);
+    const responseFingerprint = await singleCertificateFingerprintHex(response.ca_chain_pem);
+    if (responseFingerprint !== confirmedFingerprint) {
+      throw new Error('enrollment response CA does not match the confirmed daemon CA');
+    }
+    await storeCompletedEnrollment(material, response, sas);
+  } catch (error) {
+    self.postMessage({
+      type: 'route-error',
+      reason: error?.message || 'secure enrollment failed'
+    });
+    closeExisting();
+  }
+}
+
+async function storeCompletedEnrollment(material, response, sas) {
   const db = await openEnrollmentDb();
   const stored = {
     ...material,
@@ -725,13 +813,17 @@ async function confirmEnrollment() {
 
 function abortEnrollment(reason) {
   pendingEnrollment = null;
+  pendingEnrollmentPost = null;
   closeExisting();
   self.postMessage({ type: 'enrollment-aborted', reason });
 }
 
-async function firstCertificateFingerprintHex(pem) {
-  const der = pemDecodeFirst(pem, 'CERTIFICATE');
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', der));
+async function singleCertificateFingerprintHex(pem) {
+  const certs = pemDecodeAll(pem, 'CERTIFICATE');
+  if (certs.length !== 1) {
+    throw new Error(`enrollment response must contain exactly one daemon CA certificate, got ${certs.length}`);
+  }
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', certs[0]));
   return hexEncode(digest);
 }
 
@@ -748,25 +840,34 @@ async function enrollmentSas(pairingCode, caFingerprintHex) {
   return `${digest.slice(0, 4)}-${digest.slice(4, 8)}`;
 }
 
-function pemDecodeFirst(pem, label) {
+function pemDecodeAll(pem, label) {
   const begin = `-----BEGIN ${label}-----`;
   const end = `-----END ${label}-----`;
-  const start = pem.indexOf(begin);
-  if (start < 0) {
+  const certs = [];
+  let offset = 0;
+  while (true) {
+    const start = pem.indexOf(begin, offset);
+    if (start < 0) {
+      break;
+    }
+    const bodyStart = start + begin.length;
+    const bodyEnd = pem.indexOf(end, bodyStart);
+    if (bodyEnd < 0) {
+      throw new Error(`unterminated ${label} PEM block`);
+    }
+    const b64 = pem.slice(bodyStart, bodyEnd).replace(/\s+/g, '');
+    const bin = atob(b64);
+    const der = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) {
+      der[i] = bin.charCodeAt(i);
+    }
+    certs.push(der);
+    offset = bodyEnd + end.length;
+  }
+  if (certs.length === 0) {
     throw new Error(`missing ${label} PEM block`);
   }
-  const bodyStart = start + begin.length;
-  const bodyEnd = pem.indexOf(end, bodyStart);
-  if (bodyEnd < 0) {
-    throw new Error(`unterminated ${label} PEM block`);
-  }
-  const b64 = pem.slice(bodyStart, bodyEnd).replace(/\s+/g, '');
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i += 1) {
-    out[i] = bin.charCodeAt(i);
-  }
-  return out;
+  return certs;
 }
 
 function hexEncode(bytes) {
@@ -1245,6 +1346,7 @@ function pemEncode(label, bytes) {
 }
 
 function closeExisting() {
+  pendingEnrollmentPost = null;
   if (route) {
     route.close('replaced');
     route = null;

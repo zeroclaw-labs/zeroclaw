@@ -18,7 +18,7 @@
 # FINGERPRINT (sha256 hex), plus an optional shared-secret gate via --relay-token.
 
 # --- Stage 1: build only the relay binary ---
-FROM rust:1.94-slim AS builder
+FROM rust:1.96.1-slim AS builder
 WORKDIR /app
 COPY . .
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

@@ -127,17 +127,11 @@ lifetime (~15 days) over the live mTLS session; a revoked cert cannot self-renew
 Enrollment endpoint defaults: `--enroll-host` defaults to `--connect`'s host;
 `--enroll-port` defaults to `9782`.
 
-**Migrating an existing fleet.** To turn on mTLS without distributing pairing
-codes, open a time-boxed code-less window that self-closes by wall-clock:
-
-```toml
-[enroll]
-enabled = true
-allow_unpaired_enrollment = "2026-07-01T00:00:00Z"   # RFC3339 deadline
-```
-
-The daemon logs a loud warning each start while the window is open; a malformed
-deadline is rejected at startup rather than silently treated as closed.
+The first release intentionally requires a pairing code for every enrollment.
+The reserved `allow_unpaired_enrollment` knob is rejected at daemon startup until
+the client has an explicit no-code trust anchor such as a pinned daemon CA
+fingerprint. This keeps the provisional enrollment TLS path from turning into
+blind trust-on-first-use.
 
 ### 1c. Client side - option B: operator-issued certificate
 
@@ -421,7 +415,7 @@ listener; the relay address is only the TCP dial target.
 | `enabled` | `false` | Enable the enrollment endpoint (requires `[wss]` + a CA key) |
 | `bind` | `0.0.0.0` | Bind address |
 | `port` | `9782` | Listen port |
-| `allow_unpaired_enrollment` | (empty) | RFC3339 deadline for code-less enrollment; empty = pairing-code required |
+| `allow_unpaired_enrollment` | (empty) | Reserved; non-empty values are rejected until a no-code client trust anchor exists |
 
 ### Daemon `[relay]`
 

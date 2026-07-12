@@ -3064,6 +3064,23 @@ fn resolve_wss_client_auth(
     Ok((byo_ca, pinned))
 }
 
+#[cfg(feature = "agent-runtime")]
+fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> {
+    if wss_cfg.sans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    sans.extend(
+        wss_cfg
+            .sans
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+    );
+    sans
+}
+
 #[cfg(all(test, feature = "agent-runtime"))]
 mod wss_client_auth_tests {
     use super::*;
@@ -3093,6 +3110,24 @@ mod wss_client_auth_tests {
         let err =
             resolve_wss_client_auth(Some(&auth)).expect_err("disabled BYO CA must fail closed");
         assert!(err.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn wss_server_sans_adds_local_and_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["relay.example.test".into(), " ".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            wss_server_sans(&cfg),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "relay.example.test".to_string(),
+            ]
+        );
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
     }
 }
 
@@ -3129,6 +3164,8 @@ fn issue_wss_client_cert(
     let dest = out_dir.unwrap_or(tls_dir);
     let cert_path = dest.join(format!("client-{slug}.crt"));
     let key_path = dest.join(format!("client-{slug}.key"));
+    let cert_tmp_path = dest.join(format!(".client-{slug}.crt.tmp"));
+    let key_tmp_path = dest.join(format!(".client-{slug}.key.tmp"));
     if !force && (cert_path.exists() || key_path.exists()) {
         anyhow::bail!(
             "{} already exists. Pass --force to overwrite, or --out-dir / --name for a new one.",
@@ -3151,17 +3188,28 @@ fn issue_wss_client_cert(
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
         }
     }
-    std::fs::write(&cert_path, issued.cert_pem.as_bytes())?;
-    zeroclaw_tls::certgen::write_private_pem(&key_path, &issued.key_pem)?;
+    std::fs::write(&cert_tmp_path, issued.cert_pem.as_bytes())
+        .with_context(|| format!("write staged certificate {}", cert_tmp_path.display()))?;
+    if let Err(e) = zeroclaw_tls::certgen::write_private_pem(&key_tmp_path, &issued.key_pem) {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        return Err(e)
+            .with_context(|| format!("write staged private key {}", key_tmp_path.display()));
+    }
 
     // Record the issuance in the daemon-owned ledger so this cert is revocable and
     // appears in the canonical "who holds which cert" record (actor = operator).
-    {
+    let ledger_result = (|| -> Result<()> {
         use zeroclaw_runtime::security::cert_ledger::{
             CertLedger, CertStatus, IssuanceActor, LedgerEntry,
         };
-        let der = zeroclaw_tls::load_certs(&cert_path.to_string_lossy())?;
-        let fingerprint = zeroclaw_tls::cert_sha256_fingerprint(der[0].as_ref());
+        let der = rustls_pemfile::certs(&mut issued.cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("parse staged issued certificate")?;
+        let fingerprint = zeroclaw_tls::cert_sha256_fingerprint(
+            der.first()
+                .context("issued client certificate PEM is empty")?
+                .as_ref(),
+        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -3180,6 +3228,21 @@ fn issue_wss_client_cert(
             },
             false,
         )?;
+        Ok(())
+    })();
+    if let Err(e) = ledger_result {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        let _ = std::fs::remove_file(&key_tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&key_tmp_path, &key_path)
+        .with_context(|| format!("publish private key {}", key_path.display()))?;
+    if let Err(e) = std::fs::rename(&cert_tmp_path, &cert_path)
+        .with_context(|| format!("publish certificate {}", cert_path.display()))
+    {
+        let _ = std::fs::remove_file(&key_path);
+        return Err(e);
     }
 
     // When issuing into a separate out-dir, also lay it out as a drop-in client
@@ -4801,25 +4864,10 @@ async fn main() -> Result<()> {
                                 // passphrase is configured (same source the
                                 // enrollment + CLI read paths use), else 0600.
                                 // [wss].sans adds the hostnames/IPs a remote client
-                                // uses to reach the daemon to the server cert
-                                // (localhost + 127.0.0.1 are always included);
-                                // empty keeps the local-only default.
-                                let server_sans: Vec<String> = if wss_cfg.sans.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    let mut s = vec![
-                                        "localhost".to_string(),
-                                        "127.0.0.1".to_string(),
-                                    ];
-                                    s.extend(
-                                        wss_cfg
-                                            .sans
-                                            .iter()
-                                            .filter(|x| !x.trim().is_empty())
-                                            .cloned(),
-                                    );
-                                    s
-                                };
+                                // uses to reach the daemon to the server cert. The
+                                // enrollment endpoint uses the same resolver so both
+                                // TLS surfaces present matching daemon identities.
+                                let server_sans = wss_server_sans(&wss_cfg);
                                 let mats = zeroclaw_tls::ensure_server_materials_protected(
                                     &data_dir.join("tls"),
                                     &server_sans,
@@ -4836,18 +4884,28 @@ async fn main() -> Result<()> {
                         // ledger-materialized list under <data_dir>/tls/revoked
                         // (the daemon rewrites it on every revoke), overridable by
                         // [wss.client_auth].crl_path.
-                        let crl_path = wss_cfg
+                        let default_crl_path =
+                            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&data_dir);
+                        let configured_crl_path = wss_cfg
                             .client_auth
                             .as_ref()
                             .map(|c| c.crl_path.clone())
-                            .filter(|p| !p.is_empty())
-                            .unwrap_or_else(|| {
-                                zeroclaw_runtime::security::cert_ledger::revoked_list_path(
-                                    &data_dir,
+                            .filter(|p| !p.is_empty());
+                        let crl_path = configured_crl_path.clone().unwrap_or_else(|| {
+                            default_crl_path.to_string_lossy().into_owned()
+                        });
+                        if configured_crl_path.is_none() {
+                            let ledger =
+                                zeroclaw_runtime::security::cert_ledger::CertLedger::open(
+                                    &data_dir, None,
                                 )
-                                .to_string_lossy()
-                                .into_owned()
-                            });
+                                .context(
+                                    "open cert ledger before starting WSS revocation checks",
+                                )?;
+                            ledger.materialize_revocations().context(
+                                "materialize cert revocations before starting WSS listener",
+                            )?;
+                        }
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
                             &cert_path,
                             &key_path,
@@ -5030,9 +5088,10 @@ async fn main() -> Result<()> {
                         let ca_provided =
                             tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
                         let protection = ca_key_protection_from_env();
+                        let server_sans = wss_server_sans(&wss_cfg);
                         let mats = zeroclaw_tls::ensure_server_materials_protected(
                             &tls_dir,
-                            &[],
+                            &server_sans,
                             &protection,
                         )?;
                         ::zeroclaw_log::record!(
@@ -5105,53 +5164,31 @@ async fn main() -> Result<()> {
                             println!();
                         }
 
-                        // Migration/cutover window: a time-boxed period during which
-                        // clients may enroll WITHOUT a pairing code (to migrate an
-                        // existing fleet). A malformed deadline is surfaced loudly
-                        // (never silently treated as closed), and an OPEN window is
-                        // a security-relevant state the operator must see.
+                        // Reserved migration knob. Code-less enrollment needs a
+                        // separate client trust anchor before certs can be cached.
                         let allow_unpaired_until = {
                             let s = enroll_cfg.allow_unpaired_enrollment.trim();
-                            if s.is_empty() {
-                                None
-                            } else {
-                                match chrono::DateTime::parse_from_rfc3339(s) {
-                                    Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
-                                    Err(e) => {
-                                        anyhow::bail!(
-                                            "[enroll].allow_unpaired_enrollment = {s:?} is not a \
-                                             valid RFC3339 timestamp ({e}). Use e.g. \
-                                             2026-07-01T00:00:00Z, or clear it to require a pairing \
-                                             code."
-                                        );
-                                    }
-                                }
+                            if !s.is_empty() {
+                                anyhow::bail!(
+                                    "[enroll].allow_unpaired_enrollment is reserved for a future \
+                                     no-code enrollment flow and is not supported in this release. \
+                                     Clear it and use the printed pairing code."
+                                );
                             }
+                            None
                         };
-                        if let Some(deadline) = allow_unpaired_until {
-                            if chrono::Utc::now() < deadline {
-                                println!(
-                                    "WARNING: enrollment migration window is OPEN until {deadline}: \
-                                     clients may enroll WITHOUT a pairing code. Clear \
-                                     [enroll].allow_unpaired_enrollment to close it early."
-                                );
-                            } else {
-                                println!(
-                                    "Note: the enrollment migration window closed at {deadline}; a \
-                                     pairing code is now required."
-                                );
-                            }
-                        }
 
-                        let audit = zeroclaw_runtime::security::audit::AuditLogger::new(
-                            audit_cfg,
-                            data_dir.clone(),
-                        )
-                        .ok()
-                        .map(std::sync::Arc::new);
+                        let audit = std::sync::Arc::new(
+                            zeroclaw_runtime::security::audit::AuditLogger::new(
+                                audit_cfg,
+                                data_dir.clone(),
+                            )
+                            .context("initialize certificate audit logger for enrollment endpoint")?,
+                        );
                         let ledger = std::sync::Arc::new(
                             zeroclaw_runtime::security::cert_ledger::CertLedger::open(
-                                &data_dir, audit,
+                                &data_dir,
+                                Some(audit),
                             )?,
                         );
 
@@ -5164,6 +5201,11 @@ async fn main() -> Result<()> {
                             ca_key_pem,
                             ledger,
                             pairing,
+                            static_client_pins_configured: wss_cfg
+                                .client_auth
+                                .as_ref()
+                                .map(|auth| !auth.pinned_certs.is_empty())
+                                .unwrap_or(false),
                             allow_unpaired_until,
                             relay_profile,
                         });
@@ -9223,6 +9265,34 @@ mod tests {
             }
             other => panic!("expected security status command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_cleans_staged_material_when_ledger_record_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let tls_dir = config.data_dir.join("tls");
+        zeroclaw_tls::ensure_server_materials(&tls_dir, &[]).expect("daemon TLS materials");
+        std::fs::create_dir(tls_dir.join("ledger.db")).expect("poison ledger path");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ledger"), "got: {err}");
+        assert!(!out.path().join("client-dev_under_test.crt").exists());
+        assert!(!out.path().join("client-dev_under_test.key").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
     }
 
     /// Operator revocation through the `revoke-client-cert` handler writes the

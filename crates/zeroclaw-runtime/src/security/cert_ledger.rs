@@ -169,15 +169,7 @@ impl CertLedger {
         };
         // Refresh the materialized revocation list so it reflects the ledger at
         // startup (covers a missing/stale file).
-        if let Err(e) = ledger.materialize_revocations() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
-                "cert ledger: failed to materialize the revocation list at open"
-            );
-        }
+        ledger.materialize_revocations()?;
         Ok(ledger)
     }
 
@@ -185,7 +177,7 @@ impl CertLedger {
     /// rename). This is what makes a revoke take effect at the next handshake -
     /// the WSS verifier re-reads the file when its mtime changes. No-op for an
     /// in-memory ledger.
-    fn materialize_revocations(&self) -> Result<()> {
+    pub fn materialize_revocations(&self) -> Result<()> {
         let Some(path) = &self.revoked_path else {
             return Ok(());
         };
@@ -231,8 +223,7 @@ impl CertLedger {
         } else {
             AuditEventType::CertIssued
         };
-        self.audit_cert(kind, entry);
-        Ok(())
+        self.audit_cert(kind, entry)
     }
 
     /// The status of a cert by fingerprint, or `None` if unknown to the ledger.
@@ -291,13 +282,18 @@ impl CertLedger {
             .context("revoke cert")?
         };
         if changed > 0 {
-            if let Some(mut entry) = self.lookup_by_fingerprint(fingerprint)? {
+            let audit_entry = if let Some(mut entry) = self.lookup_by_fingerprint(fingerprint)? {
                 entry.actor = actor.to_string();
-                self.audit_cert(AuditEventType::CertRevoked, &entry);
-            }
+                Some(entry)
+            } else {
+                None
+            };
             // Materialize so the WSS verifier refuses this cert on the next
             // connect (drives the A5 refusal from the real revoke action).
             self.materialize_revocations()?;
+            if let Some(entry) = audit_entry {
+                self.audit_cert(AuditEventType::CertRevoked, &entry)?;
+            }
         }
         Ok(changed > 0)
     }
@@ -359,9 +355,9 @@ impl CertLedger {
     /// security audit log is already separate from operational logs; cert facts
     /// (device id, fingerprint, validity, actor) are recorded in the existing
     /// actor/action fields so the entry is covered by the Merkle chain.
-    fn audit_cert(&self, kind: AuditEventType, entry: &LedgerEntry) {
+    fn audit_cert(&self, kind: AuditEventType, entry: &LedgerEntry) -> Result<()> {
         let Some(audit) = &self.audit else {
-            return;
+            return Ok(());
         };
         let event = AuditEvent::new(kind)
             .with_actor(
@@ -379,16 +375,9 @@ impl CertLedger {
                 true,
             )
             .with_result(true, None, 0, None);
-        if let Err(e) = audit.log(&event) {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"fingerprint": entry.fingerprint})),
-                "failed to write certificate audit event"
-            );
-            let _ = e;
-        }
+        audit
+            .log(&event)
+            .with_context(|| format!("write certificate audit event for {}", entry.fingerprint))
     }
 }
 
@@ -409,6 +398,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::AuditConfig;
 
     fn entry(fp: &str, device: &str) -> LedgerEntry {
         LedgerEntry {
@@ -481,9 +471,54 @@ mod tests {
             "the revoked fingerprint is materialized"
         );
         // The verifier sees it as revoked, the other does not.
-        let set = zeroclaw_tls::load_revoked_fingerprints(&crl);
+        let set = zeroclaw_tls::load_revoked_fingerprints(&crl).unwrap();
         assert!(set.contains("fpa")); // load normalizes to lowercase
         assert!(!set.contains("fpb"));
+    }
+
+    #[test]
+    fn open_refreshes_stale_materialized_revocations_from_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let crl = revoked_list_path(dir.path());
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            led.record_issued(&entry("fpA", "dev1"), false).unwrap();
+            led.mark_revoked("fpA", "operator").unwrap();
+        }
+
+        std::fs::write(&crl, "# stale\n").unwrap();
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert!(reopened.is_revoked("fpA").unwrap());
+        let refreshed = std::fs::read_to_string(&crl).unwrap();
+        assert_eq!(refreshed.trim(), "fpA");
+
+        std::fs::remove_file(&crl).unwrap();
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert!(reopened.is_revoked("fpA").unwrap());
+        let refreshed = std::fs::read_to_string(&crl).unwrap();
+        assert_eq!(refreshed.trim(), "fpA");
+    }
+
+    #[test]
+    fn record_issued_propagates_certificate_audit_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogger::new(
+            AuditConfig {
+                enabled: true,
+                log_path: "missing/audit.log".to_string(),
+                max_size_mb: 100,
+                sign_events: false,
+            },
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let led = CertLedger::open_in_memory(Some(Arc::new(audit))).unwrap();
+
+        let err = led
+            .record_issued(&entry("fp1", "dev1"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("certificate audit event"), "got: {err}");
     }
 
     #[test]

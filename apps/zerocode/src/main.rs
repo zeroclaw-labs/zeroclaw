@@ -390,8 +390,9 @@ async fn resolve_relay_dial(
                 .filter(|s| !s.is_empty())
         });
 
-    // Relay outer-leaf pin: --relay-pin -> the enrollment-delivered pin -> a
-    // previously TOFU'd pin. TOFU persists here for the next run.
+    // Relay outer-leaf pin candidates: --relay-pin -> the enrollment-delivered
+    // pin -> a previously TOFU'd pin. The TLS connector ignores these candidates
+    // when --relay-ca is set.
     let pin_store = config_dir.join("relay").join("relay_pin");
     let relay_pin = cli
         .relay_pin
@@ -417,9 +418,9 @@ async fn resolve_relay_dial(
                     .map(|(h, _)| h.to_string())
                     .unwrap_or_else(|| relay_addr.clone())
             });
-            // Resolve the relay outer-cert trust: explicit flags/remembered pin
-            // win; otherwise offer interactive trust-on-first-use instead of a
-            // bare UnknownIssuer at connect/enrollment time.
+            // Resolve the relay outer-cert trust: explicit trust settings skip
+            // the prompt; otherwise offer interactive trust-on-first-use instead
+            // of a bare UnknownIssuer at connect/enrollment time.
             let relay_pin =
                 resolve_relay_trust(relay_pin, &relay_addr, &relay_host, cli, &pin_store).await?;
             Ok(Some(client::RelayDial {

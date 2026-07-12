@@ -271,10 +271,21 @@ mod tests {
         assert!(text.contains("handleRpcRequest"));
         assert!(text.contains("ensureRpcClient"));
         assert!(text.contains("zeroclaw-rpc-request"));
+        assert!(text.contains("ZeroClawEnrollmentTls.fetchEnrollmentTrust"));
         assert!(text.contains("ZeroClawEnrollmentTls.enroll"));
         assert!(text.contains("enrollment-sas"));
+        assert!(text.contains("pendingEnrollmentPost"));
+        assert!(text.contains("route-opening-confirmed-enrollment"));
+        assert!(text.contains("openEnrollmentRoute(pending.material)"));
+        assert!(text.contains("normalizeConnId(frame.conn_id)"));
+        assert!(text.contains("caChainPem: trust.ca_chain_pem"));
+        assert!(text.contains("storeCompletedEnrollment"));
         assert!(text.contains("material = { ...material, relayUrl, nodeId, pairingCode }"));
         assert!(text.contains("connectRpcTunnel"));
+        assert!(text.contains("singleCertificateFingerprintHex"));
+        assert!(
+            text.contains("enrollment response must contain exactly one daemon CA certificate")
+        );
         assert!(text.contains("ZeroClawEnrollmentTls.connectRpc"));
         assert!(text.contains("caChainPem: profile.caChainPem"));
         assert!(text.contains("openRelayDataRoute"));
@@ -296,10 +307,14 @@ mod tests {
         assert!(text.contains("TLS_AES_128_GCM_SHA256"));
         assert!(text.contains("ZeroClawEnrollmentTls"));
         assert!(text.contains("connectRpc"));
+        assert!(text.contains("fetchEnrollmentTrust"));
+        assert!(text.contains("/enroll/ca"));
+        assert!(text.contains("confirmed daemon CA is required before browser enrollment POST"));
         assert!(text.contains("verifyServerCertificateVerify"));
         assert!(text.contains("verifyServerCertificateChain"));
         assert!(text.contains("ecdsaDerSignatureToRaw"));
         assert!(text.contains("assertCertificateAuthority"));
+        assert!(text.contains("enrolled profile must contain exactly one daemon CA certificate"));
         assert!(text.contains("assertServerCertificate"));
         assert!(text.contains("server certificate is not authorized for server authentication"));
         assert!(text.contains("_internals"));

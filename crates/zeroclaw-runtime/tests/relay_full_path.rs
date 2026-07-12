@@ -246,6 +246,7 @@ async fn enrollment_post_round_trips_through_relay_route() {
             zeroclaw_runtime::security::cert_ledger::CertLedger::open_in_memory(None).unwrap(),
         ),
         pairing: Arc::new(pairing),
+        static_client_pins_configured: false,
         allow_unpaired_until: None,
         relay_profile: zeroclaw_runtime::enroll::RelayProfile::default(),
     });
