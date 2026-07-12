@@ -1291,6 +1291,7 @@ mod tests {
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::PAYMENT_REQUIRED,
             reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::GONE,
         ] {
             let err = http_search_failure("searxng", status);
             let msg = format!("{err}");
