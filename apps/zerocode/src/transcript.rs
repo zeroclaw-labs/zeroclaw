@@ -32,7 +32,7 @@ use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
 use crate::ui_render_spec::{RailMode, SessionStatusMode, ThoughtMode, UiRenderSpec};
-use crate::wire::ToolPresentation;
+use crate::wire::{PlanStatus, ToolPresentation};
 
 // Height of the approval popup anchored to the bottom of the content area.
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
@@ -42,6 +42,18 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const SCROLLBAR_VISIBLE_AFTER: Duration = Duration::from_millis(1200);
+const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
+
+struct DeferredInboundRequest {
+    req: crate::client::RpcInboundRequest,
+    first_seen: Instant,
+}
+
+enum ElicitationRouting {
+    Installed,
+    Unparseable(serde_json::Value),
+    Deferred(crate::client::RpcInboundRequest),
+}
 
 // ── Code transcript pane ─────────────────────────────────────────
 
@@ -146,48 +158,7 @@ pub(crate) struct Transcript {
     /// Double-click tracker for the session picker: a second click on the same row
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `TranscriptState` this pane
-    /// constructs. Defaults until fetched.
-    todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
-    /// repeat on every session start.
-    todo_settings_loaded: bool,
-    /// Inbound `elicitation/create` requests that arrived while the pane was
-    /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
-    /// Rather than auto-cancel a legitimately-owned prompt during that
-    /// transient window — which silently drops the agent's `ask_user` — we
-    /// hold it here and retry installation on subsequent drains until it
-    /// either matches (modal installed) or its grace deadline expires (then
-    /// answered `cancel`, unblocking the daemon's tool call). See
-    /// `drain_inbound_requests` / `try_install_elicitation`.
     deferred_elicitations: Vec<DeferredInboundRequest>,
-}
-
-/// How long an unroutable inbound `elicitation/create` is retried before it is
-/// answered `cancel`. Covers the transient window where the pane is switching
-/// or resuming a session and `phase` is briefly not `Active` on the target
-/// session. Short enough that a genuinely-unroutable request still unblocks the
-/// daemon's tool call promptly.
-const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
-
-/// An inbound server-initiated request buffered for a retry pass because it
-/// could not be installed on arrival. Carries the arrival instant so the drain
-/// loop can enforce [`ELICITATION_ROUTE_GRACE`].
-struct DeferredInboundRequest {
-    req: crate::client::RpcInboundRequest,
-    first_seen: Instant,
-}
-
-/// Outcome of attempting to route one inbound `elicitation/create` to the
-/// active session. See `Transcript::try_install_elicitation`.
-enum ElicitationRouting {
-    /// Modal installed on the active session; it owns the request id.
-    Installed,
-    /// Schema/params could not be decoded; caller must answer `cancel`.
-    Unparseable(serde_json::Value),
-    /// Parsed but does not target the active session yet; retry briefly.
-    Defer(crate::client::RpcInboundRequest),
 }
 
 /// Result of one background `session/git_branch` poll, routed back to the UI
@@ -249,8 +220,6 @@ impl Transcript {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
-            todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
-            todo_settings_loaded: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -704,6 +673,7 @@ impl Transcript {
     /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
     /// future daemon-side feature doesn't silently park a request id.
     fn drain_inbound_requests(&mut self) {
+        self.retry_deferred_elicitations();
         loop {
             let req = match self.inbound_rx.try_recv() {
                 Ok(req) => req,
@@ -733,6 +703,28 @@ impl Transcript {
         }
     }
 
+    fn retry_deferred_elicitations(&mut self) {
+        let now = Instant::now();
+        let mut pending = Vec::new();
+        std::mem::swap(&mut pending, &mut self.deferred_elicitations);
+        for deferred in pending {
+            match self.try_install_elicitation(deferred.req) {
+                ElicitationRouting::Installed => {}
+                ElicitationRouting::Unparseable(id) => self.cancel_inbound_request(id),
+                ElicitationRouting::Deferred(req) => {
+                    if now.duration_since(deferred.first_seen) >= ELICITATION_ROUTE_GRACE {
+                        self.cancel_inbound_request(req.id);
+                    } else {
+                        self.deferred_elicitations.push(DeferredInboundRequest {
+                            req,
+                            first_seen: deferred.first_seen,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// Decode an inbound elicitation and install an interactive modal on
     /// the matching session so the user can pick an answer.
     ///
@@ -745,42 +737,38 @@ impl Transcript {
     /// Wire shape per the ACP elicitation RFD
     /// (https://agentclientprotocol.com/rfds/elicitation).
     fn handle_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
-        let params: Option<crate::wire::ElicitationRequestParams> =
-            serde_json::from_value(req.params.clone()).ok();
-        let shape = params
-            .as_ref()
-            .and_then(|p| crate::wire::ElicitationShape::from_schema(&p.requested_schema));
-
-        // The request must target the active session AND carry a schema
-        // we understand. Anything else gets an immediate `cancel`.
-        let installable = match (&params, &shape) {
-            (Some(p), Some(_)) => matches!(
-                &self.phase,
-                TranscriptPhase::Active(state) if state.session_id == p.session_id
-            ),
-            _ => false,
-        };
-
-        if !installable {
-            let id = req.id;
-            let rpc = self.rpc.clone();
-            tokio::spawn(async move {
-                let _ = rpc
-                    .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
-                    .await;
-            });
-            return;
+        match self.try_install_elicitation(req) {
+            ElicitationRouting::Installed => {}
+            ElicitationRouting::Unparseable(id) => self.cancel_inbound_request(id),
+            ElicitationRouting::Deferred(req) => {
+                self.deferred_elicitations.push(DeferredInboundRequest {
+                    req,
+                    first_seen: Instant::now(),
+                })
+            }
         }
+    }
 
-        // Unwraps are safe: `installable` proved both are `Some`.
-        let params = params.unwrap();
-        let shape = shape.unwrap();
+    fn try_install_elicitation(
+        &mut self,
+        req: crate::client::RpcInboundRequest,
+    ) -> ElicitationRouting {
+        let Ok(params) =
+            serde_json::from_value::<crate::wire::ElicitationRequestParams>(req.params.clone())
+        else {
+            return ElicitationRouting::Unparseable(req.id);
+        };
+        let Some(shape) = crate::wire::ElicitationShape::from_schema(&params.requested_schema)
+        else {
+            return ElicitationRouting::Unparseable(req.id);
+        };
+        let request_id = req.id.clone();
         let pending = match shape {
             crate::wire::ElicitationShape::Single { choices, .. } => PendingElicitation {
-                request_id: req.id,
-                session_id: params.session_id,
+                request_id: request_id.clone(),
+                session_id: params.session_id.clone(),
                 message: params.message,
-                choices: choices.into_iter().map(|c| c.title).collect(),
+                choices: choices.into_iter().map(|choice| choice.title).collect(),
                 multi: false,
                 min_items: 1,
                 max_items: 1,
@@ -793,24 +781,38 @@ impl Transcript {
                 max_items,
                 ..
             } => {
-                let n = choices.len();
+                let selected = vec![false; choices.len()];
                 PendingElicitation {
-                    request_id: req.id,
-                    session_id: params.session_id,
+                    request_id,
+                    session_id: params.session_id.clone(),
                     message: params.message,
-                    choices: choices.into_iter().map(|c| c.title).collect(),
+                    choices: choices.into_iter().map(|choice| choice.title).collect(),
                     multi: true,
                     min_items,
                     max_items,
                     cursor: 0,
-                    selected: vec![false; n],
+                    selected,
                 }
             }
         };
 
-        if let TranscriptPhase::Active(ref mut state) = self.phase {
-            state.set_pending_elicitation(pending);
+        let TranscriptPhase::Active(state) = &mut self.phase else {
+            return ElicitationRouting::Deferred(req);
+        };
+        if state.session_id != params.session_id {
+            return ElicitationRouting::Deferred(req);
         }
+        state.set_pending_elicitation(pending);
+        ElicitationRouting::Installed
+    }
+
+    fn cancel_inbound_request(&self, id: serde_json::Value) {
+        let rpc = self.rpc.clone();
+        tokio::spawn(async move {
+            let _ = rpc
+                .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
+                .await;
+        });
     }
 
     fn settle_stuck_cancel(&mut self) {
@@ -2650,6 +2652,10 @@ impl Transcript {
             _ => false,
         }
     }
+
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        matches!(&self.phase, TranscriptPhase::Active(state) if state.wants_quit_chord())
+    }
 }
 
 impl crate::widgets::HelpContext for Transcript {
@@ -3343,6 +3349,7 @@ fn adaptive_sidebar_rows_with_owners(
     let mut rows = Vec::new();
     let mut row_owner = Vec::new();
     push_queue_sidebar_rows(state, width, &mut rows, &mut row_owner);
+    push_plan_sidebar_rows(state, width, &mut rows, &mut row_owner);
     push_session_sidebar_rows(state, width, &mut rows, &mut row_owner);
     push_tool_sidebar_rows(state, width, &mut rows, &mut row_owner);
     (rows, row_owner)
@@ -3398,6 +3405,40 @@ fn push_queue_sidebar_rows(
             )));
             row_owner.push(Some(message.id));
         }
+    }
+}
+
+fn push_plan_sidebar_rows(
+    state: &TranscriptState,
+    width: u16,
+    rows: &mut Vec<Line<'static>>,
+    row_owner: &mut Vec<Option<u64>>,
+) {
+    if state.plan_entries.is_empty() {
+        return;
+    }
+    push_sidebar_heading(rows, row_owner, crate::i18n::t("zc-code-sidebar-plan"));
+    for entry in &state.plan_entries {
+        let (glyph, style, text) = match entry.status {
+            PlanStatus::Completed => ("✔", theme::dim_style(), entry.content.as_str()),
+            PlanStatus::InProgress => (
+                "▶",
+                theme::accent_style(),
+                entry
+                    .active_form
+                    .as_deref()
+                    .unwrap_or(entry.content.as_str()),
+            ),
+            PlanStatus::Pending => ("○", Style::default(), entry.content.as_str()),
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), style),
+            Span::styled(
+                first_line_preview(text, width.saturating_sub(2) as usize),
+                style,
+            ),
+        ]));
+        row_owner.push(None);
     }
 }
 
@@ -5380,6 +5421,7 @@ pub struct TranscriptState {
     pub context_input_tokens: Option<u64>,
     /// Configured context limit for this session's model.
     pub context_max_tokens: Option<u64>,
+    plan_entries: Vec<crate::wire::PlanEntry>,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -5477,6 +5519,7 @@ impl TranscriptState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            plan_entries: Vec::new(),
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -6223,7 +6266,9 @@ impl TranscriptState {
                     self.context_max_tokens = max_context_tokens;
                 }
             }
-            SessionUpdate::Plan { .. } => {}
+            SessionUpdate::Plan { entries, .. } => {
+                self.set_plan_entries(entries);
+            }
             SessionUpdate::TurnComplete {
                 outcome, content, ..
             } => {
@@ -6265,9 +6310,18 @@ impl TranscriptState {
         self.resume_override = false;
     }
 
+    fn set_plan_entries(&mut self, entries: Vec<crate::wire::PlanEntry>) {
+        self.plan_entries = entries;
+        self.mark_dirty_full();
+    }
+
     pub fn enter_cancelling(&mut self) {
         self.turn_status = TurnStatus::Cancelling;
         self.cancel_started_at = Some(Instant::now());
+    }
+
+    fn wants_quit_chord(&self) -> bool {
+        self.turn_in_flight && !matches!(self.turn_status, TurnStatus::Cancelling)
     }
 
     pub fn cancel_watchdog_expired(&self) -> bool {
@@ -6679,6 +6733,7 @@ impl TranscriptState {
         self.cached_render_width = 0;
         self.pending_approval = None;
         self.pending_elicitation = None;
+        self.plan_entries.clear();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -6896,53 +6951,6 @@ mod tests {
             UiProfile::Minimal,
             true,
         )
-    }
-
-    #[test]
-    fn hidden_tracker_leaves_full_area_for_body() {
-        let t = crate::todo_tracker::TodoTracker::new(
-            crate::todo_tracker::TodoLocation::Right,
-            true,
-            false,
-        ); // hidden, no plan
-        let full = Rect::new(0, 0, 100, 40);
-        let (body, tracker) = carve_todo_area(&t, full);
-        assert_eq!(body, full);
-        assert!(tracker.is_none());
-    }
-
-    #[test]
-    fn visible_right_tracker_carves_column() {
-        let mut t = crate::todo_tracker::TodoTracker::new(
-            crate::todo_tracker::TodoLocation::Right,
-            true,
-            true,
-        );
-        t.set_plan(vec![crate::wire::PlanEntry {
-            content: "A".into(),
-            status: crate::wire::PlanStatus::Pending,
-            priority: crate::wire::PlanPriority::Medium,
-            active_form: None,
-        }]);
-        let full = Rect::new(0, 0, 100, 40);
-        let (body, tracker) = carve_todo_area(&t, full);
-        let tracker = tracker.expect("visible tracker gets an area");
-        assert_eq!(body.width + tracker.width, full.width);
-        assert_eq!(tracker.width, 32);
-        assert_eq!(body.height, full.height);
-    }
-
-    #[test]
-    fn tracker_width_is_clamped_on_narrow_terminals() {
-        let t = crate::todo_tracker::TodoTracker::new(
-            crate::todo_tracker::TodoLocation::Right,
-            true,
-            true,
-        );
-        let full = Rect::new(0, 0, 40, 20); // narrow
-        let (_body, tracker) = carve_todo_area(&t, full);
-        let tracker = tracker.expect("side panel visible");
-        assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
     }
 
     async fn next_rpc_request(rx: &mut mpsc::Receiver<String>, reason: &str) -> serde_json::Value {
@@ -8165,7 +8173,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Code);
+        let mut chat = transcript(client, PaneKind::Code);
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -8240,7 +8248,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Code);
+        let mut chat = transcript(client, PaneKind::Code);
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -8294,11 +8302,6 @@ mod tests {
             chat.resume_session_entry(entry).await;
             chat
         });
-
-        let request = next_rpc_request(&mut rx, "resume should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let request = next_rpc_request(&mut rx, "Enter should resume selected session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
@@ -8354,7 +8357,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Code);
+        let mut chat = transcript(client, PaneKind::Code);
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -8409,11 +8412,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "fresh start should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Esc should start a fresh session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -8450,7 +8448,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Code);
+        let mut chat = transcript(client, PaneKind::Code);
         chat.resume_session_id = Some("sess-prev".to_string());
         chat.resume_agent_alias = Some("beta".to_string());
 
@@ -8478,12 +8476,6 @@ mod tests {
         .await;
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
-
-        let request =
-            next_rpc_request(&mut rx, "fresh fallback should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let request =
             next_rpc_request(&mut rx, "stale carried resume should not be sent for alpha").await;
@@ -8561,14 +8553,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Code);
+        let mut chat = transcript(client, PaneKind::Code);
         let area = Rect::new(0, 0, 100, 30);
         let overlay_area = session_list_overlay_area(area);
-        let mut state = TranscriptState::new(
-            "sess-old".to_string(),
-            "alpha".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut state = transcript_state("sess-old", "alpha");
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         state.session_overlay = SessionOverlay::List {
@@ -8658,14 +8646,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Transcript::new(client, PaneKind::Code);
+        let mut chat = transcript(client, PaneKind::Code);
         let area = Rect::new(0, 0, 100, 30);
         let overlay_area = session_list_overlay_area(area);
-        let mut state = TranscriptState::new(
-            "sess-old".to_string(),
-            "alpha".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
+        let mut state = transcript_state("sess-old", "alpha");
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         state.session_overlay = SessionOverlay::List {
@@ -8923,24 +8907,22 @@ mod tests {
             transcript
         });
 
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("refresh should request the agent list")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request = next_rpc_request(&mut rx, "refresh should request the agent list").await;
         assert_eq!(request["method"], method::AGENTS_STATUS);
-
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(
-            &id,
-            Some(serde_json::json!({
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
                 "agents": [
                     {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
                     {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
                 ]
-            })),
-            None,
+            }),
         );
+
+        let request = next_rpc_request(&mut rx, "refresh should check recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
 
         let transcript = tokio::time::timeout(Duration::from_secs(2), refresh)
             .await
@@ -8979,25 +8961,23 @@ mod tests {
             transcript
         });
 
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("refresh should request the agent list")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request = next_rpc_request(&mut rx, "refresh should request the agent list").await;
         assert_eq!(request["method"], method::AGENTS_STATUS);
-
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(
-            &id,
-            Some(serde_json::json!({
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
                 "agents": [
                     {"alias": "alpha", "enabled": true, "live_sessions": 0},
                     {"alias": "beta", "enabled": true, "live_sessions": 0},
                     {"alias": "gamma", "enabled": true, "live_sessions": 0}
                 ]
-            })),
-            None,
+            }),
         );
+
+        let request = next_rpc_request(&mut rx, "refresh should check recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
 
         let transcript = tokio::time::timeout(Duration::from_secs(2), refresh)
             .await
@@ -9977,6 +9957,108 @@ mod tests {
             s.queue_paused(),
             "a stale inject override must not leak into the next cancelled turn"
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_elicitation_installs_after_session_becomes_active() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut transcript = transcript(client, PaneKind::Code);
+        let req = crate::client::RpcInboundRequest {
+            id: serde_json::json!("elicit-1"),
+            method: "elicitation/create".to_string(),
+            params: serde_json::json!({
+                "sessionId": "sess-1",
+                "mode": "form",
+                "message": "Pick one",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "oneOf": [
+                                { "const": "choice-0", "title": "A" },
+                                { "const": "choice-1", "title": "B" }
+                            ]
+                        }
+                    }
+                }
+            }),
+        };
+
+        transcript.handle_inbound_elicitation(req);
+        assert_eq!(transcript.deferred_elicitations.len(), 1);
+        transcript.phase = TranscriptPhase::Active(Box::new(state()));
+        transcript.retry_deferred_elicitations();
+
+        assert!(transcript.deferred_elicitations.is_empty());
+        let TranscriptPhase::Active(state) = &transcript.phase else {
+            panic!("expected active transcript");
+        };
+        let pending = state
+            .pending_elicitation()
+            .expect("deferred prompt should install");
+        assert_eq!(pending.message, "Pick one");
+        assert_eq!(pending.choices, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn plan_update_replaces_visible_sidebar_plan() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::Plan {
+            session_id: s.session_id.clone(),
+            entries: vec![crate::wire::PlanEntry {
+                content: "Write tests".to_string(),
+                status: PlanStatus::InProgress,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: Some("Writing tests".to_string()),
+            }],
+        });
+        let text = s
+            .adaptive_sidebar_rows()
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(
+            text.contains(&crate::i18n::t("zc-code-sidebar-plan")),
+            "{text}"
+        );
+        assert!(text.contains("Writing tests"), "{text}");
+    }
+
+    #[test]
+    fn empty_plan_update_clears_sidebar_plan() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::Plan {
+            session_id: s.session_id.clone(),
+            entries: vec![crate::wire::PlanEntry {
+                content: "Write tests".to_string(),
+                status: PlanStatus::Pending,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: None,
+            }],
+        });
+        s.apply_update(SessionUpdate::Plan {
+            session_id: s.session_id.clone(),
+            entries: Vec::new(),
+        });
+        assert!(s.plan_entries.is_empty());
+        let text = s
+            .adaptive_sidebar_rows()
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(!text.contains("Write tests"), "{text}");
+    }
+
+    #[test]
+    fn wants_quit_chord_releases_cancelling_turn() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        assert!(s.wants_quit_chord());
+        s.enter_cancelling();
+        assert!(!s.wants_quit_chord());
     }
 
     #[test]

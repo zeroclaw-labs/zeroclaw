@@ -193,6 +193,18 @@ fn existing_opt(alias: String) -> PickerOption {
     }
 }
 
+#[cfg(test)]
+fn current_provider_picker_cursor(options: &[PickerOption], form: &FormState) -> usize {
+    let existing = format!("{}.{}", form.provider_type, form.provider_alias);
+    options
+        .iter()
+        .position(|option| match form.provider_mode {
+            SelectorMode::Existing => option.use_existing && option.value == existing,
+            SelectorMode::Fresh => !option.use_existing && option.value == form.provider_type,
+        })
+        .unwrap_or(0)
+}
+
 fn in_rect(col: u16, row: u16, r: Rect) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
@@ -2229,10 +2241,6 @@ impl QuickstartPane {
         } else if let Some(alias) = &self.applied_alias {
             crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
         } else if let Some(first) = self.last_errors.first() {
-            // Name the first actionable field error so the user knows
-            // which field is invalid, instead of only a count. The
-            // daemon's message often already carries the specifics
-            // (e.g. "alias openai.default already exists").
             let where_ = Selector::title_for_step(first.step);
             let field_part = if first.field.is_empty() {
                 String::new()
@@ -2408,6 +2416,46 @@ fn field_row_variants(row: &FieldFormRow) -> Option<&[String]> {
         return Some(variants);
     }
     None
+}
+
+fn wrapped_selectable_option_index(options: &[PickerOption], cursor: usize, delta: i32) -> usize {
+    if options.is_empty() {
+        return cursor;
+    }
+    (cursor as i32 + delta).rem_euclid(options.len() as i32) as usize
+}
+
+fn current_field_form_row_is_model_provider_alias(form: &FieldFormModal) -> bool {
+    matches!(form.selector, Selector::ModelProvider)
+        && form
+            .fields
+            .get(form.cursor)
+            .is_some_and(|row| row.descriptor.key == "alias")
+}
+
+fn current_field_form_duplicate_error(
+    snapshot: Option<&QuickstartStateResult>,
+    form: &FieldFormModal,
+) -> Option<QuickstartError> {
+    if !current_field_form_row_is_model_provider_alias(form) {
+        return None;
+    }
+    let row = form.fields.get(form.cursor)?;
+    let alias = row.buf.trim();
+    if alias.is_empty() {
+        return None;
+    }
+    let full_ref = format!("{}.{}", form.type_key, alias);
+    snapshot
+        .is_some_and(|state| state.model_providers.iter().any(|item| item == &full_ref))
+        .then(|| QuickstartError {
+            step: QuickstartStep::ModelProvider,
+            field: "alias".to_string(),
+            message: crate::i18n::t_args(
+                "zc-quickstart-error-alias-exists",
+                &[("alias", &full_ref)],
+            ),
+        })
 }
 
 fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
@@ -3193,6 +3241,46 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_model_provider_alias_error_uses_i18n() {
+        let snapshot = QuickstartStateResult {
+            quickstart_completed: false,
+            agents: Vec::new(),
+            risk_profiles: Vec::new(),
+            runtime_profiles: Vec::new(),
+            model_providers: vec!["openai.default".to_string()],
+            channels: Vec::new(),
+            unassigned_channels: Vec::new(),
+            storage: Vec::new(),
+            model_provider_types: Vec::new(),
+            channel_types: Vec::new(),
+            risk_presets: Vec::new(),
+            runtime_presets: Vec::new(),
+            memory_kinds: Vec::new(),
+            personality_files: Vec::new(),
+        };
+        let form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openai".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::NotApplicable,
+            model_catalog_attempts: 0,
+            fields: vec![model_provider_alias_row()],
+            cursor: 0,
+        };
+
+        let error = current_field_form_duplicate_error(Some(&snapshot), &form).unwrap();
+
+        assert_eq!(
+            error.message,
+            crate::i18n::t_args(
+                "zc-quickstart-error-alias-exists",
+                &[("alias", "openai.default")]
+            )
+        );
+        assert_ne!(error.message, "alias openai.default already exists");
+    }
+
+    #[test]
     fn live_model_catalog_turns_model_row_into_picker() {
         let mut rows = vec![
             model_provider_alias_row(),
@@ -3337,12 +3425,17 @@ mod tests {
         );
 
         let mut rows = build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None);
-        restore_field_form_rows_from_form(
-            QuickstartFieldSection::ModelProvider,
-            "openai",
-            &mut rows,
-            &form,
-        );
+        for row in &mut rows {
+            match row.descriptor.key.as_str() {
+                "alias" => row.buf = form.provider_alias.clone(),
+                "model" => row.buf = form.model.clone(),
+                key => {
+                    if let Some(value) = form.provider_fields.get(key) {
+                        row.buf = value.clone();
+                    }
+                }
+            }
+        }
 
         assert_eq!(rows[0].descriptor.key, "alias");
         assert_eq!(rows[0].buf, "work");

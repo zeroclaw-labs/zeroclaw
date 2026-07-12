@@ -48,45 +48,26 @@ pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 
-/// Mode bar entries. Shared between drawing and click detection.
-const DEFAULT_MODES: [Mode; 6] = [
-    Mode::Dashboard,
-    Mode::Config,
-    Mode::Code,
-    Mode::Logs,
-    Mode::Doctor,
-    Mode::Quickstart,
-];
+macro_rules! define_modes {
+    ($($mode:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Mode {
+            $($mode),+
+        }
 
-const CHAT_MODES: [Mode; 7] = [
-    Mode::Dashboard,
-    Mode::Config,
-    Mode::Code,
-    Mode::Chat,
-    Mode::Logs,
-    Mode::Doctor,
-    Mode::Quickstart,
-];
-
-fn visible_modes(show_chat_pane: bool) -> &'static [Mode] {
-    if show_chat_pane {
-        &CHAT_MODES
-    } else {
-        &DEFAULT_MODES
-    }
+        impl Mode {
+            const ALL: &'static [Self] = &[$(Self::$mode),+];
+        }
+    };
 }
 
-// ── Mode enum ────────────────────────────────────────────────────
+define_modes!(Dashboard, Config, Code, Chat, Logs, Doctor, Quickstart);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
-    Dashboard,
-    Config,
-    Doctor,
-    Code,
-    Chat,
-    Logs,
-    Quickstart,
+fn visible_modes(show_chat_pane: bool) -> impl Iterator<Item = Mode> {
+    Mode::ALL
+        .iter()
+        .copied()
+        .filter(move |mode| mode.is_visible(show_chat_pane))
 }
 
 impl Mode {
@@ -102,8 +83,24 @@ impl Mode {
         }
     }
 
+    fn is_visible(self, show_chat_pane: bool) -> bool {
+        self != Self::Chat || show_chat_pane
+    }
+
+    fn can_handle_quit_chord(self) -> bool {
+        self.as_transcript_pane_kind().is_some()
+    }
+
+    fn as_transcript_pane_kind(self) -> Option<transcript::PaneKind> {
+        match self {
+            Mode::Code => Some(transcript::PaneKind::Code),
+            Mode::Chat => Some(transcript::PaneKind::Chat),
+            _ => None,
+        }
+    }
+
     fn cycle(self, offset: isize, show_chat_pane: bool) -> Mode {
-        let modes = visible_modes(show_chat_pane);
+        let modes: Vec<_> = visible_modes(show_chat_pane).collect();
         let len = modes.len() as isize;
         let cur = modes
             .iter()
@@ -111,6 +108,21 @@ impl Mode {
             .expect("mode missing from visible modes") as isize;
         let next = ((cur + offset).rem_euclid(len)) as usize;
         modes[next]
+    }
+}
+
+fn pane_wants_quit_chord(
+    mode: Mode,
+    code_pane: &code::Code,
+    chat_pane: &transcript::Transcript,
+) -> bool {
+    if !mode.can_handle_quit_chord() {
+        return false;
+    }
+    match mode {
+        Mode::Code => code_pane.wants_quit_chord(),
+        Mode::Chat => chat_pane.wants_quit_chord(),
+        _ => false,
     }
 }
 
@@ -599,7 +611,9 @@ pub async fn run(
                     continue;
                 }
 
-                if global == Some(GlobalAction::Quit) {
+                if global == Some(GlobalAction::Quit)
+                    && !pane_wants_quit_chord(mode, &code_pane, &chat_pane)
+                {
                     // First Ctrl+C: clear input bar text, clear transient
                     // state (browse mode, overlay, …) and arm the confirm modal.
                     match mode {
@@ -747,7 +761,7 @@ pub async fn run(
                 }
                 // Mode bar clicks
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    let modes = visible_modes(show_chat_pane);
+                    let modes: Vec<_> = visible_modes(show_chat_pane).collect();
                     let labels: Vec<(&str, String)> = modes
                         .iter()
                         .map(|m| ("", format!(" {} ", crate::i18n::t(m.fluent_key()))))
@@ -962,7 +976,7 @@ fn resolve_agent_overrides(
 fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode, show_chat_pane: bool) {
     use ratatui::widgets::Tabs;
 
-    let modes = visible_modes(show_chat_pane);
+    let modes: Vec<_> = visible_modes(show_chat_pane).collect();
     let active_idx = modes.iter().position(|m| *m == active).unwrap_or(0);
     let titles: Vec<ratatui::text::Line> = modes
         .iter()
@@ -1415,4 +1429,19 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
         Paragraph::new(Span::styled(text, theme::body_style())).style(theme::fill_style()),
         inner,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_quit_passthrough_is_limited_to_transcripts() {
+        for mode in Mode::ALL {
+            assert_eq!(
+                mode.can_handle_quit_chord(),
+                mode.as_transcript_pane_kind().is_some()
+            );
+        }
+    }
 }

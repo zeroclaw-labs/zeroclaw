@@ -208,6 +208,7 @@ mod tests {
     fn req() -> ChannelApprovalRequest {
         ChannelApprovalRequest {
             tool_name: "shell".to_string(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
         }

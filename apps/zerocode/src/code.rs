@@ -74,6 +74,10 @@ impl Code {
         self.inner.wants_text_input()
     }
 
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        self.inner.wants_quit_chord()
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }

@@ -5,6 +5,7 @@ zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
+zc-code-sidebar-plan = Plan
 
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-reload = Reload daemon
@@ -332,6 +333,7 @@ zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Code w
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
+zc-quickstart-error-alias-exists = Alias `{ $alias }` already exists
 zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
 zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
 
