@@ -1024,11 +1024,11 @@ fn duckduckgo_block_message(
 /// on the failure path (`!status.is_success()`); 2xx never reaches here.
 fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
     match status.as_u16() {
-        403 => SearchStatus::Blocked,
-        429 => SearchStatus::Unavailable,
+        403 | 451 => SearchStatus::Blocked, // active block / legal block
+        402 | 429 => SearchStatus::Unavailable, // quota / rate-limit
         400 | 401 | 404 => SearchStatus::ClientError,
         500..=599 => SearchStatus::Unavailable,
-        _ => SearchStatus::ClientError, // other 4xx -> request-side problem
+        _ => SearchStatus::ClientError, // other non-success → request-side
     }
 }
 
@@ -1047,7 +1047,10 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
             "Try a different provider (SearXNG, Brave, or Tavily)."
         }
         SearchStatus::ClientError => "Check the query and API key for this provider.",
-        _ => "Try a different provider.",
+        // classify_http_status only returns failure classes (Blocked / Unavailable /
+        // ClientError); the remaining variants are unreachable on this path.
+        SearchStatus::Ok | SearchStatus::Timeout | SearchStatus::Empty
+        | SearchStatus::ParseError => "Try a different provider.",
     };
     anyhow::Error::msg(format!(
         "{provider} search failed (search_status={}, http={status}). {hint}",
