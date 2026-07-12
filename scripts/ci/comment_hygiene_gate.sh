@@ -19,6 +19,7 @@ SKIP_PATHS=(
     "scripts/ci/comment_hygiene_gate.sh"
     "scripts/ci/comment_hygiene_gate.test.sh"
     ".cargo/audit.toml"
+    "deny.toml"
 )
 
 GLOBS=(--hidden -g '*.rs' -g '*.toml' -g '*.sh' -g '*.py' -g '*.nix'

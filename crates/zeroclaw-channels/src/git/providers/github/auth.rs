@@ -1,5 +1,9 @@
 //! Authenticates as the GitHub App: private-key loading, RS256 JWT
 //! minting, and the installation-token cache.
+//!
+//! This is the only module that touches key material; keep it that way.
+//! No HTTP here: the token-exchange *request* lives in `api`, and the
+//! provider wires the two together.
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;

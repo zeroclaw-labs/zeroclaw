@@ -1,22 +1,43 @@
-//! Inbound authentication seam: the [`AuthProvider`] trait + a
+//! RFC inbound authentication seam: the [`AuthProvider`] trait + a
 //! default-deny [`ProviderRegistry`].
 //!
-//! Each provider verifies ONE credential kind and emits a uniform
-//! [`zeroclaw_api::principal::Principal`]. Dispatch, audit, and per-principal
-//! isolation read that `Principal` and never see the credential.
+//! Each provider verifies ONE credential kind (OIDC token, SSH signature, peer
+//! uid, native pairing bearer) and emits a uniform
+//! [`zeroclaw_api::principal::Principal`] carrying the identity / claim inputs
+//! (the resolved ZeroClaw grants are added additively in the later
+//! IamPolicy-wiring step, not in this slice). Dispatch,
+//! audit, and per-principal isolation read that `Principal` and never see the
+//! credential, so they are provider-agnostic.
 //!
-//! Name distinction: this `AuthProvider` (inbound auth trait) is unrelated to
-//! [`zeroclaw_providers::auth`]'s `AuthProvider` enum (outbound LLM-provider
-//! OAuth kinds). Different crates; never coexist in one import scope.
+//! NOTE — name distinction: this `AuthProvider` (an *inbound auth* trait) is
+//! unrelated to [`zeroclaw_providers::auth`]'s `AuthProvider` enum, which names
+//! *outbound LLM-provider* OAuth kinds. They live in different crates and never
+//! coexist in one import scope.
+//!
+//! This module is the foundational seam: it has no production call sites yet (the
+//! registry is empty until providers are constructed at gateway/RPC boot in a
+//! later phase), so it changes no runtime behaviour. Default-deny means an empty
+//! registry rejects everything — wiring it on is a deliberate, later step.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason};
 
-/// A credential presented for verification. Secret material is **redacted**
-/// in `Debug` — never log it raw. Secret-bearing arms are never `Eq`-compared;
-/// plaintext is not yet zeroized on drop (repo-wide hardening is separate).
+/// A credential presented for verification (the input to the `initialize`
+/// handshake). Secret material is **redacted** in `Debug` — never log it raw.
+///
+/// Scoped to the accepted RFC provider set (bearer for native/OIDC, SSH
+/// signature, peer uid). Not-yet-accepted credential kinds (e.g. a local
+/// username/password) are added by their own scoped change, so this seam never
+/// silently carries an unaccepted credential shape.
+///
+/// SECURITY follow-up: the secret-bearing arms are redacted in `Debug`
+/// and never `Eq`-compared here, but the plaintext is not yet zeroized on drop.
+/// In-memory secret scrubbing is currently absent tree-wide (even the encrypted
+/// `config::secrets` store keeps plaintext un-scrubbed), so a `Zeroizing`/
+/// `SecretString` convention is a separate, repo-wide hardening tracked under the
+/// auth-provider work, not bolted onto this one type.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum Credential {
@@ -52,10 +73,12 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-/// Verifies one credential kind and emits a uniform [`AuthOutcome`].
+/// An RFC authentication provider: verifies one credential kind and emits a
+/// uniform [`AuthOutcome`]. Implementations live beside their identity source
+/// (e.g. `oidc` next to the IdP introspection code, `native` over `PairingGuard`).
 ///
-/// Fail-closed contract: `verify` returns [`AuthOutcome::Denied`] for anything
-/// it cannot positively authenticate — never a silent allow.
+/// Fail-closed contract: `verify` returns [`AuthOutcome::Denied`] for anything it
+/// cannot positively authenticate — never a silent allow.
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Stable provider name = its config key (e.g. `"oidc"`, `"native"`,
@@ -106,23 +129,27 @@ impl ProviderRegistry {
     }
 
     /// The configured provider names, in registration order — the enumeration
-    /// surface exposed over RPC (no hardcoded provider lists).
+    /// surface exposes over RPC (no hardcoded provider lists).
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.name()).collect()
     }
 
-    /// Resolve a presented credential to an [`AuthOutcome`], **default-deny
-    /// and authoritative-deny**.
+    /// Resolve a presented credential to an [`AuthOutcome`], **default-deny and
+    /// authoritative-deny**.
     ///
-    /// The first accepting provider that authenticates wins. A provider that
-    /// accepts a credential but rejects it with a **specific** [`DenyReason`]
-    /// (anything other than the generic [`DenyReason::BadCredential`]) is
-    /// authoritative: that outcome is returned immediately, so a later,
-    /// more broadly-accepting provider can NOT authenticate the same presented
-    /// credential past it. Only the generic `BadCredential` lets the registry
-    /// fall through to the next accepting provider. `None` is denied before
-    /// any provider runs. An empty registry denies everything.
+    /// The first accepting provider that authenticates wins. The key safety rule:
+    /// a provider that *accepts* a credential but rejects it with a **specific**
+    /// [`DenyReason`] (anything other than the generic [`DenyReason::BadCredential`]
+    /// — e.g. [`DenyReason::MfaRequired`], [`DenyReason::TokenExpired`],
+    /// [`DenyReason::Misconfigured`], [`DenyReason::AliasNotEntitled`]) is
+    /// **authoritative**: that outcome is returned immediately so a later,
+    /// more broadly-`accept`ing provider can NOT authenticate the same presented
+    /// credential past it (e.g. an OIDC provider returning `MfaRequired` for a
+    /// bearer token can't be bypassed by a later catch-all bearer provider). Only
+    /// the generic `BadCredential` ("not my credential / wrong secret") lets the
+    /// registry fall through to the next accepting provider. `None` is denied
+    /// before any provider runs. An empty registry denies everything.
     pub async fn resolve(&self, credential: &Credential) -> AuthOutcome {
         if matches!(credential, Credential::None) {
             return AuthOutcome::Denied {
@@ -266,9 +293,9 @@ mod tests {
         ));
     }
 
-    /// Regression: a provider that accepts a credential and rejects it with a
-    /// SPECIFIC reason (MfaRequired) must not be bypassed by a later provider
-    /// that would authenticate the same credential.
+    /// Regression (review): a provider that accepts a credential and rejects
+    /// it with a SPECIFIC reason (MfaRequired) must not be bypassed by a later
+    /// provider that would authenticate the same credential.
     #[tokio::test]
     async fn specific_deny_is_not_bypassed_by_a_later_provider() {
         let mut reg = ProviderRegistry::new();
