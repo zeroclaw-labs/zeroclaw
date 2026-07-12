@@ -252,6 +252,13 @@ pub enum SessionUpdate {
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
     },
+    /// Older complete turns were removed from structured session history.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: u64,
+        kept_turns: u64,
+        reason: String,
+    },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
     /// or a failure; the daemon-composed `content` carries the attributed
@@ -323,6 +330,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+        }),
+        "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
+            session_id: sid,
+            dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            kept_turns: params.get("kept_turns")?.as_u64()?,
+            reason: params.get("reason")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -3652,6 +3665,27 @@ mod plan_parse_tests {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
         }
+    }
+
+    #[test]
+    fn parses_history_trimmed_update() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                session_id,
+                dropped_messages: 12,
+                kept_turns: 3,
+                reason,
+            }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
     }
 
     #[test]
