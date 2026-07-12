@@ -773,10 +773,64 @@ turn-tool-interrupted-before-result = [interrumpido por el usuario antes de que 
 channel-runtime-malformed-tool-output = Generé un error de formato interno en la llamada de herramienta y no pude completar esta solicitud. Inténtalo de nuevo.
 channel-runtime-new-session = Historial de conversación borrado. Empezando de nuevo.
 channel-runtime-stop-sent = Señal de detención enviada.
-channel-runtime-stop-no-task = No hay tarea en curso para este alcance de remitente.
-channel-runtime-model-empty = El ID de modelo no puede estar vacío. Usa `/model <model-id>`.
+channel-runtime-stop-no-task = No hay una tarea en curso para este ámbito de remitente.
+channel-runtime-model-empty = El ID del modelo no puede estar vacío. Usa `/model <model-id>`.
 channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.
-channel-runtime-request-timeout = ⚠️ Se agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
+channel-runtime-request-timeout = ⚠️ La solicitud agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
+channel-runtime-current-model-status =
+    model_provider actual: `{ $provider }`
+    Modelo actual: `{ $model }`
+channel-runtime-model-switch-hint = Cambia el modelo con `/model <model-id>` o `/model <hint>`.
+channel-runtime-provider-switch-hint = Cambia el model_provider con `/models <model_provider>`.
+channel-runtime-available-providers-header = model_providers disponibles:
+channel-runtime-configured-routes-header = Rutas de modelo configuradas:
+channel-runtime-no-cached-models = No se encontró una lista de modelos en caché para `{ $provider }`. Pide al operador que ejecute `zeroclaw models refresh --model-provider { $provider }`.
+channel-runtime-cached-model-ids-header = IDs de modelo en caché (primeros { $count }):
+channel-runtime-config-switch-hints =
+    Usa `/models <model_provider>` para cambiar el model_provider.
+    Usa `/model <model-id>` para cambiar el modelo.
+channel-runtime-config-block-title =
+    { "*" }Configuración del modelo{ "*" }
+    Actual: `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = Seleccionar model_provider
+channel-runtime-config-select-model-placeholder = Seleccionar modelo
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *Modelo*
+channel-runtime-scope-user = usuario
+channel-runtime-scope-agent = agente
+channel-runtime-scope-overrides-summary =
+    { "**" }Sobrescrituras de modelo{ "**" } (solo sesión; precedencia user > agent > session > default):
+    • user: { $user }
+    • agent: { $agent }
+    • session (este chat): { $session }
+    • default (config): { $default }
+    Define un ámbito con `/model --user|--agent <model-id>`; bórralo configurándolo de nuevo al valor predeterminado.
+channel-runtime-set-provider-switched =
+    ModelProvider cambiado a `{ $provider }` para esta sesión del remitente. El modelo actual es `{ $model }`.
+    Usa `/model <model-id>` para definir un modelo compatible con el provider.
+channel-runtime-set-provider-init-failed =
+    Error al inicializar model_provider `{ $provider }`. La ruta no cambió.
+    Detalles: { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` tiene varios alias configurados. Especifica cuál con `/models { $family }.<alias>`: { $list }
+channel-runtime-provider-no-alias = No hay una entrada de provider configurada para `{ $provider }`. Agrega `[providers.models.{ $provider }]` (con api_key/uri) o selecciona un provider configurado; `/models` lista los válidos.
+channel-runtime-provider-unknown = model_provider desconocido `{ $provider }`. Usa `/models` para listar model_providers válidos.
+channel-runtime-scoped-model-empty = El ID del modelo no puede estar vacío. Usa `/model --user|--agent <model-id>`.
+channel-runtime-scoped-model-switched = Modelo definido en `{ $model }` (model_provider: `{ $provider }`) para el ámbito **{ $scope }**. Solo para la sesión; se restablece al reiniciar.
+channel-runtime-shadow-note = ⚠️ Hay una sobrescritura de mayor precedencia activa, por lo que los mensajes usarán `{ $model }` (`{ $provider }`) en su lugar; consulta `/model`.
+channel-runtime-thinking-set =
+    Thinking definido en `{ $level }` para esta sesión del remitente.
+    Usa `/thinking reset` para volver al valor predeterminado del agente.
+channel-runtime-thinking-cleared = Sobrescritura de thinking borrada. Usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
+channel-runtime-thinking-default =
+    Thinking ya está usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
+    Usa `/thinking high`, `/thinking max` o `/thinking off` para sobrescribirlo.
+channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/thinking off|minimal|low|medium|high|max`, `/thinking on` o `/thinking reset`.
+channel-runtime-provider-turn-init-failed =
+    ⚠️ Error al inicializar model_provider `{ $provider }`. Ejecuta `/models` para elegir otro model_provider.
+    Detalles: { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` no está disponible — respuesta de **{ $actual }** (`{ $model }`)
+    Cambiar modelo: /models
 cli-alias-list-empty = (sin entradas en {$section})
 cli-alias-created = creado {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} ya existe (sin cambios)
