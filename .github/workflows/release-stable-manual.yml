@@ -448,6 +448,32 @@ jobs:
         working-directory: apps/tauri
         run: cargo tauri build --target universal-apple-darwin --config tauri.bundled.conf.json
 
+      # Tauri notarizes + staples the .app, then wraps it in a signed .dmg — but
+      # the .dmg container carries no notarization ticket of its own, so it only
+      # validates online (Gatekeeper must reach Apple on first open). Notarize
+      # the .dmg too and staple the ticket into it so the downloaded installer
+      # validates fully offline. Guarded on APPLE_ID so unsigned builds skip
+      # cleanly — secrets never gate the build.
+      - name: Notarize and staple the .dmg (offline-valid installer)
+        if: ${{ env.APPLE_ID != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG=$(find target -name '*.dmg' ! -name 'rw.*.dmg' | head -1)
+          if [ -z "$DMG" ]; then
+            echo "No .dmg produced — skipping dmg staple."
+            exit 0
+          fi
+          echo "Notarizing .dmg for offline validation: $DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          echo "Stapled — the .dmg now validates offline."
+
       - name: Prepare desktop release assets
         run: |
           mkdir -p desktop-assets
