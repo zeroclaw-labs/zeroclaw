@@ -708,9 +708,6 @@ fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>>
 /// the caller runs the INNER WSS + mTLS. A pump task bridges that byte stream
 /// to/from the relay's binary `DATA` frames; the relay only ever forwards the
 /// (still-encrypted) inner bytes and never sees plaintext.
-// `client.rs` also compiles as part of the reusable `zerocode` library target;
-// relay enrollment is wired only by the binary's enrollment module.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 enum RelayRoute {
     Wss,
@@ -949,10 +946,7 @@ async fn dial_through_relay(
 /// Open the daemon's narrow enrollment endpoint through the nominated relay.
 /// The returned byte stream is still plaintext only to the caller; the caller
 /// must run the enrollment TLS client over it before sending pairing material.
-#[allow(dead_code)]
-pub(crate) async fn dial_enrollment_through_relay(
-    relay: &RelayDial,
-) -> Result<tokio::io::DuplexStream> {
+pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream> {
     dial_through_relay(relay, RelayRoute::Enrollment).await
 }
 

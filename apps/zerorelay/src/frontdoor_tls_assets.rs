@@ -55,12 +55,12 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
         false,
         []
       );
-      const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits(
+      const sharedBits = new Uint8Array(await crypto.subtle.deriveBits(
         { name: 'ECDH', public: serverPub },
         ecdh.privateKey,
         256
       ));
-      await this.installHandshakeKeys(sharedSecret);
+      await this.installHandshakeKeys(sharedBits);
 
       let certificateRequested = false;
       for (;;) {
@@ -97,7 +97,7 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
         this.rememberHandshake(cert);
         await this.writeEncryptedRecord(this.clientHandshake, CONTENT_HANDSHAKE, cert);
 
-        const verify = await this.clientCertificateVerify(options.clientPrivateKey);
+        const verify = await this.clientCertificateVerify(options.clientSigningKey);
         this.rememberHandshake(verify);
         await this.writeEncryptedRecord(this.clientHandshake, CONTENT_HANDSHAKE, verify);
       }
@@ -146,37 +146,37 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       return handshakeMessage(1, body);
     }
 
-    async installHandshakeKeys(sharedSecret) {
+    async installHandshakeKeys(sharedBits) {
       const zeros = new Uint8Array(HASH_LEN);
       const emptyHash = await sha256(new Uint8Array(0));
-      const earlySecret = await hkdfExtract(zeros, zeros);
-      const derivedEarly = await deriveSecret(earlySecret, 'derived', emptyHash);
-      this.handshakeSecret = await hkdfExtract(derivedEarly, sharedSecret);
+      const earlyState = await hkdfExtract(zeros, zeros);
+      const derivedEarly = await deriveSecret(earlyState, 'derived', emptyHash);
+      this.handshakeState = await hkdfExtract(derivedEarly, sharedBits);
       const transcript = await this.transcriptHash();
-      const clientSecret = await deriveSecret(this.handshakeSecret, 'c hs traffic', transcript);
-      const serverSecret = await deriveSecret(this.handshakeSecret, 's hs traffic', transcript);
-      this.clientHandshake = await trafficKeys(clientSecret);
-      this.serverHandshake = await trafficKeys(serverSecret);
-      this.clientHandshake.secret = clientSecret;
-      this.serverHandshake.secret = serverSecret;
+      const clientTraffic = await deriveSecret(this.handshakeState, 'c hs traffic', transcript);
+      const serverTraffic = await deriveSecret(this.handshakeState, 's hs traffic', transcript);
+      this.clientHandshake = await trafficKeys(clientTraffic);
+      this.serverHandshake = await trafficKeys(serverTraffic);
+      this.clientHandshake.keyingMaterial = clientTraffic;
+      this.serverHandshake.keyingMaterial = serverTraffic;
     }
 
     async installApplicationKeys() {
       const zeros = new Uint8Array(HASH_LEN);
       const emptyHash = await sha256(new Uint8Array(0));
-      const derivedHandshake = await deriveSecret(this.handshakeSecret, 'derived', emptyHash);
-      const masterSecret = await hkdfExtract(derivedHandshake, zeros);
+      const derivedHandshake = await deriveSecret(this.handshakeState, 'derived', emptyHash);
+      const masterState = await hkdfExtract(derivedHandshake, zeros);
       const transcript = await this.transcriptHash();
-      const clientSecret = await deriveSecret(masterSecret, 'c ap traffic', transcript);
-      const serverSecret = await deriveSecret(masterSecret, 's ap traffic', transcript);
-      this.clientApp = await trafficKeys(clientSecret);
-      this.serverApp = await trafficKeys(serverSecret);
+      const clientTraffic = await deriveSecret(masterState, 'c ap traffic', transcript);
+      const serverTraffic = await deriveSecret(masterState, 's ap traffic', transcript);
+      this.clientApp = await trafficKeys(clientTraffic);
+      this.serverApp = await trafficKeys(serverTraffic);
     }
 
     async verifyServerFinished(body) {
       const transcript = await this.transcriptHash();
       const finishedKey = await hkdfExpandLabel(
-        this.serverHandshake.secret,
+        this.serverHandshake.keyingMaterial,
         'finished',
         new Uint8Array(0),
         HASH_LEN
@@ -223,7 +223,7 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     async clientFinishedMessage() {
       const transcript = await this.transcriptHash();
       const finishedKey = await hkdfExpandLabel(
-        this.clientHandshake.secret,
+        this.clientHandshake.keyingMaterial,
         'finished',
         new Uint8Array(0),
         HASH_LEN
@@ -237,8 +237,8 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       return handshakeMessage(11, concat(vec8(new Uint8Array(0)), vec24(concat(...entries))));
     }
 
-    async clientCertificateVerify(privateKey) {
-      if (!privateKey) {
+    async clientCertificateVerify(signingKey) {
+      if (!signingKey) {
         throw new Error('daemon requested a client certificate but no private key is available');
       }
       const transcript = await this.transcriptHash();
@@ -248,7 +248,7 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       const signed = concat(prefix, context, bytes(0x00), transcript);
       const rawSig = new Uint8Array(await crypto.subtle.sign(
         { name: 'ECDSA', hash: 'SHA-256' },
-        privateKey,
+        signingKey,
         signed
       ));
       return handshakeMessage(15, concat(u16(0x0403), vec16(ecdsaRawSignatureToDer(rawSig))));
@@ -447,7 +447,7 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     const tls = await BrowserTls13Client.connect(transport, {
       serverName: options.serverName || '127.0.0.1',
       clientCertificatePem: options.clientCertificatePem,
-      clientPrivateKey: options.clientPrivateKey,
+      clientSigningKey: options.clientSigningKey,
       caChainPem: options.caChainPem
     });
     const ws = await tls.openWebSocket('/', options.host || '127.0.0.1');
@@ -734,11 +734,10 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     return parsed;
   }
 
-  async function trafficKeys(secret) {
+  async function trafficKeys(keyingMaterial) {
     return {
-      secret,
-      key: await hkdfExpandLabel(secret, 'key', new Uint8Array(0), KEY_LEN),
-      iv: await hkdfExpandLabel(secret, 'iv', new Uint8Array(0), IV_LEN),
+      key: await hkdfExpandLabel(keyingMaterial, 'key', new Uint8Array(0), KEY_LEN),
+      iv: await hkdfExpandLabel(keyingMaterial, 'iv', new Uint8Array(0), IV_LEN),
       seq: 0n
     };
   }

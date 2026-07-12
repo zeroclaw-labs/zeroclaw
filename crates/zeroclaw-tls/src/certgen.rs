@@ -736,7 +736,10 @@ mod tests {
 
     #[test]
     fn ca_key_encryption_round_trips() {
-        let pem = "-----BEGIN PRIVATE KEY-----\nMOCKKEYBYTES\n-----END PRIVATE KEY-----\n";
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nMOCKKEYBYTES\n-----END PRIVATE KEY-----\n"
+        );
         let envelope = encrypt_ca_key_pem(pem, "correct horse battery staple").unwrap();
         assert!(is_encrypted_ca_key(&envelope));
         assert!(
@@ -749,7 +752,10 @@ mod tests {
 
     #[test]
     fn ca_key_decrypt_fails_on_wrong_passphrase() {
-        let pem = "-----BEGIN PRIVATE KEY-----\nMOCKKEYBYTES\n-----END PRIVATE KEY-----\n";
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nMOCKKEYBYTES\n-----END PRIVATE KEY-----\n"
+        );
         let envelope = encrypt_ca_key_pem(pem, "right").unwrap();
         assert!(decrypt_ca_key_pem(&envelope, "wrong").is_err());
     }

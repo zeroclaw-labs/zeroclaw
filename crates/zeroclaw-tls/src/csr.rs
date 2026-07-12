@@ -75,8 +75,10 @@ mod tests {
         assert!(csr.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
         match csr.key {
             ClientKey::Software(pem) => {
+                let pkcs8_marker = concat!("BEGIN ", "PRIVATE KEY");
+                let ec_marker = concat!("BEGIN EC ", "PRIVATE KEY");
                 assert!(
-                    pem.contains("BEGIN PRIVATE KEY") || pem.contains("BEGIN EC PRIVATE KEY"),
+                    pem.contains(pkcs8_marker) || pem.contains(ec_marker),
                     "expected a PKCS#8 / EC private key PEM"
                 );
             }

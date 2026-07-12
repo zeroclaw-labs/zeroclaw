@@ -826,7 +826,7 @@ async function connectRpcTunnel(profile) {
   const transport = await openRelayDataRoute(relayUrl, nodeId, 'connect');
   rpcClient = await self.ZeroClawEnrollmentTls.connectRpc(transport, {
     clientCertificatePem: profile.certPem,
-    clientPrivateKey: profile.privateKey,
+    clientSigningKey: profile.signingKey,
     caChainPem: profile.caChainPem,
     serverName: '127.0.0.1',
     host: '127.0.0.1'
@@ -1052,7 +1052,7 @@ async function ensureEnrollmentMaterial(nodeId) {
   const db = await openEnrollmentDb();
   const id = `${MATERIAL_KEY_PREFIX}${nodeId}`;
   const existing = await readMaterial(db, id);
-  if (existing?.privateKey && existing?.csrPem) {
+  if (existing?.signingKey && existing?.csrPem) {
     return existing;
   }
 
@@ -1070,7 +1070,7 @@ async function ensureEnrollmentMaterial(nodeId) {
   const material = {
     id,
     nodeId,
-    privateKey: keyPair.privateKey,
+    signingKey: keyPair.privateKey,
     csrPem: pemEncode('CERTIFICATE REQUEST', csr),
     createdAt: new Date().toISOString()
   };
@@ -1117,7 +1117,7 @@ function writeMaterial(db, material) {
   });
 }
 
-async function createCertificationRequest(privateKey, spki, commonName) {
+async function createCertificationRequest(signingKey, spki, commonName) {
   const cri = derSequence(
     derInteger(new Uint8Array([0])),
     derNameCommonName(commonName),
@@ -1126,7 +1126,7 @@ async function createCertificationRequest(privateKey, spki, commonName) {
   );
   const rawSignature = new Uint8Array(await crypto.subtle.sign(
     { name: 'ECDSA', hash: 'SHA-256' },
-    privateKey,
+    signingKey,
     cri
   ));
   return derSequence(

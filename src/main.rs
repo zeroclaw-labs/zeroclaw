@@ -4722,14 +4722,14 @@ async fn main() -> Result<()> {
                         // path set while the section is disabled would otherwise be
                         // silently discarded and replaced by an auto-generated CA. Fail
                         // closed with a clear message instead.
-                        if let Some(c) = wss_cfg.client_auth.as_ref() {
-                            if !c.ca_cert_path.is_empty() && !c.enabled {
-                                anyhow::bail!(
-                                    "[wss.client_auth].ca_cert_path is set but \
-                                     [wss.client_auth].enabled is false. Set enabled = true to use \
-                                     your CA, or clear ca_cert_path to auto-generate one."
-                                );
-                            }
+                        if let Some(c) = wss_cfg.client_auth.as_ref()
+                            && !c.ca_cert_path.is_empty() && !c.enabled
+                        {
+                            anyhow::bail!(
+                                "[wss.client_auth].ca_cert_path is set but \
+                                 [wss.client_auth].enabled is false. Set enabled = true to use \
+                                 your CA, or clear ca_cert_path to auto-generate one."
+                            );
                         }
                         // Only an enabled [wss.client_auth] contributes the CA and the
                         // pins; both are gated on the same condition so they cannot

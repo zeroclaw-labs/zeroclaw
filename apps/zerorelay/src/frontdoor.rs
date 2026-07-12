@@ -11,7 +11,7 @@ use zeroclaw_relay_proto::SUBPROTOCOL;
 const MAX_HTTP_HEAD: usize = 16 * 1024;
 
 pub(crate) enum Frontdoor<S> {
-    WebSocket(WebSocketStream<PrefixedIo<S>>),
+    WebSocket(Box<WebSocketStream<PrefixedIo<S>>>),
     ServedHttp,
 }
 
@@ -28,7 +28,7 @@ where
         let ws = tokio_tungstenite::accept_hdr_async(io, select_subprotocol)
             .await
             .context("relay websocket handshake")?;
-        return Ok(Frontdoor::WebSocket(ws));
+        return Ok(Frontdoor::WebSocket(Box::new(ws)));
     }
 
     let response = response_for(&head);

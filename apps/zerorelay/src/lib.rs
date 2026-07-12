@@ -407,7 +407,7 @@ impl RelayServer {
                     Ok(frontdoor::Frontdoor::ServedHttp) => return,
                     Err(_) => return,
                 };
-                let _ = handle_conn(inner, ws, cert_node_id).await;
+                let _ = handle_conn(inner, *ws, cert_node_id).await;
             });
         }
     }
@@ -859,16 +859,15 @@ where
                             break;
                         }
                     }
-                    Ok(Control::DataAck { consumed, .. }) => {
+                    Ok(Control::DataAck { consumed, .. })
                         if to_daemon
                             .send(Message::text(
                                 Control::DataAck { conn_id, consumed }.to_json(),
                             ))
                             .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .is_err() =>
+                    {
+                        break;
                     }
                     _ => {}
                 },
