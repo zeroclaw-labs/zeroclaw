@@ -15,16 +15,16 @@
 //! and stamp each merged entry's `key` with a `[<alias>] ` prefix so
 //! callers can attribute the row.
 
-use super::markdown::MarkdownMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 /// Resolved Markdown-backed peer entry: the sibling agent's alias plus
 /// a `MarkdownMemory` pointed at that sibling's workspace dir.
 pub struct MarkdownPeer {
     pub alias: String,
-    pub memory: MarkdownMemory,
+    pub memory: Arc<dyn Memory>,
 }
 
 /// Composed Markdown memory for one agent: own backend plus the
@@ -36,7 +36,7 @@ pub struct AgentScopedMarkdownMemory {
     own_alias: String,
     /// The bound agent's MarkdownMemory pointing at
     /// `<install>/agents/<own_alias>/workspace/`.
-    own: MarkdownMemory,
+    own: Arc<dyn Memory>,
     /// Resolved sibling agents this wrapper recalls from. Empty means
     /// jailed — the agent only sees its own rows. Same-backend
     /// invariant: every peer here is also Markdown-backed (the
@@ -48,7 +48,7 @@ pub struct AgentScopedMarkdownMemory {
 impl AgentScopedMarkdownMemory {
     pub fn new(
         own_alias: impl Into<String>,
-        own: MarkdownMemory,
+        own: Arc<dyn Memory>,
         peers: Vec<MarkdownPeer>,
     ) -> Self {
         Self {
@@ -277,6 +277,7 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMarkdownMemory {
 
 #[cfg(test)]
 mod tests {
+    use super::super::markdown::MarkdownMemory;
     use super::*;
     use tempfile::TempDir;
 
@@ -294,10 +295,10 @@ mod tests {
         let (_tmp_b, peer_mem) = make_md("beta-ws");
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
             }],
         );
 
@@ -333,10 +334,10 @@ mod tests {
 
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
             }],
         );
 
@@ -371,10 +372,10 @@ mod tests {
 
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
             }],
         );
 
@@ -410,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn list_and_get_stamp_agent_alias_for_dashboard_parity() {
         let (_tmp, own) = make_md("alpha-ws");
-        let scoped = AgentScopedMarkdownMemory::new("alpha", own, vec![]);
+        let scoped = AgentScopedMarkdownMemory::new("alpha", Arc::new(own), vec![]);
 
         scoped
             .store("note", "preferences", MemoryCategory::Core, None)
@@ -455,10 +456,10 @@ mod tests {
             .unwrap();
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
             }],
         );
         scoped
