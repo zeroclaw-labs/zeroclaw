@@ -175,19 +175,19 @@ impl Tool for SopApproveTool {
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
             }),
-            // EPIC G broker outcomes: quorum not yet met, or the agent is not an
-            // authorized member of the policy's required group.
+            // A quorum can record a valid vote without clearing the gate yet.
             Ok(BrokerOutcome::PendingQuorum { have, need }) => Ok(ToolResult {
                 success: true,
                 output: format!(
                     "Approval recorded ({have} of {need}). Awaiting {} more distinct approver(s).",
                     need.saturating_sub(have)
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Ok(BrokerOutcome::NotAuthorized { required_group }) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Not authorized: approving this step requires membership in the \
                      '{required_group}' group."
@@ -197,7 +197,7 @@ impl Tool for SopApproveTool {
             // the gate is left waiting rather than cleared.
             Ok(BrokerOutcome::PolicyMissing { name }) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Approval failed: step names approval policy '{name}', which is not \
                      defined in [sop.approval].policies; the gate is left waiting."
