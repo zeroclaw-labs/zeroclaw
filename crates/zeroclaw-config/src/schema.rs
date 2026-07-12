@@ -827,7 +827,7 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
-    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
+    /// When true, the client pulls credentials from ZeroClaw's stored `openai-codex` auth profile instead of the `api_key` field above. Import an existing Codex CLI login with `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json`, or run `zeroclaw auth login --model-provider openai-codex`. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "is_false")]
     #[credential_class = "external_auth_store"]
