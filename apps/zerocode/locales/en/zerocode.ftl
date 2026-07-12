@@ -174,8 +174,10 @@ zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
 
 zc-dashboard-label-connected = Connected
+zc-dashboard-label-daemon = Daemon
+zc-dashboard-label-socket = Socket
 zc-dashboard-label-server = Server
-zc-dashboard-label-protocol = Protocol
+zc-dashboard-label-protocol = RPC API
 zc-dashboard-label-sessions = Sessions
 zc-dashboard-label-config = Config
 zc-dashboard-label-config-file = File

@@ -84,8 +84,6 @@ pub(crate) struct Dashboard {
     tab: Tab,
     last_poll: Option<Instant>,
     // Data
-    status: Option<StatusResult>,
-    health: Option<serde_json::Value>,
     sessions: Vec<SessionEntry>,
     agents: Vec<AgentStatusEntry>,
     cost: Option<CostSummaryResult>,
@@ -158,8 +156,6 @@ impl Dashboard {
             insecure_tls,
             tab: Tab::Overview,
             last_poll: None,
-            status: None,
-            health: None,
             sessions: Vec::new(),
             agents: Vec::new(),
             cost: None,
@@ -224,15 +220,6 @@ impl Dashboard {
 
     async fn poll_data(&mut self) {
         self.last_poll = Some(Instant::now());
-
-        // Always fetch status and health (health feeds the status line
-        // on every tab — RAM/CPU display).
-        if let Ok(s) = self.rpc.status().await {
-            self.status = Some(s);
-        }
-        if let Ok(h) = self.rpc.health().await {
-            self.health = Some(h);
-        }
 
         // Fetch tab-specific data
         match self.tab {
@@ -380,7 +367,13 @@ impl Dashboard {
 
     // ── Drawing ──────────────────────────────────────────────────
 
-    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+    pub(crate) fn draw(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        status: Option<&StatusResult>,
+        health: Option<&serde_json::Value>,
+    ) {
         self.drain_cron_trigger_updates();
 
         // Clear stale data when disconnected so panels don't show
@@ -407,11 +400,11 @@ impl Dashboard {
         self.draw_status_line(frame, chunks[1]);
 
         match self.tab {
-            Tab::Overview => self.draw_overview(frame, chunks[2]),
+            Tab::Overview => self.draw_overview(frame, chunks[2], status, health),
             Tab::Sessions => self.draw_sessions(frame, chunks[2]),
             Tab::Agents => self.draw_agents(frame, chunks[2]),
             Tab::Memories => self.draw_memories(frame, chunks[2]),
-            Tab::Health => self.draw_health(frame, chunks[2]),
+            Tab::Health => self.draw_health(frame, chunks[2], health),
             Tab::Cost => self.draw_cost(frame, chunks[2]),
             Tab::Cron => self.draw_cron(frame, chunks[2]),
         }
@@ -440,12 +433,6 @@ impl Dashboard {
     }
 
     fn draw_status_line(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let version = self
-            .status
-            .as_ref()
-            .map(|s| s.server_version.as_str())
-            .unwrap_or("?");
-        let active = self.status.as_ref().map(|s| s.active_sessions).unwrap_or(0);
         let help: String = if self.search_active {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
@@ -456,24 +443,14 @@ impl Dashboard {
             String::new()
         };
 
-        // Process stats from health
-        let process_info = self.process_stats_line();
-
         let line = if self.search_active {
             Line::from(vec![
-                Span::styled(
-                    format!(" v{version} sessions:{active}{process_info} "),
-                    theme::dim_style(),
-                ),
                 Span::styled(" /", theme::accent_style()),
                 Span::styled(&self.search_buf, theme::input_style()),
                 Span::styled("\u{2588}", theme::accent_style()),
             ])
         } else {
-            let mut spans = vec![Span::styled(
-                format!(" v{version} sessions:{active}{process_info} "),
-                theme::dim_style(),
-            )];
+            let mut spans = Vec::new();
             if !self.search_query.is_empty() {
                 spans.push(Span::styled(
                     crate::i18n::t("zc-dashboard-search-prefix"),
@@ -489,39 +466,15 @@ impl Dashboard {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    /// Build a compact process stats string from the health data.
-    fn process_stats_line(&self) -> String {
-        let Some(ref h) = self.health else {
-            return String::new();
-        };
-        let Some(process) = h.get("process") else {
-            return String::new();
-        };
-        let mut parts = Vec::new();
-        if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
-            && rss > 0
-        {
-            let total = process
-                .get("system_ram_total_bytes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let rss_str = format_bytes(rss);
-            if total > 0 {
-                let pct = (rss as f64 / total as f64) * 100.0;
-                parts.push(format!(" ram:{rss_str}({pct:.0}%)"));
-            } else {
-                parts.push(format!(" ram:{rss_str}"));
-            }
-        }
-        if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
-            parts.push(format!(" cpu:{cpu:.1}%"));
-        }
-        parts.join("")
-    }
-
     // ── Overview tab ─────────────────────────────────────────────
 
-    fn draw_overview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_overview(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        status: Option<&StatusResult>,
+        health: Option<&serde_json::Value>,
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -539,14 +492,38 @@ impl Dashboard {
         let inner = status_block.inner(chunks[0]);
         frame.render_widget(status_block, chunks[0]);
 
-        if let Some(ref s) = self.status {
+        if let Some(s) = status {
             let mut lines = vec![Line::from(vec![
                 Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-connected")),
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon")),
                     theme::dim_style(),
                 ),
-                Span::styled(&self.connect_label, theme::accent_style()),
+                Span::styled(daemon_label(&self.connect_label), theme::accent_style()),
             ])];
+
+            if let Some(socket) = s
+                .local_ipc_endpoint
+                .as_deref()
+                .or_else(|| local_socket_label(&self.connect_label))
+            {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-socket")),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(socket, theme::body_style()),
+                ]));
+            } else if !self.connect_label.is_empty()
+                && daemon_label(&self.connect_label) != self.connect_label
+            {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(&self.connect_label, theme::body_style()),
+                ]));
+            }
 
             if self.insecure_tls {
                 lines.push(Line::from(Span::styled(
@@ -570,22 +547,15 @@ impl Dashboard {
                     ),
                     Span::styled(format!("{}", s.protocol_version), theme::body_style()),
                 ]),
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-sessions")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format!("{}", s.active_sessions), theme::accent_style()),
-                ]),
             ]);
 
-            if let Some(config_dir) = s.config_dir.as_deref() {
+            if let Some(config_path) = s.config_file.as_deref().or(s.config_dir.as_deref()) {
                 let mut spans = vec![
                     Span::styled(
                         format!("{:<11}", crate::i18n::t("zc-dashboard-label-config")),
                         theme::dim_style(),
                     ),
-                    Span::styled(config_dir, theme::body_style()),
+                    Span::styled(config_path, theme::body_style()),
                 ];
                 if let Some(config_kind) = s.config_kind.as_ref() {
                     spans.extend([
@@ -600,28 +570,8 @@ impl Dashboard {
                 lines.push(Line::from(spans));
             }
 
-            if let Some(config_file) = s.config_file.as_deref() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-config-file")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(config_file, theme::body_style()),
-                ]));
-            }
-
-            if let Some(endpoint) = s.local_ipc_endpoint.as_deref() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(endpoint, theme::body_style()),
-                ]));
-            }
-
             // Process stats from health
-            if let Some(ref h) = self.health
+            if let Some(h) = health
                 && let Some(process) = h.get("process")
             {
                 if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
@@ -667,6 +617,14 @@ impl Dashboard {
             }
 
             frame.render_widget(Paragraph::new(lines), inner);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    crate::i18n::t("zc-dashboard-loading"),
+                    theme::dim_style(),
+                )),
+                inner,
+            );
         }
 
         // Agents
@@ -1263,7 +1221,12 @@ impl Dashboard {
 
     // ── Health tab ───────────────────────────────────────────────
 
-    fn draw_health(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_health(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        health: Option<&serde_json::Value>,
+    ) {
         let block = Block::default()
             .title(Span::styled(" Health ", theme::title_style()))
             .borders(Borders::ALL)
@@ -1271,7 +1234,7 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let Some(ref h) = self.health else {
+        let Some(h) = health else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     crate::i18n::t("zc-dashboard-loading"),
@@ -2782,6 +2745,20 @@ fn config_kind_style(kind: &ConfigKind) -> Style {
         ConfigKind::Custom => theme::accent_style(),
         ConfigKind::Temporary => theme::warn_style(),
     }
+}
+
+fn daemon_label(connect_label: &str) -> &str {
+    if connect_label.starts_with("local:") {
+        "local"
+    } else if connect_label.starts_with("ws://") || connect_label.starts_with("wss://") {
+        "remote"
+    } else {
+        connect_label
+    }
+}
+
+fn local_socket_label(connect_label: &str) -> Option<&str> {
+    connect_label.strip_prefix("local:")
 }
 
 fn format_bytes(bytes: u64) -> String {

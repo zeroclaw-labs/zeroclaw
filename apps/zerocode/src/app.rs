@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
@@ -13,7 +13,7 @@ use ratatui::{
 
 use crate::acp;
 use crate::chat;
-use crate::client::{ConnectionState, RpcClient};
+use crate::client::{ConnectionState, RpcClient, StatusResult};
 use crate::config;
 use crate::config_manager;
 use crate::dashboard;
@@ -54,6 +54,7 @@ enum QuickstartChatDrain {
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
+const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Mode bar entries. Shared between drawing and click detection.
 /// SOP authoring is not exposed from any build: the web dashboard ships as the
@@ -83,6 +84,52 @@ enum Mode {
     Quickstart,
     #[allow(dead_code)]
     Sop,
+}
+
+#[derive(Default)]
+struct ChromeStatus {
+    status: Option<StatusResult>,
+    health: Option<serde_json::Value>,
+    last_poll: Option<Instant>,
+}
+
+impl ChromeStatus {
+    async fn tick(&mut self, rpc: &Arc<RpcClient>) {
+        let due = self
+            .last_poll
+            .map(|t| t.elapsed() >= CHROME_STATUS_POLL_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.poll(rpc).await;
+        }
+    }
+
+    async fn poll(&mut self, rpc: &Arc<RpcClient>) {
+        self.last_poll = Some(Instant::now());
+        if let Ok(status) = rpc.status().await {
+            self.status = Some(status);
+        }
+        if let Ok(health) = rpc.health().await {
+            self.health = Some(health);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.status = None;
+        self.health = None;
+        self.last_poll = None;
+    }
+
+    fn summary_line(&self) -> Option<Line<'static>> {
+        let status = self.status.as_ref()?;
+        let mut text = format!(
+            " v{} sessions:{}",
+            status.server_version, status.active_sessions
+        );
+        text.push_str(&process_stats_summary(self.health.as_ref()));
+        text.push(' ');
+        Some(Line::from(Span::styled(text, theme::dim_style())))
+    }
 }
 
 impl Mode {
@@ -265,10 +312,18 @@ pub async fn run(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
     )?;
+    let mut chrome_status = ChromeStatus::default();
+    chrome_status.poll(&rpc).await;
 
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+        if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+            chrome_status.clear();
+        } else {
+            chrome_status.tick(&rpc).await;
+        }
+        let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
@@ -321,11 +376,16 @@ pub async fn run(
                 .split(frame.area());
 
             bar_area = chunks[0];
-            draw_mode_bar(frame, chunks[0], mode);
+            draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
             content_area = chunks[1];
 
             match mode {
-                Mode::Dashboard => dashboard_pane.draw(frame, chunks[1]),
+                Mode::Dashboard => dashboard_pane.draw(
+                    frame,
+                    chunks[1],
+                    chrome_status.status.as_ref(),
+                    chrome_status.health.as_ref(),
+                ),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
                 Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
@@ -465,6 +525,8 @@ pub async fn run(
                                 logs_pane = panes.5;
                                 quickstart = panes.6;
                                 sop_pane = panes.7;
+                                chrome_status.clear();
+                                chrome_status.poll(&rpc).await;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -813,7 +875,12 @@ fn resolve_agent_overrides(
 
 // ── Mode bar ─────────────────────────────────────────────────────
 
-fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
+fn draw_mode_bar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    active: Mode,
+    chrome_summary: Option<&Line<'static>>,
+) {
     use ratatui::widgets::Tabs;
 
     let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
@@ -834,7 +901,19 @@ fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
         .highlight_style(theme::selected_style().add_modifier(Modifier::BOLD))
         .divider("│")
         .padding("", "");
-    frame.render_widget(tabs, area);
+
+    if let Some(summary) = chrome_summary {
+        let summary_w = summary.width() as u16;
+        let right_w = summary_w.min(area.width);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(right_w)])
+            .split(area);
+        frame.render_widget(tabs, chunks[0]);
+        frame.render_widget(Paragraph::new(summary.clone()), chunks[1]);
+    } else {
+        frame.render_widget(tabs, area);
+    }
 }
 
 // ── Status bar ───────────────────────────────────────────────────
@@ -927,6 +1006,47 @@ fn draw_status_bar(
     };
     if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
+    }
+}
+
+fn process_stats_summary(health: Option<&serde_json::Value>) -> String {
+    let Some(h) = health else {
+        return String::new();
+    };
+    let Some(process) = h.get("process") else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
+        && rss > 0
+    {
+        let total = process
+            .get("system_ram_total_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let rss_str = format_bytes(rss);
+        if total > 0 {
+            let pct = (rss as f64 / total as f64) * 100.0;
+            parts.push(format!(" ram:{rss_str}({pct:.0}%)"));
+        } else {
+            parts.push(format!(" ram:{rss_str}"));
+        }
+    }
+    if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
+        parts.push(format!(" cpu:{cpu:.1}%"));
+    }
+    parts.join("")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1}G", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1}M", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
     }
 }
 
