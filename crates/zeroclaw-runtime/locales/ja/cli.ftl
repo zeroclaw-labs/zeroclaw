@@ -770,12 +770,66 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
 channel-runtime-malformed-tool-output = 内部ツール呼び出し形式のエラーが発生し、このリクエストを完了できませんでした。もう一度お試しください。
-channel-runtime-new-session = 会話履歴をクリアしました。新しく開始します。
+channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
 channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
-channel-runtime-model-switched = モデルを `{ $model }` に切り替えました (model_provider: `{ $provider }`)。コンテキストは保持されました。
+channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
+channel-runtime-current-model-status =
+    現在の model_provider: `{ $provider }`
+    現在のモデル: `{ $model }`
+channel-runtime-model-switch-hint = `/model <model-id>` または `/model <hint>` でモデルを切り替えます。
+channel-runtime-provider-switch-hint = `/models <model_provider>` で model_provider を切り替えます。
+channel-runtime-available-providers-header = 利用可能な model_provider:
+channel-runtime-configured-routes-header = 設定済みモデルルート:
+channel-runtime-no-cached-models = `{ $provider }` のキャッシュ済みモデル一覧が見つかりません。オペレーターに `zeroclaw models refresh --model-provider { $provider }` の実行を依頼してください。
+channel-runtime-cached-model-ids-header = キャッシュ済みモデル ID（上位 { $count } 件）:
+channel-runtime-config-switch-hints =
+    `/models <model_provider>` で model_provider を切り替えます。
+    `/model <model-id>` でモデルを切り替えます。
+channel-runtime-config-block-title =
+    { "*" }モデル設定{ "*" }
+    現在: `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = model_provider を選択
+channel-runtime-config-select-model-placeholder = モデルを選択
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *モデル*
+channel-runtime-scope-user = ユーザー
+channel-runtime-scope-agent = エージェント
+channel-runtime-scope-overrides-summary =
+    { "**" }モデル上書き{ "**" }（セッション内のみ。優先順位 user > agent > session > default）:
+    • user: { $user }
+    • agent: { $agent }
+    • session（このチャット）: { $session }
+    • default（設定）: { $default }
+    `/model --user|--agent <model-id>` でスコープを設定します。デフォルトに戻すとクリアされます。
+channel-runtime-set-provider-switched =
+    この送信者セッションの ModelProvider を `{ $provider }` に切り替えました。現在のモデルは `{ $model }` です。
+    provider 互換のモデルを設定するには `/model <model-id>` を使用してください。
+channel-runtime-set-provider-init-failed =
+    model_provider `{ $provider }` の初期化に失敗しました。ルートは変更されていません。
+    詳細: { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` には設定済みエイリアスが複数あります。`/models { $family }.<alias>` で指定してください: { $list }
+channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済み provider エントリがありません。`[providers.models.{ $provider }]`（api_key/uri を含む）を追加するか、設定済み provider を選択してください。`/models` で有効な項目を確認できます。
+channel-runtime-provider-unknown = 不明な model_provider `{ $provider }` です。`/models` で有効な model_provider を一覧表示してください。
+channel-runtime-scoped-model-empty = モデル ID は空にできません。`/model --user|--agent <model-id>` を使用してください。
+channel-runtime-scoped-model-switched = **{ $scope }** スコープのモデルを `{ $model }`（model_provider: `{ $provider }`）に設定しました。セッション内のみ有効で、再起動するとリセットされます。
+channel-runtime-shadow-note = ⚠️ より高い優先順位の上書きが有効なため、メッセージでは代わりに `{ $model }`（`{ $provider }`）が使われます。`/model` を確認してください。
+channel-runtime-thinking-set =
+    この送信者セッションの thinking を `{ $level }` に設定しました。
+    agent のデフォルトに戻すには `/thinking reset` を使用してください。
+channel-runtime-thinking-cleared = thinking の上書きをクリアしました。この送信者セッションでは agent デフォルト `{ $default }` を使用します。
+channel-runtime-thinking-default =
+    thinking はすでにこの送信者セッションで agent デフォルト `{ $default }` を使用しています。
+    上書きするには `/thinking high`、`/thinking max`、または `/thinking off` を使用してください。
+channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` です。`/thinking off|minimal|low|medium|high|max`、`/thinking on`、または `/thinking reset` を使用してください。
+channel-runtime-provider-turn-init-failed =
+    ⚠️ model_provider `{ $provider }` の初期化に失敗しました。`/models` を実行して別の model_provider を選択してください。
+    詳細: { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` は利用できません — **{ $actual }**（`{ $model }`）からの応答
+    モデル切り替え: /models
 cli-alias-list-empty = ({$section} の下にエントリがありません)
 cli-alias-created = {$section}.{$alias} を作成しました
 cli-alias-exists = {$section}.{$alias} は既に存在します（変更なし）

@@ -777,6 +777,60 @@ channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
 channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
+channel-runtime-current-model-status =
+    当前 model_provider：`{ $provider }`
+    当前模型：`{ $model }`
+channel-runtime-model-switch-hint = 使用 `/model <model-id>` 或 `/model <hint>` 切换模型。
+channel-runtime-provider-switch-hint = 使用 `/models <model_provider>` 切换 model_provider。
+channel-runtime-available-providers-header = 可用的 model_provider：
+channel-runtime-configured-routes-header = 已配置的模型路由：
+channel-runtime-no-cached-models = 未找到 `{ $provider }` 的缓存模型列表。请让操作者运行 `zeroclaw models refresh --model-provider { $provider }`。
+channel-runtime-cached-model-ids-header = 缓存的模型 ID（前 { $count } 个）：
+channel-runtime-config-switch-hints =
+    使用 `/models <model_provider>` 切换 model_provider。
+    使用 `/model <model-id>` 切换模型。
+channel-runtime-config-block-title =
+    { "*" }模型配置{ "*" }
+    当前：`{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = 选择 model_provider
+channel-runtime-config-select-model-placeholder = 选择模型
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *模型*
+channel-runtime-scope-user = 用户
+channel-runtime-scope-agent = agent
+channel-runtime-scope-overrides-summary =
+    { "**" }模型覆盖{ "**" }（仅会话内；优先级 user > agent > session > default）：
+    • user：{ $user }
+    • agent：{ $agent }
+    • session（此聊天）：{ $session }
+    • default（配置）：{ $default }
+    使用 `/model --user|--agent <model-id>` 设置范围；设置回默认值即可清除。
+channel-runtime-set-provider-switched =
+    已为此发送者会话切换到 ModelProvider `{ $provider }`。当前模型为 `{ $model }`。
+    使用 `/model <model-id>` 设置与该 provider 兼容的模型。
+channel-runtime-set-provider-init-failed =
+    初始化 model_provider `{ $provider }` 失败。路由未更改。
+    详情：{ $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` 有多个已配置别名。请用 `/models { $family }.<alias>` 指定其中一个：{ $list }
+channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置 provider 条目。请添加 `[providers.models.{ $provider }]`（含 api_key/uri），或选择一个已配置的 provider；`/models` 会列出有效项。
+channel-runtime-provider-unknown = 未知 model_provider `{ $provider }`。使用 `/models` 查看有效的 model_provider。
+channel-runtime-scoped-model-empty = 模型 ID 不能为空。请使用 `/model --user|--agent <model-id>`。
+channel-runtime-scoped-model-switched = 已为 **{ $scope }** 范围设置模型 `{ $model }`（model_provider：`{ $provider }`）。仅会话内有效，重启后重置。
+channel-runtime-shadow-note = ⚠️ 当前有更高优先级的覆盖生效，因此消息将改用 `{ $model }`（`{ $provider }`）；请查看 `/model`。
+channel-runtime-thinking-set =
+    已为此发送者会话将 thinking 设为 `{ $level }`。
+    使用 `/thinking reset` 返回 agent 默认值。
+channel-runtime-thinking-cleared = thinking 覆盖已清除。此发送者会话将使用 agent 默认值 `{ $default }`。
+channel-runtime-thinking-default =
+    thinking 已经在此发送者会话中使用 agent 默认值 `{ $default }`。
+    使用 `/thinking high`、`/thinking max` 或 `/thinking off` 覆盖。
+channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/thinking off|minimal|low|medium|high|max`、`/thinking on` 或 `/thinking reset`。
+channel-runtime-provider-turn-init-failed =
+    ⚠️ 初始化 model_provider `{ $provider }` 失败。请运行 `/models` 选择另一个 model_provider。
+    详情：{ $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
+    切换模型：/models
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）
