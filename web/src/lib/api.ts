@@ -428,6 +428,12 @@ export interface ListResponseEntry {
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
+  /**
+   * Surface hint from the schema's `#[multiline]` attribute: render a
+   * multi-line text area (e.g. a PEM key body) instead of a single-line
+   * input. Absent/false on single-line fields.
+   */
+  multiline?: boolean;
 }
 
 export interface DriftEntry {
@@ -1819,6 +1825,7 @@ export function addCronJob(body: {
   allowed_tools?: string[];
   enabled?: boolean;
   delivery?: CronDelivery;
+  uses_memory?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
     method: "POST",
@@ -1873,6 +1880,7 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    uses_memory?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(

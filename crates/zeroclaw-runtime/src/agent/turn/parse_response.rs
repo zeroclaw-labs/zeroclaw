@@ -104,6 +104,7 @@ pub(crate) struct InterpretedResponse {
     pub(crate) assistant_history_content: String,
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
+    pub(crate) input_tokens: Option<u64>,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
@@ -299,6 +300,7 @@ pub(crate) async fn interpret_chat_response(
         assistant_history_content,
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
+        input_tokens: resp_input_tokens,
     }
 }
 

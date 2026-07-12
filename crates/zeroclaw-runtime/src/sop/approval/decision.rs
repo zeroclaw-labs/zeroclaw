@@ -6,6 +6,7 @@ use crate::sop::types::SopRunAction;
 
 /// Approve or deny a waiting SOP gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Approve,
