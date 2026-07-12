@@ -79,13 +79,20 @@ mod tests {
     }
 
     #[test]
-    fn global_help_resolves_from_question_mark_and_f1() {
+    fn global_help_resolves_from_question_mark_and_control_question_mark() {
         let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
         assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
-        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
-        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
-        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
-        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
+        let ctrl_q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_q), Some(GlobalAction::Help));
+    }
+
+    #[test]
+    fn browse_enter_resolves_from_control_slash() {
+        let ev = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL);
+        assert_eq!(
+            ChatTabAction::from_chord(&ev),
+            Some(ChatTabAction::BrowseEnter)
+        );
     }
 
     #[test]

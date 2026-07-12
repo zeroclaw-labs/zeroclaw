@@ -1702,15 +1702,7 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>()).with_child(
-            HelpNode::titled(
-                crate::i18n::t("zc-input-help-slash-commands"),
-                SLASH_COMMANDS
-                    .iter()
-                    .map(|cmd| E::key(*cmd, String::new()))
-                    .collect(),
-            ),
-        )
+        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>())
     }
 }
 
@@ -2183,24 +2175,17 @@ mod tests {
     }
 
     #[test]
-    fn help_context_lists_slash_commands_from_canonical_source() {
+    fn help_context_keeps_slash_commands_out_of_general_help() {
         use crate::widgets::HelpContext;
         let bar = InputBarState::new();
         let node = bar.help_context();
         let title = crate::i18n::t("zc-input-help-slash-commands");
-        let section = node
-            .children
-            .iter()
-            .find(|c| c.title.as_deref() == Some(title.as_str()))
-            .expect("slash-commands section present");
-        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
-        for cmd in SLASH_COMMANDS {
-            assert!(
-                listed.iter().any(|k| k == cmd),
-                "slash command {cmd} must appear in the help section"
-            );
-        }
-        assert_eq!(listed.len(), SLASH_COMMANDS.len());
+        assert!(
+            node.children
+                .iter()
+                .all(|c| c.title.as_deref() != Some(title.as_str())),
+            "slash commands stay in / autocomplete, not the general Help modal"
+        );
     }
 
     #[test]

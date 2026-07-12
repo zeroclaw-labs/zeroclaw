@@ -62,6 +62,8 @@ impl Chord {
         let key = render_keycode(&self.code);
         if parts.is_empty() {
             key
+        } else if cfg!(target_os = "macos") && parts.contains(&"Ctrl") {
+            format!("{}+{}", parts.join("+"), key)
         } else if cfg!(target_os = "macos") {
             format!("{}{}", parts.join(""), key)
         } else {
@@ -231,7 +233,7 @@ fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
 fn is_host_reserved_chord(code: &KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('c' | 'C' | 'n' | 'N' | 's' | 'S') | KeyCode::F(1)
+        KeyCode::Char('c' | 'C' | 'n' | 'N' | 's' | 'S' | '/' | '?') | KeyCode::F(1)
     )
 }
 
@@ -375,7 +377,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn session_chords_stay_terminal_safe_ctrl_on_darwin() {
-        for c in ['n', 's'] {
+        for c in ['n', 's', '/', '?'] {
             let chord = Chord::ctrl(c);
             let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             let cmd = KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER);
