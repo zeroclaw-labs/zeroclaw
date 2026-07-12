@@ -111,9 +111,10 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    // The typed prompt (which also requests kind/facts/trend) is used only when
-    // the extract-facts flag is on; otherwise the default prompt is unchanged.
-    let system_prompt = if memory_config.consolidation_extract_facts {
+    // Typed memory must ask for a subtype even when atomic-fact extraction stays
+    // disabled. Reusing the extended schema keeps the model contract explicit.
+    let system_prompt = if memory_config.types.enabled || memory_config.consolidation_extract_facts
+    {
         CONSOLIDATION_TYPED_SYSTEM_PROMPT
     } else {
         CONSOLIDATION_SYSTEM_PROMPT
@@ -158,9 +159,16 @@ pub async fn consolidate_turn(
     // Phase 2: extract atomic typed facts (gated; default off). Runs before
     // the primary Core update because that path exits early when the update
     // dedups or merges into a survivor, and a duplicate primary update must
-    // not silently suppress this turn's fact writes.
+    // not silently suppress this turn's fact writes. An exact overlap belongs
+    // to the primary update so its more specific subtype wins.
     if memory_config.consolidation_extract_facts {
-        store_typed_facts(memory, memory_config, &result).await?;
+        store_typed_facts(
+            memory,
+            memory_config,
+            &result,
+            result.memory_update.as_deref(),
+        )
+        .await?;
     }
 
     // Phase 3: Write memory update to Core category (if present).
@@ -207,10 +215,14 @@ pub async fn consolidate_turn(
                     let options = StoreOptions {
                         namespace: Some(survivor.namespace.clone()),
                         importance: merged.importance,
-                        kind: memory_config
-                            .types
-                            .enabled
-                            .then(|| classify::kind_of_core(&result)),
+                        kind: survivor.kind.clone().or_else(|| {
+                            memory_config
+                                .types
+                                .enabled
+                                .then(|| classify::kind_of_core(&result))
+                        }),
+                        pinned: survivor.pinned,
+                        tenant_id: survivor.tenant_id.clone(),
                         ..StoreOptions::default()
                     };
                     memory
@@ -287,6 +299,7 @@ async fn store_typed_facts(
     memory: &dyn Memory,
     memory_config: &MemoryConfig,
     result: &ConsolidationResult,
+    primary_update: Option<&str>,
 ) -> anyhow::Result<()> {
     let fact_kind = memory_config
         .types
@@ -299,7 +312,8 @@ async fn store_typed_facts(
         .iter()
         .filter_map(|fact| {
             let trimmed = fact.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
+            let overlaps_primary = primary_update.is_some_and(|primary| primary.trim() == trimmed);
+            (!trimmed.is_empty() && !overlaps_primary).then_some(trimmed)
         })
         .take(MAX_TYPED_FACTS_PER_TURN)
     {
@@ -346,7 +360,9 @@ async fn store_typed_facts(
                             StoreOptions {
                                 namespace: Some(survivor.namespace.clone()),
                                 importance: merged.importance,
-                                kind: fact_kind.clone(),
+                                kind: survivor.kind.clone().or_else(|| fact_kind.clone()),
+                                pinned: survivor.pinned,
+                                tenant_id: survivor.tenant_id.clone(),
                                 ..StoreOptions::default()
                             },
                         )
@@ -488,11 +504,14 @@ mod tests {
         assert!(result.history_entry.len() <= 203);
     }
 
+    use crate::agent_scoped::AgentScopedMemory;
+    use crate::sqlite::SqliteMemory;
     use crate::traits::MemoryEntry;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use std::sync::Arc;
     use zeroclaw_api::model_provider::ChatMessage;
-    use zeroclaw_config::schema::{MemoryPolicyConfig, MemoryTypesConfig};
+    use zeroclaw_config::schema::{MemoryDedupAction, MemoryPolicyConfig, MemoryTypesConfig};
 
     #[derive(Debug, Clone)]
     enum RecordedWrite {
@@ -784,6 +803,9 @@ mod tests {
             .await
             .unwrap();
 
+        let prompts = provider.system_prompts.lock();
+        assert_eq!(prompts.as_slice(), [CONSOLIDATION_TYPED_SYSTEM_PROMPT]);
+
         let writes = memory.writes.lock();
         assert_eq!(writes.len(), 2);
         match &writes[0] {
@@ -803,6 +825,133 @@ mod tests {
             }
             other => panic!("expected store_with_options for the Core update, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn typed_consolidation_preserves_kind_and_agent_through_scoped_sqlite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
+        let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
+        let scoped = AgentScopedMemory::new(inner.clone(), &alpha, Vec::<String>::new());
+        let provider = ScriptedProvider::new(TYPED_RESPONSE);
+        let config = MemoryConfig {
+            types: MemoryTypesConfig { enabled: true },
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &scoped, &config)
+            .await
+            .unwrap();
+
+        let entries = inner.list(None, None).await.unwrap();
+        let daily = entries
+            .iter()
+            .find(|entry| entry.key.starts_with("daily_"))
+            .expect("daily consolidation row");
+        let core = entries
+            .iter()
+            .find(|entry| entry.key.starts_with("core_"))
+            .expect("core consolidation row");
+        assert_eq!(daily.agent_id.as_deref(), Some(alpha.as_str()));
+        assert_eq!(core.agent_id.as_deref(), Some(alpha.as_str()));
+        assert_eq!(daily.kind, Some(MemoryKind::Episodic));
+        assert_eq!(
+            core.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_update_wins_over_an_exact_overlapping_fact() {
+        const OVERLAPPING_RESPONSE: &str = r#"{"history_entry":"h","memory_update":"Use staged rollout","kind":"decision","facts":["Use staged rollout"]}"#;
+        let provider = ScriptedProvider::new(OVERLAPPING_RESPONSE);
+        let memory = RecordingMemory::default();
+        let config = MemoryConfig {
+            consolidation_extract_facts: true,
+            types: MemoryTypesConfig { enabled: true },
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let writes = memory.writes.lock();
+        assert!(
+            !writes
+                .iter()
+                .any(|write| write.key().starts_with("core_fact_")),
+            "the generic fact must not preempt the primary decision"
+        );
+        let options = writes
+            .iter()
+            .find_map(|write| match write {
+                RecordedWrite::StoreWithOptions { key, options, .. }
+                    if key.starts_with("core_") =>
+                {
+                    Some(options)
+                }
+                _ => None,
+            })
+            .expect("primary Core write");
+        assert_eq!(
+            options.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+    }
+
+    #[tokio::test]
+    async fn fact_merge_preserves_survivor_kind_pinned_and_tenant() {
+        const FACT_RESPONSE: &str =
+            r#"{"history_entry":"h","memory_update":null,"facts":["Use staged rollout"]}"#;
+        let provider = ScriptedProvider::new(FACT_RESPONSE);
+        let memory = RecordingMemory::default();
+        memory.recall_entries.lock().push(MemoryEntry {
+            id: "survivor".into(),
+            key: "core_survivor".into(),
+            content: "Use staged rollout".into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: Some("session-1".into()),
+            score: None,
+            namespace: "operations".into(),
+            importance: Some(0.8),
+            superseded_by: None,
+            kind: Some(MemoryKind::Semantic(SemanticSubtype::Preference)),
+            pinned: true,
+            tenant_id: Some("tenant-a".into()),
+            agent_alias: None,
+            agent_id: None,
+        });
+        let config = MemoryConfig {
+            consolidation_extract_facts: true,
+            dedup_on_write: true,
+            dedup_action: MemoryDedupAction::Merge,
+            types: MemoryTypesConfig { enabled: true },
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let writes = memory.writes.lock();
+        let options = writes
+            .iter()
+            .find_map(|write| match write {
+                RecordedWrite::StoreWithOptions { key, options, .. } if key == "core_survivor" => {
+                    Some(options)
+                }
+                _ => None,
+            })
+            .expect("merged survivor write");
+        assert_eq!(options.namespace.as_deref(), Some("operations"));
+        assert_eq!(
+            options.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Preference))
+        );
+        assert!(options.pinned);
+        assert_eq!(options.tenant_id.as_deref(), Some("tenant-a"));
     }
 
     #[tokio::test]

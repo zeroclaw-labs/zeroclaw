@@ -20,7 +20,9 @@
 //! wrapper only ever sees same-backend sibling UUIDs in its
 //! `allowed_agent_ids` set.
 
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
+use super::traits::{
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage, StoreOptions,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -155,6 +157,46 @@ impl Memory for AgentScopedMemory {
                 importance,
                 Some(&self.agent_id),
             )
+            .await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> Result<()> {
+        self.inner
+            .store_with_options_and_agent(
+                key,
+                content,
+                category,
+                session_id,
+                options,
+                Some(&self.agent_id),
+            )
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(requested) = agent_id
+            && requested != self.agent_id
+        {
+            anyhow::bail!(
+                "AgentScopedMemory refuses store_with_options_and_agent for foreign agent_id; use a wrapper bound to the target agent"
+            );
+        }
+        self.store_with_options(key, content, category, session_id, options)
             .await
     }
 
@@ -513,6 +555,7 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
 mod tests {
     use super::*;
     use crate::sqlite::SqliteMemory;
+    use crate::traits::{MemoryKind, SemanticSubtype};
     use tempfile::TempDir;
 
     fn fresh_sqlite() -> (TempDir, Arc<SqliteMemory>) {
@@ -579,6 +622,45 @@ mod tests {
             hits.iter().any(|e| e.key == "k1"),
             "wrapper recall must find rows it just stored"
         );
+    }
+
+    #[tokio::test]
+    async fn store_with_options_preserves_full_metadata_and_attribution() {
+        let (_tmp, inner) = fresh_sqlite();
+        let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
+        let wrapper = AgentScopedMemory::new(as_dyn(inner.clone()), &alpha, Vec::<String>::new());
+
+        wrapper
+            .store_with_options(
+                "decision",
+                "Use staged rollout",
+                MemoryCategory::Core,
+                Some("session-1"),
+                StoreOptions {
+                    namespace: Some("operations".into()),
+                    importance: Some(0.9),
+                    kind: Some(MemoryKind::Semantic(SemanticSubtype::Decision)),
+                    pinned: true,
+                    tenant_id: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entry = inner
+            .get_for_agent("decision", &alpha)
+            .await
+            .unwrap()
+            .expect("bound agent row should persist");
+        assert_eq!(entry.agent_id.as_deref(), Some(alpha.as_str()));
+        assert_eq!(entry.namespace, "operations");
+        assert_eq!(entry.importance, Some(0.9));
+        assert_eq!(
+            entry.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+        assert!(entry.pinned);
+        assert_eq!(entry.tenant_id.as_deref(), Some("tenant-a"));
     }
 
     #[tokio::test]

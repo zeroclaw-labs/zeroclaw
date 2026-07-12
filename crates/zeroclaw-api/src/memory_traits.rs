@@ -563,6 +563,33 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         .await
     }
 
+    /// Store a memory entry with full metadata and an explicit agent UUID.
+    ///
+    /// The compatibility default preserves the agent attribution through the
+    /// established `store_with_agent` path. Backends that persist the full
+    /// `StoreOptions` surface override this method so wrappers do not have to
+    /// choose between attribution and typed metadata.
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.store_with_agent(
+            key,
+            content,
+            category,
+            session_id,
+            options.namespace.as_deref(),
+            options.importance,
+            agent_id,
+        )
+        .await
+    }
+
     /// Store a memory entry attributed to an explicit agent UUID.
     /// Every backend must implement this explicitly so the agent_id
     /// is never silently dropped at storage time. Backends with
