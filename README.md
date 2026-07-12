@@ -109,20 +109,30 @@ One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 
 A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
 
-For standard OpenAI Codex subscription auth, swap the provider entry to:
+For standard OpenAI Codex subscription auth, Quickstart can write the provider
+entry for you:
+
+```bash
+zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json  # if already signed in with Codex CLI
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
+```
+
+The provider entry uses the canonical OpenAI shape; the alias below is an
+example:
 
 ```toml
 [providers.models.openai.coding]   # type = openai; alias = coding (you choose)
-model = "gpt-5-codex"
+model = "gpt-5.4"
 wire_api = "responses"
 requires_openai_auth = true
 ```
 
-…and point your agent at it with `model_provider = "openai.coding"`.
+…and point your agent at it with `model_provider = "openai.<alias>"`.
 
 Notes:
 
 - Normal OpenAI Codex subscription auth uses stored auth profiles, not an `api_key` on the provider entry.
+- Claude Max setup-token auth stays on the canonical Anthropic slot: run `claude setup-token`, choose `setup_token` in Quickstart, and paste the generated token into the API key/token prompt.
 - Only set `api_key` / `uri` on `[providers.models.openai.<alias>]` when intentionally targeting a custom OpenAI-compatible gateway or endpoint.
 - If you see `provider streaming failed, falling back to non-streaming chat`, ZeroClaw retries the same request in non-streaming mode. Check `zeroclaw auth status` before changing provider config.
 

@@ -535,7 +535,18 @@ jobs:
       - name: Validate YAML workflow syntax
         run: |
           pip install pyyaml -q 2>/dev/null || true
-          python3 -c "import sys, yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ci.yml: valid')"
+          python3 - <<'PY'
+          import yaml
+
+          for path in (
+              ".github/workflows/ci.yml",
+              ".github/workflows/project-dashboard-plan.yml",
+          ):
+              yaml.safe_load(open(path))
+              print(f"{path}: valid")
+          PY
+      - name: Validate project dashboard planner
+        run: python3 scripts/github/project_dashboard_plan_test.py
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
