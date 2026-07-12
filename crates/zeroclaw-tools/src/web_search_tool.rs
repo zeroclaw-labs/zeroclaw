@@ -1049,7 +1049,9 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
         SearchStatus::ClientError => "Check the query and API key for this provider.",
         // classify_http_status only returns failure classes (Blocked / Unavailable /
         // ClientError); the remaining variants are unreachable on this path.
-        SearchStatus::Ok | SearchStatus::Timeout | SearchStatus::Empty
+        SearchStatus::Ok
+        | SearchStatus::Timeout
+        | SearchStatus::Empty
         | SearchStatus::ParseError => "Try a different provider.",
     };
     anyhow::Error::msg(format!(
