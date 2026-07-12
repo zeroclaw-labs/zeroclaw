@@ -28,6 +28,13 @@ import {
 } from "@/lib/api";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import {
+  requiredQuickstartSelectionsComplete,
+  runtimeAfterProviderChange,
+  runtimeDefaultForProvider,
+  runtimeValueForSubmit,
+  type RuntimeSelection,
+} from "./runtime-selection";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -67,10 +74,6 @@ interface StagedPersonalityFile {
   content: string;
 }
 
-/** A preset selection — typed wrapper around a `preset_name` so the
- *  shape can't carry a raw user-typed string. The only way to construct
- *  one is via the `PresetSection` picker, which sources values from
- *  `state.risk_presets` / `state.runtime_presets` / `state.memory_kinds`. */
 interface StagedPreset {
   preset_name: string;
 }
@@ -78,7 +81,7 @@ interface StagedPreset {
 interface FormState {
   provider: StagedProvider | null;
   risk: StagedPreset | null;
-  runtime: StagedPreset | null;
+  runtime: RuntimeSelection | null;
   memory: StagedPreset | null;
   channels: StagedChannel[];
   peerGroups: StagedPeerGroup[];
@@ -96,21 +99,6 @@ const DEFAULT_FORM: FormState = {
   agentName: "",
   personalityFiles: [],
 };
-
-function runtimeDefaultForProvider(
-  state: QuickstartState | null,
-  providerType?: string,
-): string | null {
-  const advertised = providerType
-    ? state?.model_provider_types.find((provider) => provider.kind === providerType)
-        ?.default_runtime_profile
-    : null;
-  return (
-    advertised ??
-    state?.default_runtime_profile ??
-    null
-  );
-}
 
 const MUTED = { color: "var(--pc-text-muted)" } as const;
 const FAINT = { color: "var(--pc-text-faint)" } as const;
@@ -175,8 +163,8 @@ export default function Quickstart() {
   };
 
   const submit = async () => {
-    const runtime = form.runtime;
-    if (!runtime) return;
+    const runtimeProfile = runtimeValueForSubmit(form.runtime);
+    if (!runtimeProfile) return;
     setBusy(true);
     setErrors([]);
     const res = await quickstartApply({
@@ -184,7 +172,7 @@ export default function Quickstart() {
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
       runtime_profile: {
         mode: "fresh",
-        value: runtime.preset_name,
+        value: runtimeProfile,
       },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
@@ -225,7 +213,7 @@ export default function Quickstart() {
   const runtimeDone = form.runtime !== null;
   const memoryDone = form.memory !== null;
   const agentDone = form.agentName.trim() !== "";
-  const allDone = providerDone && riskDone && runtimeDone && memoryDone && agentDone;
+  const allDone = requiredQuickstartSelectionsComplete(form);
 
   // Required-step progress for the wizard stepper. Channels / peer groups /
   // personality files are optional and intentionally excluded from the gate.
@@ -295,17 +283,16 @@ export default function Quickstart() {
             state={state}
             onStage={(p) => {
               setForm((f) => {
-                const defaultRuntime = runtimeDefaultForProvider(
+                const runtime = runtimeAfterProviderChange(
                   state,
                   p.provider_type,
+                  f.runtime,
+                  runtimeAutoDefaultedRef.current,
                 );
                 return {
                   ...f,
                   provider: p,
-                  runtime:
-                    runtimeAutoDefaultedRef.current && defaultRuntime
-                      ? { preset_name: defaultRuntime }
-                      : f.runtime,
+                  runtime,
                 };
               });
               recordStep("model_provider");
