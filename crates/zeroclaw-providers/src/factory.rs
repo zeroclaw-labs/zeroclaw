@@ -1012,12 +1012,14 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
             ));
         }
         // Responses wire protocol with standard API key — full streaming tool calls.
+        // New OpenAI provider slots default wire_api to Responses via
+        // OpenAIModelProviderConfig::default(); unset/legacy configs fall through.
         if let Some(p) =
             build_responses_provider_if_requested(self.base.wire_api, alias, api_url, key, opts)
         {
             return Ok(p);
         }
-        // Default: chat_completions wire with standard API key.
+        // Fallback: chat_completions wire (explicit opt-in or legacy unset configs).
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
         if let Some(t) = opts.provider_timeout_secs {
             p = p.with_timeout_secs(t);
@@ -1608,7 +1610,7 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::ModelProviderConfig;
+    use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
 
     /// Regression for the #7136 review: the Kilo Gateway default exists in two
     /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
@@ -1645,9 +1647,12 @@ mod tests {
 
     #[test]
     fn openai_factory_routes_to_standard_when_requires_openai_auth_false() {
+        // Explicit chat_completions: OpenAIModelProviderConfig::default() now
+        // selects the responses wire, so this regression pins the legacy path.
         let cfg = OpenAIModelProviderConfig {
             base: ModelProviderConfig {
                 requires_openai_auth: false,
+                wire_api: Some(WireApi::ChatCompletions),
                 ..Default::default()
             },
         };
@@ -1655,6 +1660,22 @@ mod tests {
             .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
             .unwrap();
         assert!(!provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn openai_factory_defaults_new_provider_to_responses_wire() {
+        // Creating a new OpenAI provider slot (create_map_key / ensure) uses
+        // OpenAIModelProviderConfig::default(), which must select responses.
+        let provider = OpenAIModelProviderConfig::default()
+            .create_provider(
+                "test",
+                Some("sk-test"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert!(provider.capabilities().native_tool_calling);
     }
 
     #[tokio::test]
@@ -1683,14 +1704,20 @@ mod tests {
             provider_timeout_secs: Some(1),
             ..Default::default()
         };
-        let provider = OpenAIModelProviderConfig::default()
-            .create_provider(
-                "native",
-                Some("test-key"),
-                Some(&format!("http://{addr}")),
-                &opts,
-            )
-            .expect("openai provider should build");
+        // Pin the chat-completions path explicitly: OpenAI defaults to responses.
+        let provider = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::ChatCompletions),
+                ..Default::default()
+            },
+        }
+        .create_provider(
+            "native",
+            Some("test-key"),
+            Some(&format!("http://{addr}")),
+            &opts,
+        )
+        .expect("openai provider should build");
 
         let started = Instant::now();
         let result = provider
