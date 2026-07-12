@@ -1831,15 +1831,16 @@ mod tests {
         };
         let mut items = Vec::new();
         check_degraded_sections(&config, &mut items);
-        let item = items
-            .iter()
-            .find(|i| i.message.contains("SECURITY-CRITICAL"));
+        let item = items.iter().find(|i| {
+            i.category == "config"
+                && i.severity == Severity::Error
+                && i.message.contains("security")
+        });
         assert!(
             item.is_some(),
-            "expected a SECURITY-CRITICAL diagnostic, got messages: {:?}",
+            "expected an error diagnostic naming the degraded security section, got messages: {:?}",
             items.iter().map(|i| &i.message).collect::<Vec<_>>()
         );
-        assert_eq!(item.unwrap().severity, Severity::Error);
     }
 
     #[test]
