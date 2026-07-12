@@ -254,7 +254,7 @@ pub async fn build_channel_plugins(
     built
 }
 
-#[cfg(feature = "plugins-wasm")]
+#[cfg(any(test, feature = "plugins-wasm"))]
 fn channel_key_is_available(channel_key: &str, claimed_channel_keys: &HashSet<String>) -> bool {
     !claimed_channel_keys.contains(channel_key)
 }
