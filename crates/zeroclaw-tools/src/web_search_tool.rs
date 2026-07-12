@@ -203,7 +203,7 @@ impl WebSearchTool {
             if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
                 anyhow::bail!(message);
             }
-            anyhow::bail!("DuckDuckGo search failed with status: {}", status);
+            return Err(http_search_failure("duckduckgo", status));
         }
 
         let html = response.text().await?;
@@ -1025,8 +1025,8 @@ fn duckduckgo_block_message(
 fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
     match status.as_u16() {
         403 | 451 => SearchStatus::Blocked, // active block / legal block
-        402 | 429 => SearchStatus::Unavailable, // quota / rate-limit
-        400 | 401 | 404 => SearchStatus::ClientError,
+        402 | 404 | 410 | 429 => SearchStatus::Unavailable, // quota / not-found / rate-limit
+        400 | 401 => SearchStatus::ClientError,
         500..=599 => SearchStatus::Unavailable,
         _ => SearchStatus::ClientError, // other non-success → request-side
     }
@@ -1255,66 +1255,67 @@ mod tests {
 
     #[test]
     fn http_search_failure_classifies_forbidden_as_blocked_with_provider_hint() {
-        // 403 is the canonical signal of active provider blocking.
-        let err = http_search_failure("brave", reqwest::StatusCode::FORBIDDEN);
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("search_status=blocked"),
-            "403 must tag search_status=blocked, got: {msg}"
-        );
-        assert!(
-            msg.contains("http=403"),
-            "message must include the HTTP status code, got: {msg}"
-        );
-        assert!(
-            msg.contains("different provider"),
-            "blocked status must suggest switching providers, got: {msg}"
-        );
+        // 403 is the canonical signal of active provider blocking; 451 is the
+        // legal-block variant. Both must surface a precise `search_status=blocked`
+        // tag and direct the agent at a different provider.
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        ] {
+            let err = http_search_failure("brave", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=blocked"),
+                "{status} must tag search_status=blocked, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("different provider"),
+                "blocked status must suggest switching providers, got: {msg}"
+            );
+        }
     }
 
     #[test]
-    fn http_search_failure_classifies_server_error_as_unavailable() {
-        // 5xx is a provider-side outage; switching provider is the right suggestion.
-        let err = http_search_failure("searxng", reqwest::StatusCode::BAD_GATEWAY);
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("search_status=unavailable"),
-            "5xx must classify as unavailable, got: {msg}"
-        );
-        assert!(msg.contains("http=502"));
-        assert!(
-            msg.contains("different provider"),
-            "unavailable status must suggest switching providers, got: {msg}"
-        );
-
-        // 500 is also Unavailable.
-        let err500 = http_search_failure("searxng", reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-        let msg500 = format!("{err500}");
-        assert!(msg500.contains("search_status=unavailable"));
-        assert!(msg500.contains("http=500"));
-    }
-
-    #[test]
-    fn http_search_failure_classifies_rate_limit_as_unavailable() {
-        // 429 is provider-side rate limiting; switching provider helps.
-        let err = http_search_failure("jina", reqwest::StatusCode::TOO_MANY_REQUESTS);
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("search_status=unavailable"),
-            "429 must classify as unavailable, got: {msg}"
-        );
-        assert!(msg.contains("http=429"));
-        assert!(msg.contains("different provider"));
+    fn http_search_failure_classifies_provider_side_failures_as_unavailable() {
+        // 5xx outages, 429 rate limiting, 402 quota, and 404 endpoint problems
+        // are all provider-side in the sense that switching provider is the
+        // actionable remedy; each must tag `search_status=unavailable` and
+        // surface the "different provider" hint.
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            reqwest::StatusCode::NOT_FOUND,
+        ] {
+            let err = http_search_failure("searxng", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=unavailable"),
+                "{status} must classify as unavailable, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("different provider"),
+                "unavailable status must suggest switching providers, got: {msg}"
+            );
+        }
     }
 
     #[test]
     fn http_search_failure_classifies_client_errors_as_client_error() {
-        // 400/401/404 are request/credential problems; switching provider may
+        // 400/401 are request/credential problems; switching provider may
         // NOT help, so the hint must direct at query/key, not "different provider".
         for status in [
             reqwest::StatusCode::BAD_REQUEST,
             reqwest::StatusCode::UNAUTHORIZED,
-            reqwest::StatusCode::NOT_FOUND,
         ] {
             let err = http_search_failure("tavily", status);
             let msg = format!("{err}");
@@ -1358,6 +1359,36 @@ mod tests {
 
         assert!(err.to_string().contains("DuckDuckGo blocked"));
         assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_non_block_failure_with_status_tag() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("500 should be reported as a non-block HTTP failure");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search_status=unavailable"),
+            "non-block DDG failure must carry the search_status tag, got: {msg}"
+        );
+        assert!(
+            msg.contains("http=500"),
+            "non-block DDG failure must carry the HTTP status code, got: {msg}"
+        );
     }
 
     #[tokio::test]
