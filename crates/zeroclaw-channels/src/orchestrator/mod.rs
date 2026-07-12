@@ -6710,55 +6710,127 @@ fn normalize_telegram_identity(value: &str) -> String {
     value.trim().trim_start_matches('@').to_string()
 }
 
-pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+/// Trim-only identity normalizer for channels whose native id has no
+/// `@`-style prefix to strip (WeChat openid, LINE user id).
+fn normalize_trim_identity(value: &str) -> String {
+    value.trim().to_string()
+}
 
-    let normalized = normalize_telegram_identity(identity);
+/// Per-channel-type identity normalizer. The operator-bind op is otherwise
+/// identical across the pairing-capable channels; the only variance is how a
+/// raw identity is canonicalized before it is stored in the allowlist.
+pub type ChannelIdentityNormalizer = fn(&str) -> String;
+
+/// Resolve the identity normalizer for a pairing-capable channel type, or
+/// `None` for a type with no operator-bind surface. `None` is the closed-set
+/// gate: only `telegram` / `wechat` / `line` can be bound this way.
+#[must_use]
+pub fn channel_identity_normalizer(channel_type: &str) -> Option<ChannelIdentityNormalizer> {
+    match channel_type {
+        "telegram" => Some(normalize_telegram_identity),
+        "wechat" | "line" => Some(normalize_trim_identity),
+        _ => None,
+    }
+}
+
+/// Whether a `[channels.<type>.<alias>]` section exists. Rust has no
+/// reflection over the typed channel maps, so this stays an explicit per-type
+/// match; only this arm grows when a new pairing channel lands.
+#[must_use]
+pub fn channel_alias_configured(config: &Config, channel_type: &str, alias: &str) -> bool {
+    match channel_type {
+        "telegram" => config.channels.telegram.contains_key(alias),
+        "wechat" => config.channels.wechat.contains_key(alias),
+        "line" => config.channels.line.contains_key(alias),
+        _ => false,
+    }
+}
+
+/// Add `identity` to the peer group bound to `<type>.<alias>` in-place.
+///
+/// Returns `Ok(true)` when the identity was newly added, `Ok(false)` when it
+/// was already present. Pure config mutation — no disk write, no daemon
+/// restart — so it is the single core shared by the CLI
+/// (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
+/// field is the dotted `<type>.<alias>` ref so authorization stays scoped to
+/// the bound alias; a bare type would broaden the peer across every alias of
+/// that type.
+pub fn bind_channel_identity_into(
+    config: &mut Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Result<bool> {
+    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::providers::ChannelRef;
+
+    let Some(normalize) = channel_identity_normalizer(channel_type) else {
+        anyhow::bail!(
+            "Channel type `{channel_type}` does not support identity binding \
+             (supported: telegram, wechat, line)."
+        );
+    };
+
+    let normalized = normalize(identity);
     if normalized.is_empty() {
-        anyhow::bail!("Telegram identity cannot be empty");
+        anyhow::bail!("{channel_type} identity cannot be empty");
     }
 
-    let mut updated = config.clone();
-    if !updated.channels.telegram.contains_key("default") {
+    // The alias must name an existing `[channels.<type>.<alias>]` section.
+    // Binding into a phantom alias would mint a peer group the runtime never
+    // reads (it resolves authorization per the alias the channel actually
+    // runs under), so fail loudly instead of silently authorizing nobody.
+    if !channel_alias_configured(config, channel_type, alias) {
         anyhow::bail!(
-            "Telegram channel is not configured. Run \
-             `zeroclaw config set channels.telegram.<alias>.bot-token=<token>` \
+            "{channel_type} channel alias `{alias}` is not configured. Run \
+             `zeroclaw config set channels.{channel_type}.{alias}.bot-token=<token>` first \
              (see docs/book/src/channels/overview.md for the full field list)."
         );
     }
 
-    // Locate (or create) the peer group bound to telegram.default. The
-    // V3 surface puts inbound peer authorization in `peer_groups`,
-    // not on the channel block. Convention: the synthesized group
-    // name is `<type>_<alias>` (matching what the V2→V3 fold uses)
-    // so a hand-bound identity lands in the same group an operator
-    // would inspect after an upgrade. The `channel` field is the
-    // dotted alias ref so authorization stays scoped to the bound
-    // alias; a bare type would broaden the peer across every
-    // telegram alias on the install.
-    let group_name = "telegram_default".to_string();
-    let group = updated
+    // Convention: the synthesized group name is `<type>_<alias>` (matching the
+    // V2→V3 fold and each channel's runtime `persist_allowed_identity`) so a
+    // hand-bound identity lands in the same group the channel resolves
+    // authorization from.
+    let group_name = format!("{channel_type}_{alias}");
+    let channel_ref = format!("{channel_type}.{alias}");
+    let group = config
         .peer_groups
-        .entry(group_name.clone())
+        .entry(group_name)
         .or_insert_with(|| PeerGroupConfig {
-            channel: "telegram.default".into(),
+            channel: ChannelRef::new(channel_ref),
             ..PeerGroupConfig::default()
         });
 
     if group
         .external_peers
         .iter()
-        .any(|p| normalize_telegram_identity(p.as_str()) == normalized)
+        .any(|p| normalize(p.as_str()) == normalized)
     {
-        println!("✅ Telegram identity already bound: {normalized}");
+        return Ok(false);
+    }
+
+    group.external_peers.push(PeerUsername::new(normalized));
+    Ok(true)
+}
+
+/// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
+/// for the CLI entry point and its unit tests.
+fn bind_telegram_identity_into(config: &mut Config, identity: &str, alias: &str) -> Result<bool> {
+    bind_channel_identity_into(config, "telegram", alias, identity)
+}
+
+pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str) -> Result<()> {
+    let normalized = normalize_telegram_identity(identity);
+    let mut updated = config.clone();
+
+    if !bind_telegram_identity_into(&mut updated, identity, alias)? {
+        println!("✅ Telegram identity already bound to telegram.{alias}: {normalized}");
         return Ok(());
     }
 
-    group
-        .external_peers
-        .push(PeerUsername::new(normalized.clone()));
     updated.save().await?;
-    println!("✅ Bound Telegram identity: {normalized}");
+    println!("✅ Bound Telegram identity {normalized} to telegram.{alias}");
     println!("   Saved to {}", updated.config_path.display());
     match maybe_restart_managed_daemon_service() {
         Ok(true) => {
@@ -24623,6 +24695,159 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    fn config_with_telegram_alias(alias: &str) -> Config {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                stream_mode: zeroclaw_config::schema::StreamMode::Off,
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
+        config
+    }
+
+    /// The non-default-alias bug: the bound identity must land in the same
+    /// peer group the runtime resolves authorization from — otherwise the
+    /// bot keeps demanding `/bind` for a user the operator already approved.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_non_default_alias_is_resolvable() {
+        let mut config = config_with_telegram_alias("alerts");
+        let newly = bind_telegram_identity_into(&mut config, "123456789", "alerts").unwrap();
+        assert!(newly, "first bind should report newly added");
+        // The live resolver the channel uses must now see the identity.
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string()),
+            "identity bound to `alerts` must resolve for the `alerts` channel"
+        );
+        // And it must be scoped — not leaked onto a different alias.
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty(),
+            "binding must stay scoped to its alias"
+        );
+    }
+
+    /// Backward compatibility: the default alias still routes to
+    /// `telegram_default` / `telegram.default` exactly as before.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_default_alias_unchanged() {
+        let mut config = config_with_telegram_alias("default");
+        bind_telegram_identity_into(&mut config, "@zeroclaw_user", "default").unwrap();
+        let group = config
+            .peer_groups
+            .get("telegram_default")
+            .expect("default bind must use the telegram_default group");
+        assert_eq!(group.channel.as_str(), "telegram.default");
+        assert!(
+            config
+                .channel_external_peers("telegram", "default")
+                .contains(&"zeroclaw_user".to_string())
+        );
+    }
+
+    /// Idempotency: re-binding the same identity reports "already present".
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_is_idempotent() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(bind_telegram_identity_into(&mut config, "123", "alerts").unwrap());
+        assert!(
+            !bind_telegram_identity_into(&mut config, "123", "alerts").unwrap(),
+            "second bind of same identity should report already present"
+        );
+        assert_eq!(
+            config.channel_external_peers("telegram", "alerts").len(),
+            1,
+            "duplicate bind must not add a second peer entry"
+        );
+    }
+
+    /// A typo'd / unconfigured alias must fail loudly rather than mint a
+    /// phantom peer group that authorizes nobody.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_unconfigured_alias_bails() {
+        let mut config = config_with_telegram_alias("default");
+        let err = bind_telegram_identity_into(&mut config, "123", "typoalias")
+            .expect_err("unconfigured alias must bail");
+        assert!(
+            err.to_string().contains("typoalias"),
+            "error should name the bad alias, got: {err}"
+        );
+        assert!(
+            !config.peer_groups.contains_key("telegram_typoalias"),
+            "failed bind must not create a phantom peer group"
+        );
+    }
+
+    /// The generic bind must keep the SCOPED dotted `<type>.<alias>` channel
+    /// ref — never a bare type, which would broaden the peer across every
+    /// alias of that type (the bug the alias-aware fix closed).
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_uses_scoped_dotted_channel_ref() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(bind_channel_identity_into(&mut config, "telegram", "alerts", "@user").unwrap());
+        let group = config
+            .peer_groups
+            .get("telegram_alerts")
+            .expect("generic bind must use the telegram_alerts group");
+        assert_eq!(
+            group.channel.as_str(),
+            "telegram.alerts",
+            "channel ref must stay dotted/alias-scoped, never bare `telegram`"
+        );
+        // Resolves for `alerts`, and stays OFF a sibling alias.
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"user".to_string())
+        );
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty()
+        );
+    }
+
+    /// The closed-set gate: a non-pairing channel type cannot be bound.
+    #[test]
+    fn bind_channel_into_rejects_unsupported_type() {
+        let mut config = Config::default();
+        let err = bind_channel_identity_into(&mut config, "discord", "default", "123")
+            .expect_err("unsupported type must bail");
+        assert!(
+            err.to_string()
+                .contains("does not support identity binding"),
+            "error should explain the type is unsupported, got: {err}"
+        );
+        assert!(
+            channel_identity_normalizer("discord").is_none(),
+            "discord must not be in the bind closed-set"
+        );
+        assert!(channel_identity_normalizer("telegram").is_some());
+        assert!(channel_identity_normalizer("wechat").is_some());
+        assert!(channel_identity_normalizer("line").is_some());
     }
 
     #[cfg(feature = "channel-voice-call")]
