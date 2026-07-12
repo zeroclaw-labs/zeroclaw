@@ -697,6 +697,44 @@ function LabeledInput({
   );
 }
 
+function LabeledSelect({
+  label,
+  value,
+  onChange,
+  options,
+  help,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+  help?: string;
+}) {
+  return (
+    <label className="block">
+      <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
+        {label}
+      </div>
+      {help ? (
+        <div className="text-xs mb-1 italic" style={MUTED}>
+          {help}
+        </div>
+      ) : null}
+      <select
+        className={INPUT_CLASS}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function ProviderForm({
   state,
   onStage,
@@ -734,10 +772,15 @@ function ProviderForm({
           setDescriptors(f.fields);
           // Reset the buffer to an empty value per descriptor so the
           // ghost-text placeholder (descriptor.default) is what the
-          // user sees until they type.
+          // user sees until they type. Enum rows are different: the
+          // selected value is real state, so seed it from the descriptor
+          // default or first variant and submit it back.
           const next: Record<string, string> = {};
           for (const d of f.fields) {
-            next[d.key] = "";
+            next[d.key] =
+              d.enum_variants && d.enum_variants.length > 0
+                ? (d.default ?? d.enum_variants[0] ?? "")
+                : "";
           }
           setFieldValues(next);
         }
@@ -829,19 +872,44 @@ function ProviderForm({
 
       {descriptors
         .filter((d) => d.key !== "model")
-        .map((d) => (
-          <LabeledInput
-            key={d.key}
-            label={d.label}
-            help={d.help}
-            type={d.is_secret ? "password" : "text"}
-            value={fieldValues[d.key] ?? ""}
-            placeholder={d.default ?? ""}
-            onChange={(value) =>
-              setFieldValues((prev) => ({ ...prev, [d.key]: value }))
-            }
-          />
-        ))}
+        .filter(
+          (d) =>
+            !(
+              d.key === "api_key" &&
+              (fieldValues["auth_mode"] ?? "").trim() === "codex"
+            ),
+        )
+        .map((d) =>
+          d.enum_variants && d.enum_variants.length > 0 ? (
+            <LabeledSelect
+              key={d.key}
+              label={d.label}
+              help={d.help}
+              options={d.enum_variants}
+              value={
+                fieldValues[d.key] ??
+                d.default ??
+                d.enum_variants[0] ??
+                ""
+              }
+              onChange={(value) =>
+                setFieldValues((prev) => ({ ...prev, [d.key]: value }))
+              }
+            />
+          ) : (
+            <LabeledInput
+              key={d.key}
+              label={d.label}
+              help={d.help}
+              type={d.is_secret ? "password" : "text"}
+              value={fieldValues[d.key] ?? ""}
+              placeholder={d.default ?? ""}
+              onChange={(value) =>
+                setFieldValues((prev) => ({ ...prev, [d.key]: value }))
+              }
+            />
+          ),
+        )}
 
       <div className="flex justify-end">
         <Button
