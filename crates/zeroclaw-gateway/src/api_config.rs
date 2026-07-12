@@ -464,6 +464,113 @@ async fn persist_and_swap(
     Ok(())
 }
 
+/// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
+/// `zeroclaw channel bind-<type> <identity> --alias <alias>`: authorize an
+/// operator-named identity on one channel alias without the in-chat
+/// `/bind <code>` round trip.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ChannelBindBody {
+    pub channel_type: String,
+    pub alias: String,
+    pub identity: String,
+}
+
+/// POST /api/channels/bind — add an inbound identity to a pairing channel's
+/// allowlist. Shares the exact bind core the CLI uses
+/// (`bind_channel_identity_into`), writes ONLY to
+/// `peer_groups.<type>_<alias>.external_peers`, and is gated by the same
+/// bearer auth as every other config write. Because the gateway and the
+/// running channels share one `Arc<RwLock<Config>>`, the swap makes the new
+/// peer live immediately — no daemon restart, and no `/bind` message.
+pub async fn handle_api_channel_bind(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelBindBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let channel_type = body.channel_type.trim();
+    let alias = body.alias.trim();
+
+    // Closed-set gate: only telegram/wechat/line have an operator-bind surface.
+    if zeroclaw_channels::orchestrator::channel_identity_normalizer(channel_type).is_none() {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!(
+                "channel type `{channel_type}` does not support identity binding \
+                 (supported: telegram, wechat, line)"
+            ),
+        ));
+    }
+
+    let mut working = state.config.read().clone();
+
+    // Reject a phantom alias loudly (404) rather than minting a peer group the
+    // runtime never reads.
+    if !zeroclaw_channels::orchestrator::channel_alias_configured(&working, channel_type, alias) {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::PathNotFound,
+            format!("channel `{channel_type}.{alias}` is not configured"),
+        ));
+    }
+
+    let newly = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
+        &mut working,
+        channel_type,
+        alias,
+        &body.identity,
+    ) {
+        Ok(added) => added,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                e.to_string(),
+            ));
+        }
+    };
+
+    let group = format!("{channel_type}_{alias}");
+    let channel = format!("{channel_type}.{alias}");
+
+    if !newly {
+        return Json(serde_json::json!({
+            "saved": false,
+            "already_bound": true,
+            "group": group,
+            "channel": channel,
+        }))
+        .into_response();
+    }
+
+    // Persist with a full `save` (the same path the CLI bind uses), NOT the
+    // incremental `save_dirty` behind `persist_and_swap`: a direct peer-group
+    // mutation isn't dirty-tracked, so `save_dirty` would never write it to
+    // disk (the bind would vanish on restart), and `save` also correctly
+    // materializes a brand-new peer-group table. Then swap the shared
+    // in-memory config so the running channel authorizes the peer live.
+    if let Err(e) = working.save().await {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ReloadFailed,
+            format!("save failed: {e}"),
+        ));
+    }
+    *state.config.write() = working;
+    state
+        .pending_reload
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    Json(serde_json::json!({
+        "saved": true,
+        "already_bound": false,
+        "group": group,
+        "channel": channel,
+    }))
+    .into_response()
+}
+
 /// Fields the gateway owns end-to-end (mints, rotates, persists itself).
 /// They're skipped by [`compute_drift`] so the dashboard doesn't surface a
 /// banner the operator can't act on. Add new entries here when a similar
@@ -4179,6 +4286,93 @@ mod tests {
         assert!(
             joined.contains("archive"),
             "warnings should mention archive-side failures, got: {joined}"
+        );
+    }
+
+    fn config_with_telegram_alias(
+        tmp: &tempfile::TempDir,
+        alias: &str,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = temp_config(tmp);
+        config.channels.telegram.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    /// Trust-boundary regression: the bind route must reject an
+    /// unauthenticated request before any config mutation. Pairing is
+    /// required and no token is presented, so the handler returns 401 and
+    /// leaves the peer group untouched.
+    #[tokio::test]
+    async fn channel_bind_rejects_unauthenticated_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_telegram_alias(&tmp, "alerts");
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "alerts")
+                .is_empty(),
+            "a rejected bind must not mutate the peer group"
+        );
+    }
+
+    /// Trust-boundary regression: binding into a `[channels.telegram.<alias>]`
+    /// that does not exist must 404 rather than mint a peer group the runtime
+    /// never resolves authorization from.
+    #[tokio::test]
+    async fn channel_bind_phantom_alias_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_telegram_alias(&tmp, "alerts");
+        let state = test_state(config);
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "ghost".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "ghost")
+                .is_empty(),
+            "a phantom-alias bind must not create a peer group"
         );
     }
 

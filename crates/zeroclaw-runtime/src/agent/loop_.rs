@@ -945,20 +945,20 @@ pub async fn agent_turn(
     agent_alias: Option<&str>,
 ) -> Result<String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let turn_started_at = std::time::Instant::now();
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
     // messages) surface turn lifecycle events to observers — mirroring the
     // CLI `run` and `Agent::turn_streamed` entry points. The brackets carry
     // the caller's resolved alias, so they agree with the inner events on the
     // full (channel, agent_alias, turn_id) triple.
-    observer.record_event(&ObserverEvent::AgentStart {
-        model_provider: provider_name.to_string(),
-        model: model.to_string(),
-        channel: Some(channel_name.to_string()),
-        agent_alias: agent_alias.map(str::to_string),
-        turn_id: Some(turn_id.clone()),
-    });
+    let mut turn_guard = crate::observability::AgentTurnGuard::start(
+        observer,
+        provider_name,
+        model,
+        Some(channel_name.to_string()),
+        agent_alias.map(str::to_string),
+        Some(turn_id.clone()),
+    );
     let result = run_tool_call_loop(ToolLoop {
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -1032,16 +1032,8 @@ pub async fn agent_turn(
                 },
             )
         });
-    observer.record_event(&ObserverEvent::AgentEnd {
-        model_provider: provider_name.to_string(),
-        model: model.to_string(),
-        duration: turn_started_at.elapsed(),
-        tokens_used,
-        cost_usd: None,
-        channel: Some(channel_name.to_string()),
-        agent_alias: agent_alias.map(str::to_string),
-        turn_id: Some(turn_id),
-    });
+    turn_guard.set_usage(tokens_used, None);
+    turn_guard.finish();
     result
 }
 
@@ -1449,19 +1441,7 @@ pub async fn run(
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            mut deferred_section,
-            pinned_section,
-            activated_handle,
-            mcp_tool_names,
-        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
             security: &security,
@@ -1479,10 +1459,22 @@ pub async fn run(
             emit_assembly_logs: true,
         })
         .await;
+        // run injects one combined MCP prompt block: deferred tool-search listing +
+        // pinned resources, composed by the harness.
+        let deferred_section = assembled.combined_mcp_prompt_section();
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle,
+            mcp_tool_names,
+            ..
+        } = assembled;
         let tools_registry = registry.into_inner();
-        // run injects one combined MCP prompt block: fold the pinned-resources section
-        // onto the deferred tool-search listing (the seam now surfaces them separately).
-        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -3079,19 +3071,7 @@ pub async fn process_message(
         // non-Full autonomy. Only process_message (i.e. gateway live chat and peer
         // delegation) had that admit; the real channels already use the plain filter.
         // See the PR body for the hardening rationale.
-        let scoped::ScopedAssembled {
-            registry,
-            delegate_handle: _,
-            ask_user_handle,
-            reaction_handle,
-            poll_handle,
-            escalate_handle,
-            channel_room_handle,
-            mut deferred_section,
-            pinned_section,
-            activated_handle: activated_handle_pm,
-            mcp_tool_names: mcp_tool_names_pm,
-        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
             security: &security,
@@ -3106,10 +3086,23 @@ pub async fn process_message(
             emit_assembly_logs: true,
         })
         .await;
+        // process_message injects one combined MCP prompt block: deferred tool-search
+        // listing + pinned resources, composed by the harness. `mut` because the
+        // text-tool prompt policy below may clear it for a non-native strict target.
+        let mut deferred_section = assembled.combined_mcp_prompt_section();
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            activated_handle: activated_handle_pm,
+            mcp_tool_names: mcp_tool_names_pm,
+            ..
+        } = assembled;
         let tools_registry = registry.into_inner();
-        // process_message injects one combined MCP prompt block: fold pinned resources
-        // onto the deferred tool-search listing (the seam surfaces them separately).
-        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
