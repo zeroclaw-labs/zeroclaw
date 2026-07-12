@@ -1207,9 +1207,11 @@ fn api_key_and_uri_for_provider(
 /// `AgentStart`; dropped automatically on early returns (`?`, `return Ok`,
 /// `return Err`) so the in-flight counter never leaks.
 ///
-/// For model-switch retries, the caller emits a short-lived `AgentEnd` *before*
-/// each nested `AgentStart`; the main guard then fires the final `AgentEnd`
-/// with the last model name and accumulated token usage.
+/// A model switch is the same logical turn (#8860): the loop re-attributes
+/// this guard's `model_provider` / `model` to the new model instead of
+/// emitting a nested `AgentEnd` / `AgentStart` pair, so the turn keeps exactly
+/// one start/end pair and the guard fires the single final `AgentEnd` with the
+/// model actually used and accumulated token usage.
 pub struct LoopTurnGuard {
     pub observer: Arc<dyn Observer>,
     pub model_provider: String,
@@ -2079,19 +2081,6 @@ pub async fn run(
                                 )
                             );
 
-                            // Close the previous AgentStart before re-starting with
-                            // a new model so the in-flight counter stays balanced.
-                            observer.record_event(&ObserverEvent::AgentEnd {
-                                model_provider: provider_name.to_string(),
-                                model: model_name.to_string(),
-                                duration: std::time::Duration::ZERO,
-                                tokens_used: None,
-                                cost_usd: None,
-                                channel: Some(channel_name.to_string()),
-                                agent_alias: Some(agent_alias.to_string()),
-                                turn_id: Some(turn_id.clone()),
-                            });
-
                             let (switch_api_key, switch_uri) = api_key_and_uri_for_provider(
                                 &config,
                                 &new_model_provider,
@@ -2121,14 +2110,16 @@ pub async fn run(
 
                             clear_model_switch_request();
 
-                            observer.record_event(&ObserverEvent::AgentStart {
-                                model_provider: provider_name.to_string(),
-                                model: model_name.to_string(),
-                                channel: Some(channel_name.to_string()),
-                                agent_alias: Some(agent_alias.to_string()),
-                                turn_id: Some(turn_id.clone()),
-                            });
-
+                            // A model switch is the same logical turn (#8860), so it must NOT
+                            // close and reopen the in-flight lifecycle. Keep the single
+                            // AgentStart/AgentEnd pair and re-attribute the guard — the sole
+                            // owner of the balanced transition — to the new model so the one
+                            // eventual AgentEnd reports the model actually used. Emitting a
+                            // manual end here (as before) double-decremented the per-alias
+                            // count when provider construction failed through `?` and the
+                            // still-live guard fired its own end. Coordinated with #8916.
+                            _turn_guard.model_provider = provider_name.clone();
+                            _turn_guard.model = model_name.clone();
                             continue;
                         }
                         return Err(e);
@@ -2689,25 +2680,14 @@ pub async fn run(
 
                                 clear_model_switch_request();
 
-                                observer.record_event(&ObserverEvent::AgentEnd {
-                                    model_provider: provider_name.to_string(),
-                                    model: model_name.to_string(),
-                                    duration: std::time::Duration::ZERO,
-                                    tokens_used: None,
-                                    cost_usd: None,
-                                    channel: Some(channel_name.to_string()),
-                                    agent_alias: Some(agent_alias.to_string()),
-                                    turn_id: Some(turn_id.clone()),
-                                });
-
-                                observer.record_event(&ObserverEvent::AgentStart {
-                                    model_provider: provider_name.to_string(),
-                                    model: model_name.to_string(),
-                                    channel: Some(channel_name.to_string()),
-                                    agent_alias: Some(agent_alias.to_string()),
-                                    turn_id: Some(turn_id.clone()),
-                                });
-
+                                // A model switch is the same logical turn (#8860), so it must
+                                // NOT close and reopen the in-flight lifecycle. Keep the single
+                                // AgentStart/AgentEnd pair and re-attribute the guard — the sole
+                                // owner of the balanced transition — to the new model so the one
+                                // eventual AgentEnd reports the model actually used. Coordinated
+                                // with #8916's exactly-one-pair lifecycle contract.
+                                _turn_guard.model_provider = provider_name.clone();
+                                _turn_guard.model = model_name.clone();
                                 continue;
                             }
                             // Context overflow recovery: drop oldest whole
@@ -15875,5 +15855,96 @@ Let me check the result."#;
             CappedLine::Line(line) => assert_eq!(line, "next-line"),
             other => panic!("expected Line, got {other:?}"),
         }
+    }
+
+    /// Regression for the #8905 review, coordinated with #8916's exactly-one-
+    /// pair lifecycle work: a mid-turn model switch is the SAME logical turn
+    /// (#8860), so it must not close and reopen the in-flight lifecycle — the
+    /// `LoopTurnGuard` is the single owner of the start/end pair.
+    ///
+    /// Two turns for the SAME alias run concurrently. Turn A requests a model
+    /// switch whose replacement-provider construction then fails, returning
+    /// early (the `?` path) and dropping the guard. Turn A must contribute
+    /// exactly ONE decrement (its guard's single `AgentEnd`), leaving the
+    /// other turn's count intact at one. The pre-fix code emitted a manual
+    /// `AgentEnd` before construction AND let the still-live guard fire on the
+    /// `?` return, decrementing twice and consuming turn B's count.
+    #[test]
+    fn concurrent_same_alias_turns_survive_failed_model_switch() {
+        use crate::observability::inflight::{INFLIGHT_TEST_LOCK, registry_clear_for_test};
+        use crate::observability::{
+            InFlightObserver, Observer, ObserverEvent, get_inflight_registry,
+        };
+
+        let _lock = INFLIGHT_TEST_LOCK.lock();
+        registry_clear_for_test();
+
+        let observer: Arc<dyn Observer> = Arc::new(InFlightObserver::new());
+        let registry = get_inflight_registry();
+        let alias = "switch_regression_alias";
+
+        let agent_start = |model: &str| ObserverEvent::AgentStart {
+            model_provider: "openai".to_string(),
+            model: model.to_string(),
+            channel: Some("cli".to_string()),
+            agent_alias: Some(alias.to_string()),
+            turn_id: None,
+        };
+
+        // Turn A begins with a single AgentStart; the guard is the sole owner
+        // of its eventual AgentEnd.
+        observer.record_event(&agent_start("gpt-4"));
+        let mut guard_a = super::LoopTurnGuard {
+            observer: observer.clone(),
+            model_provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            channel_name: "cli".to_string(),
+            agent_alias: alias.to_string(),
+            turn_id: "turn-a".to_string(),
+            turn_started_at: std::time::Instant::now(),
+            done: false,
+        };
+
+        // Turn B begins concurrently for the same alias.
+        observer.record_event(&agent_start("gpt-4"));
+        let guard_b = super::LoopTurnGuard {
+            observer: observer.clone(),
+            model_provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            channel_name: "cli".to_string(),
+            agent_alias: alias.to_string(),
+            turn_id: "turn-b".to_string(),
+            turn_started_at: std::time::Instant::now(),
+            done: false,
+        };
+
+        assert_eq!(
+            registry.get(alias),
+            2,
+            "both same-alias turns are in flight"
+        );
+
+        // Turn A hits a `/model` switch: the fixed loop only re-attributes the
+        // guard (no manual AgentEnd/AgentStart), then replacement-provider
+        // construction fails and the turn returns via `?`, dropping the guard.
+        guard_a.model_provider = "anthropic".to_string();
+        guard_a.model = "claude".to_string();
+        drop(guard_a); // the guard's single AgentEnd — one decrement only
+
+        assert_eq!(
+            registry.get(alias),
+            1,
+            "a failed model switch on one turn must not consume the other turn's count"
+        );
+
+        // Turn B completes normally.
+        drop(guard_b);
+        assert_eq!(
+            registry.get(alias),
+            0,
+            "count returns to zero once every turn for the alias has ended"
+        );
+
+        registry_clear_for_test();
     }
 }
