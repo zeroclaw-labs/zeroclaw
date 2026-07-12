@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
@@ -72,6 +73,12 @@ pub struct RpcSession {
     pub workspace_dir: String,
     pub overrides: SessionOverrides,
     pub uploads: HashMap<String, UploadEntry>,
+    /// Latest authoritative execution plan for this session (TodoWrite).
+    /// Whole-list replace; empty = no/cleared plan. In-memory only —
+    /// survives client drops / tmux detach / `session/resume` within
+    /// the daemon's lifetime, lost on daemon restart (same durability
+    /// as the rest of `RpcSession`).
+    pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
 }
@@ -91,6 +98,7 @@ impl RpcSession {
             workspace_dir: workspace.to_string(),
             overrides: SessionOverrides::default(),
             uploads: HashMap::new(),
+            plan: Vec::new(),
             chat_mode,
             owner_tui_id: None,
         }
@@ -281,6 +289,20 @@ impl SessionStore {
         if let Some(s) = self.sessions.lock().await.get(id) {
             s.agent.lock().await.seed_history(msgs);
         }
+    }
+
+    /// Replace the session's execution plan wholesale (TodoWrite
+    /// whole-list semantics). No-op if the session is unknown.
+    pub async fn set_plan(&self, id: &str, entries: Vec<PlanEntry>) {
+        if let Some(s) = self.sessions.lock().await.get_mut(id) {
+            s.plan = entries;
+        }
+    }
+
+    /// Current stored plan for a session. `None` if the session is
+    /// unknown; `Some(empty)` if the session exists with no/cleared plan.
+    pub async fn get_plan(&self, id: &str) -> Option<Vec<PlanEntry>> {
+        self.sessions.lock().await.get(id).map(|s| s.plan.clone())
     }
 
     pub async fn seed_conversation_history(
@@ -590,6 +612,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn set_and_get_plan_round_trips() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        fn sample_entry(content: &str, status: PlanStatus) -> PlanEntry {
+            PlanEntry {
+                content: content.to_string(),
+                status,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            }
+        }
+
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        // Fresh session has an empty (but present) plan.
+        assert!(store.get_plan("s1").await.unwrap().is_empty());
+
+        let plan = vec![
+            sample_entry("A", PlanStatus::Completed),
+            sample_entry("B", PlanStatus::InProgress),
+        ];
+        store.set_plan("s1", plan.clone()).await;
+        assert_eq!(store.get_plan("s1").await.unwrap(), plan);
+
+        // Whole-list replace: empty list clears.
+        store.set_plan("s1", vec![]).await;
+        assert!(store.get_plan("s1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_plan_none_for_unknown_session() {
+        let store = make_store(4);
+        assert!(store.get_plan("does-not-exist").await.is_none());
     }
 
     #[tokio::test]

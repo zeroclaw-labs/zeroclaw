@@ -13,6 +13,7 @@ const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::f
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 use crate::agent::agent::TurnEvent;
+use crate::sop::SopGraphExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -22,7 +23,8 @@ use tokio::sync::mpsc;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound,
+    RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
+    SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -144,6 +146,22 @@ pub enum Method {
     QuickstartValidate,
     QuickstartApply,
     QuickstartDismiss,
+
+    SopsList,
+    SopsGet,
+    SopsGraph,
+    SopsRun,
+    SopsRuns,
+    SopsRunOverlay,
+    SopsValidate,
+    SopsSave,
+    SopsCreate,
+    SopsDelete,
+    SopsDecide,
+    SopsWireDraft,
+    SopsGraphDraft,
+    SopsTriggerSources,
+    ToolsParamOptions,
 }
 
 impl Method {
@@ -238,6 +256,21 @@ impl Method {
         (Method::QuickstartValidate, "quickstart/validate"),
         (Method::QuickstartApply, "quickstart/apply"),
         (Method::QuickstartDismiss, "quickstart/dismiss"),
+        (Method::SopsList, "sops/list"),
+        (Method::SopsGet, "sops/get"),
+        (Method::SopsGraph, "sops/graph"),
+        (Method::SopsRun, "sops/run"),
+        (Method::SopsRuns, "sops/runs"),
+        (Method::SopsRunOverlay, "sops/run-overlay"),
+        (Method::SopsValidate, "sops/validate"),
+        (Method::SopsSave, "sops/save"),
+        (Method::SopsCreate, "sops/create"),
+        (Method::SopsDelete, "sops/delete"),
+        (Method::SopsDecide, "sops/decide"),
+        (Method::SopsWireDraft, "sops/wire-draft"),
+        (Method::SopsGraphDraft, "sops/graph-draft"),
+        (Method::SopsTriggerSources, "sops/trigger-sources"),
+        (Method::ToolsParamOptions, "tools/param-options"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -699,6 +732,22 @@ impl RpcDispatcher {
             Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
             Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
+
+            Method::SopsList => self.handle_sops_list(),
+            Method::SopsGet => self.handle_sops_get(&req.params),
+            Method::SopsGraph => self.handle_sops_graph(&req.params),
+            Method::SopsRun => self.handle_sops_run(&req.params).await,
+            Method::SopsRuns => self.handle_sops_runs(&req.params),
+            Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
+            Method::SopsValidate => self.handle_sops_validate(&req.params),
+            Method::SopsSave => self.handle_sops_save(&req.params),
+            Method::SopsCreate => self.handle_sops_create(&req.params),
+            Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsDecide => self.handle_sops_decide(&req.params).await,
+            Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
+            Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
+            Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
+            Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
         };
 
         if is_notification {
@@ -1069,6 +1118,26 @@ impl RpcDispatcher {
                             .sessions
                             .seed_conversation_history(&session_id, data.messages)
                             .await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
+                        if let Some(ref store) = self.ctx.acp_session_store {
+                            let store = store.clone();
+                            let sid = session_id.clone();
+                            let plan = tokio::task::spawn_blocking(move || {
+                                store.get_plan(&sid).unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !plan.is_empty() {
+                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
+                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
+                                    let _ = self.rpc.send_raw(n).await;
+                                }
+                            }
+                        }
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
                     Ok(Ok(AcpSessionNewLoad::Killed)) => {
@@ -1558,6 +1627,10 @@ impl RpcDispatcher {
         };
 
         // Capture live attribution fields and max_context_tokens for the turn span.
+        // Zerocode's context meter field is named `max_context_tokens` and must
+        // reflect the runtime-profile budget (`[runtime_profiles.<name>]
+        // max_context_tokens`), not the provider model-window helper (which
+        // falls back to 32_000 when `context_window` is unset).
         let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
@@ -1573,13 +1646,17 @@ impl RpcDispatcher {
             };
             let max_ctx = {
                 let cfg = self.ctx.config.read();
-                Some(cfg.effective_model_context_window(&alias) as u64)
+                Some(context_usage_max_tokens(&cfg, &alias))
             };
             (alias, mp, m, max_ctx)
         };
 
         let rpc = self.rpc.clone();
         let sid_owned = sid.to_string();
+        // Clone of the session store so the turn-event closure can persist
+        // the latest TodoWrite plan (store-then-emit) before the plan
+        // notification goes out. See `persist_plan_if_any`.
+        let sessions_for_plan = self.ctx.sessions.clone();
         let acp_token_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             self.ctx.acp_session_store.clone()
         } else {
@@ -1617,6 +1694,7 @@ impl RpcDispatcher {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
+                let sessions_for_plan = sessions_for_plan.clone();
                 async move {
                     if let (
                         Some(store),
@@ -1633,6 +1711,13 @@ impl RpcDispatcher {
                             tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
                                 .await;
                     }
+                    // Store-then-emit: persist a TodoWrite plan (both the
+                    // in-memory live cache and, for ACP sessions, the durable
+                    // store) before its notification goes out, so a racing
+                    // reconnect — or a later resume — reads a consistent list.
+                    // No-op for every other event.
+                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
+                        .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
                         let _ = rpc.send_raw(n).await;
                     }
@@ -3692,7 +3777,12 @@ impl RpcDispatcher {
     async fn handle_config_catalog_models(&self, params: &Value) -> RpcResult {
         let req: CatalogModelsParams = parse_params(params)?;
         let local = crate::quickstart::model_provider_is_local(&req.model_provider);
-        let (models, pricing, live) = crate::quickstart::model_catalog(&req.model_provider).await;
+        // Snapshot config so the catalog can resolve the alias credential and
+        // reach the native /models endpoint (surfacing new native-only models
+        // that models.dev may not carry yet) rather than silently falling back.
+        let config = self.ctx.config.read().clone();
+        let (models, pricing, live) =
+            crate::quickstart::model_catalog_with_config(Some(&config), &req.model_provider).await;
         to_result(CatalogModelsResult {
             model_provider: req.model_provider,
             models,
@@ -3913,6 +4003,348 @@ impl RpcDispatcher {
         to_result(body)
     }
 
+    fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
+        let config = self.ctx.config.read();
+        let workspace = config.shared_workspace_dir();
+        let dir = crate::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+        let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
+        (dir, mode)
+    }
+
+    fn parse_sop(value: &Value) -> Result<crate::sop::Sop, JsonRpcError> {
+        serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+    }
+
+    fn handle_sops_list(&self) -> RpcResult {
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sops = crate::sop::load_sops_from_directory(&dir, mode);
+        to_result(sops)
+    }
+
+    fn handle_sops_get(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(sop)
+    }
+
+    fn handle_sops_graph(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(crate::sop::SopGraph::from_sop_with_specs(
+            &sop,
+            &self.sop_tool_specs(),
+        ))
+    }
+
+    async fn handle_sops_run(&self, params: &Value) -> RpcResult {
+        let req: SopRunRequest = parse_params(params)?;
+
+        if let Some(payload) = req.payload.as_deref()
+            && !payload.trim().is_empty()
+            && serde_json::from_str::<Value>(payload).is_err()
+        {
+            return Err(rpc_err(INVALID_PARAMS, "payload is not valid JSON"));
+        }
+
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let audit = self
+            .ctx
+            .sop_audit
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+
+        let payload = req
+            .payload
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+
+        let event = crate::sop::SopEvent {
+            source: crate::sop::SopTriggerSource::Manual,
+            topic: None,
+            payload,
+            timestamp: crate::sop::engine::now_iso8601(),
+        };
+
+        let results =
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        crate::sop::dispatch::process_headless_results(&results);
+
+        for result in &results {
+            match result {
+                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                    return to_result(SopRunResponse {
+                        run_id: run_id.clone(),
+                    });
+                }
+                crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
+                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::NoMatch => {}
+            }
+        }
+
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!("SOP '{}' has no matching manual trigger", req.name),
+        ))
+    }
+
+    fn handle_sops_runs(&self, params: &Value) -> RpcResult {
+        let req: SopRunsRequest = parse_params(params)?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
+            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        to_result(serde_json::json!({ "runs": runs }))
+    }
+
+    fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        let req: SopRunOverlayRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
+    }
+
+    async fn handle_sops_decide(&self, params: &Value) -> RpcResult {
+        let req: SopDecideRequest = parse_params(params)?;
+        let decision: crate::sop::approval::ApprovalDecision =
+            serde_json::from_value(req.decision.clone()).map_err(|e| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("decision is not a valid approval decision: {e}"),
+                )
+            })?;
+
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
+            .clone();
+
+        let agent_alias = sop.agent.clone().unwrap_or_default();
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %req.run_id,
+            agent_alias = %agent_alias,
+            channel = "rpc",
+        );
+        let _guard = span.enter();
+
+        {
+            let mut guard = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            guard
+                .decide_checkpoint(&req.run_id, decision)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        }
+
+        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
+    }
+
+    fn handle_sops_validate(&self, params: &Value) -> RpcResult {
+        let sop = if params.get("sop").is_some() {
+            let req: SopSaveRequest = parse_params(params)?;
+            Self::parse_sop(&req.sop)?
+        } else {
+            let req: SopSelectRequest = parse_params(params)?;
+            let (dir, mode) = self.sops_dir_and_mode();
+            crate::sop::load_sop_by_name(&dir, &req.name, mode)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
+        };
+        let v = crate::sop::validate_sop_strict(&sop);
+        to_result(serde_json::json!({
+            "blocking": v.blocking,
+            "warnings": v.warnings,
+            "ok": v.is_ok(),
+        }))
+    }
+
+    fn handle_sops_save(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        if let Some(original) = req.original_name.as_deref()
+            && !original.is_empty()
+            && original != sop.name
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "rename not supported: SOP '{original}' cannot be saved as '{}'",
+                    sop.name
+                ),
+            ));
+        }
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "saved": sop.name }))
+    }
+
+    fn handle_sops_create(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::create_sop_typed(&dir, &sop).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
+                _ => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "created": sop.name }))
+    }
+
+    fn handle_sops_delete(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::delete_sop_typed(&dir, &req.name).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                _ => INTERNAL_ERROR,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let edit_val = params
+            .get("edit")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'edit'"))?;
+        let mut sop = Self::parse_sop(sop_val)?;
+        let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
+        crate::sop::apply_wire(&mut sop, &edit)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({
+            "sop": sop,
+            "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
+        }))
+    }
+
+    fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let sop = Self::parse_sop(sop_val)?;
+        to_result(crate::sop::SopGraph::from_sop_with_specs(
+            &sop,
+            &self.sop_tool_specs(),
+        ))
+    }
+
+    fn sop_tool_specs(&self) -> crate::sop::ToolSpecs {
+        let config = self.ctx.config.read();
+        let agent = config.agents.keys().min().cloned().unwrap_or_default();
+        crate::sop::tool_specs_from_config(&config, &agent)
+    }
+
+    fn handle_sops_trigger_sources(&self) -> RpcResult {
+        let registry = {
+            let config = self.ctx.config.read();
+            crate::sop::registry_from_config(&config)
+        };
+        to_result(registry)
+    }
+
+    /// Resolve selectable values for a domain-typed tool parameter.
+    /// Params: `{ domain, agent?, args? }`. `domain` is an
+    /// `OptionDomain` wire name (e.g. `peer_targets`); `agent` scopes
+    /// agent-relative domains; `args` carries sibling arguments already
+    /// chosen so cascading domains can narrow.
+    fn handle_tools_param_options(&self, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct ParamOptionsParams {
+            domain: zeroclaw_api::tool::OptionDomain,
+            #[serde(default)]
+            agent: Option<String>,
+            #[serde(default)]
+            args: Value,
+        }
+        let req: ParamOptionsParams = parse_params(params)?;
+        let config = self.ctx.config.read();
+        let agent_alias = req
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .or_else(|| config.agents.keys().min().cloned())
+            .unwrap_or_default();
+
+        let entries = if req.domain == zeroclaw_api::tool::OptionDomain::ToolNames {
+            let security = std::sync::Arc::new(
+                zeroclaw_config::policy::SecurityPolicy::for_agent(&config, &agent_alias)
+                    .unwrap_or_default(),
+            );
+            let tools = crate::tools::default_tools(security);
+            let refs: Vec<&dyn zeroclaw_api::tool::Tool> =
+                tools.iter().map(std::convert::AsRef::as_ref).collect();
+            crate::tools::param_options::resolve_options(
+                req.domain,
+                &config,
+                &agent_alias,
+                &req.args,
+                &refs,
+            )
+        } else {
+            crate::tools::param_options::resolve_options(
+                req.domain,
+                &config,
+                &agent_alias,
+                &req.args,
+                &[],
+            )
+        };
+        to_result(serde_json::json!({ "options": entries }))
+    }
+
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
         // Clone out of the lock to satisfy `&mut Config`. On success
@@ -4031,6 +4463,75 @@ fn truncate_memory_previews(
     entries
 }
 
+/// Resolve the max-token ceiling shown on Zerocode's context usage meter.
+///
+/// The wire field is named `max_context_tokens` and must track the operator's
+/// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
+/// which is also the preemptive history-trim budget. Using the provider
+/// model-window helper here is wrong: that path ignores the runtime profile
+/// and falls back to 32_000 when `providers.models.*.context_window` is unset,
+/// so the meter freezes at the default even when the profile is set higher.
+fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
+    cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
+/// Persist a `TurnEvent::Plan` before it is emitted, so a racing
+/// reconnect — or a later `session/resume` — reads a consistent plan.
+/// Writes both the in-memory live cache (`sessions`) and, when an ACP
+/// durable store is present, the on-disk `plan_json` column (via
+/// `spawn_blocking`, since SQLite is synchronous). No-op for every
+/// other event. Durable-write failures are logged-and-swallowed: the
+/// in-memory cache is still authoritative for the live session.
+async fn persist_plan_if_any(
+    sessions: &crate::rpc::session::SessionStore,
+    acp_store: Option<&std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+    session_id: &str,
+    event: &TurnEvent,
+) {
+    let TurnEvent::Plan { entries } = event else {
+        return;
+    };
+    sessions.set_plan(session_id, entries.clone()).await;
+    if let Some(store) = acp_store {
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let entries = entries.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.set_plan(&sid, &entries) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "Failed to persist TodoWrite plan to ACP session store"
+                );
+            }
+        })
+        .await;
+    }
+}
+
+/// Build the `session/update` `plan` notification used to repopulate a
+/// resuming/reconnecting client's tracker from stored state. Returns
+/// `None` when the plan is empty (nothing to show). Reuses the same
+/// `TurnEvent::Plan` → notification mapping as the live path so the wire
+/// shape can never drift between live and replay.
+fn plan_replay_notification(
+    session_id: &str,
+    entries: &[zeroclaw_api::plan::PlanEntry],
+) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let event = TurnEvent::Plan {
+        entries: entries.to_vec(),
+    };
+    notification_for_turn_event(session_id, &event, None)
+}
+
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
@@ -4096,6 +4597,10 @@ fn notification_for_turn_event(
                 max_context_tokens,
             }
         }
+        TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
+            session_id: session_id.to_string(),
+            entries: entries.clone(),
+        },
     };
 
     let params = serde_json::to_value(update).ok()?;
@@ -4735,6 +5240,87 @@ mod tests {
         assert!(d.handle_cost_org().is_err());
     }
 
+    // #8590: the `sops/trigger-sources` RPC response must carry the full
+    // ordered `SopTriggerSource` walk so authoring surfaces (web + zerocode)
+    // render the picker from the backend list instead of reconstructing it.
+    // Any new trigger source variant appears here automatically; a surface that
+    // reconstructs its own list would drift while this guard would not, so the
+    // contract is pinned at the transport boundary every surface reads from.
+    #[test]
+    fn sops_trigger_sources_rpc_carries_full_trigger_source_walk() {
+        use crate::sop::types::SopTriggerSource;
+        use strum::IntoEnumIterator;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let value = d
+            .handle_sops_trigger_sources()
+            .expect("sops/trigger-sources must succeed on a default config");
+        let sources: Vec<String> = value
+            .get("sources")
+            .and_then(|s| serde_json::from_value(s.clone()).ok())
+            .expect("response must carry a `sources` array");
+        let expected: Vec<String> = SopTriggerSource::iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            sources, expected,
+            "RPC `sources` must equal the complete SopTriggerSource walk so \
+             surfaces cannot drift by reconstructing their own list"
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_run_rejects_malformed_payload_before_engine() {
+        // Payload validation runs before the engine lookup, so a malformed JSON
+        // string is rejected with INVALID_PARAMS even on a dispatcher with no
+        // SOP engine wired. This pins the "surface a clear error on malformed
+        // JSON rather than failing the run opaquely" contract.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_run(&serde_json::json!({ "name": "any", "payload": "{not json" }))
+            .await
+            .expect_err("malformed payload must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn sops_run_requires_engine() {
+        // A well-formed request against a dispatcher with no SOP engine reports
+        // the subsystem as unavailable rather than panicking or silently
+        // succeeding.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_run(&serde_json::json!({ "name": "any", "payload": "{\"k\":1}" }))
+            .await
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn sops_runs_requires_engine() {
+        // Listing runs against a dispatcher with no SOP engine reports the
+        // subsystem as unavailable rather than returning a bogus empty list.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_runs(&serde_json::json!({}))
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn sops_runs_accepts_optional_sop_filter() {
+        // The request parses with or without the `sop` field; both fail only on
+        // the engine guard, not on param parsing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_runs(&serde_json::json!({ "sop": "some-sop" }))
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
     #[test]
     fn cost_org_unreadable_non_notfound_errors() {
         // A directory at the snapshot path produces a non-NotFound read error; it must
@@ -5065,6 +5651,144 @@ mod tests {
     }
 
     #[test]
+    fn plan_turn_event_maps_to_plan_notification() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let event = TurnEvent::Plan {
+            entries: vec![PlanEntry {
+                content: "Analyze codebase".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::High,
+                active_form: Some("Analyzing codebase".to_string()),
+            }],
+        };
+        let json = notification_for_turn_event("sess-1", &event, None)
+            .expect("plan yields a notification");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-1");
+        assert_eq!(v["params"]["entries"][0]["content"], "Analyze codebase");
+        assert_eq!(v["params"]["entries"][0]["status"], "in_progress");
+        assert_eq!(v["params"]["entries"][0]["priority"], "high");
+        assert_eq!(
+            v["params"]["entries"][0]["activeForm"],
+            "Analyzing codebase"
+        );
+    }
+
+    #[test]
+    fn empty_plan_turn_event_maps_to_empty_entries() {
+        let event = TurnEvent::Plan { entries: vec![] };
+        let json =
+            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "plan");
+        assert!(v["params"]["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_plan_notification_built_for_nonempty_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let entries = vec![PlanEntry {
+            content: "Resume me".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Medium,
+            active_form: None,
+        }];
+        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-9");
+        assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
+    }
+
+    #[test]
+    fn resume_plan_notification_absent_for_empty_plan() {
+        assert!(plan_replay_notification("sess-9", &[]).is_none());
+    }
+
+    async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("minimal Agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+        sessions
+    }
+
+    #[tokio::test]
+    async fn plan_event_is_stored_before_emitting() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "persist-plan-sess";
+        let store = store_with_one_session(sid).await;
+
+        let entries = vec![PlanEntry {
+            content: "A".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&store, None, sid, &event).await;
+        assert_eq!(store.get_plan(sid).await.unwrap(), entries);
+    }
+
+    #[tokio::test]
+    async fn non_plan_event_does_not_touch_stored_plan() {
+        let sid = "no-touch-sess";
+        let store = store_with_one_session(sid).await;
+        persist_plan_if_any(&store, None, sid, &TurnEvent::Chunk { delta: "hi".into() }).await;
+        assert!(store.get_plan(sid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_event_persists_to_durable_acp_store() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "durable-plan-sess";
+        let sessions = store_with_one_session(sid).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap())
+            .unwrap();
+
+        let entries = vec![PlanEntry {
+            content: "Durable".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Low,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&sessions, Some(&acp), sid, &event).await;
+
+        // In-memory cache updated…
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), entries);
+        // …and durable store updated (survives daemon restart / eviction).
+        assert_eq!(acp.get_plan(sid).unwrap(), entries);
+    }
+
+    #[test]
     fn approval_request_notification() {
         let event = TurnEvent::ApprovalRequest {
             request_id: "ar_1".into(),
@@ -5115,6 +5839,112 @@ mod tests {
         // TokenUsage contract and must NOT be added (double-counts).
         assert_eq!(v["params"]["input_tokens"], 100);
         assert_eq!(v["params"]["max_context_tokens"], 32_000);
+    }
+
+    /// Regression: Zerocode's context meter must read the runtime-profile
+    /// `max_context_tokens` budget, not the provider model-window helper.
+    /// The model-window path falls back to 32_000 when `context_window` is
+    /// unset, which made the meter ignore a profile set to e.g. 128_000.
+    #[test]
+    fn context_usage_max_tokens_uses_runtime_profile_budget() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                // No provider context_window configured — the broken path
+                // would fall back to 32_000 here.
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            128_000,
+            "context meter must use runtime_profiles.<name>.max_context_tokens"
+        );
+        assert_eq!(
+            cfg.effective_model_context_window("coder"),
+            32_000,
+            "sanity: model-window helper still defaults to 32k without provider context_window"
+        );
+    }
+
+    /// Boundary regression: prove the corrected ceiling survives the *wire*
+    /// path, not just the config helper. This threads
+    /// `context_usage_max_tokens(&cfg, alias)` through the exact
+    /// `notification_for_turn_event` serialization the RPC dispatch emits, and
+    /// asserts the on-the-wire `context_usage.max_context_tokens` reads the
+    /// runtime-profile budget (128_000) rather than the model-window fallback
+    /// (32_000). This closes the "helper is right but does the emitted payload
+    /// carry it?" gap without needing a live daemon smoke.
+    #[test]
+    fn context_usage_notification_wire_reports_runtime_profile_budget() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                // No provider context_window: the broken path would emit 32_000.
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        // Resolve the ceiling exactly as RPC dispatch does, then emit it
+        // through the real wire serializer.
+        let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+        };
+        let json = notification_for_turn_event("s1", &event, Some(max_ctx)).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["max_context_tokens"], 128_000,
+            "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
+        );
     }
 
     #[test]
