@@ -46,6 +46,12 @@ enum ChatPhase {
         list_state: ListState,
         loading: bool,
     },
+    /// Showing saved Code sessions before any new session has been created.
+    PickSession {
+        sessions: Vec<SessionEntry>,
+        list_state: ListState,
+        agents: Vec<String>,
+    },
     /// WSS only: user picks the remote working directory before session starts.
     PickCwd {
         /// The agent alias already chosen.
@@ -124,6 +130,9 @@ pub(crate) struct Chat {
     /// Double-click tracker for the agent picker: a second click on the same row
     /// confirms (enters the session), matching the keyboard Enter.
     pick_agent_double_click: crate::mouse::DoubleClickTracker,
+    /// Double-click tracker for the session picker: a second click on the same row
+    /// resumes that saved session, matching the keyboard Enter.
+    session_list_double_click: crate::mouse::DoubleClickTracker,
     /// Parsed `[todotracker]` config, fetched once (lazily, on first
     /// session start) and applied to every `ChatState` this pane
     /// constructs. Defaults until fetched.
@@ -220,6 +229,7 @@ impl Chat {
             resume_agent_alias: None,
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
+            session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
             todo_settings_loaded: false,
             deferred_elicitations: Vec::new(),
@@ -282,23 +292,41 @@ impl Chat {
             return Ok(());
         }
 
-        if agents.len() == 1 {
-            self.pick_or_start_session(&agents[0]).await;
-            return Ok(());
-        }
-
         // Multi-agent reconnect: if a resumed session was carried across the
         // rebuild and its agent is still present, reattach to it automatically
         // rather than forcing the user back through the picker and minting a
         // fresh session. The resume id is consumed by `start_session`.
         if let Some(prior) = self.resume_agent_alias.take()
             && self.resume_session_id.is_some()
-            && agents.iter().any(|a| a == &prior)
         {
-            self.pick_or_start_session(&prior).await;
+            if agents.iter().any(|a| a == &prior) {
+                self.pick_or_start_session(&prior).await;
+                return Ok(());
+            }
+            self.resume_session_id = None;
+        }
+
+        if agents.len() == 1 {
+            if self.resume_session_id.is_some() {
+                self.pick_or_start_session(&agents[0]).await;
+                return Ok(());
+            }
+            if self.try_show_recent_acp_session_picker(&agents).await {
+                return Ok(());
+            }
+            self.pick_or_start_session(&agents[0]).await;
             return Ok(());
         }
 
+        if self.try_show_recent_acp_session_picker(&agents).await {
+            return Ok(());
+        }
+
+        self.show_agent_picker(agents);
+        Ok(())
+    }
+
+    fn show_agent_picker(&mut self, agents: Vec<String>) {
         // Preserve the highlighted alias across a re-entry refresh: init() also
         // runs when the user returns to the pane (see refresh_if_inactive), and
         // resetting the cursor to the top every tab switch would be jarring.
@@ -326,7 +354,60 @@ impl Chat {
             list_state,
             loading: false,
         };
-        Ok(())
+    }
+
+    async fn try_show_recent_acp_session_picker(&mut self, agents: &[String]) -> bool {
+        if self.pane_kind != PaneKind::Acp || self.resume_session_id.is_some() || agents.is_empty()
+        {
+            return false;
+        }
+
+        let Ok(list) = self.rpc.acp_session_list().await else {
+            return false;
+        };
+
+        let sessions = list
+            .sessions
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .agent_alias
+                    .as_ref()
+                    .is_some_and(|alias| agents.iter().any(|enabled| enabled == alias))
+            })
+            .collect::<Vec<_>>();
+
+        if sessions.is_empty() {
+            return false;
+        }
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        self.phase = ChatPhase::PickSession {
+            sessions,
+            list_state,
+            agents: agents.to_vec(),
+        };
+        true
+    }
+
+    async fn resume_session_entry(&mut self, entry: SessionEntry) {
+        let Some(agent_alias) = entry.agent_alias else {
+            return;
+        };
+        self.resume_session_id = Some(entry.session_id);
+        self.resume_agent_alias = Some(agent_alias.clone());
+        self.pick_or_start_session(&agent_alias).await;
+    }
+
+    async fn start_fresh_from_picker(&mut self, agents: Vec<String>) {
+        self.resume_session_id = None;
+        self.resume_agent_alias = None;
+        if agents.len() == 1 {
+            self.pick_or_start_session(&agents[0]).await;
+        } else {
+            self.show_agent_picker(agents);
+        }
     }
 
     /// Decide whether to show the CWD picker (WSS ACP) or start the session
@@ -966,6 +1047,19 @@ impl Chat {
                 );
                 self.pick_agent_list_area = list_area;
             }
+            ChatPhase::PickSession {
+                sessions,
+                list_state,
+                ..
+            } => {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    sessions,
+                    list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                );
+            }
             ChatPhase::PickCwd { explorer, .. } => {
                 explorer.render(frame, area);
             }
@@ -1022,6 +1116,42 @@ impl Chat {
                     Some(ChatTabAction::BrowseDown) | Some(ChatTabAction::BrowseDownVim) => {
                         let i = list_state.selected().unwrap_or(0);
                         if i + 1 < agents.len() {
+                            list_state.select(Some(i + 1));
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            ChatPhase::PickSession {
+                sessions,
+                list_state,
+                agents,
+            } => {
+                use crate::keymap::{ChatTabAction, ModalAction};
+                if ModalAction::from_chord(&key) == Some(ModalAction::Confirm) {
+                    if let Some(i) = list_state.selected()
+                        && let Some(entry) = sessions.get(i).cloned()
+                    {
+                        self.resume_session_entry(entry).await;
+                    }
+                    return false;
+                }
+                if ModalAction::from_chord(&key) == Some(ModalAction::Cancel)
+                    || ChatTabAction::from_chord(&key) == Some(ChatTabAction::NewSession)
+                {
+                    let agents = agents.clone();
+                    self.start_fresh_from_picker(agents).await;
+                    return false;
+                }
+                match ModalAction::from_chord(&key) {
+                    Some(ModalAction::Up) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(i.saturating_sub(1)));
+                    }
+                    Some(ModalAction::Down) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        if i + 1 < sessions.len() {
                             list_state.select(Some(i + 1));
                         }
                     }
@@ -1206,67 +1336,42 @@ impl Chat {
         }
 
         // ── Session overlay key handling ─────────────────────────
-        match &mut state.session_overlay {
-            SessionOverlay::List {
-                sessions,
-                list_state,
-            } => {
-                use crate::keymap::ModalAction;
-                match ModalAction::from_chord(&key) {
-                    Some(ModalAction::Cancel) => {
-                        state.session_overlay = SessionOverlay::None;
-                    }
-                    Some(ModalAction::Confirm) => {
-                        if let Some(i) = list_state.selected()
-                            && let Some(s) = sessions.get(i)
-                        {
-                            let new_sid = s.session_id.clone();
-                            let new_name = s.name.clone();
-                            let agent_alias = s
-                                .agent_alias
-                                .clone()
-                                .unwrap_or_else(|| state.agent_alias.clone());
-                            let _ = self.rpc.session_close(&state.session_id).await;
-                            state.session_overlay = SessionOverlay::None;
-                            state.reset_for_session(new_sid.clone(), new_name);
-                            state.agent_alias = agent_alias.clone();
-                            // Rehydrate the session in the daemon so prompts work.
-                            let rehydrate_result = if self.pane_kind == PaneKind::Acp {
-                                self.rpc
-                                    .session_new_acp(&agent_alias, None, Some(&new_sid))
-                                    .await
-                            } else {
-                                self.rpc
-                                    .session_new_with_id(&agent_alias, None, Some(&new_sid))
-                                    .await
-                            };
-                            if let Ok(rehydrated) = rehydrate_result
-                                && self.pane_kind == PaneKind::Acp
-                            {
-                                state.cwd = rehydrated.workspace_dir;
-                            }
-                            Self::refresh_model_identity(&self.rpc, state).await;
-                            // Load persisted message history.
-                            if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
-                                state.load_history(msgs.messages);
-                            }
-                        }
-                    }
-                    Some(ModalAction::Up) => {
-                        let i = list_state.selected().unwrap_or(0);
-                        list_state.select(Some(i.saturating_sub(1)));
-                    }
-                    Some(ModalAction::Down) => {
-                        let i = list_state.selected().unwrap_or(0);
-                        if i + 1 < sessions.len() {
-                            list_state.select(Some(i + 1));
-                        }
-                    }
-                    _ => {}
+        let mut handled_session_overlay = false;
+        let mut confirm_session = None;
+        if let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &mut state.session_overlay
+        {
+            handled_session_overlay = true;
+            use crate::keymap::ModalAction;
+            match ModalAction::from_chord(&key) {
+                Some(ModalAction::Cancel) => {
+                    state.session_overlay = SessionOverlay::None;
                 }
-                return false;
+                Some(ModalAction::Confirm) => {
+                    if let Some(i) = list_state.selected() {
+                        confirm_session = sessions.get(i).cloned();
+                    }
+                }
+                Some(ModalAction::Up) => {
+                    let i = list_state.selected().unwrap_or(0);
+                    list_state.select(Some(i.saturating_sub(1)));
+                }
+                Some(ModalAction::Down) => {
+                    let i = list_state.selected().unwrap_or(0);
+                    if i + 1 < sessions.len() {
+                        list_state.select(Some(i + 1));
+                    }
+                }
+                _ => {}
             }
-            SessionOverlay::None => { /* handled below */ }
+        }
+        if handled_session_overlay {
+            if let Some(entry) = confirm_session {
+                Self::switch_to_session_entry(&self.rpc, self.pane_kind, state, entry).await;
+            }
+            return false;
         }
 
         {
@@ -1779,6 +1884,57 @@ impl Chat {
         }
     }
 
+    async fn switch_to_session_entry(
+        rpc: &Arc<RpcClient>,
+        pane_kind: PaneKind,
+        state: &mut ChatState,
+        entry: crate::client::SessionEntry,
+    ) {
+        let new_sid = entry.session_id;
+        let new_name = entry.name;
+        let agent_alias = entry
+            .agent_alias
+            .unwrap_or_else(|| state.agent_alias.clone());
+        if new_sid == state.session_id {
+            state.session_overlay = SessionOverlay::None;
+            state.mark_dirty_full();
+            return;
+        }
+
+        let rehydrate_result = if pane_kind == PaneKind::Acp {
+            rpc.session_new_acp(&agent_alias, None, Some(&new_sid))
+                .await
+        } else {
+            rpc.session_new_with_id(&agent_alias, None, Some(&new_sid))
+                .await
+        };
+        let rehydrated = match rehydrate_result {
+            Ok(session) => session,
+            Err(e) => {
+                state.session_overlay = SessionOverlay::None;
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-chat-session-switch-error",
+                    &[("error", &e.to_string())],
+                )));
+                state.mark_dirty_full();
+                return;
+            }
+        };
+
+        let _ = rpc.session_close(&state.session_id).await;
+        state.session_overlay = SessionOverlay::None;
+        state.reset_for_session(new_sid.clone(), new_name);
+        state.agent_alias = agent_alias.clone();
+        if pane_kind == PaneKind::Acp {
+            state.cwd = rehydrated.workspace_dir;
+        }
+
+        Self::refresh_model_identity(rpc, state).await;
+        if let Ok(msgs) = rpc.session_messages(&new_sid).await {
+            state.load_history(msgs.messages);
+        }
+    }
+
     /// Apply a session override (model and/or model_provider) to the active
     /// session via `session/configure`, reporting the outcome on the info bar.
     /// On a model_provider switch the daemon rebuilds the provider box live.
@@ -2059,6 +2215,50 @@ impl Chat {
             return;
         }
 
+        if matches!(self.phase, ChatPhase::PickSession { .. }) {
+            let mut confirm_session: Option<SessionEntry> = None;
+            if let ChatPhase::PickSession {
+                sessions,
+                list_state,
+                ..
+            } = &mut self.phase
+            {
+                let overlay_area = session_list_overlay_area(area);
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left)
+                        if mouse::in_rect(mouse.column, mouse.row, overlay_area) =>
+                    {
+                        if let Some(idx) = mouse::list_click_index(
+                            mouse.row,
+                            overlay_area,
+                            list_state.offset(),
+                            sessions.len(),
+                        ) {
+                            list_state.select(Some(idx));
+                            if self
+                                .session_list_double_click
+                                .click(mouse.column, mouse.row)
+                            {
+                                confirm_session = sessions.get(idx).cloned();
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if mouse::in_rect(mouse.column, mouse.row, overlay_area) =>
+                    {
+                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(mouse::list_scroll(i, sessions.len(), up, 1)));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(entry) = confirm_session {
+                self.resume_session_entry(entry).await;
+            }
+            return;
+        }
+
         // Agent picker: click highlights a row, double-click confirms (enters
         // the session), wheel moves the selection.
         if matches!(self.phase, ChatPhase::PickAgent { loading: false, .. }) {
@@ -2128,6 +2328,7 @@ impl Chat {
                 list_state,
             } = &mut state.session_overlay
             {
+                let mut confirm_session: Option<crate::client::SessionEntry> = None;
                 let col = mouse.column;
                 let row = mouse.row;
                 let overlay_area = session_list_overlay_area(area);
@@ -2146,6 +2347,9 @@ impl Chat {
                                 count,
                             ) {
                                 list_state.select(Some(idx));
+                                if self.session_list_double_click.click(col, row) {
+                                    confirm_session = sessions.get(idx).cloned();
+                                }
                             }
                         }
                     }
@@ -2158,6 +2362,9 @@ impl Chat {
                         list_state.select(Some(mouse::list_scroll(i, count, up, 1)));
                     }
                     _ => {}
+                }
+                if let Some(entry) = confirm_session {
+                    Self::switch_to_session_entry(&self.rpc, self.pane_kind, state, entry).await;
                 }
                 return;
             }
@@ -2442,6 +2649,7 @@ impl Chat {
         match &self.phase {
             // CWD picker always captures text input.
             ChatPhase::PickCwd { .. } => true,
+            ChatPhase::PickSession { .. } => false,
             ChatPhase::Active(s) => {
                 // The model picker is modal: claim text-input so global keys
                 // (`?`, reload) are suppressed; its own handler swallows keys.
@@ -2504,6 +2712,25 @@ impl crate::widgets::HelpContext for Chat {
                 }
             }
             ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
+            ChatPhase::PickSession { .. } => {
+                use crate::keymap::{ChatTabAction as C, ModalAction as M, action_key_labels};
+                let nav = action_key_labels(M::Up)
+                    .into_iter()
+                    .chain(action_key_labels(M::Down));
+                HelpNode::entries(vec![
+                    E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                    E::new(
+                        action_key_labels(M::Confirm),
+                        crate::i18n::t("zc-chat-help-switch-session"),
+                    ),
+                    E::new(
+                        action_key_labels(M::Cancel)
+                            .into_iter()
+                            .chain(action_key_labels(C::NewSession)),
+                        crate::i18n::t("zc-chat-help-new-session"),
+                    ),
+                ])
+            }
             ChatPhase::Error(_) => {
                 use crate::keymap::{ChatTabAction as C, GlobalAction, action_key_labels};
                 let keys = action_key_labels(C::ErrorDismiss)
@@ -2954,7 +3181,13 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             sessions,
             list_state,
         } => {
-            render_session_list_overlay(f, area, sessions, list_state);
+            render_session_list_overlay(
+                f,
+                area,
+                sessions,
+                list_state,
+                crate::i18n::t("zc-chat-session-list-switch-title"),
+            );
         }
         SessionOverlay::None => {}
     }
@@ -3853,6 +4086,7 @@ fn render_session_list_overlay(
     area: Rect,
     sessions: &[SessionEntry],
     list_state: &ListState,
+    title: String,
 ) {
     let overlay_area = session_list_overlay_area(area);
 
@@ -3860,10 +4094,7 @@ fn render_session_list_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(
-            " Sessions (Enter=switch, Esc=close) ",
-            theme::overlay_border_style(),
-        ))
+        .title(Span::styled(title, theme::overlay_border_style()))
         .style(theme::overlay_border_style());
 
     let inner = block.inner(overlay_area);
@@ -6155,6 +6386,36 @@ mod tests {
         assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
     }
 
+    async fn next_rpc_request(rx: &mut mpsc::Receiver<String>, reason: &str) -> serde_json::Value {
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{reason}"))
+            .expect("RPC request channel should stay open");
+        serde_json::from_str(&line).expect("RPC request should be JSON")
+    }
+
+    fn respond_ok(rpc: &RpcOutbound, request: &serde_json::Value, result: serde_json::Value) {
+        let id = request["id"]
+            .as_str()
+            .expect("RPC request should have an id");
+        rpc.dispatch_response(id, Some(result), None);
+    }
+
+    fn respond_err(rpc: &RpcOutbound, request: &serde_json::Value, code: i32, message: &str) {
+        let id = request["id"]
+            .as_str()
+            .expect("RPC request should have an id");
+        rpc.dispatch_response(
+            id,
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code,
+                message: message.to_string(),
+                data: None,
+            }),
+        );
+    }
+
     #[test]
     fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
         let mut s = state();
@@ -6543,6 +6804,362 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_init_opens_recent_session_picker() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 1}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "ACP init should request recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "sessions": [
+                    {
+                        "session_id": "sess-ghost",
+                        "session_key": "sess-ghost",
+                        "created_at": "2026-07-07T00:00:00Z",
+                        "last_activity": "2026-07-07T00:10:00Z",
+                        "message_count": 1,
+                        "agent_alias": "ghost",
+                        "channel_id": null,
+                        "name": "Ghost"
+                    },
+                    {
+                        "session_id": "sess-beta",
+                        "session_key": "sess-beta",
+                        "created_at": "2026-07-07T00:00:00Z",
+                        "last_activity": "2026-07-07T00:05:00Z",
+                        "message_count": 2,
+                        "agent_alias": "beta",
+                        "channel_id": null,
+                        "name": "Beta work"
+                    }
+                ]
+            }),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        let ChatPhase::PickSession {
+            sessions,
+            list_state,
+            agents,
+        } = chat.phase
+        else {
+            panic!("ACP init should show the saved-session picker");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sess-beta");
+        assert_eq!(sessions[0].agent_alias.as_deref(), Some("beta"));
+        assert_eq!(list_state.selected(), Some(0));
+        assert_eq!(agents, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn acp_init_session_picker_enter_resumes_selected_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 1}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "ACP init should request recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "sessions": [
+                    {
+                        "session_id": "sess-beta",
+                        "session_key": "sess-beta",
+                        "created_at": "2026-07-07T00:00:00Z",
+                        "last_activity": "2026-07-07T00:05:00Z",
+                        "message_count": 2,
+                        "agent_alias": "beta",
+                        "channel_id": null,
+                        "name": "Beta work"
+                    }
+                ]
+            }),
+        );
+
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickSession { .. }));
+
+        let resume = tokio::spawn(async move {
+            let entry = match &chat.phase {
+                ChatPhase::PickSession { sessions, .. } => sessions[0].clone(),
+                _ => panic!("expected saved-session picker"),
+            };
+            chat.resume_session_entry(entry).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "resume should load todotracker config").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        assert_eq!(request["params"]["prefix"], "todotracker");
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "Enter should resume selected session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "beta");
+        assert_eq!(params["session_id"], "sess-beta");
+        assert_eq!(params["chat_mode"], "acp");
+        assert_eq!(params["exclude_memory"], true);
+        assert!(params["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-beta",
+                "workspace_dir": "/tmp/beta"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "resume should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        assert_eq!(request["params"]["prefix"], "agents.beta.model_provider");
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "resume should load history").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "sess-beta");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "resume me"}
+                ],
+                "total": 1,
+                "start": 0
+            }),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), resume)
+            .await
+            .expect("resume should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("Enter should enter the saved ACP session");
+        };
+        assert_eq!(state.session_id, "sess-beta");
+        assert_eq!(state.agent_alias, "beta");
+        assert_eq!(state.cwd.as_deref(), Some("/tmp/beta"));
+    }
+
+    #[tokio::test]
+    async fn acp_init_session_picker_cancel_starts_fresh_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "beta", "enabled": true, "live_sessions": 1, "persisted_sessions": 1}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "ACP init should request recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "sessions": [
+                    {
+                        "session_id": "sess-beta",
+                        "session_key": "sess-beta",
+                        "created_at": "2026-07-07T00:00:00Z",
+                        "last_activity": "2026-07-07T00:05:00Z",
+                        "message_count": 2,
+                        "agent_alias": "beta",
+                        "channel_id": null,
+                        "name": "Beta work"
+                    }
+                ]
+            }),
+        );
+
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickSession { .. }));
+
+        let fresh = tokio::spawn(async move {
+            let agents = match &chat.phase {
+                ChatPhase::PickSession { agents, .. } => agents.clone(),
+                _ => panic!("expected saved-session picker"),
+            };
+            chat.start_fresh_from_picker(agents).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "fresh start should load todotracker config").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        assert_eq!(request["params"]["prefix"], "todotracker");
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "Esc should start a fresh session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "beta");
+        assert_eq!(params["chat_mode"], "acp");
+        assert_eq!(params["exclude_memory"], true);
+        assert!(params["session_id"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/tmp/fresh"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "fresh session should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), fresh)
+            .await
+            .expect("fresh start should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("Esc should enter a fresh ACP session");
+        };
+        assert_eq!(state.session_id, "sess-fresh");
+    }
+
+    #[tokio::test]
+    async fn acp_init_clears_stale_carried_resume_for_disabled_agent() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.resume_session_id = Some("sess-prev".to_string());
+        chat.resume_agent_alias = Some("beta".to_string());
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(
+            &mut rx,
+            "stale carried resume should fall back to session picker",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        let request =
+            next_rpc_request(&mut rx, "fresh fallback should load todotracker config").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        assert_eq!(request["params"]["prefix"], "todotracker");
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request =
+            next_rpc_request(&mut rx, "stale carried resume should not be sent for alpha").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        assert!(request["params"]["session_id"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/tmp/fresh"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "fresh fallback should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        assert_eq!(request["params"]["prefix"], "agents.alpha.model_provider");
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("stale carried resume should still enter a fresh ACP session");
+        };
+        assert_eq!(state.session_id, "sess-fresh");
+        assert_eq!(state.agent_alias, "alpha");
+    }
+
+    #[tokio::test]
     async fn agent_picker_click_selects_row() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (tx, _rx) = mpsc::channel::<String>(16);
@@ -6576,6 +7193,177 @@ mod tests {
         } else {
             panic!("expected PickAgent phase");
         }
+    }
+
+    #[tokio::test]
+    async fn session_picker_double_click_resumes_selected_session() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        state.session_overlay = SessionOverlay::List {
+            sessions: vec![crate::client::SessionEntry {
+                session_id: "sess-new".to_string(),
+                session_key: "sess-new".to_string(),
+                created_at: "2026-07-07T00:00:00Z".to_string(),
+                last_activity: "2026-07-07T00:01:00Z".to_string(),
+                message_count: 1,
+                agent_alias: Some("beta".to_string()),
+                channel_id: None,
+                name: Some("Beta work".to_string()),
+            }],
+            list_state,
+        };
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: overlay_area.x + 2,
+            row: overlay_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let switch = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "double-click should resume selected session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "beta");
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        assert_eq!(request["params"]["chat_mode"], "acp");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-new",
+                "workspace_dir": "/tmp/new"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "successful switch should close old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "double-click should load history").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "messages": [
+                    {"role": "agent", "content": "restored"}
+                ],
+                "total": 1,
+                "start": 0
+            }),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("double-click switch should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("double-click should leave the chat active");
+        };
+        assert_eq!(state.session_id, "sess-new");
+        assert_eq!(state.agent_alias, "beta");
+        assert_eq!(state.cwd.as_deref(), Some("/tmp/new"));
+        assert!(matches!(state.session_overlay, SessionOverlay::None));
+    }
+
+    #[tokio::test]
+    async fn session_picker_double_click_restore_error_keeps_old_session() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        state.session_overlay = SessionOverlay::List {
+            sessions: vec![crate::client::SessionEntry {
+                session_id: "sess-dead".to_string(),
+                session_key: "sess-dead".to_string(),
+                created_at: "2026-07-07T00:00:00Z".to_string(),
+                last_activity: "2026-07-07T00:01:00Z".to_string(),
+                message_count: 1,
+                agent_alias: Some("beta".to_string()),
+                channel_id: None,
+                name: Some("Dead work".to_string()),
+            }],
+            list_state,
+        };
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: overlay_area.x + 2,
+            row: overlay_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let switch = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "double-click should try selected session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "beta");
+        assert_eq!(request["params"]["session_id"], "sess-dead");
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_NOT_FOUND,
+            "Session not found",
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("failed switch should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("failed switch should keep the chat active");
+        };
+        assert_eq!(state.session_id, "sess-old");
+        assert_eq!(state.agent_alias, "alpha");
+        assert!(matches!(state.session_overlay, SessionOverlay::None));
+        let info = state
+            .info_message
+            .as_ref()
+            .expect("failed switch should surface an info-bar error");
+        assert!(info.text.contains("Failed to switch session"));
+        assert!(info.text.contains("Session not found"));
     }
 
     #[tokio::test]

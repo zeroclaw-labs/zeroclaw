@@ -1905,6 +1905,10 @@ pub async fn run_gateway(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
