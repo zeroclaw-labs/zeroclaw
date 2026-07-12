@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Default execution time for a skill shell command when the manifest does not
 /// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
@@ -242,7 +242,7 @@ impl Tool for SkillShellTool {
             Err(reason) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(reason),
                 });
             }
@@ -251,7 +251,7 @@ impl Tool for SkillShellTool {
         if let Some(path) = self.security.forbidden_path_argument(&command) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Path blocked by security policy: {path}")),
             });
         }
@@ -264,7 +264,7 @@ impl Tool for SkillShellTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to build runtime command: {e}")),
                 });
             }
@@ -310,7 +310,7 @@ impl Tool for SkillShellTool {
 
                 Ok(ToolResult {
                     success: output.status.success(),
-                    output: stdout,
+                    output: stdout.into(),
                     error: if stderr.is_empty() {
                         None
                     } else {
@@ -320,12 +320,12 @@ impl Tool for SkillShellTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to execute command: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Command timed out after {}s and was killed",
                     self.timeout_secs
@@ -782,7 +782,7 @@ mod tests {
             let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("none");
             Ok(ToolResult {
                 success: true,
-                output: format!("mock_result:{input}"),
+                output: format!("mock_result:{input}").into(),
                 error: None,
             })
         }
@@ -997,7 +997,7 @@ mod tests {
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: args.to_string(),
+                output: args.to_string().into(),
                 error: None,
             })
         }

@@ -262,10 +262,19 @@ pub struct GhTokenResponse {
 }
 
 /// A cached installation access token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CachedToken {
     pub token: String,
     pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("token", &"***")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl CachedToken {
@@ -308,5 +317,19 @@ mod tests {
         };
         assert!(fresh.is_fresh(now));
         assert!(!stale.is_fresh(now));
+    }
+
+    #[test]
+    fn debug_redacts_cached_token() {
+        let tok = CachedToken {
+            token: "ghs_supersecretinstallationtoken".into(),
+            expires_at: Utc::now(),
+        };
+        let out = format!("{tok:?}");
+        assert!(
+            !out.contains("ghs_supersecretinstallationtoken"),
+            "Debug must not print the raw installation token"
+        );
+        assert!(out.contains("***"), "Debug must mask the token");
     }
 }
