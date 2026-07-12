@@ -1077,9 +1077,9 @@ impl ResponseMessage {
     /// that unconditional rewrite silently mangled responses whose `content`
     /// legitimately contained literal `<think>...</think>` markup (HTML, code
     /// samples, quoted discussion of the tag itself, and unclosed tails).
-    /// Removed in #8615 — model providers that need inline think-block
-    /// filtering should do it downstream of this response shape, with full
-    /// visibility into the model's actual output.
+    /// Model providers that need inline think-block filtering should do it
+    /// downstream of this response shape, with full visibility into the
+    /// model's actual output.
     fn effective_content(&self) -> String {
         self.content
             .as_ref()
@@ -4635,8 +4635,8 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_literal_think_tags() {
-        // #8615 — the deleted `strip_think_tags()` helper searched for the
-        // exact substring `<think>` / `</think>` and stripped those blocks
+        // The deleted `strip_think_tags()` helper searched for the exact
+        // substring `<think>` / `</think>` and stripped those blocks
         // unconditionally. This regression pins that literal `<think>` tags
         // now round-trip byte-for-byte, including legitimate uses where the
         // model legitimately discusses the tag (HTML sample, code quoting,
@@ -5428,8 +5428,8 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_unclosed_think_tag() {
-        // #8615 — an unclosed literal `<think>` tag must NOT discard the
-        // rest of the response. The old `strip_think_tags()` helper saw no
+        // An unclosed literal `<think>` tag must NOT discard the rest of the
+        // response. The old `strip_think_tags()` helper saw no closing
         // closing `</think>` and dropped the trailing tail ("Visible <think>"
         // → "Visible"). The new path returns the input unchanged.
         let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
@@ -5440,7 +5440,7 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_multiple_think_blocks() {
-        // #8615 — multiple literal `<think>` blocks in `content` survive
+        // Multiple literal `<think>` blocks in `content` survive the removal
         // intact. The old `strip_think_tags()` helper would have collapsed
         // the visible text to "Answer A  and B  done", losing the
         // inter-block separators and the tag delimiters themselves.
@@ -5454,7 +5454,7 @@ mod tests {
     }
     #[test]
     fn effective_content_preserves_think_tags_with_reasoning_content() {
-        // #8615 — when both `content` and `reasoning_content` are present,
+        // When both `content` and `reasoning_content` are present,
         // the literal `<think>` blocks in `content` survive intact while
         // `reasoning_content` is preserved separately and is NOT leaked
         // into the response text.
@@ -5520,7 +5520,7 @@ mod tests {
 
     #[test]
     fn reasoning_content_preserved_when_content_only_think_tags() {
-        // #8615 — the compatible provider no longer strips literal
+        // The compatible provider no longer strips literal
         // `<think>...</think>` blocks from `content`. Previously the
         // `<think>secret</think>`-only content was collapsed to the empty
         // string by `strip_think_tags()`, and `effective_content()` returned
@@ -5534,7 +5534,10 @@ mod tests {
         let msg = &resp.choices[0].message;
         assert!(msg.effective_content().contains("secret"));
         assert!(msg.effective_content().contains("<think>"));
-        assert!(msg.effective_content_optional().is_some());
+        assert_eq!(
+            msg.effective_content_optional().as_deref(),
+            Some("<think>secret</think>"),
+        );
         assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking text"));
     }
 
