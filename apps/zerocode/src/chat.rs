@@ -2288,6 +2288,10 @@ impl Chat {
                 return;
             }
 
+            if !state.in_browse_mode() {
+                return;
+            }
+
             match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
@@ -2316,12 +2320,15 @@ impl Chat {
                         .find(|r| mouse::in_rect(col, row, r.rect))
                         .cloned()
                     {
-                        state.clear_transcript_selection();
                         if !region.text.is_empty() {
                             crate::mouse::copy_osc52(&region.text);
                             match region.kind {
-                                CopyHitKind::Code => state.set_code_copy_feedback(region.group),
+                                CopyHitKind::Code => {
+                                    state.clear_mouse_highlight();
+                                    state.set_code_copy_feedback(region.group);
+                                }
                                 CopyHitKind::Message => {
+                                    state.clear_transcript_selection();
                                     state.set_message_copy_feedback(region.rect);
                                 }
                             }
@@ -2338,39 +2345,27 @@ impl Chat {
                     let ctrl = mouse.modifiers.contains(KM::CONTROL);
                     if let Some(idx) = hit {
                         if ctrl {
-                            if state.in_browse_mode() {
-                                if !state.browse_multi.remove(&idx) {
-                                    state.browse_multi.insert(idx);
-                                }
-                                state.mark_dirty_full();
+                            if !state.browse_multi.remove(&idx) {
+                                state.browse_multi.insert(idx);
                             }
+                            state.mark_dirty_full();
                         } else if shift {
-                            if state.in_browse_mode() {
-                                if state.browse_cursor.is_none() {
-                                    state.browse_cursor = Some(idx);
-                                }
-                                state.browse_anchor = state.browse_cursor;
+                            if state.browse_cursor.is_none() {
                                 state.browse_cursor = Some(idx);
-                                state.mark_dirty_full();
                             }
+                            state.browse_anchor = state.browse_cursor;
+                            state.browse_cursor = Some(idx);
+                            state.mark_dirty_full();
                         } else {
                             // Plain click
                             state.browse_multi.clear();
                             state.browse_anchor = None;
+                            // In browse mode: move cursor and prepare for
+                            // optional drag-range selection. Copying still
+                            // requires the explicit keyboard or button action.
+                            state.browse_cursor = Some(idx);
+                            state.mouse_down_entry = Some(idx);
                             state.mark_dirty_full();
-
-                            if state.in_browse_mode() {
-                                // In browse mode: move cursor and prepare for
-                                // optional drag-range selection. Copying still
-                                // requires the explicit keyboard copy command.
-                                state.browse_cursor = Some(idx);
-                                state.mouse_down_entry = Some(idx);
-                            } else {
-                                // Out of browse mode: select the entry and reveal
-                                // its contextual copy action without touching the
-                                // clipboard.
-                                state.highlighted_entry = Some(idx);
-                            }
                         }
                     } else {
                         state.clear_transcript_selection();
@@ -2523,6 +2518,21 @@ impl Chat {
                 s.input_bar.wants_text_input()
             }
             _ => false,
+        }
+    }
+
+    pub(crate) fn wants_mouse_capture(&self) -> bool {
+        match &self.phase {
+            ChatPhase::PickAgent { .. } | ChatPhase::PickCwd { .. } => true,
+            ChatPhase::Active(s) => {
+                s.in_browse_mode()
+                    || s.input_bar.has_file_explorer()
+                    || s.model_picker.is_open()
+                    || s.pending_elicitation().is_some()
+                    || s.pending_approval().is_some()
+                    || s.queue_sidebar_open()
+                    || !matches!(s.session_overlay, SessionOverlay::None)
+            }
         }
     }
 }
@@ -3740,8 +3750,12 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
-    state.rebuild_copy_regions(inner_width, scroll, body_rect);
-    state.rebuild_message_copy_region(body_rect);
+    if state.in_browse_mode() {
+        state.rebuild_copy_regions(inner_width, scroll, body_rect);
+        state.rebuild_message_copy_region(body_rect);
+    } else {
+        state.copy_hit_regions.clear();
+    }
     render_code_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
@@ -5062,6 +5076,8 @@ impl ChatState {
         self.highlighted_entry = None;
         self.mouse_down_entry = None;
         self.browse_anchor = None;
+        self.copy_hit_regions.clear();
+        self.copy_feedback = None;
         self.mark_dirty_full();
     }
 
@@ -5398,7 +5414,12 @@ impl ChatState {
     }
 
     fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
-        let idx = self.highlighted_entry?;
+        let selected = self.selected_entries();
+        let idx = if selected.len() == 1 {
+            *selected.iter().next()?
+        } else {
+            return None;
+        };
         let (_, rect) = self
             .entry_rects
             .iter()
@@ -7548,7 +7569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_message_click_reveals_copy_action_without_copying() {
+    async fn plain_message_copy_action_stays_in_browse_mode() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -7593,19 +7614,25 @@ mod tests {
         };
         assert_eq!(
             state.highlighted_entry,
-            Some(0),
-            "plain click should select the message"
+            None,
+            "normal-mode click must not select the message"
         );
         assert!(
             state.info_message.is_none(),
-            "plain click must not copy or show copied feedback"
+            "normal-mode click must not copy or show copied feedback"
         );
+        assert!(
+            state.copy_hit_regions.is_empty(),
+            "normal-mode click must not reveal a copy action"
+        );
+
+        state.enter_browse_mode();
 
         terminal
             .draw(|frame| {
                 render(frame, state, area);
             })
-            .expect("redraw selected chat");
+            .expect("redraw browse-mode chat");
         let selected_entry_rect = state
             .entry_rects
             .first()
@@ -7624,7 +7651,7 @@ mod tests {
             .copy_hit_regions
             .iter()
             .find(|region| region.text == "hello")
-            .expect("selected message copy action should be rendered")
+            .expect("browse-mode selected message copy action should be rendered")
             .rect;
         assert_eq!(
             copy_rect.y, selected_entry_rect.y,
@@ -7653,10 +7680,7 @@ mod tests {
             Some(crate::i18n::t("zc-chat-copied-clipboard").as_str()),
             "explicit message copy action should copy"
         );
-        assert_eq!(
-            state.highlighted_entry, None,
-            "copy action should dismiss the transient selection"
-        );
+        assert_eq!(state.browse_cursor, None, "copy action should dismiss selection");
         assert!(
             matches!(state.copy_feedback, Some(CopyFeedback::Message { .. })),
             "message copy should leave a transient copied-state cue"
@@ -7769,6 +7793,7 @@ mod tests {
             "```bash\necho hello\n```",
         )));
         state.highlighted_entry = Some(0);
+        state.enter_browse_mode();
         state.mark_dirty_full();
 
         let area = Rect::new(0, 0, 80, 20);

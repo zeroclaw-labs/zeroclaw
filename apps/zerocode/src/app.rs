@@ -170,6 +170,38 @@ async fn consume_pending_quickstart_chat(
     *mode = Mode::Chat;
 }
 
+fn wants_mouse_capture(
+    mode: Mode,
+    show_help: bool,
+    reload_confirm: bool,
+    quit_confirm: bool,
+    acp_pane: &acp::Acp,
+    chat_pane: &chat::Chat,
+) -> bool {
+    if show_help || reload_confirm || quit_confirm {
+        return true;
+    }
+
+    match mode {
+        Mode::Acp => acp_pane.wants_mouse_capture(),
+        Mode::Chat => chat_pane.wants_mouse_capture(),
+        _ => true,
+    }
+}
+
+fn sync_mouse_capture(
+    term: &mut config_manager::Term,
+    enabled: &mut bool,
+    desired: bool,
+) -> Result<()> {
+    if *enabled == desired {
+        return Ok(());
+    }
+    config_manager::set_mouse_capture(term, desired)?;
+    *enabled = desired;
+    Ok(())
+}
+
 // ── Top-level entry point ────────────────────────────────────────
 
 /// Run the TUI event loop. Owns the full session lifecycle: when the
@@ -195,6 +227,13 @@ pub async fn run(
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
+    let mut mouse_capture_enabled = true;
+    // In-loop reconnection state. `reconnect_last_attempt` throttles
+    // connect tries so the draw/input loop keeps running between them.
+    // `ephemeral_respawn_done` enforces the "owned ephemeral daemon is
+    // respawned at most once" policy; `needs_intervention` latches when
+    // that single respawn fails to come back, stopping auto-respawn while
+    // the UI stays responsive and quittable.
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
@@ -269,6 +308,18 @@ pub async fn run(
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+        sync_mouse_capture(
+            term,
+            &mut mouse_capture_enabled,
+            wants_mouse_capture(
+                mode,
+                show_help,
+                reload_confirm,
+                quit_confirm,
+                &acp_pane,
+                &chat_pane,
+            ),
+        )?;
         doctor_pane.poll_refresh().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
