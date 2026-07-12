@@ -82,6 +82,10 @@ cli-skills-install-tier-community =
     and run `zeroclaw skills audit {$name}` before granting any
     permissions or running it in production.
 
+cli-skills-install-locked = Another install of skill '{$name}' appears to be in progress (lock file: {$path}). Wait for it to finish, or remove the lock file if no install is running.
+cli-skills-install-stale-lock-reclaimed = warning: reclaimed a stale install lock for skill '{$name}' left behind by an interrupted install.
+cli-skills-install-staging-mutated = Staged skill content changed after the security checks ran ({$path}); aborting the install. Retry the install.
+
 cli-skills-add-scaffolded = Scaffolded skill {$target} at {$dir}
 
 cli-skills-bundle-add-prompt =

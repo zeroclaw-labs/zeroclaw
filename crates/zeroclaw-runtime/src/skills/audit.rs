@@ -101,7 +101,7 @@ pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillA
     Ok(report)
 }
 
-fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
     let mut out = Vec::new();
 
