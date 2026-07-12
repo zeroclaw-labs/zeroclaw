@@ -24,6 +24,7 @@ pub mod auth_provider;
 pub mod bubblewrap;
 pub mod constrained_runner;
 pub mod detect;
+pub mod detection;
 pub mod docker;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
@@ -86,6 +87,9 @@ pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Shared constrained process runner for skill-adjacent commands.
 #[allow(unused_imports)]
 pub use constrained_runner::{ConstrainedOutput, ConstrainedRunner, warn_if_unsandboxed};
+// Shared typed detection surface (task 1A) consumed by install screening.
+#[allow(unused_imports)]
+pub use detection::{DetectionConfidence, DetectionMatch, sanitize_excerpt};
 // Prompt injection defense exports
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};
