@@ -49,6 +49,11 @@ pub trait SopRunStore: Send + Sync {
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError>;
     /// Boot-rehydrate source: every non-terminal run (latest revision per id).
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
+    /// Boot-rehydrate source for the display retention window: terminal runs,
+    /// newest-first by `started_at`, truncated to `limit` (0 = unbounded). The
+    /// engine seeds `finished_runs` from this so completed/failed/cancelled runs
+    /// survive a restart in the Runs surface, matching `max_finished_runs`.
+    fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError>;
     /// Single run by id (latest revision), terminal or not.
     fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError>;
     /// `completed_at` of the most recently successful terminal run for `sop_name`,
@@ -310,6 +315,21 @@ impl SopRunStore for InMemoryRunStore {
             .filter(|r| !g.terminal.contains(r.run_id()))
             .cloned()
             .collect())
+    }
+
+    fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+        let g = self.lock()?;
+        let mut out: Vec<PersistedRun> = g
+            .runs
+            .values()
+            .filter(|r| g.terminal.contains(r.run_id()))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.run.started_at.cmp(&a.run.started_at));
+        if limit > 0 && out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
     }
 
     fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {

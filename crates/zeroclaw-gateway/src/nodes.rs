@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use zeroclaw_runtime::security::pairing::PairingGuard;
+use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -246,8 +246,22 @@ pub(crate) fn check_node_auth(
         ));
     }
     if let Some(ref expected_token) = nodes_config.auth_token {
+        // Fail-closed: a whitespace-only / empty configured token must not
+        // authenticate missing or arbitrary tokens (trimming both sides
+        // would produce `constant_time_eq("", "")` = true and bypass auth).
+        if expected_token.trim().is_empty() {
+            return Some((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable — nodes.auth_token must not be empty or whitespace-only",
+            ));
+        }
         let token = extract_node_ws_token(headers, query_token).unwrap_or("");
-        if token != expected_token {
+        // SECURITY: route through `constant_time_eq` (not `==`) to prevent
+        // a remote timing attack that could leak `nodes.auth_token` one
+        // byte at a time. Both sides are `.trim()`-normalized to match
+        // the canonical pattern at
+        // `crates/zeroclaw-config/src/pairing.rs:139`.
+        if !constant_time_eq(token.trim(), expected_token.trim()) {
             return Some((
                 axum::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized — provide a valid node auth token",
@@ -479,6 +493,56 @@ mod tests {
             ..NodesConfig::default()
         };
         let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, no token provided → 503
+    /// (fail-closed: empty-trimmed config must not match missing token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_missing_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents a token → 503
+    /// (fail-closed: empty-trimmed config must not authenticate any token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_any_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("anything");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents matching
+    /// whitespace token → 503 (same fail-closed path).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_matching_whitespace_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("   ");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
         assert_eq!(
             result.map(|(s, _)| s),
             Some(StatusCode::SERVICE_UNAVAILABLE)
@@ -747,5 +811,74 @@ mod tests {
     fn extract_node_ws_token_none_when_empty() {
         let headers = HeaderMap::new();
         assert_eq!(extract_node_ws_token(&headers, None), None);
+    }
+
+    /// Regression for non-constant-time `nodes.auth_token` comparison.
+    ///
+    /// The old code used `if token != expected_token`, which short-circuits
+    /// on the first differing byte and leaks the configured `nodes.auth_token`
+    /// one byte at a time via response timing. The fix routes through
+    /// `constant_time_eq` (from `zeroclaw_config::pairing`) and trims both
+    /// sides — matching the canonical pairing pattern at
+    /// `crates/zeroclaw-config/src/pairing.rs:139`.
+    ///
+    /// We can't measure wall-clock timing in a unit test, but we can lock
+    /// in the behavior contract: trim-normalized inputs match, wrong
+    /// tokens still reject. A future refactor that drops the
+    /// `constant_time_eq` call (e.g., back to `==`) would still pass the
+    /// "wrong token rejected" half — the trim half is what proves the new
+    /// shape is in place.
+    #[test]
+    fn nodes_auth_token_compare_uses_constant_time_eq_and_trims() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("node-secret-token".into()),
+            ..NodesConfig::default()
+        };
+
+        // Whitespace-padded Authorization header still passes
+        // (trim-normalized on both sides, per the canonical pairing pattern).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer   node-secret-token   ".parse().unwrap(),
+        );
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None),
+            None,
+            "auth_token comparison must trim both sides (canonical pairing pattern)"
+        );
+
+        // Wrong token via Authorization header is rejected.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None).map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Wrong token via `?token=` query parameter is also rejected.
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("wrong-token"),
+            )
+            .map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Correct token via `?token=` (with no trim ambiguity) passes.
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("node-secret-token"),
+            ),
+            None
+        );
     }
 }

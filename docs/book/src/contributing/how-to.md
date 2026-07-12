@@ -23,7 +23,7 @@ fork → branch → commit → push → open PR → review → merge (squash)
 
 The key checkpoints:
 
-- **PR template**: `.github/pull_request_template.md`. Fill it out. The summary, validation evidence, and compatibility sections are non-negotiable.
+- **PR template**: `.github/pull_request_template.md`. Fill it out. The summary, testing evidence, and compatibility sections are non-negotiable.
 - **CI**: runs on every PR. `ci.yml` is the composite gate; all legs must pass.
 - **Labels**: maintainers use labels to route review depth. You do not need to know every label family before opening a PR. If labels look obviously wrong and you cannot edit them, flag the mismatch in a comment; maintainers or reviewers with label permissions can correct obvious mismatches directly.
 - **Review routing**: make the scope, linked issues, validation, and risk/rollback context clear enough that reviewers can choose the right review path quickly.
@@ -93,7 +93,7 @@ Title mirrors the squash commit:
 feat(scope): short description
 ```
 
-Body uses the PR template. **The validation-evidence section is required**: paste the checks that match the change. For docs-only PRs, use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh` or explain why link checking had no added links to inspect. For Rust/code PRs, include `cargo fmt --check`, `cargo clippy`, `cargo test`, plus whatever manual verification you did. "It works on my machine" is not evidence.
+Body uses the PR template. **The testing section is required**: explain how the change was checked, and paste the checks that match the change. The reviewer-run A/B recipe under `How you can test` is only needed when manual verification adds useful signal; mark it `N/A` for docs-only, pure-refactor, or trivial changes without a meaningful reviewer test path. For docs-only PRs, use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh` or explain why link checking had no added links to inspect. For Rust/code PRs, use the evidence that matches the changed surface: required CI checks, focused crate or regression tests, manual smoke, or full workspace checks when broad coverage proves something narrower evidence would miss. Fresh required CI is enough when it covers the changed surface; extra local Cargo is not required just to duplicate the same head, target, and feature set. Add more evidence when the PR depends on a known CI coverage gap: platform-specific tests, cross-platform lint, desktop app coverage, release target builds, stale CI, or unavailable CI. "It works on my machine" is not evidence.
 
 Risk labels:
 
