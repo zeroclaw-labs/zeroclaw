@@ -373,6 +373,8 @@ impl Dashboard {
         area: Rect,
         status: Option<&StatusResult>,
         health: Option<&serde_json::Value>,
+        code_cwd: Option<&str>,
+        chat_cwd: Option<&str>,
     ) {
         self.drain_cron_trigger_updates();
 
@@ -400,7 +402,9 @@ impl Dashboard {
         self.draw_status_line(frame, chunks[1]);
 
         match self.tab {
-            Tab::Overview => self.draw_overview(frame, chunks[2], status, health),
+            Tab::Overview => {
+                self.draw_overview(frame, chunks[2], status, health, code_cwd, chat_cwd)
+            }
             Tab::Sessions => self.draw_sessions(frame, chunks[2]),
             Tab::Agents => self.draw_agents(frame, chunks[2]),
             Tab::Memories => self.draw_memories(frame, chunks[2]),
@@ -474,11 +478,15 @@ impl Dashboard {
         area: Rect,
         status: Option<&StatusResult>,
         health: Option<&serde_json::Value>,
+        code_cwd: Option<&str>,
+        chat_cwd: Option<&str>,
     ) {
+        let workspace_lines = workspace_lines(code_cwd, chat_cwd);
+        let status_height = 12 + workspace_lines.len() as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(12),                           // status box
+                Constraint::Length(status_height),                // status box
                 Constraint::Length(4 + self.agents.len() as u16), // agents
                 Constraint::Min(0),                               // connected TUIs
             ])
@@ -501,21 +509,21 @@ impl Dashboard {
                 Span::styled(daemon_label(&self.connect_label), theme::accent_style()),
             ])];
 
-            if let Some(socket) = s
-                .local_ipc_endpoint
-                .as_deref()
-                .or_else(|| local_socket_label(&self.connect_label))
-            {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-socket")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(socket, theme::body_style()),
-                ]));
-            } else if !self.connect_label.is_empty()
-                && daemon_label(&self.connect_label) != self.connect_label
-            {
+            if is_local_connection(&self.connect_label) {
+                if let Some(socket) = s
+                    .local_ipc_endpoint
+                    .as_deref()
+                    .or_else(|| local_socket_label(&self.connect_label))
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-socket")),
+                            theme::dim_style(),
+                        ),
+                        Span::styled(socket, theme::body_style()),
+                    ]));
+                }
+            } else if is_remote_connection(&self.connect_label) {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
@@ -570,6 +578,8 @@ impl Dashboard {
                 lines.push(Line::from(spans));
             }
 
+            lines.extend(workspace_lines);
+
             // Process stats from health
             if let Some(h) = health
                 && let Some(process) = h.get("process")
@@ -613,7 +623,32 @@ impl Dashboard {
                         ),
                         Span::styled(val, theme::body_style()),
                     ]));
+                } else {
+                    let ncpu = process
+                        .get("num_cpus")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let val = if ncpu > 0 {
+                        format!("{} ({ncpu} cores)", crate::i18n::t("zc-dashboard-loading"))
+                    } else {
+                        crate::i18n::t("zc-dashboard-loading")
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                            theme::dim_style(),
+                        ),
+                        Span::styled(val, theme::dim_style()),
+                    ]));
                 }
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(crate::i18n::t("zc-dashboard-loading"), theme::dim_style()),
+                ]));
             }
 
             frame.render_widget(Paragraph::new(lines), inner);
@@ -2748,17 +2783,52 @@ fn config_kind_style(kind: &ConfigKind) -> Style {
 }
 
 fn daemon_label(connect_label: &str) -> &str {
-    if connect_label.starts_with("local:") {
+    if is_local_connection(connect_label) {
         "local"
-    } else if connect_label.starts_with("ws://") || connect_label.starts_with("wss://") {
+    } else if is_remote_connection(connect_label) {
         "remote"
     } else {
         connect_label
     }
 }
 
+fn is_local_connection(connect_label: &str) -> bool {
+    connect_label.starts_with("local:")
+}
+
+fn is_remote_connection(connect_label: &str) -> bool {
+    connect_label.starts_with("ws://") || connect_label.starts_with("wss://")
+}
+
 fn local_socket_label(connect_label: &str) -> Option<&str> {
     connect_label.strip_prefix("local:")
+}
+
+fn workspace_lines(code_cwd: Option<&str>, chat_cwd: Option<&str>) -> Vec<Line<'static>> {
+    match (code_cwd, chat_cwd) {
+        (Some(code), Some(chat)) if code != chat => vec![
+            status_row("zc-dashboard-label-code-cwd", code, theme::body_style()),
+            status_row("zc-dashboard-label-chat-cwd", chat, theme::body_style()),
+        ],
+        (Some(cwd), _) | (_, Some(cwd)) => {
+            vec![status_row(
+                "zc-dashboard-label-workspace",
+                cwd,
+                theme::body_style(),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn status_row(label_key: &str, value: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<11}", crate::i18n::t(label_key)),
+            theme::dim_style(),
+        ),
+        Span::styled(value.to_string(), style),
+    ])
 }
 
 fn format_bytes(bytes: u64) -> String {

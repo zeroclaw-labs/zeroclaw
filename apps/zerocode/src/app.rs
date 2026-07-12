@@ -123,8 +123,10 @@ impl ChromeStatus {
     fn summary_line(&self) -> Option<Line<'static>> {
         let status = self.status.as_ref()?;
         let mut text = format!(
-            " v{} sessions:{}",
-            status.server_version, status.active_sessions
+            " v{} {}:{}",
+            status.server_version,
+            crate::i18n::t("zc-chrome-summary-sessions"),
+            status.active_sessions
         );
         text.push_str(&process_stats_summary(self.health.as_ref()));
         text.push(' ');
@@ -385,6 +387,8 @@ pub async fn run(
                     chunks[1],
                     chrome_status.status.as_ref(),
                     chrome_status.health.as_ref(),
+                    acp_pane.current_cwd(),
+                    chat_pane.current_cwd(),
                 ),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
                 Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
@@ -1010,11 +1014,13 @@ fn draw_status_bar(
 }
 
 fn process_stats_summary(health: Option<&serde_json::Value>) -> String {
+    let cpu_label = crate::i18n::t("zc-chrome-summary-cpu");
+    let loading_label = crate::i18n::t("zc-chrome-summary-loading");
     let Some(h) = health else {
-        return String::new();
+        return format!(" {cpu_label}:{loading_label}");
     };
     let Some(process) = h.get("process") else {
-        return String::new();
+        return format!(" {cpu_label}:{loading_label}");
     };
     let mut parts = Vec::new();
     if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
@@ -1025,15 +1031,18 @@ fn process_stats_summary(health: Option<&serde_json::Value>) -> String {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let rss_str = format_bytes(rss);
+        let ram_label = crate::i18n::t("zc-chrome-summary-ram");
         if total > 0 {
             let pct = (rss as f64 / total as f64) * 100.0;
-            parts.push(format!(" ram:{rss_str}({pct:.0}%)"));
+            parts.push(format!(" {ram_label}:{rss_str}({pct:.0}%)"));
         } else {
-            parts.push(format!(" ram:{rss_str}"));
+            parts.push(format!(" {ram_label}:{rss_str}"));
         }
     }
     if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
-        parts.push(format!(" cpu:{cpu:.1}%"));
+        parts.push(format!(" {cpu_label}:{cpu:.1}%"));
+    } else {
+        parts.push(format!(" {cpu_label}:{loading_label}"));
     }
     parts.join("")
 }
