@@ -2080,6 +2080,33 @@ export function getChannels(): Promise<ChannelDetail[]> {
   });
 }
 
+export interface BindChannelRequest {
+  channel_type: string;
+  alias: string;
+  identity: string;
+}
+
+export interface BindChannelResponse {
+  saved: boolean;
+  already_bound?: boolean;
+  group?: string;
+  channel?: string;
+}
+
+/**
+ * Authorize an inbound identity on a pairing channel (telegram/wechat/line)
+ * — the GUI equivalent of `zeroclaw channel bind-<type> <id> --alias <alias>`.
+ * The bound user can message the bot immediately, with no `/bind` round trip.
+ */
+export function bindChannelIdentity(
+  body: BindChannelRequest,
+): Promise<BindChannelResponse> {
+  return apiFetch<BindChannelResponse>("/api/channels/bind", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Logs (persisted JSONL via zeroclaw-log)
 // ---------------------------------------------------------------------------
