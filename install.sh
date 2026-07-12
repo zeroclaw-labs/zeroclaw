@@ -665,6 +665,16 @@ install_web_dist() {
   fi
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
+  # Prune files the fresh build no longer ships. Copy-then-prune keeps
+  # index.html present throughout, so a running gateway never 503s
+  # mid-install, while stale hashed chunks still get removed.
+  (
+    cd "$web_data_dir" || exit 0
+    find . -type f | while IFS= read -r f; do
+      [ -f "$src_dist/$f" ] || rm -f "$f"
+    done
+    find . -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+  )
   info "Web dashboard installed to $web_data_dir"
 }
 

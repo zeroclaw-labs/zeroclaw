@@ -94,8 +94,11 @@ Commit everything together:
 chore: bump version to vX.Y.Z
 ```
 
+If the PR also changes `[workspace.package] rust-version` or pinned Rust toolchains, treat it as a compatibility change, not just release plumbing. The PR should name the new MSRV, explain the source-build upgrade path, and show that CI, Docker, installer, and generated surfaces agree on the new floor before merge.
+
 Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
-adds. Get one maintainer review. Merge when CI is green. The **Installer Drift**
+adds. If the PR raises a toolchain floor, also apply `risk:high` and route it
+through lane D. Get one maintainer review. Merge when CI is green. The **Installer Drift**
 gate in CI fails the PR if a generated surface is out of sync with the spec, so
 a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit
@@ -444,4 +447,3 @@ The target end state:
 
 Until that lands, use this process. Every release you cut manually using this
 runbook is practice that informs what the automation needs to do.
-

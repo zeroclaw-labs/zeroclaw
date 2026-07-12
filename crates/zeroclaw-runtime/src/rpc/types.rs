@@ -1372,7 +1372,8 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the configured limit. Both may be
+    /// for this turn; `max_context_tokens` is the runtime-profile context
+    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
     /// absent when the provider doesn't report usage.
     ContextUsage {
         session_id: String,
@@ -1380,6 +1381,13 @@ pub enum SessionUpdateEvent {
         input_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
+    },
+    /// Emitted when the TodoWrite tool produces a plan. The `entries` array
+    /// carries the normalized `PlanEntry` values (content, status, priority,
+    /// optional activeForm) so the client can render the live tracker.
+    Plan {
+        session_id: String,
+        entries: Vec<zeroclaw_api::plan::PlanEntry>,
     },
     /// Terminal event for a turn. Replaces the response of `session/prompt`.
     /// `outcome` distinguishes a clean finish from a user-initiated cancel.

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const MAX_RESULTS: usize = 1000;
@@ -140,7 +140,7 @@ impl Tool for ContentSearchTool {
         if pattern.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Empty pattern is not allowed.".into()),
             });
         }
@@ -155,7 +155,7 @@ impl Tool for ContentSearchTool {
         if !matches!(output_mode, "content" | "files_with_matches" | "count") {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid output_mode '{output_mode}'. Allowed values: content, files_with_matches, count."
                 )),
@@ -204,7 +204,7 @@ impl Tool for ContentSearchTool {
         if search_path.contains("../") || search_path.contains("..\\") || search_path == ".." {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Path traversal ('..') is not allowed.".into()),
             });
         }
@@ -217,7 +217,7 @@ impl Tool for ContentSearchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Cannot resolve path '{search_path}': {e}")),
                 });
             }
@@ -226,7 +226,7 @@ impl Tool for ContentSearchTool {
         if !self.security.is_resolved_path_readable(&resolved_canon) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Resolved path for '{search_path}' is outside the allowed workspace."
                 )),
@@ -237,7 +237,7 @@ impl Tool for ContentSearchTool {
         if multiline && self.backend != SearchBackend::Ripgrep {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Multiline matching requires ripgrep (rg), which is not available.".into(),
                 ),
@@ -308,21 +308,21 @@ impl Tool for ContentSearchTool {
                     Ok(Ok(Err(e))) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Search error: {e}")),
                         });
                     }
                     Ok(Err(e)) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Search task failed: {e}")),
                         });
                     }
                     Err(_) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
                         });
                     }
@@ -341,7 +341,7 @@ impl Tool for ContentSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output: final_output,
+            output: final_output.into(),
             error: None,
         })
     }
@@ -403,14 +403,14 @@ impl ContentSearchTool {
             Ok(Err(e)) => {
                 return Err(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to execute search command: {e}")),
                 });
             }
             Err(_) => {
                 return Err(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
                 });
             }
@@ -422,7 +422,7 @@ impl ContentSearchTool {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Search error: {}", stderr.trim())),
             });
         }
