@@ -4556,21 +4556,13 @@ fn render_table(
         }
         let mut acc = String::new();
         let mut used = 0usize;
-        let mut chars = s.chars().peekable();
-        while let Some(ch) = chars.next() {
-            let mut w = crate::display_width::char_display_width(ch);
-            // Keep base+VS16 together so we don't split an emoji presentation.
-            if chars.peek() == Some(&'\u{FE0F}') && w == 1 {
-                w = 2;
-            }
+        // Walk graphemes so presentation sequences (⚠️, 🏔️) stay intact.
+        for (_offset, grapheme, w) in crate::display_width::grapheme_widths(s) {
             if used + w + 1 > budget {
                 acc.push('\u{2026}');
                 return acc;
             }
-            acc.push(ch);
-            if chars.peek() == Some(&'\u{FE0F}') {
-                acc.push(chars.next().unwrap());
-            }
+            acc.push_str(grapheme);
             used += w;
             if used == budget {
                 return acc;

@@ -1,78 +1,53 @@
 //! Terminal display-width helpers for TUI layout.
 //!
-//! `unicode-width` follows Unicode East Asian Width and reports many
-//! emoji base characters as width 1 (Ambiguous). Modern terminals render
-//! emoji presentation sequences (base + U+FE0F) as 2 cells, and also
-//! render emoji-default bases in the dedicated emoji blocks as 2 cells
-//! even without an explicit VS16. Under-counting by 1 cell makes
-//! padding/wrapping drop a space immediately after the glyph.
+//! Width is delegated to the locked `unicode-width` 0.2 string API, which is
+//! sequence-aware for emoji presentation (`base + U+FE0F`), emoji modifiers,
+//! flags, and fully-qualified ZWJ sequences. Scalar-only measurement cannot
+//! see a following variation selector, so layout paths that walk text must
+//! advance by grapheme cluster (or other multi-scalar unit) and measure each
+//! unit with [`display_width`].
 //!
-//! These helpers keep East Asian Width for ordinary text and correct
-//! only the sequences that terminals actually draw double-width.
+//! Bare Ambiguous bases without an emoji presentation sequence (for example
+//! `U+1F3D4` 🏔 alone) keep the dependency's width of 1. Do not reintroduce
+//! block-range overrides for Misc Symbols, Dingbats, or the dedicated emoji
+//! blocks — those ranges mix text-default and emoji-default scalars.
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+#[cfg(test)]
 use unicode_width::UnicodeWidthChar;
 
 /// Display width of a string in terminal cells.
+///
+/// Prefer this over summing per-scalar widths. Sequence-aware cases such as
+/// `⚠️` (`U+26A0 U+FE0F`) and `🏔️` (`U+1F3D4 U+FE0F`) are width 2 here even
+/// though the base scalar alone is width 1.
 pub(crate) fn display_width(text: &str) -> usize {
-    let mut total = 0usize;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let mut w = ch.width().unwrap_or(0);
-        // Explicit emoji presentation selector: force the preceding base
-        // to 2 cells. unicode-width already counts FE0F itself as 0.
-        if chars.peek() == Some(&'\u{FE0F}') && w == 1 {
-            w = 2;
-        } else if is_emoji_default_presentation(ch) && w == 1 {
-            // Bare emoji-default bases in the dedicated emoji blocks.
-            w = 2;
-        }
-        total = total.saturating_add(w);
-    }
-    total
+    UnicodeWidthStr::width(text)
 }
 
 /// Display width of a single scalar value in terminal cells.
 ///
-/// Prefer [`display_width`] for multi-codepoint sequences (emoji + VS16,
-/// ZWJ families, flags). This is for hard-wrap loops that walk `char`s.
-/// Bare scalars in Misc Symbols / Dingbats keep their `unicode-width`
-/// value here; only an explicit `base + U+FE0F` sequence (via
-/// [`display_width`]) bumps those to 2.
+/// Prefer [`display_width`] (or grapheme iteration) for multi-codepoint
+/// sequences. A scalar helper cannot observe a following `U+FE0F`.
+#[cfg(test)]
 pub(crate) fn char_display_width(ch: char) -> usize {
-    let w = ch.width().unwrap_or(0);
-    if is_emoji_default_presentation(ch) && w == 1 {
-        2
-    } else {
-        w
-    }
+    ch.width().unwrap_or(0)
 }
 
-/// True when `ch` is an emoji-default presentation character in a
-/// dedicated emoji block that terminals render double-width even without
-/// an explicit VS16.
+/// Iterate extended grapheme clusters of `text` as `(byte_offset, grapheme, width)`.
 ///
-/// Intentionally **excludes** the broad Misc Symbols (`U+2600..=U+26FF`)
-/// and Dingbats (`U+2700..=U+27BF`) ranges: those blocks mix text-default
-/// and emoji-default scalars, and bare width-1 symbols there must keep
-/// their `unicode-width` value unless an explicit `U+FE0F` follows.
-fn is_emoji_default_presentation(ch: char) -> bool {
-    let c = ch as u32;
-    matches!(
-        c,
-        // Dedicated emoji blocks. Bases here are emoji-default; terminals
-        // draw them 2 cells even without VS16. Includes 🏔 U+1F3D4.
-        0x1F300..=0x1F5FF // Misc Symbols and Pictographs
-            | 0x1F600..=0x1F64F // Emoticons
-            | 0x1F680..=0x1F6FF // Transport and Map
-            | 0x1F900..=0x1F9FF // Supplemental Symbols and Pictographs
-            | 0x1FA70..=0x1FAFF // Symbols and Pictographs Extended-A
-    )
+/// Offsets are relative to `text`. Widths come from [`display_width`] so
+/// presentation sequences stay intact.
+pub(crate) fn grapheme_widths(text: &str) -> impl Iterator<Item = (usize, &str, usize)> + '_ {
+    text.grapheme_indices(true)
+        .map(|(offset, grapheme)| (offset, grapheme, display_width(grapheme)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn ascii_and_cjk_match_unicode_width() {
@@ -83,33 +58,47 @@ mod tests {
 
     #[test]
     fn snow_capped_mountain_with_emoji_presentation_is_two_cells() {
-        // 🏔️ = U+1F3D4 + U+FE0F. Terminals draw this as 2 cells; a width of 1
-        // is what caused the missing space to the right of the glyph.
+        // 🏔️ = U+1F3D4 + U+FE0F. unicode-width 0.2 string width is already 2;
+        // char-wise sum of the base alone is 1 and is what broke layout.
         let s = "\u{1F3D4}\u{FE0F}";
+        assert_eq!(UnicodeWidthStr::width(s), 2);
         assert_eq!(display_width(s), 2, "emoji presentation must be 2 cells");
-        // And the space after it must land one cell further than unicode-width says.
         assert_eq!(display_width(&format!("{s} ")), 3);
+        assert_eq!(char_display_width('\u{1F3D4}'), 1);
+        assert_eq!(char_display_width('\u{FE0F}'), 0);
     }
 
     #[test]
-    fn snow_capped_mountain_base_without_vs16_is_still_two_cells() {
-        // Bare 🏔 lives in Misc Symbols and Pictographs and is emoji-default.
+    fn snow_capped_mountain_base_without_vs16_keeps_unicode_width() {
+        // Bare 🏔 is Ambiguous / not Emoji_Presentation. unicode-width reports
+        // width 1; do not force it to 2 via block-range guesses.
         let s = "\u{1F3D4}";
-        assert_eq!(display_width(s), 2);
+        assert_eq!(display_width(s), UnicodeWidthStr::width(s));
+        assert_eq!(display_width(s), 1);
+        assert_eq!(char_display_width('\u{1F3D4}'), 1);
+    }
+
+    #[test]
+    fn thermometer_bare_keeps_unicode_width_without_vs16() {
+        // U+1F321 THERMOMETER is another text-default emoji in the same block
+        // as the mountain; block-wide overrides would wrongly bump it to 2.
+        let s = "\u{1F321}";
+        assert_eq!(display_width(s), UnicodeWidthStr::width(s));
+        assert_eq!(display_width(s), 1);
+        assert_eq!(display_width("\u{1F321}\u{FE0F}"), 2);
     }
 
     #[test]
     fn warning_with_emoji_presentation_is_two_cells() {
-        // ⚠️ is text-default ⚠ + VS16; only the explicit presentation bumps it.
+        // ⚠️ is text-default ⚠ + VS16; string-level unicode-width is 2.
         let s = "\u{26A0}\u{FE0F}";
+        assert_eq!(UnicodeWidthStr::width(s), 2);
         assert_eq!(display_width(s), 2);
     }
 
     #[test]
     fn bare_misc_symbol_keeps_unicode_width() {
-        // Bare ⚠ (U+26A0) is text-default presentation. Over-broad range
-        // matching used to force this to 2 and would reintroduce off-by-one
-        // padding/hit-test bugs in the opposite direction.
+        // Bare ⚠ (U+26A0) is text-default presentation.
         let s = "\u{26A0}";
         assert_eq!(display_width(s), UnicodeWidthStr::width(s));
         assert_eq!(display_width(s), 1);
@@ -127,7 +116,7 @@ mod tests {
 
     #[test]
     fn bare_heart_dingbat_keeps_unicode_width_without_vs16() {
-        // Bare ❤ (U+2764) is text-default; only ❤︎ / ❤️ with VS16 is emoji.
+        // Bare ❤ (U+2764) is text-default; only ❤️ with VS16 is emoji.
         let s = "\u{2764}";
         assert_eq!(display_width(s), UnicodeWidthStr::width(s));
         assert_eq!(display_width(s), 1);
@@ -141,9 +130,23 @@ mod tests {
     }
 
     #[test]
-    fn char_display_width_bumps_ambiguous_emoji_block_base() {
-        assert_eq!(char_display_width('\u{1F3D4}'), 2);
-        assert_eq!(char_display_width('a'), 1);
-        assert_eq!(char_display_width('界'), 2);
+    fn sequence_aware_units_include_zwj_and_flags() {
+        assert_eq!(display_width("\u{1F1FA}\u{1F1F8}"), 2); // 🇺🇸
+        assert_eq!(
+            display_width("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
+            2
+        ); // 👨‍👩‍👧
+    }
+
+    #[test]
+    fn grapheme_widths_keep_presentation_sequences_together() {
+        let text = "a\u{26A0}\u{FE0F}b";
+        let units: Vec<_> = grapheme_widths(text).collect();
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0], (0, "a", 1));
+        assert_eq!(units[1].1, "\u{26A0}\u{FE0F}");
+        assert_eq!(units[1].2, 2);
+        assert_eq!(units[2].1, "b");
+        assert_eq!(units[2].2, 1);
     }
 }
