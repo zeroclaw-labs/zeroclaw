@@ -9,12 +9,14 @@
 //! helper is the cycle-safe home for the wiring: the orchestrator calls it and
 //! applies native-wins dedup itself (it owns the set of compiled-in channel ids).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::Config;
 
-/// Instantiate every installed channel plugin as an `(id, channel)` pair.
+/// Instantiate every unshadowed installed channel plugin as an `(id, channel)`
+/// pair.
 ///
 /// `id` is the plugin's manifest name — its channel kind key, used by the caller
 /// as the dedup key against compiled-in channels and returned by the built
@@ -22,13 +24,21 @@ use zeroclaw_config::schema::Config;
 /// registers and supervises exactly like a native channel (`WasmChannel::listen`
 /// drives the `poll-message` bridge under the standard supervised listener).
 ///
+/// `native_channel_ids` comes from the orchestrator's configured native
+/// channels. A matching plugin is skipped before `WasmChannel::from_wasm` is
+/// called, so native-wins resolution never executes a shadowed component or
+/// exposes its config.
+///
 /// Returns an empty vec when the plugin system is disabled, the plugins
 /// directory is absent, or the host fails to load. Per-plugin instantiation
 /// failures are logged and skipped so one broken component cannot sink channel
 /// startup. The `#[cfg(not(feature = "plugins-wasm"))]` stub below returns empty
 /// for builds with no WASM engine, so the call site compiles unconditionally.
 #[cfg(feature = "plugins-wasm")]
-pub async fn build_channel_plugins(config: &Config) -> Vec<(String, Arc<dyn Channel>)> {
+pub async fn build_channel_plugins(
+    config: &Config,
+    native_channel_ids: &HashSet<String>,
+) -> Vec<(String, Arc<dyn Channel>)> {
     let plugin_path = config.plugins.resolved_plugins_dir();
     if !config.plugins.enabled || !plugin_path.exists() {
         return Vec::new();
@@ -69,6 +79,19 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<(String, Arc<dyn Chan
 
     let mut built: Vec<(String, Arc<dyn Channel>)> = Vec::new();
     for (manifest, wasm_path) in host.channel_plugin_details() {
+        if !should_build_channel_plugin(&manifest.name, native_channel_ids) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Plugin channel '{}' shadows a compiled-in channel, skipping",
+                    manifest.name
+                )
+            );
+            continue;
+        }
+
         // Per-plugin config comes from `[[plugins.entries.<name>]]`. A plugin
         // that mirrors a built-in channel will instead resolve that channel's
         // canonical `[channels.<id>.*]` section (via the `provides` manifest
@@ -111,6 +134,33 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<(String, Arc<dyn Chan
 /// Stub for builds without a WASM engine: channel plugins are unavailable, so no
 /// channels are contributed. Keeps the orchestrator call site feature-agnostic.
 #[cfg(not(feature = "plugins-wasm"))]
-pub async fn build_channel_plugins(_config: &Config) -> Vec<(String, Arc<dyn Channel>)> {
+pub async fn build_channel_plugins(
+    _config: &Config,
+    _native_channel_ids: &HashSet<String>,
+) -> Vec<(String, Arc<dyn Channel>)> {
     Vec::new()
+}
+
+fn should_build_channel_plugin(plugin_name: &str, native_channel_ids: &HashSet<String>) -> bool {
+    !native_channel_ids.contains(plugin_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadowed_plugins_are_filtered_before_instantiation() {
+        let native_channel_ids = HashSet::from(["telegram".to_string()]);
+        let discovered_plugins = ["telegram", "weather-alerts"];
+        let mut instantiated = Vec::new();
+
+        for plugin_name in discovered_plugins {
+            if should_build_channel_plugin(plugin_name, &native_channel_ids) {
+                instantiated.push(plugin_name);
+            }
+        }
+
+        assert_eq!(instantiated, ["weather-alerts"]);
+    }
 }

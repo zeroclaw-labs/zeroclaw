@@ -10656,18 +10656,12 @@ pub async fn start_channels(
                 .iter()
                 .map(|cc| cc.channel.name().to_string())
                 .collect();
-            for (id, channel) in
-                zeroclaw_runtime::plugin_channels::build_channel_plugins(&config).await
+            for (id, channel) in zeroclaw_runtime::plugin_channels::build_channel_plugins(
+                &config,
+                &native_channel_ids,
+            )
+            .await
             {
-                if native_channel_ids.contains(&id) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!("Plugin channel '{id}' shadows a compiled-in channel, skipping")
-                    );
-                    continue;
-                }
                 configured_channels.push(ConfiguredChannel {
                     display_name: "Plugin",
                     alias: Some(id),
