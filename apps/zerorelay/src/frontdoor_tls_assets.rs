@@ -12,6 +12,10 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
   const OID_ECDSA_SHA256 = '1.2.840.10045.4.3.2';
   const OID_EC_PUBLIC_KEY = '1.2.840.10045.2.1';
   const OID_PRIME256V1 = '1.2.840.10045.3.1.7';
+  const OID_BASIC_CONSTRAINTS = '2.5.29.19';
+  const OID_SUBJECT_ALT_NAME = '2.5.29.17';
+  const OID_EXTENDED_KEY_USAGE = '2.5.29.37';
+  const OID_SERVER_AUTH = '1.3.6.1.5.5.7.3.1';
   const textEncoder = new TextEncoder();
   const textDecoder = new TextDecoder();
 
@@ -87,7 +91,7 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       }
 
       if (options.caChainPem) {
-        await verifyServerCertificateChain(this.serverCertDer, options.caChainPem);
+        await verifyServerCertificateChain(this.serverCertDer, options.caChainPem, options.serverName || '127.0.0.1');
       }
 
       await this.installApplicationKeys();
@@ -813,7 +817,10 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
   }
 
-  async function verifyServerCertificateChain(leafDer, caChainPem) {
+  async function verifyServerCertificateChain(leafDer, caChainPem, serverName, now = Date.now()) {
+    if (!serverName) {
+      throw new Error('missing expected server name');
+    }
     if (!leafDer) {
       throw new Error('server did not send a certificate');
     }
@@ -822,6 +829,8 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       throw new Error('enrolled profile has no daemon CA certificate');
     }
     const leaf = parseCertificate(leafDer);
+    assertCertificateValidity(leaf, now, 'server certificate');
+    assertServerCertificate(leaf, serverName);
     if (leaf.signatureAlgorithmOid !== OID_ECDSA_SHA256) {
       throw new Error(`unsupported server certificate signature algorithm ${leaf.signatureAlgorithmOid}`);
     }
@@ -830,6 +839,8 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       if (!constantTimeEqual(leaf.issuerDer, root.subjectDer)) {
         continue;
       }
+      assertCertificateValidity(root, now, 'daemon CA certificate');
+      assertCertificateAuthority(root);
       const publicKey = await importEcdsaPublicKey(root.spkiDer);
       const ok = await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
@@ -842,6 +853,79 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       }
     }
     throw new Error('server certificate is not signed by the enrolled daemon CA');
+  }
+
+  function assertCertificateValidity(cert, now, label) {
+    if (now < cert.notBefore || now > cert.notAfter) {
+      throw new Error(`${label} is outside its validity period`);
+    }
+  }
+
+  function assertCertificateAuthority(cert) {
+    const basicConstraints = cert.extensions.get(OID_BASIC_CONSTRAINTS);
+    if (!basicConstraints) {
+      throw new Error('daemon CA certificate has no basic constraints');
+    }
+    const r = new DerReader(basicConstraints).constructed(0x30);
+    if (r.remaining() === 0) {
+      throw new Error('daemon CA certificate is not a certificate authority');
+    }
+    const ca = r.element(0x01).body;
+    if (ca.byteLength !== 1 || ca[0] === 0) {
+      throw new Error('daemon CA certificate is not a certificate authority');
+    }
+    if (r.remaining() > 0) {
+      r.element(0x02);
+    }
+    r.done();
+  }
+
+  function assertServerCertificate(cert, serverName) {
+    const extendedKeyUsage = cert.extensions.get(OID_EXTENDED_KEY_USAGE);
+    if (!extendedKeyUsage) {
+      throw new Error('server certificate has no extended key usage');
+    }
+    const usages = new DerReader(extendedKeyUsage).constructed(0x30);
+    let hasServerAuth = false;
+    while (usages.remaining() > 0) {
+      hasServerAuth = parseOid(usages.element(0x06).body) === OID_SERVER_AUTH || hasServerAuth;
+    }
+    usages.done();
+    if (!hasServerAuth) {
+      throw new Error('server certificate is not authorized for server authentication');
+    }
+
+    const subjectAltName = cert.extensions.get(OID_SUBJECT_ALT_NAME);
+    if (!subjectAltName) {
+      throw new Error('server certificate has no subject alternative name');
+    }
+    const names = new DerReader(subjectAltName).constructed(0x30);
+    const expectedIp = parseIpv4Address(serverName);
+    let matched = false;
+    while (names.remaining() > 0) {
+      const name = names.element();
+      if (expectedIp) {
+        matched = (name.tag === 0x87 && constantTimeEqual(name.body, expectedIp)) || matched;
+      } else if (!isIpAddress(serverName)) {
+        matched = (name.tag === 0x82 && textDecoder.decode(name.body).toLowerCase() === serverName.toLowerCase()) || matched;
+      }
+    }
+    names.done();
+    if (!matched) {
+      throw new Error(`server certificate does not match ${serverName}`);
+    }
+  }
+
+  function parseIpv4Address(host) {
+    const parts = host.split('.');
+    if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part))) {
+      return null;
+    }
+    const octets = parts.map(Number);
+    if (octets.some((octet) => octet < 0 || octet > 255)) {
+      return null;
+    }
+    return new Uint8Array(octets);
   }
 
   async function importEcdsaPublicKey(spkiDer) {
@@ -869,10 +953,88 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
     tbs.skipElement();
     tbs.skipElement();
     const issuerDer = tbs.elementBytes(0x30);
-    tbs.skipElement();
+    const validity = parseCertificateValidity(tbs.elementBytes(0x30));
     const subjectDer = tbs.elementBytes(0x30);
     const spkiDer = tbs.elementBytes(0x30);
-    return { tbsDer, signatureAlgorithmOid, signatureValue, issuerDer, subjectDer, spkiDer };
+    let extensions = new Map();
+    while (tbs.remaining() > 0) {
+      const tag = tbs.peekTag();
+      if (tag === 0x81 || tag === 0x82) {
+        tbs.skipElement();
+      } else if (tag === 0xa3) {
+        extensions = parseCertificateExtensions(tbs.element(0xa3).body);
+      } else {
+        throw new Error(`unsupported certificate field 0x${tag.toString(16)}`);
+      }
+    }
+    return {
+      tbsDer,
+      signatureAlgorithmOid,
+      signatureValue,
+      issuerDer,
+      subjectDer,
+      spkiDer,
+      extensions,
+      ...validity
+    };
+  }
+
+  function parseCertificateExtensions(derBytes) {
+    const r = new DerReader(derBytes).constructed(0x30);
+    const extensions = new Map();
+    while (r.remaining() > 0) {
+      const extension = r.constructed(0x30);
+      const oid = parseOid(extension.element(0x06).body);
+      if (extension.remaining() > 0 && extension.peekTag() === 0x01) {
+        const critical = extension.element(0x01).body;
+        if (critical.byteLength !== 1) {
+          throw new Error('invalid certificate extension critical flag');
+        }
+      }
+      const value = extension.element(0x04).body;
+      extension.done();
+      if (extensions.has(oid)) {
+        throw new Error(`duplicate certificate extension ${oid}`);
+      }
+      extensions.set(oid, value);
+    }
+    r.done();
+    return extensions;
+  }
+
+  function parseCertificateValidity(derBytes) {
+    const r = new DerReader(derBytes).constructed(0x30);
+    const notBefore = parseAsn1Time(r.element());
+    const notAfter = parseAsn1Time(r.element());
+    r.done();
+    return { notBefore, notAfter };
+  }
+
+  function parseAsn1Time(element) {
+    const text = textDecoder.decode(element.body);
+    const utc = element.tag === 0x17 && text.match(/^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/);
+    const generalized = element.tag === 0x18 && text.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/);
+    const parts = utc || generalized;
+    if (!parts) {
+      throw new Error('unsupported certificate time');
+    }
+    const shortYear = Number(parts[1]);
+    const year = utc ? (shortYear >= 50 ? 1900 + shortYear : 2000 + shortYear) : shortYear;
+    const month = Number(parts[2]);
+    const day = Number(parts[3]);
+    const hour = Number(parts[4]);
+    const minute = Number(parts[5]);
+    const second = Number(parts[6]);
+    const value = Date.UTC(year, month - 1, day, hour, minute, second);
+    const date = new Date(value);
+    if (
+      date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 ||
+      date.getUTCDate() !== day || date.getUTCHours() !== hour ||
+      date.getUTCMinutes() !== minute || date.getUTCSeconds() !== second
+    ) {
+      throw new Error('invalid certificate time');
+    }
+    return value;
   }
 
   function assertP256Spki(spkiDer) {
@@ -1264,6 +1426,9 @@ pub(crate) const TLS_ENGINE_JS: &str = r#"(() => {
       hkdfExpandLabel,
       parseCertificate,
       verifyServerCertificateChain,
+      assertCertificateAuthority,
+      assertServerCertificate,
+      parseCertificateValidity,
       ecdsaDerSignatureToRaw
     }
   };

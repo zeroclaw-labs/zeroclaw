@@ -260,6 +260,14 @@ echo "$out" | grep -q "Verify return code: 0 (ok)" \
 kill -0 "$DAEMON_PID" 2>/dev/null || die "daemon exited before the relay bridge could register"
 ok "relay outer TLS verified against its own CA; daemon bridge running (deep e2e: cargo test --test relay_full_path)"
 
+say "self-check D: browser TLS certificate policy accepts only the daemon server identity"
+node "$REPO_ROOT/scripts/dev/browser-tls-chain-check.mjs" \
+  --ca "$CA" \
+  --server-cert "$TB/data/tls/server.crt" \
+  --client-cert "$CLIENT_CRT" > "$TB/browser-tls-chain.log" 2>&1 \
+  || { cat "$TB/browser-tls-chain.log" >&2; die "browser TLS certificate policy check failed"; }
+ok "browser TLS accepts the daemon server cert and rejects a client-only cert"
+
 # --- 7b. self-check: OVER-THE-WIRE ENROLLMENT -------------------------------
 # Prove the headline frictionless flow: a CERTLESS client fetches its first
 # certificate from the enrollment endpoint using the daemon's one-time pairing
@@ -281,7 +289,7 @@ if [ "$BROWSER_MANUAL" = "1" ]; then
   say "self-check D: browser manual mode (pairing code left unused)"
   ok "browser pairing code reserved for manual use"
 elif [ "$BROWSER_CHECK" = "1" ]; then
-  say "self-check D: browser frontdoor enrollment and mTLS RPC tunnel"
+  say "self-check E: browser frontdoor enrollment and mTLS RPC tunnel"
   ZC_BROWSER_E2E_URL="https://127.0.0.1:$RELAY_PORT/" \
     ZC_BROWSER_E2E_NODE_ID="$NODE_ID" \
     ZC_BROWSER_E2E_PAIRING_CODE="$CODE" \
@@ -314,7 +322,7 @@ fi
 # A certless client that connects to the always-mTLS WSS plane (non-interactive,
 # so auto-enroll does not fire) must FAIL with an actionable "enroll first"
 # message, never a silent hang or a bare TLS error.
-say "self-check E: un-migrated (certless) client is told to enroll"
+say "self-check F: un-migrated (certless) client is told to enroll"
 UNMIG_DIR="$TB/unmigrated"
 mkdir -p "$UNMIG_DIR"
 set +e

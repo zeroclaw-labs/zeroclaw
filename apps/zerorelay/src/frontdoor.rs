@@ -299,6 +299,9 @@ mod tests {
         assert!(text.contains("verifyServerCertificateVerify"));
         assert!(text.contains("verifyServerCertificateChain"));
         assert!(text.contains("ecdsaDerSignatureToRaw"));
+        assert!(text.contains("assertCertificateAuthority"));
+        assert!(text.contains("assertServerCertificate"));
+        assert!(text.contains("server certificate is not authorized for server authentication"));
         assert!(text.contains("_internals"));
         assert!(text.contains("onNotification"));
         assert!(text.contains("Unsupported browser RPC request"));
