@@ -65,6 +65,8 @@ struct Claims {
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
+    nbf: Option<u64>,
+    #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
     amr: Option<Vec<String>>,
@@ -261,6 +263,14 @@ impl OidcAuthProvider {
                 };
             }
         }
+        // Reject a token presented before its not-before time (RFC 7519 §4.1.5).
+        if let Some(nbf) = claims.nbf
+            && nbf > now_unix()
+        {
+            return AuthOutcome::Denied {
+                reason: DenyReason::BadCredential,
+            };
+        }
         let Some(sub) = claims.sub.as_deref().filter(|s| !s.trim().is_empty()) else {
             return AuthOutcome::Denied {
                 reason: DenyReason::BadCredential,
@@ -308,7 +318,8 @@ impl OidcAuthProvider {
             .split_whitespace()
             .map(String::from)
             .collect();
-        let mut principal = Principal::new(sub, sub, AuthMethod::Oidc)
+        let namespaced_id = format!("{}:{sub}", self.alias);
+        let mut principal = Principal::new(namespaced_id, sub, AuthMethod::Oidc)
             .with_roles(roles)
             .with_scopes(scopes)
             .with_mfa_verified(mfa_verified)
@@ -421,9 +432,15 @@ impl OidcAuthProvider {
                 };
             }
         };
+        // An `active: false` introspection result is indistinguishable from "this
+        // opaque bearer is not mine": it carries no claims proving prior ownership.
+        // Returning the authoritative `TokenExpired` here would short-circuit the
+        // registry and block a later provider (a native token or a second
+        // introspection issuer) from resolving the same opaque string. Fall
+        // through with the generic `BadCredential` so routing continues.
         if claims.active != Some(true) {
             return AuthOutcome::Denied {
-                reason: DenyReason::TokenExpired,
+                reason: DenyReason::BadCredential,
             };
         }
         self.claims_to_outcome(&claims)
@@ -572,7 +589,8 @@ mod tests {
         assert!(provider.accepts(&Credential::Bearer(token.clone())));
         let out = provider.verify(&Credential::Bearer(token)).await;
         let p = out.principal().expect("authenticated");
-        assert_eq!(p.id.as_str(), "alice");
+        assert_eq!(p.id.as_str(), "oidc.test:alice");
+        assert_eq!(p.user_id, "alice");
         assert_eq!(p.auth_method, AuthMethod::Oidc);
         assert!(p.grants.permits(Resource::System, Verb::Read));
         assert!(!p.grants.permits(Resource::Config, Verb::Update));
@@ -707,7 +725,8 @@ mod tests {
             .verify(&Credential::Bearer("opaque-token".into()))
             .await;
         let p = out.principal().expect("authenticated via introspection");
-        assert_eq!(p.id.as_str(), "bob");
+        assert_eq!(p.id.as_str(), "oidc.test:bob");
+        assert_eq!(p.user_id, "bob");
         assert!(p.grants.permits(Resource::System, Verb::Read));
     }
 
@@ -726,6 +745,15 @@ mod tests {
             .verify(&Credential::Bearer("revoked-token".into()))
             .await;
         assert!(!out.is_allowed());
+        // Inactive is generic `BadCredential`, not authoritative `TokenExpired`,
+        // so the registry can still route the same opaque bearer to a later
+        // provider (see `ProviderRegistry::resolve`).
+        assert!(matches!(
+            out,
+            AuthOutcome::Denied {
+                reason: DenyReason::BadCredential
+            }
+        ));
     }
 
     #[tokio::test]

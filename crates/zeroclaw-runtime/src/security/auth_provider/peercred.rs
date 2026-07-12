@@ -73,11 +73,9 @@ impl AuthProvider for PeercredAuthProvider {
                 let matched = self.roster.iter().find(|(_, user)| user.uid == Some(*uid));
                 match matched {
                     Some((username, user)) => {
-                        let mut principal = Principal::new(
-                            username.as_str(),
-                            username.as_str(),
-                            AuthMethod::Peercred,
-                        );
+                        let namespaced_id = format!("user:{}", username.as_str());
+                        let mut principal =
+                            Principal::new(namespaced_id, username.as_str(), AuthMethod::Peercred);
                         principal.grants = user.grants.clone();
                         AuthOutcome::Authenticated(principal)
                     }
@@ -167,7 +165,8 @@ mod roster_tests {
         let provider = PeercredAuthProvider::new(1000).with_roster(roster());
         let out = provider.verify(&Credential::Peercred { uid: 2222 }).await;
         let p = out.principal().expect("authenticated");
-        assert_eq!(p.id.as_str(), "bob");
+        assert_eq!(p.id.as_str(), "user:bob");
+        assert_eq!(p.user_id, "bob");
         assert_eq!(p.auth_method, AuthMethod::Peercred);
         assert!(p.is_authenticated());
         assert!(p.grants.permits(Resource::System, Verb::Read));

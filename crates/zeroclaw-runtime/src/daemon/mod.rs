@@ -632,12 +632,17 @@ pub async fn run(
 
         let auth_registry: Option<
             std::sync::Arc<crate::security::auth_provider::ProviderRegistry>,
-        > = if config.wss.enabled {
+        > = if config.wss.enabled
+            || !config.users.is_empty()
+            || !config.oidc.is_empty()
+            || !config.gateway.paired_tokens.is_empty()
+        {
             use crate::security::auth_provider::{
                 NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
                 RosterUser, SshKeyAuthProvider, UserRoster,
             };
-            if config.gateway.paired_tokens.is_empty()
+            if config.wss.enabled
+                && config.gateway.paired_tokens.is_empty()
                 && config.oidc.is_empty()
                 && config.users.is_empty()
             {
@@ -698,7 +703,7 @@ pub async fn run(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"providers": registry.names()})),
-                "RPC auth provider registry enabled (wss configured)"
+                "RPC auth provider registry enabled"
             );
             Some(std::sync::Arc::new(registry))
         } else {

@@ -127,8 +127,8 @@ impl AuthProvider for SshKeyAuthProvider {
                 reason: DenyReason::BadCredential,
             };
         }
-        let mut principal =
-            Principal::new(username.as_str(), username.as_str(), AuthMethod::SshKey);
+        let namespaced_id = format!("user:{}", username.as_str());
+        let mut principal = Principal::new(namespaced_id, username.as_str(), AuthMethod::SshKey);
         principal.grants = user.grants.clone();
         AuthOutcome::Authenticated(principal)
     }
@@ -187,7 +187,8 @@ mod tests {
             })
             .await;
         let p = out.principal().expect("authenticated");
-        assert_eq!(p.id.as_str(), "alice");
+        assert_eq!(p.id.as_str(), "user:alice");
+        assert_eq!(p.user_id, "alice");
         assert_eq!(p.auth_method, AuthMethod::SshKey);
         assert!(p.grants.permits(Resource::System, Verb::Read));
         assert!(!p.grants.permits(Resource::Config, Verb::Update));

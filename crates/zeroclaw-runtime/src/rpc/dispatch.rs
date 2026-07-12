@@ -762,6 +762,34 @@ impl RpcDispatcher {
             return;
         }
 
+        // Session-lifetime enforcement (RFC #7141): a principal whose credential
+        // carried an expiry (OIDC `exp`) must not remain authorized past it on an
+        // already-established connection. `expires_at == 0` means no expiry.
+        if !matches!(method, Method::Initialize | Method::AuthChallenge)
+            && self.principal_session_expired()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::System)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "method": method.wire_name(),
+                        "reason": "principal_expired",
+                    })),
+                "authorization decision"
+            );
+            if !is_notification {
+                self.send_error(
+                    id,
+                    AUTH_REQUIRED,
+                    "Credential expired: re-authenticate with initialize",
+                )
+                .await;
+            }
+            return;
+        }
+
         // Grant enforcement (RFC #7141): every non-Initialize method carries
         // a (resource, verb) requirement checked against the principal's
         // resolved grants. Deny-by-default; the shared-operator sentinel
@@ -1027,15 +1055,18 @@ impl RpcDispatcher {
         let principal = match self.ctx.auth_registry.as_deref() {
             Some(registry) => {
                 let nonce = self.auth_nonce.take();
+                let credential_presented;
                 let credential = match (
                     req.auth_token.as_deref(),
                     req.auth_username.as_deref(),
                     req.auth_signature.as_deref(),
                 ) {
                     (Some(token), _, _) => {
+                        credential_presented = true;
                         crate::security::auth_provider::Credential::Bearer(token.to_string())
                     }
                     (None, Some(username), Some(signature_b64)) => {
+                        credential_presented = true;
                         use base64::Engine as _;
                         let Some(nonce) = nonce else {
                             return Err(rpc_err(
@@ -1054,13 +1085,34 @@ impl RpcDispatcher {
                             signature,
                         }
                     }
-                    _ => self.transport_credential.clone(),
+                    _ => {
+                        credential_presented = false;
+                        self.transport_credential.clone()
+                    }
                 };
                 let outcome = registry.resolve(&credential).await;
                 match (outcome.principal(), self.transport_kind) {
                     (Some(p), _) => p.clone(),
-                    (None, TransportKind::Local) => {
+                    (None, TransportKind::Local) if !credential_presented => {
                         zeroclaw_api::principal::Principal::shared_operator()
+                    }
+                    (None, TransportKind::Local) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "peer": self.peer_label,
+                            })),
+                            "Local initialize rejected: a presented credential failed authentication"
+                        );
+                        return Err(rpc_err(
+                            AUTH_REQUIRED,
+                            "Authentication failed: the presented credential was rejected",
+                        ));
                     }
                     (None, TransportKind::Wss) => {
                         ::zeroclaw_log::record!(
@@ -1257,6 +1309,19 @@ impl RpcDispatcher {
             .as_ref()
             .filter(|p| p.is_authenticated() && !p.grants.admin)
             .map(|p| p.id.as_str())
+    }
+
+    /// `true` if the caller principal carried a credential expiry (OIDC `exp`,
+    /// UNIX seconds) that has now passed. `expires_at == 0` means no expiry, so
+    /// the shared-operator sentinel and expiry-less providers are never expired.
+    fn principal_session_expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.principal
+            .as_ref()
+            .is_some_and(|p| p.expires_at != 0 && p.expires_at <= now)
     }
 
     /// The caller principal's profile tool allowlist for a new session's tool
@@ -1560,7 +1625,12 @@ impl RpcDispatcher {
             });
 
         let cwd_path = Some(std::path::Path::new(&cwd));
-        let tui_env = req
+        // Environment is read from THIS connection's authenticated tui_id (stamped
+        // at `initialize`), never a client-supplied `req.tui_id`. The TUI registry
+        // is not principal-bound, so trusting the wire value would let a caller
+        // read another connected TUI's env, including credential-bearing values
+        // such as SSH_AUTH_SOCK.
+        let tui_env = self
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
@@ -3255,6 +3325,17 @@ impl RpcDispatcher {
         if let Some(ref sid) = req.session_id {
             self.authorize_owned_session_strict(sid)?;
         }
+        // An upsert replaces the existing `(agent_id, key)` row, including its
+        // owning session. Reject a write that would clobber a row owned by a
+        // session this principal does not own; filtering reads is not enough.
+        if let Some(existing) = mem
+            .get(&req.key)
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory store failed: {e}")))?
+            && let Some(ref existing_sid) = existing.session_id
+        {
+            self.authorize_owned_session_strict(existing_sid)?;
+        }
         let category = req
             .category
             .as_deref()
@@ -4664,6 +4745,10 @@ impl RpcDispatcher {
 
         let req: FileAttachParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        // A scoped principal may only attach into a session it owns; a foreign
+        // or unresolved owner is denied before any workspace path is resolved.
+        self.authorize_session_owner(sid).await?;
 
         // Uploads land in the per-agent workspace, not the session cwd.
         // See `handle_send_message` for the rationale.
@@ -7070,7 +7155,8 @@ mod tests {
         let result = dispatcher.handle_initialize(&params).await;
         assert!(result.is_ok(), "expected success, got {result:?}");
         let p = dispatcher.principal.as_ref().expect("principal bound");
-        assert_eq!(p.id.as_str(), "alice");
+        assert_eq!(p.id.as_str(), "user:alice");
+        assert_eq!(p.user_id, "alice");
         assert_eq!(p.auth_method, zeroclaw_api::principal::AuthMethod::SshKey);
         assert!(p.is_authenticated());
     }
@@ -7151,6 +7237,30 @@ mod tests {
         assert_eq!(
             p.auth_method,
             zeroclaw_api::principal::AuthMethod::SharedOperator
+        );
+    }
+
+    #[tokio::test]
+    async fn local_initialize_with_invalid_presented_bearer_is_denied() {
+        // A rostered local caller that PRESENTS an invalid auth_token must not
+        // fall back to the shared-operator sentinel (full admin). Legacy trust
+        // applies only when no credential is presented; a presented credential
+        // that fails a configured provider stays denied even on the local
+        // 0o600 endpoint.
+        let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
+        dispatcher.set_transport_for_test(
+            TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 1000 },
+        );
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_token": "zc_not_a_real_token",
+        });
+        let err = dispatcher.handle_initialize(&params).await.unwrap_err();
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(
+            dispatcher.principal.is_none(),
+            "a rejected presented credential must not bind any principal"
         );
     }
 
