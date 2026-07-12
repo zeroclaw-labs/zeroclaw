@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn stale_vote_under_old_policy_does_not_count_after_policy_change() {
-        // Finding (Audacity88 #8880 round-2): a run parks under policy `old` (quorum 2)
+        // A run parks under policy `old` (quorum 2)
         // and one `old` member votes; a SOP reload re-points the step at policy `new`
         // (a DIFFERENT group). Before the fix the old vote shared the (run, step) key and
         // counted toward `new`, so a SINGLE `new` approver cleared a quorum-2 gate. Votes
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn revoked_member_vote_does_not_count_after_config_reload() {
-        // Finding (Audacity88 #8880 round-2), membership half: alice votes under `prod`
+        // Membership revocation: alice votes under `prod`
         // (group `release`), then a live config reload revokes alice from `release` while
         // the gate is parked. Her earlier vote is REVALIDATED against the live group at
         // count time, so it stops counting - the one remaining member cannot alone clear
@@ -896,7 +896,7 @@ mod tests {
 
     #[test]
     fn quorum_vote_read_failure_is_surfaced_not_swallowed() {
-        // Regression (Audacity88 #8880 finding #3): after a vote is durably appended,
+        // After a vote is durably appended,
         // counting distinct voters reads the gate ledger. If that read fails, the
         // broker must SURFACE the error (leaving the gate waiting for a retry), not
         // collapse to a bogus `PendingQuorum { have: 0 }` that swallows the failure.
@@ -1260,7 +1260,7 @@ mod tests {
         // rename cannot silently break group/policy resolution.
         let toml = r#"
 [groups.release]
-members = ["http:abc123", "cli:marc"]
+members = ["http:abc123", "cli:test_user"]
 
 [policies.prod]
 required_group = "release"
@@ -1271,7 +1271,7 @@ escalation_route = "oncall"
         let group = cfg.groups.get("release").expect("release group");
         assert_eq!(
             group.members,
-            vec!["http:abc123".to_string(), "cli:marc".to_string()]
+            vec!["http:abc123".to_string(), "cli:test_user".to_string()]
         );
         let policy = cfg.policies.get("prod").expect("prod policy");
         assert_eq!(policy.required_group.as_deref(), Some("release"));

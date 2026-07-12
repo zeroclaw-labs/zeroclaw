@@ -12,9 +12,9 @@
 //! another resolver alongside the config-backed one (a junction of identity
 //! sources); it does not replace channel-provided identities. That resolver is where
 //! canonical-identity LINKING belongs: one person's several channel identities (e.g.
-//! `github:nillth`, `discord:559...`, `email:marc@...`) map to a single canonical
-//! user, so any of them resolves to the same groups. Until then, the config-backed
-//! resolver can grant a group to each channel identity directly.
+//! `github:octocat`, `discord:123...`, `email:user@example.invalid`) map to a
+//! single canonical user, so any of them resolves to the same groups. Until then,
+//! the config-backed resolver can grant a group to each channel identity directly.
 
 use zeroclaw_config::schema::SopApprovalConfig;
 
