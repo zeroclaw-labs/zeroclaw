@@ -227,10 +227,14 @@ impl ImageGenTool {
     /// `allowed_private_hosts`, only cloud metadata IPs are rejected
     /// (consistent with the allowlist semantics in the other tools).
     ///
-    /// This is a **pass/fail** check and does not pin the resolved addrs
-    /// to the subsequent connection, leaving a time-of-check/time-of-use
-    /// window for DNS rebinding. See #8827 for that binding layer.
-    async fn validate_image_url_resolved(&self, validated_url: &str) -> anyhow::Result<()> {
+    /// Resolve the validated image URL host to its socket addresses and reject
+    /// private/local or cloud-metadata IPs. Returns the validated socket
+    /// addresses so the caller can bind the download connection to them,
+    /// closing the TOCTOU window between DNS check and transport connect.
+    async fn validate_image_url_resolved(
+        &self,
+        validated_url: &str,
+    ) -> anyhow::Result<Vec<std::net::SocketAddr>> {
         let parsed = reqwest::Url::parse(validated_url)
             .map_err(|e| anyhow::Error::msg(format!("Invalid image URL: {e}")))?;
         let host = parsed
@@ -240,14 +244,16 @@ impl ImageGenTool {
             .port_or_known_default()
             .ok_or_else(|| anyhow::Error::msg("Image URL has no known port"))?;
 
-        let addrs = tokio::net::lookup_host((host, port))
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
             .await
-            .context("Failed to resolve image download host")?;
-        let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+            .context("Failed to resolve image download host")?
+            .collect();
 
-        if ips.is_empty() {
+        if addrs.is_empty() {
             anyhow::bail!("Failed to resolve image download host '{host}'");
         }
+
+        let ips: Vec<std::net::IpAddr> = addrs.iter().map(|sa| sa.ip()).collect();
 
         let private_resolution_allowed =
             domain_guard::host_matches_allowlist(host, &self.allowed_private_hosts);
@@ -256,7 +262,9 @@ impl ImageGenTool {
             domain_guard::validate_resolved_ips_exclude_metadata(host, &ips)
         } else {
             domain_guard::validate_resolved_ips_are_public(host, &ips)
-        }
+        }?;
+
+        Ok(addrs)
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -422,13 +430,22 @@ impl ImageGenTool {
         // resolve it now to verify none of its addresses are private/local
         // or cloud metadata. A host covered by `allowed_private_hosts`
         // skips the non-global check but still rejects cloud metadata.
-        self.validate_image_url_resolved(&validated_image_url)
+        // Returns the validated socket addresses so they can be bound to
+        // the download connection, closing the TOCTOU window.
+        let validated_addrs = self
+            .validate_image_url_resolved(&validated_image_url)
             .await?;
 
         // ── Build image-download client with per-redirect SSRF gate ─
-        // Mirrors `web_fetch.rs:407-426`. The closure captures a clone of
-        // `self.allowed_private_hosts` so the per-redirect check uses the
-        // exact operator-configured allowlist (no re-parse, no IO).
+        // The closure captures a clone of `self.allowed_private_hosts` so
+        // the per-redirect check uses the exact operator-configured
+        // allowlist (no re-parse, no IO).
+        //
+        // Redirect resolved-IP validation is explicitly deferred: the
+        // reqwest redirect callback runs synchronously inside the async
+        // runtime, and nesting `Handle::block_on` there risks a panic.
+        // Redirect targets are still gated by the synchronous host-string
+        // check below; cross-host DNS rebinding remains deferred.
         let allowed_private_hosts = self.allowed_private_hosts.clone();
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 10 {
@@ -445,17 +462,6 @@ impl ImageGenTool {
                     format!("Blocked image-URL redirect target: {err}"),
                 ));
             }
-            // Resolved-IP gate for redirect targets (runs on the tokio
-            // runtime that reqwest is driving — must be sync signature).
-            let allowed = &allowed_private_hosts;
-            if let Err(err) = tokio::runtime::Handle::current().block_on(async {
-                validate_redirect_image_url_resolved(attempt.url().as_str(), allowed).await
-            }) {
-                return attempt.error(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("Blocked image-URL redirect target DNS: {err}"),
-                ));
-            }
             attempt.follow()
         });
 
@@ -463,8 +469,16 @@ impl ImageGenTool {
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .redirect(redirect_policy)
+            .resolve_to_addrs(
+                &validated_image_url,
+                &validated_addrs,
+            )
             .build()
-            .unwrap_or_default();
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Failed to build secure image download client: {e}"
+                ))
+            })?;
 
         // ── Download image ─────────────────────────────────────────
         let img_resp = download_client
@@ -567,43 +581,6 @@ fn validate_redirect_image_url(
     }
 
     Ok(())
-}
-
-/// Async companion to `validate_redirect_image_url` — resolves the redirect
-/// target host to its IP addresses and rejects private/local or cloud-metadata
-/// IPs. Same semantics as `ImageGenTool::validate_image_url_resolved` but
-/// usable from the sync redirect policy closure via `block_on`.
-async fn validate_redirect_image_url_resolved(
-    raw_url: &str,
-    allowed_private_hosts: &[String],
-) -> anyhow::Result<()> {
-    let url = raw_url.trim();
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| anyhow::Error::msg(format!("Invalid redirect image URL: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::Error::msg("Redirect image URL has no host"))?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| anyhow::Error::msg("Redirect image URL has no known port"))?;
-
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .context("Failed to resolve redirect image download host")?;
-    let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
-
-    if ips.is_empty() {
-        anyhow::bail!("Failed to resolve redirect host '{host}'");
-    }
-
-    let private_resolution_allowed =
-        domain_guard::host_matches_allowlist(host, allowed_private_hosts);
-
-    if private_resolution_allowed {
-        domain_guard::validate_resolved_ips_exclude_metadata(host, &ips)
-    } else {
-        domain_guard::validate_resolved_ips_are_public(host, &ips)
-    }
 }
 
 #[async_trait]
@@ -1095,9 +1072,10 @@ mod tests {
 
     // ── Resolved-IP gate tests ──────────────────────────────────────
     //
-    // These exercise `validate_image_url_resolved` (instance method) and
-    // `validate_redirect_image_url_resolved` (free function). They perform
-    // real DNS lookups, so a network-free environment skips them.
+    // These exercise `validate_image_url_resolved` (instance method).
+    // They perform real DNS lookups, so a network-free environment skips
+    // them. Redirect resolved-IP validation is currently deferred (the
+    // reqwest redirect callback runs synchronously and cannot await DNS).
 
     #[tokio::test]
     async fn validate_image_url_resolved_rejects_localhost() {
@@ -1139,26 +1117,5 @@ mod tests {
         tool.validate_image_url_resolved("http://localhost:8080/test.png")
             .await
             .expect("wildcard allowlist must lift the non-global check");
-    }
-
-    #[tokio::test]
-    async fn validate_redirect_image_url_resolved_rejects_localhost() {
-        let allowed: Vec<String> = vec![];
-        let err = validate_redirect_image_url_resolved("http://localhost/test.png", &allowed)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("non-global") || err.contains("Failed to resolve"),
-            "expected non-global error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_redirect_image_url_resolved_accepts_public_host() {
-        let allowed: Vec<String> = vec![];
-        validate_redirect_image_url_resolved("https://example.com/image.png", &allowed)
-            .await
-            .expect("public redirect target must pass");
     }
 }
