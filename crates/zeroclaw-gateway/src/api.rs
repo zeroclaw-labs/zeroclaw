@@ -126,6 +126,8 @@ pub struct CronAddBody {
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
+    /// If false, disable memory recall for this agent cron job (default: true).
+    pub uses_memory: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +147,8 @@ pub struct CronPatchBody {
     /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
     /// the current state unchanged.
     pub enabled: Option<bool>,
+    /// If false, disable memory recall for this agent cron job (default: true).
+    pub uses_memory: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -348,11 +352,18 @@ pub async fn handle_api_tools(
     let tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
-            serde_json::json!({
+            let mut tool = serde_json::json!({
                 "name": spec.name,
                 "description": spec.description,
                 "parameters": spec.parameters,
-            })
+            });
+            if let Some(output) = &spec.output {
+                tool["output"] = output.clone();
+            }
+            if !spec.param_domains.is_empty() {
+                tool["param_domains"] = serde_json::json!(spec.param_domains);
+            }
+            tool
         })
         .collect();
 
@@ -402,6 +413,7 @@ pub async fn handle_api_cron_add(
         model,
         allowed_tools,
         delete_after_run,
+        uses_memory,
     } = body;
 
     let config = state.config.read().clone();
@@ -465,6 +477,7 @@ pub async fn handle_api_cron_add(
             delivery,
             delete_after_run,
             allowed_tools,
+            uses_memory.unwrap_or(true),
         )
     } else {
         let command = match command.as_deref() {
@@ -614,6 +627,7 @@ pub async fn handle_api_cron_patch(
         command,
         prompt,
         enabled,
+        uses_memory,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -696,6 +710,7 @@ pub async fn handle_api_cron_patch(
         command: patch_command,
         prompt: patch_prompt,
         enabled,
+        uses_memory,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -1914,7 +1929,7 @@ pub async fn handle_claude_code_hook(
 pub(crate) use tests::test_state;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use async_trait::async_trait;
@@ -2295,10 +2310,12 @@ mod tests {
         config.gateway.require_pairing = false;
         let mut state = test_state(config);
 
-        let spec = |name: &str| ToolSpec {
-            name: name.to_string(),
-            description: format!("{name} desc"),
-            parameters: serde_json::json!({}).into(),
+        let spec = |name: &str| {
+            ToolSpec::new(
+                name.to_string(),
+                format!("{name} desc"),
+                serde_json::json!({}),
+            )
         };
         state.tools_registry = Arc::new(vec![spec("default_tool")]);
         let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =

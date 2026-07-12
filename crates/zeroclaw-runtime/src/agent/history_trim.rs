@@ -116,6 +116,35 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
     }
 }
 
+pub fn trim_to_reported_budget(
+    history: Vec<ChatMessage>,
+    budget_tokens: usize,
+    reported_input_tokens: usize,
+) -> TrimResult {
+    let estimated = estimate_history_tokens(&history);
+    if budget_tokens == 0 || reported_input_tokens <= budget_tokens || estimated == 0 {
+        let total_turns = count_turns(&history);
+        return TrimResult {
+            tokens_before: reported_input_tokens,
+            tokens_after: reported_input_tokens,
+            history,
+            dropped_messages: 0,
+            dropped_turns: 0,
+            kept_turns: total_turns,
+            trimmed: false,
+        };
+    }
+    let scaled =
+        (budget_tokens as u128 * estimated as u128 / reported_input_tokens as u128).max(1) as usize;
+    let result = trim_to_recent_turns(history, scaled);
+    let ratio = reported_input_tokens as f64 / estimated as f64;
+    TrimResult {
+        tokens_before: reported_input_tokens,
+        tokens_after: (result.tokens_after as f64 * ratio).round() as usize,
+        ..result
+    }
+}
+
 fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
     boundaries
         .iter()
@@ -132,6 +161,20 @@ fn count_turns(history: &[ChatMessage]) -> usize {
 /// earlier turns were cut and cannot confabulate dropped work as present.
 pub fn breadcrumb() -> ChatMessage {
     ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
+}
+
+/// Insert the trim breadcrumb after the leading system messages, unless one is
+/// already sitting there.
+pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {
+    let system_count = history.iter().take_while(|m| is_system(m)).count();
+    let crumb = breadcrumb();
+    let already_present = history
+        .get(system_count)
+        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
+    if already_present {
+        return;
+    }
+    history.insert(system_count, crumb);
 }
 
 #[cfg(test)]
@@ -372,5 +415,83 @@ mod tests {
             trimmed[..system_count].iter().all(|m| m.role == "system"),
             "breadcrumb must sit after every leading system message"
         );
+    }
+
+    #[test]
+    fn reported_budget_trims_when_reported_exceeds_budget() {
+        let big = "x".repeat(2000);
+        let h = vec![
+            sys("system"),
+            user(&format!("turn1 {big}")),
+            asst("a1"),
+            user(&format!("turn2 {big}")),
+            asst("a2"),
+            user("turn3 short"),
+            asst("a3"),
+        ];
+        let estimated = estimate_history_tokens(&h);
+        let reported = estimated * 4;
+        let budget = reported / 2;
+        let r = trim_to_reported_budget(h, budget, reported);
+        assert!(
+            r.trimmed,
+            "must trim when provider-reported tokens exceed budget"
+        );
+        assert!(r.dropped_turns >= 1);
+        assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
+    }
+
+    #[test]
+    fn reported_budget_no_trim_when_real_tokens_fit() {
+        let h = vec![sys("system"), user("hi"), asst("hello")];
+        let estimated = estimate_history_tokens(&h);
+        let r = trim_to_reported_budget(h, estimated * 4, estimated);
+        assert!(!r.trimmed);
+    }
+
+    #[test]
+    fn reported_budget_trims_under_extreme_ratio() {
+        let big = "x".repeat(4000);
+        let h = vec![
+            sys("system"),
+            user(&format!("old {big}")),
+            asst("a1"),
+            user("recent short"),
+            asst("a2"),
+        ];
+        let estimated = estimate_history_tokens(&h);
+        let reported = estimated * 5000;
+        let budget = reported / 100;
+        let r = trim_to_reported_budget(h, budget, reported);
+        assert!(r.trimmed, "extreme ratio must still enforce, not no-op");
+        assert!(r.history.iter().any(|m| m.content.contains("recent short")));
+    }
+
+    #[test]
+    fn insert_breadcrumb_deduped_does_not_stack() {
+        let mut h = vec![sys("system"), user("turn1"), asst("a1")];
+        insert_breadcrumb_deduped(&mut h);
+        let after_first = h.len();
+        insert_breadcrumb_deduped(&mut h);
+        assert_eq!(
+            h.len(),
+            after_first,
+            "a second trim must not stack another breadcrumb behind the system block"
+        );
+        let crumbs = h
+            .iter()
+            .filter(|m| m.role == breadcrumb().role && m.content == breadcrumb().content)
+            .count();
+        assert_eq!(crumbs, 1);
+    }
+
+    #[test]
+    fn insert_breadcrumb_deduped_sits_after_leading_system() {
+        let mut h = vec![sys("s1"), sys("s2"), user("turn1"), asst("a1")];
+        insert_breadcrumb_deduped(&mut h);
+        assert_eq!(h[0].role, "system");
+        assert_eq!(h[1].role, "system");
+        assert_eq!(h[2].role, breadcrumb().role);
+        assert_eq!(h[2].content, breadcrumb().content);
     }
 }

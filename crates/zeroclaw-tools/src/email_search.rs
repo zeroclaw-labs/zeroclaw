@@ -215,7 +215,7 @@ impl Tool for EmailSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

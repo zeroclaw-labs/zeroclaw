@@ -5,6 +5,7 @@ import {
   Bot,
   Clock,
   LayoutDashboard,
+  ListChecks,
   MessageSquare,
   Monitor,
   Puzzle,
@@ -13,6 +14,7 @@ import {
   Sparkles,
   Stethoscope,
   Terminal,
+  Workflow,
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
@@ -51,6 +53,8 @@ const navGroups: NavGroup[] = [
       { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
       { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
       { to: '/skills', icon: Sparkles, labelKey: 'nav.skills' },
+      { to: '/sops', icon: Workflow, labelKey: 'nav.sops' },
+      { to: '/runs', icon: ListChecks, labelKey: 'nav.runs' },
       { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
       { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
     ],
