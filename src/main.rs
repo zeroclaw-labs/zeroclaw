@@ -3198,6 +3198,27 @@ enum MemoryCommands {
     Reindex,
 }
 
+/// Bootstrap the value of the global `--config-dir` flag before clap renders
+/// localized help. `Cli::config_dir` remains the canonical declaration and
+/// validation path; this probe recognizes its two long forms and respects the
+/// option terminator. The flag is global, so it may appear after a subcommand.
+fn probe_config_dir(args: impl Iterator<Item = std::ffi::OsString>) -> Option<String> {
+    let mut args = args.skip(1); // skip argv[0] (the binary path)
+    while let Some(os_arg) = args.next() {
+        let arg = os_arg.to_string_lossy();
+        if &*arg == "--" {
+            return None;
+        }
+        if let Some(value) = arg.strip_prefix("--config-dir=") {
+            return Some(value.to_string());
+        }
+        if &*arg == "--config-dir" {
+            return args.next().map(|v| v.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
     #[cfg(feature = "agent-runtime")]
     {
@@ -3383,9 +3404,24 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn main() -> Result<()> {
+    // Locale detection runs while clap builds localized help, so expose the CLI
+    // override through the bootstrap env before either i18n or Tokio starts.
+    // Empty values remain for clap's canonical parse/validation path below.
+    if let Some(config_dir) = probe_config_dir(std::env::args_os())
+        && !config_dir.trim().is_empty()
+    {
+        // SAFETY: this synchronous bootstrap runs before the Tokio runtime (and
+        // therefore its worker threads) is constructed.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+    }
+
+    async_main()
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -3409,12 +3445,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
 
-    if let Some(config_dir) = &cli.config_dir {
-        if config_dir.trim().is_empty() {
-            bail!("--config-dir cannot be empty");
-        }
-        // SAFETY: called early in main before any threads are spawned.
-        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+    if let Some(config_dir) = &cli.config_dir
+        && config_dir.trim().is_empty()
+    {
+        bail!("--config-dir cannot be empty");
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -3777,7 +3811,7 @@ async fn main() -> Result<()> {
             agent,
         } => {
             Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
-            return Ok(());
+            Ok(())
         }
 
         Commands::Agent {
@@ -5246,7 +5280,7 @@ async fn main() -> Result<()> {
         Commands::Locales { locales_command } => {
             let LocalesCommands::Fetch { locale, catalog } = locales_command;
             fetch_locales(&locale, catalog.as_deref()).await?;
-            return Ok(());
+            Ok(())
         }
 
         Commands::Update {
@@ -8079,6 +8113,53 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn probe_config_dir_extracts_global_flag_in_all_forms() {
+        fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
+            parts
+                .iter()
+                .map(|s| std::ffi::OsString::from(*s))
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+
+        // argv[0] (binary path) is skipped.
+        // Space form.
+        assert_eq!(
+            probe_config_dir(argv(&["zeroclaw", "--config-dir", "/x"])),
+            Some("/x".to_string())
+        );
+        // Equals form.
+        assert_eq!(
+            probe_config_dir(argv(&["zeroclaw", "--config-dir=/y"])),
+            Some("/y".to_string())
+        );
+        // Global arg: may appear *after* a subcommand.
+        assert_eq!(
+            probe_config_dir(argv(&["zeroclaw", "status", "--config-dir", "/z"])),
+            Some("/z".to_string())
+        );
+        // Absent.
+        assert_eq!(probe_config_dir(argv(&["zeroclaw", "status"])), None);
+        // `--` ends option parsing; later values must never redirect config.
+        assert_eq!(
+            probe_config_dir(argv(&[
+                "zeroclaw",
+                "config",
+                "set",
+                "locale",
+                "--",
+                "--config-dir=/ignored",
+            ])),
+            None
+        );
+        // Present but empty — returned verbatim for clap's validation path.
+        assert_eq!(
+            probe_config_dir(argv(&["zeroclaw", "--config-dir", ""])),
+            Some(String::new())
+        );
+    }
 
     #[test]
     fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {
