@@ -168,25 +168,32 @@ struct TeeObserver {
 impl Observer for TeeObserver {
     fn record_event(&self, event: &ObserverEvent) {
         self.primary.record_event(event);
-        let hook = broadcast_hook_slot().read();
-        // When multiple scoped hooks are stacked, only the most recent (highest
-        // scoped_id) scoped entry receives events. Non-scoped entries receive
-        // events only when no scoped hook is live.
-        if hook.entries.is_empty() {
-            return;
-        }
-        let max_scoped = hook.entries.iter().filter_map(|e| e.scoped_id).max();
-        for entry in &hook.entries {
-            if let Some(id) = entry.scoped_id {
-                if Some(id) == max_scoped {
-                    entry.observer.record_event(event);
-                }
-            } else {
-                // Non-scoped entry: fire only when no scoped hook is live
-                if max_scoped.is_none() {
-                    entry.observer.record_event(event);
-                }
+        // Collect the observers to notify while briefly holding the read lock,
+        // then release the lock *before* invoking any callback. Calling an
+        // observer callback while holding the global hook lock is unsafe: a
+        // callback that installs or drops a scoped hook needs the write lock
+        // (deadlock on this non-reentrant `RwLock`), and any slow or blocking
+        // hook would stall every other event source in the process.
+        let targets: Vec<Arc<dyn Observer>> = {
+            let hook = broadcast_hook_slot().read();
+            if hook.entries.is_empty() {
+                return;
             }
+            // When multiple scoped hooks are stacked, only the most recent
+            // (highest scoped_id) scoped entry receives events. Non-scoped
+            // entries receive events only when no scoped hook is live.
+            let max_scoped = hook.entries.iter().filter_map(|e| e.scoped_id).max();
+            hook.entries
+                .iter()
+                .filter(|entry| match entry.scoped_id {
+                    Some(id) => Some(id) == max_scoped,
+                    None => max_scoped.is_none(),
+                })
+                .map(|entry| Arc::clone(&entry.observer))
+                .collect()
+        };
+        for observer in targets {
+            observer.record_event(event);
         }
     }
 

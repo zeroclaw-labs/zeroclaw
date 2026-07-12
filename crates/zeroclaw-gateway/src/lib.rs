@@ -1532,23 +1532,29 @@ pub async fn run_gateway(
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Install the SSE broadcast hook before building any observer so that
-    // events emitted by the agent's per-call observer (built inside
-    // `process_message`) also reach `/api/events`. The state-level observer
-    // is just the configured backend — `TeeObserver` (created by
-    // `create_observer`) tees its events into the hook automatically.
-    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
-    );
+    // Install a SINGLE fan-out broadcast hook (before building any observer)
+    // containing BOTH the SSE broadcast observer and the in-flight turn
+    // counter, so events emitted by the agent's per-call observer (built
+    // inside `process_message`) reach `/api/events` and update the counter.
+    // The state-level observer is just the configured backend — `TeeObserver`
+    // (from `create_observer`) tees its events into this hook automatically.
+    // Both observers must share one scoped hook:
+    // `TeeObserver::record_event` delivers each event only to the
+    // highest `scoped_id`, so installing them as two separate scoped hooks
+    // would mask whichever was installed first — legacy `ObserverEvent`
+    // traffic would update the in-flight counter but never reach
+    // `/api/events` or `/api/events/history`. Wrapping both in a
+    // `MultiObserver` fans every event out to both sinks.
+    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> =
+        Arc::new(zeroclaw_runtime::observability::MultiObserver::new(vec![
+            Box::new(sse::BroadcastObserver::new(
+                event_tx.clone(),
+                event_buffer.clone(),
+            )),
+            Box::new(zeroclaw_runtime::observability::InFlightObserver::new()),
+        ]));
     let broadcast_hook_guard =
         zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
-
-    // Install the in-flight turn counter observer as a broadcast hook so
-    // that every AgentStart / AgentEnd event — regardless of which observer
-    // emits it — updates the per-agent in-flight count.
-    let _inflight_guard = zeroclaw_runtime::observability::set_scoped_broadcast_hook(Arc::new(
-        zeroclaw_runtime::observability::InFlightObserver::new(),
-    ));
 
     // Install the same broadcast sender as zeroclaw-log's canonical
     // hook so that every event emitted through `record!` / `record_event`

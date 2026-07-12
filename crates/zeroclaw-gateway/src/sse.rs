@@ -337,6 +337,11 @@ mod tests {
     use super::*;
     use zeroclaw_runtime::observability::{Observer, ObserverEvent};
 
+    /// The broadcast hook and the in-flight registry are process-wide state.
+    /// Serialize every hook-touching test within this binary against this one
+    /// lock so they never observe each other's installs.
+    static GATEWAY_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn make_broadcast() -> (
         Arc<BroadcastObserver>,
         tokio::sync::broadcast::Receiver<serde_json::Value>,
@@ -586,10 +591,7 @@ mod tests {
     /// by `cargo test`, not by a silent regression in production.
     #[test]
     fn factory_observer_events_reach_broadcast_hook() {
-        // The broadcast hook is process-wide; serialize hook-touching tests
-        // within this test binary so they don't observe each other's state.
-        static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = GATEWAY_HOOK_TEST_LOCK.lock();
 
         zeroclaw_runtime::observability::clear_broadcast_hook();
 
@@ -630,6 +632,94 @@ mod tests {
             1,
             "broadcast events must also land in the buffer"
         );
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+    }
+
+    /// Regression for the #8905 review. `run_gateway` installs ONE fan-out
+    /// broadcast hook (`MultiObserver`) containing BOTH the SSE
+    /// `BroadcastObserver` and the `InFlightObserver`. Because
+    /// `TeeObserver::record_event` delivers each event only to the
+    /// highest-`scoped_id` hook, installing the two observers as separate
+    /// scoped hooks silently masked the SSE observer for the gateway's
+    /// lifetime: the in-flight counter kept updating, but events stopped
+    /// reaching `/api/events` and `/api/events/history`.
+    ///
+    /// This drives one factory-built observer (the same call site the agent
+    /// loop uses in `process_message`), records a single lifecycle event, and
+    /// proves it lands in BOTH sinks: the in-flight registry AND the SSE /
+    /// history broadcast observer.
+    #[test]
+    fn factory_lifecycle_event_reaches_both_inflight_and_sse() {
+        let _guard = GATEWAY_HOOK_TEST_LOCK.lock();
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+
+        // Mirror the wiring in `run_gateway`: a single scoped fan-out hook
+        // holding both observers.
+        let fanout: Arc<dyn Observer> =
+            Arc::new(zeroclaw_runtime::observability::MultiObserver::new(vec![
+                Box::new(BroadcastObserver::new(tx, buffer.clone())),
+                Box::new(zeroclaw_runtime::observability::InFlightObserver::new()),
+            ]));
+        let _hook_guard = zeroclaw_runtime::observability::set_scoped_broadcast_hook(fanout);
+
+        // Unique alias so the process-wide in-flight singleton starts at 0 for
+        // this assertion regardless of other tests in the binary.
+        let alias = "regression_8905_alias";
+        let registry = zeroclaw_runtime::observability::get_inflight_registry();
+        assert_eq!(registry.get(alias), 0, "alias must start idle");
+
+        // Same factory call site as `process_message` in the agent loop.
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: zeroclaw_config::schema::ObservabilityBackend::None,
+            ..Default::default()
+        };
+        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
+
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: "openai".into(),
+            model: "gpt-4".into(),
+            channel: None,
+            agent_alias: Some(alias.into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        // 1) The in-flight registry (InFlightObserver in the fan-out) saw it.
+        assert_eq!(
+            registry.get(alias),
+            1,
+            "InFlightObserver in the fan-out must increment the registry"
+        );
+
+        // 2) The SSE broadcast channel (BroadcastObserver in the fan-out) saw
+        //    the very same event.
+        let value = rx
+            .try_recv()
+            .expect("BroadcastObserver in the fan-out must reach the SSE channel");
+        assert_eq!(value["type"], "agent_start");
+        assert_eq!(value["agent_alias"], alias);
+
+        // 3) The history buffer retained it for /api/events/history.
+        let snap = buffer.snapshot();
+        assert_eq!(snap.len(), 1, "event must also land in the history buffer");
+        assert_eq!(snap[0]["type"], "agent_start");
+
+        // Restore the process-wide count so we don't leak into sibling tests.
+        observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "openai".into(),
+            model: "gpt-4".into(),
+            duration: std::time::Duration::from_millis(1),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: Some(alias.into()),
+            turn_id: Some("turn-1".into()),
+        });
+        assert_eq!(registry.get(alias), 0);
 
         zeroclaw_runtime::observability::clear_broadcast_hook();
     }
