@@ -58,10 +58,6 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
-    pub(crate) fn wants_mouse_capture(&self) -> bool {
-        self.inner.wants_mouse_capture()
-    }
-
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }

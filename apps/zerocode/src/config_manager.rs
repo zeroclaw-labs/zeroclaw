@@ -83,15 +83,6 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn set_mouse_capture(term: &mut Term, enabled: bool) -> Result<()> {
-    if enabled {
-        execute!(term.backend_mut(), EnableMouseCapture)?;
-    } else {
-        execute!(term.backend_mut(), DisableMouseCapture)?;
-    }
-    Ok(())
-}
-
 // ── Screen stack ─────────────────────────────────────────────────
 
 enum Screen {
