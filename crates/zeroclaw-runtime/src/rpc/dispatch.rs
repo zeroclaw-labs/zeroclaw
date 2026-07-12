@@ -381,6 +381,32 @@ fn agent_alias_from_model_provider_prop(prop: &str) -> Option<String> {
     }
 }
 
+/// Session-selection predicate for an agent-scoped `model_provider` refresh
+/// (`config/set agents.<alias>.model_provider`). Only sessions bound to the
+/// edited agent are eligible, and a session that carries its own
+/// `model_provider` override is excluded so unrelated agents and overridden
+/// sessions are never rebuilt.
+fn agent_scoped_refresh_selects(
+    edited_agent: &str,
+    session_agent: &str,
+    overrides: &SessionOverrides,
+) -> bool {
+    session_agent == edited_agent && overrides.model_provider.is_none()
+}
+
+/// Session-selection predicate for a provider-scoped refresh
+/// (`providers.models.*` edit). A session is eligible when its own
+/// `model_provider` override matches the edited provider, or when it has no
+/// override and thus inherits the agent's provider (final provider match is
+/// resolved separately against config).
+fn provider_scoped_refresh_selects(target_ref: &str, overrides: &SessionOverrides) -> bool {
+    overrides
+        .model_provider
+        .as_deref()
+        .map(|r| r == target_ref)
+        .unwrap_or(true)
+}
+
 /// Whether memory embeddings resolve from the given `<type>.<alias>` provider
 /// profile — either the base `[memory].embedding_provider` reference or any
 /// `[[embedding_routes]]` entry. Gates the memory-embedder refresh on a
@@ -2824,8 +2850,10 @@ impl RpcDispatcher {
     /// resolving the agent's currently-configured `model_provider` from config.
     /// Fired when `agents.<alias>.model_provider` changes via `config/set` so a
     /// provider switch takes effect on the running session without a restart —
-    /// the same refresh a `providers.models.*` edit triggers. A session that
-    /// carries its own `model_provider` override is left untouched.
+    /// the same refresh a `providers.models.*` edit triggers. Only sessions
+    /// bound to the edited agent are rebuilt; sessions belonging to other
+    /// agents, and sessions that carry their own `model_provider` override, are
+    /// left untouched even when they resolve to the same provider.
     fn schedule_live_sessions_refresh_for_agent(&self, agent_alias: String) {
         let ctx = Arc::clone(&self.ctx);
         zeroclaw_spawn::spawn!(async move {
@@ -2838,7 +2866,10 @@ impl RpcDispatcher {
             let Some(provider_ref) = provider_ref else {
                 return;
             };
-            Self::refresh_live_sessions_for_model_provider(ctx, &provider_ref).await;
+            Self::refresh_live_sessions_matching(ctx, &provider_ref, |session_agent, overrides| {
+                agent_scoped_refresh_selects(&agent_alias, session_agent, overrides)
+            })
+            .await;
         });
     }
 
@@ -2846,6 +2877,20 @@ impl RpcDispatcher {
         ctx: Arc<RpcContext>,
         model_provider_ref: &str,
     ) {
+        let target_ref = model_provider_ref.to_string();
+        Self::refresh_live_sessions_matching(ctx, model_provider_ref, move |_agent, overrides| {
+            provider_scoped_refresh_selects(&target_ref, overrides)
+        })
+        .await;
+    }
+
+    async fn refresh_live_sessions_matching<F>(
+        ctx: Arc<RpcContext>,
+        model_provider_ref: &str,
+        select: F,
+    ) where
+        F: Fn(&str, &SessionOverrides) -> bool,
+    {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
             let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
@@ -2854,7 +2899,10 @@ impl RpcDispatcher {
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            let uses_provider = {
+            if !select(&agent_alias, &overrides) {
+                continue;
+            }
+            let resolves_provider = {
                 let config = ctx.config.read();
                 let effective_ref = overrides.model_provider.as_deref().or_else(|| {
                     config
@@ -2863,7 +2911,7 @@ impl RpcDispatcher {
                 });
                 effective_ref == Some(model_provider_ref)
             };
-            if !uses_provider {
+            if !resolves_provider {
                 continue;
             }
 
@@ -4685,9 +4733,10 @@ mod tests {
 
     #[test]
     fn agent_alias_from_model_provider_prop_matches_only_the_bound_provider_field() {
-        // The zerocode model_provider picker and the config pane both write
-        // `agents.<alias>.model_provider`; that path must map back to the alias
-        // so the live session refresh fires.
+        // The config pane and other `config/set agents.<alias>.model_provider`
+        // callers write this path; it must map back to the alias so the live
+        // session refresh fires. The zerocode picker takes the `session/configure`
+        // path instead and is not a caller here.
         assert_eq!(
             agent_alias_from_model_provider_prop("agents.fred.model_provider"),
             Some("fred".to_string())
@@ -4707,6 +4756,66 @@ mod tests {
             agent_alias_from_model_provider_prop("agents..model_provider"),
             None
         );
+    }
+
+    #[test]
+    fn agent_scoped_refresh_selects_only_edited_agent_without_override() {
+        use crate::rpc::session::SessionOverrides;
+        let no_override = SessionOverrides::default();
+        let with_override = SessionOverrides {
+            model_provider: Some("anthropic.other".to_string()),
+            ..Default::default()
+        };
+
+        // A session bound to the edited agent with no override is rebuilt.
+        assert!(agent_scoped_refresh_selects("fred", "fred", &no_override));
+        // A session belonging to a different agent is never rebuilt, even
+        // when it resolves to the same provider.
+        assert!(!agent_scoped_refresh_selects("fred", "wilma", &no_override));
+        // The edited agent's own session is left untouched when it carries a
+        // `model_provider` override.
+        assert!(!agent_scoped_refresh_selects(
+            "fred",
+            "fred",
+            &with_override
+        ));
+        // A different agent with an override is likewise excluded.
+        assert!(!agent_scoped_refresh_selects(
+            "fred",
+            "wilma",
+            &with_override
+        ));
+    }
+
+    #[test]
+    fn provider_scoped_refresh_selects_inheritors_and_matching_overrides() {
+        use crate::rpc::session::SessionOverrides;
+        let no_override = SessionOverrides::default();
+        let matching_override = SessionOverrides {
+            model_provider: Some("anthropic.default".to_string()),
+            ..Default::default()
+        };
+        let other_override = SessionOverrides {
+            model_provider: Some("openai.default".to_string()),
+            ..Default::default()
+        };
+
+        // No override: inherits the agent provider, so it is a candidate
+        // (final config match is resolved by the caller).
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &no_override
+        ));
+        // Override that names the edited provider is a candidate.
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &matching_override
+        ));
+        // Override that names a different provider is excluded.
+        assert!(!provider_scoped_refresh_selects(
+            "anthropic.default",
+            &other_override
+        ));
     }
 
     #[test]
