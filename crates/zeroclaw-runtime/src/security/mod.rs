@@ -22,6 +22,7 @@ pub mod audit;
 pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod constrained_runner;
 pub mod detect;
 pub mod docker;
 
@@ -82,6 +83,9 @@ pub use traits::{NoopSandbox, Sandbox};
 pub use iam_policy::{IamPolicy, PolicyDecision};
 #[allow(unused_imports)]
 pub use nevis::{NevisAuthProvider, NevisIdentity};
+// Shared constrained process runner for skill-adjacent commands.
+#[allow(unused_imports)]
+pub use constrained_runner::{ConstrainedOutput, ConstrainedRunner, warn_if_unsandboxed};
 // Prompt injection defense exports
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};

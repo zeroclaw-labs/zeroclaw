@@ -2162,26 +2162,38 @@ impl InstallLock {
 
         let is_stale = file_age(&path).is_some_and(|age| age >= stale_bound);
         if is_stale {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "skills.install.stale_lock_reclaimed",
-                        "lock": path.display().to_string(),
-                    })),
-                "reclaiming stale skill install lock"
-            );
-            eprintln!(
-                "{}",
-                crate::i18n::get_required_cli_string_with_args(
-                    "cli-skills-install-stale-lock-reclaimed",
-                    &[("name", name)],
-                )
-            );
-            let _ = std::fs::remove_file(&path);
-            if Self::try_create(&path)? {
-                return Ok(Self { path });
+            // Atomic reclaim: rename the stale lock out of the way. `rename`
+            // to a unique per-attempt name has exactly one winner among
+            // concurrent reclaimers and never deletes a *fresh* lock a peer
+            // just created (two peers rename different inodes; the loser's
+            // rename hits NotFound). The unconditional `remove_file` this
+            // replaces could otherwise clobber a peer's fresh lock. [A#1]
+            let reclaim_target = staging_root.join(format!(
+                ".lock-{name}.reclaim-{:016x}",
+                rand::random::<u64>()
+            ));
+            if std::fs::rename(&path, &reclaim_target).is_ok() {
+                let _ = std::fs::remove_file(&reclaim_target);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "skills.install.stale_lock_reclaimed",
+                            "lock": path.display().to_string(),
+                        })),
+                    "reclaiming stale skill install lock"
+                );
+                eprintln!(
+                    "{}",
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-skills-install-stale-lock-reclaimed",
+                        &[("name", name)],
+                    )
+                );
+                if Self::try_create(&path)? {
+                    return Ok(Self { path });
+                }
             }
         }
 
@@ -2279,6 +2291,16 @@ fn staged_tree_digest(dir: &Path) -> Result<String> {
         let metadata = std::fs::symlink_metadata(&path).with_context(|| {
             format!("failed to read metadata for {}", path.display().to_string())
         })?;
+        // Fail closed on a symlink appearing in the staged tree. The audit
+        // already rejects all symlinks, so one present here was injected after
+        // the audit ran — hashing only files would render it invisible to the
+        // mutation guard and let it be promoted into the live skills dir. [A#2]
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "staged skill tree contains a symlink after audit: {}",
+                path.display()
+            );
+        }
         if !metadata.is_file() {
             continue;
         }
@@ -2368,6 +2390,16 @@ fn finish_skill_install(staged: &Path, dest: &Path, digest_after_checks: &str) -
         Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
             // Staging root and skills dir are normally on the same
             // filesystem; a bind-mounted skills dir can still split them.
+            // Create the destination root with `create_dir` (never follows a
+            // symlink planted at `dest` after the NotFound check above —
+            // `create_dir_all`, which `copy_dir_recursive_secure` uses, would
+            // silently accept a symlink-to-dir and write through it). [A#3]
+            std::fs::create_dir(dest).with_context(|| {
+                format!(
+                    "failed to create install destination {}",
+                    dest.display().to_string()
+                )
+            })?;
             copy_dir_recursive_secure(staged, dest)?;
             fsync_dir_best_effort(dest);
             std::fs::remove_dir_all(staged).with_context(|| {
@@ -2565,7 +2597,9 @@ const GIT_CLONE_TIMEOUT_SECS: u64 = 120;
 
 /// Reject git transports that provide no integrity in transit: `http://`
 /// (cleartext, tamperable) and `git://` (unauthenticated daemon protocol).
-/// `https://` and `ssh://`/`git@` remotes pass through.
+/// `https://` and `ssh://`/`git@` remotes pass through. Also rejects a host
+/// component beginning with `-`, which older `ssh`/`git` would treat as an
+/// option (CVE-2017-1000117 family). [R4]
 fn validate_git_transport(source: &str) -> Result<()> {
     let scheme = if source.starts_with("http://") {
         Some("http")
@@ -2583,7 +2617,40 @@ fn validate_git_transport(source: &str) -> Result<()> {
             )
         );
     }
+    if git_host_looks_like_option(source) {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-git-bad-host",
+                &[("source", source)],
+            )
+        );
+    }
     Ok(())
+}
+
+/// True when the host component of a git remote begins with `-` (option
+/// injection into the underlying `ssh`/`git` invocation).
+fn git_host_looks_like_option(source: &str) -> bool {
+    let host = if let Some(rest) = source
+        .strip_prefix("ssh://")
+        .or_else(|| source.strip_prefix("https://"))
+    {
+        // Drop optional `userinfo@`, then take the authority up to the path.
+        let after_user = rest.rsplit('@').next().unwrap_or(rest);
+        after_user
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(after_user)
+    } else if !source.contains("://") {
+        // scp-like [user@]host:path — git hands the whole `[user@]host`
+        // token to ssh as one argument, so a leading '-' anywhere in it (user
+        // or host) is option injection.
+        source.split_once(':').map(|(lhs, _)| lhs).unwrap_or("")
+    } else {
+        ""
+    };
+    host.starts_with('-')
 }
 
 /// Spawn `cmd`, enforcing a hard wall-clock timeout. On timeout the child is
@@ -2602,14 +2669,43 @@ fn run_command_with_timeout(
         .spawn()
         .with_context(|| format!("failed to run {label}"))?;
 
+    // Drain stderr on a dedicated thread. A remote can stream more than one
+    // pipe buffer (~64 KiB) of git sideband/progress text to stderr; reading
+    // it only after exit would let the child block on a full pipe and stall
+    // for the whole timeout. Cap the retained text so a hostile remote can't
+    // balloon memory. [R4]
+    const STDERR_CAP: usize = 64 * 1024;
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf.len() < STDERR_CAP {
+                            let room = STDERR_CAP - buf.len();
+                            buf.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+    let collect_stderr = move || {
+        stderr_reader
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
+    };
+
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
+                let stderr = collect_stderr();
                 if status.success() {
                     return Ok(());
                 }
@@ -2689,8 +2785,20 @@ pub fn install_git_skill_source(
         let clone_target = staged.join(&name);
         let mut clone_cmd = std::process::Command::new("git");
         clone_cmd
-            .args(["clone", "--depth", "1", source])
-            .arg(&clone_target);
+            // Disable the ext/remote-helper transports (arbitrary-command
+            // execution vectors) and never prompt for credentials on a TTY;
+            // `--` terminates option parsing before the remote. [R4]
+            .args([
+                "-c",
+                "protocol.ext.allow=never",
+                "clone",
+                "--depth",
+                "1",
+                "--",
+                source,
+            ])
+            .arg(&clone_target)
+            .env("GIT_TERMINAL_PROMPT", "0");
         run_command_with_timeout(
             &mut clone_cmd,
             Duration::from_secs(GIT_CLONE_TIMEOUT_SECS),
@@ -2926,6 +3034,9 @@ fn sanitized_display_url(url: &Url) -> String {
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
     clean.set_query(None);
+    // A redirect `Location` can populate the fragment, and fragments are a
+    // known implicit-flow token carrier — strip it too. [R5]
+    clean.set_fragment(None);
     clean.to_string()
 }
 
@@ -4314,6 +4425,23 @@ mod install_transaction_tests {
         assert_ne!(before, after, "content change must change the digest");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn staged_tree_digest_fails_closed_on_symlink() {
+        // A symlink injected into the staged tree after the audit must make
+        // the mutation guard bail, not silently skip it. [A#2]
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("tree");
+        write_clean_skill(&dir);
+        let target = tmp.path().join("target.txt");
+        fs::write(&target, "secret").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("link.txt")).unwrap();
+
+        let err = staged_tree_digest(&dir)
+            .expect_err("a symlink in the staged tree must fail the digest closed");
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+    }
+
     #[test]
     fn finish_aborts_when_staged_tree_mutated_after_checks() {
         let (tmp, skills, staging) = setup();
@@ -4356,6 +4484,28 @@ mod install_transaction_tests {
         assert!(validate_git_transport("https://github.com/a/b.git").is_ok());
         assert!(validate_git_transport("ssh://git@github.com/a/b.git").is_ok());
         assert!(validate_git_transport("git@github.com:a/b.git").is_ok());
+    }
+
+    #[test]
+    fn git_transport_rejects_option_injection_hosts() {
+        // CVE-2017-1000117-family: a host beginning with '-' is an option to
+        // the underlying ssh/git invocation.
+        for source in [
+            "ssh://-oProxyCommand=payload/repo.git",
+            "-oProxyCommand=x@host:repo.git",
+        ] {
+            let err =
+                validate_git_transport(source).expect_err("option-injection host must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("interpret as a command-line option"),
+                "{source}: got: {err}"
+            );
+        }
+        assert!(git_host_looks_like_option("ssh://-oX/repo"));
+        assert!(git_host_looks_like_option("ssh://user@-oX/repo"));
+        assert!(!git_host_looks_like_option("ssh://git@github.com/a/b"));
+        assert!(!git_host_looks_like_option("https://github.com/a/b"));
     }
 
     #[cfg(unix)]
@@ -4417,6 +4567,7 @@ mod install_transaction_tests {
         assert!(!shown.contains("user"), "userinfo leaked: {shown}");
         assert!(!shown.contains("hunter2"), "password leaked: {shown}");
         assert!(!shown.contains("SECRET"), "query leaked: {shown}");
+        assert!(!shown.contains("frag"), "fragment leaked: {shown}");
         assert!(shown.contains("clawhub.ai/dl"), "path kept: {shown}");
     }
 
