@@ -22,6 +22,14 @@ Composite job with multiple matrix legs:
 
 `fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
+Fresh required CI is normally the shared evidence for the Cargo surfaces it actually runs. A local rerun of the same Cargo command on the same head, target, and feature set is duplicate confidence, not a stronger proof. Before asking for extra Cargo or Clippy, compare the changed surface with the current workflow files and the actual checks on the PR. Extra validation belongs where the required gate does not prove the thing under review:
+
+- a platform received compile checks but not tests;
+- a platform, crate, or path is outside the required lint job;
+- a desktop change did not trigger the desktop workflow;
+- a release target is outside the PR matrix and only covered by release/manual workflows;
+- stale, cancelled, skipped, or unavailable CI is not fresh evidence.
+
 ### Daily Advisory Scan (`daily-audit.yml`)
 
 Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tree. Opens an issue on findings. No action unless a vulnerability is reported.
