@@ -953,12 +953,31 @@ pub async fn create_memory_for_agent(
             });
         }
         let scoped = AgentScopedMarkdownMemory::new(agent_alias, own, peers);
-        return Ok(Arc::new(scoped));
+        // Route the composed per-agent wrapper through the same audit
+        // decision as the install-wide factory: with `[memory]
+        // audit_enabled = true` the wrapper's store/recall operations
+        // write `memory/audit.db` rows and emit the `memory.audit` event;
+        // default-off passes it through untouched (byte-identical). The
+        // audit db is rooted at the install `data_dir` (shared across
+        // agents), mirroring how the SQL/Qdrant/Lucid arms compose it.
+        return Ok(Arc::from(wrap_audit(
+            scoped,
+            &config.data_dir,
+            config.memory.audit_enabled,
+        )?));
     }
 
-    // None branch: nothing to scope, no agents-table lookup needed.
+    // None branch: nothing to scope, no agents-table lookup needed. Still
+    // route through the audit decision so an audit-enabled install records
+    // attempted store/recall operations on the no-op backend; the
+    // install-wide factory wraps `NoneMemory` the same way, and opt-in
+    // audit coverage must not become backend/path-dependent.
     if matches!(backend_kind, ConfigBackend::None) {
-        return Ok(Arc::new(NoneMemory::new("none")));
+        return Ok(Arc::from(wrap_audit(
+            NoneMemory::new("none"),
+            &config.data_dir,
+            config.memory.audit_enabled,
+        )?));
     }
 
     // SQL / Qdrant / Lucid: single install-wide backend; the
@@ -1293,6 +1312,147 @@ mod tests {
             .unwrap();
         assert_eq!(stores, 1);
         assert_eq!(recalls, 1);
+    }
+
+    /// Regression: an audit-enabled Markdown-backed agent built through
+    /// `create_memory_for_agent` (the production runtime/gateway/channel/
+    /// cron path) must write `memory/audit.db` rows, not just the
+    /// install-wide factory. Before the fix, the per-agent Markdown branch
+    /// returned the wrapper directly, skipping the audit decision entirely.
+    #[tokio::test]
+    async fn create_memory_for_agent_markdown_wraps_audit_when_enabled() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        // Both data_dir and config_path must be set: agent_workspace_dir
+        // resolves per-agent dirs from config_path.parent(), and the audit
+        // db is rooted at data_dir. Leaving config_path unset would write
+        // the agent workspace into the crate working tree.
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.audit_enabled = true;
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mem = create_memory_for_agent(&cfg, "scribe", None)
+            .await
+            .expect("per-agent markdown memory");
+        mem.store("agent_key", "agent value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let _ = mem.recall("agent", 5, None, None, None).await.unwrap();
+
+        let audit_db = cfg.data_dir.join("memory").join("audit.db");
+        let conn = rusqlite::Connection::open(audit_db).unwrap();
+        let stores: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recalls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'recall'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stores, 1, "markdown agent store must be audited");
+        assert_eq!(recalls, 1, "markdown agent recall must be audited");
+    }
+
+    /// Default-off must stay byte-identical for the per-agent Markdown
+    /// path: no wrapper, no `memory/audit.db` written.
+    #[tokio::test]
+    async fn create_memory_for_agent_markdown_audit_off_writes_no_db() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        assert!(!cfg.memory.audit_enabled, "audit is opt-in by default");
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mem = create_memory_for_agent(&cfg, "scribe", None)
+            .await
+            .expect("per-agent markdown memory");
+        mem.store("agent_key", "agent value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(!cfg.data_dir.join("memory").join("audit.db").exists());
+    }
+
+    /// The per-agent None branch is the same audit-skip class: the
+    /// install-wide factory wraps `NoneMemory`, so the per-agent path must
+    /// too. `NoneMemory::store` is a no-op, but the decorator records the
+    /// attempt before delegating, so the audit row must still exist.
+    #[tokio::test]
+    async fn create_memory_for_agent_none_wraps_audit_when_enabled() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.audit_enabled = true;
+        cfg.agents.insert(
+            "ghost".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::None,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mem = create_memory_for_agent(&cfg, "ghost", None)
+            .await
+            .expect("per-agent none memory");
+        mem.store("ghost_key", "dropped", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let audit_db = cfg.data_dir.join("memory").join("audit.db");
+        let conn = rusqlite::Connection::open(audit_db).unwrap();
+        let stores: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stores, 1, "none-backed agent store attempt must be audited");
     }
 
     #[test]
