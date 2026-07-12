@@ -748,10 +748,27 @@ impl LineChannel {
             channel_secret
         };
 
+        let alias = alias.into();
         let configured_peers = peer_resolver();
         let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
+                // Mirror Telegram/WeChat: a backgrounded daemon discards
+                // stdout, so surface the one-time bind code through the
+                // structured log where `zeroclaw service logs` / the gateway
+                // can find it. Tag it `Channel` so the web Logs page shows it
+                // by default (an untagged event defaults to `Internal` and is
+                // hidden behind the filter).
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias.as_str(),
+                            "pairing_code": code.as_str(),
+                        })),
+                    "LINE pairing required; one-time bind code issued"
+                );
                 println!("  🔐 LINE pairing required. One-time bind code: {code}");
                 println!("     Send `{LINE_BIND_COMMAND} <code>` from your LINE account.");
             }
@@ -765,7 +782,7 @@ impl LineChannel {
             channel_secret: secret,
             dm_policy,
             group_policy,
-            alias: alias.into(),
+            alias,
             peer_resolver,
             persist: None,
             pairing,

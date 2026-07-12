@@ -2002,6 +2002,121 @@ pub async fn run_gateway(
         // ── OpenAPI spec + docs (unauthenticated by design) ──
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
+        .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/cron", get(api::handle_api_cron_list))
+        .route("/api/cron", post(api::handle_api_cron_add))
+        .route(
+            "/api/cron/settings",
+            get(api::handle_api_cron_settings_get).patch(api::handle_api_cron_settings_patch),
+        )
+        .route(
+            "/api/cron/{id}",
+            delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
+        )
+        .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        // Note: `/api/cron/{id}/run` is registered on a separate router below
+        // with a longer TimeoutLayer — manual cron triggers run the job
+        // synchronously and routinely exceed the 30s gateway-wide default.
+        .route("/api/integrations", get(api::handle_api_integrations))
+        .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integrations_settings),
+        )
+        .route(
+            "/api/doctor",
+            get(api::handle_api_doctor).post(api::handle_api_doctor),
+        )
+        .route("/api/memory", get(api::handle_api_memory_list))
+        .route("/api/memory", post(api::handle_api_memory_store))
+        .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/cost", get(api::handle_api_cost))
+        .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/channels", get(api::handle_api_channels))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
+        .route("/api/health", get(api::handle_api_health))
+        .route("/api/tuis", get(api::handle_api_tuis))
+        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route(
+            "/api/sessions/{id}/messages",
+            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+        )
+        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        // ── Pairing + Device management API ──
+        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
+        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        .route("/api/devices", get(api_pairing::list_devices))
+        .route(
+            "/api/devices/me/capabilities",
+            post(api_pairing::update_my_capabilities),
+        )
+        .route("/api/devices/{id}", delete(api_pairing::revoke_device))
+        .route(
+            "/api/devices/{id}/token/rotate",
+            post(api_pairing::rotate_token),
+        )
+        // ── Live Canvas (A2UI) routes ──
+        .route("/api/canvas", get(canvas::handle_canvas_list))
+        .route(
+            "/api/canvas/{id}",
+            get(canvas::handle_canvas_get)
+                .post(canvas::handle_canvas_post)
+                .delete(canvas::handle_canvas_clear),
+        )
+        .route(
+            "/api/canvas/{id}/history",
+            get(canvas::handle_canvas_history),
+        );
+
+    #[cfg(feature = "a2a")]
+    let public = public.merge(a2a::a2a_routes_with_endpoint(Some(
+        a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
+    )));
+
+    // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
+    #[cfg(feature = "webauthn")]
+    let public = public
+        .route(
+            "/api/webauthn/register/start",
+            post(api_webauthn::handle_register_start),
+        )
+        .route(
+            "/api/webauthn/register/finish",
+            post(api_webauthn::handle_register_finish),
+        )
+        .route(
+            "/api/webauthn/auth/start",
+            post(api_webauthn::handle_auth_start),
+        )
+        .route(
+            "/api/webauthn/auth/finish",
+            post(api_webauthn::handle_auth_finish),
+        )
+        .route(
+            "/api/webauthn/credentials",
+            get(api_webauthn::handle_list_credentials),
+        )
+        .route(
+            "/api/webauthn/credentials/{id}",
+            delete(api_webauthn::handle_delete_credential),
+        );
+
+    // ── Plugin management API (requires plugins-wasm feature) ──
+    #[cfg(feature = "plugins-wasm")]
+    let public = public.route(
+        "/api/plugins",
+        get(api_plugins::plugin_routes::list_plugins),
+    );
+
+    let public = public
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
         .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
@@ -2016,11 +2131,6 @@ pub async fn run_gateway(
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
-
-    #[cfg(feature = "a2a")]
-    let public = public.merge(a2a::a2a_routes_with_endpoint(Some(
-        a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
-    )));
 
     let inner = public
         .merge(protected_api_routes(state.clone()))
