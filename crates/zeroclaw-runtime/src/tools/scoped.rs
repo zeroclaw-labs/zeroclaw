@@ -353,9 +353,9 @@ impl ScopedToolRegistry {
                         // tool set: the same `filtered_deferred` drives both the
                         // prompt-side `build_deferred_tools_section_filtered` and
                         // the `ToolSearchTool` constructor, so a denied tool cannot
-                        // leak into either side (issue #8054 Surface 1(b)). The
-                        // `with_access_policy` step on the search tool is now
-                        // defense-in-depth — the stub set is already pre-filtered.
+                        // leak into either side. The `with_access_policy` step on
+                        // the search tool is now defense-in-depth — the stub set is
+                        // already pre-filtered.
                         let filtered_deferred = deferred_set.filter_by_policy(mcp_policy.as_ref());
                         let allowed_stub_count = mcp_allowed_tool_count(
                             filtered_deferred

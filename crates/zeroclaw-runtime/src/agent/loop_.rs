@@ -3198,7 +3198,7 @@ pub async fn process_message(
         // keyword that happens to appear inside `/think:high` (or the
         // directive token itself — `"think"`, `"high"`, `"max"`, …) would
         // make the prompt advertise tools the request then excludes, or
-        // vice versa. Issue #8054 Surface 4.
+        // vice versa.
         let effective_message_for_filter =
             crate::agent::thinking::strip_thinking_directive(message);
         let mut excluded_tools = compute_excluded_mcp_tools(
