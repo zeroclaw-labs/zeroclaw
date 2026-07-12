@@ -87,6 +87,12 @@ pub struct AcpServer {
     /// build their own engine from config.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    /// Connection-scoped default agent alias (`?agent=` on the gateway ACP
+    /// endpoint). Slots into the `session/new` alias precedence chain between
+    /// an explicit `agentAlias` and `[acp].default_agent`. Not a config
+    /// change: it only supplies the default for new sessions on this
+    /// connection (restore keeps the operator-controlled fallback chain).
+    connection_default_agent: Option<String>,
     client_elicitation_caps: std::sync::RwLock<ElicitationCapabilities>,
 }
 
@@ -141,8 +147,22 @@ impl AcpServer {
             canvas_store: None,
             sop_engine: None,
             sop_audit: None,
+            connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
+    }
+
+    /// Set the connection-scoped default agent alias (`?agent=` query param
+    /// on the gateway ACP endpoint, #8958). Blank values are treated as
+    /// absent. The alias is validated where an explicit `agentAlias` is —
+    /// at `session/new` — so an unknown alias yields the same clear error.
+    pub fn with_connection_default_agent(mut self, alias: Option<String>) -> Self {
+        self.connection_default_agent = alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        self
     }
 
     /// Attach the shared gateway [`CanvasStore`] so that agents created by
@@ -473,9 +493,11 @@ impl AcpServer {
             .into_owned();
 
         // Every ACP session is bound to an explicit agent alias.
-        // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`.
-        // When the client omits the alias and exactly one agent is configured,
-        // auto-select it so single-agent setups work without extra config.
+        // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
+        // then the connection-scoped default (`?agent=`, #8958), then
+        // `[acp].default_agent`. When all are absent and exactly one agent
+        // is configured, auto-select it so single-agent setups work without
+        // extra config.
         let agent_alias = params
             .get("agentAlias")
             .or_else(|| params.get("agent_alias"))
@@ -484,6 +506,7 @@ impl AcpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+            .or_else(|| self.connection_default_agent.clone())
             .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
@@ -759,11 +782,13 @@ impl AcpServer {
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
         // Restore the agent the session was created with — its alias is
-        // persisted on the session row. Fall back to the ACP default (or sole
-        // agent, or "default") only when that agent no longer exists in config,
-        // so a deleted owner degrades gracefully instead of failing the restore.
+        // persisted on the session row. Fall back to the connection default
+        // (`?agent=`, #8958), then the ACP default (or sole agent, or
+        // "default") only when that agent no longer exists in config, so a
+        // deleted owner degrades gracefully instead of failing the restore.
         let restore_alias = Some(data.agent_alias.clone())
             .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
+            .or_else(|| self.connection_default_agent.clone())
             .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
@@ -970,11 +995,13 @@ impl AcpServer {
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
         // Restore the agent the session was created with — its alias is
-        // persisted on the session row. Fall back to the ACP default (or sole
-        // agent, or "default") only when that agent no longer exists in config,
-        // so a deleted owner degrades gracefully instead of failing the restore.
+        // persisted on the session row. Fall back to the connection default
+        // (`?agent=`, #8958), then the ACP default (or sole agent, or
+        // "default") only when that agent no longer exists in config, so a
+        // deleted owner degrades gracefully instead of failing the restore.
         let restore_alias = Some(data.agent_alias.clone())
             .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
+            .or_else(|| self.connection_default_agent.clone())
             .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
@@ -2746,6 +2773,168 @@ mod tests {
         .expect("should use agent-beta despite default_agent = agent-alpha");
 
         assert!(result["sessionId"].as_str().is_some());
+    }
+
+    /// `make_test_config` plus `agent-alpha`/`agent-beta`, for exercising the
+    /// connection-default slot of the alias precedence chain (#8958).
+    fn two_agent_config(cwd: &std::path::Path) -> Config {
+        let mut cfg = make_test_config(cwd);
+        for alias in ["agent-alpha", "agent-beta"] {
+            cfg.agents.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    model_provider: "anthropic.default".into(),
+                    risk_profile: "default".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        cfg
+    }
+
+    async fn session_agent_alias(server: &AcpServer, session_id: &str) -> String {
+        let sessions = server.sessions.lock().await;
+        let session = sessions.get(session_id).expect("session must exist");
+        let session = session.lock().await;
+        session.agent_alias.clone()
+    }
+
+    #[tokio::test]
+    async fn session_new_uses_connection_default_agent_when_alias_omitted() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("session/new should use the connection default agent");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_new_explicit_alias_overrides_connection_default_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-alpha",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("explicit agentAlias should win over the connection default");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_connection_default_agent_overrides_config_default_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("connection default should win over [acp].default_agent");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_new_unknown_connection_default_agent_errors_like_explicit_alias() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_default_agent(Some("ghost".to_string()));
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("an unconfigured connection default must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("Unknown agent"),
+            "error should reuse the explicit-alias validation message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_blank_connection_default_agent_is_treated_as_absent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("  ".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("blank connection default should fall through to config default");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_restore_prefers_connection_default_when_persisted_agent_deleted() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-restore-conn-default";
+        store
+            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed for a deleted persisted agent");
+
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
     }
 
     #[test]
