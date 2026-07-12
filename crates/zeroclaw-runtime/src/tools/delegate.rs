@@ -895,9 +895,13 @@ impl DelegateTool {
             },
         )
         .await;
+        // Independent delegation injects one combined MCP prompt block: the harness
+        // composes the deferred tool-search listing with any pinned MCP resources, so
+        // this can no longer silently lose pinned resources the way a raw-field
+        // destructure could (see `ScopedAssembled::combined_mcp_prompt_section`).
+        let deferred_section = assembled.combined_mcp_prompt_section();
         let crate::tools::scoped::ScopedAssembled {
             registry,
-            deferred_section,
             activated_handle,
             ..
         } = assembled;
