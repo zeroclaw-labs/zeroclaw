@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 const MAX_ROUND_DECIMALS: i64 = 15;
 
@@ -101,13 +101,25 @@ impl Tool for CalculatorTool {
         })
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {
+                    "description": "Computed value: a number for numeric results, a string for multi-value results (e.g. mode ties)"
+                }
+            },
+            "required": ["result"]
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let function = match args.get("function").and_then(|v| v.as_str()) {
             Some(f) => f,
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: function".to_string()),
                 });
             }
@@ -144,14 +156,23 @@ impl Tool for CalculatorTool {
         };
 
         match result {
-            Ok(output) => Ok(ToolResult {
-                success: true,
-                output,
-                error: None,
-            }),
+            Ok(output) => {
+                let value = output
+                    .parse::<f64>()
+                    .map(|n| serde_json::json!(n))
+                    .unwrap_or_else(|_| serde_json::Value::String(output.clone()));
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::json_with_text(
+                        serde_json::json!({ "result": value }),
+                        output,
+                    ),
+                    error: None,
+                })
+            }
             Err(err) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(err),
             }),
         }

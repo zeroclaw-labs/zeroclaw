@@ -260,6 +260,7 @@ mod tests {
             },
             duration: Duration::from_millis(1),
             receipt: None,
+            output_data: None,
         }
     }
 

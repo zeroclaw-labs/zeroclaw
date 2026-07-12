@@ -11,14 +11,14 @@ use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::FilesystemConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
-use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
-use zeroclaw_runtime::sop::types::{FilesystemEventKind, SopEvent, SopTriggerSource};
+use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::engine::SopEngine;
+use zeroclaw_runtime::sop::types::{FilesystemEventKind, SopTriggerSource};
 
 /// Filesystem change source as a `Channel`.
 ///
 /// Watches configured paths with a `notify` watcher and routes each file
-/// create/modify/delete/rename to the SOP engine via `dispatch_sop_event`.
+/// create/modify/delete/rename to the SOP engine via `dispatch_untrusted_fan_in`.
 /// It is an input-only source: `Channel::send` has no outbound surface, and
 /// `listen` never feeds the chat-loop `tx` — file events drive SOP triggers,
 /// not agent turns.
@@ -149,13 +149,6 @@ impl FilesystemChannel {
 
             let payload = build_payload(kind, &path, old_path.as_deref(), config);
 
-            let sop_event = SopEvent {
-                source: SopTriggerSource::Filesystem,
-                topic: Some(path_str.clone()),
-                payload: Some(payload.to_string()),
-                timestamp: now_iso8601(),
-            };
-
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -165,8 +158,14 @@ impl FilesystemChannel {
                 "Filesystem channel: dispatching '' ''"
             );
 
-            let results = dispatch_sop_event(&self.engine, &self.audit, sop_event).await;
-            process_headless_results(&results);
+            dispatch_untrusted_fan_in(
+                &self.engine,
+                &self.audit,
+                SopTriggerSource::Filesystem,
+                Some(&path_str),
+                Some(&payload.to_string()),
+            )
+            .await;
         }
     }
 }
