@@ -326,6 +326,18 @@ impl SkillScreeningGate {
             .map(str::to_string)
     }
 
+    /// True when this gate would require a content-bound override for a
+    /// denial-worthy signal (i.e. `confirm` or `block`). Used by the update
+    /// review (task 2B) to decide whether a content swap needs acceptance.
+    pub fn enforces_override(&self) -> bool {
+        matches!(self.action, GateAction::Confirm | GateAction::Block)
+    }
+
+    /// True under `block` — a denial cannot be overridden at all.
+    pub fn is_block(&self) -> bool {
+        self.action == GateAction::Block
+    }
+
     /// Screen `dir` (staged, keyed to `staged_hash`) and decide whether the
     /// install may proceed.
     ///

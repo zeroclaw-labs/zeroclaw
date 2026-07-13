@@ -496,6 +496,10 @@ Examples:
         /// only if the source still serves that same content.
         #[arg(long, value_name = "HASH")]
         accept_risk: Option<String>,
+        /// Replace an already-installed skill of the same name via a journaled
+        /// swap (update/reinstall) instead of failing that it exists.
+        #[arg(long)]
+        force: bool,
     },
     /// Screen a skill source for prompt-injection / credential / remote-exec /
     /// encoding-smuggling signals without installing it

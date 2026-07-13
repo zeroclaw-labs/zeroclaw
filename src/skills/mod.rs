@@ -153,7 +153,8 @@ pub async fn handle_command(
             source,
             no_tier_banner,
             accept_risk,
-        } => handle_install(config, source, no_tier_banner, accept_risk).await,
+            force,
+        } => handle_install(config, source, no_tier_banner, accept_risk, force).await,
         crate::SkillCommands::Screen { source } => handle_screen(config, source).await,
         crate::SkillCommands::Verify { name } => handle_verify(config, name),
         crate::SkillCommands::Remove { name } => {
@@ -335,7 +336,8 @@ fn screening_gate_for(
 }
 
 /// Dispatch an install spec to the matching installer with the screening gate
-/// threaded in.
+/// and install mode threaded in.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_install(
     config: &crate::config::Config,
     source: &str,
@@ -343,14 +345,15 @@ async fn dispatch_install(
     skills_path: &std::path::Path,
     no_tier_banner: bool,
     gate: &SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     let allow_scripts = config.skills.allow_scripts;
     if is_clawhub_source(source) {
-        install_clawhub_skill_source(source, skills_path, allow_scripts, gate)
+        install_clawhub_skill_source(source, skills_path, allow_scripts, gate, mode)
             .await
             .with_context(|| format!("failed to install skill from ClawHub: {source}"))
     } else if is_git_source(source) {
-        install_git_skill_source(source, skills_path, allow_scripts, gate)
+        install_git_skill_source(source, skills_path, allow_scripts, gate, mode)
             .with_context(|| format!("failed to install git skill source: {source}"))
     } else if is_registry_source(source) {
         println!(
@@ -368,6 +371,7 @@ async fn dispatch_install(
             config.skills.registry_url.as_deref(),
             no_tier_banner,
             gate,
+            mode,
         )
         .with_context(|| format!("failed to install skill from registry: {source}"))
     } else if is_extra_registry_source(source) {
@@ -389,12 +393,58 @@ async fn dispatch_install(
             &config.skills.extra_registries,
             no_tier_banner,
             gate,
+            mode,
         )
         .with_context(|| format!("failed to install skill from extra registry: {source}"))
     } else {
-        install_local_skill_source(source, skills_path, allow_scripts, gate)
+        install_local_skill_source(source, skills_path, allow_scripts, gate, mode)
             .with_context(|| format!("failed to install local skill source: {source}"))
     }
+}
+
+/// Derive the installed directory name a source spec would use, for looking up
+/// its prior receipt when building an update review.
+fn install_dir_name(source: &str) -> Option<String> {
+    match SkillSource::parse(source) {
+        SkillSource::ClawHub { .. } => clawhub_skill_dir_name(source).ok(),
+        SkillSource::Git { .. } => {
+            let trimmed = source.trim_end_matches('/');
+            let path_part = if trimmed.contains("://") {
+                trimmed
+            } else {
+                trimmed.split_once(':').map_or(trimmed, |(_, p)| p)
+            };
+            let base = path_part
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(".git");
+            (!base.is_empty()).then(|| base.to_string())
+        }
+        SkillSource::Registry { skill, .. } => Some(skill),
+        SkillSource::Local { path } => path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string),
+    }
+}
+
+/// Build the install mode for a `--force` (re)install: look up the prior
+/// receipt so the differentiated update review can compare versions and
+/// content hashes. A plain (non-force) install always uses the fresh mode.
+fn install_mode_for(config: &crate::config::Config, source: &str, force: bool) -> InstallMode {
+    if !force {
+        return InstallMode::fresh();
+    }
+    let review = install_dir_name(source)
+        .and_then(|name| {
+            zeroclaw_runtime::skills::receipt::read_receipt(&config.install_root_dir(), &name)
+        })
+        .map(|r| UpdateReview {
+            prior_version: r.version,
+            prior_tree_hash: r.tree_hash,
+        });
+    InstallMode::forced(review)
 }
 
 /// Install a skill, applying install-boundary screening. On a screening denial
@@ -405,6 +455,7 @@ async fn handle_install(
     source: String,
     no_tier_banner: bool,
     accept_risk: Option<String>,
+    force: bool,
 ) -> Result<()> {
     let workspace_dir = &config.data_dir;
     println!(
@@ -416,6 +467,7 @@ async fn handle_install(
     std::fs::create_dir_all(&skills_path)?;
 
     let gate = screening_gate_for(config, &source, accept_risk.clone());
+    let mode = install_mode_for(config, &source, force);
     let outcome = dispatch_install(
         config,
         &source,
@@ -423,16 +475,18 @@ async fn handle_install(
         &skills_path,
         no_tier_banner,
         &gate,
+        &mode,
     )
     .await;
 
     let report = match outcome {
         Ok(report) => report,
         Err(err) => {
-            // A screening denial surfaces as RiskAcceptanceRequired; show the
-            // report + hash and, on a TTY, offer to re-run with the override.
+            // A screening denial or update content-swap surfaces as
+            // RiskAcceptanceRequired; show the report + hash and, on a TTY,
+            // offer to re-run with the override.
             if let Some(risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
-                return handle_screening_denial(config, &source, no_tier_banner, risk).await;
+                return handle_screening_denial(config, &source, no_tier_banner, force, risk).await;
             }
             return Err(err);
         }
@@ -457,6 +511,7 @@ async fn handle_screening_denial(
     config: &crate::config::Config,
     source: &str,
     no_tier_banner: bool,
+    force: bool,
     risk: &RiskAcceptanceRequired,
 ) -> Result<()> {
     eprint!("{}", risk.report.render());
@@ -497,6 +552,7 @@ async fn handle_screening_denial(
     let workspace_dir = &config.data_dir;
     let skills_path = skills_dir(workspace_dir);
     let gate = screening_gate_for(config, source, Some(risk.staged_hash.clone()));
+    let mode = install_mode_for(config, source, force);
     let report = dispatch_install(
         config,
         source,
@@ -504,6 +560,7 @@ async fn handle_screening_denial(
         &skills_path,
         no_tier_banner,
         &gate,
+        &mode,
     )
     .await?;
 
@@ -594,7 +651,7 @@ fn resolve_tier_label(config: &crate::config::Config, source: &str, skill_name: 
 fn read_installed_skill_version(dir: &std::path::Path) -> Option<String> {
     for manifest in ["SKILL.toml", "manifest.toml"] {
         if let Ok(content) = std::fs::read_to_string(dir.join(manifest))
-            && let Ok(value) = content.parse::<toml::Value>()
+            && let Ok(value) = toml::from_str::<toml::Value>(&content)
             && let Some(version) = value
                 .get("skill")
                 .and_then(|s| s.get("version"))
@@ -715,6 +772,7 @@ async fn screen_remote_source(
         &skills_path,
         true,
         &SkillScreeningGate::disabled(),
+        &InstallMode::fresh(),
     )
     .await?;
     screen_skill_directory(&report.dir).context("failed to screen staged skill")

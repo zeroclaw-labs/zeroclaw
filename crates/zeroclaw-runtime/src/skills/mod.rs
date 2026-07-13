@@ -41,6 +41,8 @@ pub use screening::{
     FindingCategory, FindingImpact, RiskAcceptanceRequired, ScreeningFinding, ScreeningReport,
     SkillInstallReport, SkillScreeningGate, screen_skill_directory,
 };
+// Re-exported install-transaction types are defined in this module below;
+// `InstallMode` / `UpdateReview` need no explicit re-export here.
 pub use service::{
     EffectiveSkill, EffectiveSkillSet, RemoveMode, ServiceError, SkillOrigin, SkillSummary,
     SkillsService,
@@ -1998,7 +2000,10 @@ fn normalize_skill_name(s: &str) -> String {
         .collect()
 }
 
-fn clawhub_skill_dir_name(source: &str) -> Result<String> {
+/// The installed directory name a ClawHub source resolves to (the normalized
+/// slug). Public so the CLI can look up a skill's prior receipt before a
+/// `--force` update.
+pub fn clawhub_skill_dir_name(source: &str) -> Result<String> {
     if let Some(slug) = source.strip_prefix("clawhub:") {
         let slug = slug.trim().trim_end_matches('/');
         let base = slug.rsplit('/').next().unwrap_or(slug);
@@ -2297,23 +2302,68 @@ fn staged_tree_digest(dir: &Path) -> Result<String> {
     receipt::compute_tree_hash(dir)
 }
 
+/// Prior-install facts used to differentiate an update (task 2B): the version
+/// and content tree hash recorded in the old receipt.
+#[derive(Debug, Clone)]
+pub struct UpdateReview {
+    pub prior_version: Option<String>,
+    pub prior_tree_hash: String,
+}
+
+/// How an install treats an existing destination.
+#[derive(Debug, Clone, Default)]
+pub struct InstallMode {
+    /// Replace an existing skill via a journaled swap instead of failing.
+    force: bool,
+    /// Prior-receipt facts for the differentiated update review; `None` when
+    /// no prior receipt exists (a `--force` install over a legacy skill).
+    update: Option<UpdateReview>,
+}
+
+impl InstallMode {
+    /// A fresh install: fail if the destination already exists.
+    pub fn fresh() -> Self {
+        Self::default()
+    }
+
+    /// A forced (re)install with optional prior-receipt review context.
+    pub fn forced(update: Option<UpdateReview>) -> Self {
+        Self {
+            force: true,
+            update,
+        }
+    }
+}
+
 /// Begin a staged install transaction: acquire the per-skill lock, sweep
-/// stale leftovers, fail fast if the destination already exists, and create
-/// a fresh private staging directory.
+/// stale leftovers, check the destination, and create a fresh private staging
+/// directory.
 ///
 /// Returns `(lock, staged_dir, dest)`. The caller must keep the lock alive
-/// until after promote and remove `staged_dir` on any failure.
-fn begin_skill_install(skills_path: &Path, name: &str) -> Result<(InstallLock, PathBuf, PathBuf)> {
+/// until after promote and remove `staged_dir` on any failure. A pre-existing
+/// destination is an error unless `force` is set; a symlink at the destination
+/// is always an error (never followed).
+fn begin_skill_install(
+    skills_path: &Path,
+    name: &str,
+    force: bool,
+) -> Result<(InstallLock, PathBuf, PathBuf)> {
     let staging_root = skill_staging_root(skills_path)?;
     ensure_staging_root(&staging_root)?;
     let lock = InstallLock::acquire(&staging_root, name)?;
     sweep_stale_staging(&staging_root, Duration::from_secs(SKILL_STAGING_STALE_SECS));
 
     let dest = skills_path.join(name);
-    // Destination-exists check runs under the lock. `symlink_metadata` so a
-    // symlink at the destination is an error, not a follow.
-    if std::fs::symlink_metadata(&dest).is_ok() {
-        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    // Destination check runs under the lock. `symlink_metadata` so a symlink at
+    // the destination is an error, not a follow.
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("Destination skill path is a symlink: {}", dest.display());
+        }
+        Ok(_) if !force => {
+            anyhow::bail!("Destination skill already exists: {}", dest.display());
+        }
+        _ => {}
     }
 
     let staged = staging_root.join(format!("{name}-{:016x}", rand::random::<u64>()));
@@ -2330,9 +2380,16 @@ fn begin_skill_install(skills_path: &Path, name: &str) -> Result<(InstallLock, P
 ///
 /// Recomputes the staged-tree digest immediately before the rename and aborts
 /// on mismatch (a concurrently running process mutated the staged tree after
-/// it was audited). The destination no-clobber check is repeated here, still
-/// under the caller-held install lock.
-fn finish_skill_install(staged: &Path, dest: &Path, digest_after_checks: &str) -> Result<()> {
+/// it was audited). The destination check is repeated here, still under the
+/// caller-held install lock. With `force`, an existing destination is replaced
+/// via a journaled swap (move old aside → promote new); without it, an
+/// existing destination is an error.
+fn finish_skill_install(
+    staged: &Path,
+    dest: &Path,
+    digest_after_checks: &str,
+    force: bool,
+) -> Result<()> {
     let current = staged_tree_digest(staged)?;
     if current != digest_after_checks {
         anyhow::bail!(
@@ -2345,18 +2402,29 @@ fn finish_skill_install(staged: &Path, dest: &Path, digest_after_checks: &str) -
     }
 
     match std::fs::symlink_metadata(dest) {
-        Ok(_) => anyhow::bail!("Destination skill already exists: {}", dest.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to check install destination {}",
-                    dest.display().to_string()
-                )
-            });
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => promote_into_empty(staged, dest),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to check install destination {}",
+                dest.display().to_string()
+            )
+        }),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("Destination skill path is a symlink: {}", dest.display())
         }
+        Ok(_) if !force => {
+            anyhow::bail!("Destination skill already exists: {}", dest.display())
+        }
+        // Journaled swap: move the current skill aside, then promote the new
+        // one. A crash between the two renames leaves the old content in the
+        // trash directory (reclaimed by the stale-stage sweep) and never
+        // replaces a non-empty directory with a single rename [R5].
+        Ok(_) => journaled_swap(staged, dest),
     }
+}
 
+/// Promote `staged` into a `dest` that does not yet exist.
+fn promote_into_empty(staged: &Path, dest: &Path) -> Result<()> {
     match std::fs::rename(staged, dest) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
@@ -2388,6 +2456,55 @@ fn finish_skill_install(staged: &Path, dest: &Path, digest_after_checks: &str) -
             )
         }),
     }
+}
+
+/// Replace an existing `dest` with `staged` by ordered renames: move the
+/// current directory to a `.trash-<name>-<rand>` under the staging root, then
+/// promote the new one. On a promote failure the old content is restored from
+/// the trash so a failed update never loses the installed skill.
+fn journaled_swap(staged: &Path, dest: &Path) -> Result<()> {
+    let skills_path = dest
+        .parent()
+        .context("install destination has no parent directory")?;
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("install destination has no file name")?;
+    let staging_root = skill_staging_root(skills_path)?;
+    ensure_staging_root(&staging_root)?;
+    let trash = staging_root.join(format!(".trash-{name}-{:016x}", rand::random::<u64>()));
+
+    // Step 1: move the current skill aside.
+    std::fs::rename(dest, &trash).with_context(|| {
+        format!(
+            "failed to move current skill {} aside for update",
+            dest.display().to_string()
+        )
+    })?;
+
+    // Step 2: promote the new skill into the now-empty destination.
+    if let Err(err) = promote_into_empty(staged, dest) {
+        // Restore the old content so a failed update is not destructive.
+        if let Err(restore_err) = std::fs::rename(&trash, dest) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "skills.update.restore_failed",
+                        "dest": dest.display().to_string(),
+                        "trash": trash.display().to_string(),
+                        "error": restore_err.to_string(),
+                    })),
+                "failed to restore prior skill after a failed update; \
+                 prior content remains in the trash directory"
+            );
+        }
+        return Err(err);
+    }
+    // The trashed old content is left for the stale-stage sweep to reclaim, so
+    // it stays restorable for a bounded window after the swap.
+    Ok(())
 }
 
 /// Flush a freshly copied directory to disk. Best-effort: directory fsync is
@@ -2514,6 +2631,7 @@ fn audit_screen_promote(
     dest: &Path,
     allow_scripts: bool,
     gate: &screening::SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     let audit_report = enforce_skill_security_audit(staged_dir, allow_scripts)?;
     // The content tree hash (scheme v1) is the receipt's tree_hash, the
@@ -2522,8 +2640,23 @@ fn audit_screen_promote(
     // Screening runs after the structural audit, before promote. A denial the
     // user has not accepted (or `block`) surfaces as RiskAcceptanceRequired.
     let screening = gate.evaluate(staged_dir, &tree_hash)?;
+
+    // Differentiated update review (task 2B): compare against the prior
+    // receipt. A content swap that keeps the same version requires a
+    // content-bound override; an ordinary version bump proceeds.
+    if let Some(review) = &mode.update {
+        apply_update_review(
+            review,
+            staged_dir,
+            dest,
+            &tree_hash,
+            gate,
+            screening.as_ref(),
+        )?;
+    }
+
     let accepted_override = gate.matched_override(&tree_hash);
-    finish_skill_install(staged_dir, dest, &tree_hash)?;
+    finish_skill_install(staged_dir, dest, &tree_hash, mode.force)?;
     Ok(SkillInstallReport {
         dir: dest.to_path_buf(),
         files_scanned: audit_report.files_scanned,
@@ -2534,11 +2667,150 @@ fn audit_screen_promote(
     })
 }
 
+/// The differentiated update review (task 2B). `dest` still holds the OLD
+/// content at this point, so file-level add/remove/change counts are computed
+/// against it.
+///
+/// - version changed → ordinary update, proceed (print a summary).
+/// - version unchanged, content changed → content-swap warning; require a
+///   content-bound override (unless the gate is warn/off).
+/// - identical content → no-op, proceed.
+///
+// capability diff: RFC pending — a skill's capability request (Task 4) is not
+// modeled yet; when it lands, a capability expansion on update slots in here
+// as a further condition requiring fresh approval.
+fn apply_update_review(
+    review: &UpdateReview,
+    staged_dir: &Path,
+    dest: &Path,
+    new_hash: &str,
+    gate: &screening::SkillScreeningGate,
+    screening: Option<&screening::ScreeningReport>,
+) -> Result<()> {
+    let content_changed = review.prior_tree_hash != new_hash;
+    if !content_changed {
+        eprintln!(
+            "{}",
+            crate::i18n::get_required_cli_string("cli-skills-update-identical")
+        );
+        return Ok(());
+    }
+
+    let new_version = read_manifest_version(staged_dir);
+    let version_changed = review.prior_version != new_version;
+    let (added, removed, changed) = tree_file_diff(dest, staged_dir).unwrap_or((0, 0, 0));
+
+    if version_changed {
+        // Ordinary update: a version bump with changed content.
+        eprintln!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-update-version-changed",
+                &[
+                    ("old", review.prior_version.as_deref().unwrap_or("?")),
+                    ("new", new_version.as_deref().unwrap_or("?")),
+                    ("added", &added.to_string()),
+                    ("removed", &removed.to_string()),
+                    ("changed", &changed.to_string()),
+                ],
+            )
+        );
+        return Ok(());
+    }
+
+    // Content swap: same version, different content. Warn with the file-level
+    // diff and require a content-bound override in confirm/block mode.
+    eprintln!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-update-content-swap",
+            &[
+                ("version", new_version.as_deref().unwrap_or("?")),
+                ("added", &added.to_string()),
+                ("removed", &removed.to_string()),
+                ("changed", &changed.to_string()),
+            ],
+        )
+    );
+    if gate.enforces_override() && gate.matched_override(new_hash).is_none() {
+        return Err(screening::RiskAcceptanceRequired {
+            report: screening.cloned().unwrap_or_default(),
+            staged_hash: new_hash.to_string(),
+            blocked: gate.is_block(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// File-level `(added, removed, changed)` counts between an old and a new
+/// skill tree, comparing per-file content hashes. Best-effort — returns `None`
+/// on any read error.
+fn tree_file_diff(old_dir: &Path, new_dir: &Path) -> Option<(usize, usize, usize)> {
+    let old = file_hashes(old_dir).ok()?;
+    let new = file_hashes(new_dir).ok()?;
+    let mut added = 0;
+    let mut removed = 0;
+    let mut changed = 0;
+    for (rel, hash) in &new {
+        match old.get(rel) {
+            None => added += 1,
+            Some(old_hash) if old_hash != hash => changed += 1,
+            Some(_) => {}
+        }
+    }
+    for rel in old.keys() {
+        if !new.contains_key(rel) {
+            removed += 1;
+        }
+    }
+    Some((added, removed, changed))
+}
+
+/// Map of relative-path → content sha256 for every file under `dir`.
+fn file_hashes(dir: &Path) -> Result<HashMap<String, String>> {
+    use sha2::{Digest, Sha256};
+    let mut map = HashMap::new();
+    for path in audit::collect_paths_depth_first(dir)? {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(dir)
+            .unwrap_or(&path)
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        let content = std::fs::read(&path)?;
+        map.insert(rel, hex::encode(Sha256::digest(&content)));
+    }
+    Ok(map)
+}
+
+/// Best-effort read of a skill's declared version from its manifest.
+fn read_manifest_version(dir: &Path) -> Option<String> {
+    for manifest in ["SKILL.toml", "manifest.toml"] {
+        if let Ok(content) = std::fs::read_to_string(dir.join(manifest))
+            && let Ok(value) = toml::from_str::<toml::Value>(&content)
+            && let Some(version) = value
+                .get("skill")
+                .and_then(|s| s.get("version"))
+                .and_then(|v| v.as_str())
+        {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
 pub fn install_local_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
     gate: &screening::SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     let source_path = PathBuf::from(source);
     if !source_path.exists() {
@@ -2554,11 +2826,11 @@ pub fn install_local_skill_source(
         .file_name()
         .and_then(|name| name.to_str())
         .context("Source path must include a directory name")?;
-    let (_lock, staged, dest) = begin_skill_install(skills_path, name)?;
+    let (_lock, staged, dest) = begin_skill_install(skills_path, name, mode.force)?;
 
     let result = (|| {
         copy_dir_recursive_secure(&source_path, &staged)?;
-        audit_screen_promote(&staged, &dest, allow_scripts, gate)
+        audit_screen_promote(&staged, &dest, allow_scripts, gate, mode)
     })();
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staged);
@@ -2773,10 +3045,11 @@ pub fn install_git_skill_source(
     skills_path: &Path,
     allow_scripts: bool,
     gate: &screening::SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     validate_git_transport(source)?;
     let name = git_clone_dir_name(source)?;
-    let (_lock, staged, dest) = begin_skill_install(skills_path, &name)?;
+    let (_lock, staged, dest) = begin_skill_install(skills_path, &name, mode.force)?;
 
     let result = (|| {
         // Clone into an explicit target under the private staging directory —
@@ -2812,7 +3085,7 @@ pub fn install_git_skill_source(
         let resolution = receipt::git_head_sha(&cloned_dir);
         remove_git_metadata(&cloned_dir)?;
         ensure_tree_within_budget(&cloned_dir, MAX_SKILL_ZIP_BYTES)?;
-        let mut report = audit_screen_promote(&cloned_dir, &dest, allow_scripts, gate)?;
+        let mut report = audit_screen_promote(&cloned_dir, &dest, allow_scripts, gate, mode)?;
         report.resolution = resolution;
         Ok(report)
     })();
@@ -3081,11 +3354,12 @@ pub async fn install_clawhub_skill_source(
     skills_path: &Path,
     allow_scripts: bool,
     gate: &screening::SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     let download_url = clawhub_download_url(source)
         .with_context(|| format!("invalid ClawHub source: {source}"))?;
     let skill_dir_name = clawhub_skill_dir_name(source)?;
-    let (_lock, staged, dest) = begin_skill_install(skills_path, &skill_dir_name)?;
+    let (_lock, staged, dest) = begin_skill_install(skills_path, &skill_dir_name, mode.force)?;
 
     let result = async {
         let client = build_clawhub_http_client(true)?;
@@ -3132,7 +3406,7 @@ pub async fn install_clawhub_skill_source(
             )?;
         }
 
-        let mut report = audit_screen_promote(&staged, &dest, allow_scripts, gate)?;
+        let mut report = audit_screen_promote(&staged, &dest, allow_scripts, gate, mode)?;
         report.resolution = resolution;
         Ok(report)
     }
@@ -3313,6 +3587,7 @@ fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
     names
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn install_registry_skill_source(
     source: &str,
     skills_path: &Path,
@@ -3321,6 +3596,7 @@ pub fn install_registry_skill_source(
     registry_url: Option<&str>,
     suppress_tier_banner: bool,
     gate: &screening::SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
@@ -3353,6 +3629,7 @@ pub fn install_registry_skill_source(
         skills_path,
         allow_scripts,
         gate,
+        mode,
     )
 }
 
@@ -3394,6 +3671,7 @@ fn ensure_extra_registry(
 /// `registry:<name>/<skill>`. The named registry must be present, enabled, and
 /// of `kind = "git"`; it reuses the same git-clone registry mechanism as the
 /// default bare-name registry and then installs the skill locally.
+#[allow(clippy::too_many_arguments)]
 pub fn install_extra_registry_skill_source(
     source: &str,
     skills_path: &Path,
@@ -3402,6 +3680,7 @@ pub fn install_extra_registry_skill_source(
     extra_registries: &[zeroclaw_config::schema::ExternalRegistry],
     suppress_tier_banner: bool,
     gate: &screening::SkillScreeningGate,
+    mode: &InstallMode,
 ) -> Result<SkillInstallReport> {
     let (registry_name, skill_name) = parse_extra_registry_source(source).with_context(|| {
         format!("invalid extra-registry spec '{source}': expected 'registry:<name>/<skill>'")
@@ -3468,6 +3747,7 @@ pub fn install_extra_registry_skill_source(
         skills_path,
         allow_scripts,
         gate,
+        mode,
     )
 }
 
@@ -3964,6 +4244,7 @@ mod registry_tests {
             &[],
             true,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .expect_err("unknown registry must error before any git work");
         assert!(err.to_string().contains("nope"), "got: {err}");
@@ -4108,6 +4389,7 @@ mod install_transaction_tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use zeroclaw_config::schema::SkillScreenRemoteAction;
 
     /// Workspace layout: `<tmp>/ws/skills` plus the sibling staging root the
     /// transaction machinery derives from it.
@@ -4286,6 +4568,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .unwrap();
         assert_eq!(dest, skills.join("clean-skill"));
@@ -4310,6 +4593,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .expect_err("script-bearing skill must fail the audit");
         assert!(err.to_string().contains("audit failed"), "got: {err}");
@@ -4329,6 +4613,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .expect_err("existing destination must be rejected");
         assert!(err.to_string().contains("already exists"), "got: {err}");
@@ -4349,9 +4634,9 @@ mod install_transaction_tests {
         let dest = skills.join("linked");
         std::os::unix::fs::symlink(&elsewhere, &dest).unwrap();
 
-        let err = finish_skill_install(&staged, &dest, &digest)
+        let err = finish_skill_install(&staged, &dest, &digest, false)
             .expect_err("symlink at destination must be an error, not a follow");
-        assert!(err.to_string().contains("already exists"), "got: {err}");
+        assert!(err.to_string().contains("symlink"), "got: {err}");
         // The symlink target must be untouched.
         assert!(elsewhere.exists());
         assert!(staged.exists(), "staged tree is the caller's to clean up");
@@ -4371,6 +4656,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .expect_err("concurrent install of the same skill must fail fast");
         assert!(
@@ -4397,6 +4683,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .unwrap();
         assert!(dest.join("SKILL.md").is_file());
@@ -4422,6 +4709,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .unwrap();
 
@@ -4452,6 +4740,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .unwrap();
 
@@ -4500,7 +4789,7 @@ mod install_transaction_tests {
         write_clean_skill(&staged);
         let dest = skills.join("mutant");
 
-        let err = finish_skill_install(&staged, &dest, "not-the-real-digest")
+        let err = finish_skill_install(&staged, &dest, "not-the-real-digest", false)
             .expect_err("digest mismatch must abort the promote");
         assert!(
             err.to_string()
@@ -4517,9 +4806,14 @@ mod install_transaction_tests {
             "http://example.invalid/owner/repo.git",
             "git://example.invalid/owner/repo.git",
         ] {
-            let err =
-                install_git_skill_source(source, &skills, false, &SkillScreeningGate::disabled())
-                    .expect_err("insecure git transport must be rejected before any clone");
+            let err = install_git_skill_source(
+                source,
+                &skills,
+                false,
+                &SkillScreeningGate::disabled(),
+                &InstallMode::fresh(),
+            )
+            .expect_err("insecure git transport must be rejected before any clone");
             assert!(
                 err.to_string().contains("no integrity in transit"),
                 "{source}: got: {err}"
@@ -4697,6 +4991,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .unwrap();
         assert!(!report.tree_hash.is_empty());
@@ -4762,6 +5057,7 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .unwrap();
         assert!(
@@ -4801,12 +5097,242 @@ mod install_transaction_tests {
             &skills,
             false,
             &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
         )
         .expect_err("script-bearing clone must fail the audit");
         assert!(err.to_string().contains("audit failed"), "got: {err}");
         // The final skills tree never saw the content, and staging is clean.
         assert!(!skills.join("evil-skill").exists());
         assert!(staging_entries(&staging).is_empty());
+    }
+    // ── Task 2B: transactional update / reinstall ───────────────────────────
+
+    /// An update whose new content carries an embedded AWS key (a Denial) but
+    /// passes the structural audit, used to exercise the update override gate.
+    fn write_versioned_skill(root: &Path, name: &str, version: &str, body: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.toml"),
+            format!("[skill]\nname = \"{name}\"\ndescription = \"d\"\nversion = \"{version}\"\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("SKILL.md"), body).unwrap();
+        dir
+    }
+
+    /// Install a versioned skill locally and return its report.
+    fn install_versioned(
+        skills: &Path,
+        source: &Path,
+        gate: &SkillScreeningGate,
+        mode: &InstallMode,
+    ) -> Result<SkillInstallReport> {
+        install_local_skill_source(source.to_str().unwrap(), skills, false, gate, mode)
+    }
+
+    #[test]
+    fn force_install_over_existing_swaps_content() {
+        let (tmp, skills, staging) = setup();
+        let v1 = write_versioned_skill(tmp.path(), "up", "0.1.0", "# v1\nold body\n");
+        install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+        assert!(
+            skills.join("up/SKILL.md").exists()
+                && fs::read_to_string(skills.join("up/SKILL.md"))
+                    .unwrap()
+                    .contains("old body")
+        );
+
+        // Prepare a v2 source under a temp dir named "up" (same dest name).
+        let src2_root = tmp.path().join("src2");
+        let v2 = write_versioned_skill(&src2_root, "up", "0.2.0", "# v2\nnew body\n");
+        let review = UpdateReview {
+            prior_version: Some("0.1.0".to_string()),
+            prior_tree_hash: receipt::compute_tree_hash(&v1).unwrap(),
+        };
+        let report = install_versioned(
+            &skills,
+            &v2,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::forced(Some(review)),
+        )
+        .unwrap();
+        assert!(report.dir.join("SKILL.md").is_file());
+        assert!(
+            fs::read_to_string(skills.join("up/SKILL.md"))
+                .unwrap()
+                .contains("new body"),
+            "new content must be promoted"
+        );
+        // Old content is preserved in a trash dir (restorable until sweep).
+        let trash: Vec<_> = staging_entries(&staging)
+            .into_iter()
+            .filter(|e| e.starts_with(".trash-up-"))
+            .collect();
+        assert_eq!(trash.len(), 1, "old content must be trashed, not deleted");
+    }
+
+    #[test]
+    fn force_install_without_force_flag_still_fails_on_existing() {
+        let (tmp, skills, _) = setup();
+        let v1 = write_versioned_skill(tmp.path(), "up", "0.1.0", "# v1\n");
+        install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+        let err = install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .expect_err("a non-force reinstall must fail that the skill exists");
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+    }
+
+    #[test]
+    fn content_swap_same_version_requires_override_under_confirm() {
+        let (tmp, skills, _) = setup();
+        let v1 = write_versioned_skill(tmp.path(), "up", "0.1.0", "# v1\nold\n");
+        install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+
+        // Same version, different content → content swap.
+        let src2 = tmp.path().join("src2");
+        let v2 = write_versioned_skill(&src2, "up", "0.1.0", "# v1\nswapped\n");
+        let review = UpdateReview {
+            prior_version: Some("0.1.0".to_string()),
+            prior_tree_hash: receipt::compute_tree_hash(&v1).unwrap(),
+        };
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None);
+        let err = install_versioned(&skills, &v2, &gate, &InstallMode::forced(Some(review)))
+            .expect_err("a content swap under confirm must require an override");
+        assert!(err.downcast_ref::<RiskAcceptanceRequired>().is_some());
+        // The old content stays installed (the swap was refused pre-promote).
+        assert!(
+            fs::read_to_string(skills.join("up/SKILL.md"))
+                .unwrap()
+                .contains("old")
+        );
+    }
+
+    #[test]
+    fn ordinary_version_bump_needs_no_override() {
+        let (tmp, skills, _) = setup();
+        let v1 = write_versioned_skill(tmp.path(), "up", "0.1.0", "# v1\nold\n");
+        install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+
+        let src2 = tmp.path().join("src2");
+        let v2 = write_versioned_skill(&src2, "up", "0.2.0", "# v2\nnew\n");
+        let review = UpdateReview {
+            prior_version: Some("0.1.0".to_string()),
+            prior_tree_hash: receipt::compute_tree_hash(&v1).unwrap(),
+        };
+        // Even under confirm, a version bump with no Denial proceeds.
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None);
+        let report =
+            install_versioned(&skills, &v2, &gate, &InstallMode::forced(Some(review))).unwrap();
+        assert!(
+            fs::read_to_string(report.dir.join("SKILL.md"))
+                .unwrap()
+                .contains("new")
+        );
+    }
+
+    #[test]
+    fn content_swap_with_matching_override_installs() {
+        let (tmp, skills, _) = setup();
+        let v1 = write_versioned_skill(tmp.path(), "up", "0.1.0", "# v1\nold\n");
+        install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+
+        let src2 = tmp.path().join("src2");
+        let v2 = write_versioned_skill(&src2, "up", "0.1.0", "# v1\nswapped\n");
+        let new_hash = receipt::compute_tree_hash(&v2).unwrap();
+        let review = UpdateReview {
+            prior_version: Some("0.1.0".to_string()),
+            prior_tree_hash: receipt::compute_tree_hash(&v1).unwrap(),
+        };
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, Some(new_hash));
+        let report =
+            install_versioned(&skills, &v2, &gate, &InstallMode::forced(Some(review))).unwrap();
+        assert!(
+            fs::read_to_string(report.dir.join("SKILL.md"))
+                .unwrap()
+                .contains("swapped")
+        );
+    }
+
+    #[test]
+    fn journaled_swap_restores_old_content_on_promote_failure() {
+        // If the promote step fails after the old content is trashed, the old
+        // content is restored so the update is non-destructive.
+        let (_tmp, skills, _) = setup();
+        let dest = skills.join("up");
+        write_clean_skill(&dest);
+        fs::write(dest.join("SKILL.md"), "# original\n").unwrap();
+
+        // A staged path that does not exist → promote_into_empty fails.
+        let staging = skill_staging_root(&skills).unwrap();
+        ensure_staging_root(&staging).unwrap();
+        let missing_staged = staging.join("up-doesnotexist");
+
+        let err = journaled_swap(&missing_staged, &dest)
+            .expect_err("promote of a missing staged dir must fail");
+        assert!(err.to_string().contains("promote") || err.to_string().contains("rename"));
+        // Old content restored.
+        assert_eq!(
+            fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "# original\n",
+            "prior skill must be restored after a failed update"
+        );
+    }
+
+    #[test]
+    fn trash_from_update_is_swept_when_stale() {
+        let (tmp, skills, _) = setup();
+        let staging = skill_staging_root(&skills).unwrap();
+        ensure_staging_root(&staging).unwrap();
+        let trash = staging.join(".trash-up-deadbeefdeadbeef");
+        write_clean_skill(&trash);
+        backdate(&trash, SKILL_STAGING_STALE_SECS + 60);
+
+        // A fresh install of a different skill triggers the stale sweep.
+        let src = tmp.path().join("other");
+        write_clean_skill(&src);
+        install_versioned(
+            &skills,
+            &src,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+        assert!(!trash.exists(), "stale update trash must be swept");
     }
 }
 
@@ -4849,8 +5375,14 @@ mod screening_gate_tests {
         let source = write_denial_skill(tmp.path(), "denial-skill");
         let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None);
 
-        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect_err("denial without override must abort");
+        let err = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect_err("denial without override must abort");
         let risk = err
             .downcast_ref::<RiskAcceptanceRequired>()
             .expect("must surface RiskAcceptanceRequired");
@@ -4870,8 +5402,14 @@ mod screening_gate_tests {
         let hash = staged_hash_of(&source);
         let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, Some(hash));
 
-        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect("matching content-bound override must install");
+        let report = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect("matching content-bound override must install");
         assert!(report.dir.join("SKILL.md").is_file());
         assert!(report.screening.is_some_and(|r| r.has_denial()));
     }
@@ -4885,8 +5423,14 @@ mod screening_gate_tests {
             Some("stale-hash-that-does-not-match".to_string()),
         );
 
-        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect_err("a stale override hash must be rejected");
+        let err = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect_err("a stale override hash must be rejected");
         assert!(err.downcast_ref::<RiskAcceptanceRequired>().is_some());
         assert!(!skills.join("denial-skill").exists());
     }
@@ -4899,8 +5443,14 @@ mod screening_gate_tests {
         // Even a correct hash cannot override `block`.
         let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, Some(hash));
 
-        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect_err("block must reject even with a matching hash");
+        let err = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect_err("block must reject even with a matching hash");
         let risk = err.downcast_ref::<RiskAcceptanceRequired>().unwrap();
         assert!(risk.blocked);
         assert!(!skills.join("denial-skill").exists());
@@ -4913,8 +5463,14 @@ mod screening_gate_tests {
         // Local action tops out at warn — a denial signal installs anyway.
         let gate = SkillScreeningGate::for_local(SkillScreenLocalAction::Warn);
 
-        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect("local screening must never block");
+        let report = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect("local screening must never block");
         assert!(report.dir.join("SKILL.md").is_file());
         assert!(
             report.screening.is_some_and(|r| r.has_denial()),
@@ -4928,8 +5484,14 @@ mod screening_gate_tests {
         let source = write_denial_skill(tmp.path(), "denial-skill");
         let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Off, None);
 
-        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect("screening off must install without scanning");
+        let report = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect("screening off must install without scanning");
         assert!(report.screening.is_none());
         assert!(report.dir.join("SKILL.md").is_file());
     }
@@ -4940,8 +5502,14 @@ mod screening_gate_tests {
         let source = write_denial_skill(tmp.path(), "denial-skill");
         let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Warn, None);
 
-        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
-            .expect("warn must install");
+        let report = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect("warn must install");
         assert!(report.screening.is_some_and(|r| !r.is_clean()));
         assert!(report.dir.join("SKILL.md").is_file());
     }
