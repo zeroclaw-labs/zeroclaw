@@ -3,8 +3,8 @@
 //! system). This is a *risky* capability and will be wrapped behind a per-app
 //! approval allowlist when the full NodeClient lands (#6321 / #6499).
 //!
-//! For now, callers (the dashboard devtools console during testing) take
-//! responsibility for not running scripts they wouldn't run themselves.
+//! Gateway-served content has no remote Tauri capability and cannot invoke this
+//! command. Any future caller must provide a separately reviewed ACL boundary.
 
 #[cfg(target_os = "macos")]
 use std::process::Command;

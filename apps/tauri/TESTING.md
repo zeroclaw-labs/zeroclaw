@@ -105,21 +105,19 @@ open /Applications/ZeroClaw.app
 - Quit from the tray → relaunch → splash → dashboard again (tray icon persists
   in the menu bar).
 
-### Agent capabilities still present (not part of setup)
-- `take_screenshot` (gated by the Screen Recording TCC check in
-  `apps/tauri/src/macos/permissions.rs::check_screen_recording`)
-- `run_applescript` (gated by the Automation TCC prompt)
+### Native command boundary
 
-These are invoked by the agent/dashboard at runtime; macOS shows its own native
-permission prompt the first time each is used. There is no in-app wizard for
-them anymore.
+The Rust app still registers `take_screenshot` and `run_applescript`, but the
+gateway-served main window receives no remote Tauri capability and cannot invoke
+them. Exposing either command requires a separate, narrowly scoped approval and
+ACL design.
 
 ## Linux / Windows
 
 The app builds and runs the same splash → gateway → Quickstart flow. Bundle
 targets are unchanged (`.deb`/`.AppImage` on Linux, `.exe`/`.msi` on Windows).
 Screen capture and AppleScript capabilities remain macOS-only; the other
-platforms simply don't register them.
+platforms register stubs that return an unsupported-platform error.
 
 ### How to build
 ```sh
