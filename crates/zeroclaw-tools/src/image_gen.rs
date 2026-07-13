@@ -469,15 +469,10 @@ impl ImageGenTool {
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .redirect(redirect_policy)
-            .resolve_to_addrs(
-                &validated_image_url,
-                &validated_addrs,
-            )
+            .resolve_to_addrs(&validated_image_url, &validated_addrs)
             .build()
             .map_err(|e| {
-                anyhow::Error::msg(format!(
-                    "Failed to build secure image download client: {e}"
-                ))
+                anyhow::Error::msg(format!("Failed to build secure image download client: {e}"))
             })?;
 
         // ── Download image ─────────────────────────────────────────
