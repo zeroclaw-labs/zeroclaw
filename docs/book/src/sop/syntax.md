@@ -49,7 +49,7 @@ deterministic = false          # optional; when true, overrides execution_mode t
 | `auto` | Execute all steps without human approval. |
 | `supervised` | Request approval before starting, then execute all steps. |
 | `step_by_step` | Request approval before each step. |
-| `priority_based` | `critical`/`high` → auto; `normal`/`low` → supervised. |
+| `priority_based` | `critical`/`high` → step-by-step approval; `normal`/`low` → supervised (first-step approval). |
 | `deterministic` | Execute steps sequentially without LLM round-trips. Step outputs pipe as inputs to the next step. Checkpoint steps pause for human approval. |
 
 ### `[[triggers]]`
@@ -88,7 +88,7 @@ title = "Deploy"
 body = "Run deployment command."
 suggested_tools = ["shell"]
 requires_confirmation = true
-on_failure = "retry:2"
+on_failure = { retry = { max = 2 } }
 ```
 
 When both `[[steps]]` in TOML and `## Steps` in `SOP.md` are present, the `SOP.md` steps take precedence.
@@ -126,8 +126,9 @@ Parser behavior:
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
 - `- when:` adds a guard condition evaluated against accumulated run data
-  (same syntax as trigger `condition`). The step is marked `pending` instead of
-  dispatched when the guard does not hold. Example: `- when: $.steps.1.ok == true`
+  (same syntax as trigger `condition`). When the guard evaluates false, the
+  engine falls through to the next linear step instead of dispatching the
+  guarded step. Example: `- when: $.steps.1.ok == true`
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
@@ -184,52 +185,7 @@ through the explicit `apply` action.
 
 For the live-versus-unwired status of each source and the transport details, see [SOP Fan-In](./fan-in/overview.md).
 
-## 5. Condition Syntax
-
-`condition` is evaluated fail-closed (invalid condition/payload => no match).
-
-- JSON path comparisons: `$.value > 85`, `$.status == "critical"`
-- Nested path comparisons: `$.sensor.temperature >= 30`, `$.event.type != "heartbeat"`
-- Direct numeric comparisons: `> 0` (useful for simple payloads)
-- Operators: `>=`, `<=`, `!=`, `>`, `<`, `==`
-
-The same syntax applies to:
-
-- Trigger `condition` fields, evaluated against the incoming event payload.
-- Step `when` guards, evaluated against accumulated run data
-  (e.g., `$.steps.3.ok == true` checks whether step 3 completed successfully).
-
-### Condition examples
-
-```toml
-# MQTT trigger: only fire when the temperature reading exceeds threshold
-[[triggers]]
-type = "mqtt"
-topic = "sensors/temperature/#"
-condition = "$.value > 85"
-
-# Filesystem trigger: only when files were actually changed
-[[triggers]]
-type = "filesystem"
-path = "config/*.toml"
-events = ["modified"]
-condition = "$.changed > 0"
-
-# Peripheral trigger: match a specific board signal with a threshold
-[[triggers]]
-type = "peripheral"
-board = "rpi-4b"
-signal = "gpio-17"
-condition = "> 0"
-
-# Channel trigger: only for opened PRs on a specific alias
-[[triggers]]
-type = "channel"
-topic = "git.upstream:pull_request.opened"
-condition = "$.action == "opened""
-```
-
-## 6. Validation
+## 5. Validation
 
 Use:
 
