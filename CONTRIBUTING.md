@@ -35,7 +35,7 @@ For the full mechanics — code style, testing levels, PR template requirements,
 
 ## Keep contributions moving
 
-Submitting an issue or pull request starts a conversation. Contributors are not expected to respond immediately; the policies below explain how inactive work is handled.
+Contributors are not expected to respond instantly, but should remain in contact throughout the review process to avoid their contributions becoming inactive. The policies below explain contributor expectations and how inactive work is handled.
 
 **Pull requests:** Respond to actionable review feedback. Resolve conflicts or update your branch when a maintainer asks, or leave a comment explaining what is blocking you. A PR that remains unresponsive after a documented author-action request and follow-up period may be closed for backlog hygiene. Closing the PR does not reject the underlying bug or idea. If the work remains valuable, maintainers may carry it forward through a takeover or superseding PR while preserving contributor attribution. See [PR backlog pruning](docs/book/src/maintainers/reviewer-playbook.md#pr-backlog-pruning) and [Superseding PRs](docs/book/src/maintainers/superseding.md).
 
