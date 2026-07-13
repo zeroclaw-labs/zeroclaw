@@ -1877,7 +1877,11 @@ mod tests {
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 3);
         for tc in tool_calls {
-            assert_eq!(tc.function.arguments, "{}", "non-object arg for {} must normalize to empty object", tc.function.name);
+            assert_eq!(
+                tc.function.arguments, "{}",
+                "non-object arg for {} must normalize to empty object",
+                tc.function.name
+            );
         }
     }
 
