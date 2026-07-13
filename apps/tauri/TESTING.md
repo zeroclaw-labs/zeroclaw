@@ -40,15 +40,18 @@ with nothing pre-installed and get a running agent — bundle the kernel as a
 sidecar:
 
 ```sh
-# 1. Build (or reuse) the kernel and stage it for the bundler.
-scripts/desktop/prepare-kernel.sh                          # host triple
-scripts/desktop/prepare-kernel.sh --target universal-apple-darwin  # mac universal
-# Reuse an existing kernel instead of rebuilding (single-target only):
-ZEROCLAW_KERNEL_PATH=~/.cargo/bin/zeroclaw scripts/desktop/prepare-kernel.sh
+# 1. Build the dashboard, then embed it in the staged kernel.
+cargo web build
+scripts/desktop/prepare-kernel.sh --features embedded-web
+scripts/desktop/prepare-kernel.sh --target universal-apple-darwin --features embedded-web
 
 # 2. Bundle with the sidecar overlay (adds bundle.externalBin).
 cd apps/tauri && cargo tauri build --config tauri.bundled.conf.json
 ```
+
+`ZEROCLAW_KERNEL_PATH` can reuse a prebuilt single-target kernel, but that
+binary must already have been built with `--features embedded-web`; the staging
+script cannot add embedded assets to an existing executable.
 
 The overlay keeps the default config untouched, so `cargo tauri build`
 without the staged kernel keeps working. Tauri places the sidecar next to the
