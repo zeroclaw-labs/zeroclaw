@@ -3408,4 +3408,66 @@ data: {\"type\":\"message_stop\"}\n\n";
             );
         }
     }
+
+    #[tokio::test]
+    async fn anthropic_factory_forwards_timeout_to_native_provider() {
+        use crate::factory::FamilyProviderFactory;
+        use crate::ModelProviderRuntimeOptions;
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::time::{Duration, Instant};
+        use zeroclaw_config::schema::AnthropicModelProviderConfig;
+
+        async fn slow_messages() -> Json<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(json!({
+                "id": "msg_late",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "too late"}],
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new().route("/v1/messages", post(slow_messages));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = AnthropicModelProviderConfig::default()
+            .create_provider(
+                "native",
+                Some("test-key"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("anthropic provider should build");
+
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hello", "claude-sonnet-4-5", Some(0.7))
+            .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "slow response should time out when factory forwards provider_timeout_secs"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+        );
+    }
 }
