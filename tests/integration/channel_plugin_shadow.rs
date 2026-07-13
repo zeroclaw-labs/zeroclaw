@@ -273,8 +273,12 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     // Positive control: without a native collision, the actual component is
     // instantiated and its configure export emits the marker through the host
     // logging import.
-    let built =
-        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new()).await;
+    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &config,
+        &HashSet::new(),
+        None,
+    )
+    .await;
     assert_eq!(built.len(), 1, "unshadowed fixture is instantiated");
     let marker = receive_configure_marker(&mut rx).await;
     assert_eq!(marker["message"], CONFIGURE_MARKER);
@@ -284,7 +288,12 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     // already occupied. The builder must reject it before `from_wasm`, so no
     // guest startup export can emit the marker.
     let occupied = HashSet::from([PLUGIN_NAME.to_string()]);
-    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &occupied).await;
+    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &config,
+        &occupied,
+        None,
+    )
+    .await;
     assert!(built.is_empty(), "shadowed plugin is not registered");
 
     while let Ok(event) = rx.try_recv() {
