@@ -15,6 +15,51 @@ use std::sync::Arc;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::Config;
 
+#[cfg(feature = "plugins-wasm")]
+fn load_plugin_host(config: &Config) -> Option<zeroclaw_plugins::host::PluginHost> {
+    let plugin_path = config.plugins.resolved_plugins_dir();
+    if !config.plugins.enabled || !plugin_path.exists() {
+        return None;
+    }
+
+    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
+    match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+        &plugin_path,
+        signature_mode,
+        trusted_publisher_keys,
+    ) {
+        Ok(host) => Some(host),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "error": format!("{}", e) })),
+                "Failed to load WASM channel plugins"
+            );
+            None
+        }
+    }
+}
+
+/// Return whether canonical plugin configuration and installed manifests expose
+/// at least one WASM-backed channel for the daemon to supervise.
+#[cfg(feature = "plugins-wasm")]
+#[must_use]
+pub(crate) fn has_channel_plugins(config: &Config) -> bool {
+    load_plugin_host(config).is_some_and(|host| !host.channel_plugin_details().is_empty())
+}
+
+/// Builds without a WASM host cannot contribute plugin channels.
+#[cfg(not(feature = "plugins-wasm"))]
+#[must_use]
+pub(crate) fn has_channel_plugins(_config: &Config) -> bool {
+    false
+}
+
 /// Instantiate every unshadowed installed channel plugin as an `(id, channel)`
 /// pair.
 ///
@@ -39,31 +84,8 @@ pub async fn build_channel_plugins(
     config: &Config,
     native_channel_ids: &HashSet<String>,
 ) -> Vec<(String, Arc<dyn Channel>)> {
-    let plugin_path = config.plugins.resolved_plugins_dir();
-    if !config.plugins.enabled || !plugin_path.exists() {
+    let Some(host) = load_plugin_host(config) else {
         return Vec::new();
-    }
-
-    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
-        &config.plugins.security.signature_mode,
-    );
-    let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
-    let host = match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
-        &plugin_path,
-        signature_mode,
-        trusted_publisher_keys,
-    ) {
-        Ok(host) => host,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({ "error": format!("{}", e) })),
-                "Failed to load WASM channel plugins"
-            );
-            return Vec::new();
-        }
     };
 
     let limits = zeroclaw_plugins::component::PluginLimits {
@@ -141,6 +163,7 @@ pub async fn build_channel_plugins(
     Vec::new()
 }
 
+#[cfg(any(test, feature = "plugins-wasm"))]
 fn should_build_channel_plugin(plugin_name: &str, native_channel_ids: &HashSet<String>) -> bool {
     !native_channel_ids.contains(plugin_name)
 }
