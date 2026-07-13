@@ -24,6 +24,7 @@ ADR and mark the old one as superseded rather than rewriting history.
 | [ADR-002](./ADR-002-trait-driven-extensibility.md) | accepted | First-party extension surfaces use explicit trait contracts. |
 | [ADR-003](./ADR-003-wasm-plugin-model.md) | superseded by [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | WASM plugins initially used Extism as the execution bridge. |
 | [ADR-004](./ADR-004-tool-shared-state-ownership.md) | accepted | Tool-held shared state follows daemon-owned identity, handle ownership, isolation, and reload rules. |
+| [ADR-008](./ADR-008-goal-mode-control-plane-and-usage-accounting.md) | accepted | Goal mode uses the durable task control plane and canonical usage ledger. |
 | [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | accepted | WIT components and direct `wasmtime` replace the Extism plugin bridge. |
 
 ## Planned Retroactive ADRs
