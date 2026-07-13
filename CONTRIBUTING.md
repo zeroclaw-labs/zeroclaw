@@ -35,11 +35,11 @@ For the full mechanics — code style, testing levels, PR template requirements,
 
 ## Keep contributions moving
 
-Submitting an issue or pull request starts a conversation. You do not need to be constantly available, but please say when you need to pause so maintainers know whether to wait, help, or make another plan.
+Submitting an issue or pull request starts a conversation. Contributors are not expected to respond immediately; the policies below explain how inactive work is handled.
 
 **Pull requests:** Respond to actionable review feedback. Resolve conflicts or update your branch when a maintainer asks, or leave a comment explaining what is blocking you. A PR that remains unresponsive after a documented author-action request and follow-up period may be closed for backlog hygiene. Closing the PR does not reject the underlying bug or idea. If the work remains valuable, maintainers may carry it forward through a takeover or superseding PR while preserving contributor attribution. See [PR backlog pruning](docs/book/src/maintainers/reviewer-playbook.md#pr-backlog-pruning) and [Superseding PRs](docs/book/src/maintainers/superseding.md).
 
-**Issues:** The original reporter is not the only person who can show that an issue remains relevant. A substantive update from any participant, such as a current reproduction, logs, or a concrete affected use case, can keep the issue active; a generic `+1` cannot. Issues without current evidence may close for backlog hygiene, but updated evidence can support reopening the issue or filing a new one. See the [issue stale policy](docs/book/src/maintainers/labels.md#issue-stale-policy) for the canonical rules.
+**Issues:** If you open an issue, follow the discussion when you can and add new details as they become available. Other participants may also provide evidence that the issue remains relevant. A substantive update, such as a current reproduction, logs, or a concrete affected use case, can keep it active; a generic `+1` cannot. Issues without current evidence may close for backlog hygiene, but updated evidence can support reopening the issue or filing a new one. See the [issue stale policy](docs/book/src/maintainers/labels.md#issue-stale-policy) for the canonical rules.
 
 ## Development setup
 
