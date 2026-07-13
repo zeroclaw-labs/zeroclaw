@@ -914,6 +914,60 @@ channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-current-model-status =
+    Current model_provider: `{ $provider }`
+    Current model: `{ $model }`
+channel-runtime-model-switch-hint = Switch model with `/model <model-id>` or `/model <hint>`.
+channel-runtime-provider-switch-hint = Switch model_provider with `/models <model_provider>`.
+channel-runtime-available-providers-header = Available model_providers:
+channel-runtime-configured-routes-header = Configured model routes:
+channel-runtime-no-cached-models = No cached model list found for `{ $provider }`. Ask the operator to run `zeroclaw models refresh --model-provider { $provider }`.
+channel-runtime-cached-model-ids-header = Cached model IDs (top { $count }):
+channel-runtime-config-switch-hints =
+    Use `/models <model_provider>` to switch model_provider.
+    Use `/model <model-id>` to switch model.
+channel-runtime-config-block-title =
+    { "*" }Model Configuration{ "*" }
+    Current: `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = Select model_provider
+channel-runtime-config-select-model-placeholder = Select model
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *Model*
+channel-runtime-scope-user = user
+channel-runtime-scope-agent = agent
+channel-runtime-scope-overrides-summary =
+    { "**" }Model overrides{ "**" } (session-only; precedence user > agent > session > default):
+    • user: { $user }
+    • agent: { $agent }
+    • session (this chat): { $session }
+    • default (config): { $default }
+    Set a scope with `/model --user|--agent <model-id>`; clear by setting it back to the default.
+channel-runtime-set-provider-switched =
+    ModelProvider switched to `{ $provider }` for this sender session. Current model is `{ $model }`.
+    Use `/model <model-id>` to set a provider-compatible model.
+channel-runtime-set-provider-init-failed =
+    Failed to initialize model_provider `{ $provider }`. Route unchanged.
+    Details: { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
+channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
+channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.
+channel-runtime-scoped-model-empty = Model ID cannot be empty. Use `/model --user|--agent <model-id>`.
+channel-runtime-scoped-model-switched = Model set to `{ $model }` (model_provider: `{ $provider }`) for the **{ $scope }** scope. Session-only — resets on restart.
+channel-runtime-shadow-note = ⚠️ A higher-precedence override is active, so messages will use `{ $model }` (`{ $provider }`) instead — see `/model`.
+channel-runtime-thinking-set =
+    Thinking set to `{ $level }` for this sender session.
+    Use `/thinking reset` to return to the agent default.
+channel-runtime-thinking-cleared = Thinking override cleared. Using agent default `{ $default }` for this sender session.
+channel-runtime-thinking-default =
+    Thinking is already using agent default `{ $default }` for this sender session.
+    Use `/thinking high`, `/thinking max`, or `/thinking off` to override it.
+channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`.
+channel-runtime-provider-turn-init-failed =
+    ⚠️ Failed to initialize model_provider `{ $provider }`. Please run `/models` to choose another model_provider.
+    Details: { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
+    Switch model: /models
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
 cli-alias-list-empty = (no entries under {$section})

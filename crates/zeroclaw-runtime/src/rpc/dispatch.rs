@@ -945,10 +945,34 @@ impl RpcDispatcher {
         {
             let store_cloned = store.clone();
             let sid = session_id.clone();
-            if let Ok(Ok(Some(data))) =
-                tokio::task::spawn_blocking(move || store_cloned.load_session(&sid)).await
+            match tokio::task::spawn_blocking(move || store_cloned.load_session_for_restore(&sid))
+                .await
             {
-                preloaded_acp = Some(data);
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => {
+                    if data.agent_alias != req.agent_alias {
+                        return Err(rpc_err(
+                            INVALID_PARAMS,
+                            "ACP session belongs to a different agent",
+                        ));
+                    }
+                    preloaded_acp = Some(data);
+                }
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => {}
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                }
+                Ok(Err(e)) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session: {e}"),
+                    ));
+                }
+                Err(join) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session: {join}"),
+                    ));
+                }
             }
         }
 
@@ -1113,6 +1137,16 @@ impl RpcDispatcher {
                 };
                 match loaded {
                     Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        if data.agent_alias != req.agent_alias {
+                            if let Some(ref hooks) = self.ctx.hooks {
+                                hooks.fire_session_end(&session_id, "rpc").await;
+                            }
+                            self.ctx.sessions.remove(&session_id).await;
+                            return Err(rpc_err(
+                                INVALID_PARAMS,
+                                "ACP session belongs to a different agent",
+                            ));
+                        }
                         message_count = data.messages.len();
                         self.ctx
                             .sessions
@@ -7011,6 +7045,86 @@ mod tests {
         assert!(
             sessions.get_agent(sid).await.is_none(),
             "failed rehydrate must leave the session absent from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn killed_acp_session_new_resume_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-killed-resume-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the original ACP session");
+        dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("session/kill should succeed");
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await;
+
+        assert!(
+            resumed.is_err(),
+            "session/new must not revive a killed ACP session"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "rejected resume must leave the killed session absent from memory"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "rejected resume must preserve durable history"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_resume_rejects_agent_alias_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-alias-mismatch-001";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent")
+            .expect("test should seed durable ACP session");
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent-2",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await;
+
+        let err = resumed.expect_err("session/new must reject ACP alias mismatches");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "rejected mismatched resume must not create a live session"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "rejected mismatched resume must preserve durable history"
         );
     }
 
