@@ -2,7 +2,7 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
-use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
+use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +61,11 @@ pub(crate) async fn consume_provider_streaming_response(
     let mut delta_sender = on_delta;
     let mut text_guard = StreamTextGuard::new(request_tools);
     let mut think_stripper = StreamThinkTagStripper::default();
+    // Streaming-safe stripper for trailing provider/model end-of-message
+    // markers like `<eom>` / `<|eom|>` (issue #9006). Sits between the think
+    // stripper and the text guard so transcript display, persisted history,
+    // and forwarded live deltas all observe a single canonical clean text.
+    let mut terminal_marker_stripper = StreamTerminalMarkerStripper::default();
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -229,6 +234,11 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 }
 
+                let sanitized_delta = terminal_marker_stripper.push(&sanitized_delta);
+                if sanitized_delta.is_empty() {
+                    continue;
+                }
+
                 outcome.response_text.push_str(&sanitized_delta);
 
                 if strict_tool_parsing {
@@ -247,10 +257,27 @@ pub(crate) async fn consume_provider_streaming_response(
 
     let trailing_delta = think_stripper.finish();
     if !trailing_delta.is_empty() {
-        outcome.response_text.push_str(&trailing_delta);
+        let trailing_delta = terminal_marker_stripper.push(&trailing_delta);
+        if !trailing_delta.is_empty() {
+            outcome.response_text.push_str(&trailing_delta);
+            if strict_tool_parsing {
+                forward_visible!(trailing_delta, false);
+            } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
+                forward_visible!(forward_text, false);
+            }
+        }
+    }
+
+    // Stream is over — flush any suffix the marker stripper was withholding
+    // pending the next chunk. No more chunks arrive, so whatever was held
+    // cannot complete into a known marker; emit it verbatim so it lands in
+    // `response_text` and (via the text guard) the live transcript.
+    let final_marker_flush = terminal_marker_stripper.finish();
+    if !final_marker_flush.is_empty() {
+        outcome.response_text.push_str(&final_marker_flush);
         if strict_tool_parsing {
-            forward_visible!(trailing_delta, false);
-        } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
+            forward_visible!(final_marker_flush, false);
+        } else if let Some(forward_text) = text_guard.push(&final_marker_flush) {
             forward_visible!(forward_text, false);
         }
     }
@@ -384,6 +411,124 @@ mod tests {
         assert!(
             forwarded.contains("check the count."),
             "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
+        );
+    }
+
+    /// Provider fixture that emits a fragmented `<eom>` tail across four
+    /// chunks. Used to pin the streaming-safe contract for issue #9006:
+    /// the marker must never reach `response_text` or any forwarded
+    /// chunk even when split across delta boundaries.
+    struct SplitTerminalMarkerProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for SplitTerminalMarkerProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SplitTerminalMarkerProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SplitTerminalMarkerProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("Summary"))),
+                // Split "<eom>" so the last char arrives in a separate chunk.
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("<"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("eom"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(">"))),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_consume_strips_terminal_eom_split_across_chunks() {
+        let provider = SplitTerminalMarkerProvider;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(event_tx);
+
+        let mut forwarded = String::new();
+        while let Some(event) = event_rx.recv().await {
+            if let TurnEvent::Chunk { delta } = event {
+                forwarded.push_str(&delta);
+            }
+        }
+
+        assert_eq!(outcome.response_text, "Summary");
+        assert!(
+            !outcome.response_text.contains("<eom>"),
+            "<eom> must never leak into response_text; got={:?}",
+            outcome.response_text
+        );
+        assert!(
+            !forwarded.contains("<eom>"),
+            "<eom> must never leak into forwarded chunks; forwarded={forwarded:?}"
+        );
+        assert!(
+            !forwarded.contains("<"),
+            "partial marker suffix held back across stream end must not appear in forwarded output; forwarded={forwarded:?}"
         );
     }
 }

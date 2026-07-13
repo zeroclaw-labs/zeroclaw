@@ -115,6 +115,59 @@ impl XmlToolDispatcher {
         result
     }
 
+    /// Stateless fallback for the canonical streaming-safe
+    /// `StreamTerminalMarkerStripper` in `crates/zeroclaw-runtime/src/agent/
+    /// turn/stream_guard.rs`. The streaming path is the authoritative source
+    /// — production model output always flows through it via
+    /// `consume_provider_streaming_response`. This stateless helper exists
+    /// for tests and for any future synchronous call site; it is allowed to
+    /// be unused on builds that only touch the streaming path.
+    #[allow(dead_code)]
+    fn strip_terminal_markers(s: &str) -> String {
+        const PROVIDER_TERMINAL_MARKERS: &[&str] = &["<|eom|>", "<eom>"];
+
+        let max_marker_len = PROVIDER_TERMINAL_MARKERS
+            .iter()
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0);
+
+        // Stateless helper: the input is an already-accumulated text blob
+        // (full response or single chunk), so dropping any trailing
+        // whitespace before peeling markers is fine — there is no legitimate
+        // trailing whitespace in this context we would lose.
+        let mut trimmed = s.trim_end();
+        loop {
+            let mut changed = false;
+            for marker in PROVIDER_TERMINAL_MARKERS {
+                if trimmed.ends_with(marker) {
+                    trimmed = trimmed[..trimmed.len() - marker.len()].trim_end();
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Streaming-safety contract: a suffix that is *only* a known marker
+        // prefix (e.g. "<" or "<|" mid-stream) must not be emitted yet, since
+        // the next chunk could complete it into "<eom>" / "<|eom|>". Hold it
+        // back so the visible prefix is marker-free.
+        for cutoff in 1..=trimmed.len().min(max_marker_len.saturating_sub(1).max(1)) {
+            let suffix = &trimmed[trimmed.len() - cutoff..];
+            let is_prefix = PROVIDER_TERMINAL_MARKERS
+                .iter()
+                .any(|m| m.starts_with(suffix));
+            if is_prefix {
+                return trimmed[..trimmed.len() - cutoff].to_string();
+            }
+        }
+
+        trimmed.to_string()
+    }
+
     pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {
         tools.iter().map(|tool| tool.spec()).collect()
     }
@@ -345,6 +398,81 @@ mod tests {
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
         assert!(calls.is_empty());
+    }
+
+    // ─── Terminal-marker stripping (issue #9006) ────────────────────────────
+
+    #[test]
+    fn strip_terminal_markers_removes_trailing_eom() {
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers("Summary here.<eom>"),
+            "Summary here."
+        );
+    }
+
+    #[test]
+    fn strip_terminal_markers_removes_trailing_pipe_eom() {
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers("Summary here.<|eom|>"),
+            "Summary here."
+        );
+    }
+
+    #[test]
+    fn strip_terminal_markers_removes_multiple_stacked_markers() {
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers("hello world   <eom><|eom|>  "),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn strip_terminal_markers_preserves_inline_text() {
+        // Inline marker mid-prose must NOT be removed (issue: "narrowly
+        // scoped to recognized terminal markers").
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers(
+                "the literal <eom> in source must stay intact"
+            ),
+            "the literal <eom> in source must stay intact"
+        );
+    }
+
+    #[test]
+    fn strip_terminal_markers_preserves_plain_text_without_markers() {
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers("plain answer with no tag"),
+            "plain answer with no tag"
+        );
+    }
+
+    #[test]
+    fn strip_terminal_markers_handles_empty_input() {
+        assert_eq!(XmlToolDispatcher::strip_terminal_markers(""), "");
+    }
+
+    #[test]
+    fn strip_terminal_markers_holds_back_partial_marker_prefix() {
+        // Streaming-safety: when the suffix is a prefix of a known marker,
+        // withhold it so the next chunk can complete or invalidate it.
+        // "Summary<" is a prefix of "<eom>" / "<|eom|>" and must be held back.
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers("Summary<"),
+            "Summary"
+        );
+        // Same idea for the longer partial "<|".
+        assert_eq!(XmlToolDispatcher::strip_terminal_markers("head<|"), "head");
+    }
+
+    #[test]
+    fn strip_terminal_markers_emits_prefix_when_partial_marker_is_invalidated() {
+        // Once the tail cannot be the start of any known marker, the held-back
+        // buffer must be emitted. "Summary<z" — "<z" is not a prefix of any
+        // known marker, so the "<" must be returned.
+        assert_eq!(
+            XmlToolDispatcher::strip_terminal_markers("Summary<z"),
+            "Summary<z"
+        );
     }
 
     #[test]
