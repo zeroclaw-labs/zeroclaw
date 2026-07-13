@@ -1094,7 +1094,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            vision: false,
+            vision: true,
             prompt_caching: false,
             extended_thinking: false,
         }
