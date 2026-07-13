@@ -88,6 +88,31 @@ factual support status per runtime; they are not a marketing scorecard. Where a
 concept maps onto OpenClaw or Hermes, the migration and parity notes live with
 the relevant feature page rather than in a standalone comparison.
 
+### Runtime footprint
+
+The three runtimes differ less in how you *start* an install than in what the
+install leaves on the machine. All three publish a one-line installer and a
+container image, so the installer command is not itself a differentiator.
+
+| | Language | Install leaves behind | End-user install | Source toolchain |
+|---|---|---|---|---|
+| **ZeroClaw** | Rust | one self-contained binary | `curl … \| bash` (prebuilt binary) | Rust (cargo) |
+| **OpenClaw** | Node / TypeScript | a Node ≥22 toolchain | `npm install -g openclaw` | pnpm workspace (plain `npm install` unsupported for source) |
+| **Hermes** | Python | a Python 3.11–3.13 + `uv` virtualenv | `curl … \| bash` | `uv pip install -e ".[all,dev]"` |
+
+The practical distinction is maintenance surface: OpenClaw and Hermes each leave
+a language runtime you continue to own and upgrade, whereas ZeroClaw ships as a
+single static binary you can copy or delete. This does **not** extend to
+microcontrollers — ZeroClaw's agent runs on Linux, macOS, Windows, and
+single-board computers such as the Raspberry Pi, and drives boards like the
+ESP32 or STM32 as serial *peripherals*; it does not run the agent on the MCU
+itself.
+
+Footprint facts above were walked from the upstream repositories at the same
+pinned commits the parity columns use — OpenClaw @ `5aa7c62`, Hermes @
+`7426c09` — and should be re-verified against those SHAs when the parity data is
+refreshed.
+
 ## Integration prerequisites
 
 Some capabilities require external infrastructure. Where a channel or tool needs
