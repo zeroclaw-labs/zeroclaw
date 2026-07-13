@@ -136,7 +136,7 @@ fn load_ftl_from_disk(locale: &str) -> Option<String> {
 /// `client::resolve_config_dir`: the `--config-dir` flag (passed to `init` and
 /// cached in `CONFIG_DIR`) first, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`.
 /// This keeps the FTL read path aligned with the flag the rest of zerocode uses.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(dir) = CONFIG_DIR.get() {
         return dir.clone();
     }

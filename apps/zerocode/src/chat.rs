@@ -124,20 +124,17 @@ pub(crate) struct Chat {
     /// Double-click tracker for the agent picker: a second click on the same row
     /// confirms (enters the session), matching the keyboard Enter.
     pick_agent_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
-    /// constructs. Defaults until fetched.
+    /// Parsed `[todotracker]` config from local `zerocode-config.toml`, loaded
+    /// once (lazily, on first session start) and applied to every `ChatState`
+    /// this pane constructs. Defaults until loaded.
     todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
-    /// repeat on every session start.
-    todo_settings_loaded: bool,
-    /// Parsed `[message_queue]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
-    /// constructs. Defaults until fetched.
+    /// Parsed `[message_queue]` config from local `zerocode-config.toml`, loaded
+    /// once (lazily, on first session start) and applied to every `ChatState`
+    /// this pane constructs. Defaults until loaded.
     queue_settings: crate::config::MessageQueueSettings,
-    /// Guards the one-shot `[message_queue]` config fetch so it doesn't
-    /// repeat on every session start.
-    queue_settings_loaded: bool,
+    /// Guards the one-shot local UI config load (`[todotracker]` +
+    /// `[message_queue]`) so it doesn't repeat on every session start.
+    local_ui_settings_loaded: bool,
     /// Inbound `elicitation/create` requests that arrived while the pane was
     /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
     /// Rather than auto-cancel a legitimately-owned prompt during that
@@ -228,9 +225,8 @@ impl Chat {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
-            todo_settings_loaded: false,
             queue_settings: crate::config::MessageQueueSettings::default(),
-            queue_settings_loaded: false,
+            local_ui_settings_loaded: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -393,27 +389,17 @@ impl Chat {
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Fetch the [todotracker] config once, lazily, the first time this
-        // pane starts a session — so the tracker honors enabled /
-        // enabled_at_start / location / width / max_height. Best-effort: a
-        // failure keeps the schema defaults. Done here (not in init()) so the
-        // hot refresh path stays a single agents/status round-trip.
-        if !self.todo_settings_loaded {
-            self.todo_settings_loaded = true;
-            if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
-                self.todo_settings =
-                    crate::todo_tracker::TodoTrackerSettings::from_config_fields(&fields);
-            }
-        }
-
-        // Fetch the [message_queue] config once, lazily, the first time this
-        // pane starts a session — so the queue honors cap / widths / auto-open.
-        // Best-effort: a failure keeps the schema defaults.
-        if !self.queue_settings_loaded {
-            self.queue_settings_loaded = true;
-            if let Ok(fields) = self.rpc.config_list(Some("message_queue")).await {
-                self.queue_settings =
-                    crate::config::MessageQueueSettings::from_config_fields(&fields);
+        // Load the local `[todotracker]` and `[message_queue]` config once,
+        // lazily, the first time this pane starts a session. These are ZeroCode
+        // UI concerns owned by `zerocode-config.toml` — the daemon holds no
+        // TodoWrite display schema — so resolve them from the local config file
+        // (honoring `--config-dir` / `ZEROCLAW_CONFIG_DIR`), not over RPC.
+        // Best-effort: a load failure keeps the built-in defaults.
+        if !self.local_ui_settings_loaded {
+            self.local_ui_settings_loaded = true;
+            if let Ok(cfg) = crate::config::ensure_and_load(&crate::i18n::config_dir()) {
+                self.todo_settings = cfg.resolve_todo_tracker();
+                self.queue_settings = cfg.resolve_message_queue();
             }
         }
 
@@ -6547,20 +6533,13 @@ mod tests {
             None,
         );
 
-        // Second request: the one-shot [todotracker] config fetch fired on the
-        // first session start. Respond with an empty field set (defaults apply).
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("start_session should fetch todotracker config")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "config/list");
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
-
-        // Third request must be session_new_with_id carrying the prior id for
+        // Second request must be session_new_with_id carrying the prior id for
         // the prior agent — NOT a fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
+        //
+        // No config/list fetch precedes it: TodoWrite tracker and message-queue
+        // settings are ZeroCode-local (`zerocode-config.toml`), resolved without
+        // a daemon round-trip, so session start goes straight to `session/new`.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("reconnect should reattach the prior session")
