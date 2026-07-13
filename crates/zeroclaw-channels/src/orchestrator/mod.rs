@@ -4836,11 +4836,10 @@ async fn process_channel_message_body(
     // Captured from the attachment envelope, not from message text, so skill
     // auto-activation cannot be spoofed by a literal "[IMAGE:" string and a
     // real image is still detected when the media pipeline is disabled or
-    // emits no marker.
-    let msg_has_image_attachment = msg
-        .attachments
-        .iter()
-        .any(|a| a.kind() == zeroclaw_api::media::MediaKind::Image);
+    // emits no marker. `looks_like_image()` (MIME, extension, or magic bytes)
+    // rather than `kind() == Image` so a sender-spoofed MIME or a stripped
+    // extension cannot dodge image-turn restrictions.
+    let msg_has_image_attachment = msg.attachments.iter().any(|a| a.looks_like_image());
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
@@ -16675,16 +16674,18 @@ blocked_tools_with_image = ["test_blocked_tool"]
             Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
+            zeroclaw_config::schema::MediaPipelineConfig::default(),
         )
         .0
     }
 
     /// Core of [`skill_activation_test_ctx`] with the model provider, tool
-    /// registry, autonomy level, and approval manager parameterized, so the
-    /// image-turn tool-block e2e can wire a tool-calling provider plus an
-    /// executable tool through the SAME context shape as the route tests.
-    /// Returns the concrete channel handle alongside the context so tests can
-    /// inspect what was sent.
+    /// registry, autonomy level, approval manager, and media pipeline config
+    /// parameterized, so the image-turn tool-block e2e can wire a
+    /// tool-calling provider plus an executable tool through the SAME context
+    /// shape as the route tests, and the pipeline-dedup regression can run
+    /// with the media pipeline enabled. Returns the concrete channel handle
+    /// alongside the context so tests can inspect what was sent.
     #[allow(clippy::type_complexity)]
     fn skill_activation_test_ctx_with_tooling(
         prompt_config: Arc<zeroclaw_config::schema::Config>,
@@ -16694,6 +16695,7 @@ blocked_tools_with_image = ["test_blocked_tool"]
         tools_registry: Arc<Vec<Box<dyn Tool>>>,
         autonomy_level: AutonomyLevel,
         approval_manager: Arc<ApprovalManager>,
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig,
     ) -> (Arc<ChannelRuntimeContext>, Arc<TelegramRecordingChannel>) {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -16744,7 +16746,7 @@ blocked_tools_with_image = ["test_blocked_tool"]
                 whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            media_pipeline,
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
@@ -17088,6 +17090,7 @@ blocked_tools_with_image = ["mock_price"]
                         ..Default::default()
                     },
                 )),
+                zeroclaw_config::schema::MediaPipelineConfig::default(),
             );
 
             process_channel_message(
@@ -17103,6 +17106,221 @@ blocked_tools_with_image = ["mock_price"]
                 "{case}"
             );
         }
+    }
+
+    /// #8965 live-smoke regression: a REAL Telegram photo update, parsed by
+    /// the actual channel code (wiremock Bot API), must block the declared
+    /// tool when driven through `process_channel_message`. The first live
+    /// smoke failed because the hand-constructed e2e above proved the
+    /// orchestrator gate while Telegram ingress never populated the typed
+    /// attachment envelope the gate reads.
+    #[tokio::test]
+    async fn telegram_parsed_photo_update_blocks_declared_tool_end_to_end() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_9.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_9\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_image_toolblock_skill(workspace.path());
+
+        let telegram = crate::telegram::TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 7,
+                "chat": { "id": 555 },
+                "from": { "username": "alice", "id": 99 },
+                "photo": [ { "file_id": "best", "file_size": 4 } ],
+                "caption": "What is the BTC price now? Log it automatically."
+            }
+        });
+        let msg = telegram
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("photo update should parse");
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
+            executions: Arc::clone(&executions),
+        })]);
+        let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            workspace.path().to_path_buf(),
+            HashMap::new(),
+            Arc::new(ToolCallingModelProvider),
+            tools,
+            AutonomyLevel::Full,
+            Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                    auto_approve: vec!["mock_price".to_string()],
+                    ..Default::default()
+                },
+            )),
+            zeroclaw_config::schema::MediaPipelineConfig::default(),
+        );
+
+        process_channel_message(ctx, msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "a real parsed Telegram photo turn must not execute the blocked tool, \
+             even when the caption demands it"
+        );
+    }
+
+    /// #8965 review round 3: an image sent "as file" through Telegram, with
+    /// the media pipeline ENABLED and a vision-capable provider, must not get
+    /// a second, base64-inlined `[IMAGE:data:` marker in the outgoing prompt
+    /// or in the stored conversation history. The channel now emits the same
+    /// re-loadable `[IMAGE:<path>]` marker for image documents as for photos,
+    /// and the pipeline recognizes it as already marked.
+    #[tokio::test]
+    async fn telegram_image_document_with_enabled_pipeline_never_inlines_base64() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_11" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_11$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let telegram = crate::telegram::TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // An image uploaded as an extensionless document: the historic
+        // double-describe path, because it used to format as [Document:]
+        // while kind() classified it as Image.
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 8,
+                "chat": { "id": 556 },
+                "from": { "username": "alice", "id": 99 },
+                "document": {
+                    "file_id": "doc11",
+                    "file_name": "upload",
+                    "mime_type": "image/jpeg",
+                    "file_size": 4
+                },
+                "caption": "please describe"
+            }
+        });
+        let msg = telegram
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("image document update should parse");
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "channel must emit the path marker for image documents: {}",
+            msg.content
+        );
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            vision: true,
+        });
+        let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            workspace.path().to_path_buf(),
+            HashMap::new(),
+            provider_impl.clone(),
+            Arc::new(vec![]),
+            AutonomyLevel::default(),
+            Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+        );
+
+        process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+
+        // Outgoing prompt: the orchestrator's vision marker resolution
+        // legitimately inlines ONE base64 copy of the [IMAGE:<path>] marker
+        // at provider-call time; the double-describe bug added a SECOND copy
+        // via the media pipeline's own annotation. Assert the pipeline
+        // annotation is absent and no message carries more than one inlined
+        // copy.
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!calls.is_empty(), "provider must have been called");
+        for call in calls.iter() {
+            for (role, content) in call {
+                assert!(
+                    !content.contains("will be processed by vision model"),
+                    "media pipeline must not re-describe a channel-marked image \
+                     ({role}): {content}"
+                );
+                assert!(
+                    content.matches("[IMAGE:data:").count() <= 1,
+                    "outgoing {role} message must not inline the image twice: {content}"
+                );
+            }
+        }
+        drop(calls);
+
+        // Stored history: the persisted user turn is the enriched content
+        // verbatim, so it must carry the path marker but never base64.
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stored_turns = 0usize;
+        for (_, history) in histories.iter() {
+            for msg in history.iter() {
+                stored_turns += 1;
+                assert!(
+                    !msg.content.contains("IMAGE:data:"),
+                    "stored history must not persist base64: {}",
+                    msg.content
+                );
+            }
+        }
+        assert!(stored_turns > 0, "history must have stored the turn");
     }
 
     #[tokio::test]
