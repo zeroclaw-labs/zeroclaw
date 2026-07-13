@@ -661,6 +661,59 @@ mod tests {
         );
     }
 
+    /// Pairs with `doctor_timeout_error_is_generic_not_model_probing_specific`
+    /// above to pin the whole-RPC-vs-structured-probe discrimination from
+    /// review #8647: the "model probing" hint must only surface on the
+    /// structured-partial banner path, never on the error path. A future
+    /// refactor that swaps the discriminator (e.g. on freeform substring
+    /// matching) will be caught here even though `format_doctor_error`'s own
+    /// test would still pass in isolation.
+    #[test]
+    fn doctor_timeout_discriminator_pins_each_path_to_its_own_text() {
+        // Error path — generic daemon-side timeout text only.
+        let error_msg = format_doctor_error("RPC doctor/run: request timed out");
+        assert!(
+            error_msg.contains("daemon may be busy"),
+            "error path must surface generic daemon-busy hint; got: {error_msg}"
+        );
+        assert!(
+            !error_msg.contains("model probing"),
+            "error path must NEVER mention model probing; got: {error_msg}"
+        );
+        assert!(
+            !error_msg.contains("Partial results"),
+            "error path must NEVER render partial-results chrome; got: {error_msg}"
+        );
+
+        // Structured-partial path — only the partial-banner string is allowed
+        // to surface probe-specific copy; the error path's generic text must
+        // not appear.
+        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
+        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
+
+        assert!(
+            partial_banner.contains("model probing"),
+            "partial-banner FTL must carry the probe-specific substring; got: {partial_banner}"
+        );
+        assert!(
+            partial_hint.contains("provider catalog"),
+            "partial-hint FTL must explain which phase was lost; got: {partial_hint}"
+        );
+        assert!(
+            daemon_busy.contains("daemon"),
+            "daemon-timeout FTL must remain the generic copy; got: {daemon_busy}"
+        );
+        assert!(
+            !daemon_busy.contains("model probing"),
+            "daemon-timeout FTL must NOT leak the probe-specific copy; got: {daemon_busy}"
+        );
+        assert!(
+            !partial_banner.contains("daemon may be busy"),
+            "partial-banner FTL must NOT collide with error-path copy; got: {partial_banner}"
+        );
+    }
+
     #[tokio::test]
     async fn doctor_partial_result_banner_visible_alongside_selection() {
         // When timed_out_phase is set and sync_selection selects the
