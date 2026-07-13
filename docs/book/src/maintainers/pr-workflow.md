@@ -70,7 +70,7 @@ If none of those exists and the issue is not an active tracker or RFC, the issue
 
 ### Named milestone policy
 
-Named milestones are finite delivery cohorts for bounded outcomes within capability domains, not permanent domain backlogs. For this policy, a named milestone is organized around an outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Its domain is the capability area named at the start of its title. A combined title occupies each domain it names.
+Named milestones are finite delivery cohorts for bounded outcomes within capability domains, not permanent domain backlogs. For this policy, a named milestone is organized around an outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Name each new milestone as `Domain: Bounded Outcome`. Prefer `RPC Client: Authentication & Authorization` over a broad reusable name such as `Auth`. A combined title occupies each domain it names.
 
 Treat every open named milestone as active. Target no more than eight active named milestones so planning surfaces stay within maintainer coordination and review bandwidth. A ninth or tenth requires an explicit maintainer decision that records why the cohort cannot wait and which current milestone is expected to close next. Do not open an eleventh until another named milestone closes or the proposed work is consolidated into an existing cohort.
 
