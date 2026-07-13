@@ -270,3 +270,91 @@ impl StreamThinkTagStripper {
         std::mem::take(&mut self.pending)
     }
 }
+
+/// Streaming-safe stripper for **trailing** provider/model end-of-message
+/// markers (issue #9006 — `<eom>` and `<|eom|>` leaking into transcripts).
+///
+/// Peels complete markers from the input tail on every chunk and withholds a
+/// small suffix that could still become a marker on the next chunk. Mid-text
+/// markers are left intact — the issue explicitly demands "narrowly scoped"
+/// normalization so prose like "literal <eom> in code" stays untouched.
+#[derive(Debug, Default)]
+pub(crate) struct StreamTerminalMarkerStripper {
+    pending: String,
+}
+
+impl StreamTerminalMarkerStripper {
+    const MARKERS: &'static [&'static str] = &["<|eom|>", "<eom>"];
+
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        let mut input = std::mem::take(&mut self.pending);
+        input.push_str(chunk);
+
+        // Drop complete trailing markers.
+        let trimmed = strip_terminal_markers_owned(&input);
+
+        // Hold back any suffix that matches a marker prefix.
+        let max = max_terminal_marker_len();
+        let mut keep_len: usize = 0;
+        for len in 1..=max {
+            if trimmed.len() < len {
+                break;
+            }
+            let suffix = &trimmed[trimmed.len() - len..];
+            if Self::MARKERS.iter().any(|m| m.starts_with(suffix)) {
+                keep_len = len;
+            }
+        }
+
+        let emit_end = trimmed.len() - keep_len;
+        let visible = trimmed[..emit_end].to_string();
+        self.pending = trimmed[emit_end..].to_string();
+        visible
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        // Stream is over — no more chunks, so the held-back suffix cannot
+        // become a complete marker. Flush whatever was withheld so it lands
+        // in the final response text instead of being silently dropped.
+        let pending = std::mem::take(&mut self.pending);
+        let combined = format!("{}{pending}", pending);
+        // Defensive: still apply a final strip in case the held suffix plus
+        // buffer together form a complete marker we couldn't see before
+        // (not currently reachable, but pinning the contract).
+        strip_terminal_markers_owned(&combined)
+    }
+}
+
+fn max_terminal_marker_len() -> usize {
+    StreamTerminalMarkerStripper::MARKERS
+        .iter()
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn strip_terminal_markers_owned(s: &str) -> String {
+    // Peel trailing markers without touching trailing whitespace up front —
+    // legitimately-emitted trailing whitespace (e.g. a space character at the
+    // end of a sentence) must survive when no marker is present, otherwise
+    // streaming normal text would lose its trailing spaces.
+    let mut trimmed = s;
+    loop {
+        let mut changed = false;
+        for marker in StreamTerminalMarkerStripper::MARKERS {
+            if trimmed.ends_with(marker) {
+                trimmed = trimmed[..trimmed.len() - marker.len()].trim_end();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    trimmed.to_string()
+}
