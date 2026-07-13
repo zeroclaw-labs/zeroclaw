@@ -97,7 +97,7 @@ impl SerialTransport {
 
         Ok(ToolResult {
             success: ok,
-            output: result,
+            output: result.into(),
             error,
         })
     }

@@ -58,7 +58,7 @@ Every test binary includes `mod support;`, making the shared mocks available as 
 | `mock_model_provider.rs` | `MockModelProvider` (FIFO scripted), `RecordingModelProvider` (captures requests), `TraceLlmModelProvider` (JSON fixture replay) |
 | `mock_tools.rs` | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool` |
 | `mock_channel.rs` | `TestChannel` (captures sends, records typing events) |
-| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryStrategy` |
+| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticRecallMemory` |
 | `trace.rs` | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()` |
 | `assertions.rs` | `verify_expects()` for declarative trace assertion |
 

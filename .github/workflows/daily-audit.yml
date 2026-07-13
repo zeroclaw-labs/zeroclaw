@@ -26,7 +26,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked

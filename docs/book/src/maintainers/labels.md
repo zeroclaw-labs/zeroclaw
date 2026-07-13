@@ -12,11 +12,12 @@ When definitions conflict, update the source file first, then sync this page.
 
 Labels are portable metadata. They should answer what kind of work this is, what code area it touches, how risky it is to review, and whether stale policy or triage policy needs special handling.
 
-When Project board automation is added, use it as an automated planning board,
-not as a second PR review queue. The board should answer slower-moving planning
-questions: what is ready to pick up, what routing evidence keeps it active,
-what tracker or milestone it belongs to, and what is blocked. Native GitHub PR
-state should continue to answer fast-moving review and merge questions.
+Project board automation is a planning aid, not a second PR review queue. The
+current issue-dashboard planner is manual and report-only. The board should
+answer slower-moving planning questions: what is ready to pick up, what routing
+evidence keeps it active, what tracker or milestone it belongs to, and what is
+blocked. Native GitHub PR state should continue to answer fast-moving review and
+merge questions.
 
 Keep the split based on update frequency:
 
@@ -61,6 +62,19 @@ Use this sequence:
 
 Every live cleanup batch needs exact maintainer approval for the labels and issue/PR refs being changed.
 
+## Policy holdbacks
+
+Some label families are intentionally outside mechanical cleanup, even when they look inconsistent with newer spelling or taxonomy preferences. They should change only after a separate policy decision and an exact live operation packet.
+
+| Family | Current maintainer action it supports | Before changing live labels |
+|---|---|---|
+| Terminal and resolution labels | Explain why work left the active queue: not pursued, invalid, duplicate, or explicitly declined. | Preserve historical closure meaning and contributor expectations; define any rename, alias, migration, or deletion packet before mutating live labels. Replacement and superseding remain documented processes unless a later approved packet creates or maps a live label. |
+| Status and stale labels | Drive issue lifecycle and stale behavior, including accepted work, blockers, active implementation, `status:stale`, `status:no-stale`, and PR backlog stale handling. | Treat as policy-first because automation may protect, warn, or close issues differently. Do not change these labels as cosmetic or module-label cleanup; handle them through a stale/lifecycle policy packet that accounts for automation and routing-evidence rules. |
+| Contributor-tier labels | Signal reviewer trust and contributor experience using `.github/label-policy.json` thresholds. | Update the policy file and this guide together; do not delete or rename tiers as cosmetic cleanup because the labels affect people and review routing. |
+| GitHub default labels | Preserve familiar contributor entry points such as `bug`, `enhancement`, `documentation`, and `question`. | Replace or retire only through an explicit contributor-facing taxonomy decision. Defaults may be used by templates, searches, external links, and integrations. |
+
+The test for keeping a sensitive label live is operational: can maintainers name a real action that becomes harder if the live label disappears? If yes, keep or replace it deliberately. If no, preserve the historical mapping in the audit packet and migrate or delete through the approved operation.
+
 ## Type labels
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
@@ -75,6 +89,7 @@ New or manual applications should use the canonical no-space labels below when t
 | `type:dependencies` | Dependency or lockfile maintenance |
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
+| `type:refactor` | Code-structure cleanup or internal reorganization intended to preserve user-visible behavior |
 | `type:test` | Test-only or test-primary work |
 | `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Issue-only marker; does not by itself create stale protection, assignment, acceptance, or contributor-ready scope. |
 
@@ -272,6 +287,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `risk:manual` | Maintainer override that freezes automated risk recalculation |
 
 High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
+
+Apply `risk:high` to any PR that raises the workspace MSRV, pinned Rust toolchain, generated installer/Docker toolchain baseline, or release workflow toolchain floor. Do not downgrade the risk just because the diff looks like CI, dependency, or docs housekeeping: a higher required Rust version affects downstream source builds, distro packages, container builds, and users pinned to older toolchains.
 
 When uncertain, treat as higher risk.
 

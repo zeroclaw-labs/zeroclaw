@@ -39,6 +39,9 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "lark",
     "feishu",
     "dingtalk",
+    "wechat",
+    "signal",
+    "email",
 ];
 
 /// Validate a shell command against an agent's security policy
@@ -804,6 +807,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 
@@ -815,6 +819,7 @@ mod tests {
                 command: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
+                uses_memory: None,
             },
             &config,
         )

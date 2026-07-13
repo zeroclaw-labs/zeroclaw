@@ -6,7 +6,6 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 
 use super::capability::SopCapabilityRegistry;
-use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
 use super::route::{self, NextStep, RouteCtx};
@@ -18,13 +17,13 @@ use super::store::{
 };
 use super::types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
-    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
-    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
+    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopRunSummary, SopStep,
+    SopStepKind, SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
 use crate::security::{ContentSafety, new_marker_id};
 use serde_json::Value;
-use zeroclaw_config::schema::{ApprovalMode, SopConfig};
+use zeroclaw_config::schema::SopConfig;
 
 /// Central SOP orchestrator: loads SOPs, matches triggers, manages run lifecycle.
 pub struct SopEngine {
@@ -42,6 +41,11 @@ pub struct SopEngine {
     /// Run-execution metrics collector. Per-engine fresh in `new()` (test
     /// isolation); `build_sop_engine` swaps in the process-shared collector.
     metrics: Arc<SopMetricsCollector>,
+    /// Optional live run-change notifier. When present, every run mutation
+    /// (admission, step advance, terminal finish) publishes the run's fresh
+    /// summary so push surfaces (the Runs WebSocket) can forward it without
+    /// polling. `None` in tests and any embedder that does not want a feed.
+    run_notifier: Option<tokio::sync::broadcast::Sender<SopRunSummary>>,
     /// Deterministic capability registry for `kind = "capability"` SOP steps.
     capabilities: Arc<SopCapabilityRegistry>,
 }
@@ -81,6 +85,7 @@ impl SopEngine {
             deterministic_savings: DeterministicSavings::default(),
             store: Arc::new(InMemoryRunStore::new()),
             metrics: Arc::new(SopMetricsCollector::new()),
+            run_notifier: None,
             capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
         }
     }
@@ -99,6 +104,29 @@ impl SopEngine {
     pub fn with_metrics(mut self, metrics: Arc<SopMetricsCollector>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Attach a live run-change notifier. `build_sop_engine` wires the gateway's
+    /// sender here so run transitions push to the Runs WebSocket. Returns the
+    /// engine unchanged when never called (tests, headless embedders).
+    pub fn with_run_notifier(mut self, tx: tokio::sync::broadcast::Sender<SopRunSummary>) -> Self {
+        self.run_notifier = Some(tx);
+        self
+    }
+
+    /// Subscribe to the live run-change feed if a notifier is attached. Each
+    /// item is a fresh [`SopRunSummary`] for the run that just transitioned.
+    pub fn subscribe_run_changes(&self) -> Option<tokio::sync::broadcast::Receiver<SopRunSummary>> {
+        self.run_notifier.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Publish a run's current summary on the notifier, if attached. A send
+    /// error means no live subscribers; that is not a failure, so it is
+    /// dropped. Marked `active` per the caller's chokepoint.
+    fn notify_run(&self, run: &SopRun, active: bool) {
+        if let Some(tx) = self.run_notifier.as_ref() {
+            let _ = tx.send(SopRunSummary::from_run(run, active));
+        }
     }
 
     /// Inject a deterministic capability registry. Tests and future daemon
@@ -126,6 +154,8 @@ impl SopEngine {
                         .store
                         .renew_claim_for_restore(&pr.run.run_id, &pr.run.sop_name)
                     {
+                        let span = ::zeroclaw_log::attribution_span!(&pr.run);
+                        let _guard = span.enter();
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -151,6 +181,12 @@ impl SopEngine {
                     }
                 }
                 if restored > 0 {
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        sop_name = "*",
+                    );
+                    let _guard = span.enter();
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -159,13 +195,85 @@ impl SopEngine {
                     );
                 }
             }
-            Err(e) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "SOP engine: failed to restore runs from store"
-            ),
+            Err(e) => {
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    sop_name = "*",
+                );
+                let _guard = span.enter();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP engine: failed to restore runs from store"
+                );
+            }
+        }
+        self.restore_finished_runs();
+    }
+
+    /// Seed the display retention window (`finished_runs`) from the store's
+    /// terminal records at boot, newest-first and capped at `max_finished_runs`.
+    /// Terminal runs are durable but not part of the active-run rehydrate set, so
+    /// without this the Runs surface drops all completed/failed/cancelled runs
+    /// across a restart even though they remain on disk.
+    fn restore_finished_runs(&mut self) {
+        let limit = self.config.max_finished_runs;
+        match self.store.load_terminal_runs(limit) {
+            Ok(runs) => {
+                let mut seeded = 0usize;
+                for pr in runs {
+                    let span = ::zeroclaw_log::attribution_span!(&pr.run);
+                    let _guard = span.enter();
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": pr.run.run_id.as_str(),
+                                "sop_name": pr.run.sop_name.as_str(),
+                            })),
+                        "SOP engine: seeded terminal run into the retention window"
+                    );
+                    self.finished_runs.push(pr.run);
+                    seeded += 1;
+                }
+                self.finished_runs
+                    .sort_by(|a, b| a.started_at.cmp(&b.started_at));
+                if seeded > 0 {
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        sop_name = "*",
+                    );
+                    let _guard = span.enter();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"seeded": seeded})),
+                        &format!(
+                            "SOP engine seeded {seeded} terminal run(s) into the retention window"
+                        )
+                    );
+                }
+            }
+            Err(e) => {
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    sop_name = "*",
+                );
+                let _guard = span.enter();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP engine: failed to seed terminal runs from store"
+                );
+            }
         }
     }
 
@@ -199,6 +307,7 @@ impl SopEngine {
                     "SOP engine: failed to persist run"
                 );
             }
+            self.notify_run(run, true);
         }
     }
 
@@ -287,6 +396,7 @@ impl SopEngine {
                 "SOP engine: failed to persist terminal run"
             );
         }
+        self.notify_run(run, false);
     }
 
     fn record_transition_event(
@@ -368,6 +478,15 @@ impl SopEngine {
             .iter()
             .filter(|sop| sop.triggers.iter().any(|t| trigger_matches(t, event)))
             .collect()
+    }
+
+    /// True when any loaded SOP has a trigger of this source. Fan-in
+    /// callers use this as a cheap pre-filter before building and
+    /// dispatching an event.
+    pub fn wants_source(&self, source: SopTriggerSource) -> bool {
+        self.sops
+            .iter()
+            .any(|sop| sop.triggers.iter().any(|t| t.source() == source))
     }
 
     // ── Run lifecycle ───────────────────────────────────────────
@@ -978,13 +1097,7 @@ impl SopEngine {
                 .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
             format_step_context(sop, run, &step, &self.config)
         };
-        let action = resolve_step_action(
-            sop,
-            &step,
-            run_id.to_string(),
-            context,
-            self.config.approval_mode,
-        );
+        let action = resolve_step_action(sop, &step, run_id.to_string(), context);
         if matches!(action, SopRunAction::WaitApproval { .. })
             && let Some(run) = self.active_runs.get_mut(run_id)
         {
@@ -1061,6 +1174,7 @@ impl SopEngine {
                     output: reason.clone(),
                     started_at: now.clone(),
                     completed_at: Some(now.clone()),
+                    tool_calls: Vec::new(),
                 });
             }
         }
@@ -1168,6 +1282,87 @@ impl SopEngine {
         self.advance_deterministic_step(run_id, piped, None)
     }
 
+    /// Resolve a checkpoint decision (`PausedCheckpoint`). `Approve` resumes the
+    /// success path (records the checkpoint `Completed`, pipes forward down
+    /// `routing.next`); `Deny` takes the failure path (records the checkpoint
+    /// `Failed` and routes through the step's `on_failure`, exactly like a step
+    /// that failed execution). This is the single entry point for both outcomes;
+    /// callers never branch on status. `approve_step` is the `Approve`-only alias.
+    pub fn decide_checkpoint(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+    ) -> Result<SopRunAction> {
+        match decision {
+            super::approval::ApprovalDecision::Approve => self.approve_step(run_id),
+            super::approval::ApprovalDecision::Deny { reason } => {
+                self.deny_checkpoint(run_id, reason)
+            }
+        }
+    }
+
+    /// Failure path for a denied checkpoint: record the checkpoint step `Failed`
+    /// and route through its `on_failure` policy via the shared deterministic
+    /// record-and-route chokepoint. `Goto` reaches the authored failure step;
+    /// the default `Fail` terminates the run `Failed`. Mirrors `approve_step`'s
+    /// guard so a wrong-status or missing run fails closed with the gate intact.
+    fn deny_checkpoint(&mut self, run_id: &str, reason: Option<String>) -> Result<SopRunAction> {
+        let status = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?
+            .status;
+
+        if status != SopRunStatus::PausedCheckpoint {
+            bail!("Run {run_id} is not paused at a checkpoint (status: {status})");
+        }
+
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let current_step_number = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
+            .current_step;
+        let current_step = self.resolve_sop_step(&sop, current_step_number)?;
+
+        let detail = reason.unwrap_or_else(|| "checkpoint denied by operator".to_string());
+        let now = now_iso8601();
+
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+        }
+        self.record_transition_event(
+            run_id,
+            "checkpoint_denied",
+            Some(detail.clone()),
+            ::serde_json::json!({
+                "step": current_step.number,
+                "kind": current_step.kind.to_string(),
+            }),
+        );
+
+        self.record_deterministic_step_result(
+            run_id,
+            &sop,
+            &current_step,
+            SopStepStatus::Failed,
+            detail.clone(),
+            serde_json::Value::String(detail),
+            now.clone(),
+            Some(now),
+        )
+    }
+
     /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
     /// action for the current step, and persist. Shared by `approve_step` (the
     /// agent path) and `resolve_gate` (the out-of-band path) so the transition
@@ -1253,6 +1448,11 @@ impl SopEngine {
         run.waiting_since = None;
         let context = format_step_context(&sop, run, &step, &self.config);
 
+        let mut step = step;
+        step.agent = step
+            .effective_agent(sop.agent.as_deref())
+            .map(str::to_string);
+
         self.persist_active(run_id);
         Ok(SopRunAction::ExecuteStep {
             run_id: run_id.to_string(),
@@ -1267,6 +1467,28 @@ impl SopEngine {
             .iter()
             .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
             .collect()
+    }
+
+    /// Summaries of every run the engine currently holds: live runs from the
+    /// active set plus retained terminal runs, newest first by start time.
+    /// This is the enumeration the Runs surface polls; it never touches the
+    /// durable store directly, so it reflects exactly what the running engine
+    /// knows (active set + `max_finished_runs` retention window).
+    pub fn run_summaries(&self, sop_name: Option<&str>) -> Vec<SopRunSummary> {
+        let mut out: Vec<SopRunSummary> = self
+            .active_runs
+            .values()
+            .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
+            .map(|r| SopRunSummary::from_run(r, true))
+            .chain(
+                self.finished_runs
+                    .iter()
+                    .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
+                    .map(|r| SopRunSummary::from_run(r, false)),
+            )
+            .collect();
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out
     }
 
     /// Return cumulative deterministic execution savings.
@@ -1555,6 +1777,7 @@ impl SopEngine {
             output: recorded_output,
             started_at,
             completed_at,
+            tool_calls: Vec::new(),
         });
 
         let mut last_status = status;
@@ -1632,6 +1855,7 @@ impl SopEngine {
                 output: reason.clone(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                tool_calls: Vec::new(),
             });
         }
         self.record_transition_event(
@@ -1704,6 +1928,7 @@ impl SopEngine {
                     output: output.to_string(),
                     started_at: state.persisted_at.clone(),
                     completed_at: Some(state.persisted_at.clone()),
+                    tool_calls: Vec::new(),
                 });
             }
         }
@@ -2166,123 +2391,41 @@ pub(crate) enum GateState {
 // ── Trigger matching ────────────────────────────────────────────
 
 /// Check whether a single trigger definition matches an incoming event.
+///
+/// Source class is the cheap gate: a trigger can only match an event from its
+/// own source. Past that, matching is the trigger's own responsibility via its
+/// `TriggerBehavior`, so there is no per-source logic to drift here.
 fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
-    match (trigger, event.source) {
-        (SopTrigger::Mqtt { topic, condition }, SopTriggerSource::Mqtt) => {
-            let topic_match = event
-                .topic
-                .as_deref()
-                .is_some_and(|t| mqtt_topic_matches(topic, t));
-            if !topic_match {
-                return false;
-            }
-            // Evaluate condition against payload (None condition = unconditional)
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
+    trigger.source() == event.source && trigger.behavior().matches(event)
+}
 
-        (
-            SopTrigger::Amqp {
-                routing_key,
-                condition,
-            },
-            SopTriggerSource::Amqp,
-        ) => {
-            let key_match = event
-                .topic
-                .as_deref()
-                .is_some_and(|t| amqp_routing_key_matches(routing_key, t));
-            if !key_match {
-                return false;
-            }
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (SopTrigger::Webhook { path }, SopTriggerSource::Webhook) => {
-            event.topic.as_deref().is_some_and(|t| t == path)
-        }
-
-        (
-            SopTrigger::Peripheral {
-                board,
-                signal,
-                condition,
-            },
-            SopTriggerSource::Peripheral,
-        ) => {
-            let topic_match = event.topic.as_deref().is_some_and(|t| {
-                let expected = format!("{board}/{signal}");
-                t == expected
-            });
-            if !topic_match {
-                return false;
-            }
-            // Evaluate condition against payload (None condition = unconditional)
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (SopTrigger::Cron { expression }, SopTriggerSource::Cron) => {
-            event.topic.as_deref().is_some_and(|t| t == expression)
-        }
-
-        (
-            SopTrigger::Filesystem {
-                path,
-                events,
-                condition,
-            },
-            SopTriggerSource::Filesystem,
-        ) => {
-            let path_match = event
-                .topic
-                .as_deref()
-                .is_some_and(|t| filesystem_path_matches(path, t));
-            if !path_match {
-                return false;
-            }
-            if !events.is_empty() && !filesystem_event_listed(events, event.payload.as_deref()) {
-                return false;
-            }
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (
-            SopTrigger::Calendar {
-                calendar_source,
-                calendar_ids,
-            },
-            SopTriggerSource::Calendar,
-        ) => calendar_trigger_matches(calendar_source, calendar_ids, event),
-
-        (SopTrigger::Channel { topic, condition }, SopTriggerSource::Channel) => {
-            let topic_match = event.topic.as_deref().is_some_and(|t| t == topic);
-            if !topic_match {
-                return false;
-            }
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (SopTrigger::Manual, SopTriggerSource::Manual) => true,
-
-        _ => false,
+/// Match a channel trigger against an event topic. Two producer forms are
+/// accepted through the shared [`ChannelSopTopic`] grammar: the plain
+/// `channel` / `channel/alias` form used by agent-loop message triggers, and
+/// the forge form `channel.alias:event_type`. Channel type compares
+/// case-insensitively; an aliased trigger requires an exact alias, an
+/// alias-less trigger matches any instance. No topic fails closed. The
+/// `event_type` (forge form) is left for an authored `condition` to match.
+pub(crate) fn channel_trigger_topic_matches(
+    channel: &str,
+    alias: Option<&str>,
+    topic: Option<&str>,
+) -> bool {
+    let Some(topic) = topic else {
+        return false;
+    };
+    let (topic_channel, topic_alias, _event_type) =
+        zeroclaw_api::channel::ChannelSopTopic::parse(topic);
+    if !topic_channel.eq_ignore_ascii_case(channel) {
+        return false;
+    }
+    match alias {
+        Some(a) => topic_alias.is_some_and(|ta| ta == a),
+        None => true,
     }
 }
 
-fn calendar_trigger_matches(
+pub(crate) fn calendar_trigger_matches(
     calendar_source: &str,
     calendar_ids: &[String],
     event: &SopEvent,
@@ -2310,7 +2453,7 @@ fn calendar_trigger_matches(
 }
 
 /// Simple MQTT topic matching with `+` (single-level) and `#` (multi-level) wildcards.
-fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
+pub(crate) fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
     let pat_parts: Vec<&str> = pattern.split('/').collect();
     let top_parts: Vec<&str> = topic.split('/').collect();
 
@@ -2342,7 +2485,7 @@ fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
 /// AMQP topic-exchange routing-key matching. Keys are `.`-delimited words;
 /// `*` matches exactly one word and `#` matches zero or more words. A `#` that
 /// can absorb zero segments is what distinguishes this from MQTT matching.
-fn amqp_routing_key_matches(pattern: &str, key: &str) -> bool {
+pub(crate) fn amqp_routing_key_matches(pattern: &str, key: &str) -> bool {
     let pat: Vec<&str> = pattern.split('.').collect();
     let words: Vec<&str> = key.split('.').collect();
     amqp_match_from(&pat, &words)
@@ -2362,7 +2505,7 @@ fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
 /// Glob match a filesystem trigger `pattern` against a normalized `path`,
 /// supporting `*` (single segment) and `**` (recursive) wildcards via the
 /// `glob` crate. A bare directory pattern also matches paths nested beneath it.
-fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
     if let Ok(compiled) = glob::Pattern::new(pattern)
         && compiled.matches(path)
     {
@@ -2373,7 +2516,10 @@ fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
 }
 
 /// Whether the payload's `event` field names one of the trigger's listed kinds.
-fn filesystem_event_listed(events: &[FilesystemEventKind], payload: Option<&str>) -> bool {
+pub(crate) fn filesystem_event_listed(
+    events: &[FilesystemEventKind],
+    payload: Option<&str>,
+) -> bool {
     let Some(payload) = payload else {
         return false;
     };
@@ -2411,13 +2557,13 @@ fn execution_mode_needs_approval(mode: SopExecutionMode, sop: &Sop, step: &SopSt
 }
 
 /// Determine the action for a step based on the effective execution mode.
-fn resolve_step_action(
-    sop: &Sop,
-    step: &SopStep,
-    run_id: String,
-    context: String,
-    approval_mode: ApprovalMode,
-) -> SopRunAction {
+fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: String) -> SopRunAction {
+    let mut step = step.clone();
+    step.agent = step
+        .effective_agent(sop.agent.as_deref())
+        .map(str::to_string);
+    let step = &step;
+
     // Steps with requires_confirmation always need approval
     if step.requires_confirmation {
         return SopRunAction::WaitApproval {
@@ -2429,10 +2575,8 @@ fn resolve_step_action(
 
     let effective_mode = step.mode.unwrap_or(sop.execution_mode);
     let sop_needs_approval = execution_mode_needs_approval(sop.execution_mode, sop, step);
-    let mut needs_approval = execution_mode_needs_approval(effective_mode, sop, step);
-    if approval_mode == ApprovalMode::OutOfBandRequired && sop_needs_approval && !needs_approval {
-        needs_approval = true;
-    }
+    let step_needs_approval = execution_mode_needs_approval(effective_mode, sop, step);
+    let needs_approval = sop_needs_approval || step_needs_approval;
 
     if needs_approval {
         SopRunAction::WaitApproval {
@@ -2694,6 +2838,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -2762,6 +2907,119 @@ mod tests {
         let event = mqtt_event("sensors/temp", "{}");
         let matches = engine.match_trigger(&event);
         assert!(matches.is_empty());
+    }
+
+    fn channel_event(topic: &str, payload: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some(topic.into()),
+            payload: Some(payload.into()),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    fn channel_sop(name: &str, alias: Option<&str>, condition: Option<&str>) -> Sop {
+        let mut sop = test_sop(name, SopExecutionMode::Auto, SopPriority::Normal);
+        sop.triggers = vec![SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: alias.map(str::to_string),
+            condition: condition.map(str::to_string),
+        }];
+        sop
+    }
+
+    #[test]
+    fn channel_trigger_matches_channel_type_case_insensitive() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        assert_eq!(
+            engine.match_trigger(&channel_event("telegram", "{}")).len(),
+            1
+        );
+        assert_eq!(
+            engine.match_trigger(&channel_event("Telegram", "{}")).len(),
+            1
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("discord", "{}"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn channel_trigger_without_alias_matches_any_instance() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        assert_eq!(
+            engine
+                .match_trigger(&channel_event("telegram/prod", "{}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine.match_trigger(&channel_event("telegram", "{}")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn channel_trigger_with_alias_requires_exact_alias() {
+        let engine = engine_with_sops(vec![channel_sop("s1", Some("prod"), None)]);
+        assert_eq!(
+            engine
+                .match_trigger(&channel_event("telegram/prod", "{}"))
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("telegram/backup", "{}"))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("telegram", "{}"))
+                .is_empty(),
+            "aliased trigger must not match an alias-less topic"
+        );
+    }
+
+    #[test]
+    fn channel_trigger_without_topic_fails_closed() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: None,
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&event).is_empty());
+    }
+
+    #[test]
+    fn channel_trigger_condition_filters_by_payload() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, Some("$.kind == \"deploy\""))]);
+        assert_eq!(
+            engine
+                .match_trigger(&channel_event("telegram", "{\"kind\":\"deploy\"}"))
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("telegram", "{\"kind\":\"chat\"}"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn wants_source_reflects_loaded_trigger_sources() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        assert!(engine.wants_source(SopTriggerSource::Channel));
+        assert!(!engine.wants_source(SopTriggerSource::Mqtt));
+        assert!(!engine.wants_source(SopTriggerSource::Amqp));
+
+        let empty = engine_with_sops(vec![]);
+        assert!(!empty.wants_source(SopTriggerSource::Channel));
     }
 
     fn amqp_event(routing_key: &str, payload: &str) -> SopEvent {
@@ -2912,6 +3170,7 @@ mod tests {
             triggers: vec![SopTrigger::Calendar {
                 calendar_source: "microsoft365".into(),
                 calendar_ids: Vec::new(),
+                condition: None,
             }],
             ..test_sop("calendar-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -2933,6 +3192,7 @@ mod tests {
             triggers: vec![SopTrigger::Calendar {
                 calendar_source: "microsoft365".into(),
                 calendar_ids: vec!["primary".into()],
+                condition: None,
             }],
             ..test_sop("calendar-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -2974,6 +3234,7 @@ mod tests {
             triggers: vec![SopTrigger::Calendar {
                 calendar_source: "microsoft365".into(),
                 calendar_ids: Vec::new(),
+                condition: None,
             }],
             ..test_sop("calendar-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -3076,11 +3337,12 @@ mod tests {
     }
 
     #[test]
-    fn channel_trigger_matches_exact_topic_and_condition() {
+    fn channel_trigger_matches_forge_topic_and_condition() {
         let sop = Sop {
             triggers: vec![SopTrigger::Channel {
-                topic: "git.main:pull_request.opened".into(),
-                condition: Some("$.repo == \"octo/repo\"".into()),
+                channel: "git".into(),
+                alias: Some("main".into()),
+                condition: Some("$.event_type == \"pull_request.opened\"".into()),
             }],
             ..test_sop("git-pr-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -3089,26 +3351,28 @@ mod tests {
         let event = SopEvent {
             source: SopTriggerSource::Channel,
             topic: Some("git.main:pull_request.opened".into()),
-            payload: Some(r#"{"repo":"octo/repo","number":12}"#.into()),
+            payload: Some(
+                r#"{"event_type":"pull_request.opened","repo":"octo/repo","number":12}"#.into(),
+            ),
             timestamp: now_iso8601(),
         };
         assert_eq!(engine.match_trigger(&event).len(), 1);
 
-        let wrong_topic = SopEvent {
+        let wrong_event_type = SopEvent {
             source: SopTriggerSource::Channel,
             topic: Some("git.main:issues.opened".into()),
-            payload: Some(r#"{"repo":"octo/repo"}"#.into()),
+            payload: Some(r#"{"event_type":"issues.opened","repo":"octo/repo"}"#.into()),
             timestamp: now_iso8601(),
         };
-        assert!(engine.match_trigger(&wrong_topic).is_empty());
+        assert!(engine.match_trigger(&wrong_event_type).is_empty());
 
-        let wrong_payload = SopEvent {
+        let wrong_alias = SopEvent {
             source: SopTriggerSource::Channel,
-            topic: Some("git.main:pull_request.opened".into()),
-            payload: Some(r#"{"repo":"other/repo"}"#.into()),
+            topic: Some("git.staging:pull_request.opened".into()),
+            payload: Some(r#"{"event_type":"pull_request.opened","repo":"octo/repo"}"#.into()),
             timestamp: now_iso8601(),
         };
-        assert!(engine.match_trigger(&wrong_payload).is_empty());
+        assert!(engine.match_trigger(&wrong_alias).is_empty());
     }
 
     // ── Cron trigger matching ─────────────────────────
@@ -3278,6 +3542,37 @@ mod tests {
     }
 
     #[test]
+    fn run_notifier_publishes_on_admission() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_run_notifier(tx);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        let published = rx
+            .try_recv()
+            .expect("a summary must be published on admission");
+        assert_eq!(published.run_id, run_id);
+        assert_eq!(published.sop_name, "s1");
+        assert!(published.active, "an admitted run is active");
+    }
+
+    #[test]
+    fn run_notifier_absent_is_a_noop() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        assert!(engine.subscribe_run_changes().is_none());
+        engine.start_run("s1", manual_event()).unwrap();
+        assert_eq!(engine.active_runs().len(), 1);
+    }
+
+    #[test]
     fn start_run_unknown_sop_fails() {
         let mut engine = engine_with_sops(vec![]);
         assert!(engine.start_run("nonexistent", manual_event()).is_err());
@@ -3303,6 +3598,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3320,6 +3616,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3348,6 +3645,7 @@ mod tests {
                     output: "valve stuck".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3409,6 +3707,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3450,6 +3749,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3481,6 +3781,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3515,6 +3816,7 @@ mod tests {
                     output: "first failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3538,6 +3840,7 @@ mod tests {
                     output: "second failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3557,6 +3860,7 @@ mod tests {
                     output: "third failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3584,6 +3888,7 @@ mod tests {
                     output: "needs compensation".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3609,6 +3914,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3653,6 +3959,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3671,6 +3978,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3836,6 +4144,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3848,6 +4157,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4009,6 +4319,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4064,14 +4375,17 @@ mod tests {
     }
 
     #[test]
-    fn step_mode_can_relax_step_by_step_step() {
+    fn step_mode_cannot_relax_step_by_step_step() {
         let mut sop = test_sop("s1", SopExecutionMode::StepByStep, SopPriority::Normal);
         sop.steps[0].mode = Some(SopExecutionMode::Auto);
         let mut engine = engine_with_sops(vec![sop]);
 
         let action = engine.start_run("s1", manual_event()).unwrap();
 
-        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "a step auto override must not relax the SOP's step_by_step gate, got {action:?}"
+        );
     }
 
     #[test]
@@ -4080,7 +4394,7 @@ mod tests {
         sop.steps[0].mode = Some(SopExecutionMode::Auto);
         let mut engine = engine_with_config_sops(
             SopConfig {
-                approval_mode: ApprovalMode::OutOfBandRequired,
+                approval_mode: zeroclaw_config::schema::ApprovalMode::OutOfBandRequired,
                 ..SopConfig::default()
             },
             vec![sop],
@@ -4127,6 +4441,25 @@ mod tests {
         assert!(engine.approve_step(&run_id).is_err());
     }
 
+    #[test]
+    fn step_auto_override_cannot_defeat_supervised_step_one_gate() {
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps[0].mode = Some(SopExecutionMode::Auto);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "supervised SOP must gate step 1 even when the step overrides mode to auto, got {action:?}"
+        );
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.active_runs().get(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval,
+            "the run must park at the gate, not sit Running at step 1"
+        );
+    }
+
     // ── Advance step gate guard (#8678) ─────────────────
     //
     // A driver calling `sop_advance` while a run is parked at an external
@@ -4159,6 +4492,7 @@ mod tests {
                     output: "fabricated".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap_err();
@@ -4203,6 +4537,7 @@ mod tests {
                     output: "fabricated".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap_err();
@@ -4240,6 +4575,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4305,6 +4641,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4317,6 +4654,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4628,6 +4966,7 @@ mod tests {
                         output: "ok".into(),
                         started_at: now_iso8601(),
                         completed_at: Some(now_iso8601()),
+                        tool_calls: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -4669,6 +5008,7 @@ mod tests {
                         output: "ok".into(),
                         started_at: now_iso8601(),
                         completed_at: Some(now_iso8601()),
+                        tool_calls: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -4739,6 +5079,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: true,
+            agent: None,
         }
     }
 
@@ -4949,6 +5290,7 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: true,
+            agent: None,
         }
     }
 
@@ -4970,6 +5312,7 @@ type = "manual"
                     output: "step1-output".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4987,6 +5330,7 @@ type = "manual"
                     output: "step2-output".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -5080,6 +5424,7 @@ type = "manual"
                     output: "boom".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -5128,6 +5473,7 @@ type = "manual"
                     output: "step1-output".into(),
                     started_at: started.clone(),
                     completed_at: Some(completed.clone()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -5180,12 +5526,109 @@ type = "manual"
                     output: "s3-out".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
             "deterministic run should complete after the post-checkpoint step"
+        );
+    }
+
+    #[test]
+    fn deny_checkpoint_routes_through_on_failure_goto() {
+        // A denied checkpoint takes the failure path: the checkpoint step is
+        // recorded Failed and routed through its `on_failure`. With a Goto, the
+        // run continues at the authored failure-handler step, not the success
+        // successor and not a whole-run cancel.
+        let mut sop = deterministic_sop("det-cp-deny-goto");
+        sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run("det-cp-deny-goto", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let action = engine
+            .decide_checkpoint(
+                &run_id,
+                ApprovalDecision::Deny {
+                    reason: Some("not acceptable".into()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "denying a checkpoint with on_failure=Goto must route to the failure-handler step"
+        );
+        let cp = engine
+            .get_run(&run_id)
+            .unwrap()
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 2)
+            .expect("checkpoint step recorded");
+        assert_eq!(cp.status, SopStepStatus::Failed);
+    }
+
+    #[test]
+    fn deny_checkpoint_defaults_to_terminal_failure() {
+        // With the default on_failure (Fail), a denied checkpoint terminates the
+        // run Failed. This is distinct from Cancelled: the operator declined and
+        // no failure handler was authored, so the run failed.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp-deny-fail")]);
+        let action = engine
+            .start_run("det-cp-deny-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let action = engine
+            .decide_checkpoint(&run_id, ApprovalDecision::Deny { reason: None })
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Failed { .. }),
+            "denying a checkpoint with default on_failure must fail the run"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn decide_checkpoint_approve_matches_approve_step() {
+        // Approve through the unified decision entry point must behave exactly
+        // like approve_step: resume to the next step down the success edge.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp-approve")]);
+        let action = engine.start_run("det-cp-approve", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        let action = engine
+            .decide_checkpoint(&run_id, ApprovalDecision::Approve)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "approving via decide_checkpoint must resume to the next step"
         );
     }
 
@@ -5263,6 +5706,68 @@ type = "manual"
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
         engine.restore_runs();
         assert!(engine.active_runs().contains_key("r-restore"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn engine_restores_finished_runs_from_store() {
+        use super::super::store::SqliteRunStore;
+        let path = std::env::temp_dir().join(format!(
+            "zc-sop-engine-restore-fin-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+
+        // Persist a terminal run: saved active, then finished with a bumped revision.
+        let base = SopRun {
+            run_id: "r-done".to_string(),
+            sop_name: "deploy".to_string(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: now_iso8601(),
+            },
+            frame_marker_id: "marker-done".to_string(),
+            status: SopRunStatus::Running,
+            current_step: 0,
+            total_steps: 1,
+            started_at: now_iso8601(),
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+        store
+            .save_run(&PersistedRun::new(
+                base.clone(),
+                now_iso8601(),
+                SopTriggerSource::Manual,
+            ))
+            .unwrap();
+        let mut terminal = base;
+        terminal.status = SopRunStatus::Completed;
+        terminal.completed_at = Some(now_iso8601());
+        let mut persisted = PersistedRun::new(terminal, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = 1;
+        store.finish_run("r-done", &persisted).unwrap();
+
+        // A fresh engine seeds its retention window from the store's terminal set.
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
+        engine.restore_runs();
+        assert!(
+            !engine.active_runs().contains_key("r-done"),
+            "terminal run must not rehydrate as active"
+        );
+        let finished = engine.finished_runs(None);
+        assert_eq!(
+            finished.len(),
+            1,
+            "terminal run seeded into retention window"
+        );
+        assert_eq!(finished[0].run_id, "r-done");
+        assert_eq!(finished[0].status, SopRunStatus::Completed);
         let _ = std::fs::remove_file(&path);
     }
 
