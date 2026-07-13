@@ -10,6 +10,8 @@ gateway config editor, env-var overrides, `zeroclaw config set`,
 `zeroclaw config patch`, Quickstart, and RPC config methods all route through
 that same typed schema.
 
+For the build order, tracked-output rules, and drift checks that turn the typed schema into the config reference, see [Generated documentation pipeline](./generated-documentation-pipeline.md).
+
 ## What owns what
 
 | Surface | Owner | Persistence boundary | Runtime apply boundary |
