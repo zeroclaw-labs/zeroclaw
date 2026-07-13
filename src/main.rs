@@ -3401,6 +3401,31 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Pre-parse --config-dir from argv BEFORE applying i18n translations.
+    // This is required because locale detection reads ZEROCLAW_CONFIG_DIR,
+    // but the flag is normally parsed AFTER apply_i18n_to_command().
+    // Without this, --config-dir is ignored during locale detection (#9017).
+    let pre_config_dir = std::env::args_os()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|w| {
+            if w[0] == "--config-dir" {
+                Some(w[1].to_string_lossy().to_string())
+            } else if let Some(val) = w[0].to_string_lossy().strip_prefix("--config-dir=") {
+                Some(val.to_string())
+            } else {
+                None
+            }
+        });
+
+    if let Some(ref dir) = pre_config_dir {
+        if dir.trim().is_empty() {
+            eprintln!("Warning: --config-dir cannot be empty");
+        } else {
+            unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir.trim()) };
+        }
+    }
+
     let cmd = apply_i18n_to_command(Cli::command());
 
     if std::env::args_os().len() <= 1 {
@@ -3409,6 +3434,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
 
+    // The official parse will also set ZEROCLAW_CONFIG_DIR, but we already
+    // set it above. This is intentional: the pre-parse ensures locale
+    // detection uses the correct config, and the official parse validates
+    // the flag syntax and handles the empty-string error case.
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
