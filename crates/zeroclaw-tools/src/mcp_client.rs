@@ -268,6 +268,29 @@ impl McpServer {
         self.inner.lock().await.capabilities.clone()
     }
 
+    /// Health-check the underlying transport without sending a real request.
+    /// Returns `true` when the transport is alive, `false` otherwise.
+    ///
+    /// Uses `try_lock` instead of `blocking_lock` because this method may be
+    /// called from async contexts (e.g. `health_check_all` during heartbeat
+    /// retries inside an async test or the tokio-based heartbeat worker).
+    pub fn health_check(&self) -> bool {
+        self.inner
+            .try_lock()
+            .map(|mut inner| inner.transport.health_check())
+            .unwrap_or(true) // assume healthy if lock is contended
+    }
+
+    /// Get the server's config name.
+    pub async fn server_name(&self) -> String {
+        self.inner.lock().await.config.name.clone()
+    }
+
+    /// Get the server's config for reconnection.
+    pub fn server_config(&self) -> McpServerConfig {
+        self.inner.blocking_lock().config.clone()
+    }
+
     /// Call a tool on this server. Returns the raw JSON result.
     pub async fn call_tool(
         &self,
@@ -681,6 +704,70 @@ impl McpRegistry {
         }
     }
 
+    /// Build a registry with servers having custom names, each backed by a
+    /// no-op transport.  Test-only — gated behind the `test-helpers` feature.
+    ///
+    /// This variant lets tests give each server a distinct name so that
+    /// identity-aware reconciliation logic (server-name superset check) can
+    /// be verified without real stdio children.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_names(names: Vec<&str>) -> Self {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        struct NoopTransport;
+
+        #[async_trait]
+        impl McpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &mut self,
+                _request: &JsonRpcRequest,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_with_server_names registry is only used for \
+                     server_name/Arc equality — never for actual tool calls"
+                )
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn make_stub_server(name: &str) -> McpServer {
+            let inner = McpServerInner {
+                config: McpServerConfig {
+                    name: name.to_string(),
+                    ..McpServerConfig::default()
+                },
+                transport: Box::new(NoopTransport),
+                #[cfg(target_has_atomic = "64")]
+                next_id: AtomicU64::new(0),
+                #[cfg(not(target_has_atomic = "64"))]
+                next_id: AtomicU32::new(0),
+                tools: Vec::new(),
+                capabilities: McpServerCapabilities::default(),
+            };
+            McpServer {
+                inner: Arc::new(Mutex::new(inner)),
+            }
+        }
+
+        let mut servers = Vec::with_capacity(names.len());
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index = HashMap::new();
+        for name in &names {
+            let idx = servers.len();
+            servers.push(make_stub_server(name));
+            server_index.insert(name.to_string(), idx);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()
@@ -730,6 +817,69 @@ impl McpRegistry {
 
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
+    }
+
+    /// Names of all connected servers.
+    pub fn server_names(&self) -> Vec<String> {
+        self.server_index.keys().cloned().collect()
+    }
+
+    /// Check health of every connected server. Returns names of dead servers.
+    pub fn health_check_all(&self) -> Vec<String> {
+        let names = self.server_names();
+        let mut dead = Vec::new();
+        for name in names {
+            if let Some(&idx) = self.server_index.get(&name)
+                && !self.servers[idx].health_check()
+            {
+                dead.push(name);
+            }
+        }
+        dead
+    }
+
+    /// Remove servers whose transport is dead.
+    /// Returns the names of servers that were removed.
+    ///
+    /// This is a no-op for the `for_test_with_server_count` registries used in
+    /// unit tests — those have no-op transports that always report alive, so
+    /// no server will ever be removed.
+    pub async fn kill_dead_connections(&mut self) -> Vec<String> {
+        let dead = self.health_check_all();
+        if dead.is_empty() {
+            return dead;
+        }
+
+        // Rebuild the registry without dead servers, updating indices
+        // so tool_index references remain valid.
+        let dead_set: std::collections::HashSet<_> = dead.iter().cloned().collect();
+
+        let mut new_servers = Vec::with_capacity(self.servers.len());
+        let mut new_server_index = HashMap::with_capacity(self.server_index.len());
+        let mut old_to_new_idx = HashMap::with_capacity(self.server_index.len());
+
+        for (name, &old_idx) in &self.server_index {
+            if dead_set.contains(name) {
+                continue;
+            }
+            let new_idx = new_servers.len();
+            new_servers.push(self.servers[old_idx].clone());
+            old_to_new_idx.insert(old_idx, new_idx);
+            new_server_index.insert(name.clone(), new_idx);
+        }
+
+        let mut new_tool_index = HashMap::with_capacity(self.tool_index.len());
+        for (prefixed, (old_srv_idx, tool_name)) in &self.tool_index {
+            if let Some(&new_srv_idx) = old_to_new_idx.get(old_srv_idx) {
+                new_tool_index.insert(prefixed.clone(), (new_srv_idx, tool_name.clone()));
+            }
+        }
+
+        self.servers = new_servers;
+        self.server_index = new_server_index;
+        self.tool_index = new_tool_index;
+
+        dead
     }
 
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.

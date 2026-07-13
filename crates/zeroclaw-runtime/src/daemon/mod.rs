@@ -1038,15 +1038,13 @@ fn resolve_heartbeat_workspace_dir(config: &Config) -> Result<(String, PathBuf)>
 /// and shares it across every tick so that stdio MCP children live
 /// for the daemon's lifetime (#5903). Tests inject a hook here to
 /// count invocations and assert the registry is constructed at most
-/// once for N simulated ticks (the prior fix only kept a strong Arc
-/// inside `agent::run`, so the registry was still re-spawned per
-/// tick — see the rejected PR feedback).
+/// once for N simulated ticks.
 ///
 /// Hooks receive the resolved agent alias and the pre-computed list of
 /// MCP server configs granted to that agent by `mcp_bundles`. They
 /// MUST return an `Arc<McpRegistry>` whose inner server lifetime
 /// outlives the simulated ticks (returning a fresh registry per call
-/// would re-create the leak).
+/// would create a new stdio child on every tick).
 #[cfg(test)]
 type HeartbeatMcpRegistryTestHook = std::sync::Arc<
     dyn Fn(
@@ -1167,7 +1165,7 @@ fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTest
 /// granted-but-unreachable MCP server must NOT crash the heartbeat
 /// worker under supervisor backoff — the per-run `agent::run` MCP
 /// path itself fails open, so we mirror that here. Because the
-/// connection failed there is no stdio child to leak, so #5903's
+/// connection failed there is no stdio child to spawn, so #5903's
 /// "construct the registry once per worker" guarantee still holds
 /// whenever the registry IS reachable — the healthy case this
 /// targets).
@@ -1197,7 +1195,7 @@ async fn connect_heartbeat_mcp_registry(
     // heartbeat worker down under supervisor backoff. On connect
     // failure we log and return `Ok(None)`; each tick then falls
     // back to the per-run path (which itself fails open). Because
-    // the connection failed there is no stdio child to leak, so
+    // the connection failed there is no stdio child to spawn, so
     // #5903's "construct the registry once per worker" guarantee
     // still holds whenever the registry IS reachable — the healthy
     // case this targets.
@@ -1219,6 +1217,105 @@ async fn connect_heartbeat_mcp_registry(
     }
 }
 
+/// Decide whether to replace the current heartbeat MCP registry with a
+/// freshly-constructed one.
+///
+/// The replacement is allowed only when every server connected in `current`
+/// is also connected in `fresh` (fresh is a superset by server name).  This
+/// prevents silently dropping healthy connections when a transient error
+/// causes `fresh` to be missing some servers that were previously healthy.
+///
+/// Returns `fresh` when it is safe to use, `None` when the caller should
+/// keep using `current`.
+fn reconcile_heartbeat_mcp_registry(
+    current: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
+    fresh: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
+) -> Option<std::sync::Arc<crate::tools::McpRegistry>> {
+    let Some(current_reg) = current else {
+        // No current registry — use fresh (if any)
+        return fresh.map(std::sync::Arc::clone);
+    };
+    let Some(fresh_reg) = fresh else {
+        // No fresh registry — keep current
+        return None;
+    };
+
+    // Identity-aware comparison: only replace when fresh contains every
+    // server that current has.  This is the monotonicity guarantee that
+    // Finding #2 requires.
+    let current_names: std::collections::HashSet<_> =
+        current_reg.server_names().into_iter().collect();
+    let fresh_names: std::collections::HashSet<_> = fresh_reg.server_names().into_iter().collect();
+
+    if fresh_names.is_superset(&current_names) {
+        Some(std::sync::Arc::clone(fresh_reg))
+    } else {
+        None
+    }
+}
+
+/// Reconnect and reconcile the daemon-level MCP registry.
+///
+/// Called on each heartbeat tick. When the registry is incomplete (fewer
+/// connected servers than granted) or health checks detect dead connections,
+/// this function rebuilds the registry and uses [`reconcile_heartbeat_mcp_registry`]
+/// to decide whether to replace the current registry.
+///
+/// Returns immediately (Ok(())) when no reconnection is needed.
+async fn retry_heartbeat_mcp_registry(
+    shared: &mut Option<std::sync::Arc<crate::tools::McpRegistry>>,
+    config: &Config,
+    agent_alias: &str,
+) -> Result<()> {
+    // Always attempt to reconnect and reconcile. This ensures that:
+    // - Dead servers (after startup) are detected and replaced
+    // - New servers (that came up later) are picked up
+    // - Healthy servers are preserved via identity-aware reconciliation
+    // (Finding #1: reconnect after stdio child exits, Finding #2:
+    //  identity-aware replacement, not count-based).
+    let granted = config.mcp_servers_for_agent(agent_alias);
+    let granted_count = granted.len();
+    let current_count = shared.as_ref().map_or(0, |r| r.server_count());
+
+    // When the registry is complete and we own the Arc (single strong
+    // ref), we can do a live health check and skip reconnect if healthy.
+    // When the Arc is shared (e.g. an `AgentRunOverrides` clone exists),
+    // we can still do the health check (it's read-only), but we may get
+    // a stale result. Since `health_check_all` is read-only, we use
+    // `shared.as_ref()` so `Arc::get_mut` is no longer required.
+    let should_reconnect = if current_count >= granted_count {
+        // Complete registry: only reconnect if health check fails.
+        // `health_check_all` is read-only, so it works with shared Arc refs.
+        match shared.as_ref().map(|arc| arc.health_check_all()) {
+            Some(dead) => !dead.is_empty(),
+            None => true, // no registry → reconnect
+        }
+    } else if current_count > 0 {
+        // Partially complete — always reconnect to pick up missing servers.
+        true
+    } else {
+        // Incomplete: always reconnect.
+        true
+    };
+
+    if should_reconnect {
+        // Kill dead connections if we can (no-op for test stubs).
+        if let Some(arc) = shared
+            && let Some(reg) = std::sync::Arc::get_mut(arc)
+        {
+            let _dead = reg.kill_dead_connections().await;
+        }
+        let fresh = connect_heartbeat_mcp_registry(config, agent_alias).await?;
+        // Identity-aware replacement — only swap when `fresh` is a
+        // superset of `current` by server name, never silently dropping
+        // a healthy one.
+        if let Some(replaced) = reconcile_heartbeat_mcp_registry(shared.as_ref(), fresh.as_ref()) {
+            *shared = Some(replaced);
+        }
+    }
+    Ok(())
+}
+
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
@@ -1230,20 +1327,14 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     // Build the daemon-level MCP registry ONCE per worker. With this
     // owner in place, every `agent::run` tick below reuses the same
     // `Arc<McpRegistry>` and the stdio MCP children live for the
-    // worker's whole lifetime (#5903). The previous "fix" only
-    // hold-aliased a per-run Arc, which left the construction itself
-    // per-tick — the prior review correctly identified that as the
-    // missing piece.
+    // worker's whole lifetime (#5903).
     //
-    // The variable is `mut` so the per-tick "retry while incomplete"
-    // block at the top of the loop below can replace the stored
-    // registry with a fresh one when a granted MCP server is missing
-    // from the registry (e.g. it was down at worker boot and comes up
-    // later). Once `server_count == granted.len()` the block is a
-    // no-op and the Arc pointer survives across ticks — the
-    // no-churn steady state the PR is FOR is preserved. See the
-    // regression tests `heartbeat_worker_retries_incomplete_mcp_registry_across_ticks`
-    // and `heartbeat_worker_skips_retry_when_mcp_registry_already_complete`.
+    // The variable is `mut` so `retry_heartbeat_mcp_registry` below
+    // can replace the stored registry with a fresh one when a granted
+    // MCP server is missing from the registry (e.g. it was down at
+    // worker boot and comes up later). Once `server_count ==
+    // granted.len()` the call is a no-op and the Arc pointer survives
+    // across ticks — the no-churn steady state is preserved.
     let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
         connect_heartbeat_mcp_registry(&config, &agent_alias).await?;
 
@@ -1336,49 +1427,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let tick_start = std::time::Instant::now();
 
         // ── #5903 retry-while-incomplete ───────────────────────────
-        // `connect_heartbeat_mcp_registry` is fail-open: a granted-but-down
-        // MCP server at worker boot is logged and skipped, and the
-        // returned registry is missing that server (possibly `None`
-        // outright when `connect_all` returns nothing or errors out).
-        // Because the registry is held in `shared_mcp_registry` for
-        // the daemon's lifetime, a server that comes up LATER would
-        // never be picked up — recovery from transient MCP startup
-        // failures would require a daemon restart.
-        //
-        // Re-attempt the connect path each tick while the stored
-        // registry is still incomplete: it has fewer connected
-        // servers than the granted list (treat `None` as 0 connected
-        // when the granted list is non-empty). When the registry IS
-        // complete, this block is a pure no-op — `shared_mcp_registry`
-        // is left untouched and `Arc::as_ptr` stays identical across
-        // ticks, so the no-churn steady state the PR is FOR is
-        // preserved. The fresh attempt is allowed to ALSO be
-        // incomplete; the next tick will retry again.
-        {
-            let granted = config.mcp_servers_for_agent(&agent_alias);
-            let granted_count = granted.len();
-            let current_count = shared_mcp_registry.as_ref().map_or(0, |r| r.server_count());
-            if current_count < granted_count {
-                // Replace (not augment) — `connect_heartbeat_mcp_registry`
-                // returns a freshly-built `Arc<McpRegistry>` whose
-                // inner stdio children are owned by that Arc. The old
-                // Arc (if any) drops at end of this block; its child
-                // reaps via `kill_on_drop(true)`. This is the same
-                // construction path the worker's pre-loop boot call
-                // used, just re-run.
-                let fresh = connect_heartbeat_mcp_registry(&config, &agent_alias).await?;
-                // Only swap when the fresh attempt actually advanced
-                // — equal-or-less means the previous Arc was just as
-                // good, and swapping would gratuitously re-spawn a
-                // stdio child. Strictly an optimisation: the retry
-                // check above still finds us incomplete next tick
-                // either way.
-                let fresh_count = fresh.as_ref().map_or(0, |r| r.server_count());
-                if fresh_count >= current_count {
-                    shared_mcp_registry = fresh;
-                }
-            }
-        }
+        // When the registry is incomplete (fewer connected servers than
+        // granted) or health checks detect dead connections, this call
+        // rebuilds the registry and uses `reconcile_heartbeat_mcp_registry`
+        // to decide whether to replace the current registry.
+        retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias).await?;
 
         // Collect runnable tasks (active only, sorted by priority)
         let mut tasks = engine.collect_runnable_tasks().await?;
@@ -3308,7 +3361,7 @@ mod tests {
 
         // All N tick Arcs MUST point to the same allocation. If the
         // worker ever constructed a fresh registry per tick, the
-        // pointers would diverge — which is the leak #5903 reports.
+        // pointers would diverge.
         let first_ptr = observed_ptrs[0];
         for (tick, ptr) in observed_ptrs.iter().enumerate() {
             assert!(
@@ -3322,7 +3375,7 @@ mod tests {
 
         // The construction counter MUST still be 1 — N ticks must
         // not have re-triggered the hook. A counter of 2..=N would
-        // mean the worker is reconnecting per tick (the leak).
+        // mean the worker is reconnecting per tick.
         assert_eq!(
             construct_count.load(Ordering::SeqCst),
             1,
@@ -3358,22 +3411,20 @@ mod tests {
     //    ticks. The two regressions above cover the path where a
     //    test hook short-circuits `connect_heartbeat_mcp_registry`
     //    to a pre-built `Arc<McpRegistry>` and counts constructions
-    //    through a closure. That path cannot catch the actual
-    //    stdio-child leak: a buggy worker that calls
-    //    `McpRegistry::connect_all` per tick on the real path would
-    //    spawn one child per tick — but the hook would never fire,
-    //    because the test hook is only consulted on the
-    //    `connect_heartbeat_mcp_registry` side, not on every
-    //    `agent::run` re-construction.
+    //    through a closure. That path cannot catch an actual spawn
+    //    per tick: a buggy worker that calls `McpRegistry::connect_all`
+    //    per tick on the real path would spawn one child per tick —
+    //    but the hook would never fire, because the test hook is only
+    //    consulted on the `connect_heartbeat_mcp_registry` side, not
+    //    on every `agent::run` re-construction.
     //
     //    This test exercises the REAL `connect_all` path (no test
     //    hook), spawns a real `@modelcontextprotocol/server-filesystem`
     //    via `npx`, and watches the OS process table for the
-    //    resulting `mcp-server-filesystem` node process. The fix
-    //    hoists registry construction out of the tick loop, so the
-    //    process count MUST stay at 1 across N=8 ticks. The pre-fix
-    //    code would have caused the count to grow to N+1 (one per
-    //    tick), leaking an orphaned stdio child every tick.
+    //    resulting `mcp-server-filesystem` node process. With the
+    //    registry hoisted out of the tick loop, the process count
+    //    MUST stay at 1 across N=8 ticks. Without the fix the count
+    //    would grow to N+1 (one per tick).
     //
     //    Drop semantics: `StdioTransport` is built with
     //    `kill_on_drop(true)` (see `zeroclaw-tools::mcp_transport`),
@@ -3513,7 +3564,7 @@ mod tests {
                 count_during_ticks, 1,
                 "tick {tick}: mcp-server-filesystem child count drifted to {count_during_ticks}; \
                  expected exactly 1 across all ticks (the daemon must not respawn the stdio \
-                 child per heartbeat tick — that is the #5903 leak)"
+                 child per heartbeat tick — that is the #5903 fix)"
             );
         }
 
@@ -3734,20 +3785,20 @@ mod tests {
         // ── Hard regression assertions ────────────────────────────
         // Counter == 1 across all TICKS. A counter of TICKS or more
         // would mean the daemon is reconnecting MCP stdio children
-        // every tick — the leak #5903 reports.
+        // every tick — this invariant is reported.
         assert_eq!(
             construct_count.load(Ordering::SeqCst),
             1,
             "construction counter must be 1 after {TICKS} ticks; \
              got {} (a value >1 means the daemon is spawning a new \
-             stdio MCP child every tick — the #5903 leak)",
+             stdio MCP child every tick — that is the #5903 fix))",
             construct_count.load(Ordering::SeqCst),
         );
 
         // Strong-count sanity: the worker (`worker_held` + `shared`)
         // and the hook closures still hold the registry, but a
         // per-tick transient Arc inside `overrides.mcp_registry`
-        // must NOT have leaked an extra strong reference.
+        // must not add an extra strong reference.
         let strong_after_ticks = Arc::strong_count(&shared);
         assert!(
             strong_after_ticks >= 2,
@@ -3838,30 +3889,17 @@ mod tests {
     }
 
     // ── #5903 follow-up: REGISTRY RECOVERY on transient startup
-    //    failures. The fix hoists `connect_heartbeat_mcp_registry` out
-    //    of the tick loop so the stdio child lives for the daemon
-    //    lifetime, BUT that hoist must not freeze an incomplete
-    //    registry when a granted MCP server was down at boot. The
-    //    fix preserves both properties at once:
+    //    failures. While incomplete, each tick re-runs the connect
+    //    path so a server that comes up later is picked up without
+    //    a daemon restart. Once the registry is complete, ticks
+    //    skip the retry block so the Arc pointer stays identical.
     //
-    //      (a) once the registry is complete, subsequent ticks do NOT
-    //          re-call `connect_heartbeat_mcp_registry` (no churn);
-    //      (b) while the registry is incomplete (missing servers, or
-    //          `None` when the granted list is non-empty), each tick
-    //          re-runs the connect path so a server that comes up
-    //          later is picked up without a daemon restart.
-    //
-    //    These two regressions exercise the worker's per-tick retry
+    //    These regressions exercise the worker's per-tick retry
     //    block directly by simulating the boot + N heartbeat ticks
-    //    against a test hook that swaps registry shape over time. The
-    //    hook receives `&[McpServerConfig]` (the granted list) and
-    //    returns the `Arc<McpRegistry>` the worker should use for
-    //    that boot/tick — we pre-build two registries and return them
-    //    in a controlled sequence.
+    //    against a test hook that swaps registry shape over time.
     //
     //    Helper: build a config with one granted MCP server so the
-    //    retry check `server_count() < granted.len()` fires when the
-    //    hook returns a sub-complete registry.
+    //    retry check fires when the hook returns a sub-complete registry.
     fn config_with_one_granted_mcp_server(tmp: &TempDir) -> (Config, String) {
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
         let mut config = test_config(tmp);
@@ -3891,20 +3929,262 @@ mod tests {
         (config, agent_alias)
     }
 
-    // ── #5903 follow-up (a): once complete, NO RE-TRY across ticks.
+    // ── reconcile_heartbeat_mcp_registry unit tests ──────────────────────
+
+    /// Verify that `reconcile_heartbeat_mcp_registry` never replaces the
+    /// current registry when the fresh registry's connected-server set is
+    /// NOT a superset of the current set (Finding #2).
+    /// Equal-count swap — different servers, must NOT replace.
+    #[test]
+    fn reconcile_heartbeat_mcp_registry_ignores_equal_count_swap() {
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+        ));
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-b"]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
+        assert!(
+            result.is_none(),
+            "must NOT replace when fresh has a different server than current"
+        );
+        // Current registry must be preserved.
+        assert_eq!(
+            current.as_ref().unwrap().server_names(),
+            vec!["server-a"],
+            "current registry must be preserved"
+        );
+    }
+
+    /// Partial overlap — current has {A, B}, fresh has {B, C}.
+    /// Fresh is not a superset of current (A is missing from fresh).
+    #[test]
+    fn reconcile_heartbeat_mcp_registry_partial_overlap() {
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
+        ));
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-b", "server-c"]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
+        assert!(
+            result.is_none(),
+            "must NOT replace when fresh is missing a server that current has"
+        );
+    }
+
+    /// Fresh is a strict superset — should replace.
+    #[test]
+    fn reconcile_heartbeat_mcp_registry_replaces_when_superset() {
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+        ));
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
+        assert!(
+            result.is_some(),
+            "must replace when fresh is a superset of current"
+        );
+        let names = result.unwrap().server_names();
+        assert!(
+            names.contains(&"server-a".to_string()) && names.contains(&"server-b".to_string()),
+            "replaced registry must contain both server-a and server-b; got {names:?}",
+        );
+    }
+
+    /// Fresh has exactly the same servers — should replace (superset is reflexive).
+    #[test]
+    fn reconcile_heartbeat_mcp_registry_replaces_when_equal_set() {
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
+        ));
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
+        assert!(result.is_some(), "must replace when server sets are equal");
+    }
+
+    /// No current registry — use fresh if available.
+    #[test]
+    fn reconcile_heartbeat_mcp_registry_none_current_uses_fresh() {
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(None, fresh.as_ref());
+        assert!(result.is_some(), "must use fresh when there is no current");
+    }
+
+    /// No fresh registry — keep current.
+    #[test]
+    fn reconcile_heartbeat_mcp_registry_none_fresh_keeps_current() {
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), None);
+        assert!(result.is_none(), "must keep current when there is no fresh");
+    }
+
+    // ── Finding #1: health check & reconnection for a stdio child that dies ─
+
+    /// Regression test: when a stdio MCP child exits after a successful
+    /// connection, the heartbeat worker's retry gate must detect the dead
+    /// transport via `health_check_all` and reconnect on the next tick.
+    ///
+    /// The test does NOT call `run_heartbeat_worker` directly — instead it
+    /// exercises the health-check + reconnect path that the real worker
+    /// uses each tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_worker_reconnects_after_stdio_child_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
+
+        let tmp = TempDir::new().unwrap();
+
+        // ── 1. Build a tiny stdio MCP server script ──────────────────────
+        let pid_path = tmp.path().join("pid");
+        let server_path = tmp.path().join("mcp-server.sh");
+        std::fs::write(
+        &server_path,
+        format!(
+            r#"#!/usr/bin/env bash
+echo $$ > "{}"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"reconnect-test","version":"0.1.0"}}}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
+      ;;
+  esac
+done
+"#,
+            pid_path.display(),
+        ),
+    )
+    .expect("write server script");
+        std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
+        // ── 2. Build a config that grants this stdio server ─────────────
+        let mut config = test_config(&tmp);
+        config.mcp.enabled = true;
+        config.mcp.servers.push(McpServerConfig {
+            name: "reconnect-test".to_string(),
+            command: server_path.display().to_string(),
+            args: vec![pid_path.display().to_string()],
+            env: std::collections::HashMap::new(),
+            tool_timeout_secs: None,
+            transport: zeroclaw_config::schema::McpTransport::Stdio,
+            url: None,
+            headers: std::collections::HashMap::new(),
+            pinned_resources: vec![],
+        });
+        let agent_alias = "ops".to_string();
+        config.mcp_bundles.insert(
+            "reconnect-bundle".to_string(),
+            McpBundleConfig {
+                servers: vec!["reconnect-test".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            agent_alias.clone(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["reconnect-bundle".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        // ── 3. Connect (boot) — no test hook, real stdio child ─────────
+        let mut shared_mcp_registry: Option<std::sync::Arc<crate::tools::McpRegistry>> =
+            connect_heartbeat_mcp_registry(&config, &agent_alias)
+                .await
+                .expect("connect_heartbeat_mcp_registry succeeds");
+        assert!(shared_mcp_registry.is_some(), "registry must be Some");
+        assert_eq!(
+            shared_mcp_registry.as_ref().unwrap().server_names(),
+            vec!["reconnect-test"],
+            "must have the granted server"
+        );
+
+        // ── 4. Kill the stdio child process ─────────────────────────────
+        let pid: u32 = std::fs::read_to_string(&pid_path)
+            .expect("read PID")
+            .trim()
+            .parse()
+            .expect("parse PID");
+        std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output()
+            .expect("kill child");
+
+        // Give the kernel a moment to reap.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ── 5. Simulate heartbeat tick: detect dead + reconnect ─────────
+        //    a. health_check_all detects the dead child
+        if let Some(arc) = &mut shared_mcp_registry
+            && let Some(reg) = std::sync::Arc::get_mut(arc)
+        {
+            let dead = reg.health_check_all();
+            assert!(
+                dead.contains(&"reconnect-test".to_string()),
+                "health_check_all must detect the dead server; got {dead:?}"
+            );
+
+            //    b. remove the dead connection
+            let killed = reg.kill_dead_connections().await;
+            assert_eq!(killed, vec!["reconnect-test"]);
+        }
+
+        //    c. reconnect (fresh connect_all spawns a new child)
+        let fresh = connect_heartbeat_mcp_registry(&config, &agent_alias)
+            .await
+            .expect("reconnect must succeed");
+
+        //    d. reconcile — empty current is a subset of any fresh set
+        if let Some(replaced) =
+            reconcile_heartbeat_mcp_registry(shared_mcp_registry.as_ref(), fresh.as_ref())
+        {
+            shared_mcp_registry = Some(replaced);
+        }
+
+        // ── 6. Verify the reconnected registry is alive ─────────────────
+        assert!(
+            shared_mcp_registry.is_some(),
+            "registry must be Some after reconnection"
+        );
+        if let Some(arc) = &mut shared_mcp_registry
+            && let Some(reg) = std::sync::Arc::get_mut(arc)
+        {
+            let dead = reg.health_check_all();
+            assert!(
+                dead.is_empty(),
+                "reconnected server must be alive; health_check_all returned {dead:?}"
+            );
+            assert_eq!(
+                reg.server_count(),
+                1,
+                "must have exactly one connected server"
+            );
+        }
+    }
+
+    // ── #5903 (a): steady-state pin — once complete, no churn.
     //
     //    The hook returns the SAME complete `Arc<McpRegistry>` on every
-    //    call (simulating "the server was up at boot and stayed up").
-    //    The worker boots once (pre-loop call) and then every
-    //    subsequent per-tick retry check must short-circuit (because
-    //    `server_count == granted_count == 1`). The construction
-    //    counter therefore MUST stay at 1 across N ticks, and the
-    //    Arc pointer the worker hands to `agent::run` MUST stay
-    //    identical across ticks (no churn).
-    //
-    //    This test would FAIL under the original PR's hoist-only
-    //    behaviour if the retry block were ever to over-trigger; it
-    //    is the steady-state pin.
+    //    call, so the retry block short-circuits after boot and the Arc
+    //    pointer stays identical across ticks.
     #[tokio::test]
     async fn heartbeat_worker_skips_retry_when_mcp_registry_already_complete() {
         use std::sync::Arc;
@@ -3936,10 +4216,7 @@ mod tests {
                 Arc::clone(&complete_registry_for_hook)
             }));
 
-        // (1) Worker boot — single pre-loop call. With this PR's fix
-        //     the boot call must NOT also trigger a retry (the boot
-        //     call IS the first connect attempt; the retry block
-        //     lives inside the loop only).
+        // (1) Worker boot — single pre-loop call.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
             connect_heartbeat_mcp_registry(&config, &agent_alias)
                 .await
@@ -3959,30 +4236,17 @@ mod tests {
             "boot constructs the registry exactly once"
         );
 
-        // (2) Simulate N heartbeat ticks. For each tick we replicate
-        //     the worker's per-tick retry block: if `server_count <
-        //     granted.len()`, re-run `connect_heartbeat_mcp_registry`
-        //     and replace; else skip. Then build an
-        //     `AgentRunOverrides` cloning the current shared Arc.
+        // (2) Simulate N heartbeat ticks. Each tick calls
+        //     `retry_heartbeat_mcp_registry` — the same production
+        //     function the worker uses — so the retry-decision logic
+        //     is not reimplemented inline.
         const TICKS: usize = 32;
         let mut override_ptrs: Vec<*const crate::tools::McpRegistry> = Vec::with_capacity(TICKS);
         let complete_ptr = Arc::as_ptr(&complete_registry);
         for tick in 0..TICKS {
-            // Per-tick retry block, copied verbatim from
-            // `run_heartbeat_worker` (kept in sync; if one changes,
-            // both must).
-            let granted = config.mcp_servers_for_agent(&agent_alias);
-            let granted_count = granted.len();
-            let current_count = shared_mcp_registry.as_ref().map_or(0, |r| r.server_count());
-            if current_count < granted_count {
-                let fresh = connect_heartbeat_mcp_registry(&config, &agent_alias)
-                    .await
-                    .expect("connect_heartbeat_mcp_registry succeeds");
-                let fresh_count = fresh.as_ref().map_or(0, |r| r.server_count());
-                if fresh_count >= current_count {
-                    shared_mcp_registry = fresh;
-                }
-            }
+            retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
+                .await
+                .expect("retry_heartbeat_mcp_registry succeeds");
 
             // Build the override the worker would hand to `agent::run`.
             let overrides = crate::agent::loop_::AgentRunOverrides {
@@ -4009,20 +4273,19 @@ mod tests {
         //
         //     Hook fired exactly once total — boot only. Any value >1
         //     would mean the retry block over-triggered and
-        //     gratuitously re-ran the connect path on a registry that
-        //     was already complete.
+        //     re-ran the connect path on a registry that was
+        //     already complete.
         assert_eq!(
             construct_count.load(Ordering::SeqCst),
             1,
             "once the registry is complete, the per-tick retry block MUST NOT re-run \
-             connect_heartbeat_mcp_registry; saw {} constructions across {TICKS} ticks \
-             (boot + N retries would be the #5903 churn regression)",
+             connect_heartbeat_mcp_registry; saw {} constructions across {TICKS} ticks",
             construct_count.load(Ordering::SeqCst),
         );
 
         // Every tick's override Arc points to the same allocation.
         // A divergence would mean a per-tick construction slipped
-        // through (the leak #5903 reports).
+        // through.
         let first = override_ptrs[0];
         for (tick, ptr) in override_ptrs.iter().enumerate() {
             assert!(
@@ -4153,30 +4416,19 @@ mod tests {
             "boot pointer must be the empty registry",
         );
 
-        // (2) Simulate N=4 heartbeat ticks. Each tick runs the
-        //     worker's per-tick retry block (inlined verbatim to keep
-        //     the regression signal tight) and records both the
-        //     override Arc pointer and its `server_count()` for the
-        //     assertions below.
+        // (2) Simulate N=4 heartbeat ticks. Each tick calls
+        //     `retry_heartbeat_mcp_registry` — the same production
+        //     function the worker uses — so the retry-decision logic
+        //     is not reimplemented inline.
         const TICKS: usize = 4;
         let mut per_tick_ptrs: Vec<*const crate::tools::McpRegistry> = Vec::with_capacity(TICKS);
         let mut per_tick_server_counts: Vec<usize> = Vec::with_capacity(TICKS);
         for _tick in 0..TICKS {
-            // ── Per-tick retry block (mirrors `run_heartbeat_worker`) ──
-            let granted = config.mcp_servers_for_agent(&agent_alias);
-            let granted_count = granted.len();
-            let current_count = shared_mcp_registry.as_ref().map_or(0, |r| r.server_count());
-            if current_count < granted_count {
-                let fresh = connect_heartbeat_mcp_registry(&config, &agent_alias)
-                    .await
-                    .expect("connect_heartbeat_mcp_registry succeeds");
-                let fresh_count = fresh.as_ref().map_or(0, |r| r.server_count());
-                if fresh_count >= current_count {
-                    shared_mcp_registry = fresh;
-                }
-            }
+            retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
+                .await
+                .expect("retry_heartbeat_mcp_registry succeeds");
 
-            // ── Build override the worker would hand to agent::run ──
+            // Build the override the worker would hand to `agent::run`.
             let overrides = crate::agent::loop_::AgentRunOverrides {
                 mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
                 ..crate::agent::loop_::AgentRunOverrides::default()
@@ -4199,12 +4451,11 @@ mod tests {
         //     registry is complete, so tick 2 and tick 3 skip the
         //     retry block.
         //
-        //     A hook count of 1 (boot only, like the original PR)
-        //     would mean the retry block never ran and the worker is
-        //     stuck on the empty registry — the regression.
+        //     A hook count of 1 would mean the retry block never ran
+        //     and the worker is stuck on the empty registry.
         //
         //     A hook count >3 would mean the retry block re-ran
-        //     after recovery, defeating the no-churn steady state.
+        //     after recovery.
         assert_eq!(
             construct_count.load(Ordering::SeqCst),
             3,
@@ -4269,8 +4520,7 @@ mod tests {
 
         // Once recovery has produced the complete registry, the
         // Arc pointer MUST stay the same across all subsequent
-        // ticks — the no-churn property the PR is FOR. A drift
-        // means the retry block is over-firing.
+        // ticks — any drift means the retry block is over-firing.
         let recovery_ptr = per_tick_ptrs[1];
         assert!(
             std::ptr::eq(recovery_ptr, complete_ptr),

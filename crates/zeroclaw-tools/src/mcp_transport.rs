@@ -98,6 +98,14 @@ pub trait McpTransportConn: Send + Sync {
         Ok(())
     }
 
+    /// Check whether the underlying transport is still alive without sending a
+    /// real request.  The HTTP and SSE transports always return `Ok(true)` —
+    /// connection drops surface through `send_and_recv` errors.  The stdio
+    /// transport verifies the child process is still running via `try_wait()`.
+    fn health_check(&mut self) -> bool {
+        true
+    }
+
     /// Close the connection.
     async fn close(&mut self) -> Result<()>;
 }
@@ -229,6 +237,14 @@ impl McpTransportConn for StdioTransport {
     async fn close(&mut self) -> Result<()> {
         let _ = self.stdin.shutdown().await;
         Ok(())
+    }
+
+    fn health_check(&mut self) -> bool {
+        // Verify the child process is still running via try_wait().
+        // Returns true only when the process is alive (has not exited).
+        self._child
+            .try_wait()
+            .map_or(true, |status| status.is_none())
     }
 }
 
