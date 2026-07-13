@@ -297,6 +297,14 @@ pub async fn run(
     port: u16,
     mut registry: DaemonRegistry,
     ephemeral: bool,
+    // `true` when the daemon was launched as an interactive foreground
+    // process — i.e. the operator is sitting at the terminal. When `true`,
+    // `echo_daemon_started_to_terminal` reprints the seven pre-#7934
+    // informational lines so the operator can see the gateway URL, IPC
+    // socket, components, and stop signal without needing `--verbose`.
+    // Auto-spawned / systemd-managed callers MUST pass `false` to keep
+    // stderr/journal output quiet.
+    foreground: bool,
 ) -> Result<DaemonExit> {
     config.gateway.host = host.clone();
     if port != 0 {
@@ -696,6 +704,13 @@ pub async fn run(
     }
 
     record_daemon_started(&config, &host, port);
+    if foreground {
+        let mut stderr = std::io::stderr().lock();
+        // Stderr write failures at daemon startup are diagnostic-only;
+        // dropping the `Result` keeps startup robust to closed pipes
+        // (e.g. the operator who launched via `&` then quit the shell).
+        let _ = echo_daemon_started_to_terminal(&config, &host, port, &mut stderr);
+    }
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
@@ -763,6 +778,43 @@ fn record_daemon_started(config: &Config, host: &str, port: u16) {
             })),
         "ZeroClaw daemon started"
     );
+}
+
+/// Foreground echo for the seven pre-#7934 informational lines that the
+/// structured `record_daemon_started` event hid behind the `--verbose`
+/// display gate. Kept as a separate helper so the structured call path
+/// (always emit) and the terminal-echo path (foreground only) stay
+/// independently testable. Accepts any `io::Write` so the in-process
+/// tests can pass an in-memory buffer without pulling in `libc` or
+/// touching global stderr state. `run()` passes `std::io::stderr().lock()`
+/// — the only call site for production output. Restores the operator-facing
+/// feedback lost in the #7934 "route stdout diagnostics through logs"
+/// sweep (issue #9000).
+fn echo_daemon_started_to_terminal<W: std::io::Write>(
+    config: &Config,
+    host: &str,
+    port: u16,
+    mut out: W,
+) -> std::io::Result<()> {
+    writeln!(out, "🧠 ZeroClaw daemon started")?;
+    writeln!(out, "   Gateway:  http://{host}:{port}")?;
+    writeln!(
+        out,
+        "   Socket:   {}",
+        crate::rpc::local::socket_path(config).display()
+    )?;
+    writeln!(
+        out,
+        "   Components: gateway, channels, heartbeat, scheduler"
+    )?;
+    if config.gateway.require_pairing {
+        writeln!(
+            out,
+            "   Pairing:    enabled (code appears in gateway output above)"
+        )?;
+    }
+    writeln!(out, "   Ctrl+C or SIGTERM to stop")?;
+    Ok(())
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
@@ -2246,6 +2298,102 @@ mod tests {
         );
     }
 
+    // ── Foreground terminal-echo (issue #9000) ──────────────────────────────
+    //
+    // The helper writes via `eprintln!`-equivalent into a `io::Write` so
+    // the in-process tests can pass an in-memory buffer without pulling
+    // in `libc` or touching global stderr state. Production call site in
+    // `run()` locks `std::io::stderr()`.
+    //
+    // The `foreground: bool` parameter on `run()` itself is plumbed from
+    // `src/main.rs` (foreground = `Commands::Daemon` && !cli.verbose &&
+    // stderr.is_terminal()); that branch is exercised by the manual smoke
+    // test in the PR body, not by in-process unit tests, since
+    // `IsTerminal::is_terminal` depends on the file-descriptor state at
+    // the moment of the test invocation.
+
+    const FOREGROUND_ECHO_HOST: &str = "127.0.0.1";
+    const FOREGROUND_ECHO_PORT: u16 = 0;
+
+    #[test]
+    fn foreground_echo_lists_all_pre_7934_lines_when_pairing_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+
+        let mut buf: Vec<u8> = Vec::new();
+        echo_daemon_started_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            &mut buf,
+        )
+        .expect("foreground echo writes succeed");
+        let captured = String::from_utf8(buf).expect("echo output is utf-8");
+
+        assert!(
+            captured.contains("ZeroClaw daemon started"),
+            "missing banner line, got: {captured:?}"
+        );
+        assert!(
+            captured.contains(&format!(
+                "http://{FOREGROUND_ECHO_HOST}:{FOREGROUND_ECHO_PORT}"
+            )),
+            "missing gateway URL line, got: {captured:?}"
+        );
+        assert!(
+            captured.contains("Socket:"),
+            "missing socket-prefix line, got: {captured:?}"
+        );
+        assert!(
+            captured.contains(
+                &crate::rpc::local::socket_path(&config)
+                    .display()
+                    .to_string()
+            ),
+            "missing socket path in socket line, got: {captured:?}"
+        );
+        assert!(
+            captured.contains("Components:"),
+            "missing components line, got: {captured:?}"
+        );
+        assert!(
+            captured.contains("Pairing:") && captured.contains("enabled"),
+            "missing pairing line when require_pairing is true, got: {captured:?}"
+        );
+        assert!(
+            captured.contains("Ctrl+C or SIGTERM"),
+            "missing stop-signal line, got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn foreground_echo_omits_pairing_line_when_pairing_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = false;
+
+        let mut buf: Vec<u8> = Vec::new();
+        echo_daemon_started_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            &mut buf,
+        )
+        .expect("foreground echo writes succeed");
+        let captured = String::from_utf8(buf).expect("echo output is utf-8");
+
+        assert!(
+            !captured.contains("Pairing:"),
+            "pairing line must NOT appear when require_pairing is false, got: {captured:?}"
+        );
+        // The remaining informational lines still emit so the operator
+        // gets gateway / socket / components / stop-signal context.
+        assert!(captured.contains("ZeroClaw daemon started"));
+        assert!(captured.contains("Components:"));
+        assert!(captured.contains("Ctrl+C or SIGTERM"));
+    }
+
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -2839,7 +2987,14 @@ mod tests {
 
         let exit = timeout(
             Duration::from_secs(2),
-            run(config, "127.0.0.1".to_string(), 4242, registry, false),
+            run(
+                config,
+                "127.0.0.1".to_string(),
+                4242,
+                registry,
+                false,
+                false,
+            ),
         )
         .await
         .expect("daemon should return after gateway-triggered reload")
@@ -2894,7 +3049,7 @@ mod tests {
 
         let exit = timeout(
             Duration::from_secs(3),
-            run(config, "127.0.0.1".to_string(), 0, registry, false),
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
         )
         .await
         .expect("daemon should return after gateway-triggered reload")

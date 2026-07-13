@@ -4236,6 +4236,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    // Foreground echo (issue #9000): only true when this
+                    // daemon is the user's interactive foreground process
+                    // (no `--verbose`, stderr is a real tty). Background
+                    // / systemd-supervised callers stay silent so we
+                    // don't pollute the journal with the seven
+                    // pre-#7934 informational lines.
+                    !cli.verbose && std::io::stderr().is_terminal(),
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
