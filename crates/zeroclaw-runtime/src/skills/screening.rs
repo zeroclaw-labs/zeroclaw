@@ -203,7 +203,8 @@ fn confidence_label(c: DetectionConfidence) -> &'static str {
 }
 
 /// Outcome of a successful install, carrying the screening report (when
-/// screening ran) so callers can persist it (task 2A) and display it.
+/// screening ran) plus the provenance fields the caller persists in the
+/// install receipt (task 2A).
 #[derive(Debug, Clone)]
 pub struct SkillInstallReport {
     /// Final installed directory.
@@ -212,6 +213,14 @@ pub struct SkillInstallReport {
     pub files_scanned: usize,
     /// Screening report, or `None` if screening was off for this source.
     pub screening: Option<ScreeningReport>,
+    /// Content tree hash (scheme v1) of the promoted tree — the receipt's
+    /// `tree_hash` and the content-bound override value.
+    pub tree_hash: String,
+    /// Immutable resolution of the fetched artifact (git commit SHA / zip
+    /// sha256), set by the remote installers; `None` for local installs.
+    pub resolution: Option<String>,
+    /// Content-bound override that was used, if any (I11).
+    pub accepted_override: Option<String>,
 }
 
 /// Raised when a `Denial`-impact finding requires a content-bound override
@@ -305,6 +314,16 @@ impl SkillScreeningGate {
     /// True when screening is entirely off — callers can skip the scan.
     pub fn is_off(&self) -> bool {
         self.action == GateAction::Off
+    }
+
+    /// The content-bound override that applies to `staged_hash`: the supplied
+    /// `--accept-risk` hash if it matches the freshly staged tree. Recorded in
+    /// the install receipt (I11).
+    pub fn matched_override(&self, staged_hash: &str) -> Option<String> {
+        self.accept_hash
+            .as_deref()
+            .filter(|h| *h == staged_hash)
+            .map(str::to_string)
     }
 
     /// Screen `dir` (staged, keyed to `staged_hash`) and decide whether the

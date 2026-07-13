@@ -20,6 +20,7 @@ pub mod creator;
 pub mod document;
 pub mod frontmatter;
 pub mod improver;
+pub mod receipt;
 pub mod reference;
 pub mod review;
 pub mod scaffold;
@@ -31,6 +32,9 @@ pub mod testing;
 pub use bundle::{BundleError, BundleSummary};
 pub use document::{DocumentParseError, SkillDocument};
 pub use frontmatter::SkillFrontmatter;
+pub use receipt::{
+    SkillInstallReceipt, SkillSourceRecord, VerifyStatus, compute_tree_hash, verify_skill,
+};
 pub use reference::{SkillRef, SkillRefError};
 pub use scaffold::{ScaffoldError, ScaffoldOptions};
 pub use screening::{
@@ -2282,52 +2286,15 @@ fn sweep_stale_staging(staging_root: &Path, stale_bound: Duration) {
     }
 }
 
-/// Deterministic digest of `(rel_path, len, mtime)` for every file under
-/// `dir`, used to detect concurrent mutation of the staged tree between the
-/// security checks and the final promote rename.
-///
-/// TODO(task-2A): replaced by the canonical content tree hash (scheme v1)
-/// once install receipts land; this interim digest is metadata-only.
+/// Canonical content tree hash (scheme v1) of a staged skill tree. Used both
+/// to detect concurrent mutation between the security checks and the promote
+/// rename, and as the content-bound override hash the user accepts. It reads
+/// file contents (not just metadata), so a same-length, same-mtime content
+/// swap is caught — and it is the exact value persisted in the install receipt
+/// [R5]. Fails closed on any symlink (the audit already rejects symlinks; one
+/// here was injected after the audit).
 fn staged_tree_digest(dir: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    for path in audit::collect_paths_depth_first(dir)? {
-        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
-            format!("failed to read metadata for {}", path.display().to_string())
-        })?;
-        // Fail closed on a symlink appearing in the staged tree. The audit
-        // already rejects all symlinks, so one present here was injected after
-        // the audit ran — hashing only files would render it invisible to the
-        // mutation guard and let it be promoted into the live skills dir. [A#2]
-        if metadata.file_type().is_symlink() {
-            anyhow::bail!(
-                "staged skill tree contains a symlink after audit: {}",
-                path.display()
-            );
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        let rel = path.strip_prefix(dir).unwrap_or(&path);
-        let rel_bytes = rel.to_string_lossy();
-        let rel_bytes = rel_bytes.as_bytes();
-        hasher.update(
-            u64::try_from(rel_bytes.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        hasher.update(rel_bytes);
-        hasher.update(metadata.len().to_le_bytes());
-        let mtime_nanos = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        hasher.update(mtime_nanos.to_le_bytes());
-    }
-    Ok(hex::encode(hasher.finalize()))
+    receipt::compute_tree_hash(dir)
 }
 
 /// Begin a staged install transaction: acquire the per-skill lock, sweep
@@ -2549,15 +2516,21 @@ fn audit_screen_promote(
     gate: &screening::SkillScreeningGate,
 ) -> Result<SkillInstallReport> {
     let audit_report = enforce_skill_security_audit(staged_dir, allow_scripts)?;
-    let digest = staged_tree_digest(staged_dir)?;
+    // The content tree hash (scheme v1) is the receipt's tree_hash, the
+    // mutation-guard digest, and the content-bound override value — one value.
+    let tree_hash = staged_tree_digest(staged_dir)?;
     // Screening runs after the structural audit, before promote. A denial the
     // user has not accepted (or `block`) surfaces as RiskAcceptanceRequired.
-    let screening = gate.evaluate(staged_dir, &digest)?;
-    finish_skill_install(staged_dir, dest, &digest)?;
+    let screening = gate.evaluate(staged_dir, &tree_hash)?;
+    let accepted_override = gate.matched_override(&tree_hash);
+    finish_skill_install(staged_dir, dest, &tree_hash)?;
     Ok(SkillInstallReport {
         dir: dest.to_path_buf(),
         files_scanned: audit_report.files_scanned,
         screening,
+        tree_hash,
+        resolution: None,
+        accepted_override,
     })
 }
 
@@ -2835,9 +2808,13 @@ pub fn install_git_skill_source(
         // Defense-in-depth: the staged tree must contain exactly the one
         // directory the clone was asked to create.
         let cloned_dir = detect_newly_installed_directory(&staged, &HashSet::new())?;
+        // Capture the immutable resolution (commit SHA) before .git is stripped.
+        let resolution = receipt::git_head_sha(&cloned_dir);
         remove_git_metadata(&cloned_dir)?;
         ensure_tree_within_budget(&cloned_dir, MAX_SKILL_ZIP_BYTES)?;
-        audit_screen_promote(&cloned_dir, &dest, allow_scripts, gate)
+        let mut report = audit_screen_promote(&cloned_dir, &dest, allow_scripts, gate)?;
+        report.resolution = resolution;
+        Ok(report)
     })();
     // On success the staged wrapper directory is left behind after its single
     // child was renamed away; on failure it may still hold the failed clone.
@@ -3138,6 +3115,8 @@ pub async fn install_clawhub_skill_source(
         }
 
         let bytes = download_skill_zip_bytes(resp, MAX_SKILL_ZIP_BYTES).await?;
+        // Immutable resolution: sha256 of the exact downloaded artifact.
+        let resolution = Some(receipt::sha256_hex(&bytes));
         extract_zip_secure(bytes, &staged, MAX_SKILL_ZIP_BYTES)?;
 
         let has_manifest = staged.join("SKILL.md").exists()
@@ -3153,7 +3132,9 @@ pub async fn install_clawhub_skill_source(
             )?;
         }
 
-        audit_screen_promote(&staged, &dest, allow_scripts, gate)
+        let mut report = audit_screen_promote(&staged, &dest, allow_scripts, gate)?;
+        report.resolution = resolution;
+        Ok(report)
     }
     .await;
     if result.is_err() {
@@ -4706,6 +4687,64 @@ mod install_transaction_tests {
     }
 
     #[test]
+    fn local_install_report_drives_receipt_and_verify() {
+        let (tmp, skills, _) = setup();
+        let source = tmp.path().join("clean-skill");
+        write_clean_skill(&source);
+
+        let report = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .unwrap();
+        assert!(!report.tree_hash.is_empty());
+        assert!(
+            report.resolution.is_none(),
+            "local install has no resolution"
+        );
+
+        let install_root = tmp.path().join("home");
+        let receipt = receipt::SkillInstallReceipt {
+            schema_version: receipt::RECEIPT_SCHEMA_VERSION,
+            name: "clean-skill".to_string(),
+            source: receipt::SkillSourceRecord::from_source(&SkillSource::Local {
+                path: source.clone(),
+            }),
+            immutable_resolution: report.resolution.clone(),
+            tree_hash: report.tree_hash.clone(),
+            tree_hash_scheme: receipt::TREE_HASH_SCHEME,
+            version: None,
+            tier_at_install: "unknown".to_string(),
+            screening_ruleset_version: 0,
+            screening_max_impact: None,
+            screening_counts: std::collections::BTreeMap::new(),
+            unscanned_count: 0,
+            audit_options: "allow_scripts=false".to_string(),
+            installer_version: "test".to_string(),
+            installed_at: 0,
+            accepted_hash: None,
+        };
+        receipt::write_receipt(&install_root, &receipt).unwrap();
+
+        assert_eq!(
+            receipt::verify_skill(&install_root, "clean-skill", &report.dir).unwrap(),
+            receipt::VerifyStatus::Ok
+        );
+        assert_eq!(
+            receipt::compute_tree_hash(&report.dir).unwrap(),
+            report.tree_hash
+        );
+
+        std::fs::write(report.dir.join("SKILL.md"), "# Test Skill\nedited\n").unwrap();
+        assert_eq!(
+            receipt::verify_skill(&install_root, "clean-skill", &report.dir).unwrap(),
+            receipt::VerifyStatus::Modified
+        );
+    }
+
+    #[test]
     fn git_install_success_via_local_fixture() {
         if !git_available() {
             eprintln!("skipping: git not available");
@@ -4718,17 +4757,19 @@ mod install_transaction_tests {
             &[("SKILL.md", "# Fixture\nClean skill.\n")],
         );
 
-        let SkillInstallReport {
-            dir: dest,
-            files_scanned: files,
-            ..
-        } = install_git_skill_source(
+        let report = install_git_skill_source(
             repo.to_str().unwrap(),
             &skills,
             false,
             &SkillScreeningGate::disabled(),
         )
         .unwrap();
+        assert!(
+            report.resolution.as_ref().is_some_and(|s| s.len() >= 7),
+            "git install must record a commit SHA resolution"
+        );
+        let dest = report.dir;
+        let files = report.files_scanned;
         assert_eq!(dest, skills.join("fixture-skill"));
         assert!(dest.join("SKILL.md").is_file());
         assert!(

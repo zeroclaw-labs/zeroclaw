@@ -503,6 +503,12 @@ Examples:
         /// Source URL, registry name, or local path to screen
         source: String,
     },
+    /// Verify installed skills against their install receipts (detects local
+    /// edits and upstream content swaps)
+    Verify {
+        /// Skill name to verify; omit to verify all installed skills
+        name: Option<String>,
+    },
     /// Remove an installed skill
     Remove {
         /// Skill name to remove

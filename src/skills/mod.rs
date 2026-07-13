@@ -155,6 +155,7 @@ pub async fn handle_command(
             accept_risk,
         } => handle_install(config, source, no_tier_banner, accept_risk).await,
         crate::SkillCommands::Screen { source } => handle_screen(config, source).await,
+        crate::SkillCommands::Verify { name } => handle_verify(config, name),
         crate::SkillCommands::Remove { name } => {
             // Reject path traversal attempts
             if name.contains("..") || name.contains('/') || name.contains('\\') {
@@ -223,45 +224,94 @@ pub async fn handle_command(
             }
             crate::SkillBundleCommands::Show { alias } => handle_bundle_show(config, alias),
         },
-        crate::SkillCommands::Test { name, verbose } => {
-            let results = if let Some(ref skill_name) = name {
-                // Test a single skill
-                let source_path = PathBuf::from(skill_name);
-                let target = if source_path.exists() {
-                    source_path
-                } else {
-                    skills_dir(workspace_dir).join(skill_name)
-                };
-
-                if !target.exists() {
-                    anyhow::bail!("Skill not found: {}", skill_name);
-                }
-
-                let r = testing::test_skill(&target, skill_name, verbose)?;
-                if r.tests_run == 0 {
-                    println!(
-                        "  {} No TEST.sh found for skill '{}'.",
-                        console::style("-").dim(),
-                        skill_name,
-                    );
-                    return Ok(());
-                }
-                vec![r]
-            } else {
-                // Test all skills
-                let dirs = vec![skills_dir(workspace_dir)];
-                testing::test_all_skills(&dirs, verbose)?
-            };
-
-            testing::print_results(&results);
-
-            let any_failed = results.iter().any(|r| !r.failures.is_empty());
-            if any_failed {
-                anyhow::bail!("Some skill tests failed.");
-            }
-            Ok(())
-        }
+        crate::SkillCommands::Test { name, verbose } => handle_test(config, name, verbose),
     }
+}
+
+/// True when the named installed skill's receipt records a remote source.
+/// Without a receipt (dev-local or pre-provenance skills) the skill is treated
+/// as local and its TEST.sh is allowed to run.
+fn skill_is_remote_origin(config: &crate::config::Config, skill_name: &str) -> bool {
+    let install_root = config.install_root_dir();
+    zeroclaw_runtime::skills::receipt::read_receipt(&install_root, skill_name)
+        .is_some_and(|r| r.source.is_remote())
+}
+
+/// Run TEST.sh validation. Under the current no-OS-sandbox posture, a skill
+/// whose receipt records a remote source is refused (its unaudited commands
+/// would run with only environment scrubbing) — a hard refusal that the
+/// sandboxed detonation work in a later RFC lifts. Local / no-receipt skills
+/// keep the existing warn-and-run behavior.
+fn handle_test(config: &crate::config::Config, name: Option<String>, verbose: bool) -> Result<()> {
+    let workspace_dir = &config.data_dir;
+    let results = if let Some(ref skill_name) = name {
+        let source_path = PathBuf::from(skill_name);
+        let (target, is_installed) = if source_path.exists() {
+            (source_path, false)
+        } else {
+            (skills_dir(workspace_dir).join(skill_name), true)
+        };
+
+        if !target.exists() {
+            anyhow::bail!("Skill not found: {}", skill_name);
+        }
+        if is_installed && skill_is_remote_origin(config, skill_name) {
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-test-remote-refused",
+                    &[("name", skill_name)]
+                )
+            );
+        }
+
+        let r = testing::test_skill(&target, skill_name, verbose)?;
+        if r.tests_run == 0 {
+            println!(
+                "  {} No TEST.sh found for skill '{}'.",
+                console::style("-").dim(),
+                skill_name,
+            );
+            return Ok(());
+        }
+        vec![r]
+    } else {
+        // Test all skills, skipping (with a note) any remote-origin skill.
+        let skills_path = skills_dir(workspace_dir);
+        let mut results = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&skills_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let skill_name = entry.file_name().to_string_lossy().into_owned();
+                if !path.join("TEST.sh").exists() {
+                    continue;
+                }
+                if skill_is_remote_origin(config, &skill_name) {
+                    eprintln!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-test-remote-refused",
+                            &[("name", &skill_name)]
+                        )
+                    );
+                    continue;
+                }
+                results.push(testing::test_skill(&path, &skill_name, verbose)?);
+            }
+        }
+        results
+    };
+
+    testing::print_results(&results);
+
+    let any_failed = results.iter().any(|r| !r.failures.is_empty());
+    if any_failed {
+        anyhow::bail!("Some skill tests failed.");
+    }
+    Ok(())
 }
 
 /// Build the screening gate for an install spec: remote sources use
@@ -394,24 +444,8 @@ async fn handle_install(
         eprint!("{}", screening.render());
     }
 
-    let status = console::style("✓").green().bold().to_string();
-    let installed_path = report.dir.display().to_string();
-    let files_scanned = report.files_scanned.to_string();
-    println!(
-        "{}",
-        get_required_cli_string_with_args(
-            "cli-skills-install-installed-audited",
-            &[
-                ("status", &status),
-                ("path", &installed_path),
-                ("files", &files_scanned)
-            ]
-        )
-    );
-    println!(
-        "{}",
-        get_required_cli_string("cli-skills-install-security-audit-completed")
-    );
+    record_install_receipt(config, &source, &report);
+    print_install_success(&report);
     Ok(())
 }
 
@@ -473,6 +507,13 @@ async fn handle_screening_denial(
     )
     .await?;
 
+    record_install_receipt(config, source, &report);
+    print_install_success(&report);
+    Ok(())
+}
+
+/// Print the standard install-success lines from a completed install report.
+fn print_install_success(report: &SkillInstallReport) {
     let status = console::style("✓").green().bold().to_string();
     let installed_path = report.dir.display().to_string();
     let files_scanned = report.files_scanned.to_string();
@@ -487,6 +528,145 @@ async fn handle_screening_denial(
             ]
         )
     );
+    println!(
+        "{}",
+        get_required_cli_string("cli-skills-install-security-audit-completed")
+    );
+}
+
+/// Assemble and persist an install receipt. A write failure is a warning, not
+/// a rollback — the skill is already installed.
+fn record_install_receipt(
+    config: &crate::config::Config,
+    source: &str,
+    report: &SkillInstallReport,
+) {
+    let install_root = config.install_root_dir();
+    let name = match report.dir.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+    let tier_at_install = resolve_tier_label(config, source, &name);
+    let receipt = zeroclaw_runtime::skills::receipt::SkillInstallReceipt {
+        schema_version: zeroclaw_runtime::skills::receipt::RECEIPT_SCHEMA_VERSION,
+        name: name.clone(),
+        source: SkillSourceRecord::from_source(&SkillSource::parse(source)),
+        immutable_resolution: report.resolution.clone(),
+        tree_hash: report.tree_hash.clone(),
+        tree_hash_scheme: zeroclaw_runtime::skills::receipt::TREE_HASH_SCHEME,
+        version: read_installed_skill_version(&report.dir),
+        tier_at_install,
+        screening_ruleset_version: 0,
+        screening_max_impact: None,
+        screening_counts: std::collections::BTreeMap::new(),
+        unscanned_count: 0,
+        audit_options: format!("allow_scripts={}", config.skills.allow_scripts),
+        installer_version: env!("CARGO_PKG_VERSION").to_string(),
+        installed_at: install_timestamp(),
+        accepted_hash: report.accepted_override.clone(),
+    }
+    .with_screening(report.screening.as_ref());
+
+    if let Err(err) = zeroclaw_runtime::skills::receipt::write_receipt(&install_root, &receipt) {
+        eprintln!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-receipt-write-failed",
+                &[("name", &name), ("error", &err.to_string())]
+            )
+        );
+    }
+}
+
+/// Best-effort trust-tier label for the receipt. Registry sources resolve the
+/// live registry tier; other sources have no tier and record `"unknown"`.
+fn resolve_tier_label(config: &crate::config::Config, source: &str, skill_name: &str) -> String {
+    if is_registry_source(source) {
+        let registry_dir = config.data_dir.join("skills-registry");
+        let (tier, _version) = lookup_registry_skill_tier(&registry_dir, skill_name);
+        format!("{tier:?}").to_lowercase()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Read the installed skill's version from its manifest, if present.
+fn read_installed_skill_version(dir: &std::path::Path) -> Option<String> {
+    for manifest in ["SKILL.toml", "manifest.toml"] {
+        if let Ok(content) = std::fs::read_to_string(dir.join(manifest))
+            && let Ok(value) = content.parse::<toml::Value>()
+            && let Some(version) = value
+                .get("skill")
+                .and_then(|s| s.get("version"))
+                .and_then(|v| v.as_str())
+        {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
+/// Current Unix timestamp in seconds for the receipt's `installed_at`.
+fn install_timestamp() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify installed skills against their receipts.
+fn handle_verify(config: &crate::config::Config, name: Option<String>) -> Result<()> {
+    use zeroclaw_runtime::skills::VerifyStatus;
+    let install_root = config.install_root_dir();
+    let skills_path = skills_dir(&config.data_dir);
+
+    let names: Vec<String> = match name {
+        Some(name) => vec![name],
+        None => {
+            let Ok(entries) = std::fs::read_dir(&skills_path) else {
+                println!("{}", get_required_cli_string("cli-skills-none-installed"));
+                return Ok(());
+            };
+            entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        }
+    };
+
+    let mut any_modified = false;
+    for name in names {
+        let skill_dir = skills_path.join(&name);
+        if !skill_dir.is_dir() {
+            anyhow::bail!("Skill not found: {name}");
+        }
+        let status = verify_skill(&install_root, &name, &skill_dir)?;
+        let (glyph, key) = match status {
+            VerifyStatus::Ok => (console::style("✓").green().bold(), "cli-skills-verify-ok"),
+            VerifyStatus::Modified => {
+                any_modified = true;
+                (
+                    console::style("✗").red().bold(),
+                    "cli-skills-verify-modified",
+                )
+            }
+            VerifyStatus::NoReceipt => (console::style("-").dim(), "cli-skills-verify-no-receipt"),
+        };
+        println!(
+            "  {} {}",
+            glyph,
+            get_required_cli_string_with_args(key, &[("name", &name)])
+        );
+    }
+
+    if any_modified {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string("cli-skills-verify-found-modified")
+        );
+    }
     Ok(())
 }
 
