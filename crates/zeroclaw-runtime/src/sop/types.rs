@@ -786,7 +786,13 @@ pub struct DeterministicSavings {
 pub enum SopRunAction {
     /// Inject this step into the agent for execution. `step.agent` is the
     /// resolved effective agent (step override then parent), not the raw
-    /// persisted override; consumers must not re-resolve it.
+    /// persisted override; consumers must not re-resolve it. Consumers MUST run
+    /// the step AS that effective agent: when it names a different agent than
+    /// the one running the turn, the step's per-agent execution context — its
+    /// gated tool registry, security/approval policy, and MCP scope — must be
+    /// re-assembled for that agent on EVERY driver path, not inherited from the
+    /// parent turn. Inheriting the parent's context would let a step run with a
+    /// broader tool/policy/MCP surface than its own agent is granted.
     ExecuteStep {
         run_id: String,
         step: SopStep,

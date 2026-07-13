@@ -200,6 +200,12 @@ pub struct ToolLoop<'a> {
     /// turn-level observer event so OTel spans correlate across the loop.
     pub agent_alias: Option<&'a str>,
     pub turn_id: &'a str,
+    /// Handle the live SOP driver uses to re-assemble a nested step's execution
+    /// context when the step delegates to a different agent (see
+    /// [`SopStepReassembly`]). `None` on every path that cannot reach `Config`
+    /// or that never drives nested SOP steps; when `None`, a cross-agent step
+    /// falls back to the parent context (today's behavior).
+    pub sop_reassembly: Option<SopStepReassembly<'a>>,
 }
 
 async fn enforce_reported_budget(
@@ -265,6 +271,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         memory,
         agent_alias,
         turn_id,
+        sop_reassembly,
     } = p;
     let ResolvedAgentExecution {
         model_access:
@@ -1153,7 +1160,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
         if !queued_sop_actions.is_empty() {
-            drive_live_sop_actions(
+            // Box the drive future: it inlines the full per-agent re-assembly
+            // (a large async fn), which would otherwise inflate this loop's
+            // stack-allocated future for every turn, SOP or not.
+            Box::pin(drive_live_sop_actions(
                 queued_sop_actions,
                 history,
                 model_provider,
@@ -1189,7 +1199,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 new_messages_out.as_deref_mut(),
                 image_cache.as_deref_mut(),
                 agent_alias,
-            )
+                sop_reassembly,
+            ))
             .await?;
         }
 
@@ -1307,6 +1318,160 @@ fn sop_step_excluded_tools(
     scoped
 }
 
+/// Config handle the live SOP driver needs to re-assemble a nested step's agent
+/// when the step delegates to a different agent than the one running the turn.
+///
+/// The live nested-step driver otherwise reuses the parent turn's assembled
+/// execution context; when a step names a different agent it must run AS that
+/// agent — with that agent's own gated tools, policy, and MCP scope — not the
+/// parent's. This carries the one handle needed to rebuild that context in
+/// flight; the runtime adapter is created from `config.runtime` so the nested
+/// context is assembled the way a fresh agent turn would be. `Copy` so the
+/// handle survives being re-read on every drained action and forwarded into
+/// each nested turn.
+#[derive(Clone, Copy)]
+pub struct SopStepReassembly<'a> {
+    pub config: &'a zeroclaw_config::schema::Config,
+}
+
+/// A nested SOP step's owned per-agent execution surface, assembled for a step
+/// that delegates to a different agent. Owns exactly the fields of
+/// [`ResolvedAgentExecution`] that constitute per-agent isolation — provider
+/// binding, gated tool registry, approval policy, and the deferred-MCP
+/// activation set. The remaining turn knobs (iteration caps, pacing, budgets,
+/// multimodal, hooks) stay parent-threaded by design: the boundary re-assembled
+/// here is per-agent isolation of tools/policy/MCP/provider, not a full
+/// per-agent turn-config swap.
+pub(crate) struct OwnedAgentExecution {
+    model_provider: Box<dyn ModelProvider>,
+    provider_name: String,
+    model: String,
+    pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
+    approval: crate::approval::ApprovalManager,
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+}
+
+/// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
+/// would: the agent's security policy, memory, gated tool registry (through the
+/// one [`crate::tools::scoped::ScopedToolRegistry::assemble`] seam, connecting
+/// the agent's own granted MCP scope), skills, provider binding, and
+/// non-interactive approval policy. The live SOP engine/audit handles are
+/// threaded from the running SOP so the nested step keeps its SOP tools bound to
+/// the same engine. This connects MCP servers, so the driver memoizes the
+/// result per alias across a drain and re-assembles only on an alias change.
+pub(crate) async fn assemble_owned_execution(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+) -> Result<OwnedAgentExecution> {
+    let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
+    let risk_profile = config
+        .risk_profile_for_agent(alias)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SOP step agent '{alias}' has no configured risk profile"
+            ))
+        })?;
+    let api_key = config
+        .resolved_model_provider_for_agent(alias)
+        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    let memory =
+        zeroclaw_memory::create_memory_for_agent(config, alias, api_key.as_deref()).await?;
+
+    // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
+    // tools via `crate::agent::run`, which builds its runtime from
+    // `config.runtime`. Creating it here (rather than reusing the parent's) is
+    // read-only — a shell-existence check plus struct construction — and only
+    // happens on the cross-agent path, which is memoized per alias.
+    let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+        Arc::from(crate::platform::create_runtime(&config.runtime)?);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let built = crate::tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        &risk_profile,
+        alias,
+        runtime.clone(),
+        memory,
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.data_dir,
+        &config.agents,
+        api_key.as_deref(),
+        config,
+        None,
+        false,
+        None,
+        Some(sop_engine),
+        sop_audit,
+        None,
+    );
+    let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // The same gated seam run(), process_message, and independent delegation use:
+    // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
+    // this agent's MCP bundles, and its skills register as tools. Peripherals stay
+    // disconnected — a nested SOP sub-loop must not seize the serial hardware the
+    // live daemon holds exclusively.
+    let assembled =
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            config,
+            agent_alias: alias,
+            security: &security,
+            built,
+            skills: &skills,
+            runtime,
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+    let crate::tools::scoped::ScopedAssembled {
+        registry,
+        activated_handle,
+        ..
+    } = assembled;
+    let tools_registry = registry.into_inner();
+
+    let provider_ref = config
+        .resolved_model_provider_for_agent(alias)
+        .map(|(ty, al, _)| format!("{ty}.{al}"))
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SOP step agent '{alias}' has no resolved model provider"
+            ))
+        })?;
+    let (model_provider, provider_name, model) =
+        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
+
+    let approval = crate::approval::ApprovalManager::for_non_interactive(&risk_profile);
+
+    Ok(OwnedAgentExecution {
+        model_provider,
+        provider_name,
+        model,
+        tools_registry,
+        approval,
+        activated_tools: activated_handle,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
@@ -1344,8 +1509,15 @@ async fn drive_live_sop_actions(
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     agent_alias: Option<&str>,
+    sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<()> {
     let mut pending = std::collections::VecDeque::from(queued_actions);
+    // Per-agent execution contexts re-assembled in flight for steps that
+    // delegate to a different agent, memoized by alias across this drain:
+    // `assemble_owned_execution` connects MCP, so it runs at most once per
+    // distinct step agent, never per step.
+    let mut exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
+        std::collections::HashMap::new();
     while let Some(queued) = pending.pop_front() {
         let mut action = queued.action.clone();
         loop {
@@ -1362,69 +1534,161 @@ async fn drive_live_sop_actions(
                         out.push(user_message);
                     }
 
-                    let sop_excluded_tools = sop_step_excluded_tools(
-                        &queued,
-                        &run_id,
-                        &step,
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                    );
+                    // A step that delegates to a different agent must run AS that
+                    // agent — with that agent's own gated tools, policy, and MCP
+                    // scope — not the parent turn's. When the step names a
+                    // different agent and a reassembly handle is available,
+                    // re-assemble (and memoize) that agent's execution context;
+                    // same-agent steps keep the parent context unchanged.
+                    let step_alias = step.agent.as_deref();
+                    let needs_reassembly = matches!(step_alias, Some(s) if agent_alias != Some(s));
+                    let mut assembly_error: Option<anyhow::Error> = None;
+                    if needs_reassembly {
+                        let alias =
+                            step_alias.expect("needs_reassembly implies a step agent alias");
+                        if let Some(reassembly) = sop_reassembly {
+                            if !exec_cache.contains_key(alias) {
+                                match assemble_owned_execution(
+                                    reassembly.config,
+                                    alias,
+                                    Arc::clone(&queued.engine),
+                                    queued.audit.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(owned) => {
+                                        exec_cache.insert(alias.to_string(), owned);
+                                    }
+                                    Err(e) => assembly_error = Some(e),
+                                }
+                            }
+                        } else {
+                            // This construction path provides no per-agent re-assembly
+                            // handle, so a step delegating to a different agent would run
+                            // with the parent turn's broader context. Surface the gap
+                            // rather than under-enforce in silence (omission is not a grant).
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                &format!(
+                                    "SOP step delegates to agent '{alias}' but this run path \
+                                     provides no per-agent re-assembly; the step runs with the \
+                                     parent agent's context (per-agent isolation not applied)"
+                                )
+                            );
+                        }
+                    }
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
                     let step_call_sink = crate::sop::executor::new_step_call_sink();
-                    let step_output = crate::sop::executor::scope_step_call_sink(
-                        step_call_sink.clone(),
-                        Box::pin(run_tool_call_loop(ToolLoop {
-                            exec: ResolvedAgentExecution::resolve(
-                                ResolvedModelAccess {
-                                    model_provider,
-                                    provider_name,
-                                    model,
-                                    temperature,
-                                },
-                                ResolvedIo {
-                                    tools_registry,
-                                    observer,
-                                    silent,
-                                    approval,
-                                    multimodal_config,
-                                    hooks,
-                                    activated_tools,
-                                    model_switch_callback: model_switch_callback.clone(),
-                                    receipt_generator,
-                                },
-                                ResolvedRuntimeKnobs {
-                                    max_tool_iterations,
-                                    excluded_tools: &sop_excluded_tools,
-                                    dedup_exempt_tools,
-                                    pacing,
-                                    strict_tool_parsing,
-                                    parallel_tools,
-                                    max_tool_result_chars,
-                                    context_token_budget,
-                                    knobs,
-                                },
+                    let step_output = if let Some(err) = assembly_error {
+                        // Fail closed: never run a delegated step with the parent
+                        // agent's broader context when the step agent's own
+                        // context could not be assembled.
+                        Err(err)
+                    } else {
+                        // Select the effective per-agent execution surface: the
+                        // re-assembled step agent when reassembly applied,
+                        // otherwise the parent turn's (byte-identical to today).
+                        let owned = if needs_reassembly {
+                            exec_cache.get(
+                                step_alias.expect("needs_reassembly implies a step agent alias"),
+                            )
+                        } else {
+                            None
+                        };
+                        let (
+                            eff_model_provider,
+                            eff_provider_name,
+                            eff_model,
+                            eff_registry,
+                            eff_approval,
+                            eff_activated,
+                        ) = match owned {
+                            Some(o) => (
+                                o.model_provider.as_ref(),
+                                o.provider_name.as_str(),
+                                o.model.as_str(),
+                                o.tools_registry.as_slice(),
+                                Some(&o.approval),
+                                o.activated_tools.as_ref(),
                             ),
-                            history,
-                            channel_name,
-                            channel_reply_target,
-                            cancellation_token: cancellation_token.clone(),
-                            on_delta: on_delta.clone(),
-                            shared_budget: shared_budget.clone(),
-                            channel,
-                            collected_receipts,
-                            event_tx: event_tx.clone(),
-                            steering: None,
-                            new_messages_out: new_messages_out.as_deref_mut(),
-                            image_cache: image_cache.as_deref_mut(),
-                            memory: None,
-                            ingress: IngressContext::sub_turn(),
-                            agent_alias,
-                            turn_id: &nested_turn_id,
-                        })),
-                    )
-                    .await;
+                            None => (
+                                model_provider,
+                                provider_name,
+                                model,
+                                tools_registry,
+                                approval,
+                                activated_tools,
+                            ),
+                        };
+
+                        let sop_excluded_tools = sop_step_excluded_tools(
+                            &queued,
+                            &run_id,
+                            &step,
+                            eff_registry,
+                            eff_activated,
+                            excluded_tools,
+                        );
+
+                        crate::sop::executor::scope_step_call_sink(
+                            step_call_sink.clone(),
+                            Box::pin(run_tool_call_loop(ToolLoop {
+                                exec: ResolvedAgentExecution::resolve(
+                                    ResolvedModelAccess {
+                                        model_provider: eff_model_provider,
+                                        provider_name: eff_provider_name,
+                                        model: eff_model,
+                                        temperature,
+                                    },
+                                    ResolvedIo {
+                                        tools_registry: eff_registry,
+                                        observer,
+                                        silent,
+                                        approval: eff_approval,
+                                        multimodal_config,
+                                        hooks,
+                                        activated_tools: eff_activated,
+                                        model_switch_callback: model_switch_callback.clone(),
+                                        receipt_generator,
+                                    },
+                                    ResolvedRuntimeKnobs {
+                                        max_tool_iterations,
+                                        excluded_tools: &sop_excluded_tools,
+                                        dedup_exempt_tools,
+                                        pacing,
+                                        strict_tool_parsing,
+                                        parallel_tools,
+                                        max_tool_result_chars,
+                                        context_token_budget,
+                                        knobs,
+                                    },
+                                ),
+                                history,
+                                channel_name,
+                                channel_reply_target,
+                                cancellation_token: cancellation_token.clone(),
+                                on_delta: on_delta.clone(),
+                                shared_budget: shared_budget.clone(),
+                                channel,
+                                collected_receipts,
+                                event_tx: event_tx.clone(),
+                                steering: None,
+                                new_messages_out: new_messages_out.as_deref_mut(),
+                                image_cache: image_cache.as_deref_mut(),
+                                memory: None,
+                                ingress: IngressContext::sub_turn(),
+                                agent_alias,
+                                turn_id: &nested_turn_id,
+                                sop_reassembly,
+                            })),
+                        )
+                        .await
+                    };
 
                     let step_calls = crate::sop::executor::drain_step_calls(&step_call_sink);
                     let completed_at = crate::sop::engine::now_iso8601();

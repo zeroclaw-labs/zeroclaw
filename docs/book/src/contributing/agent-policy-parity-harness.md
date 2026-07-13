@@ -27,10 +27,13 @@ runtime knobs) are assembled at several distinct sites:
 | Gateway | the gateway server |
 | `loop_::run` | non-interactive runs: cron jobs, the daemon heartbeat, sub-agent spawning |
 | Delegate | sub-agent delegation |
+| SOP live nested step | `drive_live_sop_actions`: a step delegating to a different agent re-assembles that agent's engine input in-flight |
 
 Each path must hand the engine the same policy for the same agent config. The
 parity harness asserts exactly that: a setting enforced on one path is enforced
-on every path.
+on every path. The SOP live nested-step path is a sub-turn inside an already-running
+turn: when a step names a different agent, its engine input is re-assembled through
+the same seam rather than inherited from the parent turn.
 
 ## The parity matrix
 
