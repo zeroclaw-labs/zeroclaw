@@ -25,10 +25,11 @@ pub struct LucidMemory {
 impl LucidMemory {
     const DEFAULT_LUCID_CMD: &'static str = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    // Lucid CLI cold start can exceed 120ms on slower machines, which causes
-    // avoidable fallback to local-only memory and premature cooldown.
-    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
-    const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
+    // Lucid CLI cold starts include loading the local embedding model and can
+    // exceed 1.5s on ARM hosts. Keep the bound finite while avoiding fallback
+    // before a healthy process has had time to initialize.
+    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 3_000;
+    const DEFAULT_STORE_TIMEOUT_MS: u64 = 3_000;
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
@@ -612,8 +613,8 @@ if [ "${1:-}" = "store" ]; then
 fi
 
 if [ "${1:-}" = "context" ]; then
-  # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
-  sleep 0.2
+  # Simulate an ARM cold start that exceeds the previous 500ms timeout.
+  sleep 1.5
   cat <<'EOF'
 <lucid-context>
 - [decision] Delayed token refresh guidance
@@ -734,7 +735,18 @@ exit 1
     async fn recall_handles_lucid_cold_start_delay_within_timeout() {
         let tmp = TempDir::new().unwrap();
         let delayed_cmd = write_delayed_lucid_script(tmp.path());
-        let memory = test_memory(tmp.path(), delayed_cmd);
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_options(
+            "test",
+            tmp.path(),
+            sqlite,
+            delayed_cmd,
+            200,
+            3,
+            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS),
+            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS),
+            Duration::from_secs(2),
+        );
 
         memory
             .store(
