@@ -12,11 +12,12 @@ When definitions conflict, update the source file first, then sync this page.
 
 Labels are portable metadata. They should answer what kind of work this is, what code area it touches, how risky it is to review, and whether stale policy or triage policy needs special handling.
 
-When Project board automation is added, use it as an automated planning board,
-not as a second PR review queue. The board should answer slower-moving planning
-questions: what is ready to pick up, what routing evidence keeps it active,
-what tracker or milestone it belongs to, and what is blocked. Native GitHub PR
-state should continue to answer fast-moving review and merge questions.
+Project board automation is a planning aid, not a second PR review queue. The
+current issue-dashboard planner is manual and report-only. The board should
+answer slower-moving planning questions: what is ready to pick up, what routing
+evidence keeps it active, what tracker or milestone it belongs to, and what is
+blocked. Native GitHub PR state should continue to answer fast-moving review and
+merge questions.
 
 Keep the split based on update frequency:
 
@@ -286,6 +287,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `risk:manual` | Maintainer override that freezes automated risk recalculation |
 
 High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
+
+Apply `risk:high` to any PR that raises the workspace MSRV, pinned Rust toolchain, generated installer/Docker toolchain baseline, or release workflow toolchain floor. Do not downgrade the risk just because the diff looks like CI, dependency, or docs housekeeping: a higher required Rust version affects downstream source builds, distro packages, container builds, and users pinned to older toolchains.
 
 When uncertain, treat as higher risk.
 

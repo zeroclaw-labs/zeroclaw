@@ -678,12 +678,28 @@ impl WeChatChannel {
         let api_base_url = https_base_url("api_base_url", api_base_url, DEFAULT_API_BASE_URL)?;
         let cdn_base_url = https_base_url("cdn_base_url", cdn_base_url, CDN_BASE_URL)?;
 
+        let alias = alias.into();
         let has_peers = !peer_resolver().is_empty();
         let pairing = if has_peers {
             None
         } else {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
+                // Mirror Telegram: a backgrounded daemon discards stdout, so
+                // also record the one-time bind code through the structured
+                // log where `zeroclaw service logs` / the gateway can find it.
+                // Tag it `Channel` so the web Logs page shows it by default
+                // (an untagged event defaults to `Internal` and is hidden).
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias.as_str(),
+                            "pairing_code": code.as_str(),
+                        })),
+                    "WeChat pairing required; one-time bind code issued"
+                );
                 println!(
                     "  {}",
                     wechat_cli_string_with_args("cli-wechat-pairing-required", &[("code", &code)],)
@@ -710,7 +726,7 @@ impl WeChatChannel {
             account_id: RwLock::new(None),
             api_base_url,
             cdn_base_url,
-            alias: alias.into(),
+            alias,
             peer_resolver,
             persist: None,
             pairing,
