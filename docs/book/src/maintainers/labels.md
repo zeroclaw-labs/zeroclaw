@@ -288,6 +288,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 
 High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
 
+Apply `risk:high` to any PR that raises the workspace MSRV, pinned Rust toolchain, generated installer/Docker toolchain baseline, or release workflow toolchain floor. Do not downgrade the risk just because the diff looks like CI, dependency, or docs housekeeping: a higher required Rust version affects downstream source builds, distro packages, container builds, and users pinned to older toolchains.
+
 When uncertain, treat as higher risk.
 
 ## Contributor tier labels
