@@ -226,12 +226,12 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           toggle: the rail is the navigation. Grouping is expressed as thin
           divider rules between the icon clusters. */}
       <aside
-        className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col border-r z-50"
+        className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col overflow-x-hidden border-r z-50"
         style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
         aria-label={t('nav.aria.primary')}
       >
         <RailLogo />
-        <nav className="flex-1 overflow-y-auto py-3 px-1.5" aria-label={t('nav.aria.primary')}>
+        <nav className="flex-1 overflow-y-auto overflow-x-hidden py-3 px-1.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
