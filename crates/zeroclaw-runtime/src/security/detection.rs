@@ -53,6 +53,7 @@ pub fn sanitize_excerpt(raw: &str) -> String {
         }
         let stripped = is_bidi_control(ch)
             || is_zero_width(ch)
+            || is_tag_or_selector(ch)
             || (ch.is_control() && ch != '\t')
             // C1 controls (U+0080–U+009F) are not flagged by is_control on
             // char, so reject them explicitly.
@@ -94,6 +95,18 @@ pub fn is_zero_width(ch: char) -> bool {
     )
 }
 
+/// Unicode TAG characters (U+E0000–U+E007F) and variation selectors — invisible
+/// glyphs that can carry a smuggled instruction channel into a rendered report
+/// or a persisted receipt. Stripped from excerpts as defense-in-depth [R3].
+pub fn is_tag_or_selector(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{E0000}'..='\u{E007F}'      // Unicode TAG block
+            | '\u{FE00}'..='\u{FE0F}'  // variation selectors
+            | '\u{E0100}'..='\u{E01EF}' // variation selectors supplement
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +132,15 @@ mod tests {
         assert!(!clean.chars().any(is_bidi_control));
         assert!(!clean.chars().any(is_zero_width));
         assert!(clean.contains("safe"));
+    }
+
+    #[test]
+    fn sanitize_strips_tag_chars_and_selectors() {
+        let raw = "name\u{E0069}\u{E0067}\u{FE0F}end";
+        let clean = sanitize_excerpt(raw);
+        assert!(!clean.chars().any(is_tag_or_selector));
+        assert!(clean.contains("name"));
+        assert!(clean.contains("end"));
     }
 
     #[test]
