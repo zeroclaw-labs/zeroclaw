@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use super::constants::{SKILL_DEPRECATED_MANIFESTS, SKILL_MANIFEST_FILENAME};
 
-const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
+pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SkillAuditOptions {

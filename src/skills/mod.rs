@@ -152,90 +152,9 @@ pub async fn handle_command(
         crate::SkillCommands::Install {
             source,
             no_tier_banner,
-        } => {
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-skills-install-start",
-                    &[("source", &source)]
-                )
-            );
-
-            let skills_path = skills_dir(workspace_dir);
-            std::fs::create_dir_all(&skills_path)?;
-
-            let (installed_dir, files_scanned) = if is_clawhub_source(&source) {
-                install_clawhub_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .await
-                    .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
-            } else if is_git_source(&source) {
-                install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .with_context(|| format!("failed to install git skill source: {source}"))?
-            } else if is_registry_source(&source) {
-                println!(
-                    "{}",
-                    get_required_cli_string_with_args(
-                        "cli-skills-install-resolving-registry",
-                        &[("source", &source)]
-                    )
-                );
-                install_registry_skill_source(
-                    &source,
-                    &skills_path,
-                    config.skills.allow_scripts,
-                    workspace_dir,
-                    config.skills.registry_url.as_deref(),
-                    no_tier_banner,
-                )
-                .with_context(|| format!("failed to install skill from registry: {source}"))?
-            } else if is_extra_registry_source(&source) {
-                // `is_extra_registry_source` is `parse_extra_registry_source(..).is_some()`,
-                // so this re-parse always succeeds. `unwrap_or_default` only guards an
-                // unreachable `None` for a cosmetic label rather than panicking in the CLI.
-                let registry_label = parse_extra_registry_source(&source)
-                    .map(|(name, _)| name)
-                    .unwrap_or_default();
-                println!(
-                    "{}",
-                    get_required_cli_string_with_args(
-                        "cli-skills-install-resolving-extra-registry",
-                        &[("source", &source), ("registry", &registry_label)]
-                    )
-                );
-                install_extra_registry_skill_source(
-                    &source,
-                    &skills_path,
-                    config.skills.allow_scripts,
-                    workspace_dir,
-                    &config.skills.extra_registries,
-                    no_tier_banner,
-                )
-                .with_context(|| format!("failed to install skill from extra registry: {source}"))?
-            } else {
-                install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?
-            };
-            let status = console::style("✓").green().bold().to_string();
-            let installed_path = installed_dir.display().to_string();
-            let files_scanned = files_scanned.to_string();
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-skills-install-installed-audited",
-                    &[
-                        ("status", &status),
-                        ("path", &installed_path),
-                        ("files", &files_scanned)
-                    ]
-                )
-            );
-
-            println!(
-                "{}",
-                get_required_cli_string("cli-skills-install-security-audit-completed")
-            );
-            Ok(())
-        }
+            accept_risk,
+        } => handle_install(config, source, no_tier_banner, accept_risk).await,
+        crate::SkillCommands::Screen { source } => handle_screen(config, source).await,
         crate::SkillCommands::Remove { name } => {
             // Reject path traversal attempts
             if name.contains("..") || name.contains('/') || name.contains('\\') {
@@ -343,6 +262,282 @@ pub async fn handle_command(
             Ok(())
         }
     }
+}
+
+/// Build the screening gate for an install spec: remote sources use
+/// `[skills.install_screening].remote_action` (carrying any `--accept-risk`
+/// override), local sources use `local_action`.
+fn screening_gate_for(
+    config: &crate::config::Config,
+    source: &str,
+    accept_risk: Option<String>,
+) -> SkillScreeningGate {
+    let cfg = &config.skills.install_screening;
+    let is_remote = is_clawhub_source(source)
+        || is_git_source(source)
+        || is_registry_source(source)
+        || is_extra_registry_source(source);
+    if is_remote {
+        SkillScreeningGate::for_remote(cfg.remote_action, accept_risk)
+    } else {
+        SkillScreeningGate::for_local(cfg.local_action)
+    }
+}
+
+/// Dispatch an install spec to the matching installer with the screening gate
+/// threaded in.
+async fn dispatch_install(
+    config: &crate::config::Config,
+    source: &str,
+    workspace_dir: &std::path::Path,
+    skills_path: &std::path::Path,
+    no_tier_banner: bool,
+    gate: &SkillScreeningGate,
+) -> Result<SkillInstallReport> {
+    let allow_scripts = config.skills.allow_scripts;
+    if is_clawhub_source(source) {
+        install_clawhub_skill_source(source, skills_path, allow_scripts, gate)
+            .await
+            .with_context(|| format!("failed to install skill from ClawHub: {source}"))
+    } else if is_git_source(source) {
+        install_git_skill_source(source, skills_path, allow_scripts, gate)
+            .with_context(|| format!("failed to install git skill source: {source}"))
+    } else if is_registry_source(source) {
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-install-resolving-registry",
+                &[("source", source)]
+            )
+        );
+        install_registry_skill_source(
+            source,
+            skills_path,
+            allow_scripts,
+            workspace_dir,
+            config.skills.registry_url.as_deref(),
+            no_tier_banner,
+            gate,
+        )
+        .with_context(|| format!("failed to install skill from registry: {source}"))
+    } else if is_extra_registry_source(source) {
+        let registry_label = parse_extra_registry_source(source)
+            .map(|(name, _)| name)
+            .unwrap_or_default();
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-install-resolving-extra-registry",
+                &[("source", source), ("registry", &registry_label)]
+            )
+        );
+        install_extra_registry_skill_source(
+            source,
+            skills_path,
+            allow_scripts,
+            workspace_dir,
+            &config.skills.extra_registries,
+            no_tier_banner,
+            gate,
+        )
+        .with_context(|| format!("failed to install skill from extra registry: {source}"))
+    } else {
+        install_local_skill_source(source, skills_path, allow_scripts, gate)
+            .with_context(|| format!("failed to install local skill source: {source}"))
+    }
+}
+
+/// Install a skill, applying install-boundary screening. On a screening denial
+/// under `confirm`, prints the report and the staged content hash, then either
+/// prompts on a TTY or instructs a rerun with `--accept-risk=<hash>`.
+async fn handle_install(
+    config: &crate::config::Config,
+    source: String,
+    no_tier_banner: bool,
+    accept_risk: Option<String>,
+) -> Result<()> {
+    let workspace_dir = &config.data_dir;
+    println!(
+        "{}",
+        get_required_cli_string_with_args("cli-skills-install-start", &[("source", &source)])
+    );
+
+    let skills_path = skills_dir(workspace_dir);
+    std::fs::create_dir_all(&skills_path)?;
+
+    let gate = screening_gate_for(config, &source, accept_risk.clone());
+    let outcome = dispatch_install(
+        config,
+        &source,
+        workspace_dir,
+        &skills_path,
+        no_tier_banner,
+        &gate,
+    )
+    .await;
+
+    let report = match outcome {
+        Ok(report) => report,
+        Err(err) => {
+            // A screening denial surfaces as RiskAcceptanceRequired; show the
+            // report + hash and, on a TTY, offer to re-run with the override.
+            if let Some(risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
+                return handle_screening_denial(config, &source, no_tier_banner, risk).await;
+            }
+            return Err(err);
+        }
+    };
+
+    if let Some(screening) = &report.screening
+        && !screening.is_clean()
+    {
+        eprint!("{}", screening.render());
+    }
+
+    let status = console::style("✓").green().bold().to_string();
+    let installed_path = report.dir.display().to_string();
+    let files_scanned = report.files_scanned.to_string();
+    println!(
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-skills-install-installed-audited",
+            &[
+                ("status", &status),
+                ("path", &installed_path),
+                ("files", &files_scanned)
+            ]
+        )
+    );
+    println!(
+        "{}",
+        get_required_cli_string("cli-skills-install-security-audit-completed")
+    );
+    Ok(())
+}
+
+/// Handle a screening denial: print the report + staged hash. Under `block`
+/// (no override possible) abort. Under `confirm`, on an interactive TTY prompt
+/// y/N against the displayed hash and, if accepted, re-run the install with a
+/// content-bound override; otherwise instruct a `--accept-risk` rerun.
+async fn handle_screening_denial(
+    config: &crate::config::Config,
+    source: &str,
+    no_tier_banner: bool,
+    risk: &RiskAcceptanceRequired,
+) -> Result<()> {
+    eprint!("{}", risk.report.render());
+    eprintln!(
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-skills-screen-staged-hash",
+            &[("hash", &risk.staged_hash)]
+        )
+    );
+
+    if risk.blocked {
+        anyhow::bail!("{}", get_required_cli_string("cli-skills-screen-blocked"));
+    }
+
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !interactive {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-screen-accept-hint",
+                &[("hash", &risk.staged_hash)]
+            )
+        );
+    }
+
+    let proceed = dialoguer::Confirm::new()
+        .with_prompt(get_required_cli_string("cli-skills-screen-confirm-prompt"))
+        .default(false)
+        .interact()?;
+    if !proceed {
+        anyhow::bail!("{}", get_required_cli_string("cli-skills-screen-declined"));
+    }
+
+    // Re-run with the content-bound override. The install re-stages and
+    // re-hashes; if the source now serves different bytes the hash differs and
+    // this stale override is rejected.
+    let workspace_dir = &config.data_dir;
+    let skills_path = skills_dir(workspace_dir);
+    let gate = screening_gate_for(config, source, Some(risk.staged_hash.clone()));
+    let report = dispatch_install(
+        config,
+        source,
+        workspace_dir,
+        &skills_path,
+        no_tier_banner,
+        &gate,
+    )
+    .await?;
+
+    let status = console::style("✓").green().bold().to_string();
+    let installed_path = report.dir.display().to_string();
+    let files_scanned = report.files_scanned.to_string();
+    println!(
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-skills-install-installed-audited",
+            &[
+                ("status", &status),
+                ("path", &installed_path),
+                ("files", &files_scanned)
+            ]
+        )
+    );
+    Ok(())
+}
+
+/// Screen a skill source without installing it. Remote sources are staged to a
+/// temporary directory, scanned, and discarded; local sources are scanned in
+/// place. Exits nonzero iff any `Denial` finding is present.
+async fn handle_screen(config: &crate::config::Config, source: String) -> Result<()> {
+    let report = if is_clawhub_source(&source)
+        || is_git_source(&source)
+        || is_registry_source(&source)
+        || is_extra_registry_source(&source)
+    {
+        screen_remote_source(config, &source).await?
+    } else {
+        let path = PathBuf::from(&source);
+        if !path.exists() {
+            anyhow::bail!("Source path does not exist: {source}");
+        }
+        screen_skill_directory(&path)?
+    };
+
+    print!("{}", report.render());
+    if report.has_denial() {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string("cli-skills-screen-found-denial")
+        );
+    }
+    Ok(())
+}
+
+/// Stage a remote source into a throwaway temp directory and screen it without
+/// installing. Reuses the real installers with a disabled gate, pointed at a
+/// temp skills dir, then screens the promoted copy.
+async fn screen_remote_source(
+    config: &crate::config::Config,
+    source: &str,
+) -> Result<zeroclaw_runtime::skills::ScreeningReport> {
+    let tmp = tempfile::tempdir().context("failed to create temp dir for screening")?;
+    let skills_path = tmp.path().join("skills");
+    std::fs::create_dir_all(&skills_path)?;
+    let report = dispatch_install(
+        config,
+        source,
+        tmp.path(),
+        &skills_path,
+        true,
+        &SkillScreeningGate::disabled(),
+    )
+    .await?;
+    screen_skill_directory(&report.dir).context("failed to screen staged skill")
 }
 
 #[allow(clippy::too_many_arguments)]

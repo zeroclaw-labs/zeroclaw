@@ -23,6 +23,7 @@ pub mod improver;
 pub mod reference;
 pub mod review;
 pub mod scaffold;
+pub mod screening;
 pub mod service;
 mod suggestions;
 pub mod testing;
@@ -32,6 +33,10 @@ pub use document::{DocumentParseError, SkillDocument};
 pub use frontmatter::SkillFrontmatter;
 pub use reference::{SkillRef, SkillRefError};
 pub use scaffold::{ScaffoldError, ScaffoldOptions};
+pub use screening::{
+    FindingCategory, FindingImpact, RiskAcceptanceRequired, ScreeningFinding, ScreeningReport,
+    SkillInstallReport, SkillScreeningGate, screen_skill_directory,
+};
 pub use service::{
     EffectiveSkill, EffectiveSkillSet, RemoveMode, ServiceError, SkillOrigin, SkillSummary,
     SkillsService,
@@ -2534,11 +2539,34 @@ fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Audit → screen → promote a staged skill tree. The single tail shared by
+/// every installer: runs the structural audit, then install-boundary screening
+/// (task 1B) via `gate`, then promotes with the concurrent-mutation guard.
+fn audit_screen_promote(
+    staged_dir: &Path,
+    dest: &Path,
+    allow_scripts: bool,
+    gate: &screening::SkillScreeningGate,
+) -> Result<SkillInstallReport> {
+    let audit_report = enforce_skill_security_audit(staged_dir, allow_scripts)?;
+    let digest = staged_tree_digest(staged_dir)?;
+    // Screening runs after the structural audit, before promote. A denial the
+    // user has not accepted (or `block`) surfaces as RiskAcceptanceRequired.
+    let screening = gate.evaluate(staged_dir, &digest)?;
+    finish_skill_install(staged_dir, dest, &digest)?;
+    Ok(SkillInstallReport {
+        dir: dest.to_path_buf(),
+        files_scanned: audit_report.files_scanned,
+        screening,
+    })
+}
+
 pub fn install_local_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
+    gate: &screening::SkillScreeningGate,
+) -> Result<SkillInstallReport> {
     let source_path = PathBuf::from(source);
     if !source_path.exists() {
         anyhow::bail!("Source path does not exist: {source}");
@@ -2557,10 +2585,7 @@ pub fn install_local_skill_source(
 
     let result = (|| {
         copy_dir_recursive_secure(&source_path, &staged)?;
-        let report = enforce_skill_security_audit(&staged, allow_scripts)?;
-        let digest = staged_tree_digest(&staged)?;
-        finish_skill_install(&staged, &dest, &digest)?;
-        Ok((dest.clone(), report.files_scanned))
+        audit_screen_promote(&staged, &dest, allow_scripts, gate)
     })();
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staged);
@@ -2774,7 +2799,8 @@ pub fn install_git_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
+    gate: &screening::SkillScreeningGate,
+) -> Result<SkillInstallReport> {
     validate_git_transport(source)?;
     let name = git_clone_dir_name(source)?;
     let (_lock, staged, dest) = begin_skill_install(skills_path, &name)?;
@@ -2811,10 +2837,7 @@ pub fn install_git_skill_source(
         let cloned_dir = detect_newly_installed_directory(&staged, &HashSet::new())?;
         remove_git_metadata(&cloned_dir)?;
         ensure_tree_within_budget(&cloned_dir, MAX_SKILL_ZIP_BYTES)?;
-        let report = enforce_skill_security_audit(&cloned_dir, allow_scripts)?;
-        let digest = staged_tree_digest(&cloned_dir)?;
-        finish_skill_install(&cloned_dir, &dest, &digest)?;
-        Ok((dest.clone(), report.files_scanned))
+        audit_screen_promote(&cloned_dir, &dest, allow_scripts, gate)
     })();
     // On success the staged wrapper directory is left behind after its single
     // child was renamed away; on failure it may still hold the failed clone.
@@ -3080,7 +3103,8 @@ pub async fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
+    gate: &screening::SkillScreeningGate,
+) -> Result<SkillInstallReport> {
     let download_url = clawhub_download_url(source)
         .with_context(|| format!("invalid ClawHub source: {source}"))?;
     let skill_dir_name = clawhub_skill_dir_name(source)?;
@@ -3129,10 +3153,7 @@ pub async fn install_clawhub_skill_source(
             )?;
         }
 
-        let report = enforce_skill_security_audit(&staged, allow_scripts)?;
-        let digest = staged_tree_digest(&staged)?;
-        finish_skill_install(&staged, &dest, &digest)?;
-        Ok((dest.clone(), report.files_scanned))
+        audit_screen_promote(&staged, &dest, allow_scripts, gate)
     }
     .await;
     if result.is_err() {
@@ -3318,7 +3339,8 @@ pub fn install_registry_skill_source(
     workspace_dir: &Path,
     registry_url: Option<&str>,
     suppress_tier_banner: bool,
-) -> Result<(PathBuf, usize)> {
+    gate: &screening::SkillScreeningGate,
+) -> Result<SkillInstallReport> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
 
@@ -3338,6 +3360,8 @@ pub fn install_registry_skill_source(
         print_install_tier_banner(source, version.as_deref(), tier);
     }
 
+    // A registry skill is remote provenance even though the final copy is
+    // local; the caller passes the remote gate.
     install_local_skill_source(
         skill_dir.to_str().with_context(|| {
             format!(
@@ -3347,6 +3371,7 @@ pub fn install_registry_skill_source(
         })?,
         skills_path,
         allow_scripts,
+        gate,
     )
 }
 
@@ -3395,7 +3420,8 @@ pub fn install_extra_registry_skill_source(
     workspace_dir: &Path,
     extra_registries: &[zeroclaw_config::schema::ExternalRegistry],
     suppress_tier_banner: bool,
-) -> Result<(PathBuf, usize)> {
+    gate: &screening::SkillScreeningGate,
+) -> Result<SkillInstallReport> {
     let (registry_name, skill_name) = parse_extra_registry_source(source).with_context(|| {
         format!("invalid extra-registry spec '{source}': expected 'registry:<name>/<skill>'")
     })?;
@@ -3460,6 +3486,7 @@ pub fn install_extra_registry_skill_source(
         })?,
         skills_path,
         allow_scripts,
+        gate,
     )
 }
 
@@ -3955,6 +3982,7 @@ mod registry_tests {
             &workspace,
             &[],
             true,
+            &SkillScreeningGate::disabled(),
         )
         .expect_err("unknown registry must error before any git work");
         assert!(err.to_string().contains("nope"), "got: {err}");
@@ -4268,8 +4296,17 @@ mod install_transaction_tests {
         let source = tmp.path().join("clean-skill");
         write_clean_skill(&source);
 
-        let (dest, files) =
-            install_local_skill_source(source.to_str().unwrap(), &skills, false).unwrap();
+        let SkillInstallReport {
+            dir: dest,
+            files_scanned: files,
+            ..
+        } = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .unwrap();
         assert_eq!(dest, skills.join("clean-skill"));
         assert!(dest.join("SKILL.md").is_file());
         assert!(files > 0);
@@ -4287,8 +4324,13 @@ mod install_transaction_tests {
         write_clean_skill(&source);
         fs::write(source.join("install.sh"), "echo unsafe\n").unwrap();
 
-        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false)
-            .expect_err("script-bearing skill must fail the audit");
+        let err = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .expect_err("script-bearing skill must fail the audit");
         assert!(err.to_string().contains("audit failed"), "got: {err}");
         assert!(!skills.join("scripted-skill").exists());
         assert!(staging_entries(&staging).is_empty());
@@ -4301,8 +4343,13 @@ mod install_transaction_tests {
         write_clean_skill(&source);
         fs::create_dir_all(skills.join("clean-skill")).unwrap();
 
-        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false)
-            .expect_err("existing destination must be rejected");
+        let err = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .expect_err("existing destination must be rejected");
         assert!(err.to_string().contains("already exists"), "got: {err}");
         assert!(staging_entries(&staging).is_empty());
     }
@@ -4338,8 +4385,13 @@ mod install_transaction_tests {
         let lock = staging.join(".lock-locked-skill");
         fs::write(&lock, b"").unwrap();
 
-        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false)
-            .expect_err("concurrent install of the same skill must fail fast");
+        let err = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .expect_err("concurrent install of the same skill must fail fast");
         assert!(
             err.to_string().contains(".lock-locked-skill"),
             "error should name the lock file: {err}"
@@ -4359,8 +4411,13 @@ mod install_transaction_tests {
         fs::write(&lock, b"").unwrap();
         backdate(&lock, SKILL_STAGING_STALE_SECS + 60);
 
-        let (dest, _) =
-            install_local_skill_source(source.to_str().unwrap(), &skills, false).unwrap();
+        let SkillInstallReport { dir: dest, .. } = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .unwrap();
         assert!(dest.join("SKILL.md").is_file());
         assert!(!lock.exists(), "stale lock must be reclaimed and released");
     }
@@ -4379,7 +4436,13 @@ mod install_transaction_tests {
 
         let source = tmp.path().join("sweeper");
         write_clean_skill(&source);
-        install_local_skill_source(source.to_str().unwrap(), &skills, false).unwrap();
+        install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .unwrap();
 
         assert!(!stale.exists(), "stale staged tree must be swept");
         assert!(fresh.exists(), "in-flight staged tree must be left alone");
@@ -4403,8 +4466,13 @@ mod install_transaction_tests {
 
         let source = tmp.path().join("phoenix");
         write_clean_skill(&source);
-        let (dest, _) =
-            install_local_skill_source(source.to_str().unwrap(), &skills, false).unwrap();
+        let SkillInstallReport { dir: dest, .. } = install_local_skill_source(
+            source.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .unwrap();
 
         assert!(dest.join("SKILL.md").is_file());
         assert!(!leftover.exists());
@@ -4468,8 +4536,9 @@ mod install_transaction_tests {
             "http://example.invalid/owner/repo.git",
             "git://example.invalid/owner/repo.git",
         ] {
-            let err = install_git_skill_source(source, &skills, false)
-                .expect_err("insecure git transport must be rejected before any clone");
+            let err =
+                install_git_skill_source(source, &skills, false, &SkillScreeningGate::disabled())
+                    .expect_err("insecure git transport must be rejected before any clone");
             assert!(
                 err.to_string().contains("no integrity in transit"),
                 "{source}: got: {err}"
@@ -4649,8 +4718,17 @@ mod install_transaction_tests {
             &[("SKILL.md", "# Fixture\nClean skill.\n")],
         );
 
-        let (dest, files) =
-            install_git_skill_source(repo.to_str().unwrap(), &skills, false).unwrap();
+        let SkillInstallReport {
+            dir: dest,
+            files_scanned: files,
+            ..
+        } = install_git_skill_source(
+            repo.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .unwrap();
         assert_eq!(dest, skills.join("fixture-skill"));
         assert!(dest.join("SKILL.md").is_file());
         assert!(
@@ -4677,12 +4755,204 @@ mod install_transaction_tests {
             ],
         );
 
-        let err = install_git_skill_source(repo.to_str().unwrap(), &skills, false)
-            .expect_err("script-bearing clone must fail the audit");
+        let err = install_git_skill_source(
+            repo.to_str().unwrap(),
+            &skills,
+            false,
+            &SkillScreeningGate::disabled(),
+        )
+        .expect_err("script-bearing clone must fail the audit");
         assert!(err.to_string().contains("audit failed"), "got: {err}");
         // The final skills tree never saw the content, and staging is clean.
         assert!(!skills.join("evil-skill").exists());
         assert!(staging_entries(&staging).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod screening_gate_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use zeroclaw_config::schema::{SkillScreenLocalAction, SkillScreenRemoteAction};
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("ws").join("skills");
+        fs::create_dir_all(&skills).unwrap();
+        (tmp, skills)
+    }
+
+    /// A source skill whose content carries an embedded AWS key (a Denial
+    /// signal under screening) but passes the structural audit (no scripts).
+    fn write_denial_skill(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "# Skill\nExample: AKIAIOSFODNN7EXAMPLE is our key.\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn staged_hash_of(source_dir: &Path) -> String {
+        // Mirror what the installer hashes: the copied tree. The source is a
+        // clean directory tree, so its digest equals the staged copy's digest.
+        staged_tree_digest(source_dir).unwrap()
+    }
+
+    #[test]
+    fn confirm_denial_without_override_aborts_and_reports_hash() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None);
+
+        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect_err("denial without override must abort");
+        let risk = err
+            .downcast_ref::<RiskAcceptanceRequired>()
+            .expect("must surface RiskAcceptanceRequired");
+        assert!(!risk.blocked);
+        assert!(risk.report.has_denial());
+        assert!(!risk.staged_hash.is_empty());
+        assert!(
+            !skills.join("denial-skill").exists(),
+            "no content may be promoted on an aborted denial"
+        );
+    }
+
+    #[test]
+    fn confirm_denial_with_matching_hash_installs() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        let hash = staged_hash_of(&source);
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, Some(hash));
+
+        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect("matching content-bound override must install");
+        assert!(report.dir.join("SKILL.md").is_file());
+        assert!(report.screening.is_some_and(|r| r.has_denial()));
+    }
+
+    #[test]
+    fn confirm_denial_with_stale_hash_is_rejected() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        let gate = SkillScreeningGate::for_remote(
+            SkillScreenRemoteAction::Confirm,
+            Some("stale-hash-that-does-not-match".to_string()),
+        );
+
+        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect_err("a stale override hash must be rejected");
+        assert!(err.downcast_ref::<RiskAcceptanceRequired>().is_some());
+        assert!(!skills.join("denial-skill").exists());
+    }
+
+    #[test]
+    fn block_ignores_override() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        let hash = staged_hash_of(&source);
+        // Even a correct hash cannot override `block`.
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, Some(hash));
+
+        let err = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect_err("block must reject even with a matching hash");
+        let risk = err.downcast_ref::<RiskAcceptanceRequired>().unwrap();
+        assert!(risk.blocked);
+        assert!(!skills.join("denial-skill").exists());
+    }
+
+    #[test]
+    fn local_gate_never_blocks_a_denial() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        // Local action tops out at warn — a denial signal installs anyway.
+        let gate = SkillScreeningGate::for_local(SkillScreenLocalAction::Warn);
+
+        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect("local screening must never block");
+        assert!(report.dir.join("SKILL.md").is_file());
+        assert!(
+            report.screening.is_some_and(|r| r.has_denial()),
+            "the denial is still reported, just not enforced"
+        );
+    }
+
+    #[test]
+    fn screening_off_skips_scan_and_installs() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Off, None);
+
+        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect("screening off must install without scanning");
+        assert!(report.screening.is_none());
+        assert!(report.dir.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn warn_installs_and_returns_report() {
+        let (tmp, skills) = setup();
+        let source = write_denial_skill(tmp.path(), "denial-skill");
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Warn, None);
+
+        let report = install_local_skill_source(source.to_str().unwrap(), &skills, false, &gate)
+            .expect("warn must install");
+        assert!(report.screening.is_some_and(|r| !r.is_clean()));
+        assert!(report.dir.join("SKILL.md").is_file());
+    }
+
+    /// Warn-volume measurement (§6.6). Clones the default skills registry and
+    /// screens every skill, printing finding-rate stats. Network + git are
+    /// required, so it is `#[ignore]`d; run with:
+    ///   cargo test -p zeroclaw-runtime --lib -- --ignored registry_screening_sweep --nocapture
+    /// Merge bar: zero Denial across the registry. Elevated rate is reported,
+    /// not gated.
+    #[test]
+    #[ignore = "network + git: run manually to measure screening finding rate"]
+    fn registry_screening_sweep() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let registry_dir =
+            ensure_skills_registry(&workspace, None).expect("clone default registry");
+
+        let skills_parent = registry_dir.join("skills");
+        let mut total = 0usize;
+        let mut with_elevated = 0usize;
+        let mut with_denial = 0usize;
+        let mut denial_skills: Vec<String> = Vec::new();
+
+        for entry in fs::read_dir(&skills_parent).unwrap().flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            total += 1;
+            let report = screening::screen_skill_directory(&path).expect("screen registry skill");
+            match report.max_impact() {
+                Some(FindingImpact::Denial) => {
+                    with_denial += 1;
+                    denial_skills.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+                Some(FindingImpact::Elevated) => with_elevated += 1,
+                _ => {}
+            }
+        }
+
+        println!(
+            "registry screening sweep: {total} skills, {with_elevated} elevated, {with_denial} denial"
+        );
+        if !denial_skills.is_empty() {
+            println!("  denial skills: {}", denial_skills.join(", "));
+        }
+        assert_eq!(
+            with_denial, 0,
+            "no registry skill may trip a Denial finding: {denial_skills:?}"
+        );
     }
 }
 

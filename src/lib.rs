@@ -491,6 +491,17 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
+        /// Accept the content screening risk for the exact staged tree whose
+        /// hash was printed on a prior aborted install. The install proceeds
+        /// only if the source still serves that same content.
+        #[arg(long, value_name = "HASH")]
+        accept_risk: Option<String>,
+    },
+    /// Screen a skill source for prompt-injection / credential / remote-exec /
+    /// encoding-smuggling signals without installing it
+    Screen {
+        /// Source URL, registry name, or local path to screen
+        source: String,
     },
     /// Remove an installed skill
     Remove {

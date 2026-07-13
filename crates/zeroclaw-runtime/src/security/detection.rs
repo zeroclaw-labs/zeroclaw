@@ -6,12 +6,14 @@
 //! `scan()` methods are projections over the same typed results, so their
 //! public behavior is unchanged.
 
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 /// How strong the pattern match is — *match quality*, not consequence. Kept
 /// separate from a finding's impact so the screening layer can weigh a
 /// high-confidence-but-benign hit differently from a low-confidence one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DetectionConfidence {
     Low,
     Medium,
