@@ -7300,7 +7300,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
 
