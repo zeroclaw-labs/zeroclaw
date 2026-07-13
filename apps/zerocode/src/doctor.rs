@@ -763,6 +763,11 @@ mod tests {
         assert_eq!(doctor.filter, DoctorFilter::Errors);
     }
 
+    // ─────────────────────────────────────────────────────────
+    // Tests from #8650 (log_path) — kept verbatim with `timed_out_phase: None`
+    // to match the merged DoctorRunResult shape.
+    // ─────────────────────────────────────────────────────────
+
     #[tokio::test]
     async fn doctor_detail_panel_includes_log_path_when_no_entry_selected() {
         let mut doctor = Doctor::new(test_client());
@@ -896,17 +901,76 @@ mod tests {
         );
     }
 
-    /// Helper: flatten a ratatui buffer to a string the way a user would see
-    /// it on the terminal. Each row becomes one line; trailing whitespace is
-    /// trimmed so the capture looks like the rendered TUI rather than a
-    /// 120-column ragged dump.
+    // ─────────────────────────────────────────────────────────
+    // Test from #8647 (partial-results banner) — kept verbatim.
+    // ─────────────────────────────────────────────────────────
+
+    /// Render Doctor when `probe_models` has timed out: the partial-results
+    /// banner must appear above the selected entry's detail in the detail
+    /// panel. Mirrors the Scenario 1 capture in the PR body, but produced
+    /// via `Doctor::draw` against a `ratatui::backend::TestBackend` at
+    /// 120x24 so it can be regenerated on demand:
+    ///
+    ///   cargo test --locked --bin zerocode -p zerocode \
+    ///     render_screenshot -- --nocapture
+    #[tokio::test]
+    async fn render_screenshot_partial_results_banner() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        let mut result = sample_result();
+        result.timed_out_phase = Some("probe_models".to_string());
+        doctor.result = Some(result);
+        // sync_selection so the highlight lands on the first visible row.
+        doctor.sync_selection();
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+
+        // The banner from #8647 must be discoverable in the detail panel,
+        // above the selected entry's `detail_lines` content.
+        assert!(
+            rendered.contains("⚠ Partial results"),
+            "partial-results banner must render in detail panel; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model probing timed out"),
+            "banner subtitle must render in detail panel; got:\n{rendered}"
+        );
+        // The Diagnostics list still surfaces surviving entries (the probe
+        // row is missing) — both warn and error entries are visible.
+        assert!(
+            rendered.contains("workspace"),
+            "warn entry must still appear in Diagnostics list; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("daemon"),
+            "error entry must still appear in Diagnostics list; got:\n{rendered}"
+        );
+
+        println!(
+            "\n=== CAPTURE: zerocode doctor with probe_models timed_out (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+        );
+    }
+
+    /// Helper: flatten a ratatui buffer to a string the way a user would
+    /// see it on the terminal. Each row becomes one line; trailing
+    /// whitespace is trimmed so the capture looks like the rendered TUI
+    /// rather than a 120-column ragged dump.
     fn render_buffer_to_string(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
         let mut out = String::new();
         for y in 0..area.height {
             let mut row = String::new();
             for x in 0..area.width {
-                let symbol = buffer[(x, y)].symbol();
-                row.push_str(symbol);
+                row.push_str(buffer[(x, y)].symbol());
             }
             out.push_str(row.trim_end());
             out.push('\n');
