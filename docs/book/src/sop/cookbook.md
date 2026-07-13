@@ -133,7 +133,7 @@ The `SOP.md` body:
 1. **Validate input** — Check the release payload schema.
    - kind: capability
    - capability: json.validate
-   - with: {"schema":{"type":"object","required":["project","version"]}}
+    - with: {"schema":{"type":"object","required":["project","version"]},"value":{"project":"example","version":"1.0.0"}}
 
 2. **Bump** — Set the new version and fetch source.
    - tools: shell, file_read, file_write
