@@ -3411,8 +3411,8 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn anthropic_factory_forwards_timeout_to_native_provider() {
-        use crate::factory::FamilyProviderFactory;
         use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
         use axum::{Json, Router, routing::post};
         use serde_json::json;
         use tokio::time::{Duration, Instant};
