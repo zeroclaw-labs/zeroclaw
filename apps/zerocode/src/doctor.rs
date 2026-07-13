@@ -699,4 +699,130 @@ mod tests {
             "log_path must be accessible to draw_detail when no entry selected"
         );
     }
+
+    /// Render Doctor with `log_persistence = "file"` and a long realistic
+    /// resolved path. Asserts the path appears in the detail panel buffer
+    /// (the operator's discoverability contract from #8650) and dumps the
+    /// rendered buffer to stdout so `cargo test -- --nocapture` produces a
+    /// capture suitable for pasting into the PR as first-hand evidence.
+    #[tokio::test]
+    async fn render_screenshot_log_path_file() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        doctor.result = Some(DoctorRunResult {
+            results: vec![],
+            summary: DoctorSummary {
+                ok: 0,
+                warnings: 0,
+                errors: 0,
+            },
+            log_path: Some(
+                "/home/operator/.local/share/zeroclaw/logs/trace-2026-07-13T08-30-00Z.jsonl"
+                    .to_string(),
+            ),
+        });
+        doctor.filter = DoctorFilter::Problems;
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+
+        // The path must be discoverable in the detail panel. The detail panel
+        // inner width is narrower than the path, so ratatui's wrap may split
+        // the path across two lines — both halves must be present.
+        assert!(
+            rendered.contains("trace-2026-07-13T08-30"),
+            "first half of resolved log path must render in detail panel; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-00Z.jsonl"),
+            "second half of resolved log path must render in detail panel; got:\n{rendered}"
+        );
+        // The "No diagnostic selected" line should also be present so the
+        // operator sees the discoverability affordance is part of the
+        // empty-selection fallback rather than a hidden field.
+        assert!(
+            rendered.contains("No diagnostic selected"),
+            "fallback hint must render alongside log_path; got:\n{rendered}"
+        );
+
+        println!(
+            "\n=== CAPTURE: zerocode doctor with log_persistence = \"file\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+        );
+    }
+
+    /// Render Doctor with `log_persistence = "none"`. Asserts the path is
+    /// absent and the fallback "No diagnostic selected" message renders.
+    #[tokio::test]
+    async fn render_screenshot_log_path_none() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        doctor.result = Some(DoctorRunResult {
+            results: vec![],
+            summary: DoctorSummary {
+                ok: 0,
+                warnings: 0,
+                errors: 0,
+            },
+            log_path: None,
+        });
+        doctor.filter = DoctorFilter::Problems;
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+
+        // No resolved-path text should appear when persistence is disabled.
+        assert!(
+            !rendered.contains("/home/operator/"),
+            "log_path must be absent when persistence is disabled; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("trace-2026-07-13"),
+            "log_path must be absent when persistence is disabled; got:\n{rendered}"
+        );
+        // The fallback "No diagnostic selected" line should still render.
+        assert!(
+            rendered.contains("No diagnostic selected"),
+            "fallback hint must still render when persistence is disabled; got:\n{rendered}"
+        );
+
+        println!(
+            "\n=== CAPTURE: zerocode doctor with log_persistence = \"none\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+        );
+    }
+
+    /// Helper: flatten a ratatui buffer to a string the way a user would see
+    /// it on the terminal. Each row becomes one line; trailing whitespace is
+    /// trimmed so the capture looks like the rendered TUI rather than a
+    /// 120-column ragged dump.
+    fn render_buffer_to_string(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+        let mut out = String::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                let symbol = buffer[(x, y)].symbol();
+                row.push_str(symbol);
+            }
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
+        out
+    }
 }
