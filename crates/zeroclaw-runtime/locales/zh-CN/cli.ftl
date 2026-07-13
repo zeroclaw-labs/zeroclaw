@@ -361,6 +361,9 @@ channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count}
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
+channel-line-bind-success = ✅ 已配对！现在可以聊天了。
+channel-line-bind-invalid-code = ❌ 代码无效。请重试。
+channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）
@@ -374,10 +377,17 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = 以不会被展开的 `~` 开头
 cli-web-dist-dir-reason-dollar = 包含不会被展开的 `$`
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 凭据已登录，但没有模型提供方槽位使用它们。请在 OpenAI 提供方槽位上设置 `requires_openai_auth = true`，并将 agent 的 `model_provider` 指向它，或运行 `zeroclaw quickstart`。
+cli-doctor-codex-auth-slot-no-profile = OpenAI 槽位 {$slots} 已设置 `requires_openai_auth = true`，但没有 OpenAI Codex 凭据登录。请运行 `zeroclaw auth login --provider openai-codex`。
+cli-doctor-codex-auth-ok = OpenAI Codex 凭据已登录，并由模型提供方槽位引用。
+cli-doctor-systemd-linger-enabled = systemd 用户 linger 已启用
+cli-doctor-systemd-linger-disabled = systemd 用户 linger 已禁用；用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = 无法使用 loginctl 检查 systemd 用户 linger
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
 cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
 cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-service-systemd-linger-disabled-warning = systemd 用户 linger 已禁用。ZeroClaw 的用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}示例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -397,11 +407,19 @@ cli-skills-skipped-header = 已跳过 ({$count}):
 cli-skills-skipped-reason = {"    "}原因: {$reason}
 cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
+cli-sop-pending-none = 没有等待审批的 SOP 运行。
+cli-sop-pending-header = 等待审批的 SOP 运行：
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] 步骤 {$step}/{$total}
+cli-sop-ws-invalid-approval = sop approval_response 需要 run_id，以及 approve 或 deny 决策
+cli-sop-ws-resolve-failed = SOP 解析失败：{$error}
+cli-sop-ws-engine-lock-poisoned = SOP 引擎锁已中毒
+cli-sop-ws-subsystem-disabled = SOP 子系统未启用
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
 cli-sop-none-to-validate = 未找到可验证的 SOP。
 cli-sop-valid = ✅ {$name} — 有效
+cli-sop-deleted = 已删除 SOP：{$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} 个警告:
 cli-sop-all-passed = 所有 SOP 均已通过验证。
 cli-sop-priority = {"  "}优先级:       {$value}
@@ -660,6 +678,10 @@ cli-plugin-no-description = （无描述）
 cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
+cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
+cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
+cli-plugin-config-entry-seed-unaddressable = 警告：已跳过为 '{$name}' 创建配置条目：包含 '.' 的插件名称无法通过点分配置路径寻址（`config set` 会按 '.' 分割）。请手动向配置文件添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块。
+cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
 cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
@@ -744,6 +766,7 @@ turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
@@ -752,7 +775,62 @@ channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
 channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
+channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
 channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
+channel-runtime-current-model-status =
+    当前 model_provider：`{ $provider }`
+    当前模型：`{ $model }`
+channel-runtime-model-switch-hint = 使用 `/model <model-id>` 或 `/model <hint>` 切换模型。
+channel-runtime-provider-switch-hint = 使用 `/models <model_provider>` 切换 model_provider。
+channel-runtime-available-providers-header = 可用的 model_provider：
+channel-runtime-configured-routes-header = 已配置的模型路由：
+channel-runtime-no-cached-models = 未找到 `{ $provider }` 的缓存模型列表。请让操作者运行 `zeroclaw models refresh --model-provider { $provider }`。
+channel-runtime-cached-model-ids-header = 缓存的模型 ID（前 { $count } 个）：
+channel-runtime-config-switch-hints =
+    使用 `/models <model_provider>` 切换 model_provider。
+    使用 `/model <model-id>` 切换模型。
+channel-runtime-config-block-title =
+    { "*" }模型配置{ "*" }
+    当前：`{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = 选择 model_provider
+channel-runtime-config-select-model-placeholder = 选择模型
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *模型*
+channel-runtime-scope-user = 用户
+channel-runtime-scope-agent = agent
+channel-runtime-scope-overrides-summary =
+    { "**" }模型覆盖{ "**" }（仅会话内；优先级 user > agent > session > default）：
+    • user：{ $user }
+    • agent：{ $agent }
+    • session（此聊天）：{ $session }
+    • default（配置）：{ $default }
+    使用 `/model --user|--agent <model-id>` 设置范围；设置回默认值即可清除。
+channel-runtime-set-provider-switched =
+    已为此发送者会话切换到 ModelProvider `{ $provider }`。当前模型为 `{ $model }`。
+    使用 `/model <model-id>` 设置与该 provider 兼容的模型。
+channel-runtime-set-provider-init-failed =
+    初始化 model_provider `{ $provider }` 失败。路由未更改。
+    详情：{ $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` 有多个已配置别名。请用 `/models { $family }.<alias>` 指定其中一个：{ $list }
+channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置 provider 条目。请添加 `[providers.models.{ $provider }]`（含 api_key/uri），或选择一个已配置的 provider；`/models` 会列出有效项。
+channel-runtime-provider-unknown = 未知 model_provider `{ $provider }`。使用 `/models` 查看有效的 model_provider。
+channel-runtime-scoped-model-empty = 模型 ID 不能为空。请使用 `/model --user|--agent <model-id>`。
+channel-runtime-scoped-model-switched = 已为 **{ $scope }** 范围设置模型 `{ $model }`（model_provider：`{ $provider }`）。仅会话内有效，重启后重置。
+channel-runtime-shadow-note = ⚠️ 当前有更高优先级的覆盖生效，因此消息将改用 `{ $model }`（`{ $provider }`）；请查看 `/model`。
+channel-runtime-thinking-set =
+    已为此发送者会话将 thinking 设为 `{ $level }`。
+    使用 `/thinking reset` 返回 agent 默认值。
+channel-runtime-thinking-cleared = thinking 覆盖已清除。此发送者会话将使用 agent 默认值 `{ $default }`。
+channel-runtime-thinking-default =
+    thinking 已经在此发送者会话中使用 agent 默认值 `{ $default }`。
+    使用 `/thinking high`、`/thinking max` 或 `/thinking off` 覆盖。
+channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/thinking off|minimal|low|medium|high|max`、`/thinking on` 或 `/thinking reset`。
+channel-runtime-provider-turn-init-failed =
+    ⚠️ 初始化 model_provider `{ $provider }` 失败。请运行 `/models` 选择另一个 model_provider。
+    详情：{ $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
+    切换模型：/models
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）
@@ -793,6 +871,9 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
+cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%

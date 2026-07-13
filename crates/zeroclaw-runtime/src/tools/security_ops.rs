@@ -12,7 +12,7 @@ use crate::security::playbook::{
     Playbook, StepStatus, evaluate_step, load_playbooks, severity_level,
 };
 use crate::security::vulnerability::{generate_summary, parse_vulnerability_json};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::SecurityOpsConfig;
 
 /// Security operations tool — triage alerts, run playbooks, parse vulns, generate reports.
@@ -96,7 +96,7 @@ impl SecurityOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -179,7 +179,7 @@ impl SecurityOpsTool {
 
         Ok(ToolResult {
             success: result.status != StepStatus::Failed,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: if result.status == StepStatus::Failed {
                 Some(result.message)
             } else {
@@ -226,7 +226,7 @@ impl SecurityOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -278,7 +278,7 @@ impl SecurityOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: report,
+            output: report.into(),
             error: None,
         })
     }
@@ -309,7 +309,7 @@ impl SecurityOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&playbook_list)?,
+            output: serde_json::to_string_pretty(&playbook_list)?.into(),
             error: None,
         })
     }
@@ -377,7 +377,7 @@ impl SecurityOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -491,7 +491,7 @@ impl Tool for SecurityOpsTool {
             "alert_stats" => self.alert_stats(&args),
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{action}'. Valid: triage_alert, run_playbook, \
                      parse_vulnerability, generate_report, list_playbooks, alert_stats"
