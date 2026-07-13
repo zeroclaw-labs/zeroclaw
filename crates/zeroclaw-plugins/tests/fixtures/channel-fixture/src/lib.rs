@@ -3,9 +3,11 @@
 //! It reports one canned inbound message the first time `poll-message` is
 //! called, accepts `send` (dropping the bytes), advertises `health-check` +
 //! `self-handle`, and stubs every capability-gated method with its documented
-//! default. It exists solely to prove the host's channel-plugin runtime path
-//! end-to-end (`WasmChannel::from_wasm` → configure → capabilities → send →
-//! poll). No network, no filesystem, no config needed.
+//! default. Its `configure` export emits a unique host log so integration tests
+//! can prove whether startup exports ran. It exists solely to prove the host's
+//! channel-plugin runtime path end-to-end (`WasmChannel::from_wasm` → configure
+//! → capabilities → send → poll). No network, no filesystem, no config
+//! needed.
 //!
 //! Build:  rustup target add wasm32-wasip2
 //!         cargo build --target wasm32-wasip2 --release
@@ -25,9 +27,13 @@ mod component {
         SendMessage,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
+    use zeroclaw::plugin::logging::{
+        log_record, LogLevel, PluginAction, PluginEvent, PluginOutcome,
+    };
 
     const PLUGIN_NAME: &str = "echo-channel";
     const PLUGIN_VERSION: &str = "0.1.0";
+    const CONFIGURE_MARKER: &str = "channel-fixture configure export invoked";
 
     struct EchoChannel;
 
@@ -52,6 +58,17 @@ mod component {
         }
 
         fn configure(_config: String) -> Result<(), String> {
+            log_record(
+                LogLevel::Info,
+                &PluginEvent {
+                    function_name: "channel_fixture::configure".to_string(),
+                    action: PluginAction::Start,
+                    outcome: Some(PluginOutcome::Success),
+                    duration_ms: None,
+                    attrs: None,
+                    message: CONFIGURE_MARKER.to_string(),
+                },
+            );
             Ok(())
         }
 
