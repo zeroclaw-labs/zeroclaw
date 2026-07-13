@@ -44,7 +44,7 @@ pub enum SopExecutionMode {
     Supervised,
     /// Request approval before each step.
     StepByStep,
-    /// Critical/High → Auto, Normal/Low → Supervised.
+    /// Critical/High → StepByStep, Normal/Low → Supervised.
     PriorityBased,
     /// Execute steps sequentially without LLM round-trips.
     /// Step outputs are piped as inputs to the next step.
