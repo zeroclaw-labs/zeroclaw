@@ -16,10 +16,48 @@ Use case: paired-identity channels where sub-second replies are an AI-tell. Wire
 
 ## Telegram
 
+### Setup
+
+1. **Create a bot** with [@BotFather](https://t.me/botfather) on Telegram. Send `/newbot`, pick a name, and copy the token BotFather returns.
+2. **Add the bot to your config** with the token you just copied. The token is
+   a secret, so set it through a surface that encrypts it rather than typing it
+   into `config.toml`:
+
+   {{#config-where channels telegram}}
+
+   {{#secret-config channels.telegram.<alias>.bot_token}}
+
+3. **Start the bot**: send `/start` to it in a Telegram chat so it can begin
+   receiving messages.
+
+### Who can talk to the agent
+
 {{#peer-group telegram}}
 
-- Long polling is the default; no public URL required.
-- Streaming draft edits are supported but capped by Telegram's rate limit. Tune `draft_update_interval_ms` if you see "Too Many Requests".
+Inbound senders are gated through **peer groups**, not a per-channel
+`allowed_users` field. After the channel is configured, authorized senders
+are listed in `[peer_groups.<name>].external_peers`. See
+[Peer Groups](./peer-groups.md) for the full decision logic.
+
+If you want to let anyone message the bot without pairing, add `"*"` to the
+peer group's `external_peers`:
+
+```toml
+[peer_groups.telegram_default]
+channel = "telegram"
+external_peers = ["*"]
+```
+
+### Binding a Telegram identity
+
+Once the channel is configured, use `zeroclaw channel bind-telegram` to
+authorize a specific Telegram user. The identity can be:
+
+- A **numeric user ID** (e.g., `zeroclaw channel bind-telegram 111111111`)
+- An **@username** (e.g., `zeroclaw channel bind-telegram @alice`)
+
+To find your Telegram user ID, send a message to [@userinfobot](https://t.me/userinfobot)
+or use a bot that echoes back your chat ID.
 
 ## iMessage (macOS only)
 
