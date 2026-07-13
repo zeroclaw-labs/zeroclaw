@@ -16,12 +16,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
+
+const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -113,10 +115,16 @@ impl RpcTransport for LocalTransport {
     }
 
     async fn next_frame(&mut self) -> Option<String> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut limited = (&mut self.reader).take(MAX_FRAME_BYTES + 1);
+        match limited.read_until(b'\n', &mut buf).await {
             Ok(0) => None,
-            Ok(_) => Some(line),
+            Ok(_) => {
+                if buf.len() as u64 > MAX_FRAME_BYTES {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
             Err(_) => None,
         }
     }

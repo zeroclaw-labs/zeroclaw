@@ -36,6 +36,7 @@
 //! peer-delegation paths - a narrowing, since no construction path now bypasses
 //! `allowed_tools`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
@@ -43,8 +44,9 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 use crate::agent::loop_::{
-    apply_policy_tool_filter, eager_mcp_tool_allowed, load_peripheral_tools,
-    mcp_allowed_tool_count, mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+    append_pinned_mcp_section, apply_policy_tool_filter, eager_mcp_tool_allowed,
+    load_peripheral_tools, mcp_allowed_tool_count, mcp_tool_access_policy,
+    preactivate_always_filter_groups, register_eager_mcp_tool_if_allowed,
 };
 use crate::skills::Skill;
 use crate::tools::{
@@ -140,19 +142,72 @@ pub struct ScopedAssembled {
     /// `## Deferred Tools` section that names the policy-admitted `<server>__<tool>`
     /// stubs and instructs the model to call `tool_search`. Empty when deferred loading
     /// is off, no stubs are admitted, or `tool_search` itself is in `excluded_tools`
-    /// (the registry and prompt surfaces move together). Callers that inject one
-    /// combined MCP prompt block (`run`, `process_message`) append [`Self::pinned_section`] onto this via
-    /// `append_pinned_mcp_section`; `from_config` threads it into the Agent's separate
-    /// `mcp_deferred_section` slot alongside `pinned_section`.
-    pub deferred_section: String,
+    /// (the registry and prompt surfaces move together).
+    ///
+    /// Private - deliberately not destructurable. Every caller that has ever needed
+    /// this field also needs [`Self::pinned_section`] threaded correctly alongside it,
+    /// and a `..` (or an unaware full destructure) silently drops it - which is exactly
+    /// how the independent-delegate path lost `pinned_section` when #8711 split it out
+    /// of this field (2026-07-08). Use [`Self::combined_mcp_prompt_section`] for the
+    /// single-block shape (`run`, `process_message`, independent delegation) or
+    /// [`Self::deferred_section`]/[`Self::pinned_section`] for the two-slot shape
+    /// (`from_config`'s `Agent`, which injects each separately per-turn).
+    deferred_section: String,
     /// The pinned-MCP-resources system-prompt section on its own. Empty when no pinned
-    /// resources are granted. Kept separate from [`Self::deferred_section`] so callers
-    /// with two distinct prompt slots (`from_config`'s Agent) inject each without
-    /// duplication; single-block callers append it onto `deferred_section`.
-    pub pinned_section: String,
+    /// resources are granted. Private for the same reason as [`Self::deferred_section`]
+    /// above - access via the same two accessor patterns.
+    pinned_section: String,
     /// Live handle to the activated deferred-MCP set (present only when a deferred
     /// `tool_search` tool was registered).
     pub activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    /// MCP-origin ground truth for `tool_filter_groups` (#6699): every tool name
+    /// this assembly admitted from MCP — the registry's `<server>__<tool>` names
+    /// (covering eager wrappers, deferred stubs, and later `tool_search`
+    /// activations, which share those names) plus the registered capability
+    /// tools (`mcp_resources` / `mcp_prompts`). The per-turn filter gates
+    /// classify by membership here, never by name shape, because skill tools
+    /// use the same `<x>__<y>` convention. Created at the seam: the registry it
+    /// derives from is immutable after `connect_all` and is consumed by this
+    /// assembly, and the set is a superset of the *registered* tools (it may
+    /// retain policy-skipped names) — safe because both gates intersect it with
+    /// the live registry, so do not "tighten" it to admitted-only without
+    /// treating that as a behavior change. Any future MCP registration source
+    /// added to `assemble` MUST extend this set; a missed extension silently
+    /// un-filters those tools (the same no-op bug class as #6699). Empty when
+    /// MCP is disabled, unconfigured, or failed to connect — the gates then
+    /// classify nothing as MCP and `tool_filter_groups` is inert.
+    pub mcp_tool_names: HashSet<String>,
+}
+
+impl ScopedAssembled {
+    /// The deferred-MCP tool-search listing and the pinned-MCP-resources section,
+    /// composed into ONE prompt block. For callers that inject a single combined MCP
+    /// prompt section: `run`, `process_message`, and independent delegation.
+    ///
+    /// Centralizing the composition here (instead of each caller hand-rolling
+    /// `append_pinned_mcp_section(&mut deferred_section, &pinned_section)` after its own
+    /// destructure) is what makes dropping `pinned_section` a thing that can no longer
+    /// happen silently - the field isn't reachable except through this method or
+    /// [`Self::pinned_section`], so a caller must consciously pick one.
+    pub fn combined_mcp_prompt_section(&self) -> String {
+        let mut combined = self.deferred_section.clone();
+        append_pinned_mcp_section(&mut combined, &self.pinned_section);
+        combined
+    }
+
+    /// The deferred-MCP tool-search listing on its own, for callers with two distinct
+    /// prompt slots that inject each separately (`Agent::from_config`'s `Agent`, whose
+    /// prompt is composed per-turn later rather than at `assemble`-call time). See
+    /// [`Self::pinned_section`] for its counterpart, and
+    /// [`Self::combined_mcp_prompt_section`] for the single-block shape.
+    pub fn deferred_section(&self) -> &str {
+        &self.deferred_section
+    }
+
+    /// The pinned-MCP-resources section on its own. See [`Self::deferred_section`].
+    pub fn pinned_section(&self) -> &str {
+        &self.pinned_section
+    }
 }
 
 impl ScopedToolRegistry {
@@ -238,6 +293,9 @@ impl ScopedToolRegistry {
         let mut pinned_section = String::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+        // MCP-origin ground truth for the tool_filter_groups gates (#6699); see
+        // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
+        let mut mcp_tool_names: HashSet<String> = HashSet::new();
 
         let agent_mcp_servers = if connect_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
@@ -259,6 +317,10 @@ impl ScopedToolRegistry {
             match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = Arc::new(registry);
+                    // Origin set: every `<server>__<tool>` name the registry knows.
+                    // Deferred stubs derive from the same `tool_names()` call, so
+                    // one extension covers eager, deferred, and later activations.
+                    mcp_tool_names.extend(registry.tool_names());
                     // Elevation arcs exist only to resolve skill-declared MCP
                     // elevation in step 5; skip the collection when no skills are
                     // registered through this assembly.
@@ -269,12 +331,19 @@ impl ScopedToolRegistry {
                     // Generic MCP resource/prompt capability tools (policy-gated in
                     // deferred-loading and eager modes) - parity with run/process_message.
                     for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
-                        register_eager_mcp_tool_if_allowed(
+                        let capability_name = tool.name().to_string();
+                        if register_eager_mcp_tool_if_allowed(
                             tool,
                             &mut tools_registry,
                             delegate_handle.as_ref(),
                             mcp_policy.as_ref(),
-                        );
+                        ) {
+                            // Capability tools are MCP-origin (built from the
+                            // registry) and were the only names the pre-#6699
+                            // prefix gate matched — they stay classifiable so a
+                            // non-matching group set keeps excluding them.
+                            mcp_tool_names.insert(capability_name);
+                        }
                     }
                     pinned_section = tools::mcp_context::build_pinned_resources_section(
                         &registry,
@@ -336,6 +405,53 @@ impl ScopedToolRegistry {
                             let activated =
                                 Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
                             activated_handle = Some(Arc::clone(&activated));
+                            // Pre-activate `mode = "always"` tool_filter_groups
+                            // entries (#6699) before `ToolSearchTool::new` consumes
+                            // the stub set, so `always` tools are live on the very
+                            // first turn. Groups resolve from the agent's runtime
+                            // profile — the same source `Config::resolved_agent_config`
+                            // clones into `agent.resolved.tool_filter_groups`, which
+                            // the per-turn gates read; if profile resolution ever
+                            // grows merge logic, both lookups must move together.
+                            let filter_groups = config
+                                .runtime_profile_for_agent(agent_alias)
+                                .map(|profile| profile.tool_filter_groups.as_slice())
+                                .unwrap_or(&[]);
+                            let preactivated_names = preactivate_always_filter_groups(
+                                &deferred_set,
+                                &activated,
+                                filter_groups,
+                                mcp_policy.as_ref(),
+                                delegate_handle.as_ref(),
+                            );
+                            if emit_assembly_logs && !preactivated_names.is_empty() {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Register
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "agent_alias": agent_alias,
+                                            "count": preactivated_names.len(),
+                                        })
+                                    ),
+                                    "MCP deferred: pre-activated tool(s) via tool_filter_groups mode=always"
+                                );
+                            }
+                            // Build the prompt section AFTER pre-activation and
+                            // exclude the just-activated names: the section tells
+                            // the model listed tools are "NOT yet loaded" and MUST
+                            // be fetched via tool_search — advertising a live tool
+                            // there would burn the exact first-turn round-trip
+                            // `mode = "always"` pre-activation exists to remove.
+                            deferred_section = tools::build_deferred_tools_section_excluding(
+                                &deferred_set,
+                                mcp_policy.as_ref(),
+                                &preactivated_names,
+                            );
                             let mut tool_search =
                                 tools::ToolSearchTool::new(deferred_set, activated);
                             if let Some(policy) = mcp_policy {
@@ -467,6 +583,7 @@ impl ScopedToolRegistry {
             deferred_section,
             pinned_section,
             activated_handle,
+            mcp_tool_names,
         }
     }
 }
@@ -474,7 +591,7 @@ impl ScopedToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolResult;
+    use crate::tools::{ToolOutput, ToolResult};
     use async_trait::async_trait;
 
     struct MockTool(&'static str);
@@ -502,7 +619,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: None,
             })
         }
@@ -847,6 +964,82 @@ mod tests {
             names,
             vec!["shell".to_string()],
             "caller_allowed narrows: {names:?}"
+        );
+    }
+
+    fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
+        ScopedAssembled {
+            registry: ScopedToolRegistry(Vec::new()),
+            delegate_handle: None,
+            ask_user_handle: None,
+            reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            channel_room_handle: None,
+            deferred_section: deferred.to_string(),
+            pinned_section: pinned.to_string(),
+            activated_handle: None,
+            mcp_tool_names: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn combined_mcp_prompt_section_composes_both_when_present() {
+        let assembled = assembled_with_sections("## Deferred Tools\n- x__y", "## Pinned\n- z");
+        // Exact-string, not just contains()+ordering: pins the precise
+        // `deferred + "\n\n" + pinned` format `append_pinned_mcp_section` produces, so a
+        // regression in the separator or a stray transformation fails this test directly.
+        assert_eq!(
+            assembled.combined_mcp_prompt_section(),
+            "## Deferred Tools\n- x__y\n\n## Pinned\n- z"
+        );
+    }
+
+    #[test]
+    fn combined_mcp_prompt_section_is_deferred_only_when_pinned_empty() {
+        let assembled = assembled_with_sections("## Deferred Tools\n- x__y", "");
+        assert_eq!(
+            assembled.combined_mcp_prompt_section(),
+            "## Deferred Tools\n- x__y"
+        );
+    }
+
+    #[test]
+    fn deferred_and_pinned_accessors_return_the_raw_unmerged_sections() {
+        // The two-slot shape (`from_config`'s Agent) must get each section on its own,
+        // NOT the combined block - this is what makes it safe for a caller with two
+        // separate prompt-injection points to avoid duplicating pinned content.
+        let assembled = assembled_with_sections("deferred-only", "pinned-only");
+        assert_eq!(assembled.deferred_section(), "deferred-only");
+        assert_eq!(assembled.pinned_section(), "pinned-only");
+    }
+
+    #[tokio::test]
+    async fn assemble_without_mcp_yields_empty_origin_set() {
+        // No MCP connected => nothing is classified MCP-origin, so the
+        // tool_filter_groups gates treat every tool as a pass-through
+        // built-in/skill and the groups are inert by construction (#6699).
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+        let out = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: built_with(vec![Box::new(MockTool("shell"))]),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+        })
+        .await;
+        assert!(
+            out.mcp_tool_names.is_empty(),
+            "no-MCP assembly must export an empty origin set; got {:?}",
+            out.mcp_tool_names
         );
     }
 }

@@ -7,7 +7,7 @@
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::CloudOpsConfig;
 
 /// Read-only cloud operations advisory tool.
@@ -75,7 +75,7 @@ impl Tool for CloudOpsTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("'action' parameter is required".into()),
                 });
             }
@@ -116,7 +116,7 @@ impl Tool for CloudOpsTool {
         if input.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'input' parameter is required and cannot be empty".into()),
             });
         }
@@ -124,7 +124,7 @@ impl Tool for CloudOpsTool {
         if !self.config.supported_clouds.contains(&cloud.to_string()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Cloud model_provider '{}' is not in supported_clouds: {:?}",
                     cloud, self.config.supported_clouds
@@ -139,7 +139,7 @@ impl Tool for CloudOpsTool {
             "architecture_review" => self.architecture_review(input, cloud).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{}'. Valid: review_iac, assess_migration, cost_analysis, architecture_review",
                     action
@@ -182,7 +182,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -198,7 +198,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -216,7 +216,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -233,7 +233,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
