@@ -8,6 +8,7 @@ const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+const MODEL_CACHE_FILE: &str = "models_cache.json";
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
@@ -367,6 +368,52 @@ fn create_doctor_model_provider(
     }
 }
 
+/// Persist the fetched model catalog to `<workspace_dir>/state/models_cache.json`
+/// so that `/model` can display available models without a live probe.
+fn persist_model_cache(workspace_dir: &Path, provider_name: &str, models: &[String]) {
+    let state_dir = workspace_dir.join("state");
+    if let Err(e) = std::fs::create_dir_all(&state_dir) {
+        eprintln!("  ⚠️  Failed to create state dir for model cache: {e}");
+        return;
+    }
+
+    let cache_path = state_dir.join(MODEL_CACHE_FILE);
+
+    // Load existing cache or start fresh.
+    #[derive(Default, serde::Deserialize, serde::Serialize)]
+    struct Cache {
+        entries: Vec<CacheEntry>,
+    }
+    #[derive(Default, serde::Deserialize, serde::Serialize)]
+    struct CacheEntry {
+        model_provider: String,
+        models: Vec<String>,
+    }
+
+    let mut cache: Cache = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+
+    // Replace or insert the entry for this provider.
+    cache.entries.retain(|e| e.model_provider != provider_name);
+    cache.entries.push(CacheEntry {
+        model_provider: provider_name.to_string(),
+        models: models.to_vec(),
+    });
+
+    match serde_json::to_string_pretty(&cache) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&cache_path, json) {
+                eprintln!("  ⚠️  Failed to write model cache: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("  ⚠️  Failed to serialize model cache: {e}");
+        }
+    }
+}
+
 pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
@@ -400,6 +447,9 @@ pub async fn run_models(
             Ok(models) => {
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
+                // Persist the catalog so `/model` can display it without a live probe.
+                let workspace_dir = config.agent_workspace_dir("default");
+                persist_model_cache(&workspace_dir, provider_name, &models);
                 if show_model_names && !models.is_empty() {
                     for m in &models {
                         println!("      • {}", m);
