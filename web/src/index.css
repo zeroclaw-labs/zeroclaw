@@ -382,6 +382,11 @@ code, kbd, pre {
   color: var(--pc-text-muted);
 }
 
+.secret-mask {
+  -webkit-text-security: disc;
+  text-security: disc;
+}
+
 /* Primary action (pill) */
 .btn-primary {
   background: var(--pc-accent);

@@ -423,6 +423,7 @@ cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
 cli-sop-loaded-header = SOP chargés ({$count}) :
 cli-sop-none-to-validate = Aucun SOP trouvé à valider.
 cli-sop-valid = ✅ {$name} — valide
+cli-sop-deleted = SOP supprimé : {$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} avertissement(s) :
 cli-sop-all-passed = Tous les SOP ont réussi la validation.
 cli-sop-priority = {"  "}Priorité :      {$value}
@@ -744,7 +745,7 @@ cli-hardware-unsupported-platform = La découverte USB du matériel n'est pas pr
 cli-hardware-supported-platforms = Plateformes prises en charge : Linux, macOS, Windows.
 cli-update-already-current = Déjà à jour (v{ $version }).
 cli-update-success = Mise à jour réussie vers la v{ $version } !
-cli-update-prebuilt-channel-note = Les mises à jour précompilées utilisent le paquet de canaux léger par défaut. Compilez depuis les sources avec `./install.sh --source --preset full`, `--features channels-full` ou une fonctionnalité `channel-*` spécifique pour Slack et les autres canaux non inclus par défaut.
+cli-update-prebuilt-channel-note = Les mises à jour précompilées utilisent la distribution standard légère. Compilez depuis les sources avec `./install.sh --source --preset full`, `--features channels-full` ou une fonctionnalité `channel-*` spécifique pour Slack et les autres canaux non inclus dans cette distribution.
 cli-update-available = Mise à jour disponible : v{ $current } -> v{ $latest }
 cli-update-forcing-reinstall = Réinstallation forcée : v{ $current } -> v{ $latest }
 cli-update-not-writable = le répertoire d'installation { $dir } n'est pas accessible en écriture ({ $error }) ; relancez `zeroclaw update` avec des privilèges élevés (sudo sur macOS/Linux, une console Administrateur sous Windows)
@@ -774,10 +775,64 @@ turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que ce
 channel-runtime-malformed-tool-output = J'ai généré une erreur de format d'appel d'outil interne et n'ai pas pu terminer cette requête. Veuillez réessayer.
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
-channel-runtime-stop-no-task = Aucune tâche en cours pour cette portée d'expéditeur.
-channel-runtime-model-empty = L'ID de modèle ne peut pas être vide. Utilisez `/model <model-id>`.
+channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
+channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model <model-id>`.
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
-channel-runtime-request-timeout = ⚠️ Délai dépassé en attendant le modèle. Veuillez réessayer.
+channel-runtime-request-timeout = ⚠️ La requête a expiré en attendant le modèle. Veuillez réessayer.
+channel-runtime-current-model-status =
+    model_provider actuel : `{ $provider }`
+    Modèle actuel : `{ $model }`
+channel-runtime-model-switch-hint = Changez de modèle avec `/model <model-id>` ou `/model <hint>`.
+channel-runtime-provider-switch-hint = Changez de model_provider avec `/models <model_provider>`.
+channel-runtime-available-providers-header = model_providers disponibles :
+channel-runtime-configured-routes-header = Routes de modèle configurées :
+channel-runtime-no-cached-models = Aucune liste de modèles en cache trouvée pour `{ $provider }`. Demandez à l'opérateur d'exécuter `zeroclaw models refresh --model-provider { $provider }`.
+channel-runtime-cached-model-ids-header = IDs de modèle en cache ({ $count } premiers) :
+channel-runtime-config-switch-hints =
+    Utilisez `/models <model_provider>` pour changer de model_provider.
+    Utilisez `/model <model-id>` pour changer de modèle.
+channel-runtime-config-block-title =
+    { "*" }Configuration du modèle{ "*" }
+    Actuel : `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = Sélectionner model_provider
+channel-runtime-config-select-model-placeholder = Sélectionner le modèle
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *Modèle*
+channel-runtime-scope-user = utilisateur
+channel-runtime-scope-agent = agent
+channel-runtime-scope-overrides-summary =
+    { "**" }Surcharges de modèle{ "**" } (session uniquement ; précédence user > agent > session > default) :
+    • user : { $user }
+    • agent : { $agent }
+    • session (cette discussion) : { $session }
+    • default (config) : { $default }
+    Définissez un périmètre avec `/model --user|--agent <model-id>` ; effacez-le en le remettant sur la valeur par défaut.
+channel-runtime-set-provider-switched =
+    ModelProvider changé vers `{ $provider }` pour cette session d'expéditeur. Le modèle actuel est `{ $model }`.
+    Utilisez `/model <model-id>` pour définir un modèle compatible avec ce provider.
+channel-runtime-set-provider-init-failed =
+    Échec de l'initialisation de model_provider `{ $provider }`. Route inchangée.
+    Détails : { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` a plusieurs alias configurés. Précisez lequel avec `/models { $family }.<alias>` : { $list }
+channel-runtime-provider-no-alias = Aucune entrée de provider configurée pour `{ $provider }`. Ajoutez `[providers.models.{ $provider }]` (avec api_key/uri) ou sélectionnez un provider configuré ; `/models` liste les valeurs valides.
+channel-runtime-provider-unknown = model_provider inconnu `{ $provider }`. Utilisez `/models` pour lister les model_providers valides.
+channel-runtime-scoped-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model --user|--agent <model-id>`.
+channel-runtime-scoped-model-switched = Modèle défini sur `{ $model }` (model_provider : `{ $provider }`) pour le périmètre **{ $scope }**. Session uniquement ; réinitialisé au redémarrage.
+channel-runtime-shadow-note = ⚠️ Une surcharge de plus haute précédence est active, donc les messages utiliseront plutôt `{ $model }` (`{ $provider }`) ; voir `/model`.
+channel-runtime-thinking-set =
+    Thinking défini sur `{ $level }` pour cette session d'expéditeur.
+    Utilisez `/thinking reset` pour revenir à la valeur par défaut de l'agent.
+channel-runtime-thinking-cleared = Surcharge de thinking effacée. Utilisation de la valeur par défaut de l'agent `{ $default }` pour cette session d'expéditeur.
+channel-runtime-thinking-default =
+    Thinking utilise déjà la valeur par défaut de l'agent `{ $default }` pour cette session d'expéditeur.
+    Utilisez `/thinking high`, `/thinking max` ou `/thinking off` pour le surcharger.
+channel-runtime-thinking-invalid = Niveau de thinking inconnu `{ $raw }`. Utilisez `/thinking off|minimal|low|medium|high|max`, `/thinking on` ou `/thinking reset`.
+channel-runtime-provider-turn-init-failed =
+    ⚠️ Échec de l'initialisation de model_provider `{ $provider }`. Exécutez `/models` pour choisir un autre model_provider.
+    Détails : { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` indisponible — réponse de **{ $actual }** (`{ $model }`)
+    Changer de modèle : /models
 cli-alias-list-empty = (aucune entrée sous {$section})
 cli-alias-created = {$section}.{$alias} créé
 cli-alias-exists = {$section}.{$alias} existe déjà (aucun changement)

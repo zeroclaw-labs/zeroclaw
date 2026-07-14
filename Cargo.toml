@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -20,6 +20,7 @@ zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.2" }
 zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.2" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.2", default-features = false }
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.2" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.2", default-features = false }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.2", default-features = false }
 zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.2" }
 zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.2" }
@@ -255,16 +256,13 @@ non_row_features = [
     "metrics",
     "embedded-web",
 ]
-# Heavyweight non-channel features excluded from the default binary
-# distribution (`Selection::Dist`): they pull large native/ML deps and would
-# bloat the single artifact for users who never use them. Still opt-in via
-# source `--features`, the docker `:all-features` tag, or a nix override. This
-# "too big for the default download" bit is not derivable from the feature
-# graph, so it lives here in the canonical registry; never shadowed.
-heavyweight_features = [
-    "hardware",
-    "browser-native",
-    "voice-wake",
+# Features intentionally added to the lean Cargo defaults for standard
+# distribution artifacts. This list is the complete positive policy beyond
+# `default`; target-specific exclusions are resolved from the table below.
+dist_extra_features = [
+    "channel-matrix",
+    "channel-lark",
+    "whatsapp-web",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -275,6 +273,13 @@ heavyweight_features = [
 container_excluded_features = [
     "voice-wake",
 ]
+
+# Compatibility exclusions for standard distribution artifacts. Release
+# workflows pass only their target triple; feature policy stays here.
+[package.metadata.zeroclaw.dist_target_exclusions]
+aarch64-linux-android = ["whatsapp-web"]
+arm-unknown-linux-gnueabihf = ["observability-prometheus"]
+armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
 
 [features]
 default = [
