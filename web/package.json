@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -b && vite build",
     "dev": "vite",
-    "test:permissions": "jiti src/components/ToolPermissionGrid.logic.test.ts"
+    "test:permissions": "jiti src/components/ToolPermissionGrid.logic.test.ts && jiti src/lib/toolCatalog.logic.test.ts && jiti src/components/ToolCatalogWarningPanel.test.ts"
   },
   "browserslist": [
     "chrome >= 111",

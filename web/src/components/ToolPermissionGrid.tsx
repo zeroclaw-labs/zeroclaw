@@ -27,8 +27,14 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { Search, X, Check, Minus, AlertCircle, Zap } from 'lucide-react';
-import { loadToolCatalog, peekToolCatalog, type CatalogEntry } from '@/lib/toolCatalog';
+import {
+  loadToolCatalogResult,
+  peekToolCatalog,
+  type CatalogEntry,
+  type CatalogLoadWarning,
+} from '@/lib/toolCatalog';
 import { t } from '@/lib/i18n';
+import { ToolCatalogWarningPanel } from './ToolCatalogWarningPanel';
 import {
   APPROVAL_WILDCARD,
   applyApprovalState,
@@ -79,32 +85,38 @@ export default function ToolPermissionGrid({
   const [catalog, setCatalog] = useState<CatalogEntry[] | null>(() => peekToolCatalog(cacheKey));
   const [loading, setLoading] = useState(() => peekToolCatalog(cacheKey) === null);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<CatalogLoadWarning[]>([]);
+  const [reloadSeq, setReloadSeq] = useState(0);
   const [search, setSearch] = useState('');
   const [customName, setCustomName] = useState('');
   const [customError, setCustomError] = useState<string | null>(null);
 
   useEffect(() => {
-    const cached = peekToolCatalog(cacheKey);
+    const cached = reloadSeq === 0 ? peekToolCatalog(cacheKey) : null;
     if (cached) {
       setCatalog(cached);
       setLoading(false);
       setError(null);
+      setWarnings([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setWarnings([]);
     setCatalog(null);
-    loadToolCatalog(agent)
-      .then((entries) => {
+    loadToolCatalogResult(agent)
+      .then((result) => {
         if (!cancelled) {
-          setCatalog(entries);
+          setCatalog(result.entries);
+          setWarnings(result.warnings);
           setLoading(false);
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : t('tool_picker.load_failed'));
+          setWarnings([]);
           setCatalog([]);
           setLoading(false);
         }
@@ -112,7 +124,7 @@ export default function ToolPermissionGrid({
     return () => {
       cancelled = true;
     };
-  }, [agent, cacheKey]);
+  }, [agent, cacheKey, reloadSeq]);
 
   const strict = value.allowedTools.length > 0;
   const realAllowSet = useMemo(
@@ -201,6 +213,10 @@ export default function ToolPermissionGrid({
     setCustomError(null);
     setCustomName('');
     onChange(next);
+  }
+
+  function retryCatalogLoad() {
+    setReloadSeq((seq) => seq + 1);
   }
 
   function mcpAutoAdmitted(name: string): boolean {
@@ -377,6 +393,14 @@ export default function ToolPermissionGrid({
           {t('tool_picker.load_failed_prefix')}
           {error}
         </div>
+      )}
+
+      {warnings.length > 0 && (
+        <ToolCatalogWarningPanel
+          warnings={warnings}
+          onRetry={retryCatalogLoad}
+          retryDisabled={loading}
+        />
       )}
 
       {loading ? (

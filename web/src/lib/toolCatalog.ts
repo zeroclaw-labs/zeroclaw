@@ -3,21 +3,14 @@
 // place that fetches and caches it so the two components (and anything else
 // that needs the catalog) stay in sync instead of hitting the network twice.
 
-import type { ToolSpec, CliTool, OptionDomain } from "@/types/api";
 import { getTools, getCliTools } from "@/lib/api";
+import {
+  settleToolCatalogResult,
+  type CatalogEntry,
+  type ToolCatalogLoadResult,
+} from "./toolCatalog.logic";
 
-/** A flattened, group-tagged catalog entry. */
-export interface CatalogEntry {
-  name: string;
-  description: string;
-  group: "agent" | "cli";
-  /** JSON Schema for the tool's args (agent tools only; CLI tools omit it). */
-  parameters?: unknown;
-  /** Declared structured-output schema, when the tool declares one. */
-  output?: unknown;
-  /** Parameter name -> runtime option domain, for domain-typed params. */
-  param_domains?: Record<string, OptionDomain>;
-}
+export type { CatalogEntry, CatalogLoadWarning, ToolCatalogLoadResult } from "./toolCatalog.logic";
 
 // Process-wide cache so re-mounting a consumer (e.g. reopening the Cron
 // modal, or switching config sections) doesn't re-hit the network. Keyed by
@@ -27,16 +20,7 @@ export interface CatalogEntry {
 // from the default. Each per-agent catalog is effectively static for the
 // daemon's lifetime.
 const catalogCache = new Map<string, CatalogEntry[]>();
-const catalogInflight = new Map<string, Promise<CatalogEntry[]>>();
-
-function cliDescription(tool: CliTool): string {
-  // CliTool has no `description`; synthesize a short one from category/path
-  // so the row still says something useful.
-  const parts = [tool.category, tool.version ? `v${tool.version}` : null, tool.path]
-    .filter(Boolean)
-    .join(" · ");
-  return parts || tool.path;
-}
+const catalogInflight = new Map<string, Promise<ToolCatalogLoadResult>>();
 
 /** Synchronous cache peek — `null` when nothing has been fetched yet for
  *  this agent. Lets a consumer seed its initial state without waiting on
@@ -45,48 +29,27 @@ export function peekToolCatalog(agent?: string): CatalogEntry[] | null {
   return catalogCache.get(agent ?? "") ?? null;
 }
 
-export function loadToolCatalog(agent?: string): Promise<CatalogEntry[]> {
+export function loadToolCatalogResult(agent?: string): Promise<ToolCatalogLoadResult> {
   const key = agent ?? "";
   const cached = catalogCache.get(key);
-  if (cached) return Promise.resolve(cached);
+  if (cached) return Promise.resolve({ entries: cached, warnings: [] });
   const inflight = catalogInflight.get(key);
   if (inflight) return inflight;
   const promise = Promise.allSettled([getTools(agent), getCliTools()])
     .then(([toolsResult, cliToolsResult]) => {
-      if (toolsResult.status === "rejected" && cliToolsResult.status === "rejected") {
-        const toolsMessage =
-          toolsResult.reason instanceof Error
-            ? toolsResult.reason.message
-            : String(toolsResult.reason);
-        const cliMessage =
-          cliToolsResult.reason instanceof Error
-            ? cliToolsResult.reason.message
-            : String(cliToolsResult.reason);
-        throw new Error(`${toolsMessage}; ${cliMessage}`);
+      const result = settleToolCatalogResult(toolsResult, cliToolsResult);
+      if (result.warnings.length === 0) {
+        catalogCache.set(key, result.entries);
       }
-
-      const tools = toolsResult.status === "fulfilled" ? toolsResult.value : [];
-      const cliTools = cliToolsResult.status === "fulfilled" ? cliToolsResult.value : [];
-      const agentEntries: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
-        name: tnt.name,
-        description: tnt.description,
-        group: "agent" as const,
-        parameters: tnt.parameters,
-        output: tnt.output,
-        param_domains: tnt.param_domains,
-      }));
-      const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
-        name: c.name,
-        description: cliDescription(c),
-        group: "cli" as const,
-      }));
-      const entries = [...agentEntries, ...cli];
-      catalogCache.set(key, entries);
-      return entries;
+      return result;
     })
     .finally(() => {
       catalogInflight.delete(key);
     });
   catalogInflight.set(key, promise);
   return promise;
+}
+
+export function loadToolCatalog(agent?: string): Promise<CatalogEntry[]> {
+  return loadToolCatalogResult(agent).then((result) => result.entries);
 }

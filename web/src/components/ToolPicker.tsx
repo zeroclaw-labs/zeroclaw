@@ -17,8 +17,14 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
-import { loadToolCatalog, peekToolCatalog, type CatalogEntry as ToolCatalogEntry } from '@/lib/toolCatalog';
+import {
+  loadToolCatalogResult,
+  peekToolCatalog,
+  type CatalogEntry as ToolCatalogEntry,
+  type CatalogLoadWarning,
+} from '@/lib/toolCatalog';
 import { t } from '@/lib/i18n';
+import { ToolCatalogWarningPanel } from './ToolCatalogWarningPanel';
 
 export { loadToolCatalog as loadCatalog, type CatalogEntry } from '@/lib/toolCatalog';
 
@@ -55,39 +61,45 @@ export default function ToolPicker({
   );
   const [loading, setLoading] = useState(() => peekToolCatalog(cacheKey) === null);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<CatalogLoadWarning[]>([]);
+  const [reloadSeq, setReloadSeq] = useState(0);
   const [search, setSearch] = useState('');
 
   // Reload when the bound agent changes so the catalog reflects that agent's
   // scoped tools (cached per agent, so switching back is instant).
   useEffect(() => {
-    const cached = peekToolCatalog(cacheKey);
+    const cached = reloadSeq === 0 ? peekToolCatalog(cacheKey) : null;
     if (cached) {
       setCatalog(cached);
       setLoading(false);
       setError(null);
+      setWarnings([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setWarnings([]);
     setCatalog(null);
-    loadToolCatalog(agent)
-      .then((entries) => {
+    loadToolCatalogResult(agent)
+      .then((result) => {
         if (!cancelled) {
-          setCatalog(entries);
+          setCatalog(result.entries);
+          setWarnings(result.warnings);
           setLoading(false);
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : t('tool_picker.load_failed'));
+          setWarnings([]);
           setLoading(false);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [agent, cacheKey]);
+  }, [agent, cacheKey, reloadSeq]);
 
   // Fast membership lookups for the catalog and the current selection.
   const byName = useMemo(() => {
@@ -113,6 +125,10 @@ export default function ToolPicker({
   const removeChip = (name: string) => {
     if (disabled) return;
     onChange(value.filter((n) => n !== name));
+  };
+
+  const retryCatalogLoad = () => {
+    setReloadSeq((seq) => seq + 1);
   };
 
   // Bulk toggle for a group's currently-displayed entries. If every displayed
@@ -324,6 +340,14 @@ export default function ToolPicker({
             )}
           </div>
         )}
+
+      {warnings.length > 0 && (
+        <ToolCatalogWarningPanel
+          warnings={warnings}
+          onRetry={retryCatalogLoad}
+          retryDisabled={loading}
+        />
+      )}
 
       {/* Catalog list */}
       {loading ? (
