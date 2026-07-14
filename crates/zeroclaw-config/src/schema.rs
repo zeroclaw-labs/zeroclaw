@@ -33762,7 +33762,10 @@ system_bank = "zeroclaw-system"
         assert_eq!(cfg.memory.hindsight.top_k, 7);
         assert_eq!(cfg.memory.hindsight.bank_template, "zeroclaw-{agent}");
         assert_eq!(cfg.memory.hindsight.token_env, "ZC_HINDSIGHT_TOKEN");
-        assert_eq!(cfg.memory.hindsight.shared_bank_configured(), Some("zeroclaw-house"));
+        assert_eq!(
+            cfg.memory.hindsight.shared_bank_configured(),
+            Some("zeroclaw-house")
+        );
         assert_eq!(
             cfg.memory.hindsight.system_bank_configured(),
             Some("zeroclaw-system")

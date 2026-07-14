@@ -146,6 +146,7 @@ tool-shared-memory-store-error-missing-key = Missing 'key' parameter
 tool-shared-memory-store-error-missing-content = Missing 'content' parameter
 tool-shared-memory-store-error-not-available = { $tier } memory is not available on this backend
 tool-shared-memory-store-error-no-bank = no { $tier } bank configured
+tool-shared-memory-store-error-not-authorized = writing { $tier } memory is not authorized for this agent
 tool-shared-memory-store-success = Stored { $tier } memory: { $key }
 tool-shared-memory-store-error-failed = Failed to store { $tier } memory: { $error }
 

@@ -98,6 +98,7 @@ tool-shared-memory-store-error-missing-key = Paramètre 'key' manquant
 tool-shared-memory-store-error-missing-content = Paramètre 'content' manquant
 tool-shared-memory-store-error-not-available = La mémoire { $tier } n'est pas disponible sur ce backend
 tool-shared-memory-store-error-no-bank = aucune banque { $tier } configurée
+tool-shared-memory-store-error-not-authorized = cet agent n'est pas autorisé à écrire dans la mémoire { $tier }
 tool-shared-memory-store-success = Mémoire { $tier } enregistrée : { $key }
 tool-shared-memory-store-error-failed = Échec de l'enregistrement de la mémoire { $tier } : { $error }
 tool-microsoft365 = Intégration Microsoft 365 : gérez les e-mails Outlook, les messages Teams, les événements du calendrier, les fichiers OneDrive et la recherche SharePoint via l'API Microsoft Graph
