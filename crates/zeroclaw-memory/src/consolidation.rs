@@ -431,8 +431,8 @@ mod tests {
         let cfg = MemoryConfig::default();
         assert!(cfg.daily_dedup);
 
-        let core = "Svetlana is the user's mother and grandmother to Ellie and Vitalik";
-        let daily = "Svetlana is the user's mother and also grandmother to Ellie and Vitalik";
+        let core = "relative_a is user_a's mentor and advisor to user_b and user_c";
+        let daily = "relative_a is user_a's mentor and also advisor to user_b and user_c";
         maybe_write_daily_history(&mem, &cfg, daily, Some(core))
             .await
             .unwrap();
@@ -456,7 +456,7 @@ mod tests {
             &mem,
             &cfg,
             "User asked what the weather is like today",
-            Some("The user's birthday is February 24, 1990"),
+            Some("user_a prefers the metric system for unit conversions"),
         )
         .await
         .unwrap();

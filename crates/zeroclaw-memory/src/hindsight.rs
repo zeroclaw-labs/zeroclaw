@@ -1235,6 +1235,12 @@ mod tests {
         assert_eq!(by_id("v1"), MemoryCategory::Conversation);
         // Untagged rows keep the historical Core fallback.
         assert_eq!(by_id("u1"), MemoryCategory::Core);
+
+        // The whole point of decoding tags: the Daily gate can now find the
+        // Daily candidate instead of every row reading back as Core.
+        let daily = crate::dedup::daily_candidates(hits);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].id, "d1");
     }
 
     #[tokio::test]

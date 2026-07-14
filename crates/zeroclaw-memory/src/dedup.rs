@@ -343,8 +343,8 @@ mod tests {
         let cfg = MemoryConfig::default();
         assert!(cfg.daily_dedup);
         // Same fact, reworded: high token overlap -> treated as a cross-path dup.
-        let core = "Svetlana is the user's mother and grandmother to Ellie and Vitalik";
-        let daily = "Svetlana is the user's mother and also grandmother to Ellie and Vitalik";
+        let core = "relative_a is user_a's mentor and advisor to user_b and user_c";
+        let daily = "relative_a is user_a's mentor and also advisor to user_b and user_c";
         assert!(daily_duplicates_core(daily, core, &cfg));
     }
 
@@ -353,7 +353,7 @@ mod tests {
         let cfg = MemoryConfig::default();
         assert!(!daily_duplicates_core(
             "User asked what the weather is like today",
-            "The user's birthday is February 24, 1990",
+            "user_a prefers the metric system for unit conversions",
             &cfg,
         ));
     }
