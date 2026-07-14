@@ -18,6 +18,13 @@ use crate::tools::{
     register_skill_tools_with_context_and_runtime,
 };
 
+/// A per-agent tool registry that has been scoped and gated. The inner field is
+/// private and production code can only mint one through
+/// [`ScopedToolRegistry::assemble`]. Today (the unsealed P1 phase) the engine still
+/// takes `&[Box<dyn Tool>]`, so callers dissolve the type via [`std::ops::Deref`] or
+/// [`Self::into_inner`] at the boundary; once every construction site is cut over,
+/// the engine's tools field seals to this type and handing it an unfiltered
+/// registry becomes a compile error instead of a review-checklist item.
 pub struct ScopedToolRegistry(Vec<Box<dyn Tool>>);
 
 impl std::ops::Deref for ScopedToolRegistry {

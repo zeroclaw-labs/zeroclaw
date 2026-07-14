@@ -102,7 +102,7 @@ pub fn current_snapshot() -> Arc<PriceSnapshot> {
 
 /// Model-id candidate forms, most specific first: the id verbatim, then the
 /// path-suffix form (`vendor/slug` → `slug`). The single owner of the
-/// candidate policy: snapshot assembly ([`match_pricing`]) and lookup both
+/// candidate policy: snapshot assembly (`match_pricing`) and lookup both
 /// consume it, and the config-rate resolver mirrors it.
 pub fn model_id_candidates(model_id: &str) -> impl Iterator<Item = &str> {
     std::iter::once(model_id).chain(model_id.rsplit_once('/').map(|(_, suffix)| suffix))
@@ -139,6 +139,30 @@ fn any_live_pricing(config: &Config) -> bool {
         .any(|(_, _, base)| base.live_pricing)
 }
 
+/// Spawn the background price refresher, once per process.
+///
+/// No-op when no provider currently sets `live_pricing = true`: zero network,
+/// zero task; the cost path keeps reading an empty snapshot. This cheap
+/// pre-check runs *before* claiming the once-per-process guard, so a later
+/// `/admin/reload` (or a re-`start_channels`) that newly enables a provider can
+/// still start the refresher. Idempotent: a second concurrent caller (e.g. the
+/// gateway after the channels supervisor, in a combined process) returns at the
+/// guard without building any provider handles.
+///
+/// Every call re-binds `CONFIG_HANDLE` before anything else, and the running
+/// task re-resolves it each cycle, so a daemon reload (which re-instantiates
+/// the config `Arc` and re-runs both call sites) re-points the refresher at
+/// the current config, and toggling `live_pricing` on a provider (or changing
+/// its model/endpoint) is honored on the next refresh without a restart. Each
+/// cycle rebuilds the per-gateway poll set via the normal factory path
+/// (reusing each provider's configured `base_url`, credentials, and options),
+/// fetches one `/models` per gateway, and fills only the flagged models,
+/// falling back to the models.dev catalog for models a gateway doesn't price
+/// (or providers with no HTTP listing, e.g. the `kilocli` subprocess gateway).
+/// A fetch error for one source keeps the previous snapshot rather than
+/// regressing good prices to empty; disabling `live_pricing` on the last
+/// flagged provider instead clears the snapshot on the next cycle, so stale
+/// prices stop filling after an opt-out.
 pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
     // Re-bind before the enabled pre-check so even a "nothing enabled yet"
     // call leaves the freshest handle for a refresher started later.

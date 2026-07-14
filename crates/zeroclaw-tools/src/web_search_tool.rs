@@ -7,6 +7,19 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
+/// Web search tool for searching the internet.
+/// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
+/// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
+/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly).
+///
+/// API keys are resolved lazily at execution time: if the boot-time key
+/// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
+/// corresponding `[web_search]` field, and uses the result. This ensures that
+/// keys set or rotated after boot, and encrypted keys, are correctly picked up.
+/// The Bocha key has no boot-time snapshot at all — it is always resolved from
+/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
+/// canonical `[web_search] bocha_api_key` field stays the single source of
+/// truth and rotation/removal takes effect without a restart.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,

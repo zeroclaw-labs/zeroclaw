@@ -1,4 +1,28 @@
 //! JSONL append-only writer + rolling rotation.
+//!
+//! RAM contract: a single event lands in two allocations (the JSON line
+//! that goes to disk + the `serde_json::Value` clone that goes to the
+//! broadcast hook). Rolling rotation streams through `BufReader::lines`
+//! into a temp file rather than slurping the whole file into a `String`.
+//!
+//! ## Hot-path write concurrency model
+//!
+//! Disk persistence runs on a dedicated `std::thread` named
+//! `zeroclaw-log-writer` so `record_event` does not block on file I/O
+//! or fsync. The async runtime emits an event by serializing it once
+//! and `try_send`-ing onto a bounded `std::sync::mpsc::sync_channel`;
+//! when the channel is full (worker is slow or disk is stalled) the
+//! event is dropped with a `tracing::warn!` so a single slow disk
+//! cannot wedge an agent turn. The worker re-opens the active file
+//! per write (matching the prior single-threaded semantics — required
+//! because rolling trim and size-based rotation rename the file out
+//! from under an open handle), runs the rotation hooks inline, and
+//! calls `sync_all` on a periodic cadence (every
+//! `SYNC_EVERY_N_WRITES` writes or `SYNC_INTERVAL` of wall-clock
+//! time, whichever comes first). This trades per-event durability
+//! (the prior behaviour was `sync_data` after every write) for bounded
+//! write latency: a process crash may lose up to one sync interval of
+//! pending writes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
