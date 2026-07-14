@@ -134,7 +134,7 @@ pub(crate) async fn interpret_chat_response(
     llm_started_at: Instant,
     iteration: usize,
     detect_protocol_without_tools: bool,
-) -> InterpretedResponse {
+) -> anyhow::Result<InterpretedResponse> {
     let (resp_input_tokens, resp_output_tokens) = resp
         .usage
         .as_ref()
@@ -161,10 +161,12 @@ pub(crate) async fn interpret_chat_response(
     // the per-call USD so both the Usage event and the llm_response log line
     // can carry it. `None` = untracked (no cost scope or no usage). A tracked
     // unpriced call still returns `Some(0.0)`, and the persisted cost row marks
-    // `pricing_available = false` so goal cost budgets can fail closed.
+    // Non-goal unpriced calls remain observable as `Some(0.0)`; a
+    // goal-attributed call instead returns an accounting error before its
+    // response can advance the tool loop.
     let call_cost_usd = match resp.usage.as_ref() {
         Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
-            .await
+            .await?
             .map(|(_total_tokens, cost_usd)| cost_usd),
         None => None,
     };
@@ -310,7 +312,7 @@ pub(crate) async fn interpret_chat_response(
     };
 
     let native_calls = resp.tool_calls;
-    InterpretedResponse {
+    Ok(InterpretedResponse {
         response_text,
         parsed_text,
         tool_calls: calls,
@@ -318,7 +320,7 @@ pub(crate) async fn interpret_chat_response(
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
         input_tokens: resp_input_tokens,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -466,7 +468,9 @@ mod cost_usd_regression_tests {
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(cost_ctx), async {
-                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
+                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false)
+                    .await
+                    .unwrap();
             })
             .await;
 

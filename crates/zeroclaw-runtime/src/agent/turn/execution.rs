@@ -71,7 +71,7 @@ impl ResolvedModelAccess<'_> {
         // validation) so a downstream failure still counts the provider usage.
         if let Some(usage) = resp.usage.as_ref() {
             crate::agent::cost::record_tool_loop_cost_usage(self.provider_name, self.model, usage)
-                .await;
+                .await?;
         }
         Ok(resp)
     }

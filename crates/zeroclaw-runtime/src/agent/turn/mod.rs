@@ -736,7 +736,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
-                .await;
+                .await?;
                 (
                     interpreted.response_text,
                     interpreted.parsed_text,

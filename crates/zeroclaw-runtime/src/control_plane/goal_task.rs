@@ -381,6 +381,13 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// together.
     async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
 
+    /// Atomically complete exactly a running goal. A false result means a
+    /// concurrent pause/cancel/terminal transition won the lifecycle race.
+    async fn complete_running_goal_task(
+        &self,
+        task_id: &str,
+        output: String,
+    ) -> anyhow::Result<bool>;
     /// Atomically clear goal pause state, claim ownership, and mark the task running.
     ///
     /// `continuation_context` is written only when supplied by trusted ingress.

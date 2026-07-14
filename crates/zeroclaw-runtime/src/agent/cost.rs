@@ -393,24 +393,36 @@ fn merge_config_and_live_rates(
 }
 
 /// Record token usage from an LLM response via the task-local cost tracker.
-/// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
+///
+/// Ordinary unscoped/non-goal callers retain best-effort metering. A
+/// goal-attributed turn is different: its durable budget is a safety boundary,
+/// so missing attribution, incomplete pricing for used dimensions, an absent
+/// tracker, or a ledger-write error is returned to the caller rather than
+/// silently recording an unpriced or unattributed call.
 pub async fn record_tool_loop_cost_usage(
     model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
-) -> Option<(u64, f64)> {
+) -> anyhow::Result<Option<(u64, f64)>> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
     let total_tokens = input_tokens.saturating_add(output_tokens);
     if total_tokens == 0 {
-        return None;
+        return Ok(None);
     }
 
-    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+    let Some(ctx) = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
-        .flatten()?;
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let goal_attributed = ctx.goal_attribution_enabled();
+    if goal_attributed && ctx.tracker.is_none() {
+        anyhow::bail!("goal accounting tracker unavailable");
+    }
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
     let config_rates = pricing
         .map(|map| resolve_rates_opt(map, model))
@@ -433,7 +445,7 @@ pub async fn record_tool_loop_cost_usage(
     // Exact id matching keeps provider-qualified self-hosted ids — absent from
     // the public catalog — at $0, so only billed cloud models get a non-zero
     // rate here.
-    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
+    if input_rate == 0.0 && output_rate == 0.0 {
         if let Some((cat_in, cat_out, cat_cached)) =
             crate::agent::pricing_catalog::global_pricing_rates(model)
         {
@@ -442,16 +454,17 @@ pub async fn record_tool_loop_cost_usage(
             if cached_rate == 0.0 {
                 cached_rate = cat_cached;
             }
-            true
-        } else {
-            false
         }
-    } else {
-        false
-    };
+    }
 
-    let pricing_available =
-        priced_from_catalog || input_rate > 0.0 || output_rate > 0.0 || cached_rate > 0.0;
+    let pricing_available = pricing_covers_usage(
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        input_rate,
+        cached_rate,
+        output_rate,
+    );
 
     let mut cost_usage = CostTokenUsage::new_with_cache(
         model,
@@ -475,6 +488,11 @@ pub async fn record_tool_loop_cost_usage(
     // (indistinguishable from unpriced here).
     if tracker_scoped && !pricing_available {
         warn_once_missing_pricing(model_provider_name, model);
+        if goal_attributed {
+            anyhow::bail!(
+                "goal accounting pricing unavailable for used usage dimensions ({model_provider_name}/{model})"
+            );
+        }
     }
 
     // Accumulate turn usage: prefer the caller-scoped TOOL_LOOP_TURN_USAGE
@@ -509,18 +527,19 @@ pub async fn record_tool_loop_cost_usage(
     let returned_usage = (cost_usage.total_tokens, cost_usage.cost_usd);
 
     if let Some(tracker) = &ctx.tracker {
-        let attributed_task_id = if ctx.goal_attribution_enabled() {
-            match ctx.agent_alias.as_deref() {
-                Some(agent_alias) => {
-                    active_goal_task_id_for_context(
-                        agent_alias,
-                        ctx.originator_route.as_deref(),
-                        ctx.principal_id.as_deref(),
-                    )
-                    .await
-                }
-                None => None,
-            }
+        let attributed_task_id = if goal_attributed {
+            let agent_alias = ctx.agent_alias.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("goal accounting attribution is missing agent identity")
+            })?;
+            Some(
+                active_goal_task_id_for_context(
+                    agent_alias,
+                    ctx.originator_route.as_deref(),
+                    ctx.principal_id.as_deref(),
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("goal accounting attribution has no active task"))?,
+            )
         } else {
             None
         };
@@ -529,41 +548,65 @@ pub async fn record_tool_loop_cost_usage(
             ctx.agent_alias.as_deref(),
             attributed_task_id,
         ) {
+            if goal_attributed {
+                return Err(anyhow::anyhow!(
+                    "persist goal-attributed cost usage: {error}"
+                ));
+            }
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
         }
     }
 
-    Some(returned_usage)
+    Ok(Some(returned_usage))
+}
+
+/// Identifies fail-closed accounting errors produced while a trusted goal owns
+/// a model call. The verifier uses this to preserve the durable accounting
+/// blocker instead of misreporting it as a provider/verifier outage.
+pub fn is_goal_accounting_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with("goal accounting ")
+            || message.starts_with("persist goal-attributed cost usage")
+    })
+}
+
+/// Distinguishes unavailable pricing from other unavailable goal-accounting
+/// dependencies so the durable budget blocker retains the useful cause.
+pub fn is_goal_accounting_pricing_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("goal accounting pricing unavailable")
+    })
+}
+
+fn pricing_covers_usage(
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    input_rate: f64,
+    cached_rate: f64,
+    output_rate: f64,
+) -> bool {
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    (uncached_input_tokens == 0 || input_rate > 0.0)
+        && (cached_input_tokens == 0 || cached_rate > 0.0)
+        && (output_tokens == 0 || output_rate > 0.0)
 }
 
 async fn active_goal_task_id_for_context(
     agent_alias: &str,
     originator_route: Option<&str>,
     principal_id: Option<&str>,
-) -> Option<String> {
-    let control_plane = crate::control_plane::control_plane()?;
-    match control_plane
+) -> anyhow::Result<Option<String>> {
+    let control_plane = crate::control_plane::control_plane()
+        .ok_or_else(|| anyhow::anyhow!("goal accounting control plane unavailable"))?;
+    control_plane
         .goal_store
         .latest_active_goal_id_for_context(agent_alias, originator_route, principal_id)
         .await
-    {
-        Ok(Some(goal_id)) => Some(goal_id),
-        Ok(None) => None,
-        Err(error) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "agent_alias": agent_alias,
-                        "error": format!("{error}")
-                    })),
-                "Failed to resolve active goal for cost attribution"
-            );
-            None
-        }
-    }
+        .map_err(|error| anyhow::anyhow!("resolve goal accounting attribution: {error}"))
 }
 
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
@@ -618,6 +661,20 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
             "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
         );
     }
+}
+
+/// Reject a goal-attributed provider call before it spends budget if the
+/// canonical tracker is unavailable. Non-goal callers retain the historical
+/// unscoped best-effort behavior.
+pub fn ensure_goal_accounting_preflight() -> anyhow::Result<()> {
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    if matches!(ctx, Some(ref ctx) if ctx.goal_attribution_enabled() && ctx.tracker.is_none()) {
+        anyhow::bail!("goal accounting tracker unavailable");
+    }
+    Ok(())
 }
 
 /// Check budget before an LLM call. Returns `None` when no cost tracking
@@ -978,6 +1035,7 @@ mod tests {
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
                 record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
             }))
+            .expect("cost accounting")
             .expect("cost usage");
 
         let expected = (1_000.0 * 0.27 / 1_000_000.0)
@@ -1022,6 +1080,7 @@ mod tests {
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
                 record_tool_loop_cost_usage("cache-provider", "cache-model", &usage).await
             }))
+            .expect("cost accounting")
             .expect("cost usage");
 
         let expected = 5_000.0 * 0.50 / 1_000_000.0;
@@ -1069,6 +1128,7 @@ mod tests {
                     record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
                 }),
             ))
+            .expect("cost accounting")
             .expect("cost usage");
 
         let expected = (1_000.0 * 0.27 / 1_000_000.0)
@@ -1105,6 +1165,7 @@ mod tests {
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
                 record_tool_loop_cost_usage("unpriced-provider", "unpriced-model", &usage).await
             }))
+            .expect("cost accounting")
             .expect("cost usage");
 
         assert_eq!(total_tokens, 5_200);
@@ -1114,6 +1175,160 @@ mod tests {
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert!(!record.usage.pricing_available);
+    }
+
+    #[test]
+    fn goal_attributed_usage_rejects_missing_or_partial_pricing_dimensions() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let goal_ctx = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_goal_task_id(Some("goal-priced".into()));
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let missing =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()))
+                .with_goal_admission_context(&goal_ctx);
+        let partial = ToolLoopCostTrackingContext::new(
+            tracker,
+            Arc::new(HashMap::from([(
+                "provider.alias".to_string(),
+                HashMap::from([("model.input".to_string(), 1.0)]),
+            )])),
+        )
+        .with_goal_admission_context(&goal_ctx);
+        let input_and_output = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cached_input_tokens: None,
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let missing_error = runtime.block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(missing),
+            record_tool_loop_cost_usage("provider.alias", "model", &input_and_output),
+        ));
+        assert!(missing_error.is_err());
+        let partial_error = runtime.block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(partial),
+            record_tool_loop_cost_usage("provider.alias", "model", &input_and_output),
+        ));
+        assert!(
+            partial_error.is_err(),
+            "missing output pricing must fail a goal call"
+        );
+    }
+
+    #[test]
+    fn goal_attributed_usage_rejects_missing_tracker_and_unresolved_exact_task() {
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cached_input_tokens: None,
+        };
+        let missing_tracker = ToolLoopCostTrackingContext::usage_only()
+            .with_goal_admission_context(
+                &crate::control_plane::GoalAdmissionContext::new("agent-a")
+                    .with_goal_task_id(Some("goal-no-tracker".into())),
+            );
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let unresolved = ToolLoopCostTrackingContext::new(
+            tracker,
+            Arc::new(HashMap::from([(
+                "provider.alias".to_string(),
+                HashMap::from([
+                    ("model.input".to_string(), 1.0),
+                    ("model.output".to_string(), 1.0),
+                ]),
+            )])),
+        )
+        .with_agent_alias("missing-goal-agent")
+        .with_goal_admission_context(
+            &crate::control_plane::GoalAdmissionContext::new("missing-goal-agent")
+                .with_originator_route(Some("missing-route".into()))
+                .with_principal_id(Some("missing-principal".into())),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            runtime
+                .block_on(
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(missing_tracker.clone()), async {
+                        ensure_goal_accounting_preflight()
+                    },)
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(missing_tracker),
+                    record_tool_loop_cost_usage("provider.alias", "model", &usage),
+                ))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(unresolved),
+                    record_tool_loop_cost_usage("provider.alias", "model", &usage),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn goal_attributed_usage_rejects_ledger_write_failure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(workspace.path().join("state").join("costs.jsonl"))
+            .expect("make ledger path unwritable as a directory");
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker,
+            Arc::new(HashMap::from([(
+                "provider.alias".to_string(),
+                HashMap::from([
+                    ("model.input".to_string(), 1.0),
+                    ("model.output".to_string(), 1.0),
+                ]),
+            )])),
+        )
+        .with_goal_admission_context(
+            &crate::control_plane::GoalAdmissionContext::new("agent-a")
+                .with_goal_task_id(Some("goal-ledger-failure".into())),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cached_input_tokens: None,
+        };
+
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                Some(ctx),
+                record_tool_loop_cost_usage("provider.alias", "model", &usage),
+            ),
+        );
+        assert!(
+            result.is_err(),
+            "goal ledger write failure must reject the turn"
+        );
     }
 
     fn ensure_test_control_plane_store() -> Arc<dyn crate::control_plane::TaskRegistry> {
@@ -1217,6 +1432,7 @@ mod tests {
                     record_tool_loop_cost_usage("mock-provider", "mock-model", &usage).await
                 })
                 .await
+                .expect("cost accounting")
                 .expect("cost usage");
         });
 
@@ -1293,6 +1509,7 @@ mod tests {
                     record_tool_loop_cost_usage("mock-provider", "mock-model", &usage).await
                 })
                 .await
+                .expect("cost accounting")
                 .expect("cost usage");
         });
 
@@ -1368,6 +1585,7 @@ mod tests {
                     record_tool_loop_cost_usage("mock-provider", "mock-model", &usage).await
                 })
                 .await
+                .expect("cost accounting")
                 .expect("cost usage");
         });
 

@@ -12,6 +12,8 @@ use zeroclaw_commands::{BuiltinCommandId, CommandSurface, command_by_name};
 use zeroclaw_config::cost::CostTracker;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
+use crate::agent::cost::{is_goal_accounting_failure, is_goal_accounting_pricing_failure};
+
 use super::global::control_plane;
 use super::goal_task::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
@@ -375,11 +377,18 @@ fn goal_budget_unavailable_pause(
     if !goal_has_effective_budget(goal) {
         return None;
     }
+    Some(goal_accounting_unavailable_pause(goal, cause))
+}
+
+fn goal_accounting_unavailable_pause(
+    goal: &GoalTaskRecord,
+    cause: GoalBudgetUnavailableCause,
+) -> GoalPauseState {
     let budget = goal_budget_summary(goal, None);
     let usage_unavailable = matches!(cause, GoalBudgetUnavailableCause::UsageUnavailable);
     let cost_pricing_unavailable =
         matches!(cause, GoalBudgetUnavailableCause::CostPricingUnavailable);
-    Some(GoalPauseState {
+    GoalPauseState {
         reason: GoalPauseReason::BudgetUnavailable,
         description: Some(msg(
             "goal-command-budget-unavailable-description",
@@ -398,7 +407,7 @@ fn goal_budget_unavailable_pause(
                 "cost_limit_usd": goal.effective_cost_limit_usd,
             })),
         }],
-    })
+    }
 }
 
 fn goal_budget_gate_pause(
@@ -1401,17 +1410,16 @@ pub async fn evaluate_goal_turn_with_verifier(
     match verifier_decision {
         Ok(GoalVerifierDecision::Complete { notes: _ }) => {
             let task_id = resolved.task_id().to_string();
-            cp.store
-                .update_status(
-                    &task_id,
-                    TaskStatus::Completed,
-                    Some(candidate_summary.to_string()),
-                    None,
-                )
+            if !cp
+                .goal_store
+                .complete_running_goal_task(&task_id, candidate_summary.to_string())
                 .await
                 .with_context(|| {
                     msg("goal-command-error-update-failed", &[("task_id", &task_id)])
-                })?;
+                })?
+            {
+                return Ok(None);
+            }
             let final_usage = if verifier_enabled {
                 goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id)
             } else {
@@ -1484,6 +1492,27 @@ pub async fn evaluate_goal_turn_with_verifier(
         }
         Err(error) => {
             let task_id = resolved.task_id().to_string();
+            if is_goal_accounting_failure(&error) {
+                let cause = if is_goal_accounting_pricing_failure(&error) {
+                    GoalBudgetUnavailableCause::CostPricingUnavailable
+                } else {
+                    GoalBudgetUnavailableCause::UsageUnavailable
+                };
+                let pause = goal_accounting_unavailable_pause(resolved.goal(), cause);
+                let budget = goal_budget_summary(resolved.goal(), None);
+                let admission = pause_goal_for_resolved_task_with_budget(
+                    cp.goal_store.as_ref(),
+                    resolved,
+                    pause,
+                    budget,
+                )
+                .await?;
+                publish_goal_state_update(&admission);
+                return Ok(Some(GoalTurnEvaluation::Paused {
+                    task_id,
+                    message: admission.message,
+                }));
+            }
             let admission = pause_goal_for_known_blocker(
                 cp.goal_store.as_ref(),
                 resolved,
