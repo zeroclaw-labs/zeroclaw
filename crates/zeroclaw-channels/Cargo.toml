@@ -200,6 +200,7 @@ channels-full = [
   "channel-imessage",
   "channel-irc",
   "channel-lark",
+  "channel-line",
   "channel-linq",
   "channel-mattermost",
   "channel-mochat",

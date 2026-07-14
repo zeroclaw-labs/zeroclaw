@@ -316,6 +316,7 @@ default-channels = [
 # pre-#6895 default channel surface.
 channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
+    "channel-line",
     "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
