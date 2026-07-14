@@ -186,6 +186,17 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
         "403 forbidden",
         "invalid api key",
         "incorrect api key",
+        // A missing/unconfigured key is an authentication failure too, not a
+        // generic provider error (#9001). Providers phrase this several ways,
+        // including "credentials not set" (Anthropic) as well as "api key".
+        "missing api key",
+        "api key not set",
+        "no api key",
+        "api key is not configured",
+        "credentials not set",
+        "credentials not found",
+        "no credentials",
+        "credentials required",
         "authentication failed",
         "auth failed",
         "unauthorized",
@@ -195,6 +206,59 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
     ];
 
     hints.iter().any(|hint| msg_lower.contains(hint))
+}
+
+/// Refine an auth failure into `auth_missing` (no credential configured),
+/// `auth_rejected` (a credential was sent and refused), or the ambiguous `auth`
+/// when neither signal is positively present (#9001).
+///
+/// "Rejected" is broadly portable — it rides on the HTTP 401/403 contract that
+/// any networked provider returns. "Missing" is best-effort: providers phrase
+/// their pre-flight "no key configured" check differently, and some (local /
+/// OpenAI-compatible) never emit one, so we only claim it on a positive match
+/// and otherwise fall back to the honest combined message.
+fn classify_auth_kind(err: &anyhow::Error, lower: &str) -> &'static str {
+    // A real 401/403 is authoritative: the request reached the provider and was
+    // refused, so this is a rejection regardless of any other wording.
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status()
+        && (status.as_u16() == 401 || status.as_u16() == 403)
+    {
+        return "auth_rejected";
+    }
+
+    let missing = [
+        "not set",
+        "not configured",
+        "no api key",
+        "no credentials",
+        "missing api key",
+        "credentials not found",
+        "credentials required",
+    ];
+    if missing.iter().any(|hint| lower.contains(hint)) {
+        return "auth_missing";
+    }
+
+    let rejected = [
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "incorrect api key",
+        "invalid token",
+        "token expired",
+        "expired",
+        "rejected",
+        "access denied",
+        "permission denied",
+    ];
+    if rejected.iter().any(|hint| lower.contains(hint)) {
+        return "auth_rejected";
+    }
+
+    "auth"
 }
 
 /// Check if an error is a tool schema validation failure (e.g. Groq returning
@@ -350,6 +414,77 @@ struct ProviderErrorDiagnostic {
     endpoint: Option<String>,
 }
 
+impl ProviderErrorDiagnostic {
+    /// Build a single, actionable, provider-named lead sentence for end users
+    /// (#9001). The reliable layer already classifies the underlying error into
+    /// `kind`; this promotes that classification into a message a user can act
+    /// on, instead of leading with the generic "All model_providers/models
+    /// failed" envelope. Detailed retry/fallback traces stay untouched in the
+    /// logs and in the tail of the bail message.
+    fn user_facing_summary(&self, provider: &str) -> String {
+        let at = self
+            .endpoint
+            .as_deref()
+            .map(|endpoint| format!(" at {endpoint}"))
+            .unwrap_or_default();
+        match self.kind {
+            "auth_missing" => format!(
+                "No API key is configured for {provider}. Add credentials for the selected provider."
+            ),
+            "auth_rejected" => {
+                format!("The configured credentials for {provider} were rejected.")
+            }
+            "auth" => format!(
+                "The configured credentials for {provider} were rejected or missing. Add or check the API key for the selected provider."
+            ),
+            "connect" | "dns" => format!(
+                "{provider} is not reachable{at}. Start its local server or update the endpoint."
+            ),
+            "connect_timeout" | "timeout" => format!(
+                "{provider} did not respond in time{at}. Retry, check the network, or switch provider."
+            ),
+            "rate_limited" => format!(
+                "{provider} rate-limited the request. Wait, change key/quota, or switch provider."
+            ),
+            "model_not_found" => format!(
+                "The configured model was not found by {provider}. Check the model id for the selected provider."
+            ),
+            "context_window" => format!(
+                "The request exceeds the context window for {provider}. Reduce context or use a larger-context model."
+            ),
+            "provider_server" => {
+                format!("{provider} returned a server error. Retry or switch provider.")
+            }
+            _ => format!("The request to {provider} failed. See the logs for details."),
+        }
+    }
+}
+
+/// Rank a diagnostic `kind` by how actionable it is as a user-facing lead.
+/// Clear configuration/process causes (auth, unreachable local server, unknown
+/// model, oversized context) outrank transient/ambiguous ones so that, across
+/// several failing providers, the most useful cause leads the message (#9001).
+fn lead_priority(kind: &str) -> u8 {
+    match kind {
+        "auth" | "auth_missing" | "auth_rejected" | "connect" | "dns" | "model_not_found"
+        | "context_window" => 3,
+        "rate_limited" | "timeout" | "connect_timeout" | "provider_server" => 2,
+        _ => 1,
+    }
+}
+
+/// Decide whether `candidate` should become the user-facing lead diagnostic,
+/// keeping the first-seen one on ties.
+fn should_replace_lead(
+    current: Option<&(String, ProviderErrorDiagnostic)>,
+    candidate: &ProviderErrorDiagnostic,
+) -> bool {
+    match current {
+        None => true,
+        Some((_, existing)) => lead_priority(candidate.kind) > lead_priority(existing.kind),
+    }
+}
+
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -389,7 +524,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
 
     if is_auth_error(err) {
         return ProviderErrorDiagnostic {
-            kind: "auth",
+            kind: classify_auth_kind(err, &lower),
             phase: "http_response",
             hint: "check provider credentials",
             endpoint,
@@ -488,6 +623,24 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             kind: "dns",
             phase: "dns",
             hint: "DNS resolution failed; check network or provider host",
+            endpoint,
+        };
+    }
+
+    // Stringified connection failures (e.g. a local LM Studio/Ollama server not
+    // running) do not always survive as a typed `reqwest::Error`, so recognize
+    // them by text too (#9001).
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("failed to connect")
+        || lower.contains("could not connect")
+        || lower.contains("couldn't connect")
+        || lower.contains("client error (connect)")
+    {
+        return ProviderErrorDiagnostic {
+            kind: "connect",
+            phase: "connect",
+            hint: "could not open provider connection; check network, VPN, or firewall",
             endpoint,
         };
     }
@@ -922,6 +1075,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<(String, ProviderErrorDiagnostic)> = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1011,6 +1165,9 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some((provider_name.to_string(), diagnostic.clone()));
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1109,7 +1266,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\n\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref()
+                .map(|(provider, diagnostic)| diagnostic.user_facing_summary(provider))
+                .unwrap_or_else(|| "All configured providers failed.".to_string()),
             failures.join("\n")
         )
     }
@@ -1122,6 +1282,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<(String, ProviderErrorDiagnostic)> = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1220,6 +1381,9 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some((provider_name.to_string(), diagnostic.clone()));
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1312,7 +1476,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\n\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref()
+                .map(|(provider, diagnostic)| diagnostic.user_facing_summary(provider))
+                .unwrap_or_else(|| "All configured providers failed.".to_string()),
             failures.join("\n")
         )
     }
@@ -1340,6 +1507,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<(String, ProviderErrorDiagnostic)> = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1439,6 +1607,9 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some((provider_name.to_string(), diagnostic.clone()));
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1531,7 +1702,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\n\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref()
+                .map(|(provider, diagnostic)| diagnostic.user_facing_summary(provider))
+                .unwrap_or_else(|| "All configured providers failed.".to_string()),
             failures.join("\n")
         )
     }
@@ -1544,6 +1718,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<(String, ProviderErrorDiagnostic)> = None;
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
 
@@ -1648,6 +1823,9 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some((provider_name.to_string(), diagnostic.clone()));
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1744,7 +1922,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\n\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref()
+                .map(|(provider, diagnostic)| diagnostic.user_facing_summary(provider))
+                .unwrap_or_else(|| "All configured providers failed.".to_string()),
             failures.join("\n")
         )
     }
@@ -2006,6 +2187,112 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
+
+    // --- #9001: cause-specific provider diagnostics ---------------------------
+
+    #[test]
+    fn missing_key_is_classified_as_auth() {
+        // A missing/unconfigured key must read as an auth failure, not the
+        // generic provider_error fallback, and specifically as `auth_missing`.
+        for msg in [
+            "missing api key",
+            "No API key is configured for OpenAI",
+            "api key not set",
+            // Anthropic's real missing-credential wording (verified via live repro).
+            "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+        ] {
+            let err = anyhow::Error::msg(msg);
+            assert!(is_auth_error(&err), "should be auth: {msg}");
+            let diag = provider_error_diagnostic(&err);
+            assert_eq!(diag.kind, "auth_missing", "kind for: {msg}");
+            assert!(
+                diag.user_facing_summary("OpenAI")
+                    .starts_with("No API key is configured for OpenAI"),
+                "missing summary for: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_credentials_classified_as_auth_rejected() {
+        // A credential that reached the provider and was refused reads as a
+        // rejection, distinct from a missing key (#9001).
+        for msg in [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "invalid api key provided",
+            "token expired",
+        ] {
+            let err = anyhow::Error::msg(msg);
+            let diag = provider_error_diagnostic(&err);
+            assert_eq!(diag.kind, "auth_rejected", "kind for: {msg}");
+            assert_eq!(
+                diag.user_facing_summary("Anthropic"),
+                "The configured credentials for Anthropic were rejected."
+            );
+        }
+    }
+
+    #[test]
+    fn auth_summary_names_provider_and_credentials() {
+        let diag = provider_error_diagnostic(&anyhow::Error::msg("missing api key"));
+        let summary = diag.user_facing_summary("OpenAI");
+        assert!(summary.contains("OpenAI"), "summary: {summary}");
+        assert!(
+            summary.to_lowercase().contains("credentials")
+                || summary.to_lowercase().contains("api key"),
+            "summary should point at credentials: {summary}"
+        );
+    }
+
+    #[test]
+    fn unreachable_local_server_summary_is_actionable() {
+        let diag = provider_error_diagnostic(&anyhow::Error::msg(
+            "error sending request: client error (Connect): tcp connect error: connection refused",
+        ));
+        assert_eq!(diag.kind, "connect");
+        let summary = diag.user_facing_summary("LM Studio");
+        assert!(
+            summary.contains("LM Studio") && summary.contains("not reachable"),
+            "summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn unknown_model_and_rate_limit_summaries() {
+        let model = provider_error_diagnostic(&anyhow::Error::msg("model glm-4.7 not found")).kind;
+        assert_eq!(model, "model_not_found");
+
+        let rl = provider_error_diagnostic(&anyhow::Error::msg("429 Too Many Requests"));
+        assert_eq!(rl.kind, "rate_limited");
+        assert!(rl.user_facing_summary("Anthropic").contains("Anthropic"));
+    }
+
+    #[test]
+    fn lead_priority_prefers_actionable_cause() {
+        let auth = ProviderErrorDiagnostic {
+            kind: "auth",
+            phase: "http_response",
+            hint: "",
+            endpoint: None,
+        };
+        let generic = ProviderErrorDiagnostic {
+            kind: "provider_error",
+            phase: "unknown",
+            hint: "",
+            endpoint: None,
+        };
+        // A generic cause never displaces an already-recorded actionable one.
+        assert!(should_replace_lead(None, &generic));
+        assert!(should_replace_lead(
+            Some(&("p".into(), generic.clone())),
+            &auth
+        ));
+        assert!(!should_replace_lead(
+            Some(&("p".into(), auth.clone())),
+            &generic
+        ));
+    }
 
     struct MockModelProvider {
         calls: Arc<AtomicUsize>,
@@ -2438,12 +2725,55 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
+        // #9001: a user-facing summary now leads; the detailed envelope and
+        // per-attempt traces are retained below it (nothing is lost).
+        let first_line = msg.lines().next().unwrap_or_default();
+        assert!(
+            !first_line.starts_with("All model_providers/models failed"),
+            "envelope should no longer be the lead line: {first_line}"
+        );
         assert!(msg.contains("All model_providers/models failed"));
         assert!(msg.contains("model_provider=p1 model=test"));
         assert!(msg.contains("model_provider=p2 model=test"));
         assert!(msg.contains("error=p1 error"));
         assert!(msg.contains("error=p2 error"));
         assert!(msg.contains("retryable"));
+    }
+
+    #[tokio::test]
+    async fn missing_key_failure_leads_with_actionable_summary() {
+        // Reproduces #9001 scenario B: a cloud provider without credentials.
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "openai".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "missing api key",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let err = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("provider should fail");
+        let msg = err.to_string();
+        let first_line = msg.lines().next().unwrap_or_default();
+        // Lead names the provider and points at credentials, not a raw trace.
+        assert!(first_line.contains("openai"), "lead: {first_line}");
+        assert!(
+            first_line.to_lowercase().contains("credentials")
+                || first_line.to_lowercase().contains("api key"),
+            "lead should be actionable: {first_line}"
+        );
+        // Detailed traces still present for logs / debugging.
+        assert!(msg.contains("All model_providers/models failed"));
+        assert!(msg.contains("model_provider=openai"));
     }
 
     #[test]
@@ -2569,7 +2899,7 @@ mod tests {
             ),
             (
                 "401 Unauthorized: invalid api key",
-                "auth",
+                "auth_rejected",
                 "http_response",
                 "credentials",
             ),
