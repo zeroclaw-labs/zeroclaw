@@ -927,7 +927,12 @@ pub struct OpenAiResponsesModelProvider {
 }
 
 impl OpenAiResponsesModelProvider {
-    pub fn new(alias: &str, api_url: Option<&str>, credential: Option<&str>, vision: Option<bool>) -> Self {
+    pub fn new(
+        alias: &str,
+        api_url: Option<&str>,
+        credential: Option<&str>,
+        vision: Option<bool>,
+    ) -> Self {
         let responses_url = api_url
             .map(|url| {
                 let trimmed = url.trim_end_matches('/');
@@ -1093,16 +1098,16 @@ impl OpenAiResponsesModelProvider {
     }
 }
 
-    #[async_trait]
-    impl ModelProvider for OpenAiResponsesModelProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                native_tool_calling: true,
-                vision: self.supports_vision,
-                prompt_caching: false,
-                extended_thinking: false,
-            }
+#[async_trait]
+impl ModelProvider for OpenAiResponsesModelProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: self.supports_vision,
+            prompt_caching: false,
+            extended_thinking: false,
         }
+    }
 
     /// Reports the instance's resolved endpoint so callers can verify which
     /// host a responses provider will actually hit (e.g. a compat family's
@@ -1341,8 +1346,12 @@ mod tests {
 
     #[test]
     fn responses_url_appends_responses_to_custom_base() {
-        let p =
-            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None, None);
+        let p = OpenAiResponsesModelProvider::new(
+            "opencode",
+            Some("https://opencode.ai/zen/v1"),
+            None,
+            None,
+        );
         assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
     }
 
@@ -1402,7 +1411,8 @@ mod tests {
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p =
+            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
         assert_eq!(
             p.extra_headers.len(),
             2,
@@ -1438,7 +1448,8 @@ mod tests {
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p =
+            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1467,7 +1478,8 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X Valid".to_string(), "ok".to_string()); // space → invalid
         headers.insert("X-Also-Valid".to_string(), "ok".to_string());
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p =
+            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1488,7 +1500,8 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Bad-Value".to_string(), "has\0nul".to_string()); // NUL → invalid
         headers.insert("X-Good-Value".to_string(), "ok".to_string());
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p =
+            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -2195,8 +2208,8 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_max_tokens_when_set() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", None, None, None).with_max_tokens(Some(2048));
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None)
+            .with_max_tokens(Some(2048));
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2291,8 +2304,12 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_instructions_and_temperature_and_model() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None, None);
+        let provider = OpenAiResponsesModelProvider::new(
+            "openai",
+            Some("https://api.example.test/v1"),
+            None,
+            None,
+        );
         let req = provider.build_request(
             Some("You are a careful assistant.".to_string()),
             vec![serde_json::json!({"role": "user", "content": "summarize"})],
@@ -2326,8 +2343,8 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", None, None, None).with_max_tokens(Some(1024));
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None)
+            .with_max_tokens(Some(1024));
         let tools = Some(vec![ResponsesToolSpec {
             kind: "function".to_string(),
             name: "lookup_weather".to_string(),
