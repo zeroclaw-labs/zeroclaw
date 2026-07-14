@@ -54,7 +54,7 @@ impl ChannelRouteAdapter {
 /// `@user:server` id) survives intact on the right. Channel-map keys are
 /// dot-separated (`discord.ops`), never colon-separated, so the first colon is
 /// unambiguously the channel/recipient boundary.
-fn parse_route(route: &str) -> Option<(&str, &str)> {
+pub fn parse_approval_route(route: &str) -> Option<(&str, &str)> {
     let (channel_key, recipient) = route.split_once(':')?;
     if channel_key.is_empty() || recipient.is_empty() {
         return None;
@@ -274,7 +274,7 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
 /// error describing why it can't be built. PURE (no I/O, no spawn) so the parse +
 /// message-shaping is unit-testable without a runtime.
 fn build_delivery(route: &str, notice: &GateNotice<'_>) -> anyhow::Result<(String, SendMessage)> {
-    let Some((channel_key, recipient)) = parse_route(route) else {
+    let Some((channel_key, recipient)) = parse_approval_route(route) else {
         anyhow::bail!(
             "approval route '{route}' is not 'channel:recipient' (e.g. \
              'discord.ops:123456789') - both halves must be non-empty"
@@ -464,26 +464,30 @@ mod tests {
     use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
     use zeroclaw_api::channel::ChannelMessage;
 
-    // ── pure build_delivery / parse_route ────────────────────────
+    // ── pure build_delivery / parse_approval_route ───────────────
 
     #[test]
-    fn parse_route_splits_on_first_colon_and_keeps_colons_in_recipient() {
+    fn parse_approval_route_splits_on_first_colon_and_keeps_colons_in_recipient() {
         assert_eq!(
-            parse_route("discord.ops:12345"),
+            parse_approval_route("discord.ops:12345"),
             Some(("discord.ops", "12345"))
         );
         // A Matrix-style recipient with its own ':' survives on the right.
         assert_eq!(
-            parse_route("matrix.main:@alice:server.example"),
+            parse_approval_route("matrix.main:@alice:server.example"),
             Some(("matrix.main", "@alice:server.example"))
         );
     }
 
     #[test]
-    fn parse_route_rejects_missing_or_empty_halves() {
-        assert_eq!(parse_route("discord.ops"), None, "no recipient");
-        assert_eq!(parse_route("discord.ops:"), None, "empty recipient");
-        assert_eq!(parse_route(":12345"), None, "empty channel key");
+    fn parse_approval_route_rejects_missing_or_empty_halves() {
+        assert_eq!(parse_approval_route("discord.ops"), None, "no recipient");
+        assert_eq!(
+            parse_approval_route("discord.ops:"),
+            None,
+            "empty recipient"
+        );
+        assert_eq!(parse_approval_route(":12345"), None, "empty channel key");
     }
 
     #[test]
