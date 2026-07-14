@@ -10665,9 +10665,34 @@ impl HindsightMemoryConfig {
                 "[memory.hindsight] base_url must start with http:// or https:// (got {base:?})"
             ));
         }
-        if !self.bank_template.contains("{agent}") && self.bank_template.trim().is_empty() {
+        // Remote trust boundary: the built-in convenience default points at a
+        // third-party hosted endpoint. Silently retaining/recalling memory there
+        // is a data-exfiltration risk, so require the operator to set an endpoint
+        // they own rather than inheriting the default.
+        if base.trim_end_matches('/') == DEFAULT_HINDSIGHT_BASE_URL.trim_end_matches('/') {
             return Err(
-                "[memory.hindsight] bank_template must not be empty (use `{agent}` for per-agent banks)"
+                "[memory.hindsight] base_url must be an explicit operator-owned endpoint; \
+                 the built-in default targets a third-party host and is refused for safety"
+                    .to_string(),
+            );
+        }
+        // Reject plaintext http:// to a remote host (credentials + memory would
+        // cross the network in the clear). Loopback is allowed for local dev.
+        if base.starts_with("http://") && !base_url_is_loopback(base) {
+            return Err(format!(
+                "[memory.hindsight] base_url must use https:// for a remote host \
+                 (plaintext http:// is only allowed for loopback dev, got {base:?})"
+            ));
+        }
+        // Private-bank invariant: the template derives every agent's private
+        // bank. Without the `{agent}` placeholder a constant like `shared-bank`
+        // would resolve to the SAME bank for every agent, leaking one agent's
+        // memory into another's recall. Require the placeholder so derived banks
+        // are always per-agent-distinct.
+        if !self.bank_template.contains("{agent}") {
+            return Err(
+                "[memory.hindsight] bank_template must contain `{agent}` so each agent gets a \
+                 distinct private bank; a constant template leaks memory across agents"
                     .to_string(),
             );
         }
@@ -10707,6 +10732,26 @@ pub const DEFAULT_HINDSIGHT_TOKEN_ENV: &str = "ZC_HINDSIGHT_TOKEN";
 /// service can never park an agent turn indefinitely. Single source of truth
 /// shared by the typed config default and the driver's `from_env` path.
 pub const DEFAULT_HINDSIGHT_TIMEOUT_SECS: u64 = 30;
+
+/// Whether a Hindsight `base_url` targets a loopback host, for which plaintext
+/// `http://` is acceptable in local development. Parses the authority between
+/// the scheme and the first `/`, strips any `user@` and `:port`, and matches the
+/// usual loopback names/addresses. Anything else is treated as remote.
+fn base_url_is_loopback(base: &str) -> bool {
+    let rest = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+        .unwrap_or(base);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port; IPv6 literals are wrapped in `[...]`.
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(stripped)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
+}
 
 fn default_hindsight_base_url() -> String {
     DEFAULT_HINDSIGHT_BASE_URL.into()
@@ -31242,7 +31287,15 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert!(names.contains("memory.hindsight.top_k"));
         assert!(names.contains("memory.hindsight.token_env"));
 
-        // Edit through set_prop, read back, and validate cleanly.
+        // Edit through set_prop, read back, and validate cleanly. An explicit
+        // operator-owned endpoint is required (the default is refused for
+        // safety), so set one alongside the other edits.
+        config
+            .set_prop(
+                "memory.hindsight.base_url",
+                "https://memory.example.com/hindsight",
+            )
+            .expect("base_url is editable");
         config
             .set_prop("memory.hindsight.top_k", "9")
             .expect("top_k is editable");
@@ -31282,6 +31335,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             config.agents.get("alpha").unwrap().memory.bank_id,
             "alpha-private"
         );
+        // An explicit operator-owned endpoint is required over the refused
+        // built-in default.
+        config
+            .set_prop(
+                "memory.hindsight.base_url",
+                "https://memory.example.com/hindsight",
+            )
+            .expect("base_url is settable");
         config.validate().expect("switched agent should validate");
     }
 
@@ -33527,15 +33588,94 @@ allowed_users = []
     }
 
     #[test]
-    async fn validate_accepts_hindsight_agent_with_default_section() {
-        // A hindsight agent validates cleanly against the default
-        // [memory.hindsight] section (valid base_url, bank_template, top_k).
+    async fn validate_accepts_hindsight_agent_with_operator_endpoint() {
+        // A hindsight agent validates cleanly once the operator sets an explicit
+        // owned https endpoint over the default section (valid bank_template,
+        // top_k). The built-in default base_url is refused for safety, so this
+        // is the minimal valid configuration.
         let mut config = multi_agent_test_config();
         let alpha = config.agents.get_mut("alpha").unwrap();
         alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
         config
             .validate()
-            .expect("hindsight agent with default section should validate");
+            .expect("hindsight agent with operator endpoint should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_hindsight_default_third_party_endpoint() {
+        // The built-in default base_url points at a third-party host; a
+        // hindsight agent must not silently retain/recall there.
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        // base_url stays at the default.
+        let err = config
+            .validate()
+            .expect_err("default third-party endpoint must be refused");
+        assert!(
+            err.to_string().contains("operator-owned"),
+            "expected operator-owned endpoint explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_hindsight_plaintext_remote_endpoint() {
+        // Plaintext http:// to a remote host would cross the network in the
+        // clear; only loopback dev is allowed.
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.base_url = "http://memory.example.com/hindsight".to_string();
+        let err = config
+            .validate()
+            .expect_err("plaintext remote endpoint must be refused");
+        assert!(
+            err.to_string().contains("https"),
+            "expected https requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_hindsight_loopback_http_for_dev() {
+        // Loopback http:// is fine for local development.
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.base_url = "http://127.0.0.1:8080/hindsight".to_string();
+        config
+            .validate()
+            .expect("loopback http hindsight endpoint should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_constant_bank_template_cross_agent_leak() {
+        // A constant template (no `{agent}`) resolves to the same bank for every
+        // agent, leaking memory across agents. It must be refused, and two
+        // distinct aliases must derive distinct banks from a valid template.
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "shared-bank".to_string();
+        let err = config
+            .validate()
+            .expect_err("constant bank_template must be refused");
+        assert!(
+            err.to_string().contains("{agent}"),
+            "expected {{agent}} requirement, got: {err}"
+        );
+
+        // A valid per-agent template derives distinct banks for distinct agents.
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        let bank_a = config.memory.hindsight.bank_for("agent_a", "");
+        let bank_b = config.memory.hindsight.bank_for("agent_b", "");
+        assert_ne!(bank_a, bank_b, "distinct agents must get distinct banks");
+        assert_eq!(bank_a, "zeroclaw-agent_a");
+        assert_eq!(bank_b, "zeroclaw-agent_b");
+        config
+            .validate()
+            .expect("valid per-agent template should validate");
     }
 
     #[test]
