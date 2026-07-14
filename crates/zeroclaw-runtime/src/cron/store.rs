@@ -208,7 +208,9 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row?);
+            let mut job = row?;
+            resolve_declarative_shell_output_format(config, &mut job);
+            jobs.push(job);
         }
         Ok(jobs)
     })?
@@ -220,7 +222,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 }
 
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(job) = with_read_connection(config, |conn| {
+    let Some(mut job) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -239,6 +241,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         anyhow::bail!("Cron job '{job_id}' not found")
     };
 
+    resolve_declarative_shell_output_format(config, &mut job);
     Ok(job)
 }
 
@@ -303,7 +306,9 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
         let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row?);
+            let mut job = row?;
+            resolve_declarative_shell_output_format(config, &mut job);
+            jobs.push(job);
         }
         Ok(jobs)
     })?
@@ -954,6 +959,16 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     })
 }
 
+/// For declarative jobs, resolve `shell_output_format` from the canonical
+/// config source instead of the DB column (which stays at the default).
+fn resolve_declarative_shell_output_format(config: &Config, job: &mut CronJob) {
+    if job.source == "declarative"
+        && let Some(decl) = config.cron.get(&job.id)
+    {
+        job.shell_output_format = decl.shell_output_format.clone();
+    }
+}
+
 fn decode_schedule(schedule_raw: Option<&str>, expression: &str) -> Result<Schedule> {
     if let Some(raw) = schedule_raw {
         let trimmed = raw.trim();
@@ -1080,10 +1095,6 @@ pub fn sync_declarative_jobs(
             let allowed_tools_json = encode_allowed_tools(decl.allowed_tools.as_ref())?;
             let command = decl.command.as_deref().unwrap_or("");
             let delete_after_run = matches!(decl.schedule, CronScheduleDecl::At { .. });
-            let shell_output_format_str = match decl.shell_output_format {
-                zeroclaw_config::schema::CronShellOutputFormat::Wrapped => "wrapped",
-                zeroclaw_config::schema::CronShellOutputFormat::Raw => "raw",
-            };
 
             // Check if job already exists.
             let exists: bool = conn
@@ -1111,8 +1122,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
-                             uses_memory = ?14, shell_output_format = ?15
-                         WHERE id = ?16",
+                             uses_memory = ?14
+                         WHERE id = ?15",
                         params![
                             expression,
                             command,
@@ -1128,7 +1139,6 @@ pub fn sync_declarative_jobs(
                             allowed_tools_json,
                             next_run.to_rfc3339(),
                             i32::from(decl.uses_memory),
-                            shell_output_format_str,
                             id,
                         ],
                     )
@@ -1140,8 +1150,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
-                             uses_memory = ?13, shell_output_format = ?14
-                         WHERE id = ?15",
+                             uses_memory = ?13
+                         WHERE id = ?14",
                         params![
                             expression,
                             command,
@@ -1156,7 +1166,6 @@ pub fn sync_declarative_jobs(
                             i32::from(delete_after_run),
                             allowed_tools_json,
                             i32::from(decl.uses_memory),
-                            shell_output_format_str,
                             id,
                         ],
                     )
@@ -1189,9 +1198,8 @@ pub fn sync_declarative_jobs(
                     "INSERT INTO cron_jobs (
                         id, expression, command, schedule, job_type, prompt, name,
                         session_target, model, enabled, delivery, delete_after_run,
-                        allowed_tools, source, uses_memory, agent_alias, created_at, next_run,
-                        shell_output_format
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16, ?17, ?18)",
+                        allowed_tools, source, uses_memory, agent_alias, created_at, next_run
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16, ?17)",
                     params![
                         id,
                         expression,
@@ -1210,7 +1218,6 @@ pub fn sync_declarative_jobs(
                         agent_alias,
                         now.to_rfc3339(),
                         next_run.to_rfc3339(),
-                        shell_output_format_str,
                     ],
                 )
                 .with_context(|| {
@@ -2873,40 +2880,40 @@ schedule = { kind = "every", every_ms = 300000 }
 
     /// Regression: a declarative shell job with `shell_output_format = raw`
     /// must report `shell_output_format = raw` through `get_job()`/`list_jobs()`,
-    /// matching the execution source of truth (config).
+    /// resolving from the config source of truth (not the DB column).
     #[test]
     fn sync_declarative_raw_shell_job_lists_with_raw_format() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         seed_claiming_agent(&mut config, &["raw-decl"]);
 
-        let decls = decls_map(vec![(
-            "raw-decl".to_string(),
-            zeroclaw_config::schema::CronJobDecl {
-                name: Some("raw-decl".to_string()),
-                job_type: "shell".to_string(),
-                schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
-                    expr: "0 2 * * *".to_string(),
-                    tz: None,
-                },
-                command: Some("echo raw-decl-output".to_string()),
-                prompt: None,
-                enabled: true,
-                model: None,
-                allowed_tools: None,
-                uses_memory: true,
-                session_target: None,
-                delivery: None,
-                shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("raw-decl".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
             },
-        )]);
+            command: Some("echo raw-decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
+        // Populate config.cron so resolution finds the canonical source.
+        config.cron.insert("raw-decl".to_string(), decl);
         sync_declarative_jobs(&config, &decls).unwrap();
 
         let job = get_job(&config, "raw-decl").unwrap();
         assert_eq!(
             job.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Raw,
-            "get_job must return raw format for a declarative raw shell job"
+            "get_job must return raw format resolved from config for a declarative raw shell job"
         );
         assert_eq!(job.source, "declarative");
 
@@ -2918,7 +2925,7 @@ schedule = { kind = "every", every_ms = 300000 }
         assert_eq!(
             listed.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Raw,
-            "list_jobs must return raw format for a declarative raw shell job"
+            "list_jobs must return raw format resolved from config for a declarative raw shell job"
         );
     }
 }
