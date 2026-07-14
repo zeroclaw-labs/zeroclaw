@@ -119,7 +119,7 @@ impl Memory for AgentScopedMemory {
     ) -> Result<()> {
         // Every store routes through `store_with_agent` so the bound
         // agent's UUID is persisted. Backends with native agent_id
-        // columns (Sqlite, Postgres, Lucid) write the column; Qdrant
+        // columns (Sqlite, Postgres, Lucid, Shodh) write the column; Qdrant
         // writes the payload field; Markdown attributes via the on-
         // disk path; None drops it. Each backend's behavior is
         // explicit at the trait boundary.

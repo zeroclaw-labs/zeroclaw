@@ -18,8 +18,8 @@ relates-to:
 
 This fork RFC records the design implemented by the
 `refactor/unified-memory-enrichment` branch. The discussion source is
-[fork issue 9](https://github.com/yanchenko/zeroclaw/issues/9). It establishes
-the shared seam and migrates Lucid; additional connectors are separate work.
+[fork issue 9](https://github.com/yanchenko/zeroclaw/issues/9). It supersedes
+the separate Lucid and Shodh proposals in fork issues 7 and 8.
 
 Human sponsor: `@yanchenko`. Drafting assistance: Codex.
 
@@ -30,7 +30,7 @@ not claim ratification by the upstream ZeroClaw maintainers.
 
 ## Problem
 
-Lucid supplements ZeroClaw's memory recall, but it should not replace
+Lucid and Shodh supplement ZeroClaw's memory recall, but neither should replace
 the durable store selected by `memory.backend`. Modeling each connector as a
 full backend makes the architecture say that it owns canonical memory and
 forces every connector to repeat integration work across:
@@ -54,15 +54,18 @@ Separate memory configuration into two independent axes:
 
 Connector-specific settings live in one typed `memory_enrichment` catalog.
 One shared SQLite-authoritative wrapper owns every connector-independent rule.
-Lucid implements only its protocol translation and capability declarations.
+Lucid and Shodh implement only their protocol translation and capability
+declarations.
 
 ```text
 memory.backend ───────────────► authoritative store ───────► SQLite
                                       │
 memory.enricher ─► connector factory ─┴─► EnrichedMemory<E>
                                                 │
-                                                ▼
-                                        Lucid CLI adapter
+                                  ┌─────────────┴─────────────┐
+                                  ▼                           ▼
+                          Lucid CLI adapter          Shodh REST adapter
+                                                    local or remote server
 ```
 
 The initial seam supports SQLite as the authoritative store. Extending it over
@@ -73,15 +76,16 @@ cross-store requirements.
 
 - Keep one source of truth for durable storage and one for connector choice.
 - Preserve SQLite as the canonical row store when enrichment is enabled.
-- Keep the Lucid adapter as thin as its protocol allows.
+- Make Lucid and Shodh adapters as thin as their protocols allow.
 - Centralize agent and session scope, fallback, merge, cooldown, and cleanup.
 - Make a future connector additive rather than another product-wide backend.
 
 ## Non-goals
 
-- Replacing SQLite with Lucid.
+- Replacing SQLite with Lucid or Shodh.
 - Synchronizing all existing SQLite rows into a newly enabled connector.
 - Generalizing enrichment over PostgreSQL, Qdrant, or Markdown in this RFC.
+- Starting, installing, upgrading, or supervising a Shodh server process.
 - Hiding protocol and capability differences behind an inaccurate common API.
 
 ## Sources of truth
@@ -110,9 +114,17 @@ as another selector.
 ```toml
 [memory]
 backend = "sqlite.default"
-enricher = "lucid.local"
+enricher = "shodh.semantic"
 
 [storage.sqlite.default]
+
+[memory_enrichment.shodh.semantic]
+base_url = "http://127.0.0.1:3030"
+api_key = "replace-with-the-shodh-api-key"
+recall_timeout_ms = 2000
+store_timeout_ms = 5000
+local_hit_threshold = 3
+failure_cooldown_ms = 15000
 
 [memory_enrichment.lucid.local]
 binary_path = "/opt/lucid/bin/lucid"
@@ -135,7 +147,9 @@ enricher = "none"
 ```
 
 Enrichment with a non-SQLite durable backend fails validation. Dotted aliases
-must resolve. Bare `lucid` remains a zero-configuration convenience.
+must resolve. Bare `lucid` remains a zero-configuration convenience; Shodh
+requires a typed alias because its API credential and deployment details are
+operationally significant.
 
 ## Shared runtime contract
 
@@ -174,6 +188,30 @@ Lucid results are derived context rather than canonical SQLite references. The
 CLI cannot express an agent allowlist, so the wrapper skips it for agent-scoped
 cross-agent recall. Lucid declares no cleanup capability.
 
+### Shodh
+
+Shodh uses its authenticated REST API. The same adapter targets either:
+
+- the official local binary started with `shodh server` on loopback; or
+- a separately managed remote Shodh deployment.
+
+The binary is a server deployment, not a Lucid-style executable invoked for
+each memory operation. ZeroClaw therefore does not create a second binary
+adapter or spawn one server per agent-memory handle. Operators supervise one
+shared local process with their normal service manager and point `base_url` at
+it. This preserves one request/response implementation for local and remote
+deployments.
+
+Each stable ZeroClaw agent UUID maps to a Shodh `user_id`. Cross-agent recall
+makes bounded calls only for UUIDs already admitted by `read_memory_from`.
+ZeroClaw keys, sessions, namespaces, and categories are encoded as unambiguous
+tags.
+
+Shodh results are candidate references. The wrapper looks up the corresponding
+key and agent UUID in SQLite, rejects missing or superseded rows, and returns
+the canonical local content with the remote score. This prevents stale Shodh
+state from resurrecting deleted or replaced memory.
+
 ## Failure and consistency semantics
 
 SQLite remains usable when a connector is missing, slow, malformed, or
@@ -193,14 +231,21 @@ state is a rebuildable derivative, not another authority.
 
 - Durable backend locking compares the authoritative storage kind, not the
   connector label.
+- Agent allowlists are resolved by ZeroClaw and cannot be expanded by Shodh.
+- Canonical Shodh candidates are rehydrated under the caller's agent scope.
 - Lucid is not queried where its unscoped protocol cannot preserve isolation.
 - Lucid-derived context is marked as untrusted external enrichment before it
   becomes model-visible.
+- Shodh credentials use the existing secret-field machinery.
+- Shodh URLs reject embedded credentials, query strings, fragments, and
+  non-HTTP schemes.
+- A local Shodh server should bind to loopback. Remote exposure requires the
+  server's own TLS and access-control deployment policy.
 
 ## Product surface
 
 Storage selectors list only real durable stores: SQLite, PostgreSQL, Qdrant,
-Markdown, and `none`. Lucid appears under a separate Memory Enrichment entry
+Markdown, and `none`. Lucid and Shodh appear under one Memory Enrichment entry
 with connector-specific configuration beneath it.
 
 Quickstart and ZeroCode no longer present either connector as a backend. A
@@ -233,12 +278,12 @@ parallel integration system:
 
 If enrichment becomes a third-party extension surface, its stable contract
 belongs in `zeroclaw-api` or the versioned WIT memory world. This RFC keeps it
-internal because Lucid is a first-party composition of the existing
+internal because Lucid and Shodh are first-party compositions of the existing
 `Memory` contract.
 
 ## Configuration boundary
 
-Lucid is an enrichment connector only. It is not accepted by the
+Lucid and Shodh are enrichment connectors only. They are not accepted by the
 backend enum, storage catalog, memory factory, migration factory, or Quickstart
 wire shape. Validation rejects enrichment over a non-SQLite backend.
 
@@ -260,10 +305,28 @@ throughout rollout and rollback.
 
 ## Alternatives considered
 
-### Keep Lucid as an independent backend
+### Keep Lucid and Shodh as independent backends
 
 Rejected. It misstates data ownership, couples connector changes to backend
 locking, and repeats policy and product wiring.
+
+### One adapter with protocol conditionals
+
+Rejected. Lucid's per-operation CLI and Shodh's REST API have genuinely
+different translation and capability behavior. Sharing the policy wrapper is
+useful; merging unrelated transports into one adapter is not.
+
+### Separate Shodh binary and HTTP adapters
+
+Rejected. The official binary exposes the same HTTP API used remotely. A
+second adapter would duplicate request translation and encourage one server
+process per memory handle. Deployment lifecycle is distinct from connector
+protocol.
+
+### Embed the Shodh Rust crate
+
+Deferred. It would add a large in-process dependency and a new lifecycle and
+storage-ownership question without improving the established connector seam.
 
 ### Generalize the wrapper over every durable backend
 
@@ -279,12 +342,13 @@ Positive:
 - adapters are limited to protocol, authentication, translation, and declared
   capability differences;
 - product surfaces grow by connector configuration rather than backend fanout;
-- connector state cannot overrule SQLite authority.
+- stale remote state cannot overrule SQLite authority.
 
 Negative:
 
 - enrichment is initially SQLite-only;
 - connector state can lag SQLite and may need rebuilding;
+- Shodh local deployment requires an independently supervised server;
 - Lucid cannot participate in agent-allowlisted recall with its current CLI.
 
 Known lifecycle constraint:
@@ -302,9 +366,11 @@ The implementation includes tests for:
 - factory resolution and missing-alias diagnostics;
 - local-first writes, deterministic merge, deduplication, fallback, cooldown,
   and cleanup dispatch;
+- aggregate cross-agent recall deadlines and partial Shodh failures;
 - derived-context and canonical-reference session behavior;
-- canonical-row rehydration and agent allowlist enforcement in the shared seam;
-- Lucid process deadlines and command translation;
+- stale Shodh row rejection and agent allowlist enforcement;
+- Lucid process deadlines and Shodh authenticated REST translation;
+- loopback Shodh defaults for the official local binary server;
 - storage and enrichment pickers, Quickstart wiring, generated config
   references, and documentation consistency.
 
@@ -316,6 +382,6 @@ targeted linting, and the documentation consistency checker.
 
 - Configuration and validation: `zeroclaw-config` memory schema.
 - Shared seam and factory: `zeroclaw-memory` enrichment and factory modules.
-- Protocol adapter: `zeroclaw-memory` Lucid module.
+- Protocol adapters: `zeroclaw-memory` Lucid and Shodh modules.
 - Product configuration: gateway sections, Quickstart, and ZeroCode.
 - Operator reference: [Memory storage and enrichment](../reference/memory-backends.md).

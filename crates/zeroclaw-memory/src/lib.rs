@@ -51,6 +51,7 @@ pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
+pub mod shodh;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -79,6 +80,7 @@ pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
+pub use shodh::ShodhEnrichedMemory;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -94,11 +96,12 @@ use std::time::Duration;
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
     ActiveMemoryEnricher, ActiveStorage, EmbeddingRouteConfig, LucidEnrichmentConfig, MemoryConfig,
-    PostgresStorageConfig,
+    PostgresStorageConfig, ShodhEnrichmentConfig,
 };
 
 use enriched::{EnrichedMemory, EnrichmentPolicy};
 use lucid::LucidConnector;
+use shodh::ShodhConnector;
 
 const DEFAULT_ENRICHMENT_LOCAL_HIT_THRESHOLD: usize = 3;
 const DEFAULT_ENRICHMENT_FAILURE_COOLDOWN_MS: u64 = 15_000;
@@ -119,6 +122,24 @@ fn build_lucid_enriched_memory(
         EnrichmentPolicy::new(
             DEFAULT_ENRICHMENT_LOCAL_HIT_THRESHOLD,
             Duration::from_millis(DEFAULT_ENRICHMENT_FAILURE_COOLDOWN_MS),
+        ),
+    ))
+}
+
+fn build_shodh_enriched_memory(
+    local: SqliteMemory,
+    config: &ShodhEnrichmentConfig,
+) -> anyhow::Result<ShodhEnrichedMemory> {
+    if config.local_hit_threshold == 0 {
+        anyhow::bail!("Shodh local_hit_threshold must be greater than zero");
+    }
+    Ok(EnrichedMemory::from_parts(
+        "shodh",
+        local,
+        ShodhConnector::new(config)?,
+        EnrichmentPolicy::new(
+            config.local_hit_threshold,
+            Duration::from_millis(config.failure_cooldown_ms),
         ),
     ))
 }
@@ -527,9 +548,9 @@ pub fn create_memory(
 /// Factory: create memory with a resolved active storage backend and embedding routes.
 ///
 /// `active_storage` configures the authoritative durable store.
-/// `active_enricher` independently carries optional Lucid connector settings.
-/// Shared enrichment policy is built here; connector modules only translate
-/// their edge protocols.
+/// `active_enricher` independently carries optional Lucid or Shodh connector
+/// settings. Shared enrichment policy is built here; connector modules only
+/// translate their edge protocols.
 ///
 /// `providers` is the canonical `providers.models` catalog, used to resolve a
 /// dotted `<type>.<alias>` embedding `model_provider` reference (from
@@ -748,9 +769,28 @@ pub fn create_memory_with_storage_and_routes(
                         "memory enricher '{enricher_ref}' requires a matching \
                      `[memory_enrichment.lucid.<alias>]` entry"
                     ),
+                    other => anyhow::bail!(
+                        "memory enricher 'lucid' received incompatible '{}' connector config",
+                        other.kind()
+                    ),
                 }
             }
-            _ => anyhow::bail!("unknown memory enricher '{enricher_ref}'; expected lucid or none"),
+            "shodh" => match active_enricher {
+                ActiveMemoryEnricher::Shodh(shodh) => {
+                    Ok(Box::new(build_shodh_enriched_memory(local, shodh)?))
+                }
+                ActiveMemoryEnricher::None => anyhow::bail!(
+                    "memory enricher '{enricher_ref}' requires a matching \
+                     `[memory_enrichment.shodh.<alias>]` entry"
+                ),
+                other => anyhow::bail!(
+                    "memory enricher 'shodh' received incompatible '{}' connector config",
+                    other.kind()
+                ),
+            },
+            _ => anyhow::bail!(
+                "unknown memory enricher '{enricher_ref}'; expected lucid, shodh, or none"
+            ),
         };
     }
 
@@ -1072,9 +1112,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::EmbeddingRouteConfig;
     #[cfg(unix)]
     use zeroclaw_config::schema::{Config, LucidEnrichmentConfig};
+    use zeroclaw_config::schema::{EmbeddingRouteConfig, ShodhEnrichmentConfig};
 
     #[cfg(unix)]
     fn write_timed_lucid_script(
@@ -1550,6 +1590,45 @@ exit 1
         let local = memory.get("agent_probe").await.unwrap().unwrap();
         assert_eq!(local.content, "SQLite stays authoritative");
         assert!(local.agent_id.is_some());
+    }
+
+    #[test]
+    fn factory_shodh_uses_typed_enricher_config() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            enricher: Some("shodh.semantic".into()),
+            ..MemoryConfig::default()
+        };
+        let storage = ShodhEnrichmentConfig {
+            api_key: Some("test-key".into()),
+            ..ShodhEnrichmentConfig::default()
+        };
+        let mem = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::None,
+            ActiveMemoryEnricher::Shodh(&storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mem.name(), "shodh");
+    }
+
+    #[test]
+    fn factory_shodh_without_enricher_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            enricher: Some("shodh.default".into()),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("enricher=shodh requires a [memory_enrichment.shodh.<alias>] entry");
+        assert!(error.to_string().contains("memory_enrichment.shodh"));
     }
 
     #[test]

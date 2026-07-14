@@ -13,7 +13,7 @@ skipped.
 |---|---|---|
 | **Model provider** | yes | Provider family (Anthropic, OpenAI, Ollama, OpenRouter, …), its API key or endpoint, and the model. |
 | **Risk profile** | yes | Autonomy and sandbox posture. Pick a preset or reuse an existing `[risk_profiles.<alias>]`. |
-| **Memory** | yes | Authoritative backend (`sqlite`, `markdown`, `postgres`, `qdrant`, or `none`) plus optional Lucid enrichment. |
+| **Memory** | yes | Authoritative backend (`sqlite`, `markdown`, `postgres`, `qdrant`, or `none`) plus optional Lucid/Shodh enrichment. |
 | **Channels** | optional | Chat platforms (Telegram, Discord, Slack, …). The built-in `cli` channel always works; add others here or later. |
 | **Peer groups** | optional | Multi-agent peer membership for the channels you configured. |
 | **Agent** | yes | Agent alias, system prompt, and any personality files. |

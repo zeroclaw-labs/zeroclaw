@@ -724,6 +724,9 @@ fn memory_enrichment_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<Picker
             "lucid" => Some(
                 "Local lucid-memory CLI connector with best-effort derived context.".to_string(),
             ),
+            "shodh" => Some(
+                "Shodh REST connector for a local binary server or remote deployment.".to_string(),
+            ),
             _ => None,
         };
         if item.badge.as_deref() == Some("configured") {
@@ -732,6 +735,7 @@ fn memory_enrichment_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<Picker
     }
     items.sort_by_key(|item| match item.key.as_str() {
         "lucid" => 0,
+        "shodh" => 1,
         _ => 99,
     });
     items
@@ -2025,7 +2029,7 @@ mod tests {
         let mut cfg = empty_cfg();
         let items = memory_enrichment_picker(&cfg);
         let keys: Vec<&str> = items.iter().map(|item| item.key.as_str()).collect();
-        assert_eq!(keys, ["lucid"]);
+        assert_eq!(keys, ["lucid", "shodh"]);
         assert!(items.iter().all(|item| item.badge.is_none()));
 
         cfg.create_map_key("memory_enrichment.lucid", "local")

@@ -567,7 +567,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Every backend must implement this explicitly so the agent_id
     /// is never silently dropped at storage time. Backends with
     /// native agent_id columns (SqliteMemory, PostgresMemory,
-    /// LucidEnrichedMemory) persist the attribution in SQL; MarkdownMemory
+    /// LucidEnrichedMemory, ShodhEnrichedMemory) persist the attribution in SQL; MarkdownMemory
     /// attributes via the per-agent directory path; QdrantMemory
     /// persists in the vector payload; NoneMemory is a no-op stub.
     /// `AgentScopedMemory` is the canonical caller.
@@ -615,7 +615,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// to the agent named by `alias`.
     ///
     /// Backends with an `agents` table (SqliteMemory, PostgresMemory,
-    /// LucidEnrichedMemory) return the row's UUID, inserting if absent.
+    /// LucidEnrichedMemory, ShodhEnrichedMemory) return the row's UUID, inserting if absent.
     /// Backends without (MarkdownMemory, QdrantMemory, NoneMemory)
     /// return the alias verbatim — there is no UUID indirection at
     /// the storage layer, so the alias serves as the agent_id.

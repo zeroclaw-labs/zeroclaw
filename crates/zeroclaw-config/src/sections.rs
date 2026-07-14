@@ -393,7 +393,7 @@ sections! {
         shape: TypedFamilyMap,
         group: Foundation,
         help:  "Optional enrichment connectors layered over authoritative SQLite memory. \
-                Configure a Lucid alias here, then select it with \
+                Configure a Lucid or Shodh alias here, then select it with \
                 `memory.enricher`; connector failures never replace durable local storage.",
     },
     Memory => {
@@ -1123,6 +1123,7 @@ mod tests {
     fn enrichment_help_names_connectors_without_calling_them_storage() {
         let help = section_help("memory_enrichment").to_lowercase();
         assert!(help.contains("lucid"));
+        assert!(help.contains("shodh"));
         assert!(help.contains("sqlite"));
         assert!(help.contains("connector"));
         assert!(!help.contains("backend"));
