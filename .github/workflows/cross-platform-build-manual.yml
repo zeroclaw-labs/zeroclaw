@@ -65,19 +65,16 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            excluded_features: observability-prometheus
           - os: ubuntu-latest
             target: arm-unknown-linux-gnueabihf
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            excluded_features: observability-prometheus
           - os: macos-14
             target: aarch64-apple-darwin
           - os: ubuntu-latest
             target: aarch64-linux-android
             ndk: true
-            excluded_features: whatsapp-web
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
@@ -135,11 +132,7 @@ jobs:
             export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
-          EXCLUDE_ARGS=()
-          if [ -n "${{ matrix.excluded_features || '' }}" ]; then
-            EXCLUDE_ARGS=(--exclude "${{ matrix.excluded_features }}")
-          fi
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist "${EXCLUDE_ARGS[@]}")"
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
           if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then

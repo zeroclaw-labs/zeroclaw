@@ -202,6 +202,14 @@ pub fn dist_extra_features(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<
     required_registry_list(pkg, "dist_extra_features")
 }
 
+/// Target-specific compatibility exclusions for standard distribution builds.
+/// Release workflows provide a target triple and never duplicate this policy.
+pub fn dist_target_exclusions(
+    pkg: &cargo_metadata::Package,
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<String>>> {
+    parse_target_exclusions(pkg.metadata.get("zeroclaw"))
+}
+
 /// Features whose build needs system libraries/tooling absent from the minimal
 /// static container image, excluded from `Selection::All`. Read from
 /// `[package.metadata.zeroclaw] container_excluded_features`; never shadowed.
@@ -233,12 +241,17 @@ fn parse_required_registry_list(
     let value = registry
         .and_then(|zeroclaw| zeroclaw.get(key))
         .ok_or_else(|| anyhow::Error::msg(format!("missing [package.metadata.zeroclaw] {key}")))?;
-    let entries = value.as_array().ok_or_else(|| {
-        anyhow::Error::msg(format!(
-            "[package.metadata.zeroclaw] {key} must be an array"
-        ))
-    })?;
-    anyhow::ensure!(!entries.is_empty(), "{key} must not be empty");
+    parse_nonempty_string_list(value, &format!("[package.metadata.zeroclaw] {key}"))
+}
+
+fn parse_nonempty_string_list(
+    value: &serde_json::Value,
+    path: &str,
+) -> anyhow::Result<Vec<String>> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| anyhow::Error::msg(format!("{path} must be an array")))?;
+    anyhow::ensure!(!entries.is_empty(), "{path} must not be empty");
 
     let mut values = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -246,15 +259,42 @@ fn parse_required_registry_list(
             .as_str()
             .filter(|feature| !feature.is_empty())
             .ok_or_else(|| {
-                anyhow::Error::msg(format!("{key} entries must be non-empty strings"))
+                anyhow::Error::msg(format!("{path} entries must be non-empty strings"))
             })?;
         anyhow::ensure!(
             !values.iter().any(|existing| existing == feature),
-            "duplicate {key} entry `{feature}`"
+            "duplicate {path} entry `{feature}`"
         );
         values.push(feature.to_owned());
     }
     Ok(values)
+}
+
+fn parse_target_exclusions(
+    registry: Option<&serde_json::Value>,
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let value = registry
+        .and_then(|zeroclaw| zeroclaw.get("dist_target_exclusions"))
+        .ok_or_else(|| {
+            anyhow::Error::msg("missing [package.metadata.zeroclaw.dist_target_exclusions]")
+        })?;
+    let entries = value.as_object().ok_or_else(|| {
+        anyhow::Error::msg("[package.metadata.zeroclaw.dist_target_exclusions] must be a table")
+    })?;
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "dist_target_exclusions must not be empty"
+    );
+
+    let mut targets = std::collections::BTreeMap::new();
+    for (target, value) in entries {
+        anyhow::ensure!(!target.is_empty(), "dist target must not be empty");
+        targets.insert(
+            target.to_owned(),
+            parse_nonempty_string_list(value, &format!("dist_target_exclusions.{target}"))?,
+        );
+    }
+    Ok(targets)
 }
 
 /// Remove target-specific features from a resolved selection. Exclusions fail
@@ -402,15 +442,27 @@ pub fn resolve_feature_list(
         .manifest_path(manifest_dir.join("Cargo.toml"))
         .no_deps()
         .exec()?;
-    let root = meta
-        .root_package()
-        .cloned()
-        .or_else(|| meta.workspace_packages().into_iter().next().cloned())
-        .ok_or_else(|| anyhow::Error::msg("no root/workspace package"))?;
+    let root = workspace_root_package(&meta)?;
+    resolve_feature_list_from_package(&meta, root, selection)
+}
+
+fn workspace_root_package(
+    meta: &cargo_metadata::Metadata,
+) -> anyhow::Result<&cargo_metadata::Package> {
+    meta.root_package()
+        .or_else(|| meta.workspace_packages().into_iter().next())
+        .ok_or_else(|| anyhow::Error::msg("no root/workspace package"))
+}
+
+fn resolve_feature_list_from_package(
+    meta: &cargo_metadata::Metadata,
+    root: &cargo_metadata::Package,
+    selection: &Selection,
+) -> anyhow::Result<Vec<String>> {
     let all_features: Vec<String> = root.features.keys().cloned().collect();
-    let non_row = non_row_features(&meta, &root);
-    let dist_extra = dist_extra_features(&root)?;
-    let container_excluded = container_excluded_features(&root);
+    let non_row = non_row_features(meta, root);
+    let dist_extra = dist_extra_features(root)?;
+    let container_excluded = container_excluded_features(root);
     let ctx = FeatureCtx {
         graph: &root.features,
         all: &all_features,
@@ -419,6 +471,47 @@ pub fn resolve_feature_list(
         container_excluded: &container_excluded,
     };
     selection.to_feature_list(&ctx)
+}
+
+/// Resolve a selection and apply the registry-owned compatibility policy for
+/// one build target. Target policy is defined only for the Dist selection.
+pub fn resolve_feature_list_for_target(
+    manifest_dir: &Path,
+    selection: &Selection,
+    target: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let meta = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_dir.join("Cargo.toml"))
+        .no_deps()
+        .exec()?;
+    let root = workspace_root_package(&meta)?;
+    let features = resolve_feature_list_from_package(&meta, root, selection)?;
+    let Some(target) = target else {
+        return Ok(features);
+    };
+    anyhow::ensure!(!target.is_empty(), "target must not be empty");
+    anyhow::ensure!(
+        matches!(selection, Selection::Dist),
+        "target-specific exclusions are only defined for the dist selection"
+    );
+
+    let exclusions = dist_target_exclusions(root)?;
+    for (configured_target, excluded) in &exclusions {
+        for feature in excluded {
+            anyhow::ensure!(
+                features.iter().any(|candidate| candidate == feature),
+                "dist_target_exclusions.{configured_target} names `{feature}`, which is not in the dist selection"
+            );
+        }
+    }
+
+    exclude_features(
+        features,
+        exclusions
+            .get(target)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    )
 }
 
 /// Read canonical data via `cargo_metadata` - Cargo's own resolver, so the
@@ -801,20 +894,107 @@ mod tests {
     }
 
     #[test]
+    fn target_exclusion_registry_rejects_malformed_metadata() {
+        assert!(parse_target_exclusions(None).is_err());
+        for malformed in [
+            serde_json::json!({ "dist_target_exclusions": [] }),
+            serde_json::json!({ "dist_target_exclusions": {} }),
+            serde_json::json!({ "dist_target_exclusions": { "target": [] } }),
+            serde_json::json!({ "dist_target_exclusions": { "target": [1] } }),
+            serde_json::json!({
+                "dist_target_exclusions": { "target": ["feature", "feature"] }
+            }),
+        ] {
+            assert!(parse_target_exclusions(Some(&malformed)).is_err());
+        }
+    }
+
+    #[test]
     fn release_exclusions_remove_only_named_features() {
         let dist = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        let meta = cargo_metadata::MetadataCommand::new()
+            .manifest_path(root().join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
+        let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        let android = exclude_features(dist.clone(), &["whatsapp-web".to_owned()]).unwrap();
-        assert!(!android.contains(&"whatsapp-web".to_owned()));
-        assert!(android.contains(&"observability-prometheus".to_owned()));
-        assert_eq!(android.len(), dist.len() - 1);
+        for (target, excluded) in &exclusions {
+            let resolved =
+                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
+            assert_eq!(resolved.len(), dist.len() - excluded.len());
+            for feature in &dist {
+                assert_eq!(
+                    resolved.contains(feature),
+                    !excluded.contains(feature),
+                    "unexpected resolution for {target}: {feature}"
+                );
+            }
+        }
 
-        let arm = exclude_features(dist.clone(), &["observability-prometheus".to_owned()]).unwrap();
-        assert!(arm.contains(&"whatsapp-web".to_owned()));
-        assert!(!arm.contains(&"observability-prometheus".to_owned()));
-        assert_eq!(arm.len(), dist.len() - 1);
+        let host = resolve_feature_list_for_target(
+            &root(),
+            &Selection::Dist,
+            Some("aarch64-apple-darwin"),
+        )
+        .unwrap();
+        assert_eq!(host, dist);
 
-        assert!(exclude_features(dist, &["channel-slack".to_owned()]).is_err());
+        assert!(exclude_features(host, &["channel-slack".to_owned()]).is_err());
+        let (target, excluded) = exclusions.iter().next().unwrap();
+        let resolved =
+            resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
+        assert!(exclude_features(resolved, &[excluded[0].clone()]).is_err());
+    }
+
+    #[test]
+    fn dist_target_exclusions_are_declared_in_registry() {
+        let meta = cargo_metadata::MetadataCommand::new()
+            .manifest_path(root().join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
+        let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
+
+        assert_eq!(exclusions["aarch64-linux-android"], vec!["whatsapp-web"]);
+        assert_eq!(
+            exclusions["arm-unknown-linux-gnueabihf"],
+            vec!["observability-prometheus"]
+        );
+        assert_eq!(
+            exclusions["armv7-unknown-linux-gnueabihf"],
+            vec!["observability-prometheus"]
+        );
+    }
+
+    #[test]
+    fn release_workflows_delegate_target_policy_to_generator() {
+        let meta = cargo_metadata::MetadataCommand::new()
+            .manifest_path(root().join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
+        let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
+        for workflow in [
+            ".github/workflows/cross-platform-build-manual.yml",
+            ".github/workflows/release-stable-manual.yml",
+        ] {
+            let contents = std::fs::read_to_string(root().join(workflow)).unwrap();
+            assert!(
+                contents.contains("features --selection dist --target \"${{ matrix.target }}\""),
+                "{workflow} must pass the target triple to the canonical feature resolver"
+            );
+            assert!(
+                !contents.contains("excluded_features"),
+                "{workflow} must not own a parallel target exclusion policy"
+            );
+            for feature in exclusions.values().flatten() {
+                assert!(
+                    !contents.contains(feature),
+                    "{workflow} must not name target-excluded feature {feature}"
+                );
+            }
+        }
     }
 
     #[test]

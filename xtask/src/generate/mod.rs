@@ -107,7 +107,11 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn features(selection_id: &str, excluded: &[String]) -> anyhow::Result<()> {
+pub fn features(
+    selection_id: &str,
+    target: Option<&str>,
+    excluded: &[String],
+) -> anyhow::Result<()> {
     let menu = Sel::menu();
     let selection = menu
         .iter()
@@ -119,7 +123,7 @@ pub fn features(selection_id: &str, excluded: &[String]) -> anyhow::Result<()> {
             ))
         })?;
     let list = spec::exclude_features(
-        spec::resolve_feature_list(&workspace_root(), selection)?,
+        spec::resolve_feature_list_for_target(&workspace_root(), selection, target)?,
         excluded,
     )?;
     println!("{}", list.join(","));
