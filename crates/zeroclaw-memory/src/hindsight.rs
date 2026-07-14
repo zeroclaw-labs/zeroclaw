@@ -59,6 +59,29 @@ fn encode_segment(segment: &str) -> String {
     urlencoding::encode(segment).into_owned()
 }
 
+/// Maximum number of bytes of a remote error body echoed into an error message.
+/// Remote bodies are attacker/operator-influenced and may contain secrets or
+/// large payloads, so they are truncated before surfacing.
+const MAX_REMOTE_ERROR_BODY: usize = 512;
+
+/// Read a failed response's body and reduce it to a bounded, single-line
+/// snippet safe to embed in an error message. Collapses whitespace/newlines and
+/// truncates to [`MAX_REMOTE_ERROR_BODY`] so a large or multi-line remote body
+/// cannot flood logs or smuggle control characters into the error surface.
+async fn bounded_error_body(resp: reqwest::Response) -> String {
+    let raw = resp.text().await.unwrap_or_default();
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() > MAX_REMOTE_ERROR_BODY {
+        let mut end = MAX_REMOTE_ERROR_BODY;
+        while !collapsed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… (truncated)", &collapsed[..end])
+    } else {
+        collapsed
+    }
+}
+
 /// Build the shared `reqwest::Client` with a per-request timeout so every
 /// outbound Hindsight call is bounded. A `timeout_secs` of `0` (which config
 /// validation rejects, but the env path could still yield) falls back to the
@@ -263,8 +286,8 @@ impl HindsightMemory {
             .context("hindsight recall request failed")?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("hindsight recall returned HTTP {status}: {text}");
+            let body = bounded_error_body(resp).await;
+            anyhow::bail!("hindsight recall returned HTTP {status}: {body}");
         }
         let parsed: RecallResponse = resp
             .json()
@@ -291,8 +314,8 @@ impl HindsightMemory {
             .context("hindsight list request failed")?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("hindsight list returned HTTP {status}: {text}");
+            let body = bounded_error_body(resp).await;
+            anyhow::bail!("hindsight list returned HTTP {status}: {body}");
         }
         let parsed: ListResponse = resp
             .json()
@@ -479,8 +502,8 @@ impl Memory for HindsightMemory {
             .context("hindsight retain request failed")?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("hindsight retain returned HTTP {status}: {text}");
+            let body = bounded_error_body(resp).await;
+            anyhow::bail!("hindsight retain returned HTTP {status}: {body}");
         }
         Ok(())
     }
@@ -1013,6 +1036,35 @@ mod tests {
         assert!(
             !recall.contains("banks/team/space"),
             "raw slash must not leak into the path: {recall}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_error_body_is_bounded_and_single_line() {
+        // A large multi-line remote error body must be collapsed to one line
+        // and truncated so it cannot flood logs or smuggle control chars into
+        // the surfaced error.
+        let server = MockServer::start().await;
+        let huge = format!("line-one\nline-two\n{}", "X".repeat(4000));
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .recall("otter", 3, None, None, None)
+            .await
+            .expect_err("a 500 must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("truncated"), "body must be truncated: {msg}");
+        assert!(!msg.contains('\n'), "body must be single-line: {msg:?}");
+        // The bounded snippet plus the fixed prefix stay comfortably small.
+        assert!(
+            msg.len() < 700,
+            "error message must be bounded: {}",
+            msg.len()
         );
     }
 }
