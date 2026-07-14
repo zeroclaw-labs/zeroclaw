@@ -5430,7 +5430,7 @@ mod tests {
     fn effective_content_preserves_unclosed_think_tag() {
         // An unclosed literal `<think>` tag must NOT discard the rest of the
         // response. The old `strip_think_tags()` helper saw no closing
-        // closing `</think>` and dropped the trailing tail ("Visible <think>"
+        // ` closing ` and dropped the trailing tail ("Visible  think"
         // → "Visible"). The new path returns the input unchanged.
         let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
