@@ -6,7 +6,7 @@ An agent lists the channels it answers on; see [Agents](../agents/overview.md) f
 
 Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one is feature-gated at compile time, so a minimal build only includes the channels you want.
 
-The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, and Discord. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Pre-built binaries use this lean default. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
+The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, Discord, and filesystem. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Standard pre-built binaries add Matrix, Lark, and WhatsApp Web; the Android artifact omits WhatsApp Web for target compatibility. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
 
 <div class="os-tabs-src">
 
