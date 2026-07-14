@@ -327,8 +327,11 @@ impl CopilotModelProvider {
                             id: Some(tool_call.id),
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
-                                name: tool_call.name,
-                                arguments: tool_call.arguments,
+                                name: tool_call.name.clone(),
+                                arguments: crate::request_payload::normalize_native_tool_arguments(
+                                    &tool_call.arguments,
+                                    &tool_call.name,
+                                ),
                             },
                         })
                         .collect::<Vec<_>>();

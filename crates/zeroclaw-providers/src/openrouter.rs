@@ -267,8 +267,11 @@ impl OpenRouterModelProvider {
                             id: Some(tc.id),
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
+                                name: tc.name.clone(),
+                                arguments: crate::request_payload::normalize_native_tool_arguments(
+                                    &tc.arguments,
+                                    &tc.name,
+                                ),
                             },
                         })
                         .collect::<Vec<_>>();

@@ -302,8 +302,11 @@ impl OpenAiModelProvider {
                             id: Some(tc.id),
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
+                                name: tc.name.clone(),
+                                arguments: crate::request_payload::normalize_native_tool_arguments(
+                                    &tc.arguments,
+                                    &tc.name,
+                                ),
                             },
                         })
                         .collect::<Vec<_>>();
@@ -1920,6 +1923,27 @@ mod tests {
             native[0].reasoning_content.as_deref(),
             Some("Let me think...")
         );
+    }
+
+    #[test]
+    fn convert_messages_normalizes_malformed_tool_arguments() {
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "file_write",
+                "arguments": r#"{"path": "unclosed"#
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.arguments, "{}");
     }
 
     #[test]
