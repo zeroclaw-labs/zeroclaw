@@ -65,7 +65,7 @@ When connecting through the **gateway WebSocket** endpoint, the connection URL m
 4. sole configured `[agents.<alias>]` entry when exactly one exists
 5. error when no alias can be resolved
 
-Every resolved alias — regardless of which step selected it — must name an **enabled, dispatchable** agent. Unknown aliases and configured-but-disabled agents fail `session/new` with `-32602 INVALID_PARAMS`. A blank or whitespace-only `?agent=` is treated as absent and falls through to the next step.
+Every resolved alias, regardless of which step selected it, must name an **enabled, dispatchable** agent. Unknown aliases and configured-but-disabled agents fail `session/new` with `-32602 INVALID_PARAMS`. A blank or whitespace-only `?agent=` is treated as absent and falls through to the next step.
 
 Standalone **`zeroclaw acp`** (stdio subprocess) does not read `?agent=`; use an explicit `agentAlias` or `[acp].default_agent` there instead.
 
@@ -315,7 +315,7 @@ The binary reads stdin, writes stdout, exits on EOF.
 
 **Via the daemon gateway (remote or same-host):**
 
-Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly — for multi-agent installs, use a URL such as `ws://127.0.0.1:8080/acp?agent=myagent` so `session/new` can omit `agentAlias` — or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
+Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly: for multi-agent installs, use a URL such as `ws://127.0.0.1:8080/acp?agent=myagent` so `session/new` can omit `agentAlias`, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
 
 <div class="os-tabs-src">
 
