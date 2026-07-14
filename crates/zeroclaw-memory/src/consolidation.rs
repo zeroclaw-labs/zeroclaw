@@ -15,7 +15,9 @@ use crate::importance;
 use crate::merge;
 use crate::policy::PolicyEnforcer;
 use crate::policy_gate;
-use crate::traits::{Memory, MemoryCategory, MemoryKind, SemanticSubtype, StoreOptions};
+use crate::traits::{
+    Memory, MemoryCategory, MemoryEntry, MemoryKind, SemanticSubtype, StoreOptions,
+};
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
@@ -311,7 +313,9 @@ async fn store_typed_facts(
         .iter()
         .filter_map(|fact| {
             let trimmed = fact.trim();
-            let overlaps_primary = primary_update.is_some_and(|primary| primary.trim() == trimmed);
+            let overlaps_primary = primary_update.is_some_and(|primary| {
+                fact_overlaps_primary_update(trimmed, primary, memory_config)
+            });
             (!trimmed.is_empty() && !overlaps_primary).then_some(trimmed)
         })
         .take(MAX_TYPED_FACTS_PER_TURN)
@@ -419,6 +423,46 @@ async fn store_typed_facts(
     }
 
     Ok(())
+}
+
+fn fact_overlaps_primary_update(
+    fact: &str,
+    primary_update: &str,
+    memory_config: &MemoryConfig,
+) -> bool {
+    let primary = primary_update.trim();
+    if primary.is_empty() {
+        return false;
+    }
+    if primary == fact {
+        return true;
+    }
+    if !memory_config.dedup_on_write {
+        return false;
+    }
+
+    let candidate = MemoryEntry {
+        id: "primary_update_candidate".into(),
+        key: "primary_update_candidate".into(),
+        content: primary.to_string(),
+        category: MemoryCategory::Core,
+        timestamp: "now".into(),
+        session_id: None,
+        score: None,
+        namespace: "default".into(),
+        importance: None,
+        superseded_by: None,
+        kind: None,
+        pinned: false,
+        tenant_id: None,
+        agent_alias: None,
+        agent_id: None,
+    };
+
+    !matches!(
+        dedup::dedup_gate(&[candidate], fact, memory_config),
+        DedupAction::Insert
+    )
 }
 
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
@@ -886,6 +930,57 @@ mod tests {
             .find_map(|write| match write {
                 RecordedWrite::StoreWithOptions { key, options, .. }
                     if key.starts_with("core_") =>
+                {
+                    Some(options)
+                }
+                _ => None,
+            })
+            .expect("primary Core write");
+        assert_eq!(
+            options.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_update_wins_over_a_semantically_overlapping_fact() {
+        const OVERLAPPING_RESPONSE: &str = r#"{"history_entry":"h","memory_update":"Use staged rollout for deploys","kind":"decision","facts":["Use staged rollout deploys","Rollbacks keep the previous binary"]}"#;
+        let provider = ScriptedProvider::new(OVERLAPPING_RESPONSE);
+        let memory = RecordingMemory::default();
+        let config = MemoryConfig {
+            consolidation_extract_facts: true,
+            dedup_on_write: true,
+            dedup_jaccard_threshold: 0.5,
+            types: MemoryTypesConfig { enabled: true },
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let writes = memory.writes.lock();
+        let fact_writes: Vec<_> = writes
+            .iter()
+            .filter_map(|write| match write {
+                RecordedWrite::StoreWithOptions { key, content, .. }
+                    if key.starts_with("core_fact_") =>
+                {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fact_writes,
+            vec!["Rollbacks keep the previous binary"],
+            "the overlapping paraphrased fact must be claimed by the primary update, while unrelated facts still land"
+        );
+        let options = writes
+            .iter()
+            .find_map(|write| match write {
+                RecordedWrite::StoreWithOptions { key, options, .. }
+                    if key.starts_with("core_") && !key.starts_with("core_fact_") =>
                 {
                     Some(options)
                 }
