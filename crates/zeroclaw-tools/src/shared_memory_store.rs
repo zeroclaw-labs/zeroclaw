@@ -194,7 +194,7 @@ impl Tool for SharedMemoryStoreTool {
         if !self.security.is_tool_allowed(self.name()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-not-authorized",
                     &[("tier", self.tier.tier_label())],
@@ -210,7 +210,7 @@ impl Tool for SharedMemoryStoreTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(error),
             });
         }
@@ -221,7 +221,7 @@ impl Tool for SharedMemoryStoreTool {
         let Some(writable) = self.memory.as_shared_writable() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-not-available",
                     &[("tier", self.tier.tier_label())],
@@ -236,7 +236,7 @@ impl Tool for SharedMemoryStoreTool {
         if bank.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-no-bank",
                     &[("tier", self.tier.tier_label())],
@@ -254,12 +254,13 @@ impl Tool for SharedMemoryStoreTool {
                 output: Self::tool_msg_with_args(
                     "tool-shared-memory-store-success",
                     &[("tier", self.tier.tier_label()), ("key", key)],
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-failed",
                     &[("tier", self.tier.tier_label()), ("error", &e.to_string())],
