@@ -63,10 +63,11 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, SharedWritable};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
-use zeroclaw_config::schema::HindsightMemoryConfig;
+use zeroclaw_config::schema::{
+    DEFAULT_HINDSIGHT_BASE_URL, DEFAULT_HINDSIGHT_TOKEN_ENV, DEFAULT_HINDSIGHT_TOP_K,
+    HindsightMemoryConfig,
+};
 
-const DEFAULT_BASE: &str = "https://tokengate.appz.cloud/api/embedding/hindsight";
-const DEFAULT_TOP_K: usize = 25;
 /// Env var naming the shared/family bank (read-merged; written via tool only).
 const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
 /// Env var naming the system bank (read-merged; written via tool only).
@@ -203,7 +204,7 @@ impl HindsightMemory {
             &[bank.as_str(), shared_bank.as_deref().unwrap_or_default()],
         );
         let default_top_k = if cfg.top_k == 0 {
-            DEFAULT_TOP_K
+            DEFAULT_HINDSIGHT_TOP_K
         } else {
             cfg.top_k
         };
@@ -232,18 +233,24 @@ impl HindsightMemory {
     /// no typed config in scope (e.g. CLI migration probes); the daemon path
     /// uses [`HindsightMemory::from_config`].
     pub fn from_env(agent_alias: &str) -> Result<Self> {
-        let token = std::env::var("ZC_HINDSIGHT_TOKEN")
+        // The token env var name is the same canonical fact the typed config
+        // defaults `token_env` to, so consume it from the single source rather
+        // than re-hardcoding the literal here.
+        let token = std::env::var(DEFAULT_HINDSIGHT_TOKEN_ENV)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .context(
-                "memory backend 'hindsight' requires ZC_HINDSIGHT_TOKEN (the tokengate bearer token)",
-            )?;
+            .with_context(|| {
+                format!(
+                    "memory backend 'hindsight' requires {DEFAULT_HINDSIGHT_TOKEN_ENV} \
+                     (the tokengate bearer token)"
+                )
+            })?;
         let base_url = std::env::var("ZC_HINDSIGHT_BASE")
             .ok()
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_BASE.to_string());
+            .unwrap_or_else(|| DEFAULT_HINDSIGHT_BASE_URL.to_string());
         let bank = std::env::var("ZC_HINDSIGHT_BANK")
             .ok()
             .map(|s| s.trim().to_string())
@@ -261,7 +268,7 @@ impl HindsightMemory {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|k| *k > 0)
-            .unwrap_or(DEFAULT_TOP_K);
+            .unwrap_or(DEFAULT_HINDSIGHT_TOP_K);
         // Async retain by default; an explicit falsey env forces sync. Parity
         // with the typed `[memory.hindsight] retain_async` default (true).
         let retain_async = std::env::var("ZC_HINDSIGHT_RETAIN_ASYNC")
@@ -326,7 +333,7 @@ impl HindsightMemory {
             shared_bank: shared_bank.map(str::to_string),
             system_bank: system_bank.map(str::to_string),
             token: token.to_string(),
-            default_top_k: DEFAULT_TOP_K,
+            default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             retain_async: true,
             recall_types: Vec::new(),
             client: reqwest::Client::new(),
@@ -913,7 +920,7 @@ mod tests {
             shared_bank: None,
             system_bank: None,
             token: "test-token".to_string(),
-            default_top_k: 25,
+            default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             retain_async: true,
             recall_types: Vec::new(),
             client: reqwest::Client::new(),
