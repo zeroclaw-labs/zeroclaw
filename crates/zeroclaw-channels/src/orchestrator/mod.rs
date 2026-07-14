@@ -5420,6 +5420,22 @@ async fn process_channel_message_body(
                 let mut accumulated = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
+                        StreamDelta::Lifecycle(event) => {
+                            if let Err(e) = channel
+                                .update_draft_lifecycle(&reply_target, &draft_id, event)
+                                .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Draft lifecycle update failed"
+                                );
+                            }
+                        }
                         StreamDelta::Status(text) => {
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
@@ -5469,14 +5485,10 @@ async fn process_channel_message_body(
     // begins. Channel implementations decide how to render or rate-limit it.
     if let Some(tx) = delta_tx.as_ref() {
         let _ = tx
-            .send(StreamDelta::Status(
-                ProgressEvent::Received.label().to_string(),
-            ))
+            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
             .await;
         let _ = tx
-            .send(StreamDelta::Status(
-                ProgressEvent::Planning.label().to_string(),
-            ))
+            .send(StreamDelta::Lifecycle(ProgressEvent::Planning))
             .await;
     }
 
@@ -5813,9 +5825,7 @@ async fn process_channel_message_body(
         && let Some(tx) = delta_tx.as_ref()
     {
         let _ = tx
-            .send(StreamDelta::Status(
-                ProgressEvent::FinalizingResponse.label().to_string(),
-            ))
+            .send(StreamDelta::Lifecycle(ProgressEvent::FinalizingResponse))
             .await;
     }
 
@@ -13424,6 +13434,7 @@ api_key = "anthropic-key"
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         progress_messages: tokio::sync::Mutex<Vec<String>>,
+        lifecycle_events: tokio::sync::Mutex<Vec<ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -13435,6 +13446,7 @@ api_key = "anthropic-key"
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 progress_messages: tokio::sync::Mutex::new(Vec::new()),
+                lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
             }
         }
@@ -13678,6 +13690,16 @@ api_key = "anthropic-key"
             text: &str,
         ) -> anyhow::Result<()> {
             self.progress_messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn update_draft_lifecycle(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            event: ProgressEvent,
+        ) -> anyhow::Result<()> {
+            self.lifecycle_events.lock().await.push(event);
             Ok(())
         }
 
@@ -14015,29 +14037,13 @@ api_key = "anthropic-key"
         )
         .await;
 
-        let progress_messages = channel_impl.progress_messages.lock().await;
-        let stable_progress: Vec<_> = progress_messages
-            .iter()
-            .filter(|message| {
-                matches!(
-                    message.as_str(),
-                    "Received"
-                        | "Planning"
-                        | "Waiting on model"
-                        | "Running tool"
-                        | "Compacting context"
-                        | "Finalizing response"
-                )
-            })
-            .map(String::as_str)
-            .collect();
         assert_eq!(
-            stable_progress,
+            channel_impl.lifecycle_events.lock().await.as_slice(),
             [
-                "Received",
-                "Planning",
-                "Waiting on model",
-                "Finalizing response"
+                ProgressEvent::Received,
+                ProgressEvent::Planning,
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::FinalizingResponse,
             ]
         );
     }

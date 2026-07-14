@@ -2437,6 +2437,7 @@ pub async fn run(
                     use std::io::Write;
                     while let Some(event) = delta_rx.recv().await {
                         match event {
+                            StreamDelta::Lifecycle(_) => {}
                             StreamDelta::Status(text) => {
                                 if is_tty {
                                     let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
@@ -9842,6 +9843,7 @@ This is an example, not an invocation."#;
             deltas.iter().all(|delta| match delta {
                 StreamDelta::Status(text) | StreamDelta::Text(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
+                StreamDelta::Lifecycle(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -9933,7 +9935,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10022,7 +10024,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11002,7 +11004,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11462,7 +11464,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -13841,6 +13843,7 @@ Let me check the result."#;
             .iter()
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+                StreamDelta::Lifecycle(_) => "",
             })
             .collect();
 

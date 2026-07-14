@@ -191,6 +191,18 @@ pub enum RoomVisibility {
     Public,
 }
 
+/// Stable, non-sensitive lifecycle states that channels may render while an
+/// agent turn is running. Variants carry no display text or internal details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressEvent {
+    Received,
+    Planning,
+    WaitingOnModel,
+    RunningTool,
+    CompactingContext,
+    FinalizingResponse,
+}
+
 impl RoomVisibility {
     pub const SCHEMA_VALUES: &'static [&'static str] = &["private", "public"];
 
@@ -537,6 +549,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _recipient: &str,
         _message_id: &str,
         _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Show localized lifecycle progress produced from a typed runtime event.
+    /// Unlike raw tool status text, this input is trusted channel chrome.
+    async fn update_draft_lifecycle(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _event: ProgressEvent,
     ) -> anyhow::Result<()> {
         Ok(())
     }

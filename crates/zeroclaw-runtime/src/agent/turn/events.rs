@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -15,32 +16,6 @@ pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
-
-/// Stable, non-sensitive lifecycle labels that channels may render while a
-/// turn is running. The enum deliberately carries no tool names, arguments,
-/// prompts, provider output, or error details.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressEvent {
-    Received,
-    Planning,
-    WaitingOnModel,
-    RunningTool,
-    CompactingContext,
-    FinalizingResponse,
-}
-
-impl ProgressEvent {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Received => "Received",
-            Self::Planning => "Planning",
-            Self::WaitingOnModel => "Waiting on model",
-            Self::RunningTool => "Running tool",
-            Self::CompactingContext => "Compacting context",
-            Self::FinalizingResponse => "Finalizing response",
-        }
-    }
-}
 
 /// Delta sent from the agent loop to the channel's draft updater.
 /// Append-only — no clear/reset variant exists by design.
@@ -50,15 +25,15 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// Typed, non-sensitive agent lifecycle progress.
+    Lifecycle(ProgressEvent),
 }
 
-/// Send a stable lifecycle label through the existing draft stream without
-/// exposing tool names, arguments, prompts, provider output, or error details.
+/// Send a typed lifecycle state through the draft stream without exposing tool
+/// names, arguments, prompts, provider output, or error details.
 pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
     if let Some(tx) = on_delta {
-        let _ = tx
-            .send(StreamDelta::Status(event.label().to_string()))
-            .await;
+        let _ = tx.send(StreamDelta::Lifecycle(event)).await;
     }
 }
 
@@ -176,31 +151,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[test]
-    fn progress_event_labels_are_stable_and_non_sensitive() {
-        let labels = [
-            ProgressEvent::Received,
-            ProgressEvent::Planning,
-            ProgressEvent::WaitingOnModel,
-            ProgressEvent::RunningTool,
-            ProgressEvent::CompactingContext,
-            ProgressEvent::FinalizingResponse,
-        ]
-        .map(ProgressEvent::label);
+    #[tokio::test]
+    async fn progress_events_remain_typed_in_the_draft_stream() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-        assert_eq!(
-            labels,
-            [
-                "Received",
-                "Planning",
-                "Waiting on model",
-                "Running tool",
-                "Compacting context",
-                "Finalizing response",
-            ]
-        );
-        assert!(labels.iter().all(|label| !label.contains("shell")));
-        assert!(labels.iter().all(|label| !label.contains("command")));
+        send_progress(Some(&tx), ProgressEvent::RunningTool).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::RunningTool))
+        ));
     }
 
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {

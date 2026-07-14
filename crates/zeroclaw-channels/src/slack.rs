@@ -12,7 +12,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ProgressEvent,
+    SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
 
@@ -523,23 +524,17 @@ impl SlackChannel {
         Ok(ts)
     }
 
-    fn sanitize_progress_label(text: &str) -> Option<&'static str> {
+    fn legacy_progress_event(text: &str) -> Option<ProgressEvent> {
         let line = text.trim().lines().last()?.trim();
         match line {
-            "Received" => Some("Received"),
-            "Planning" => Some("Planning"),
-            "Waiting on model" => Some("Waiting on model"),
-            "Running tool" => Some("Running tool"),
-            "Compacting context" => Some("Compacting context"),
-            "Finalizing response" => Some("Finalizing response"),
-            line if line.starts_with('\u{1f914}') => Some("Waiting on model"),
-            line if line.starts_with('\u{23f3}') => Some("Running tool"),
-            line if line.starts_with('\u{1f4ac}') => Some("Planning"),
+            line if line.starts_with('\u{1f914}') => Some(ProgressEvent::WaitingOnModel),
+            line if line.starts_with('\u{23f3}') => Some(ProgressEvent::RunningTool),
+            line if line.starts_with('\u{1f4ac}') => Some(ProgressEvent::Planning),
             line if line.starts_with('\u{2705}')
                 || line.starts_with('\u{274c}')
                 || line.starts_with('\u{270f}') =>
             {
-                Some("Planning")
+                Some(ProgressEvent::Planning)
             }
             _ => None,
         }
@@ -4678,19 +4673,30 @@ impl Channel for SlackChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        let Some(status_line) = Self::sanitize_progress_label(text) else {
+        let Some(event) = Self::legacy_progress_event(text) else {
             return Ok(());
         };
+        self.update_draft_lifecycle(recipient, message_id, event)
+            .await
+    }
+
+    async fn update_draft_lifecycle(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        event: ProgressEvent,
+    ) -> anyhow::Result<()> {
+        let status_line = crate::util::localized_lifecycle_progress(event);
 
         if self.active_assistant_thread_ts(recipient).is_some() {
             if self.progress_rate_limited(recipient) {
                 return Ok(());
             }
             self.record_progress_update(recipient);
-            return self.set_assistant_status(recipient, status_line).await;
+            return self.set_assistant_status(recipient, &status_line).await;
         }
 
-        self.update_draft(recipient, message_id, status_line).await
+        self.update_draft(recipient, message_id, &status_line).await
     }
 
     async fn finalize_draft(
@@ -6918,6 +6924,15 @@ mod tests {
         assert!(!body["text"].as_str().unwrap().contains("secret"));
     }
 
+    #[test]
+    fn legacy_progress_parser_does_not_trust_display_strings() {
+        assert_eq!(SlackChannel::legacy_progress_event("Running tool"), None);
+        assert_eq!(
+            SlackChannel::legacy_progress_event("⏳ shell: cat /private/secret.txt"),
+            Some(ProgressEvent::RunningTool)
+        );
+    }
+
     #[tokio::test]
     async fn draft_progress_falls_back_to_message_updates_for_group_threads() {
         use wiremock::matchers::{method, path};
@@ -6944,7 +6959,7 @@ mod tests {
             .unwrap()
             .expect("streaming Slack returns a draft id");
 
-        ch.update_draft_progress("C123", &draft_id, "Received")
+        ch.update_draft_lifecycle("C123", &draft_id, ProgressEvent::Received)
             .await
             .unwrap();
 
@@ -6981,7 +6996,7 @@ mod tests {
             .unwrap()
             .insert("C123".to_string(), "1709999999.000001".to_string());
 
-        ch.update_draft_progress("C123", "unused", "🤔 Thinking...\n")
+        ch.update_draft_lifecycle("C123", "unused", ProgressEvent::WaitingOnModel)
             .await
             .unwrap();
         ch.update_draft_progress("C123", "unused", "⏳ shell: cat secret\n")

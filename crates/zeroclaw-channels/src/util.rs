@@ -1,3 +1,20 @@
+use zeroclaw_api::channel::ProgressEvent;
+
+pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
+    match event {
+        ProgressEvent::Received => "channel-runtime-progress-received",
+        ProgressEvent::Planning => "channel-runtime-progress-planning",
+        ProgressEvent::WaitingOnModel => "channel-runtime-progress-waiting-on-model",
+        ProgressEvent::RunningTool => "channel-runtime-progress-running-tool",
+        ProgressEvent::CompactingContext => "channel-runtime-progress-compacting-context",
+        ProgressEvent::FinalizingResponse => "channel-runtime-progress-finalizing-response",
+    }
+}
+
+pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string(lifecycle_progress_fluent_key(event))
+}
+
 /// Truncate a string to `max_chars` Unicode characters, appending "..." if truncated.
 pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
@@ -418,6 +435,29 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_progress_maps_typed_events_to_fluent_keys() {
+        assert_eq!(
+            [
+                ProgressEvent::Received,
+                ProgressEvent::Planning,
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::RunningTool,
+                ProgressEvent::CompactingContext,
+                ProgressEvent::FinalizingResponse,
+            ]
+            .map(lifecycle_progress_fluent_key),
+            [
+                "channel-runtime-progress-received",
+                "channel-runtime-progress-planning",
+                "channel-runtime-progress-waiting-on-model",
+                "channel-runtime-progress-running-tool",
+                "channel-runtime-progress-compacting-context",
+                "channel-runtime-progress-finalizing-response",
+            ]
+        );
+    }
 
     #[test]
     fn floor_char_boundary_handles_mid_codepoint_offset() {
