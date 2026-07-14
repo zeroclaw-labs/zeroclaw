@@ -16,7 +16,7 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getStatus } from '@/lib/api';
 
 interface NavItem {
@@ -82,55 +82,65 @@ const navGroups: NavGroup[] = [
 function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
+  const [tooltipVisible, setTooltipVisible] = useState(false);
+  const linkRef = useRef<HTMLAnchorElement>(null);
   return (
-    <NavLink
-      to={to}
-      end={to === '/'}
-      onClick={onClick}
-      title={text}
-      aria-label={text}
-      className={({ isActive }) =>
-        [
-          'group relative flex h-10 w-10 mx-auto items-center justify-center',
-          'rounded-[var(--radius-md)] transition-colors duration-150',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-          isActive
-            ? 'bg-pc-accent/10 text-pc-accent'
-            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
-        ].join(' ')
-      }
-    >
-      {({ isActive }) => (
-        <>
-          {/* 2px left accent bar marking the active item against the rail edge. */}
-          {isActive && (
-            <span
-              aria-hidden="true"
-              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+    <>
+      <NavLink
+        ref={linkRef}
+        to={to}
+        end={to === '/'}
+        onClick={onClick}
+        title={text}
+        aria-label={text}
+        onMouseEnter={() => setTooltipVisible(true)}
+        onMouseLeave={() => setTooltipVisible(false)}
+        onFocus={() => setTooltipVisible(true)}
+        onBlur={() => setTooltipVisible(false)}
+        className={({ isActive }) =>
+          [
+            'group relative flex h-10 w-10 mx-auto items-center justify-center',
+            'rounded-[var(--radius-md)] transition-colors duration-150',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+            isActive
+              ? 'bg-pc-accent/10 text-pc-accent'
+              : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
+          ].join(' ')
+        }
+      >
+        {({ isActive }) => (
+          <>
+            {isActive && (
+              <span
+                aria-hidden="true"
+                className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+              />
+            )}
+            <Icon
+              className={`h-[22px] w-[22px] shrink-0 transition-colors ${
+                isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
+              }`}
             />
-          )}
-          <Icon
-            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
-              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
-            }`}
-          />
-          {/* Tooltip popover to the right — appears on pointer hover and on
-              keyboard focus (focus-within) so the rail is usable without a
-              mouse. Token-styled; non-interactive so it never traps focus. */}
-          <span
-            role="tooltip"
-            className="pointer-events-none absolute left-full ml-2 z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
-            style={{
-              background: 'var(--pc-bg-elevated)',
-              color: 'var(--pc-text-primary)',
-              border: '1px solid var(--pc-border)',
-            }}
-          >
-            {text}
-          </span>
-        </>
+          </>
+        )}
+      </NavLink>
+      {tooltipVisible && linkRef.current && (
+        <span
+          role="tooltip"
+          className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs transition-opacity"
+          style={{
+            top: linkRef.current.getBoundingClientRect().top + linkRef.current.getBoundingClientRect().height / 2,
+            left: 64,
+            transform: 'translateY(-50%)',
+            background: 'var(--pc-bg-elevated)',
+            color: 'var(--pc-text-primary)',
+            border: '1px solid var(--pc-border)',
+          }}
+        >
+          {text}
+        </span>
       )}
-    </NavLink>
+    </>
   );
 }
 
