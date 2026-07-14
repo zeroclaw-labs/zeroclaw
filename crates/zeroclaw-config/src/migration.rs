@@ -1656,4 +1656,58 @@ bot_token = "t"
         let cfg = migrate_to_current(&out).expect("generated V4 config round-trips");
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
     }
+
+    #[test]
+    fn v3_to_v4_prunes_agent_refs_to_removed_channels() {
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+
+[agents.assistant]
+channels = ["telegram.main", "twitter", "reddit.default", "notion"]
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        let agent = cfg.agents.get("assistant").expect("agent survives");
+        let refs: Vec<&str> = agent.channels.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["telegram.main"],
+            "refs to removed channel types must be pruned so validate() has no dangling target"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_peer_groups_bound_to_removed_channels() {
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+
+[peer_groups.ops]
+channel = "telegram.main"
+
+[peer_groups.birdwatch]
+channel = "twitter.default"
+
+[peer_groups.frontpage]
+channel = "reddit"
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert!(
+            cfg.peer_groups.contains_key("ops"),
+            "peer group on a surviving channel must be kept; got: {:?}",
+            cfg.peer_groups.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !cfg.peer_groups.contains_key("birdwatch")
+                && !cfg.peer_groups.contains_key("frontpage"),
+            "peer groups bound to removed channels must be dropped; got: {:?}",
+            cfg.peer_groups.keys().collect::<Vec<_>>()
+        );
+    }
 }
