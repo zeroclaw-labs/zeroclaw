@@ -157,6 +157,7 @@
   - [Zero compromise in practice](./foundations/fnd-006-zero-compromise-in-practice.md)
 - [Contributing](./contributing/index.md)
   - [How to contribute](./contributing/how-to.md)
+  - [Coding agent guidelines](./contributing/agent-guidelines.md)
   - [Architecture and contribution map](./contributing/architecture-map.md)
   - [RFC process](./contributing/rfcs.md)
   - [Communication](./contributing/communication.md)
