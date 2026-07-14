@@ -15317,6 +15317,28 @@ impl ChannelConfig for LineConfig {
     }
 }
 
+impl LineConfig {
+    /// Resolve the effective channel access token using LINE's legacy direct
+    /// environment contract when the configured value is empty.
+    pub fn resolved_channel_access_token(&self) -> String {
+        resolve_line_credential(&self.channel_access_token, "LINE_CHANNEL_ACCESS_TOKEN")
+    }
+
+    /// Resolve the effective channel secret using LINE's legacy direct
+    /// environment contract when the configured value is empty.
+    pub fn resolved_channel_secret(&self) -> String {
+        resolve_line_credential(&self.channel_secret, "LINE_CHANNEL_SECRET")
+    }
+}
+
+fn resolve_line_credential(configured: &str, env_var: &str) -> String {
+    if configured.is_empty() {
+        std::env::var(env_var).unwrap_or_default()
+    } else {
+        configured.to_string()
+    }
+}
+
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.

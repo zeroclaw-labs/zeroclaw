@@ -79,6 +79,62 @@ fn mirror_sections<'a>(
         })
 }
 
+/// Materialize the effective typed config passed to one channel mirror.
+///
+/// Schema-derived environment overrides are already present in [`Config`].
+/// Slack and LINE additionally support legacy direct environment contracts in
+/// their native constructors, so those exact credential fields are resolved
+/// through the same typed helpers here. The returned view exists only for this
+/// guest startup call; canonical state remains in `config.channels`.
+#[cfg(feature = "plugins-wasm")]
+fn resolve_mirror_config(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+    section: &serde_json::Value,
+) -> serde_json::Value {
+    let mut resolved = section.clone();
+    let Some(fields) = resolved.as_object_mut() else {
+        return resolved;
+    };
+
+    match channel_type {
+        "slack" => {
+            let Some(slack) = config.channels.slack.get(alias) else {
+                return resolved;
+            };
+            fields.insert(
+                "bot_token".to_string(),
+                slack
+                    .resolved_bot_token()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+            fields.insert(
+                "app_token".to_string(),
+                slack
+                    .resolved_app_token()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+        "line" => {
+            let Some(line) = config.channels.line.get(alias) else {
+                return resolved;
+            };
+            fields.insert(
+                "channel_access_token".to_string(),
+                serde_json::Value::String(line.resolved_channel_access_token()),
+            );
+            fields.insert(
+                "channel_secret".to_string(),
+                serde_json::Value::String(line.resolved_channel_secret()),
+            );
+        }
+        _ => {}
+    }
+
+    resolved
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn ambiguous_mirror_types<'a>(
     manifests: impl IntoIterator<Item = &'a zeroclaw_plugins::PluginManifest>,
@@ -206,14 +262,15 @@ pub async fn build_channel_plugins(
                 for (alias, section) in mirror_sections(sections, channel_type) {
                     let channel_key = format!("{channel_type}.{alias}");
                     if !active.contains(&channel_key) {
-                        log_unowned_plugin(&manifest.name, &channel_key);
+                        log_unowned_plugin(&manifest.name, &channel_key).await;
                         continue;
                     }
                     if !channel_key_is_available(&channel_key, &claimed_channel_keys) {
                         log_shadowed_plugin(&manifest.name, &channel_key);
                         continue;
                     }
-                    let config_json = match serde_json::to_string(section) {
+                    let resolved = resolve_mirror_config(&config, channel_type, alias, section);
+                    let config_json = match serde_json::to_string(&resolved) {
                         Ok(json) => json,
                         Err(error) => {
                             log_instantiate_failure(&manifest.name, &error.into());
@@ -250,7 +307,7 @@ pub async fn build_channel_plugins(
             None => {
                 let binding = zeroclaw_api::channel::plugin_channel_ref(&manifest.name);
                 if !active.contains(&binding) {
-                    log_unowned_plugin(&manifest.name, &binding);
+                    log_unowned_plugin(&manifest.name, &binding).await;
                     continue;
                 }
                 if !channel_key_is_available(&manifest.name, &claimed_channel_keys) {
@@ -308,17 +365,24 @@ fn log_shadowed_plugin(plugin: &str, channel_key: &str) {
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn log_unowned_plugin(plugin: &str, binding: &str) {
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({
-                "plugin": plugin,
-                "binding": binding,
-            })),
-        "Channel plugin has no enabled owning agent; skipping before instantiation"
-    );
+async fn log_unowned_plugin(plugin: &str, binding: &str) {
+    ::zeroclaw_log::scope!(
+        category: "channel",
+        channel: binding,
+        => async {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": plugin,
+                        "binding": binding,
+                    })),
+                "Channel plugin has no enabled owning agent; skipping before instantiation"
+            );
+        }
+    )
+    .await;
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -434,7 +498,10 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "plugins-wasm")]
-    use zeroclaw_config::multi_agent::PeerGroupConfig;
+    use zeroclaw_config::{
+        multi_agent::PeerGroupConfig,
+        schema::{LineConfig, SlackConfig, TelegramConfig},
+    };
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
@@ -520,7 +587,6 @@ mod tests {
             assert!(sender_allowed(sender_match, &peers(&["*"]), "anyone"));
         }
     }
-
     #[test]
     fn shadowed_plugins_are_filtered_before_instantiation() {
         let claimed = HashSet::from(["telegram.main".to_string()]);
@@ -561,5 +627,176 @@ mod tests {
             ambiguous_mirror_types(manifests),
             HashSet::from(["telegram"])
         );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn mirror_credentials_follow_typed_channel_contracts() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let env_guard = ENV_LOCK.lock().expect("environment test lock");
+        let keys = [
+            "ZEROCLAW_SLACK_BOT_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "ZEROCLAW_SLACK_APP_TOKEN",
+            "SLACK_APP_TOKEN",
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            "LINE_CHANNEL_SECRET",
+            "ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN",
+            "ZEROCLAW_LINE_SENDER_NAME",
+            "TELEGRAM_BOT_TOKEN",
+            "ZEROCLAW_TELEGRAM_API_BASE_URL",
+        ];
+        let previous = keys.map(|key| (key, std::env::var_os(key)));
+        let restore_guard = scopeguard::guard(previous, |previous| {
+            for (key, value) in previous {
+                // SAFETY: this test serializes its environment mutations.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        });
+
+        // SAFETY: this test serializes its environment mutations and restores
+        // every value before releasing the lock.
+        unsafe {
+            std::env::set_var("ZEROCLAW_SLACK_BOT_TOKEN", "  xoxb-scoped  ");
+            std::env::set_var("SLACK_BOT_TOKEN", "xoxb-plain");
+            std::env::remove_var("ZEROCLAW_SLACK_APP_TOKEN");
+            std::env::set_var("SLACK_APP_TOKEN", "  xapp-plain  ");
+            std::env::set_var("LINE_CHANNEL_ACCESS_TOKEN", "line-access");
+            std::env::set_var("LINE_CHANNEL_SECRET", "line-secret");
+            std::env::set_var(
+                "ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN",
+                "invented-name-must-not-win",
+            );
+            std::env::set_var("ZEROCLAW_LINE_SENDER_NAME", "must-not-populate");
+            std::env::set_var("TELEGRAM_BOT_TOKEN", "must-not-populate");
+            std::env::set_var("ZEROCLAW_TELEGRAM_API_BASE_URL", "must-not-populate");
+        }
+
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "main".to_string(),
+            SlackConfig {
+                enabled: true,
+                bot_token: None,
+                app_token: Some("   ".to_string()),
+                ..Default::default()
+            },
+        );
+        config.channels.line.insert(
+            "main".to_string(),
+            LineConfig {
+                enabled: true,
+                channel_access_token: String::new(),
+                channel_secret: String::new(),
+                sender_name: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "main".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "schema-resolved-token".to_string(),
+                api_base_url: String::new(),
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "blank".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: String::new(),
+                api_base_url: String::new(),
+                ..Default::default()
+            },
+        );
+
+        let slack =
+            serde_json::to_value(&config.channels.slack["main"]).expect("serialize Slack config");
+        let slack = resolve_mirror_config(&config, "slack", "main", &slack);
+        assert_eq!(slack["bot_token"], "xoxb-scoped");
+        assert_eq!(slack["app_token"], "xapp-plain");
+
+        let line =
+            serde_json::to_value(&config.channels.line["main"]).expect("serialize LINE config");
+        let line = resolve_mirror_config(&config, "line", "main", &line);
+        assert_eq!(line["channel_access_token"], "line-access");
+        assert_eq!(line["channel_secret"], "line-secret");
+        assert_eq!(line["sender_name"], "", "unrelated blank field changed");
+
+        // The legacy LINE contract has no ZEROCLAW-prefixed spelling.
+        unsafe { std::env::remove_var("LINE_CHANNEL_ACCESS_TOKEN") };
+        let line =
+            serde_json::to_value(&config.channels.line["main"]).expect("serialize LINE config");
+        let line = resolve_mirror_config(&config, "line", "main", &line);
+        assert_eq!(line["channel_access_token"], "");
+
+        let telegram = serde_json::to_value(&config.channels.telegram["main"])
+            .expect("serialize Telegram config");
+        let telegram = resolve_mirror_config(&config, "telegram", "main", &telegram);
+        assert_eq!(telegram["bot_token"], "schema-resolved-token");
+        assert_eq!(
+            telegram["api_base_url"], "",
+            "unrelated blank field changed"
+        );
+
+        let blank_telegram = serde_json::to_value(&config.channels.telegram["blank"])
+            .expect("serialize blank Telegram config");
+        let blank_telegram = resolve_mirror_config(&config, "telegram", "blank", &blank_telegram);
+        assert_eq!(
+            blank_telegram["bot_token"], "",
+            "runtime invented a direct Telegram environment contract"
+        );
+
+        drop(restore_guard);
+        drop(env_guard);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unowned_plugin_log_has_channel_attribution() {
+        let writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::clear_broadcast_hook();
+        let hook_cleanup = scopeguard::guard((), |_| zeroclaw_log::clear_broadcast_hook());
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+
+        log_unowned_plugin("slack-mirror", "slack.ops").await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(event)
+                        if event.get("message").and_then(serde_json::Value::as_str)
+                            == Some(
+                                "Channel plugin has no enabled owning agent; skipping before instantiation",
+                            ) =>
+                    {
+                        return event;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("log broadcast closed")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("unowned channel log is captured");
+
+        assert_eq!(event["zeroclaw"]["channel"], "slack.ops");
+        assert_eq!(event["zeroclaw"]["channel_type"], "slack");
+        assert_eq!(event["zeroclaw"]["channel_alias"], "ops");
+
+        drop(hook_cleanup);
+        drop(hook_guard);
+        drop(writer_guard);
     }
 }

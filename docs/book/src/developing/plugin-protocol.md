@@ -450,6 +450,12 @@ channel alias. After duplicate-provider, enabled-owner, and native-collision
 admission, the host passes exactly that canonical `[channels.<type>.<alias>]`
 section to `configure`. It cannot select another channel family or alias, and
 the value is materialized on demand rather than copied into plugin config.
+Effective credential values follow the same typed contract as the native
+channel. Schema-mirror environment overrides are already present in the loaded
+config; Slack additionally honors `ZEROCLAW_SLACK_*_TOKEN` and
+`SLACK_*_TOKEN`, while LINE honors only `LINE_CHANNEL_ACCESS_TOKEN` and
+`LINE_CHANNEL_SECRET`. The host does not synthesize environment variable names
+for arbitrary channel fields.
 
 ## WASI Component Host
 
