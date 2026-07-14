@@ -28,6 +28,8 @@ const MAX_DATAGRAM: usize = 2_048;
 const MAX_INSTANCE_ID_LEN: usize = 128;
 const MAX_NODE_NAME_LEN: usize = 128;
 const MAX_VERSION_LEN: usize = 128;
+const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(250);
+const RECEIVE_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Runtime gateway endpoint advertised over LAN discovery.
 ///
@@ -130,14 +132,34 @@ pub struct MdnsPeerSnapshot {
 }
 
 /// In-memory peer registry populated from LAN discovery announcements.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct MdnsPeerRegistry {
     peers: Arc<Mutex<HashMap<String, MdnsPeer>>>,
+    max_peers: Arc<dyn Fn() -> usize + Send + Sync>,
+}
+
+impl Default for MdnsPeerRegistry {
+    fn default() -> Self {
+        Self::new(|| MdnsConfig::default().max_peers)
+    }
 }
 
 impl MdnsPeerRegistry {
+    pub fn new(max_peers: impl Fn() -> usize + Send + Sync + 'static) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            max_peers: Arc::new(max_peers),
+        }
+    }
+
+    /// Insert or refresh a peer. New identities are rejected at capacity, but
+    /// known identities may refresh without increasing registry cardinality.
     pub fn insert(&self, id: String, peer: MdnsPeer) {
-        self.peers.lock().insert(id, peer);
+        let mut peers = self.peers.lock();
+        if peers.len() >= (self.max_peers)() && !peers.contains_key(&id) {
+            return;
+        }
+        peers.insert(id, peer);
     }
 
     pub fn remove(&self, id: &str) {
@@ -185,6 +207,7 @@ pub async fn run_peer_discovery(
     let mut evict_ticker = tokio::time::interval(Duration::from_secs(15));
     evict_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut buf = [0u8; MAX_DATAGRAM];
+    let mut last_receive_error_log = None;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -217,13 +240,19 @@ pub async fn run_peer_discovery(
                         handle_datagram(&buf[..len], &src_ip, &registry, &instance_id);
                     }
                     Err(err) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": format!("{err}")})),
-                            "LAN peer discovery receive failed"
-                        );
+                        if should_log_receive_error(&mut last_receive_error_log, Instant::now()) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                                "LAN peer discovery receive failed; retrying with backoff"
+                            );
+                        }
+                        if receive_error_backoff_or_shutdown(&mut shutdown_rx).await {
+                            broadcast_bye(&socket, &instance_id).await;
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -385,6 +414,24 @@ fn is_valid_announcement(ann: &Announcement) -> bool {
     }
 }
 
+async fn receive_error_backoff_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(RECEIVE_ERROR_BACKOFF) => false,
+        _ = shutdown_rx.changed() => true,
+    }
+}
+
+fn should_log_receive_error(last_log: &mut Option<Instant>, now: Instant) -> bool {
+    let should_log = match *last_log {
+        Some(last) => now.saturating_duration_since(last) >= RECEIVE_ERROR_LOG_INTERVAL,
+        None => true,
+    };
+    if should_log {
+        *last_log = Some(now);
+    }
+    should_log
+}
+
 fn format_peer_base_url(addr: &str, port: u16, path_prefix: Option<&str>) -> String {
     match normalize_path_prefix(path_prefix) {
         Some(prefix) => format!("http://{addr}:{port}{prefix}"),
@@ -394,12 +441,60 @@ fn format_peer_base_url(addr: &str, port: u16, path_prefix: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::LAN_DISCOVERY_GROUP;
+    use super::{
+        LAN_DISCOVERY_GROUP, RECEIVE_ERROR_LOG_INTERVAL, receive_error_backoff_or_shutdown,
+        should_log_receive_error,
+    };
     use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
+    use tokio::sync::watch;
 
     #[test]
     fn proprietary_multicast_group_is_not_reserved_mdns() {
         assert_ne!(LAN_DISCOVERY_GROUP, Ipv4Addr::new(224, 0, 0, 251));
         assert_eq!(LAN_DISCOVERY_GROUP.octets()[0], 239);
+    }
+
+    #[tokio::test]
+    async fn receive_error_backoff_delays_retry() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            receive_error_backoff_or_shutdown(&mut shutdown_rx),
+        )
+        .await;
+
+        assert!(result.is_err(), "retry returned before the backoff elapsed");
+    }
+
+    #[tokio::test]
+    async fn receive_error_backoff_yields_to_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            receive_error_backoff_or_shutdown(&mut shutdown_rx),
+        )
+        .await;
+
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn receive_error_logs_are_rate_limited() {
+        let now = Instant::now();
+        let mut last_log = None;
+
+        assert!(should_log_receive_error(&mut last_log, now));
+        assert!(!should_log_receive_error(
+            &mut last_log,
+            now + Duration::from_secs(1)
+        ));
+        assert!(should_log_receive_error(
+            &mut last_log,
+            now + RECEIVE_ERROR_LOG_INTERVAL
+        ));
     }
 }

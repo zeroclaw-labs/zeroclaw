@@ -1,9 +1,25 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use zeroclaw_gateway::nodes::mdns::{
     Announcement, Bye, MdnsAdvertisedGateway, MdnsPeer, MdnsPeerRegistry, PeerPacket,
     evict_stale_peers, handle_datagram, is_advertisable_gateway_addr,
 };
+
+fn announcement_bytes(id: &str, name: &str, port: u16) -> Vec<u8> {
+    serde_json::to_vec(&PeerPacket::Announce(Announcement {
+        id: id.into(),
+        name: name.into(),
+        addr: String::new(),
+        port,
+        version: "0.8.1".into(),
+        path_prefix: None,
+    }))
+    .unwrap()
+}
 
 #[test]
 fn advertised_gateway_uses_runtime_port_and_path_prefix() {
@@ -138,6 +154,133 @@ fn invalid_announcements_are_ignored() {
     }
 
     assert!(registry.snapshots().is_empty());
+}
+
+#[test]
+fn registry_capacity_bounds_flood_and_refreshes_known_peers() {
+    let registry = MdnsPeerRegistry::new(|| 2);
+    handle_datagram(
+        &announcement_bytes("peer-1", "first", 42617),
+        "10.0.0.1",
+        &registry,
+        "me",
+    );
+    handle_datagram(
+        &announcement_bytes("peer-2", "second", 42618),
+        "10.0.0.2",
+        &registry,
+        "me",
+    );
+    let full = registry.snapshots();
+
+    handle_datagram(
+        &announcement_bytes("peer-3", "rejected", 42619),
+        "10.0.0.3",
+        &registry,
+        "me",
+    );
+    assert_eq!(registry.snapshots(), full);
+
+    for i in 0..128 {
+        handle_datagram(
+            &announcement_bytes(&format!("flood-{i}"), "flood", 42620),
+            "10.0.0.4",
+            &registry,
+            "me",
+        );
+    }
+    assert_eq!(registry.snapshots().len(), 2);
+
+    registry.insert(
+        "peer-1".into(),
+        MdnsPeer {
+            name: "stale".into(),
+            addr: "10.0.0.8".into(),
+            port: 42620,
+            version: "0.8.0".into(),
+            path_prefix: None,
+            last_seen: Instant::now() - Duration::from_secs(120),
+        },
+    );
+    handle_datagram(
+        &announcement_bytes("peer-1", "refreshed", 42621),
+        "10.0.0.9",
+        &registry,
+        "me",
+    );
+    evict_stale_peers(&registry, Duration::from_secs(90));
+    let snapshots = registry.snapshots();
+    assert_eq!(snapshots.len(), 2);
+    let refreshed = snapshots.iter().find(|peer| peer.id == "peer-1").unwrap();
+    assert_eq!(refreshed.name, "refreshed");
+    assert_eq!(refreshed.addr, "10.0.0.9");
+    assert_eq!(refreshed.port, 42621);
+}
+
+#[test]
+fn registry_capacity_fails_closed_at_zero_and_reuses_freed_slots() {
+    let zero_capacity = MdnsPeerRegistry::new(|| 0);
+    handle_datagram(
+        &announcement_bytes("peer-1", "rejected", 42617),
+        "10.0.0.1",
+        &zero_capacity,
+        "me",
+    );
+    assert!(zero_capacity.snapshots().is_empty());
+
+    let registry = MdnsPeerRegistry::new(|| 1);
+    handle_datagram(
+        &announcement_bytes("peer-1", "first", 42617),
+        "10.0.0.1",
+        &registry,
+        "me",
+    );
+    handle_datagram(
+        &serde_json::to_vec(&PeerPacket::Bye(Bye {
+            id: "peer-1".into(),
+        }))
+        .unwrap(),
+        "10.0.0.1",
+        &registry,
+        "me",
+    );
+    handle_datagram(
+        &announcement_bytes("peer-2", "second", 42618),
+        "10.0.0.2",
+        &registry,
+        "me",
+    );
+    assert_eq!(registry.snapshots()[0].id, "peer-2");
+}
+
+#[test]
+fn registry_resolves_peer_capacity_on_demand() {
+    let max_peers = Arc::new(AtomicUsize::new(1));
+    let live_max_peers = Arc::clone(&max_peers);
+    let registry = MdnsPeerRegistry::new(move || live_max_peers.load(Ordering::Relaxed));
+
+    handle_datagram(
+        &announcement_bytes("peer-1", "first", 42617),
+        "10.0.0.1",
+        &registry,
+        "me",
+    );
+    handle_datagram(
+        &announcement_bytes("peer-2", "blocked", 42618),
+        "10.0.0.2",
+        &registry,
+        "me",
+    );
+    assert_eq!(registry.snapshots().len(), 1);
+
+    max_peers.store(2, Ordering::Relaxed);
+    handle_datagram(
+        &announcement_bytes("peer-2", "accepted", 42618),
+        "10.0.0.2",
+        &registry,
+        "me",
+    );
+    assert_eq!(registry.snapshots().len(), 2);
 }
 
 #[test]

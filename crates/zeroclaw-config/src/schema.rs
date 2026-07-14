@@ -4836,6 +4836,10 @@ fn default_mdns_peer_ttl_secs() -> u64 {
     90
 }
 
+fn default_mdns_max_peers() -> usize {
+    16
+}
+
 /// Configuration for LAN-local mDNS peer discovery (`[nodes.mdns]`).
 ///
 /// This config controls only discovery behavior. The advertised gateway
@@ -4852,6 +4856,9 @@ pub struct MdnsConfig {
     /// local fallback when unset.
     #[serde(default)]
     pub node_name: Option<String>,
+    /// Maximum number of unauthenticated LAN peer hints retained in memory.
+    #[serde(default = "default_mdns_max_peers")]
+    pub max_peers: usize,
     /// How often this node re-broadcasts its presence, in seconds.
     #[serde(default = "default_mdns_announce_interval_secs")]
     pub announce_interval_secs: u64,
@@ -4865,6 +4872,7 @@ impl Default for MdnsConfig {
         Self {
             enabled: false,
             node_name: None,
+            max_peers: default_mdns_max_peers(),
             announce_interval_secs: default_mdns_announce_interval_secs(),
             peer_ttl_secs: default_mdns_peer_ttl_secs(),
         }
@@ -17966,6 +17974,13 @@ impl Config {
                 RequiredFieldEmpty,
                 "gateway.host",
                 "gateway.host must not be empty"
+            );
+        }
+        if self.nodes.mdns.max_peers == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "nodes.mdns.max_peers",
+                "nodes.mdns.max_peers must be greater than 0"
             );
         }
         if self.nodes.mdns.announce_interval_secs == 0 {

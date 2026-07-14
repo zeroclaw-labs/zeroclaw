@@ -7,6 +7,7 @@ fn mdns_config_defaults_to_disabled_without_gateway_port_copy() {
     assert!(!cfg.mdns.enabled);
     assert_eq!(cfg.mdns.node_name, None);
     assert_eq!(cfg.mdns.announce_interval_secs, 30);
+    assert_eq!(cfg.mdns.max_peers, 16);
     assert_eq!(cfg.mdns.peer_ttl_secs, 90);
 
     let value = serde_json::to_value(&cfg.mdns).unwrap();
@@ -25,6 +26,7 @@ enabled = true
 [mdns]
 enabled = true
 node_name = "lab-node"
+max_peers = 24
 announce_interval_secs = 15
 peer_ttl_secs = 60
 "#,
@@ -35,6 +37,7 @@ peer_ttl_secs = 60
     assert!(cfg.mdns.enabled);
     assert_eq!(cfg.mdns.node_name.as_deref(), Some("lab-node"));
     assert_eq!(cfg.mdns.announce_interval_secs, 15);
+    assert_eq!(cfg.mdns.max_peers, 24);
     assert_eq!(cfg.mdns.peer_ttl_secs, 60);
 }
 
@@ -55,6 +58,20 @@ fn mdns_config_rejects_zero_intervals() {
         err.to_string()
             .contains("nodes.mdns.announce_interval_secs")
     );
+}
+
+#[test]
+fn mdns_config_rejects_zero_peer_capacity() {
+    let mut cfg = Config::default();
+    cfg.nodes.mdns = MdnsConfig {
+        max_peers: 0,
+        ..MdnsConfig::default()
+    };
+
+    let err = cfg
+        .validate()
+        .expect_err("mDNS peer capacity must be greater than zero");
+    assert!(err.to_string().contains("nodes.mdns.max_peers"));
 }
 
 #[test]

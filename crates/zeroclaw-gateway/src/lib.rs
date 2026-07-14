@@ -1652,7 +1652,9 @@ pub async fn run_gateway(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
-    let mdns_peer_registry = nodes::mdns::MdnsPeerRegistry::default();
+    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_peer_registry =
+        nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
     let mdns_task = if config.nodes.mdns.enabled
         && nodes::mdns::is_advertisable_gateway_addr(&actual_addr)
     {
