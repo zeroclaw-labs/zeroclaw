@@ -710,7 +710,7 @@ jobs:
               --source-digest "$GITHUB_SHA" \
               --bundle "$tmp_dir/$target" \
               --custom-trusted-root "$tmp_dir/trusted_root.jsonl"
-            printf '`%s` | `%s` | `%s`\n' "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+            printf "\`%s\` | \`%s\` | \`%s\`\n" "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
             bundle_count=$((bundle_count + 1))
           done
 
@@ -719,7 +719,7 @@ jobs:
           mv "$tmp_dir"/* .
 
           echo "--- Attestation bundles ---"
-          ls -lh *.attestation.jsonl trusted_root.jsonl ATTESTATION-BUNDLES.md
+          ls -lh ./*.attestation.jsonl ./trusted_root.jsonl ./ATTESTATION-BUNDLES.md
 
       - name: Write release notes
         env:
@@ -742,27 +742,27 @@ jobs:
           Release artifacts have GitHub artifact provenance attestations.
 
           **Online**
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
             --source-digest ${SOURCE_DIGEST}
-          ```
+          \`\`\`
           VERIFY_EOF
 
             if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
               cat >> release-notes.md <<VERIFY_EOF
 
           **Offline**
-          Download `<artifact>`, `<artifact>.attestation.jsonl`, and `trusted_root.jsonl` from the release assets, then run:
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
-            --source-digest ${SOURCE_DIGEST} \
-            --bundle <artifact>.attestation.jsonl \
+          Download \`<artifact>\`, \`<artifact>.attestation.jsonl\`, and \`trusted_root.jsonl\` from the release assets, then run:
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
+            --source-digest ${SOURCE_DIGEST} \\
+            --bundle <artifact>.attestation.jsonl \\
             --custom-trusted-root trusted_root.jsonl
-          ```
+          \`\`\`
           VERIFY_EOF
             else
               cat >> release-notes.md <<VERIFY_EOF
