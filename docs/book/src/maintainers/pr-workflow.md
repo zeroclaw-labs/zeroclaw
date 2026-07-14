@@ -27,7 +27,7 @@ The Project board is an automated planning board, not the authoritative PR revie
 
 Use the board for issue readiness, routing evidence, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
 
-The current automation is manual and report-only. [`project-dashboard-plan.yml`](../../../../.github/workflows/project-dashboard-plan.yml) runs on `workflow_dispatch` for a single issue number, reads the issue payload, and writes a step summary proposing the existing Project Status value that best matches the issue's live labels and state. It does not write Project fields, edit issues, add labels, post comments, or run automatically on issue events.
+The current automation is manual and report-only. [`project-dashboard-plan.yml`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/.github/workflows/project-dashboard-plan.yml) runs on `workflow_dispatch` for a single issue number, reads the issue payload, and writes a step summary proposing the existing Project Status value that best matches the issue's live labels and state. It does not write Project fields, edit issues, add labels, post comments, or run automatically on issue events.
 
 A JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as the contract for the report-only planner and future board refresh automation, not as approval for automatic issue-event runs or active GitHub Project mutation yet. Live ProjectV2 writes need an approved field mapping, a project-scoped credential or app installation, and readback that compares planned status with live Project state before maintainers rely on it.
 
