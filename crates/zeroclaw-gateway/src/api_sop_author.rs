@@ -419,6 +419,27 @@ pub async fn handle_sop_decide(
             }
         };
         use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
+        let run_sop_name = match guard.get_run(&run_id).map(|run| run.sop_name.clone()) {
+            Some(name) => name,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("Run {run_id} not found")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if run_sop_name != name {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("run '{run_id}' belongs to SOP '{run_sop_name}', not '{name}'")
+                })),
+            )
+                .into_response();
+        }
         match guard.resolve_via_broker(&run_id, decision, principal) {
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                 resumed_action = Some(*action);
@@ -710,6 +731,30 @@ mod tests {
         }
     }
 
+    fn authoring_checkpoint_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("{name} checkpoint"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "gate".into(),
+                kind: SopStepKind::Checkpoint,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
     fn authoring_state_with_policied_gate(
         member_token: &str,
         other_token: &str,
@@ -806,6 +851,70 @@ mod tests {
             status,
             Some(SopRunStatus::WaitingApproval),
             "the gate stays waiting after a broker-rejected authoring decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoring_decide_rejects_run_id_from_different_sop_before_broker_resolution() {
+        let token = "member-token";
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_a = authoring_checkpoint_sop("deploy-a");
+        let sop_b = authoring_checkpoint_sop("deploy-b");
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop_a).unwrap();
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop_b).unwrap();
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop_a, sop_b]);
+        let action = engine
+            .start_run(
+                "deploy-b",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected CheckpointWait, got {other:?}"),
+        };
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+
+        let resp = handle_sop_decide(
+            State(state.clone()),
+            bearer(token),
+            Path(("deploy-a".to_string(), run_id.clone())),
+            Json(serde_json::json!("approve")),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a path SOP must not resolve a run owned by another SOP"
+        );
+        let guard = state.sop_engine.as_ref().unwrap().lock().unwrap();
+        let run = guard.get_run(&run_id).expect("deploy-b run remains active");
+        assert_eq!(run.sop_name, "deploy-b");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "mismatched authoring decision must not append a gate_resolved row"
         );
     }
 }
