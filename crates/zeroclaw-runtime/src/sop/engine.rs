@@ -2681,25 +2681,31 @@ impl SopEngine {
         sop: &Sop,
         run_id: &str,
         step_number: u32,
+        input: &serde_json::Value,
     ) -> bool {
         let Some(run) = self.active_runs.get(run_id) else {
             return false;
         };
-        let Some(checkpoint_step_number) = run
+        let Some(checkpoint_result) = run
             .step_results
             .iter()
             .rev()
-            .find(|result| {
-                result.status == SopStepStatus::Completed
-                    && result.step_number < step_number
-                    && sop.steps.iter().any(|step| {
-                        step.number == result.step_number && step.kind == SopStepKind::Checkpoint
-                    })
-            })
-            .map(|result| result.step_number)
+            .find(|result| result.status == SopStepStatus::Completed)
         else {
             return false;
         };
+        let checkpoint_step_number = checkpoint_result.step_number;
+        if !sop.steps.iter().any(|step| {
+            step.number == checkpoint_step_number && step.kind == SopStepKind::Checkpoint
+        }) {
+            return false;
+        }
+        if checkpoint_step_number >= step_number {
+            return false;
+        }
+        if !forge_comment_input_matches_checkpoint_output(input, checkpoint_result) {
+            return false;
+        }
 
         self.run_events(run_id).is_ok_and(|events| {
             events.iter().any(|event| {
@@ -2725,13 +2731,19 @@ impl SopEngine {
         input: serde_json::Value,
     ) -> Result<SopRunAction> {
         let started_at = now_iso8601();
+        let capability_input = step.capability_call_input(input.clone());
         if step.capability_id() == Some("forge.comment")
-            && !self.forge_comment_authorized_by_prior_checkpoint(sop, run_id, step.number)
+            && !self.forge_comment_authorized_by_prior_checkpoint(
+                sop,
+                run_id,
+                step.number,
+                &capability_input,
+            )
         {
             self.metrics.record_capability_executed(&sop.name);
             let completed_at = Some(now_iso8601());
             let error =
-                "forge.comment requires a completed, ledger-audited checkpoint before execution"
+                "forge.comment requires the immediately preceding checkpoint to approve the exact repo, number, and body"
                     .to_string();
             return self.record_deterministic_step_result(
                 run_id,
@@ -4061,6 +4073,46 @@ fn retry_input_value(run: &SopRun, step_number: u32) -> Value {
 
 fn step_result_value(result: &SopStepResult) -> Value {
     jsonish_value(&result.output)
+}
+
+fn forge_comment_input_matches_checkpoint_output(
+    input: &Value,
+    checkpoint_result: &SopStepResult,
+) -> bool {
+    let Some((repo, number, body)) = forge_comment_target(input) else {
+        return false;
+    };
+    let approved = step_result_value(checkpoint_result);
+    let Some(approved) = approved.as_object() else {
+        return false;
+    };
+    let approved_repo = approved
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty());
+    let approved_number = approved.get("number").and_then(Value::as_u64);
+    let approved_body = approved.get("body").and_then(Value::as_str);
+
+    approved_repo == Some(repo) && approved_number == Some(number) && approved_body == Some(body)
+}
+
+fn forge_comment_target(input: &Value) -> Option<(&str, u64, &str)> {
+    let src = input
+        .get("input")
+        .filter(|value| value.is_object())
+        .unwrap_or(input);
+    let repo = src
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())?;
+    let number = src.get("number").and_then(Value::as_u64)?;
+    let body = src
+        .get("body")
+        .and_then(Value::as_str)
+        .filter(|body| !body.trim().is_empty())?;
+    Some((repo, number, body))
 }
 
 fn jsonish_value(raw: &str) -> Value {
@@ -8621,6 +8673,42 @@ type = "manual"
         }
     }
 
+    struct MutatesForgePayload;
+
+    impl super::super::capability::SopCapability for MutatesForgePayload {
+        fn id(&self) -> &'static str {
+            "mutate.forge"
+        }
+
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "Change the approved forge comment body",
+                deterministic: true,
+                idempotent: true,
+                reversible: false,
+                supports_retry: false,
+                required_permissions: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: super::super::capability::CapabilityContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<super::super::capability::CapabilityResult> {
+            Ok(super::super::capability::CapabilityResult::success(
+                serde_json::json!({
+                    "repo": "o/r",
+                    "number": 7,
+                    "body": "mutated after approval",
+                }),
+            ))
+        }
+    }
+
     fn forge_comment_registry(
         calls: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Arc<SopCapabilityRegistry> {
@@ -8631,6 +8719,35 @@ type = "manual"
             adapter,
         )));
         Arc::new(registry)
+    }
+
+    fn forge_comment_registry_with_mutator(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<SopCapabilityRegistry> {
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(MutatesForgePayload);
+        let adapter: Arc<dyn super::super::capability::ForgeCommentAdapter> =
+            Arc::new(CountingForgeCommentAdapter { calls });
+        registry.register(super::super::capability::ForgeCommentCapability::new(Some(
+            adapter,
+        )));
+        Arc::new(registry)
+    }
+
+    fn forge_comment_event() -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: Some(
+                serde_json::json!({
+                    "repo": "o/r",
+                    "number": 7,
+                    "body": "triage approved",
+                })
+                .to_string(),
+            ),
+            timestamp: now_iso8601(),
+        }
     }
 
     fn forge_comment_step(number: u32) -> SopStep {
@@ -8724,6 +8841,40 @@ type = "manual"
                     ..SopStep::default()
                 },
                 forge_comment_step(4),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn checkpoint_mutates_before_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> mutator -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Mutate approved body".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("mutate.forge".into()),
+                    ..SopStep::default()
+                },
+                forge_comment_step(3),
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
@@ -8852,7 +9003,7 @@ type = "manual"
             .expect("forge step result recorded");
         assert_eq!(result.status, SopStepStatus::Failed);
         assert!(
-            result.output.contains("ledger-audited checkpoint"),
+            result.output.contains("immediately preceding checkpoint"),
             "failure should name the missing authorization invariant: {result:?}"
         );
     }
@@ -8863,7 +9014,9 @@ type = "manual"
         let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-approved")])
             .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
 
-        let first = engine.start_run("forge-approved", manual_event()).unwrap();
+        let first = engine
+            .start_run("forge-approved", forge_comment_event())
+            .unwrap();
         assert!(
             matches!(first, SopRunAction::CheckpointWait { .. }),
             "forge run must park at the checkpoint before writing: {first:?}"
@@ -8905,6 +9058,61 @@ type = "manual"
     }
 
     #[test]
+    fn forge_comment_rejects_payload_mutated_after_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_mutates_before_forge_comment_sop(
+            "forge-mutated",
+        )])
+        .with_capabilities(forge_comment_registry_with_mutator(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-mutated", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the checkpoint before any forge write: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Failed { .. }),
+            "mutated forge payload must require a new checkpoint: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not run after an intervening capability changes the approved body"
+        );
+        let run = engine
+            .last_finished_run("forge-mutated")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 3)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("exact repo, number, and body"),
+            "failure should name the exact payload invariant: {result:?}"
+        );
+    }
+
+    #[test]
     fn forge_comment_rejects_stale_ledger_from_prior_checkpoint() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut engine =
@@ -8912,7 +9120,7 @@ type = "manual"
                 .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
 
         let first = engine
-            .start_run("forge-stale-ledger", manual_event())
+            .start_run("forge-stale-ledger", forge_comment_event())
             .unwrap();
         assert!(
             matches!(first, SopRunAction::CheckpointWait { .. }),
@@ -8975,7 +9183,7 @@ type = "manual"
             .expect("forge step result recorded");
         assert_eq!(result.status, SopStepStatus::Failed);
         assert!(
-            result.output.contains("ledger-audited checkpoint"),
+            result.output.contains("immediately preceding checkpoint"),
             "failure should name the missing checkpoint-specific ledger row: {result:?}"
         );
     }

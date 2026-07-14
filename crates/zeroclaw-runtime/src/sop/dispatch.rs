@@ -85,6 +85,12 @@ fn action_label(action: &SopRunAction) -> &'static str {
 
 // ── Core dispatch ───────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DispatchStartMode {
+    Incremental,
+    AllOrNothing,
+}
+
 /// Dispatch an incoming event to the SOP engine.
 ///
 /// Pattern (batch lock — exactly 2 acquisitions):
@@ -96,7 +102,7 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, None).await
+    dispatch_sop_event_filtered(engine, audit, event, None, DispatchStartMode::Incremental).await
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
@@ -109,7 +115,14 @@ pub async fn dispatch_sop_event_to(
     event: SopEvent,
     target_sop: &str,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop)).await
+    dispatch_sop_event_filtered(
+        engine,
+        audit,
+        event,
+        Some(target_sop),
+        DispatchStartMode::Incremental,
+    )
+    .await
 }
 
 async fn dispatch_sop_event_filtered(
@@ -117,6 +130,7 @@ async fn dispatch_sop_event_filtered(
     audit: &SopAuditLogger,
     event: SopEvent,
     target_sop: Option<&str>,
+    start_mode: DispatchStartMode,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -234,6 +248,89 @@ async fn dispatch_sop_event_filtered(
                 return vec![];
             }
         };
+
+        if start_mode == DispatchStartMode::AllOrNothing {
+            let preflight: Vec<(String, SopAdmission)> = matched_names
+                .iter()
+                .map(|sop_name| (sop_name.clone(), eng.evaluate_admission(sop_name)))
+                .collect();
+            if preflight
+                .iter()
+                .any(|(_, admission)| matches!(admission, SopAdmission::Defer { .. }))
+            {
+                for (sop_name, admission) in preflight {
+                    match admission {
+                        SopAdmission::Defer { reason } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!(
+                                    "SOP dispatch: deferred '{sop_name}' (backpressure): {reason}"
+                                )
+                            );
+                            results.push(DispatchResult::Deferred { sop_name, reason });
+                        }
+                        SopAdmission::Admit => {
+                            let reason = "same delivery contains a deferred SOP; withholding start for all-or-nothing redelivery".to_string();
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!(
+                                    "SOP dispatch: withheld '{sop_name}' for all-or-nothing redelivery: {reason}"
+                                )
+                            );
+                            results.push(DispatchResult::Deferred { sop_name, reason });
+                        }
+                        SopAdmission::Coalesce { existing_run_id } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "existing_run_id": existing_run_id
+                                })),
+                                &format!(
+                                    "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
+                                )
+                            );
+                            results.push(DispatchResult::Coalesced {
+                                sop_name,
+                                existing_run_id,
+                            });
+                        }
+                        SopAdmission::Drop { reason } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                            );
+                            results.push(DispatchResult::Skipped { sop_name, reason });
+                        }
+                    }
+                }
+                return results;
+            }
+        }
 
         for sop_name in &matched_names {
             // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
@@ -543,6 +640,46 @@ pub async fn dispatch_untrusted_fan_in(
     topic: Option<&str>,
     payload: Option<&str>,
 ) -> Vec<DispatchResult> {
+    dispatch_untrusted_fan_in_with_mode(
+        engine,
+        audit,
+        source,
+        topic,
+        payload,
+        DispatchStartMode::Incremental,
+    )
+    .await
+}
+
+/// AMQP SOP-only fan-in must be all-or-nothing at the broker-delivery level:
+/// if one matched SOP is backpressured, no sibling SOP from the same delivery is
+/// started before the delivery is nacked/requeued.
+pub async fn dispatch_untrusted_fan_in_all_or_nothing(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+) -> Vec<DispatchResult> {
+    dispatch_untrusted_fan_in_with_mode(
+        engine,
+        audit,
+        source,
+        topic,
+        payload,
+        DispatchStartMode::AllOrNothing,
+    )
+    .await
+}
+
+async fn dispatch_untrusted_fan_in_with_mode(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+    start_mode: DispatchStartMode,
+) -> Vec<DispatchResult> {
     let max_bytes = match engine.lock() {
         Ok(eng) => eng.config().untrusted_payload_max_bytes,
         Err(e) => {
@@ -594,7 +731,7 @@ pub async fn dispatch_untrusted_fan_in(
         payload,
         timestamp: now_iso8601(),
     };
-    let results = dispatch_sop_event(engine, audit, event).await;
+    let results = dispatch_sop_event_filtered(engine, audit, event, None, start_mode).await;
     process_headless_results(&results);
     results
 }
