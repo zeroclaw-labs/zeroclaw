@@ -10661,7 +10661,7 @@ pub async fn start_channels(
 
             println!("🦀 ZeroClaw Channel Server");
             println!("  🤖 Model:    {model} (agent: {agent_alias})");
-            let effective_backend = config.resolve_active_storage().kind();
+            let effective_backend = config.effective_memory_label();
             println!(
                 "  🧠 Memory:   {} (auto-save: {})",
                 effective_backend,

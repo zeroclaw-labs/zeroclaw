@@ -38,7 +38,7 @@ pub fn render_zone(root: &Path) -> anyhow::Result<String> {
     // building each binary with --no-default-features --features <list>. Users
     // override with `.override { features = [ ... ]; }`.
     let lines = [
-        "        # Default feature set: canonical lean Dist.".to_string(),
+        "        # Default feature set: canonical Dist (all channels, no heavyweight).".to_string(),
         "        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.".to_string(),
         format!("        zeroclawDefaultFeatures = [ {feature_list} ];"),
         "        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:"
@@ -121,11 +121,10 @@ mod tests {
     }
 
     #[test]
-    fn zone_default_is_lean_dist() {
+    fn zone_default_is_dist_channels_no_heavyweight() {
         let z = render_zone(&root()).unwrap();
-        assert!(z.contains("\"channel-matrix\""));
-        assert!(z.contains("\"whatsapp-web\""));
-        assert!(!z.contains("\"channel-slack\""));
+        assert!(z.contains("\"channel-discord\""), "dist ships all channels");
+        assert!(!z.contains("\"hardware\""), "dist excludes heavyweight");
     }
 
     #[test]

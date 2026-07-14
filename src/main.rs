@@ -581,7 +581,7 @@ enum Commands {
         #[arg(long, hide = true)]
         model: Option<String>,
 
-        /// Memory backend (sqlite, lucid, markdown, none).
+        /// Authoritative memory backend (sqlite, postgres, qdrant, markdown, none).
         #[arg(long, hide = true)]
         memory: Option<String>,
 
@@ -1828,17 +1828,16 @@ async fn run_quickstart_cli(
                 }
             }
             Action::Memory => {
-                // Schema-derived list — six variants today, more as
+                // Schema-derived list — seven variants today, more as
                 // soon as someone adds them to
                 // `zeroclaw_config::multi_agent::MemoryBackendKind`.
                 // The exhaustive `match` here keeps the variant
                 // array honest at compile time.
-                let kinds: [MemoryChoice; 6] = [
+                let kinds: [MemoryChoice; 5] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
                     MemoryChoice::Postgres,
                     MemoryChoice::Qdrant,
-                    MemoryChoice::Lucid,
                     MemoryChoice::None,
                 ];
                 #[allow(clippy::no_effect_underscore_binding)]
@@ -1847,7 +1846,6 @@ async fn run_quickstart_cli(
                     | MemoryChoice::Markdown
                     | MemoryChoice::Postgres
                     | MemoryChoice::Qdrant
-                    | MemoryChoice::Lucid
                     | MemoryChoice::None => (),
                 };
                 let labels: Vec<String> = kinds
@@ -4564,7 +4562,7 @@ async fn main() -> Result<()> {
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
             }
-            let effective_memory_backend = config.resolve_active_storage().kind();
+            let effective_memory_backend = config.effective_memory_label();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -4585,7 +4583,7 @@ async fn main() -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            let memory_backend = effective_memory_backend;
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {

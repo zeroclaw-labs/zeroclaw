@@ -435,6 +435,10 @@ fn section_ready(cfg: &zeroclaw_config::schema::Config, key: &str, completed_mar
             .prop_fields()
             .iter()
             .any(|field| field.name.starts_with("storage.")),
+        Some(Section::MemoryEnrichment) => cfg
+            .prop_fields()
+            .iter()
+            .any(|field| field.name.starts_with("memory_enrichment.")),
         Some(Section::Memory) => completed_marker,
         Some(Section::Agents) => cfg.agents.iter().any(|(alias, agent)| {
             quickstart_agent_missing_requirements(cfg, alias, agent).is_empty()
@@ -578,6 +582,7 @@ fn picker_items_for(
         // Storage is two-tier (`storage.<kind>.<alias>`) — same shape
         // and walker as channels and the typed-provider families.
         Section::Storage => PickerDispatch::Items(storage_picker(cfg)),
+        Section::MemoryEnrichment => PickerDispatch::Items(memory_enrichment_picker(cfg)),
         // OneTierAliasMap explorer sections: pick a key from the live
         // HashMap. Generic walker covers every section whose schema is
         // `<section>.<alias>` (operator-named keys, no closed kind set).
@@ -690,7 +695,6 @@ fn storage_rank(key: &str) -> usize {
         "postgres" => 1,
         "qdrant" => 2,
         "markdown" => 3,
-        "lucid" => 4,
         _ => 99,
     }
 }
@@ -709,11 +713,28 @@ fn storage_description(key: &str) -> Option<&'static str> {
         "markdown" => {
             Some("Human-readable files with simple local storage and no database service.")
         }
-        "lucid" => {
-            Some("Bridge to local lucid-memory CLI while keeping SQLite-style local operation.")
-        }
         _ => None,
     }
+}
+
+fn memory_enrichment_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    let mut items = schema_walk_picker(cfg, "memory_enrichment");
+    for item in &mut items {
+        item.description = match item.key.as_str() {
+            "lucid" => Some(
+                "Local lucid-memory CLI connector with best-effort derived context.".to_string(),
+            ),
+            _ => None,
+        };
+        if item.badge.as_deref() == Some("configured") {
+            item.badge = Some("created".to_string());
+        }
+    }
+    items.sort_by_key(|item| match item.key.as_str() {
+        "lucid" => 0,
+        _ => 99,
+    });
+    items
 }
 
 fn memory_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
@@ -1141,9 +1162,8 @@ pub async fn handle_section_select(
         Section::Storage => {
             // Two-tier typed-family (`storage.<kind>.<alias>`) — same
             // shape and selection flow as model_providers / tts_providers /
-            // transcription_providers. Outer bucket is the storage kind
-            // (sqlite, postgres, qdrant, markdown, lucid); inner key is
-            // the operator-named alias.
+            // transcription_providers. Outer bucket is the authoritative
+            // storage kind; inner key is the operator-named alias.
             let created = working
                 .create_map_key(&format!("storage.{key}"), &alias)
                 .map_err(|msg| {
@@ -1161,6 +1181,24 @@ pub async fn handle_section_select(
             };
             mark_section_completed(&mut working, "storage");
             (format!("storage.{key}.{alias}"), created)
+        }
+        Section::MemoryEnrichment => {
+            let parent = format!("memory_enrichment.{key}");
+            let created = working.create_map_key(&parent, &alias).map_err(|msg| {
+                error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::PathNotFound,
+                        format!("could not select memory enricher `{key}` alias `{alias}`: {msg}"),
+                    )
+                    .with_path(&parent),
+                )
+            });
+            let created = match created {
+                Ok(created) => created,
+                Err(response) => return response,
+            };
+            mark_section_completed(&mut working, "memory_enrichment");
+            (format!("memory_enrichment.{key}.{alias}"), created)
         }
         Section::Memory => {
             // Set memory.backend to the picked key. Fields_prefix points at
@@ -1919,6 +1957,7 @@ mod tests {
             Section::Agents,
             Section::PeerGroups,
             Section::Storage,
+            Section::MemoryEnrichment,
             Section::Cron,
             Section::Mcp,
             Section::McpBundles,
@@ -1949,20 +1988,15 @@ mod tests {
 
     /// Storage is `[storage.<kind>.<alias>]` — two-tier typed-family
     /// shape, served by the storage picker. The picker
-    /// surfaces the 5 storage kinds (sqlite, postgres, qdrant,
-    /// markdown, lucid) regardless of which aliases exist, and badges
+    /// surfaces the real storage kinds (sqlite, postgres, qdrant, markdown)
+    /// regardless of which aliases exist, and badges
     /// the kind `created` once any alias under it is created.
     #[test]
     fn storage_picker_lists_all_kinds_and_marks_created() {
         let cfg = empty_cfg();
         let items = storage_picker(&cfg);
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        for expected in ["sqlite", "postgres", "qdrant", "markdown", "lucid"] {
-            assert!(
-                keys.contains(&expected),
-                "storage picker must list `{expected}`, got: {keys:?}",
-            );
-        }
+        assert_eq!(keys, ["sqlite", "postgres", "qdrant", "markdown"]);
         // Fresh config — no kind should be badged.
         assert!(
             items.iter().all(|i| i.badge.is_none()),
@@ -1983,6 +2017,26 @@ mod tests {
         assert!(
             sqlite.description.is_some(),
             "storage picker should explain each backend tradeoff",
+        );
+    }
+
+    #[test]
+    fn memory_enrichment_picker_is_one_surface_with_connector_choices() {
+        let mut cfg = empty_cfg();
+        let items = memory_enrichment_picker(&cfg);
+        let keys: Vec<&str> = items.iter().map(|item| item.key.as_str()).collect();
+        assert_eq!(keys, ["lucid"]);
+        assert!(items.iter().all(|item| item.badge.is_none()));
+
+        cfg.create_map_key("memory_enrichment.lucid", "local")
+            .expect("canonical Lucid alias must be creatable");
+        let items = memory_enrichment_picker(&cfg);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.key == "lucid")
+                .and_then(|item| item.badge.as_deref()),
+            Some("created")
         );
     }
 }

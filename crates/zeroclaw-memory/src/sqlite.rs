@@ -959,6 +959,19 @@ impl SqliteMemory {
     pub fn embedder_dimensions(&self) -> usize {
         self.embedder.read().dimensions()
     }
+
+    /// Resolve a human agent alias without creating a new identity row.
+    pub(crate) async fn find_agent_uuid(&self, alias: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.clone();
+        let alias = alias.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare("SELECT id FROM agents WHERE alias = ?1 LIMIT 1")?;
+            let mut rows = stmt.query(params![alias])?;
+            Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
+        })
+        .await?
+    }
 }
 
 #[async_trait]

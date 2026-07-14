@@ -404,12 +404,11 @@ fn memory_options() -> Vec<PickerOption> {
     // schema additions are caught at compile time because
     // `MemoryKind` is a public re-export and a `match` exhaustiveness
     // check below would fail to compile if a variant were dropped.
-    let variants: [MemoryKind; 6] = [
+    let variants: [MemoryKind; 5] = [
         MemoryKind::Sqlite,
         MemoryKind::Markdown,
         MemoryKind::Postgres,
         MemoryKind::Qdrant,
-        MemoryKind::Lucid,
         MemoryKind::None,
     ];
     // Compile-time exhaustiveness check: adding a new variant to
@@ -421,7 +420,6 @@ fn memory_options() -> Vec<PickerOption> {
         | MemoryKind::Markdown
         | MemoryKind::Postgres
         | MemoryKind::Qdrant
-        | MemoryKind::Lucid
         | MemoryKind::None => (),
     };
     variants

@@ -73,6 +73,7 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
         &config.memory,
         &config.embedding_routes,
         config.resolve_active_storage(),
+        config.resolve_active_enricher(),
         &config.data_dir,
         None,
         Some(&config.providers.models),
@@ -328,7 +329,7 @@ fn unsupported_clear_backend_message(backend: &str) -> String {
     #[cfg(not(feature = "agent-runtime"))]
     {
         format!(
-            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
+            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite or postgres)"
         )
     }
 }

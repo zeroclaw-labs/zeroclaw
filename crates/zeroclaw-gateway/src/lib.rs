@@ -756,6 +756,7 @@ pub async fn run_gateway(
             &config.memory,
             &config.embedding_routes,
             config.resolve_active_storage(),
+            config.resolve_active_enricher(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
             Some(&config.providers.models),

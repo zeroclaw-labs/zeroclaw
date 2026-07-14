@@ -1228,22 +1228,7 @@ pub async fn run(
             )
         })?
         .clone();
-    let memory_composite = {
-        use zeroclaw_config::multi_agent::MemoryBackendKind;
-        match agent.memory.backend {
-            MemoryBackendKind::Markdown => format!("markdown.{agent_alias}"),
-            MemoryBackendKind::None => "none".to_string(),
-            _ => {
-                let raw = config.memory.backend.trim();
-                if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
-                    "none".to_string()
-                } else {
-                    let (kind, alias) = raw.split_once('.').unwrap_or((raw, "default"));
-                    format!("{kind}.{alias}")
-                }
-            }
-        }
-    };
+    let memory_composite = config.memory_backend_ref_for_agent(agent_alias)?;
     let __zc_alias = agent_alias.to_string();
     let __zc_attribution_span =
         ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(__zc_alias.as_str()));
@@ -2903,22 +2888,7 @@ pub async fn process_message(
             )
         })?
         .clone();
-    let memory_composite = {
-        use zeroclaw_config::multi_agent::MemoryBackendKind;
-        match agent.memory.backend {
-            MemoryBackendKind::Markdown => format!("markdown.{agent_alias}"),
-            MemoryBackendKind::None => "none".to_string(),
-            _ => {
-                let raw = config.memory.backend.trim();
-                if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
-                    "none".to_string()
-                } else {
-                    let (kind, alias) = raw.split_once('.').unwrap_or((raw, "default"));
-                    format!("{kind}.{alias}")
-                }
-            }
-        }
-    };
+    let memory_composite = config.memory_backend_ref_for_agent(agent_alias)?;
     let __zc_alias = agent_alias.to_string();
     let __zc_message = message.to_string();
     let __zc_session_id = session_id.map(str::to_string);
