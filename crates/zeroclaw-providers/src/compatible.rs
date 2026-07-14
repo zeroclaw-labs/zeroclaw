@@ -438,6 +438,11 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.supports_vision = vision;
+        self
+    }
+
     /// Set extra HTTP headers to include in all API requests.
     pub fn with_extra_headers(
         mut self,

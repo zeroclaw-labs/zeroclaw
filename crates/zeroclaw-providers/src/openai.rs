@@ -927,12 +927,7 @@ pub struct OpenAiResponsesModelProvider {
 }
 
 impl OpenAiResponsesModelProvider {
-    pub fn new(
-        alias: &str,
-        api_url: Option<&str>,
-        credential: Option<&str>,
-        vision: Option<bool>,
-    ) -> Self {
+    pub fn new(alias: &str, api_url: Option<&str>, credential: Option<&str>) -> Self {
         let responses_url = api_url
             .map(|url| {
                 let trimmed = url.trim_end_matches('/');
@@ -951,8 +946,13 @@ impl OpenAiResponsesModelProvider {
             reasoning_effort: None,
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
-            supports_vision: vision.unwrap_or(false),
+            supports_vision: false,
         }
+    }
+
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.supports_vision = vision;
+        self
     }
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
@@ -1346,18 +1346,14 @@ mod tests {
 
     #[test]
     fn responses_url_appends_responses_to_custom_base() {
-        let p = OpenAiResponsesModelProvider::new(
-            "opencode",
-            Some("https://opencode.ai/zen/v1"),
-            None,
-            None,
-        );
+        let p =
+            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
         assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
     }
 
     #[test]
     fn responses_url_defaults_to_openai_when_base_absent() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None);
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
         assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
@@ -1378,7 +1374,7 @@ mod tests {
 
     #[test]
     fn responses_provider_defaults_timeout_to_120() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None);
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
         assert_eq!(
             p.timeout_secs, 120,
             "fresh provider must default timeout_secs to 120 (matches OpenAiCompatibleModelProvider)"
@@ -1387,7 +1383,7 @@ mod tests {
 
     #[test]
     fn responses_provider_defaults_extra_headers_to_empty() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None);
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
         assert!(
             p.extra_headers.is_empty(),
             "fresh provider must default extra_headers to an empty HashMap"
@@ -1396,7 +1392,7 @@ mod tests {
 
     #[test]
     fn with_timeout_secs_overrides_default() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None).with_timeout_secs(45);
+        let p = OpenAiResponsesModelProvider::new("test", None, None).with_timeout_secs(45);
         assert_eq!(
             p.timeout_secs, 45,
             "with_timeout_secs must override the 120 default"
@@ -1411,8 +1407,7 @@ mod tests {
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p =
-            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
         assert_eq!(
             p.extra_headers.len(),
             2,
@@ -1432,7 +1427,7 @@ mod tests {
 
     #[test]
     fn build_default_headers_is_empty_when_no_extra_headers() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None, None);
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
         let headers = p.build_default_headers();
         assert!(
             headers.is_empty(),
@@ -1448,8 +1443,7 @@ mod tests {
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p =
-            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1478,8 +1472,7 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X Valid".to_string(), "ok".to_string()); // space → invalid
         headers.insert("X-Also-Valid".to_string(), "ok".to_string());
-        let p =
-            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1500,8 +1493,7 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Bad-Value".to_string(), "has\0nul".to_string()); // NUL → invalid
         headers.insert("X-Good-Value".to_string(), "ok".to_string());
-        let p =
-            OpenAiResponsesModelProvider::new("test", None, None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1544,7 +1536,7 @@ mod tests {
             "Authorization".to_string(),
             "Bearer operator-override".to_string(),
         );
-        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None, None)
+        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
             .with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert!(
@@ -1571,7 +1563,7 @@ mod tests {
         ] {
             let mut headers = std::collections::HashMap::new();
             headers.insert(variant.to_string(), "Bearer x".to_string());
-            let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None, None)
+            let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
                 .with_extra_headers(headers);
             let default_headers = p.build_default_headers();
             assert!(
@@ -1604,7 +1596,7 @@ mod tests {
             "https://example.com".to_string(),
         );
         headers.insert("X-Trace-Id".to_string(), "trace-123".to_string());
-        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None, None)
+        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
             .with_extra_headers(headers);
         let default_headers = p.build_default_headers();
         assert_eq!(
@@ -2208,8 +2200,8 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_max_tokens_when_set() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None)
-            .with_max_tokens(Some(2048));
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(2048));
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2229,7 +2221,7 @@ mod tests {
 
     #[test]
     fn responses_request_omits_max_tokens_when_unset() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None);
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
         assert!(
             provider.max_tokens.is_none(),
             "fresh provider must default max_tokens to None"
@@ -2255,7 +2247,7 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_reasoning_effort_when_set() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None)
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None)
             .with_reasoning_effort(Some("high".to_string()));
         let req = provider.build_request(
             None,
@@ -2278,7 +2270,7 @@ mod tests {
 
     #[test]
     fn responses_request_omits_reasoning_when_unset() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None);
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
         assert!(
             provider.reasoning_effort.is_none(),
             "fresh provider must default reasoning_effort to None"
@@ -2304,12 +2296,8 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_instructions_and_temperature_and_model() {
-        let provider = OpenAiResponsesModelProvider::new(
-            "openai",
-            Some("https://api.example.test/v1"),
-            None,
-            None,
-        );
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None);
         let req = provider.build_request(
             Some("You are a careful assistant.".to_string()),
             vec![serde_json::json!({"role": "user", "content": "summarize"})],
@@ -2343,8 +2331,8 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None)
-            .with_max_tokens(Some(1024));
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(1024));
         let tools = Some(vec![ResponsesToolSpec {
             kind: "function".to_string(),
             name: "lookup_weather".to_string(),
@@ -2390,7 +2378,7 @@ mod tests {
 
     #[test]
     fn responses_request_omits_tool_choice_and_parallel_when_tools_absent() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None);
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2420,7 +2408,7 @@ mod tests {
 
     #[test]
     fn responses_request_omits_tool_choice_and_parallel_when_tools_empty() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None);
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2458,7 +2446,7 @@ mod tests {
 
     #[test]
     fn responses_provider_capabilities_with_vision_enabled() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, Some(true));
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None).with_vision(true);
         let caps = provider.capabilities();
         assert!(
             caps.vision,
@@ -2468,7 +2456,7 @@ mod tests {
 
     #[test]
     fn responses_provider_capabilities_with_vision_disabled() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, Some(false));
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None).with_vision(false);
         let caps = provider.capabilities();
         assert!(
             !caps.vision,
@@ -2478,7 +2466,7 @@ mod tests {
 
     #[test]
     fn responses_provider_capabilities_defaults_to_false_for_unknown_models() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None);
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
         let caps = provider.capabilities();
         assert!(
             !caps.vision,

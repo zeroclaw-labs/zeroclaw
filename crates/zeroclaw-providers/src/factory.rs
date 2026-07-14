@@ -202,6 +202,9 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         p = p.without_assistant_reasoning_replay();
     }
+    if let Some(v) = opts.vision {
+        p = p.with_vision(v);
+    }
     if let Some(extra) = &opts.provider_extra {
         if extra.is_object() {
             p = p.with_extra_body(extra.clone());
@@ -240,7 +243,10 @@ fn build_responses_provider_if_requested(
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
-    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key, opts.vision);
+    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key);
+    if let Some(v) = opts.vision {
+        p = p.with_vision(v);
+    }
     if let Some(t) = opts.provider_timeout_secs {
         p = p.with_timeout_secs(t);
     }
@@ -2336,5 +2342,110 @@ mod tests {
 
         let paths = capture.lock().expect("capture lock poisoned").clone();
         assert_eq!(paths, vec!["/zen/v1/responses".to_string()]);
+    }
+
+    #[test]
+    fn responses_provider_vision_override_true_through_factory() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let opts = ModelProviderRuntimeOptions {
+            vision: Some(true),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider("vision-test", Some("sk-key"), None, &opts)
+            .unwrap();
+        assert!(
+            provider.capabilities().vision,
+            "Responses provider should report vision=true when opts.vision = Some(true)"
+        );
+    }
+
+    #[test]
+    fn responses_provider_vision_disabled_through_factory() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let opts = ModelProviderRuntimeOptions {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider("vision-test", Some("sk-key"), None, &opts)
+            .unwrap();
+        assert!(
+            !provider.capabilities().vision,
+            "Responses provider should report vision=false when opts.vision = Some(false)"
+        );
+    }
+
+    #[test]
+    fn responses_provider_vision_defaults_to_false_through_factory() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "vision-test",
+                Some("sk-key"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            !provider.capabilities().vision,
+            "Responses provider should default vision=false when opts.vision = None"
+        );
+    }
+
+    #[test]
+    fn compat_provider_vision_override_through_shared_apply_compat_options() {
+        let cfg = ModelProviderConfig {
+            vision: Some(true),
+            ..Default::default()
+        };
+        let opts = ModelProviderRuntimeOptions {
+            vision: Some(true),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "compat-test",
+                Some("sk-key"),
+                Some("https://api.example.test/v1"),
+                &opts,
+            )
+            .unwrap();
+        assert!(
+            provider.capabilities().vision,
+            "OpenAI-compatible provider should report vision=true when overridden via apply_compat_options"
+        );
+    }
+
+    #[test]
+    fn compat_provider_vision_not_overridden_when_none() {
+        let cfg = ModelProviderConfig::default();
+        let provider = cfg
+            .create_provider(
+                "compat-test",
+                Some("sk-key"),
+                Some("https://api.example.test/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            provider.capabilities().vision,
+            "OpenAI-compatible provider should keep its family-default vision=true when opts.vision = None"
+        );
     }
 }
