@@ -353,7 +353,6 @@ queue_poll_ms = 200
 open_skills_enabled = false
 trusted_skill_roots = []
 allow_scripts = false
-prompt_injection_mode = "full"
 
 [query_classification]
 enabled = false
