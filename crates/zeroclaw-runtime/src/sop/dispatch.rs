@@ -465,6 +465,14 @@ async fn dispatch_sop_event_filtered(
                 }
             }
         }
+
+        suppress_redelivery_after_partial_all_or_nothing_start(
+            start_mode,
+            results
+                .iter()
+                .any(|result| matches!(result, DispatchResult::Started { .. })),
+            &mut results,
+        );
     } // lock dropped
 
     // Phase 3: audit (async, no lock)
@@ -622,6 +630,41 @@ pub fn results_need_redelivery(results: &[DispatchResult]) -> bool {
     results
         .iter()
         .any(|r| matches!(r, DispatchResult::Deferred { .. }))
+}
+
+/// A preflight admission is all-or-nothing only until the authoritative starts
+/// execute. If a later admission/CAS race fails after a sibling already started,
+/// requeueing the broker delivery would execute that sibling twice. Record the
+/// late result as handled instead, while preserving normal redelivery when no
+/// sibling started.
+fn suppress_redelivery_after_partial_all_or_nothing_start(
+    start_mode: DispatchStartMode,
+    has_started: bool,
+    results: &mut [DispatchResult],
+) {
+    if start_mode != DispatchStartMode::AllOrNothing || !has_started {
+        return;
+    }
+
+    for result in results {
+        let DispatchResult::Deferred { sop_name, reason } = result else {
+            continue;
+        };
+        let sop_name = sop_name.clone();
+        let reason = std::mem::take(reason);
+        let reason = format!(
+            "late all-or-nothing admission failure after a sibling started; \
+             suppressing broker redelivery to avoid duplicate sibling work: {reason}"
+        );
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason})),
+            "SOP dispatch: acknowledging a partially started all-or-nothing delivery"
+        );
+        *result = DispatchResult::Skipped { sop_name, reason };
+    }
 }
 
 /// Headless fan-in chokepoint for untrusted external events (channel
@@ -1768,6 +1811,34 @@ mod tests {
         assert!(
             !results_need_redelivery(&handled),
             "Skipped/Coalesced/NoMatch were all handled and must be acked"
+        );
+    }
+
+    #[test]
+    fn all_or_nothing_late_defer_after_a_sibling_start_is_acked() {
+        // Models the second authoritative start losing a late admission/CAS race
+        // after an earlier sibling has started. Requeueing this broker delivery
+        // would repeat the first sibling, so it must be acknowledged.
+        let mut results = vec![DispatchResult::Deferred {
+            sop_name: "second".into(),
+            reason: "shared execution capacity was claimed".into(),
+        }];
+
+        suppress_redelivery_after_partial_all_or_nothing_start(
+            DispatchStartMode::AllOrNothing,
+            true,
+            &mut results,
+        );
+
+        assert!(
+            matches!(&results[0], DispatchResult::Skipped { sop_name, reason }
+                if sop_name == "second" && reason.contains("suppressing broker redelivery")),
+            "the late sibling must be marked handled, got {:?}",
+            results[0]
+        );
+        assert!(
+            !results_need_redelivery(&results),
+            "a partially started all-or-nothing delivery must be acked"
         );
     }
 

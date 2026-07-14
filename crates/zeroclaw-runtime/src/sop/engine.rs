@@ -566,6 +566,14 @@ impl SopEngine {
         saved
     }
 
+    /// Complete a durable park exactly once: release its exec claim and send the
+    /// approval request only after the snapshot can survive restart.
+    fn complete_durable_park(&mut self, run_id: &str) {
+        self.claims_pending_persist.remove(run_id);
+        self.release_claim_on_park(run_id);
+        self.notify_park_request(run_id);
+    }
+
     /// Park a run (WaitingApproval / PausedCheckpoint) and free its exec slot, but
     /// ONLY after the parked snapshot is durably persisted. If the persist fails,
     /// the claim is KEPT (fail closed): the run stays correctly counted against
@@ -577,8 +585,7 @@ impl SopEngine {
     /// the run is recoverable after a restart.
     fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) -> bool {
         if self.persist_active_checked(run_id) {
-            self.claims_pending_persist.remove(run_id);
-            self.release_claim_on_park(run_id);
+            self.complete_durable_park(run_id);
             true
         } else {
             // Track this run so `heartbeat_active_claims` keeps renewing its KEPT
@@ -617,7 +624,6 @@ impl SopEngine {
                 continue;
             };
             if self.persist_active_checked(&run_id) {
-                self.claims_pending_persist.remove(&run_id);
                 // Only release the claim if the run is STILL parked. The entry
                 // guards in `resolve_gate`/`approve_step`/`resume_deterministic_run`
                 // (`is_park_persist_pending`) already refuse to resume a run while
@@ -626,8 +632,9 @@ impl SopEngine {
                 // one of those guarded paths, its claim is now legitimately held
                 // by that transition and must NOT be released out from under it.
                 if !holds_exec_claim(status) {
-                    self.release_claim_on_park(&run_id);
-                    self.notify_park_request(&run_id);
+                    self.complete_durable_park(&run_id);
+                } else {
+                    self.claims_pending_persist.remove(&run_id);
                 }
             }
         }
@@ -1701,20 +1708,10 @@ impl SopEngine {
             }
         }
 
-        // A1: free the exec slot while the run waits on a human - but only AFTER
-        // the parked snapshot is durably persisted (else keep the claim, fail
-        // closed).
+        // A1: parking, claim release, and the out-of-band prompt are one durable
+        // transition. The helper notifies only after the snapshot is persisted.
         if parked_for_approval {
-            let persisted = self.persist_parked_snapshot_then_release_claim(run_id);
-            // EPIC G route delivery: if the parked step's policy names a
-            // `request_route`, deliver the approval request out-of-band (e.g. to a
-            // Discord ops channel) so an approver can act without watching the
-            // originating surface. Best-effort - the gate is already parked and
-            // durable; a delivery failure never affects it, and the approval still
-            // comes back through the normal HTTP/WS/tool -> broker path.
-            if persisted {
-                self.notify_park_request(run_id);
-            }
+            self.persist_parked_snapshot_then_release_claim(run_id);
         } else {
             self.persist_active(run_id);
         }
@@ -2130,9 +2127,11 @@ impl SopEngine {
     /// guidance framed as reviewer feedback, record the resolved ledger row, then
     /// replace the recorded draft, bump the gate revision, and re-present the gate.
     /// The run never leaves `PausedCheckpoint`: a failed re-draft keeps the OLD
-    /// draft parked and answerable AND writes no ledger row (the audit records
-    /// only revises that actually happened). The model call blocks under the
-    /// engine lock — the same tradeoff as a normal `llm.generate` step.
+    /// draft parked and answerable and writes no ledger row. If the successful
+    /// re-draft cannot be persisted after its ledger entry is recorded, it remains
+    /// fail-closed for retry and this method returns an error rather than reporting
+    /// `Revised` to the prompt owner. The model call blocks under the engine lock —
+    /// the same tradeoff as a normal `llm.generate` step.
     fn revise_checkpoint_draft(
         &mut self,
         run_id: &str,
@@ -2260,9 +2259,8 @@ impl SopEngine {
         }
 
         // Same park sequence as the original checkpoint: refresh the state file,
-        // durably persist the parked snapshot (releasing the claim taken above),
-        // then re-notify the approver with the new draft + new revision only after
-        // that parked state can be recovered.
+        // then durably persist the parked snapshot. The helper releases the claim
+        // and notifies the approver only after that state can be recovered.
         if let Err(e) = self.persist_deterministic_state(run_id, &sop) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2272,8 +2270,11 @@ impl SopEngine {
                 "SOP engine: revised state-file refresh failed (run store remains authoritative)"
             );
         }
-        if self.persist_parked_snapshot_then_release_claim(run_id) {
-            self.notify_park_request(run_id);
+        if !self.persist_parked_snapshot_then_release_claim(run_id) {
+            bail!(
+                "Run {run_id} revised draft is not durably parked yet; \
+                 keeping the prior prompt active until persistence succeeds"
+            );
         }
         Ok(())
     }
@@ -3491,18 +3492,10 @@ impl SopEngine {
 
                 // Mirror the paused checkpoint into the shared run store (alongside
                 // the deterministic state file) so a restart leaves a non-terminal
-                // row for restore_runs() to rehydrate. A1: free the exec slot while
-                // the run waits at the checkpoint - but only AFTER the parked
-                // snapshot is durably persisted (else keep the claim).
-                let persisted = self.persist_parked_snapshot_then_release_claim(run_id);
-                // EPIC G route delivery, checkpoint flavor: a checkpoint step that
-                // names a `policy` with a `request_route` notifies the approver
-                // out-of-band on park (e.g. a Discord ops channel), exactly like a
-                // `WaitApproval` gate. Best-effort after the parked state is
-                // durable; a delivery failure never affects it.
-                if persisted {
-                    self.notify_park_request(run_id);
-                }
+                // row for restore_runs() to rehydrate. The helper frees the exec
+                // slot and sends the approval request only after the parked snapshot
+                // is durable; a failure keeps the claim for maintenance retry.
+                self.persist_parked_snapshot_then_release_claim(run_id);
 
                 Ok(SopRunAction::CheckpointWait {
                     run_id: run_id.to_string(),
@@ -7742,6 +7735,11 @@ mod tests {
             self.fail_saves
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
+
+        fn fail_saves(&self) {
+            self.fail_saves
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl SopRunStore for FailingSaveStore {
@@ -10695,6 +10693,60 @@ type = "manual"
         assert_eq!(
             engine.last_finished_run("cp-revise-fail").unwrap().status,
             SopRunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn revise_does_not_report_success_until_its_parked_snapshot_persists() {
+        // A successful provider re-draft still cannot supersede the old prompt
+        // until the new gate state is recoverable. Inject the failure only after
+        // the original checkpoint has parked durably.
+        let store = Arc::new(FailingSaveStore::new());
+        store.allow_saves();
+        let mut engine =
+            revisable_checkpoint_engine("cp-revise-save-fail").with_store(store.clone());
+        let first = engine
+            .start_run("cp-revise-save-fail", manual_event())
+            .expect("start the revisable SOP");
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("park the original checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(store.claim_counts("cp-revise-save-fail").unwrap(), (0, 0));
+
+        store.fail_saves();
+        let result = engine.resolve_via_broker(
+            &run_id,
+            super::super::approval::ApprovalDecision::Revise {
+                guidance: "make it shorter".into(),
+            },
+            super::super::approval::ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            result.is_err(),
+            "a non-durable revised checkpoint must not return Resolved(Revised): {result:?}"
+        );
+        assert!(
+            engine.is_park_persist_pending(&run_id),
+            "the revised gate must remain fail-closed for its durable retry"
+        );
+        assert_eq!(
+            store.claim_counts("cp-revise-save-fail").unwrap(),
+            (1, 1),
+            "the revised checkpoint keeps its claim while its write is failing"
+        );
+
+        store.allow_saves();
+        engine.run_maintenance_tick();
+        assert!(
+            !engine.is_park_persist_pending(&run_id),
+            "a successful maintenance retry completes the revised park"
+        );
+        assert_eq!(
+            store.claim_counts("cp-revise-save-fail").unwrap(),
+            (0, 0),
+            "the deferred park releases its claim only after it is durable"
         );
     }
 
