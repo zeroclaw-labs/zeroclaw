@@ -133,17 +133,6 @@ pub(crate) struct Chat {
     /// Double-click tracker for the session picker: a second click on the same row
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config from local `zerocode-config.toml`, loaded
-    /// once (lazily, on first session start) and applied to every `ChatState`
-    /// this pane constructs. Defaults until loaded.
-    todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Parsed `[message_queue]` config from local `zerocode-config.toml`, loaded
-    /// once (lazily, on first session start) and applied to every `ChatState`
-    /// this pane constructs. Defaults until loaded.
-    queue_settings: crate::config::MessageQueueSettings,
-    /// Guards the one-shot local UI config load (`[todotracker]` +
-    /// `[message_queue]`) so it doesn't repeat on every session start.
-    local_ui_settings_loaded: bool,
     /// Inbound `elicitation/create` requests that arrived while the pane was
     /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
     /// Rather than auto-cancel a legitimately-owned prompt during that
@@ -234,9 +223,6 @@ impl Chat {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
-            todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
-            queue_settings: crate::config::MessageQueueSettings::default(),
-            local_ui_settings_loaded: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -470,19 +456,23 @@ impl Chat {
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Load the local `[todotracker]` and `[message_queue]` config once,
-        // lazily, the first time this pane starts a session. These are ZeroCode
-        // UI concerns owned by `zerocode-config.toml` — the daemon holds no
-        // TodoWrite display schema — so resolve them from the local config file
-        // (honoring `--config-dir` / `ZEROCLAW_CONFIG_DIR`), not over RPC.
-        // Best-effort: a load failure keeps the built-in defaults.
-        if !self.local_ui_settings_loaded {
-            self.local_ui_settings_loaded = true;
-            if let Ok(cfg) = crate::config::ensure_and_load(&crate::i18n::config_dir()) {
-                self.todo_settings = cfg.resolve_todo_tracker();
-                self.queue_settings = cfg.resolve_message_queue();
-            }
-        }
+        // Resolve the local `[todotracker]` and `[message_queue]` config at
+        // every new-session boundary. These are ZeroCode UI concerns owned by
+        // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
+        // — so read them from the local config file (honoring `--config-dir` /
+        // `ZEROCLAW_CONFIG_DIR`), not over RPC. Resolving per session (rather
+        // than caching once for the pane's lifetime) makes the file the single
+        // source of truth: a Config-pane save is picked up by the *next*
+        // session without restarting zerocode. Best-effort: a load failure
+        // falls back to the built-in defaults.
+        let (todo_settings, queue_settings) =
+            match crate::config::ensure_and_load(&crate::i18n::config_dir()) {
+                Ok(cfg) => (cfg.resolve_todo_tracker(), cfg.resolve_message_queue()),
+                Err(_) => (
+                    crate::todo_tracker::TodoTrackerSettings::default(),
+                    crate::config::MessageQueueSettings::default(),
+                ),
+            };
 
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
@@ -521,8 +511,8 @@ impl Chat {
                 let mut state = ChatState::new(
                     session.session_id,
                     agent_alias.to_string(),
-                    self.todo_settings,
-                    self.queue_settings,
+                    todo_settings,
+                    queue_settings,
                 );
                 // Only ACP shows the working directory above the input bar.
                 if self.pane_kind == PaneKind::Acp {
@@ -5052,7 +5042,7 @@ impl ChatState {
             queue_paused: false,
             resume_override: false,
             cancel_started_at: None,
-            queue_sidebar_cols: 36,
+            queue_sidebar_cols: queue_settings.default_width,
             queue_sel: None,
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
@@ -6059,8 +6049,12 @@ impl ChatState {
     }
 
     pub fn widen_queue_sidebar(&mut self) {
-        self.queue_sidebar_cols = (self.queue_sidebar_cols
-            + self.message_queue_settings.width_step)
+        // `width_step` is operator-supplied (`[message_queue] width_step`), so
+        // widen with a saturating add: a large step near the u16 ceiling must
+        // clamp to `max_width`, never wrap around to a tiny sidebar.
+        self.queue_sidebar_cols = self
+            .queue_sidebar_cols
+            .saturating_add(self.message_queue_settings.width_step)
             .min(self.message_queue_settings.max_width);
         self.mark_dirty_full();
     }
@@ -6349,6 +6343,31 @@ mod tests {
             crate::todo_tracker::TodoTrackerSettings::default(),
             crate::config::MessageQueueSettings::default(),
         )
+    }
+
+    // Reviewer Blocking #3: the resolved `message_queue.default_width` must
+    // seed the runtime sidebar column count, not the old hardcoded `36`.
+    #[test]
+    fn queue_sidebar_seeds_from_configured_default_width() {
+        let queue = crate::config::MessageQueueSettings {
+            default_width: 52,
+            min_width: 20,
+            max_width: 100,
+            ..crate::config::MessageQueueSettings::default()
+        };
+        let st = ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            queue,
+        );
+        assert_eq!(
+            st.queue_sidebar_cols, 52,
+            "initial sidebar width must come from the configured default_width"
+        );
+        // And a non-default value must survive the on-screen clamp when the
+        // terminal is wide enough for it.
+        assert_eq!(st.queue_sidebar_width(200), 52);
     }
 
     #[test]

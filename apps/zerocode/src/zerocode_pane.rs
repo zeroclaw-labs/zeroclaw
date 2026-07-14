@@ -1677,14 +1677,38 @@ impl ZerocodePane {
         let Some(edit) = self.queue_edit.take() else {
             return;
         };
-        let parse_u16 = |s: &str| s.trim().parse::<u16>().unwrap_or(0);
-        let parse_usize = |s: &str| s.trim().parse::<usize>().unwrap_or(0);
+        // A failed parse must leave the current value untouched rather than
+        // fall through to a persisted `0` (a `0` cap drops every message; a
+        // `0` width/step collapses or freezes the sidebar). The canonical
+        // resolver floors these anyway, but we never *persist* a degenerate
+        // value here in the first place.
+        let trimmed = edit.buf.trim();
         match edit.field {
-            QueueField::Cap => self.queue.cap = parse_usize(&edit.buf),
-            QueueField::DefaultWidth => self.queue.default_width = parse_u16(&edit.buf),
-            QueueField::MinWidth => self.queue.min_width = parse_u16(&edit.buf),
-            QueueField::MaxWidth => self.queue.max_width = parse_u16(&edit.buf),
-            QueueField::WidthStep => self.queue.width_step = parse_u16(&edit.buf),
+            QueueField::Cap => {
+                if let Ok(n) = trimmed.parse::<usize>() {
+                    self.queue.cap = n;
+                }
+            }
+            QueueField::DefaultWidth => {
+                if let Ok(n) = trimmed.parse::<u16>() {
+                    self.queue.default_width = n;
+                }
+            }
+            QueueField::MinWidth => {
+                if let Ok(n) = trimmed.parse::<u16>() {
+                    self.queue.min_width = n;
+                }
+            }
+            QueueField::MaxWidth => {
+                if let Ok(n) = trimmed.parse::<u16>() {
+                    self.queue.max_width = n;
+                }
+            }
+            QueueField::WidthStep => {
+                if let Ok(n) = trimmed.parse::<u16>() {
+                    self.queue.width_step = n;
+                }
+            }
             _ => {}
         }
         self.persist_queue_field(edit.field);

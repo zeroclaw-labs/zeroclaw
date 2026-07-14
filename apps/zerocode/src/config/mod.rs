@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::keymap::{Chord, overrides::OverrideTable};
 use crate::theme::{self, Theme};
-use crate::todo_tracker::TodoTrackerSettings;
 
 const FILE_NAME: &str = "zerocode-config.toml";
 const ENV_PREFIX: &str = "ZEROCODE_";
@@ -154,6 +153,42 @@ impl Default for TodoTrackerSection {
     }
 }
 
+/// Where the todo tracker renders, as consumed by the
+/// [`TodoTracker`](crate::todo_tracker::TodoTracker) widget. This is the
+/// runtime mirror of [`TodoTrackerLocation`] (the serde section enum);
+/// keeping them distinct lets the widget stay independent of the on-disk
+/// serialization shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TodoLocation {
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Runtime `[todotracker]` settings, resolved from the config section by
+/// [`ZerocodeConfig::resolve_todo_tracker`]. Values are validated at that
+/// boundary, so downstream consumers can trust them as-is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TodoTrackerSettings {
+    pub enabled: bool,
+    pub enabled_at_start: bool,
+    pub location: TodoLocation,
+    pub width: u16,
+    pub max_height: u16,
+}
+
+impl Default for TodoTrackerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoLocation::Right,
+            width: default_todotracker_width(),
+            max_height: default_todotracker_max_height(),
+        }
+    }
+}
+
 // ── Message queue ─────────────────────────────────────────────────────────────
 
 /// The `[message_queue]` section.
@@ -193,7 +228,6 @@ impl Default for MessageQueueSection {
 
 /// Runtime settings for the message queue, derived from `[message_queue]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct MessageQueueSettings {
     pub cap: usize,
     pub default_width: u16,
@@ -215,61 +249,6 @@ impl Default for MessageQueueSettings {
             auto_open: true,
             stay_open_when_empty: false,
         }
-    }
-}
-
-impl crate::config::MessageQueueSettings {
-    /// Convert config fields (from `config_list("message_queue")`) into
-    /// runtime settings. Falls back to schema defaults for any field that is
-    /// missing or unparseable.
-    #[allow(dead_code)]
-    pub(crate) fn from_config_fields(fields: &[crate::wire::ConfigFieldEntry]) -> Self {
-        let mut s = Self::default();
-        for f in fields {
-            let key = f.path.rsplit('.').next().unwrap_or(f.path.as_str());
-            let Some(value) = f.value.as_ref() else {
-                continue;
-            };
-            match key {
-                "cap" => {
-                    if let Some(n) = value.as_u64() {
-                        s.cap = n as usize;
-                    }
-                }
-                "default_width" => {
-                    if let Some(n) = value.as_u64() {
-                        s.default_width = n as u16;
-                    }
-                }
-                "min_width" => {
-                    if let Some(n) = value.as_u64() {
-                        s.min_width = n as u16;
-                    }
-                }
-                "max_width" => {
-                    if let Some(n) = value.as_u64() {
-                        s.max_width = n as u16;
-                    }
-                }
-                "width_step" => {
-                    if let Some(n) = value.as_u64() {
-                        s.width_step = n as u16;
-                    }
-                }
-                "auto_open" => {
-                    if let Some(b) = value.as_bool() {
-                        s.auto_open = b;
-                    }
-                }
-                "stay_open_when_empty" => {
-                    if let Some(b) = value.as_bool() {
-                        s.stay_open_when_empty = b;
-                    }
-                }
-                _ => {}
-            }
-        }
-        s
     }
 }
 
@@ -415,8 +394,13 @@ impl ZerocodeConfig {
 
     /// Convert the `[todotracker]` section into the runtime settings type
     /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
+    ///
+    /// Values are validated/normalized here — this is the canonical
+    /// config boundary, and the section fields are operator-supplied and
+    /// therefore untrusted. `width` and `max_height` are floored at `1`
+    /// so a `0` (which would collapse the panel/strip) can never reach
+    /// the runtime.
     pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
-        use crate::todo_tracker::TodoLocation;
         TodoTrackerSettings {
             enabled: self.todotracker.enabled,
             enabled_at_start: self.todotracker.enabled_at_start,
@@ -425,21 +409,41 @@ impl ZerocodeConfig {
                 TodoTrackerLocation::Left => TodoLocation::Left,
                 TodoTrackerLocation::Right => TodoLocation::Right,
             },
-            width: self.todotracker.width,
-            max_height: self.todotracker.max_height,
+            width: self.todotracker.width.max(1),
+            max_height: self.todotracker.max_height.max(1),
         }
     }
 
     /// Convert the `[message_queue]` section into the runtime settings type.
+    ///
+    /// The section fields are operator-supplied and therefore untrusted:
+    /// they were safe compile-time constants before local config existed.
+    /// This canonical boundary normalizes them so no downstream consumer
+    /// has to defend against a degenerate value:
+    ///
+    /// - `cap` and `width_step` are floored at `1` (a `0` cap would drop
+    ///   every message; a `0` step would make resize a no-op).
+    /// - The three widths are coerced into a consistent
+    ///   `min_width <= default_width <= max_width` relationship, with
+    ///   `min_width` floored at `1`. An inverted or partial config (e.g.
+    ///   `max_width < min_width`, or a `default_width` outside the band)
+    ///   is clamped rather than allowed to produce an unusable sidebar.
     pub fn resolve_message_queue(&self) -> MessageQueueSettings {
+        let s = &self.message_queue;
+        let cap = s.cap.max(1);
+        let width_step = s.width_step.max(1);
+        let min_width = s.min_width.max(1);
+        // Keep max at or above min, then clamp the default into [min, max].
+        let max_width = s.max_width.max(min_width);
+        let default_width = s.default_width.clamp(min_width, max_width);
         MessageQueueSettings {
-            cap: self.message_queue.cap,
-            default_width: self.message_queue.default_width,
-            min_width: self.message_queue.min_width,
-            max_width: self.message_queue.max_width,
-            width_step: self.message_queue.width_step,
-            auto_open: self.message_queue.auto_open,
-            stay_open_when_empty: self.message_queue.stay_open_when_empty,
+            cap,
+            default_width,
+            min_width,
+            max_width,
+            width_step,
+            auto_open: s.auto_open,
+            stay_open_when_empty: s.stay_open_when_empty,
         }
     }
 }
@@ -1502,5 +1506,116 @@ mod tests {
         let mut c = ZerocodeConfig::default();
         set_prop(&mut c, "todotracker.location", "left").unwrap();
         assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
+    }
+
+    // ── Resolver validation / normalization (untrusted config boundary) ──────
+
+    #[test]
+    fn resolve_message_queue_floors_zero_cap_and_step() {
+        let mut c = ZerocodeConfig::default();
+        c.message_queue.cap = 0;
+        c.message_queue.width_step = 0;
+        let s = c.resolve_message_queue();
+        assert_eq!(s.cap, 1, "cap=0 must be floored to 1, never drop messages");
+        assert_eq!(s.width_step, 1, "width_step=0 must be floored to 1");
+    }
+
+    #[test]
+    fn resolve_message_queue_coerces_inconsistent_widths() {
+        let mut c = ZerocodeConfig::default();
+        // Inverted band + a default outside it, plus a zero min.
+        c.message_queue.min_width = 0;
+        c.message_queue.max_width = 10;
+        c.message_queue.default_width = 200;
+        let s = c.resolve_message_queue();
+        assert_eq!(s.min_width, 1, "min_width floored at 1");
+        assert!(s.max_width >= s.min_width, "max_width >= min_width");
+        assert!(
+            s.default_width >= s.min_width && s.default_width <= s.max_width,
+            "default_width clamped into [min, max]: got {} for [{}, {}]",
+            s.default_width,
+            s.min_width,
+            s.max_width
+        );
+    }
+
+    #[test]
+    fn resolve_message_queue_preserves_valid_widths() {
+        let mut c = ZerocodeConfig::default();
+        c.message_queue.min_width = 20;
+        c.message_queue.default_width = 48;
+        c.message_queue.max_width = 100;
+        let s = c.resolve_message_queue();
+        assert_eq!(s.min_width, 20);
+        assert_eq!(s.default_width, 48);
+        assert_eq!(s.max_width, 100);
+    }
+
+    #[test]
+    fn resolve_todo_tracker_floors_zero_width_and_height() {
+        let mut c = ZerocodeConfig::default();
+        c.todotracker.width = 0;
+        c.todotracker.max_height = 0;
+        let s = c.resolve_todo_tracker();
+        assert_eq!(s.width, 1, "tracker width=0 must be floored to 1");
+        assert_eq!(s.max_height, 1, "tracker max_height=0 must be floored to 1");
+    }
+
+    // ── Single-source-of-truth regression (reviewer Blocking #2) ────────────
+    //
+    // `zerocode-config.toml` must be the live source of truth: a Config-pane
+    // save has to be picked up by the *next* session, not shadowed by a value
+    // cached at first-session start. `start_session` resolves the file per
+    // session, so this exercises that boundary at the config layer — load,
+    // persist a change (as the Config pane does), load again — and asserts the
+    // second resolve reflects the edit.
+    #[test]
+    fn resolved_settings_track_edits_across_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // "Session 1" resolves the defaults.
+        let cfg1 = ensure_and_load(dir.path()).unwrap();
+        let q1 = cfg1.resolve_message_queue();
+        let t1 = cfg1.resolve_todo_tracker();
+
+        // A Config-pane save persists changed fields to the same file.
+        persist_message_queue_field(
+            dir.path(),
+            "cap",
+            toml::Value::Integer((q1.cap + 11) as i64),
+        )
+        .unwrap();
+        persist_message_queue_field(
+            dir.path(),
+            "default_width",
+            toml::Value::Integer((q1.default_width + 5) as i64),
+        )
+        .unwrap();
+        persist_todotracker_field(
+            dir.path(),
+            "width",
+            toml::Value::Integer((t1.width + 7) as i64),
+        )
+        .unwrap();
+
+        // "Session 2" must resolve the *edited* values, not the cached copy.
+        let cfg2 = ensure_and_load(dir.path()).unwrap();
+        let q2 = cfg2.resolve_message_queue();
+        let t2 = cfg2.resolve_todo_tracker();
+        assert_eq!(
+            q2.cap,
+            q1.cap + 11,
+            "second session must see the persisted cap edit"
+        );
+        assert_eq!(
+            q2.default_width,
+            q1.default_width + 5,
+            "second session must see the persisted default_width edit"
+        );
+        assert_eq!(
+            t2.width,
+            t1.width + 7,
+            "second session must see the persisted tracker width edit"
+        );
     }
 }
