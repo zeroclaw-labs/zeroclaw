@@ -1394,6 +1394,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chrome_process_summary_shows_cpu_loading_without_health() {
+        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let loading = crate::i18n::t("zc-chrome-summary-loading");
+
+        assert_eq!(process_stats_summary(None), format!(" {cpu}:{loading}"));
+    }
+
+    #[test]
+    fn chrome_process_summary_shows_ram_and_cpu_values() {
+        let ram = crate::i18n::t("zc-chrome-summary-ram");
+        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let health = serde_json::json!({
+            "process": {
+                "rss_bytes": 1_048_576_u64,
+                "system_ram_total_bytes": 4_194_304_u64,
+                "cpu_percent": 12.345_f64
+            }
+        });
+
+        assert_eq!(
+            process_stats_summary(Some(&health)),
+            format!(" {ram}:1.0M(25%) {cpu}:12.3%")
+        );
+    }
+
+    #[test]
+    fn chrome_process_summary_keeps_cpu_loading_until_sample_exists() {
+        let ram = crate::i18n::t("zc-chrome-summary-ram");
+        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let loading = crate::i18n::t("zc-chrome-summary-loading");
+        let health = serde_json::json!({
+            "process": {
+                "rss_bytes": 1_048_576_u64,
+                "system_ram_total_bytes": 4_194_304_u64
+            }
+        });
+
+        assert_eq!(
+            process_stats_summary(Some(&health)),
+            format!(" {ram}:1.0M(25%) {cpu}:{loading}")
+        );
+    }
+
+    #[test]
     fn quickstart_chat_handoff_consumes_immediate_target() {
         let state = SharedReconnectState::default();
         {

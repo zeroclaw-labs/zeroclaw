@@ -501,156 +501,14 @@ impl Dashboard {
         frame.render_widget(status_block, chunks[0]);
 
         if let Some(s) = status {
-            let mut lines = vec![Line::from(vec![
-                Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon")),
-                    theme::dim_style(),
-                ),
-                Span::styled(daemon_label(&self.connect_label), theme::accent_style()),
-            ])];
-
-            if is_local_connection(&self.connect_label) {
-                if let Some(socket) = s
-                    .local_ipc_endpoint
-                    .as_deref()
-                    .or_else(|| local_socket_label(&self.connect_label))
-                {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-socket")),
-                            theme::dim_style(),
-                        ),
-                        Span::styled(socket, theme::body_style()),
-                    ]));
-                }
-            } else if is_remote_connection(&self.connect_label) {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(&self.connect_label, theme::body_style()),
-                ]));
-            }
-
-            if self.insecure_tls {
-                lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-dashboard-label-insecure-tls"),
-                    theme::warn_style(),
-                )));
-            }
-
-            lines.extend([
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-server")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format!("v{}", s.server_version), theme::body_style()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-protocol")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format!("{}", s.protocol_version), theme::body_style()),
-                ]),
-            ]);
-
-            if let Some(config_path) = s.config_file.as_deref().or(s.config_dir.as_deref()) {
-                let mut spans = vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-config")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(config_path, theme::body_style()),
-                ];
-                if let Some(config_kind) = s.config_kind.as_ref() {
-                    spans.extend([
-                        Span::styled(" (", theme::body_style()),
-                        Span::styled(
-                            config_kind_label(config_kind),
-                            config_kind_style(config_kind),
-                        ),
-                        Span::styled(")", theme::body_style()),
-                    ]);
-                }
-                lines.push(Line::from(spans));
-            }
-
-            lines.extend(workspace_lines);
-
-            // Process stats from health
-            if let Some(h) = health
-                && let Some(process) = h.get("process")
-            {
-                if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
-                    && rss > 0
-                {
-                    let total = process
-                        .get("system_ram_total_bytes")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let rss_str = format_bytes(rss);
-                    let val = if total > 0 {
-                        let pct = (rss as f64 / total as f64) * 100.0;
-                        format!("{rss_str} / {} ({pct:.1}%)", format_bytes(total))
-                    } else {
-                        rss_str
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-memory")),
-                            theme::dim_style(),
-                        ),
-                        Span::styled(val, theme::body_style()),
-                    ]));
-                }
-                if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
-                    let ncpu = process
-                        .get("num_cpus")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let val = if ncpu > 0 {
-                        format!("{cpu:.1}% ({ncpu} cores)")
-                    } else {
-                        format!("{cpu:.1}%")
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
-                            theme::dim_style(),
-                        ),
-                        Span::styled(val, theme::body_style()),
-                    ]));
-                } else {
-                    let ncpu = process
-                        .get("num_cpus")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let val = if ncpu > 0 {
-                        format!("{} ({ncpu} cores)", crate::i18n::t("zc-dashboard-loading"))
-                    } else {
-                        crate::i18n::t("zc-dashboard-loading")
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
-                            theme::dim_style(),
-                        ),
-                        Span::styled(val, theme::dim_style()),
-                    ]));
-                }
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(crate::i18n::t("zc-dashboard-loading"), theme::dim_style()),
-                ]));
-            }
-
+            let lines = overview_status_lines(
+                &self.connect_label,
+                self.insecure_tls,
+                s,
+                health,
+                code_cwd,
+                chat_cwd,
+            );
             frame.render_widget(Paragraph::new(lines), inner);
         } else {
             frame.render_widget(
@@ -2766,6 +2624,173 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+fn overview_status_lines(
+    connect_label: &str,
+    insecure_tls: bool,
+    status: &StatusResult,
+    health: Option<&serde_json::Value>,
+    code_cwd: Option<&str>,
+    chat_cwd: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon")),
+            theme::dim_style(),
+        ),
+        Span::styled(
+            daemon_label(connect_label).to_string(),
+            theme::accent_style(),
+        ),
+    ])];
+
+    if is_local_connection(connect_label) {
+        if let Some(socket) = status
+            .local_ipc_endpoint
+            .as_deref()
+            .or_else(|| local_socket_label(connect_label))
+        {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-socket")),
+                    theme::dim_style(),
+                ),
+                Span::styled(socket.to_string(), theme::body_style()),
+            ]));
+        }
+    } else if is_remote_connection(connect_label) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
+                theme::dim_style(),
+            ),
+            Span::styled(connect_label.to_string(), theme::body_style()),
+        ]));
+    }
+
+    if insecure_tls {
+        lines.push(Line::from(Span::styled(
+            crate::i18n::t("zc-dashboard-label-insecure-tls"),
+            theme::warn_style(),
+        )));
+    }
+
+    lines.extend([
+        Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-server")),
+                theme::dim_style(),
+            ),
+            Span::styled(format!("v{}", status.server_version), theme::body_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-protocol")),
+                theme::dim_style(),
+            ),
+            Span::styled(format!("{}", status.protocol_version), theme::body_style()),
+        ]),
+    ]);
+
+    if let Some(config_path) = status
+        .config_file
+        .as_deref()
+        .or(status.config_dir.as_deref())
+    {
+        let mut spans = vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-config")),
+                theme::dim_style(),
+            ),
+            Span::styled(config_path.to_string(), theme::body_style()),
+        ];
+        if let Some(config_kind) = status.config_kind.as_ref() {
+            spans.extend([
+                Span::styled(" (", theme::body_style()),
+                Span::styled(
+                    config_kind_label(config_kind),
+                    config_kind_style(config_kind),
+                ),
+                Span::styled(")", theme::body_style()),
+            ]);
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.extend(workspace_lines(code_cwd, chat_cwd));
+
+    if let Some(h) = health
+        && let Some(process) = h.get("process")
+    {
+        if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
+            && rss > 0
+        {
+            let total = process
+                .get("system_ram_total_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let rss_str = format_bytes(rss);
+            let val = if total > 0 {
+                let pct = (rss as f64 / total as f64) * 100.0;
+                format!("{rss_str} / {} ({pct:.1}%)", format_bytes(total))
+            } else {
+                rss_str
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-memory")),
+                    theme::dim_style(),
+                ),
+                Span::styled(val, theme::body_style()),
+            ]));
+        }
+        if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
+            let ncpu = process
+                .get("num_cpus")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let val = if ncpu > 0 {
+                format!("{cpu:.1}% ({ncpu} cores)")
+            } else {
+                format!("{cpu:.1}%")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                    theme::dim_style(),
+                ),
+                Span::styled(val, theme::body_style()),
+            ]));
+        } else {
+            let ncpu = process
+                .get("num_cpus")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let val = if ncpu > 0 {
+                format!("{} ({ncpu} cores)", crate::i18n::t("zc-dashboard-loading"))
+            } else {
+                crate::i18n::t("zc-dashboard-loading")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                    theme::dim_style(),
+                ),
+                Span::styled(val, theme::dim_style()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                theme::dim_style(),
+            ),
+            Span::styled(crate::i18n::t("zc-dashboard-loading"), theme::dim_style()),
+        ]));
+    }
+
+    lines
+}
+
 fn config_kind_label(kind: &ConfigKind) -> String {
     match kind {
         ConfigKind::Default => crate::i18n::t("zc-dashboard-config-kind-default"),
@@ -2854,6 +2879,167 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    fn status_fixture() -> StatusResult {
+        StatusResult {
+            server_version: "0.8.2".into(),
+            protocol_version: 1,
+            active_sessions: 2,
+            config_dir: Some("/tmp/zc-profile".into()),
+            config_file: Some("/tmp/zc-profile/config.toml".into()),
+            config_kind: Some(ConfigKind::Temporary),
+            local_ipc_endpoint: Some("/tmp/zc-profile/data/daemon.sock".into()),
+        }
+    }
+
+    #[test]
+    fn overview_status_lines_render_local_socket_not_endpoint() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "local:/fallback.sock",
+            false,
+            &status,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(text.contains("local"), "daemon label: {text}");
+        assert!(
+            text.contains("/tmp/zc-profile/data/daemon.sock"),
+            "local socket: {text}"
+        );
+        assert!(
+            !text.contains("/fallback.sock"),
+            "daemon socket wins: {text}"
+        );
+        assert!(
+            !text.contains("wss://"),
+            "must not render remote endpoint: {text}"
+        );
+    }
+
+    #[test]
+    fn overview_status_lines_render_remote_endpoint_and_insecure_tls() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "wss://zero.example.test:9781",
+            true,
+            &status,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(text.contains("remote"), "daemon label: {text}");
+        assert!(
+            text.contains("wss://zero.example.test:9781"),
+            "remote endpoint: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-insecure-tls")),
+            "insecure TLS warning: {text}"
+        );
+        assert!(
+            !text.contains("/tmp/zc-profile/data/daemon.sock"),
+            "remote view must not label socket as endpoint: {text}"
+        );
+    }
+
+    #[test]
+    fn overview_status_lines_collapse_shared_workspace() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            None,
+            Some("/work/shared"),
+            Some("/work/shared"),
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-workspace")),
+            "shared workspace row: {text}"
+        );
+        assert!(!text.contains(&crate::i18n::t("zc-dashboard-label-code-cwd")));
+        assert!(!text.contains(&crate::i18n::t("zc-dashboard-label-chat-cwd")));
+        assert!(text.contains("/work/shared"), "workspace value: {text}");
+    }
+
+    #[test]
+    fn overview_status_lines_split_different_workspaces() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            None,
+            Some("/work/code"),
+            Some("/work/chat"),
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-code-cwd")),
+            "code cwd row: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-chat-cwd")),
+            "chat cwd row: {text}"
+        );
+        assert!(text.contains("/work/code"), "code cwd value: {text}");
+        assert!(text.contains("/work/chat"), "chat cwd value: {text}");
+    }
+
+    #[test]
+    fn overview_status_lines_render_cpu_loading_before_sample() {
+        let status = status_fixture();
+        let health = serde_json::json!({
+            "process": {
+                "rss_bytes": 1_048_576_u64,
+                "system_ram_total_bytes": 4_194_304_u64,
+                "num_cpus": 8_u64
+            }
+        });
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            Some(&health),
+            None,
+            None,
+        ));
+
+        assert!(text.contains("1.0M / 4.0M (25.0%)"), "memory: {text}");
+        assert!(
+            text.contains(&format!(
+                "{} (8 cores)",
+                crate::i18n::t("zc-dashboard-loading")
+            )),
+            "cpu loading: {text}"
+        );
+    }
+
+    #[test]
+    fn overview_status_lines_render_cpu_value_with_core_count() {
+        let status = status_fixture();
+        let health = serde_json::json!({
+            "process": {
+                "cpu_percent": 12.345_f64,
+                "num_cpus": 8_u64
+            }
+        });
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            Some(&health),
+            None,
+            None,
+        ));
+
+        assert!(text.contains("12.3% (8 cores)"), "cpu value: {text}");
     }
 
     #[test]
