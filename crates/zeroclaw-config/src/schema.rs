@@ -13403,7 +13403,7 @@ impl ChannelConfig for DiscordConfig {
 }
 
 /// Default number of prior Slack thread messages included on first encounter.
-pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 20;
+pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
 /// Slack's `conversations.replies` request limit used by thread hydration.
 pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
 
@@ -13473,7 +13473,8 @@ pub struct SlackConfig {
     pub strict_mention_in_thread: bool,
     /// Maximum number of prior messages prepended when ZeroClaw first
     /// encounters a Slack thread. `0` disables automatic thread-context
-    /// hydration. When omitted, defaults to 20. Maximum: 50.
+    /// hydration. When omitted, defaults to 0, so hydration is opt-in.
+    /// Maximum: 50.
     #[tab(Advanced)]
     #[serde(default)]
     pub thread_context_max_messages: Option<usize>,
@@ -25407,10 +25408,10 @@ allowed_users = ["U111"]
     }
 
     #[test]
-    async fn slack_thread_context_max_messages_defaults_to_twenty() {
+    async fn slack_thread_context_max_messages_defaults_to_zero() {
         let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.thread_context_max_messages, None);
-        assert_eq!(parsed.effective_thread_context_max_messages(), 20);
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
     }
 
     #[test]

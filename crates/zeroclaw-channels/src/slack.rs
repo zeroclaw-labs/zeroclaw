@@ -130,8 +130,8 @@ pub struct SlackChannel {
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 /// Bound first-interaction thread hydration independently from the number of
-/// messages retained in the prompt. Each page is attempted once, so this is
-/// also the hard upper bound on Slack API requests for one hydration.
+/// messages retained in the prompt. Retries consume the same budget, so this
+/// is also the hard upper bound on Slack API requests for one hydration.
 const SLACK_THREAD_BACKFILL_MAX_REQUESTS: usize = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
@@ -1831,9 +1831,10 @@ impl SlackChannel {
     ///   with a `… N earlier thread messages omitted …` prefix marker when
     ///   the cap activates.
     /// - Request cap: hydration makes at most
-    ///   [`SLACK_THREAD_BACKFILL_MAX_REQUESTS`] single-attempt Slack requests.
-    ///   If another cursor remains, the partial context is committed with a
-    ///   visible marker so later messages do not restart the scan from page 1.
+    ///   [`SLACK_THREAD_BACKFILL_MAX_REQUESTS`] total Slack requests, including
+    ///   retries after rate limits. If another cursor remains, the partial
+    ///   context is committed with a visible marker so later messages do not
+    ///   restart the scan from page 1.
     /// - Char cap: the joined block is clipped to
     ///   `SLACK_PERMALINK_TEXT_MAX_CHARS` via `truncate_text`, which
     ///   appends a `…[truncated]` suffix on overflow.
@@ -1871,15 +1872,15 @@ impl SlackChannel {
                 );
                 break;
             }
-            requests_made += 1;
             let Some(payload) = self
-                .fetch_thread_replies_page_with_retry(
+                .fetch_thread_replies_page_with_request_budget(
                     channel_id,
                     thread_ts,
                     "0",
                     (!trigger_ts.is_empty()).then_some(trigger_ts),
                     cursor.as_deref(),
-                    0,
+                    &mut requests_made,
+                    SLACK_THREAD_BACKFILL_MAX_REQUESTS,
                 )
                 .await
             else {
@@ -4337,6 +4338,29 @@ impl SlackChannel {
         cursor: Option<&str>,
         max_retries: u32,
     ) -> Option<serde_json::Value> {
+        let mut requests_made = 0usize;
+        self.fetch_thread_replies_page_with_request_budget(
+            channel_id,
+            thread_ts,
+            oldest,
+            latest,
+            cursor,
+            &mut requests_made,
+            max_retries.saturating_add(1) as usize,
+        )
+        .await
+    }
+
+    async fn fetch_thread_replies_page_with_request_budget(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        oldest: &str,
+        latest: Option<&str>,
+        cursor: Option<&str>,
+        requests_made: &mut usize,
+        request_budget: usize,
+    ) -> Option<serde_json::Value> {
         let mut total_wait = Duration::from_secs(0);
         let mut query = vec![
             ("channel", channel_id),
@@ -4351,7 +4375,12 @@ impl SlackChannel {
             query.push(("cursor", cursor));
         }
 
-        for attempt in 0..=max_retries {
+        loop {
+            if *requests_made >= request_budget {
+                return None;
+            }
+            *requests_made += 1;
+            let attempt = (*requests_made).saturating_sub(1);
             let resp = match self
                 .http_client()
                 .get(self.slack_api_url("conversations.replies"))
@@ -4409,7 +4438,7 @@ impl SlackChannel {
                     .is_some_and(|err| err == "ratelimited");
 
             if is_ratelimited_http || is_ratelimited_payload {
-                if attempt >= max_retries {
+                if *requests_made >= request_budget {
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -4419,7 +4448,7 @@ impl SlackChannel {
                             thread_ts,
                             channel_id,
                             total_wait.as_secs(),
-                            max_retries
+                            *requests_made
                         )
                     );
                     return None;
@@ -4428,7 +4457,11 @@ impl SlackChannel {
                 let retry_after_secs = Self::parse_retry_after_secs(&headers)
                     .unwrap_or(SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS);
                 let jitter_ms = Self::jitter_ms(SLACK_HISTORY_MAX_JITTER_MS);
-                let wait = Self::compute_retry_delay(retry_after_secs, attempt, jitter_ms);
+                let wait = Self::compute_retry_delay(
+                    retry_after_secs,
+                    attempt.min(u32::MAX as usize) as u32,
+                    jitter_ms,
+                );
                 total_wait += wait;
                 let next_retry_at = Self::next_retry_timestamp(wait);
                 ::zeroclaw_log::record!(
@@ -4440,8 +4473,8 @@ impl SlackChannel {
                         thread_ts,
                         channel_id,
                         retry_after_secs,
-                        attempt + 1,
-                        max_retries,
+                        *requests_made,
+                        request_budget,
                         next_retry_at
                     )
                 );
@@ -4496,8 +4529,6 @@ impl SlackChannel {
 
             return Some(payload);
         }
-
-        None
     }
 
     /// Extract thread parent timestamps from channel history messages.
@@ -7479,6 +7510,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_backfill_honors_retry_after_before_retrying_bodyless_429() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [
+                    {"ts": "T_PRIOR", "thread_ts": "T_PARENT", "user": "U_USER", "text": "prior context"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = Arc::new(
+            SlackChannel::new(
+                "xoxb-fake".into(),
+                None,
+                vec!["C_ONE".into()],
+                "slack_test_alias",
+                Arc::new(|| vec!["U_USER".to_string()]),
+            )
+            .with_thread_context_max_messages_resolver(Arc::new(|| 2))
+            .with_api_base_url(server.uri()),
+        );
+        ch.cache_sender_display_name("U_USER", "alice");
+
+        let mention = serde_json::json!({
+            "ts": "T_TRIGGER",
+            "thread_ts": "T_PARENT",
+            "user": "U_USER",
+            "text": "<@U_BOT> summarize",
+        });
+        let task_ch = Arc::clone(&ch);
+        let task = tokio::spawn(async move {
+            task_ch
+                .build_incoming_content(&mention, "C_ONE", true, "U_BOT")
+                .await
+        });
+
+        for _ in 0..20 {
+            if server.received_requests().await.unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let content = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("hydration retry must complete after Retry-After")
+            .expect("hydration task must not panic")
+            .expect("the triggering message must be forwarded");
+        assert!(content.contains("prior context"), "{content}");
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn thread_backfill_paginates_to_newest_prior_messages() {
         use wiremock::matchers::{method, path, query_param, query_param_is_missing};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -7676,6 +7776,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_backfill_default_depth_disables_fetch() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec!["C_ONE".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_USER".to_string()]),
+        )
+        .with_api_base_url(server.uri());
+        let mention = serde_json::json!({
+            "ts": "T_TRIGGER",
+            "thread_ts": "T_PARENT",
+            "user": "U_USER",
+            "text": "<@U_BOT> summarize this",
+        });
+
+        let content = ch
+            .build_incoming_content(&mention, "C_ONE", true, "U_BOT")
+            .await
+            .expect("the triggering message must still be forwarded");
+        assert_eq!(content, "<@U_BOT> summarize this");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn thread_backfill_successful_empty_history_does_not_refetch() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -7700,6 +7828,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for (ts, text) in [
@@ -7742,6 +7871,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for (ts, text) in [
@@ -7784,6 +7914,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for ts in ["T_FIRST", "T_RETRY"] {
@@ -7826,6 +7957,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for ts in ["T_FIRST", "T_RETRY"] {
@@ -7869,6 +8001,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for ts in ["T_FIRST", "T_RETRY"] {
@@ -7919,6 +8052,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for (ts, should_contain_context) in [("T_FIRST", true), ("T_SECOND", false)] {
@@ -7977,6 +8111,7 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["U_USER".to_string()]),
         )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
 
         for ts in ["T_FIRST", "T_RETRY"] {
