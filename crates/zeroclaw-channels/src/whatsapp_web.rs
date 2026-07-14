@@ -3221,7 +3221,9 @@ mod tests {
             updated_at: 1_700_000_100,
             learning_source: "usync".to_string(),
         };
-        ProtocolStore::put_lid_mapping(&store, &entry).await.unwrap();
+        ProtocolStore::put_lid_mapping(&store, &entry)
+            .await
+            .unwrap();
 
         let sender = Jid::lid("37207519834264");
         let mapped_phone = ProtocolStore::get_lid_mapping(&store, sender.user())
