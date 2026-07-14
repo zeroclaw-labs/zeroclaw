@@ -134,10 +134,12 @@ distinguished by `kind`). On approve, the engine resumes the run and drives any
 following `kind: capability` steps headlessly to the next pause or completion -
 so a `checkpoint -> capability` tail (e.g. posting an approved draft) executes
 without a live agent turn. On deny, the run is cancelled. Both resolutions are
-recorded in the approval ledger. A checkpoint step may carry `- policy:` to select
-a `request_route`/`escalation_route` for its out-of-band notice; checkpoint
-resolution itself is not membership/quorum-gated (it is an in-band pause, not a
-policied approval gate).
+recorded in the approval ledger. A checkpoint step may carry `- policy:`; the
+same policy's required-group membership and quorum apply before the checkpoint
+decision resolves. If that policy names `request_route`, the daemon sends the
+out-of-band checkpoint notice there. `escalation_route` remains the timeout route
+for timed approval gates; checkpoint pauses do not currently schedule a
+checkpoint-specific escalation timeout.
 
 Two further checkpoint resolutions let a reviewer shape the draft instead of
 just gating it (both ledger-audited like approve/deny):

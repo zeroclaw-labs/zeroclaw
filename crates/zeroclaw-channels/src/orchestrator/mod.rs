@@ -6631,13 +6631,14 @@ async fn dispatch_channel_sop_gate(
     let (ref_run, ref_rev) = parse_gate_reference(&reference);
     let channel_key = channel_key_for_message(msg);
 
-    // Resolve against runs actually parked on a human: the full run id, or an
-    // unambiguous suffix (prompts may show a shortened id). For the TEXT form a
-    // non-match means "not a gate answer" — fall through to the agent; a marker
+    // Resolve against runs actually parked on a human. Marker messages keep the
+    // legacy suffix-compatible lookup for stale button payloads, but plain text
+    // replies must carry the full run id minted in the prompt. For the TEXT form
+    // a non-match means "not a gate answer" — fall through to the agent; a marker
     // non-match is consumed (stale buttons after the run ended). A matched run
-    // whose CURRENT revision differs from the reference's is superseded, but
-    // text replies must first prove they came through the request route that
-    // actually presented fallback instructions.
+    // whose CURRENT revision differs from the reference's is superseded, but text
+    // replies must first prove they came through the request route that actually
+    // presented fallback instructions.
     let resolved = {
         let Ok(guard) = engine.lock() else {
             return matches!(form, Form::Marker);
@@ -6651,7 +6652,10 @@ async fn dispatch_channel_sop_gate(
         });
         let matched: Vec<(String, u32, bool)> = candidates
             .by_ref()
-            .filter(|r| r.run_id == ref_run || r.run_id.ends_with(&ref_run))
+            .filter(|r| match form {
+                Form::Marker => r.run_id == ref_run || r.run_id.ends_with(&ref_run),
+                Form::Text => r.run_id == ref_run,
+            })
             .map(|r| {
                 let text_admissible = matches!(form, Form::Marker)
                     || text_gate_reply_matches_request_route(
@@ -6831,8 +6835,8 @@ async fn dispatch_channel_sop_gate(
                 _ => None,
             };
             // Finalize by the prompt's CANONICAL reference (revision-qualified
-            // when > 0): the prompt registry is keyed by what was sent, and a
-            // text reply may have used a shortened id.
+            // when > 0): the prompt registry is keyed by what was sent, while
+            // marker compatibility may have resolved by suffix.
             let finalize_reference = if ref_rev == 0 {
                 run_id.clone()
             } else {
@@ -26905,6 +26909,34 @@ Done."#;
         assert!(
             !dispatch_channel_sop_gate(&router, &msg, None).await,
             "text replies must not normalize a configured request_route differently from delivery"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_rejects_short_suffix_reference() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        assert!(
+            run_id.ends_with('1'),
+            "the deterministic test run id should exercise the old one-character suffix match: {run_id}"
+        );
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: "approve 1".to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            !dispatch_channel_sop_gate(&router, &msg, None).await,
+            "plain text replies must carry the full prompt reference, not a short run-id suffix"
         );
         assert_eq!(
             active_run_status(&engine, &run_id),

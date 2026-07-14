@@ -96,10 +96,10 @@ impl SopCapability for ForgeCommentCapability {
             reversible: false,
             supports_retry: false,
             required_permissions: vec!["forge.write"],
-            // No `required` here: the effective fields may sit at the top level OR
-            // nested under `input` (a step with static `capability_input` receives
-            // the piped payload under that key), which a flat schema cannot
-            // express. `execute` enforces the real contract with field-precise
+            // No `required` here: repo/number/body may sit at the top level OR nested
+            // under `input` (a step with static `capability_input` receives the piped
+            // payload under that key), while `channel` is trusted only from the static
+            // top-level input. `execute` enforces the real contract with field-precise
             // errors either way.
             input_schema: Some(json!({
                 "type": "object",
@@ -131,11 +131,19 @@ impl SopCapability for ForgeCommentCapability {
         };
 
         // The step's static capability_input is merged with the piped value under
-        // the `input` key; accept the fields at either the top level or nested.
-        let src = input
-            .get("input")
-            .filter(|v| v.is_object())
-            .unwrap_or(&input);
+        // the `input` key. Accept repo/number/body at either level, but never accept
+        // channel routing from the nested piped payload: forge writes must route
+        // through static SOP-authored input, not model- or tool-produced data.
+        let nested_input = input.get("input").filter(|v| v.is_object());
+        if nested_input
+            .and_then(Value::as_object)
+            .is_some_and(|nested| nested.contains_key("channel"))
+        {
+            return Ok(CapabilityResult::failure(
+                "forge.comment: field 'input.channel' is not accepted; set top-level 'channel' in capability_input",
+            ));
+        }
+        let src = nested_input.unwrap_or(&input);
 
         let repo = match src.get("repo").and_then(Value::as_str) {
             Some(r) if !r.trim().is_empty() => r.trim(),
@@ -163,10 +171,9 @@ impl SopCapability for ForgeCommentCapability {
         };
         // `channel` is authored in the static capability_input, so it lives at the
         // TOP level of the merged input (unlike repo/number/body, which usually
-        // arrive in the nested piped payload). Accept both, top level first.
+        // arrive in the nested piped payload).
         let channel = input
             .get("channel")
-            .or_else(|| src.get("channel"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|c| !c.is_empty());
@@ -208,11 +215,20 @@ impl ChannelForgeAdapter {
         Self { channels }
     }
 
+    fn is_git_channel_key(key: &str) -> bool {
+        key == "git" || key.starts_with("git.")
+    }
+
     /// Resolve which channel to post through: an explicit `git.<alias>` key, or the
     /// unique git channel in the map. Ambiguity and absence are hard errors so a
     /// multi-forge daemon never posts to the wrong host silently.
     fn resolve(&self, channel: Option<&str>) -> Result<Arc<dyn Channel>, String> {
         if let Some(key) = channel {
+            if !Self::is_git_channel_key(key) {
+                return Err(format!(
+                    "channel '{key}' is not a git channel (expected 'git' or 'git.<alias>')"
+                ));
+            }
             return self
                 .channels
                 .get(key)
@@ -222,7 +238,7 @@ impl ChannelForgeAdapter {
         let mut git_keys: Vec<&String> = self
             .channels
             .keys()
-            .filter(|k| *k == "git" || k.starts_with("git."))
+            .filter(|k| Self::is_git_channel_key(k))
             .collect();
         git_keys.sort();
         // The channel map registers a singleton under BOTH its bare type key and
@@ -392,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_fields_nested_under_input_key_and_passes_channel() {
+    fn reads_fields_nested_under_input_key_and_top_level_channel() {
         let adapter = Arc::new(RecordingAdapter {
             calls: Mutex::new(Vec::new()),
             result: Ok(()),
@@ -401,7 +417,10 @@ mod tests {
         let out = cap
             .execute(
                 ctx(),
-                json!({"input": {"repo": "o/r", "number": 9, "body": "x", "channel": "git.main"}}),
+                json!({
+                    "channel": "git.main",
+                    "input": {"repo": "o/r", "number": 9, "body": "x"},
+                }),
             )
             .unwrap();
         assert!(out.success, "expected success, got {out:?}");
@@ -413,6 +432,43 @@ mod tests {
                 9,
                 "x".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn rejects_channel_from_nested_piped_input() {
+        let adapter = Arc::new(RecordingAdapter {
+            calls: Mutex::new(Vec::new()),
+            result: Ok(()),
+        });
+        let cap = ForgeCommentCapability::new(Some(adapter.clone()));
+        let out = cap
+            .execute(
+                ctx(),
+                json!({
+                    "input": {
+                        "repo": "o/r",
+                        "number": 9,
+                        "body": "x",
+                        "channel": "discord.ops",
+                    },
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            !out.success,
+            "expected nested channel rejection, got {out:?}"
+        );
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.contains("input.channel")),
+            "expected field-specific error, got {out:?}"
+        );
+        assert!(
+            adapter.calls.lock().unwrap().is_empty(),
+            "nested channel input must fail before any forge adapter call"
         );
     }
 
@@ -452,6 +508,35 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(out.error.unwrap().contains("forge said no"));
+    }
+
+    #[test]
+    fn channel_forge_rejects_explicit_non_git_channel() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels.insert(
+            "discord.ops".to_string(),
+            Arc::new(SlowChannel {
+                sends: Arc::clone(&sends),
+                delay: Duration::from_millis(0),
+            }),
+        );
+        let adapter = ChannelForgeAdapter::new(channels);
+
+        let err = match adapter.resolve(Some("discord.ops")) {
+            Ok(_) => panic!("expected explicit non-git channel to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("not a git channel"),
+            "expected git-only channel rejection, got {err}"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "non-git channel rejection must happen before send"
+        );
     }
 
     #[test]
