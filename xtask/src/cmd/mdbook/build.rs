@@ -40,12 +40,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
             .collect::<Vec<_>>()
             .join(" ")
     );
-    inject_lang_switcher_locales(&book, &entries)?;
-    crate::cmd::mdbook::themes::run(root)?;
-    crate::cmd::mdbook::keymap::run(root)?;
-    crate::cmd::mdbook::hardware::run(root)?;
-    crate::cmd::mdbook::feature_matrix::run(root)?;
-    crate::cmd::mdbook::plugins::run(root)?;
+    prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
     let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
@@ -67,6 +62,28 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+/// Generate every gitignored input that mdBook sources or hashes while
+/// rendering. Keep all entrypoints on this helper so a warm working tree cannot
+/// hide a missing generator from clean-checkout builds.
+pub fn prepare_generated_book_inputs(
+    root: &Path,
+    entries: &[LocaleEntry],
+) -> anyhow::Result<()> {
+    inject_lang_switcher_locales(&book_dir(root), entries)?;
+    crate::cmd::mdbook::themes::run(root)?;
+    crate::cmd::mdbook::keymap::run(root)?;
+    crate::cmd::mdbook::hardware::run(root)?;
+    crate::cmd::mdbook::feature_matrix::run(root)?;
+    crate::cmd::mdbook::plugins::run(root)?;
+    Ok(())
+}
+
+/// Render `theme/lang-switcher.js.tpl` into `theme/lang-switcher.js` with the
+/// `LOCALES` array filled from `locales.toml`. The `.js` output is gitignored
+/// (every locale add/remove rewrites it); the `.tpl` source is the tracked
+/// truth. Errors loudly when the template is missing — silently skipping
+/// would let mdBook fail later with a confusing "missing additional-js"
+/// message.
 pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
     let tpl_path = book.join("theme/lang-switcher.js.tpl");
     let js_path = book.join("theme/lang-switcher.js");

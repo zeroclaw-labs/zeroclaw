@@ -203,14 +203,14 @@ During a release, after `./scripts/release/bump-version.sh` has set the version 
 #### sh
 
 ```sh
-./scripts/release/refresh-translations.sh    # version from Cargo.toml
+./scripts/release/refresh-translations.sh --model-provider anthropic.release
 ```
 
 </div>
 
-Run it after `bump-version.sh` so the version it reads is the release version. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` only when the catalogues are already current and separately checked; that flag skips both sync and `cargo mdbook check`. Pass an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
+Run it after `bump-version.sh` so the version it reads is the release version. Pass the configured provider alias explicitly with `--model-provider`; use `--config-dir` when that alias is stored outside the default config directory. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` only when the catalogues are already current and separately checked; that flag skips both sync and `cargo mdbook check`. Pass an explicit version (`./scripts/release/refresh-translations.sh 0.8.2 --model-provider anthropic.release`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
 
-The model used is whatever is configured under `providers.models.<kind>.<alias>` for the selected alias.
+The model used is the alias selected by `--model-provider`, resolved from `providers.models.<kind>.<alias>`.
 
 ## Model quality notes
 

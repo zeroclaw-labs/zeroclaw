@@ -74,7 +74,7 @@ Then refresh the docs translation catalogues and pin them to the matching tag:
 #### sh
 
 ```sh
-./scripts/release/refresh-translations.sh    # init submodule, refresh catalogues, tag, pin
+./scripts/release/refresh-translations.sh --model-provider anthropic.release
 ```
 
 </div>
@@ -85,8 +85,10 @@ hand), runs the translation pass, commits and pushes the catalogues to the
 submodule, cuts the `v{version}` tag there, and stages the main-repo gitlink
 pinned to that tag. It initialises the submodule if it is not already checked
 out. Run it after `bump-version.sh` so the `Cargo.toml` version it reads is the
-release version. Pass `--no-translate` to skip the sync pass when the catalogues
-are already current, or an explicit version to override the `Cargo.toml` default.
+release version. The configured provider alias is required explicitly so the
+release does not depend on a hardcoded backend; pass `--config-dir` when needed.
+Use `--no-translate` when the catalogues are already current, or pass an explicit
+version before `--model-provider` to override the `Cargo.toml` default.
 
 Commit everything together:
 
