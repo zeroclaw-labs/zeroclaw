@@ -38,6 +38,8 @@ pub use crate::discord::DiscordChannel;
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-filesystem")]
 pub use crate::filesystem::FilesystemChannel;
+#[cfg(feature = "channel-git")]
+pub use crate::git::GitChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
@@ -88,6 +90,8 @@ pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 #[cfg(feature = "channel-wecom-ws")]
 pub use crate::wecom_ws::WeComWsChannel;
+#[cfg(feature = "channel-wecom-ws")]
+use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -108,29 +112,35 @@ pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
+use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
+#[cfg(test)]
+use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
+use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, ToolLoop, apply_policy_tool_filter,
-    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
-    eager_mcp_tool_allowed, get_model_switch_state, is_model_switch_requested,
-    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
+    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
+    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
+    scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -258,9 +268,6 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
-const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
@@ -322,12 +329,18 @@ enum OverrideScope {
     Agent,
 }
 
-impl OverrideScope {
-    fn label(self) -> &'static str {
-        match self {
-            OverrideScope::User => "user",
-            OverrideScope::Agent => "agent",
-        }
+fn channel_runtime_cli_string(key: &str) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string(key)
+}
+
+fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+}
+
+fn channel_runtime_scope_label(scope: OverrideScope) -> String {
+    match scope {
+        OverrideScope::User => channel_runtime_cli_string("channel-runtime-scope-user"),
+        OverrideScope::Agent => channel_runtime_cli_string("channel-runtime-scope-agent"),
     }
 }
 
@@ -536,6 +549,8 @@ struct ChannelRuntimeContext {
     /// (append / remove_last / delete_session) for the same sender without
     /// serializing the full message-processing loop.  See #7753.
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -602,9 +617,6 @@ fn channel_scope(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     let channel_scope = channel_scope(msg);
-    if msg.channel == "wecom_ws" {
-        return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
-    }
     // reply_target gives per-channel isolation (distinct Discord/Slack
     // channels) and thread_ts gives per-topic isolation in forum groups.
     // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
@@ -617,10 +629,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
         other => other,
     };
     let raw = match (msg.conversation_scope, thread_scope) {
-        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(tid)) => {
-            format!("{channel_scope}_{}_{tid}", msg.reply_target)
-        }
-        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
+        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, _) => {
             format!("{channel_scope}_{}", msg.reply_target)
         }
         (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(tid)) => {
@@ -660,20 +669,20 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    if msg.channel == "wecom_ws" && msg.reply_target.starts_with("group--") {
-        let channel_scope = match &msg.channel_alias {
-            Some(alias) => format!("{}.{}", msg.channel, alias),
-            None => msg.channel.clone(),
-        };
-        return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
-    }
-
-    match &msg.interruption_scope_id {
-        Some(scope) => format!(
+    match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
+        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
+            sanitize_session_key(&format!("{}_{}", channel_scope(msg), scope))
+        }
+        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
+            sanitize_session_key(&format!("{}_{}", channel_scope(msg), msg.reply_target))
+        }
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, msg.sender, scope
         ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => {
+            format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+        }
     }
 }
 
@@ -904,6 +913,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on WhatsApp Web:\n\
              - Be concise and direct\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
@@ -911,10 +921,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
              - Be concise and direct\n\
+             - Use Markdown formatting for readable answers\n\
+             - If a tool can answer the task, use your tools instead of stopping at a plain chat reply\n\
+             - Use tool results silently: answer with the outcome and do not narrate internal tool execution bookkeeping\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in Lark/Feishu media markers.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers, tool output, or protocol markup in code fences.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
@@ -1030,6 +1043,54 @@ fn build_channel_system_prompt(
     );
 
     prompt
+}
+
+/// Build a channel system prompt whose tool-availability claim is derived
+/// from the **per-turn** `native_tool_specs_present` signal rather than
+/// from the startup prompt's frozen signal.
+///
+/// The startup prompt is built once with `model_provider.supports_native_tools()`
+/// against the base provider, and never reflects per-turn route/vision
+/// resolution or `non_cli_excluded_tools` filtering. A non-CLI channel turn
+/// at autonomy below `Full` can therefore advertise native tools while the
+/// request sends a filtered/empty `tool_specs` list — issue #8054 Surface 1(a).
+///
+/// This helper preserves the startup prompt's cached-prefix byte-stability
+/// (important for provider prompt caching) by performing a surgical anchor
+/// swap rather than a full prompt rebuild. The anchor strings
+/// (`NATIVE_TOOLS_TASK_FRAMING` / `NO_TOOLS_TASK_FRAMING`) are emitted by
+/// `build_system_prompt_with_mode_and_autonomy` in
+/// `crates/zeroclaw-runtime/src/agent/system_prompt.rs` (introduced by
+/// PR #8053). If neither anchor is present in the base prompt (e.g. a
+/// custom `system_prompt_prefix` overrides the default), the helper is a
+/// no-op — same as today's behavior.
+fn build_channel_system_prompt_for_message_with_signal(
+    base_prompt: &str,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    native_tool_specs_present: bool,
+) -> String {
+    let prompt = build_channel_system_prompt_for_message(base_prompt, msg, target_channel);
+    let want = if native_tool_specs_present {
+        ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING
+    } else {
+        ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING
+    };
+    if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING) {
+        prompt.replace(
+            ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+            want,
+        )
+    } else if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING) {
+        prompt.replace(
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+            want,
+        )
+    } else {
+        // Anchor absent (custom system_prompt_prefix or unusual config);
+        // no-op. Preserves byte-stability for non-default startup prompts.
+        prompt
+    }
 }
 
 fn current_date_section() -> String {
@@ -1153,23 +1214,18 @@ fn build_channel_turn_context_preamble(
     preamble
 }
 
-/// Compose the outgoing user-turn content from the volatile preamble, the
-/// per-turn memory recall block, and the raw (timestamped) user content.
+/// Compose the outgoing user-turn content from the volatile preamble and
+/// the raw (timestamped) user content. The per-turn memory block is no
+/// longer composed here: the turn engine injects it above the whole user
+/// turn (agent::memory_inject), so the wire order is memory -> preamble ->
+/// raw content, matching the CLI shape.
 ///
-/// Order on the wire: preamble → memory_context → raw user content, joined
-/// by blank lines. When `preamble` is empty (CLI-style / no `reply_target`)
-/// and `memory_context` is empty, returns the raw content unchanged.
-fn compose_outgoing_user_turn_with_context(
-    preamble: &str,
-    memory_context: &str,
-    raw_user_content: &str,
-) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+/// When `preamble` is empty (CLI-style / no `reply_target`), returns the
+/// raw content unchanged.
+fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &str) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(2);
     if !preamble.is_empty() {
         parts.push(preamble);
-    }
-    if !memory_context.is_empty() {
-        parts.push(memory_context);
     }
     parts.push(raw_user_content);
     parts.join("\n\n")
@@ -1346,9 +1402,11 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     )
 }
 
-fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) -> bool {
-    channel_name == "wecom_ws"
-        && content.contains("[WeCom group message addressed to this bot via @")
+fn should_bypass_reply_intent_precheck(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    direct_message: bool,
+) -> bool {
+    msg.explicitly_addressed || direct_message
 }
 
 fn is_matrix_channel_name(channel_name: &str) -> bool {
@@ -1931,8 +1989,14 @@ fn shadow_note(
         String::new()
     } else {
         format!(
-            "\n⚠️ A higher-precedence override is active, so messages will use `{}` (`{}`) instead — see `/model`.",
-            effective.model, effective.model_provider
+            "\n{}",
+            channel_runtime_cli_string_with_args(
+                "channel-runtime-shadow-note",
+                &[
+                    ("model", effective.model.as_str()),
+                    ("provider", effective.model_provider.as_str()),
+                ],
+            )
         )
     }
 }
@@ -1958,6 +2022,66 @@ fn set_scope_override(
     } else {
         overrides.insert(key, next);
     }
+}
+
+/// Per-sender authorization for `/model --agent <model>`. Resolves live
+/// from `Config::peer_groups` via `Config::channel_agent_scope_admins`;
+/// no cache, no per-channel duplicate sender list (consistent with
+/// `AGENTS.md` SINGLE SOURCE OF TRUTH). Default deny
+/// (`RequireExplicit`); operators who want the prior behavior opt in
+/// by marking one or more peer groups `admin_for_agent_scope = true`.
+/// See issue #8044.
+///
+/// **Effective-on-restart semantics:** this gate reads
+/// `ctx.prompt_config`, an `Arc<Config>` snapshot captured when the
+/// runtime context was built. A `peer_groups` edit in `config.toml`
+/// therefore takes effect on context rebuild / daemon restart, not on
+/// the next command — same lifetime as the other `prompt_config`-backed
+/// orchestrator helpers. (The `channel_external_peers` sibling reads a
+/// live `RwLock` for inbound dispatch because the gateway constructs
+/// fresh `peer_resolver` closures per alias; the orchestrator's runtime
+/// context is built once at startup and uses the snapshot path.)
+///
+/// Matching routes through `crate::allowlist::is_user_allowed` so the
+/// gate honors the same wildcard (`["*"]` admits anyone) and per-channel
+/// peer-identity semantics every inbound channel uses, instead of a raw
+/// `==` that ignores wildcard, case, and the leading `@` Telegram strips
+/// before comparison. Both the configured peer list and the incoming
+/// sender are normalized through [`normalize_peer_username`] (strip a
+/// leading `@`, ASCII-lowercase) so an operator who writes
+/// `external_peers = ["@user_1"]` is matched by an inbound `user_1`
+/// sender — matching what every channel's inbound path does before
+/// calling `is_user_allowed`.
+fn is_agent_scope_authorized(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let channel_type = msg.channel.as_str();
+    let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+    let agent_alias = ctx.agent_alias.as_str();
+    let admins: Vec<String> = ctx
+        .prompt_config
+        .channel_agent_scope_admins(channel_type, channel_alias, agent_alias)
+        .into_iter()
+        .map(|p| normalize_peer_username(&p))
+        .collect();
+    let sender = normalize_peer_username(msg.sender.as_str());
+    crate::allowlist::is_user_allowed(&admins, &sender, crate::allowlist::Match::Sensitive)
+}
+
+/// Canonical peer-username form used by the agent-scope gate. Inbound
+/// channels (Telegram: `Self::normalize_identity`; IRC: `Match::CaseInsensitive`;
+/// Matrix: same) already collapse the inbound sender into a stripped /
+/// case-folded identity before calling `allowlist::is_user_allowed`. The
+/// gate must apply the same shape to the configured `external_peers`
+/// list so an operator's `"@user_1"` / `"user_1"` / `"@Alice"` entries
+/// all match the same channel-normalized sender identity.
+///
+/// Kept local to this module so any future per-channel nuance (E.164
+/// phone, email domain) can be plumbed explicitly through
+/// `allowlist::is_user_allowed_by` rather than overloading this helper.
+fn normalize_peer_username(raw: &str) -> String {
+    raw.trim_start_matches('@').to_ascii_lowercase()
 }
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -2032,7 +2156,8 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
             ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
-        ctx.prompt_config.skills.prompt_injection_mode,
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
 }
@@ -2201,45 +2326,6 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     }
 
     zeroclaw_providers::reliable::is_non_retryable(error)
-}
-
-fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
-    if zeroclaw_memory::is_assistant_autosave_key(key) {
-        return true;
-    }
-
-    // Skip raw per-turn user messages: re-injecting them causes each
-    // recalled entry to embed all prior generations, growing exponentially.
-    // Consolidated knowledge is already promoted to Core/Daily entries.
-    if zeroclaw_memory::is_user_autosave_key(key) {
-        return true;
-    }
-
-    if zeroclaw_memory::should_skip_autosave_content(content) {
-        return true;
-    }
-
-    if key.trim().to_ascii_lowercase().ends_with("_history") {
-        return true;
-    }
-
-    // Skip entries containing image markers to prevent duplication.
-    // When auto_save stores a photo message to memory, a subsequent
-    // memory recall on the same turn would surface the marker again,
-    // causing two identical image blocks in the model_provider request.
-    if content.contains("[IMAGE:") {
-        return true;
-    }
-
-    // Skip entries containing tool_result blocks. After a daemon restart
-    // these can be recalled from SQLite and injected as memory context,
-    // presenting the LLM with a `<tool_result>` without a preceding
-    // `<tool_call>` and triggering hallucinated output.
-    if content.contains("<tool_result") {
-        return true;
-    }
-
-    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
@@ -2429,15 +2515,25 @@ fn build_models_help_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current model_provider: `{}`\nCurrent model: `{}`",
-        current.model_provider, current.model
-    );
-    response.push_str("\nSwitch model with `/model <model-id>` or `/model <hint>`.\n");
+    response.push_str(&channel_runtime_cli_string_with_args(
+        "channel-runtime-current-model-status",
+        &[
+            ("provider", current.model_provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-model-switch-hint",
+    ));
+    response.push('\n');
 
     if !model_routes.is_empty() {
-        response.push_str("\nConfigured model routes:\n");
+        response.push('\n');
+        response.push_str(&channel_runtime_cli_string(
+            "channel-runtime-configured-routes-header",
+        ));
+        response.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 response,
@@ -2449,17 +2545,19 @@ fn build_models_help_response(
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.model_provider);
     if cached_models.is_empty() {
-        let _ = writeln!(
-            response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --model-provider {}`.",
-            current.model_provider, current.model_provider
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-no-cached-models",
+            &[("provider", current.model_provider.as_str())],
+        ));
+        response.push('\n');
     } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-cached-model-ids-header",
+            &[("count", &cached_models.len().to_string())],
+        ));
+        response.push('\n');
         for model in cached_models {
             let _ = writeln!(response, "- `{model}`");
         }
@@ -2470,14 +2568,26 @@ fn build_models_help_response(
 
 fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current model_provider: `{}`\nCurrent model: `{}`",
-        current.model_provider, current.model
-    );
-    response.push_str("\nSwitch model_provider with `/models <model_provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
-    response.push_str("Available model model_providers:\n");
+    response.push_str(&channel_runtime_cli_string_with_args(
+        "channel-runtime-current-model-status",
+        &[
+            ("provider", current.model_provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-provider-switch-hint",
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-model-switch-hint",
+    ));
+    response.push_str("\n\n");
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-available-providers-header",
+    ));
+    response.push('\n');
     for model_provider in zeroclaw_providers::list_model_providers() {
         let _ = writeln!(response, "- {}", model_provider.name);
     }
@@ -2491,17 +2601,28 @@ fn build_config_text_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut resp = String::new();
-    let _ = writeln!(
-        resp,
-        "Current model_provider: `{}`\nCurrent model: `{}`",
-        current.model_provider, current.model
-    );
-    resp.push_str("\nAvailable model_providers:\n");
+    resp.push_str(&channel_runtime_cli_string_with_args(
+        "channel-runtime-current-model-status",
+        &[
+            ("provider", current.model_provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    ));
+    resp.push('\n');
+    resp.push('\n');
+    resp.push_str(&channel_runtime_cli_string(
+        "channel-runtime-available-providers-header",
+    ));
+    resp.push('\n');
     for p in zeroclaw_providers::list_model_providers() {
         let _ = writeln!(resp, "- `{}`", p.name);
     }
     if !model_routes.is_empty() {
-        resp.push_str("\nConfigured model routes:\n");
+        resp.push('\n');
+        resp.push_str(&channel_runtime_cli_string(
+            "channel-runtime-configured-routes-header",
+        ));
+        resp.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 resp,
@@ -2510,9 +2631,10 @@ fn build_config_text_response(
             );
         }
     }
-    resp.push_str(
-        "\nUse `/models <model_provider>` to switch model_provider.\nUse `/model <model-id>` to switch model.",
-    );
+    resp.push('\n');
+    resp.push_str(&channel_runtime_cli_string(
+        "channel-runtime-config-switch-hints",
+    ));
     resp
 }
 
@@ -2599,7 +2721,10 @@ fn build_config_block_kit(
     let mut provider_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_provider",
-        "placeholder": { "type": "plain_text", "text": "Select model_provider" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_cli_string("channel-runtime-config-select-provider-placeholder")
+        },
         "options": provider_options
     });
     if let Some(init) = initial_provider {
@@ -2609,7 +2734,10 @@ fn build_config_block_kit(
     let mut model_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_model",
-        "placeholder": { "type": "plain_text", "text": "Select model" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_cli_string("channel-runtime-config-select-model-placeholder")
+        },
         "options": model_options
     });
     if let Some(init) = initial_model {
@@ -2621,22 +2749,31 @@ fn build_config_block_kit(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!(
-                    "*Model Configuration*\nCurrent: `{}` / `{}`",
-                    current.model_provider, current.model
+                "text": channel_runtime_cli_string_with_args(
+                    "channel-runtime-config-block-title",
+                    &[
+                        ("provider", current.model_provider.as_str()),
+                        ("model", current.model.as_str()),
+                    ],
                 )
             }
         },
         {
             "type": "section",
             "block_id": "config_provider_block",
-            "text": { "type": "mrkdwn", "text": "*ModelProvider*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_cli_string("channel-runtime-config-provider-label")
+            },
             "accessory": provider_select
         },
         {
             "type": "section",
             "block_id": "config_model_block",
-            "text": { "type": "mrkdwn", "text": "*Model*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_cli_string("channel-runtime-config-model-label")
+            },
             "accessory": model_select
         }
     ]);
@@ -2678,11 +2815,18 @@ fn build_scope_override_summary(
         .map(fmt_sel)
         .unwrap_or_else(|| "—".to_string());
     let default = default_route_selection_from_snapshot(defaults_snapshot);
+    let default = fmt_sel(&default);
     format!(
-        "\n\n**Model overrides** (session-only; precedence user > agent > session > default):\n\
-         • user: {user}\n• agent: {agent}\n• session (this chat): {session}\n• default (config): {}\n\
-         Set a scope with `/model --user|--agent <model-id>`; clear by setting it back to the default.",
-        fmt_sel(&default),
+        "\n\n{}",
+        channel_runtime_cli_string_with_args(
+            "channel-runtime-scope-overrides-summary",
+            &[
+                ("user", user.as_str()),
+                ("agent", agent.as_str()),
+                ("session", session.as_str()),
+                ("default", default.as_str()),
+            ],
+        )
     )
 }
 
@@ -2721,15 +2865,22 @@ async fn handle_runtime_command_if_needed(
                                 );
                             }
 
-                            format!(
-                                "ModelProvider switched to `{provider_ref}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                                current.model
+                            channel_runtime_cli_string_with_args(
+                                "channel-runtime-set-provider-switched",
+                                &[
+                                    ("provider", provider_ref.as_str()),
+                                    ("model", current.model.as_str()),
+                                ],
                             )
                         }
                         Err(err) => {
                             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                            format!(
-                                "Failed to initialize model_provider `{provider_ref}`. Route unchanged.\nDetails: {safe_err}"
+                            channel_runtime_cli_string_with_args(
+                                "channel-runtime-set-provider-init-failed",
+                                &[
+                                    ("provider", provider_ref.as_str()),
+                                    ("error", safe_err.as_str()),
+                                ],
                             )
                         }
                     }
@@ -2740,15 +2891,20 @@ async fn handle_runtime_command_if_needed(
                         .map(|a| format!("`{family}.{a}`"))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!(
-                        "ModelProvider `{family}` has multiple configured aliases. Qualify which one with `/models {family}.<alias>`: {list}"
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-provider-ambiguous",
+                        &[("family", family.as_str()), ("list", list.as_str())],
                     )
                 }
-                ModelsCommandResolution::NoAlias(ref_or_family) => format!(
-                    "No configured provider entry for `{ref_or_family}`. Add `[providers.models.{ref_or_family}]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones."
-                ),
-                ModelsCommandResolution::Unknown => format!(
-                    "Unknown model_provider `{raw_model_provider}`. Use `/models` to list valid model_providers."
+                ModelsCommandResolution::NoAlias(ref_or_family) => {
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-provider-no-alias",
+                        &[("provider", ref_or_family.as_str())],
+                    )
+                }
+                ModelsCommandResolution::Unknown => channel_runtime_cli_string_with_args(
+                    "channel-runtime-provider-unknown",
+                    &[("provider", raw_model_provider.as_str())],
                 ),
             }
         }
@@ -2764,18 +2920,66 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModelScoped(scope, raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
+                channel_runtime_cli_string("channel-runtime-scoped-model-empty")
+            } else if scope == OverrideScope::Agent && !is_agent_scope_authorized(ctx, msg) {
+                // Per-sender authorization gate for the `--agent` scope only.
+                // `/model --user` is unaffected. See issue #8044.
+                let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "sender": msg.sender.as_str(),
+                            "agent": ctx.agent_alias.as_str(),
+                            "channel": msg.channel.as_str(),
+                            "channel_alias": channel_alias,
+                            "model_requested": model.as_str(),
+                            "command": "/model --agent",
+                        })),
+                    "agent-scope /model override rejected"
+                );
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-agent-scope-rejected",
+                    &[
+                        ("sender", msg.sender.as_str()),
+                        ("agent", ctx.agent_alias.as_str()),
+                        ("model", model.as_str()),
+                    ],
+                )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
                 let mut next = current.clone();
                 apply_model_ref(&mut next, &ctx.model_routes, &model);
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
-                let mut resp = format!(
-                    "Model set to `{}` (model_provider: `{}`) for the **{}** scope. Session-only — resets on restart.",
-                    next.model,
-                    next.model_provider,
-                    scope.label(),
+                if scope == OverrideScope::Agent {
+                    let channel_alias =
+                        msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "sender": msg.sender.as_str(),
+                                "agent": ctx.agent_alias.as_str(),
+                                "channel": msg.channel.as_str(),
+                                "channel_alias": channel_alias,
+                                "model_provider": next.model_provider.as_str(),
+                                "model": next.model.as_str(),
+                                "command": "/model --agent",
+                            })),
+                        "agent-scope /model override accepted"
+                    );
+                }
+                let scope_label = channel_runtime_scope_label(scope);
+                let mut resp = channel_runtime_cli_string_with_args(
+                    "channel-runtime-scoped-model-switched",
+                    &[
+                        ("model", next.model.as_str()),
+                        ("provider", next.model_provider.as_str()),
+                        ("scope", scope_label.as_str()),
+                    ],
                 );
                 resp.push_str(&shadow_note(
                     ctx,
@@ -2790,12 +2994,12 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-model-empty")
+                channel_runtime_cli_string("channel-runtime-model-empty")
             } else {
                 apply_model_ref(&mut current, &ctx.model_routes, &model);
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
-                let mut resp = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                let mut resp = channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",
                     &[
                         ("model", current.model.as_str()),
@@ -2848,7 +3052,7 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
+            channel_runtime_cli_string("channel-runtime-new-session")
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -2856,9 +3060,9 @@ async fn handle_runtime_command_if_needed(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(sender_key.clone(), level);
-                format!(
-                    "Thinking set to `{}` for this sender session.\nUse `/thinking reset` to return to the agent default.",
-                    level.as_str()
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-thinking-set",
+                    &[("level", level.as_str())],
                 )
             }
             None => {
@@ -2870,18 +3074,21 @@ async fn handle_runtime_command_if_needed(
                     .is_some();
                 let default = ctx.agent_cfg.resolved.thinking.default_level.as_str();
                 if removed {
-                    format!(
-                        "Thinking override cleared. Using agent default `{default}` for this sender session."
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-thinking-cleared",
+                        &[("default", default)],
                     )
                 } else {
-                    format!(
-                        "Thinking is already using agent default `{default}` for this sender session.\nUse `/thinking high`, `/thinking max`, or `/thinking off` to override it."
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-thinking-default",
+                        &[("default", default)],
                     )
                 }
             }
         },
-        ChannelRuntimeCommand::InvalidThinking(raw) => format!(
-            "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
+        ChannelRuntimeCommand::InvalidThinking(raw) => channel_runtime_cli_string_with_args(
+            "channel-runtime-thinking-invalid",
+            &[("raw", raw.as_str())],
         ),
     };
 
@@ -2914,114 +3121,6 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
-}
-
-async fn build_memory_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_id: Option<&str>,
-) -> String {
-    build_memory_context_for_sessions(mem, user_msg, min_relevance_score, &[session_id]).await
-}
-
-async fn build_memory_context_for_sessions(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_ids: &[Option<&str>],
-) -> String {
-    let mut entries = Vec::new();
-    let mut seen_keys = HashSet::new();
-
-    match session_ids {
-        [] => {}
-        [session_id] => {
-            let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-        }
-        [first_session_id, second_session_id] => {
-            let (first_entries, second_entries) = tokio::join!(
-                mem.recall(user_msg, 5, *first_session_id, None, None),
-                mem.recall(user_msg, 5, *second_session_id, None, None)
-            );
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, first_entries);
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, second_entries);
-        }
-        _ => {
-            for session_id in session_ids {
-                let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-                append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-            }
-        }
-    }
-
-    format_memory_context(&entries, min_relevance_score)
-}
-
-fn append_recalled_memory_entries(
-    entries: &mut Vec<zeroclaw_memory::MemoryEntry>,
-    seen_keys: &mut HashSet<String>,
-    recalled: Result<Vec<zeroclaw_memory::MemoryEntry>>,
-) {
-    if let Ok(recalled) = recalled {
-        for entry in recalled {
-            if seen_keys.insert(entry.key.clone()) {
-                entries.push(entry);
-            }
-        }
-    }
-}
-
-fn format_memory_context(
-    entries: &[zeroclaw_memory::MemoryEntry],
-    min_relevance_score: f64,
-) -> String {
-    let mut context = String::new();
-
-    let mut included = 0usize;
-    let mut used_chars = 0usize;
-
-    for entry in entries.iter().filter(|e| match e.score {
-        Some(score) => score >= min_relevance_score,
-        None => true, // keep entries without a score (e.g. non-vector backends)
-    }) {
-        if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-            break;
-        }
-
-        if should_skip_memory_context_entry(&entry.key, &entry.content) {
-            continue;
-        }
-
-        let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-            truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-        } else {
-            entry.content.clone()
-        };
-
-        let line = format!("- {}: {}\n", entry.key, content);
-        let line_chars = line.chars().count();
-        if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-            break;
-        }
-
-        if included == 0 {
-            context.push_str(MEMORY_CONTEXT_OPEN);
-            context.push('\n');
-        }
-
-        context.push_str(&line);
-        used_chars += line_chars;
-        included += 1;
-    }
-
-    if included > 0 {
-        context.push_str(MEMORY_CONTEXT_CLOSE);
-        context.push_str("\n\n");
-    }
-
-    context
 }
 
 fn is_group_reply_target(reply_target: &str) -> bool {
@@ -3488,7 +3587,52 @@ fn should_suppress_top_level_tool_protocol_response(
     zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(response)
 }
 
+#[cfg(test)]
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    sanitize_channel_response_with_leak_detection(
+        response,
+        tools,
+        &zeroclaw_config::schema::LeakDetectionConfig::default(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundContentFormat {
+    Markdown,
+    PlainText,
+}
+
+fn outbound_content_format_for_channel(channel: &str) -> OutboundContentFormat {
+    let channel_type = channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type);
+    if channel_type.eq_ignore_ascii_case("irc") || channel_type.eq_ignore_ascii_case("twitch") {
+        OutboundContentFormat::PlainText
+    } else {
+        OutboundContentFormat::Markdown
+    }
+}
+
+#[cfg(test)]
+fn sanitize_channel_response_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> String {
+    sanitize_channel_response_for_format_with_leak_detection(
+        response,
+        tools,
+        leak_detection,
+        OutboundContentFormat::Markdown,
+    )
+}
+
+fn sanitize_channel_response_for_format_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -3517,9 +3661,25 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
-    // Scan for credential leaks before returning to caller
-    match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
-        zeroclaw_runtime::security::LeakResult::Clean => sanitized,
+    redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
+}
+
+fn redact_channel_outbound_leaks(
+    content: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
+    if !leak_detection.enabled {
+        return content.to_string();
+    }
+    // Scan for credential leaks before returning to caller. Format-specific
+    // outbound layers identify parsed destinations that must remain intact and
+    // pass only byte ranges to the format-agnostic detector.
+    let protected_spans = channel_outbound_protected_spans(content, content_format);
+    match zeroclaw_runtime::security::LeakDetector::with_config(leak_detection)
+        .scan_with_protected_spans(content, &protected_spans)
+    {
+        zeroclaw_runtime::security::LeakResult::Clean => content.to_string(),
         zeroclaw_runtime::security::LeakResult::Detected { patterns, redacted } => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3530,6 +3690,201 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
             );
             redacted
         }
+    }
+}
+
+fn channel_outbound_protected_spans(
+    content: &str,
+    content_format: OutboundContentFormat,
+) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    // A file URI is a file reference even when punctuation inside it looks
+    // like query syntax; protect it for every outbound text format.
+    if content
+        .as_bytes()
+        .windows(b"file:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"file:"))
+    {
+        collect_raw_file_uri_spans(content, &mut spans);
+    }
+    match content_format {
+        OutboundContentFormat::Markdown => {
+            if content.contains("](")
+                || content.contains("]:")
+                || (content.contains('<') && content.contains("://"))
+            {
+                collect_markdown_link_destination_spans(content, &mut spans);
+            }
+        }
+        OutboundContentFormat::PlainText => {}
+    }
+    spans
+}
+
+fn collect_markdown_link_destination_spans(content: &str, spans: &mut Vec<Range<usize>>) {
+    let parser = MarkdownParser::new_ext(content, MarkdownOptions::empty());
+
+    for (_, link_def) in parser.reference_definitions().iter() {
+        if let Some(span) =
+            parsed_destination_span(content, link_def.span.clone(), link_def.dest.as_ref())
+        {
+            spans.push(span);
+        }
+    }
+
+    for (event, range) in parser.into_offset_iter() {
+        if let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) = event
+            && let Some(span) = parsed_destination_span(content, range, dest_url.as_ref())
+        {
+            spans.push(span);
+        }
+    }
+}
+
+fn parsed_destination_span(
+    content: &str,
+    source_range: Range<usize>,
+    parsed_destination: &str,
+) -> Option<Range<usize>> {
+    if parsed_destination.is_empty() {
+        return None;
+    }
+    let source = content.get(source_range.clone())?;
+    let search_start = destination_search_start(source);
+    decoded_destination_span(source, search_start, parsed_destination)
+        .map(|span| source_range.start + span.start..source_range.start + span.end)
+}
+
+fn destination_search_start(source: &str) -> usize {
+    source
+        .find("](")
+        .map(|idx| idx + 2)
+        .or_else(|| source.find("]:").map(|idx| idx + 2))
+        .unwrap_or(0)
+}
+
+fn decoded_destination_span(
+    source: &str,
+    search_start: usize,
+    parsed_destination: &str,
+) -> Option<Range<usize>> {
+    for (offset, _) in source[search_start..].char_indices() {
+        let start = search_start + offset;
+        if let Some(end) = decoded_match_end(&source[start..], parsed_destination) {
+            return Some(start..start + end);
+        }
+    }
+    None
+}
+
+fn decoded_match_end(raw: &str, parsed: &str) -> Option<usize> {
+    let mut raw_idx = 0;
+
+    for expected in parsed.chars() {
+        let ch = raw[raw_idx..].chars().next()?;
+        let (decoded, end) = if ch == '\\' {
+            let escaped_idx = raw_idx + ch.len_utf8();
+            let next_ch = raw[escaped_idx..].chars().next()?;
+            if !next_ch.is_ascii_punctuation() {
+                return None;
+            }
+            (next_ch, escaped_idx + next_ch.len_utf8())
+        } else if ch == '&' {
+            decode_markdown_entity(raw, raw_idx)?
+        } else {
+            (ch, raw_idx + ch.len_utf8())
+        };
+
+        if decoded != expected {
+            return None;
+        }
+        raw_idx = end;
+    }
+
+    Some(raw_idx)
+}
+
+fn decode_markdown_entity(raw: &str, amp_idx: usize) -> Option<(char, usize)> {
+    let entity_end = raw[amp_idx..].find(';')? + amp_idx + 1;
+    let entity = &raw[amp_idx + 1..entity_end - 1];
+    let decoded = match entity {
+        "amp" | "AMP" => '&',
+        "lt" | "LT" => '<',
+        "gt" | "GT" => '>',
+        "quot" | "QUOT" => '"',
+        "apos" | "APOS" => '\'',
+        "colon" | "COLON" => ':',
+        "sol" | "SOL" => '/',
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            let value = u32::from_str_radix(&entity[2..], 16).ok()?;
+            char::from_u32(value)?
+        }
+        _ if entity.starts_with('#') => {
+            let value = entity[1..].parse::<u32>().ok()?;
+            char::from_u32(value)?
+        }
+        _ => return None,
+    };
+    Some((decoded, entity_end))
+}
+
+fn collect_raw_file_uri_spans(content: &str, spans: &mut Vec<Range<usize>>) {
+    let mut token_start = None;
+
+    for (idx, ch) in content.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                collect_file_uri_token_span(content, start, idx, spans);
+            }
+        } else {
+            token_start.get_or_insert(idx);
+        }
+    }
+
+    if let Some(start) = token_start {
+        collect_file_uri_token_span(content, start, content.len(), spans);
+    }
+}
+
+fn collect_file_uri_token_span(
+    content: &str,
+    token_start: usize,
+    token_end: usize,
+    spans: &mut Vec<Range<usize>>,
+) {
+    let token = &content[token_start..token_end];
+    let trimmed_start = token
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, '<' | '(' | '[' | '{' | '"' | '\''))
+        .map_or(token.len(), |(idx, _)| idx);
+    let trimmed_end = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| {
+            !matches!(
+                ch,
+                '>' | ')' | ']' | '}' | '"' | '\'' | '.' | ',' | ';' | ':'
+            )
+        })
+        .map_or(trimmed_start, |(idx, ch)| idx + ch.len_utf8());
+
+    if trimmed_start >= trimmed_end {
+        return;
+    }
+
+    let trimmed = &token[trimmed_start..trimmed_end];
+    let Some(scheme_offset) = trimmed
+        .as_bytes()
+        .windows(b"file:".len())
+        .position(|window| window.eq_ignore_ascii_case(b"file:"))
+    else {
+        return;
+    };
+    let uri_start = trimmed_start + scheme_offset;
+    let candidate = &token[uri_start..trimmed_end];
+
+    if Url::parse(candidate).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("file")) {
+        spans.push(token_start + uri_start..token_start + trimmed_end);
     }
 }
 
@@ -4385,6 +4740,27 @@ async fn process_channel_message_body(
         }
     }
 
+    if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
+        let wants = engine
+            .lock()
+            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
+            .unwrap_or(false);
+        if wants {
+            let topic = match &msg.channel_alias {
+                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+                _ => msg.channel.clone(),
+            };
+            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
+                engine,
+                audit,
+                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+                Some(&topic),
+                Some(&msg.content),
+            )
+            .await;
+        }
+    }
+
     let history_key = conversation_history_key(&msg);
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
@@ -4559,9 +4935,12 @@ async fn process_channel_message_body(
         Ok(model_provider) => model_provider,
         Err(err) => {
             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize model_provider `{}`. Please run `/models` to choose another model_provider.\nDetails: {safe_err}",
-                route.model_provider
+            let message = channel_runtime_cli_string_with_args(
+                "channel-runtime-provider-turn-init-failed",
+                &[
+                    ("provider", route.model_provider.as_str()),
+                    ("error", safe_err.as_str()),
+                ],
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
@@ -4674,48 +5053,19 @@ async fn process_channel_message_body(
     // within the context budget (#3460).
     collapse_inline_image_payloads(&mut prior_turns);
 
-    // ── Dual-scope memory recall ──────────────────────────────────
-    // Always recall before each LLM call (not just first turn).
-    // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: recall from the current conversation scope plus sender scope.
+    // ── Dual-scope memory recall (engine-injected) ───────────────
+    // Memory context is injected once in the turn engine, keyed on the
+    // ingress origin (agent::memory_inject). This site only assembles the
+    // session scopes: sender scope(s) always; the group/history scope is
+    // added for group chats so both are recalled (key-deduped, one block).
     let is_group_chat = is_group_reply_target(&msg.reply_target);
-
-    let mem_recall_start = Instant::now();
-    let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
-    let sender_session_id_refs: Vec<Option<&str>> = sender_session_ids
-        .iter()
-        .map(|s| Some(s.as_str()))
+    let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
+        .into_iter()
+        .map(Some)
         .collect();
-    let sender_memory_fut = build_memory_context_for_sessions(
-        ctx.memory.as_ref(),
-        &msg.content,
-        ctx.min_relevance_score,
-        sender_session_id_refs.as_slice(),
-    );
-
-    let (sender_memory, group_memory) = if is_group_chat {
-        let group_memory_fut = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            ctx.min_relevance_score,
-            Some(&history_key),
-        );
-        tokio::join!(sender_memory_fut, group_memory_fut)
-    } else {
-        (sender_memory_fut.await, String::new())
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"mem_recall_ms": mem_recall_ms, "sender_empty": sender_memory.is_empty(), "group_empty": group_memory.is_empty()})), "memory recall completed");
-
-    // Merge sender and group memory context blocks.
-    let memory_context = if group_memory.is_empty() {
-        sender_memory
-    } else if sender_memory.is_empty() {
-        group_memory
-    } else {
-        format!("{sender_memory}\n{group_memory}")
-    };
+    if is_group_chat {
+        memory_sessions.push(Some(history_key.clone()));
+    }
 
     // Build the byte-stable system prompt for the cached prefix.
     // Note: memory recall is NOT injected here (it used to be, but the
@@ -4727,8 +5077,38 @@ async fn process_channel_message_body(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
-        build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
+    // Per-turn effective tool signal — mirrors the request-side slice at
+    // line 4776 so the prompt's native/text tool claim matches what the
+    // request will actually send. See issue #8054 Surface 1(a) and the
+    // audit-zeroclaw-2026-06-28.md entry. Pattern lifted from PR #8053
+    // (direct runtime agent path) and #8216 (/think directive stripping).
+    let per_turn_excluded_tools: &[String] =
+        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+            &[]
+        } else {
+            ctx.non_cli_excluded_tools.as_ref()
+        };
+    // `process_channel_message_body` returns `()`, so the per-turn helper's
+    // `Result<bool>` is unwrapped to a default-false signal. The
+    // `build_iteration_tool_specs` path that backs this helper is the same
+    // one the request path uses (line 4855), so on a transient error the
+    // prompt falls back to the safer "no native tool specs" claim rather
+    // than a stale "yes native" one — i.e. the prompt under-claims, never
+    // over-claims, on error.
+    let per_turn_native_tool_specs_present =
+        ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+            active_model_provider.as_ref(),
+            ctx.tools_registry.as_ref(),
+            per_turn_excluded_tools,
+            ctx.activated_tools.as_ref(),
+        )
+        .unwrap_or(false);
+    let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
+        &base_system_prompt,
+        &msg,
+        target_channel.as_ref(),
+        per_turn_native_tool_specs_present,
+    );
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -4770,48 +5150,119 @@ async fn process_channel_message_body(
         && last_turn.role == "user"
     {
         let raw_content = last_turn.content.clone();
-        last_turn.content =
-            compose_outgoing_user_turn_with_context(&preamble, &memory_context, &raw_content);
+        last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let explicit_channel_address =
-        is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
     let direct_message = target_channel
         .as_ref()
         .map(|c| c.is_direct_message(&msg))
         .unwrap_or(false);
-    let classifier_intent = if explicit_channel_address || direct_message {
-        AssistantChannelOutcome::Reply(String::new())
-    } else {
-        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
-            Arc<dyn ModelProvider>,
-            String,
-            Option<f64>,
-        ) = resolve_classifier_route(
-            ctx.as_ref(),
-            &ctx.agent_cfg.classifier_provider,
-            &runtime_defaults,
-        )
-        .await
-        .unwrap_or_else(|| {
-            (
-                Arc::clone(&active_model_provider),
-                route.model.clone(),
-                None,
-            )
-        });
+    let precheck = &ctx.agent_cfg.precheck;
+    let classifier_intent = ::zeroclaw_log::scope!(
+        category: "channel",
+        model_provider: route.model_provider.as_str(),
+        model: route.model.as_str(),
+        => async {
+            if should_bypass_reply_intent_precheck(&msg, direct_message) {
+                AssistantChannelOutcome::Reply(String::new())
+            } else if !precheck.enabled {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip).with_attrs(
+                        ::serde_json::json!({
+                            "phase": "precheck",
+                            "reason": "disabled",
+                        })
+                    ),
+                    "reply-intent precheck skipped"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            } else {
+                let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+                    Arc<dyn ModelProvider>,
+                    String,
+                    Option<f64>,
+                ) = resolve_classifier_route(
+                    ctx.as_ref(),
+                    &ctx.agent_cfg.classifier_provider,
+                    &runtime_defaults,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    (
+                        Arc::clone(&active_model_provider),
+                        route.model.clone(),
+                        None,
+                    )
+                });
 
-        classify_channel_reply_intent(
-            classifier_provider_arc.as_ref(),
-            history[0].content.as_str(),
-            &history,
-            classifier_model_owned.as_str(),
-            classifier_temperature.or(runtime_defaults.defaults.temperature),
-        )
-        .await
-        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
-    };
+                let started = Instant::now();
+                let precheck_future = classify_channel_reply_intent(
+                    classifier_provider_arc.as_ref(),
+                    history[0].content.as_str(),
+                    &history,
+                    classifier_model_owned.as_str(),
+                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                );
+                match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
+                    .await
+                {
+                    Ok(Ok(outcome)) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck completed"
+                        );
+                        outcome
+                    }
+                    Ok(Err(e)) => {
+                        let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "error": safe_err,
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck failed open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                    "timeout_secs": precheck.timeout_secs,
+                                })),
+                            "reply-intent precheck timed out; failing open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                }
+            }
+        }
+    )
+    .await;
 
     // ACP sessions are direct user requests — there is no broadcast,
     // no peer context, no spam concern. The no-reply classifier is a
@@ -5098,6 +5549,12 @@ async fn process_channel_message_body(
             .with_attrs(::serde_json::json!({"elapsed_before_llm_ms": elapsed_before_llm_ms})),
         "starting LLM call"
     );
+    // Fresh per-turn routing handle, scoped into TURN_ROUTING for the duration of
+    // the tool-call loop below. Allocating per turn (rather than clearing a shared
+    // handle) keeps concurrent same-agent turns from reading each other's routes.
+    let turn_routing: tools::TurnRoutingHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Per-turn collector. `tool_execution::execute_one_tool` pushes
     // `<tool_name>: <receipt>` here whenever a receipt is generated, so the
     // orchestrator can render the trailing `Tool receipts:` block after the
@@ -5128,38 +5585,36 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             let tool_loop = run_tool_call_loop(ToolLoop {
-                exec: ResolvedAgentExecution {
-                    model_access: ResolvedModelAccess {
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
                         temperature: thinking.effective_temperature,
                     },
-                    tools_registry: ctx.tools_registry.as_ref(),
-                    observer: notify_observer.as_ref() as &dyn Observer,
-                    silent: true,
-                    approval: Some(&*ctx.approval_manager),
-                    multimodal_config: &ctx.multimodal,
-                    max_tool_iterations: ctx.max_tool_iterations,
-                    hooks: ctx.hooks.as_deref(),
-                    excluded_tools,
-                    dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                    activated_tools: ctx.activated_tools.as_ref(),
-                    model_switch_callback: Some(model_switch_callback.clone()),
-                    pacing: &ctx.pacing,
-                    strict_tool_parsing: ctx
-                        .prompt_config
-                        .agent(ctx.agent_alias.as_str())
-                        .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                    parallel_tools: ctx
-                        .prompt_config
-                        .agent(ctx.agent_alias.as_str())
-                        .is_some_and(|agent| agent.resolved.parallel_tools),
-                    max_tool_result_chars: ctx.max_tool_result_chars,
-                    context_token_budget: ctx.context_token_budget,
-                    receipt_generator: ctx.receipt_generator.as_ref(),
-                    knobs: &loop_knobs,
-                },
+                    ResolvedIo {
+                        tools_registry: ctx.tools_registry.as_ref(),
+                        observer: notify_observer.as_ref() as &dyn Observer,
+                        silent: true,
+                        approval: Some(&*ctx.approval_manager),
+                        multimodal_config: &ctx.multimodal,
+                        hooks: ctx.hooks.as_deref(),
+                        activated_tools: ctx.activated_tools.as_ref(),
+                        model_switch_callback: Some(model_switch_callback.clone()),
+                        receipt_generator: ctx.receipt_generator.as_ref(),
+                    },
+                    ResolvedRuntimeKnobs {
+                        max_tool_iterations: ctx.max_tool_iterations,
+                        excluded_tools,
+                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                        pacing: &ctx.pacing,
+                        strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
+                        parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
+                        max_tool_result_chars: ctx.max_tool_result_chars,
+                        context_token_budget: ctx.context_token_budget,
+                        knobs: &loop_knobs,
+                    },
+                ),
                 history: &mut history,
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
@@ -5178,12 +5633,26 @@ async fn process_channel_message_body(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Channel-orchestrator dispatch; source/transport/trust stay
+                // placeholders, not yet stamped at the edge.
+                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                    handle: ctx.memory.as_ref(),
+                    query: msg.content.clone(),
+                    sessions: memory_sessions.clone(),
+                    suppress: false,
+                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                        min_relevance_score: ctx.min_relevance_score,
+                        ..Default::default()
+                    },
+                }),
+                ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });
+            // Scope this turn's routing handle so concurrent same-agent turns,
+            // which share one SendViaTool, never read each other's routes.
+            let tool_loop =
+                tools::TURN_ROUTING.scope(Some(std::sync::Arc::clone(&turn_routing)), tool_loop);
             let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(thinking.params.native_thinking, tool_loop);
             let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
@@ -5200,7 +5669,17 @@ async fn process_channel_message_body(
                 result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
 
-            // Handle model switch: re-create the model_provider and retry
+            // Handle model switch: re-create the model_provider and retry.
+            //
+            // Resolves the requested provider to a configured
+            // `<type>.<alias>` ref, picks up any route-specific `api_key`
+            // from `ctx.model_routes`, then reuses `get_or_create_provider`
+            // so the new provider lands in the cache (consistent with the
+            // normal route-selection path) and is built with the proper
+            // credentials. The resolved route is persisted via
+            // `set_route_selection` only after the provider is built, so
+            // subsequent messages from this sender keep using the switched
+            // model instead of reverting to the default (#6173).
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
             {
@@ -5234,19 +5713,52 @@ async fn process_channel_message_body(
                     }
                 };
 
+                // Resolve a route-specific api_key by matching the switched
+                // provider/model against `model_routes` (the same lookup the
+                // `/model` command uses). Falls back to None so
+                // `get_or_create_provider` resolves credentials strictly from
+                // the requested provider's own config entry.
+                let resolved_api_key = ctx
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.clone());
+
                 match get_or_create_provider(
                     ctx.as_ref(),
                     &resolved_model_provider,
-                    None,
+                    resolved_api_key.as_deref(),
                     &runtime_defaults,
                 )
                 .await
                 {
                     Ok(new_prov) => {
+                        // Commit state only after the provider was built
+                        // successfully, so a failure leaves the turn on the
+                        // original provider/model pair instead of a
+                        // half-switched state.
                         active_model_provider = new_prov;
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
+                        route.api_key = resolved_api_key;
                         clear_model_switch_request();
+
+                        // Persist the route override so subsequent messages
+                        // from this sender continue using the switched model.
+                        set_route_selection(
+                            ctx.as_ref(),
+                            &history_key,
+                            ChannelRouteSelection {
+                                model_provider: route.model_provider.clone(),
+                                model: route.model.clone(),
+                                api_key: route.api_key.clone(),
+                            },
+                            &runtime_defaults,
+                        );
 
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
@@ -5423,15 +5935,18 @@ async fn process_channel_message_body(
                 }
             }
 
-            let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let mut delivered_response = if sanitized_response.is_empty()
-                && !outbound_response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
-            };
+            let sanitized_response = sanitize_channel_response_for_format_with_leak_detection(
+                &outbound_response,
+                ctx.tools_registry.as_ref(),
+                &ctx.prompt_config.security.leak_detection,
+                outbound_content_format_for_channel(&msg.channel),
+            );
+            let mut delivered_response =
+                if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
+                    channel_runtime_cli_string("channel-runtime-malformed-tool-output")
+                } else {
+                    sanitized_response
+                };
             delivered_response = ensure_nonempty_channel_reply(
                 delivered_response,
                 &outbound_response,
@@ -5448,13 +5963,15 @@ async fn process_channel_message_body(
                     || req_base.starts_with(act_base)
                     || act_base.starts_with(req_base);
                 if !same_family {
-                    use std::fmt::Write as _;
-                    write!(
-                        delivered_response,
-                        "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
-                        fb.requested_provider, fb.actual_provider, fb.actual_model,
-                    )
-                    .ok();
+                    delivered_response.push_str("\n\n---\n");
+                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
+                        "channel-runtime-fallback-footer",
+                        &[
+                            ("requested", fb.requested_provider.as_str()),
+                            ("actual", fb.actual_provider.as_str()),
+                            ("model", fb.actual_model.as_str()),
+                        ],
+                    ));
                 }
             }
 
@@ -5560,55 +6077,130 @@ async fn process_channel_message_body(
                 None
             };
 
-            if let Some(channel) = target_channel.as_ref() {
-                let reply_delivered = if let Some(ref draft_id) = draft_message_id {
-                    match channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
-                        .await
+            // Read the last routing instruction set by `send_via` this turn from
+            // the per-turn handle scoped into TURN_ROUTING around the loop above.
+            let turn_route = turn_routing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned();
+
+            // Resolve the delivery channel and modality from the routing entry.
+            // `None` entry → default delivery (originating channel, no modality override).
+            let (
+                delivery_channel,
+                delivery_recipient,
+                suppress_voice_override,
+                force_voice_override,
+            ) = if let Some(ref route) = turn_route {
+                let ch: Option<Arc<dyn Channel>> = match route.channel.as_deref() {
+                    None | Some("") => target_channel.clone(),
+                    Some(key) => ctx.channels_by_name.get(key).map(Arc::clone),
+                };
+                let recipient = route
+                    .recipient
+                    .clone()
+                    .unwrap_or_else(|| msg.reply_target.clone());
+                let suppress = match route.modality {
+                    zeroclaw_config::multi_agent::OutputModality::Text => Some(true),
+                    zeroclaw_config::multi_agent::OutputModality::Voice => Some(false),
+                    zeroclaw_config::multi_agent::OutputModality::Mirror => None,
+                };
+                let force_voice = matches!(
+                    route.modality,
+                    zeroclaw_config::multi_agent::OutputModality::Voice
+                );
+                (ch, recipient, suppress, force_voice)
+            } else {
+                (
+                    target_channel.clone(),
+                    msg.reply_target.clone(),
+                    None,
+                    false,
+                )
+            };
+
+            if let Some(channel) = delivery_channel.as_ref() {
+                let is_redirect = turn_route
+                    .as_ref()
+                    .and_then(|r| r.channel.as_deref())
+                    .is_some();
+                // Whether the agent's reply reached a channel — gates the
+                // `fire_message_sent` observer hook below.
+                let reply_delivered = if is_redirect {
+                    // Routing redirects to a different channel: cancel any in-progress
+                    // draft on the originating channel before delivering elsewhere.
+                    if let (Some(orig_ch), Some(draft_id)) =
+                        (target_channel.as_ref(), draft_message_id.as_deref())
                     {
-                        Ok(()) => true,
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Failed to finalize draft; sending as new message"
-                            );
-                            match channel
-                                .send(&SendMessage::reply_to(&msg, &delivered_response))
-                                .await
-                            {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    ::zeroclaw_log::record!(
-                                        ERROR,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(
-                                            ::serde_json::json!({"error": format!("{}", e)}),
-                                        ),
-                                        "failed to reply"
-                                    );
-                                    false
+                        let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
+                    }
+                    let suppress = suppress_voice_override.unwrap_or(false);
+                    let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
+                        .in_thread(msg.thread_ts.clone());
+                    if suppress {
+                        send_msg = send_msg.suppress_voice();
+                    } else if force_voice_override {
+                        send_msg = send_msg.force_voice();
+                    }
+                    channel.send(&send_msg).await.is_ok()
+                } else if let Some(ref draft_id) = draft_message_id {
+                    // Same channel with draft. For force-voice routing: cancel the
+                    // draft placeholder and deliver via send() so force_voice()
+                    // reaches the channel's voice path (finalize_draft has no
+                    // force_voice concept).
+                    if force_voice_override {
+                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
+                        channel
+                            .send(
+                                &SendMessage::new(&delivered_response, &delivery_recipient)
+                                    .force_voice()
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await
+                            .is_ok()
+                    } else {
+                        let suppress = suppress_voice_override.unwrap_or(false);
+                        match channel
+                            .finalize_draft(
+                                &delivery_recipient,
+                                draft_id,
+                                &delivered_response,
+                                suppress,
+                            )
+                            .await
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Failed to finalize draft; sending as new message"
+                                );
+                                let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
+                                if suppress {
+                                    fallback = fallback.suppress_voice();
                                 }
+                                channel.send(&fallback).await.is_ok()
                             }
                         }
                     }
                 } else {
-                    match channel
-                        .send(
-                            &SendMessage::reply_to(&msg, &delivered_response)
-                                .with_cancellation(cancellation_token.clone()),
-                        )
-                        .await
-                    {
+                    // No draft — plain send.
+                    let suppress = suppress_voice_override.unwrap_or(false);
+                    let mut send_msg = SendMessage::reply_to(&msg, &delivered_response)
+                        .with_cancellation(cancellation_token.clone());
+                    if suppress {
+                        send_msg = send_msg.suppress_voice();
+                    } else if force_voice_override {
+                        send_msg = send_msg.force_voice();
+                    }
+                    match channel.send(&send_msg).await {
                         Ok(()) => true,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -5637,7 +6229,7 @@ async fn process_channel_message_body(
                 if let Some(ref block) = receipts_block
                     && let Err(e) = channel
                         .send(
-                            &SendMessage::new(block, &msg.reply_target)
+                            &SendMessage::new(block, &delivery_recipient)
                                 .in_thread(msg.thread_ts.clone()),
                         )
                         .await
@@ -5717,18 +6309,16 @@ async fn process_channel_message_body(
                     "channel_message_error"
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                    if let Some(draft_id) = draft_message_id.as_deref() {
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(error_text, &msg.reply_target)
+                                .suppress_voice()
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                 }
             } else {
                 eprintln!(
@@ -5789,7 +6379,9 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = format!("⚠️ Error: {safe_error}");
+                    let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -5839,21 +6431,22 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
+                // Localized error text (master) delivered with suppress_voice
+                // (RFC #6969 error-path fix): cancel the draft, then send as
+                // text so a timeout notice is never read aloud on a voice peer.
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
                     "channel-runtime-request-timeout",
                 );
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text.as_str())
-                        .await;
-                } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+                if let Some(draft_id) = draft_message_id.as_deref() {
+                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                 }
+                let _ = channel
+                    .send(
+                        &SendMessage::new(error_text, &msg.reply_target)
+                            .suppress_voice()
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
             }
         }
     }
@@ -5945,6 +6538,8 @@ struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 impl AgentRouter {
@@ -5954,17 +6549,23 @@ impl AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: Some(ctx),
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
     fn multi(
         by_agent: HashMap<String, Arc<ChannelRuntimeContext>>,
         owner_by_channel_key: HashMap<String, String>,
+        sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+        sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
             single_ctx: None,
+            sop_engine,
+            sop_audit,
         }
     }
 
@@ -5992,6 +6593,82 @@ impl AgentRouter {
     }
 }
 
+async fn dispatch_channel_sop_event(
+    router: &AgentRouter,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    // Route on the internal marker the git/forge producer sets, NOT on the
+    // user-facing `subject`. The email channel is the one inbound channel that
+    // fills `subject` from user-controlled data, so keying on `subject` would
+    // let an allowlisted (or From-spoofed) sender hijack SOP ingress. This
+    // marker is set only by the git producer and never round-trips through any
+    // wire format, so it cannot be forged by an inbound message.
+    let Some(topic) = msg
+        .internal_sop_event
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return false;
+    };
+
+    let Some(engine) = router.sop_engine.as_ref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel.as_str(),
+                    "channel_alias": msg.channel_alias.as_deref(),
+                    "topic": topic,
+                })
+            ),
+            "dropping channel SOP event: SOP engine is not available"
+        );
+        return true;
+    };
+    let Some(audit) = router.sop_audit.as_ref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel.as_str(),
+                    "channel_alias": msg.channel_alias.as_deref(),
+                    "topic": topic,
+                })
+            ),
+            "dropping channel SOP event: SOP audit logger is not available"
+        );
+        return true;
+    };
+
+    let event = zeroclaw_runtime::sop::types::SopEvent {
+        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        topic: Some(topic.to_string()),
+        payload: Some(msg.content.clone()),
+        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
+    };
+    let target_sop = channel_sop_target(msg);
+    let results = if let Some(sop_name) = target_sop.as_deref() {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
+    } else {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
+    };
+    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    true
+}
+
+fn channel_sop_target(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&msg.content)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("sop")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -6010,6 +6687,9 @@ async fn run_message_dispatch_loop(
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
+        if dispatch_channel_sop_event(&router, &msg).await {
+            continue;
+        }
         // Fast path: /stop cancels the in-flight task for this sender scope without
         // spawning a worker or registering a new task. Handled here — before semaphore
         // acquisition — so the target task is still in the store and is never replaced.
@@ -6122,55 +6802,127 @@ fn normalize_telegram_identity(value: &str) -> String {
     value.trim().trim_start_matches('@').to_string()
 }
 
-pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+/// Trim-only identity normalizer for channels whose native id has no
+/// `@`-style prefix to strip (WeChat openid, LINE user id).
+fn normalize_trim_identity(value: &str) -> String {
+    value.trim().to_string()
+}
 
-    let normalized = normalize_telegram_identity(identity);
+/// Per-channel-type identity normalizer. The operator-bind op is otherwise
+/// identical across the pairing-capable channels; the only variance is how a
+/// raw identity is canonicalized before it is stored in the allowlist.
+pub type ChannelIdentityNormalizer = fn(&str) -> String;
+
+/// Resolve the identity normalizer for a pairing-capable channel type, or
+/// `None` for a type with no operator-bind surface. `None` is the closed-set
+/// gate: only `telegram` / `wechat` / `line` can be bound this way.
+#[must_use]
+pub fn channel_identity_normalizer(channel_type: &str) -> Option<ChannelIdentityNormalizer> {
+    match channel_type {
+        "telegram" => Some(normalize_telegram_identity),
+        "wechat" | "line" => Some(normalize_trim_identity),
+        _ => None,
+    }
+}
+
+/// Whether a `[channels.<type>.<alias>]` section exists. Rust has no
+/// reflection over the typed channel maps, so this stays an explicit per-type
+/// match; only this arm grows when a new pairing channel lands.
+#[must_use]
+pub fn channel_alias_configured(config: &Config, channel_type: &str, alias: &str) -> bool {
+    match channel_type {
+        "telegram" => config.channels.telegram.contains_key(alias),
+        "wechat" => config.channels.wechat.contains_key(alias),
+        "line" => config.channels.line.contains_key(alias),
+        _ => false,
+    }
+}
+
+/// Add `identity` to the peer group bound to `<type>.<alias>` in-place.
+///
+/// Returns `Ok(true)` when the identity was newly added, `Ok(false)` when it
+/// was already present. Pure config mutation — no disk write, no daemon
+/// restart — so it is the single core shared by the CLI
+/// (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
+/// field is the dotted `<type>.<alias>` ref so authorization stays scoped to
+/// the bound alias; a bare type would broaden the peer across every alias of
+/// that type.
+pub fn bind_channel_identity_into(
+    config: &mut Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Result<bool> {
+    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::providers::ChannelRef;
+
+    let Some(normalize) = channel_identity_normalizer(channel_type) else {
+        anyhow::bail!(
+            "Channel type `{channel_type}` does not support identity binding \
+             (supported: telegram, wechat, line)."
+        );
+    };
+
+    let normalized = normalize(identity);
     if normalized.is_empty() {
-        anyhow::bail!("Telegram identity cannot be empty");
+        anyhow::bail!("{channel_type} identity cannot be empty");
     }
 
-    let mut updated = config.clone();
-    if !updated.channels.telegram.contains_key("default") {
+    // The alias must name an existing `[channels.<type>.<alias>]` section.
+    // Binding into a phantom alias would mint a peer group the runtime never
+    // reads (it resolves authorization per the alias the channel actually
+    // runs under), so fail loudly instead of silently authorizing nobody.
+    if !channel_alias_configured(config, channel_type, alias) {
         anyhow::bail!(
-            "Telegram channel is not configured. Run \
-             `zeroclaw config set channels.telegram.<alias>.bot-token=<token>` \
+            "{channel_type} channel alias `{alias}` is not configured. Run \
+             `zeroclaw config set channels.{channel_type}.{alias}.bot-token=<token>` first \
              (see docs/book/src/channels/overview.md for the full field list)."
         );
     }
 
-    // Locate (or create) the peer group bound to telegram.default. The
-    // V3 surface puts inbound peer authorization in `peer_groups`,
-    // not on the channel block. Convention: the synthesized group
-    // name is `<type>_<alias>` (matching what the V2→V3 fold uses)
-    // so a hand-bound identity lands in the same group an operator
-    // would inspect after an upgrade. The `channel` field is the
-    // dotted alias ref so authorization stays scoped to the bound
-    // alias; a bare type would broaden the peer across every
-    // telegram alias on the install.
-    let group_name = "telegram_default".to_string();
-    let group = updated
+    // Convention: the synthesized group name is `<type>_<alias>` (matching the
+    // V2→V3 fold and each channel's runtime `persist_allowed_identity`) so a
+    // hand-bound identity lands in the same group the channel resolves
+    // authorization from.
+    let group_name = format!("{channel_type}_{alias}");
+    let channel_ref = format!("{channel_type}.{alias}");
+    let group = config
         .peer_groups
-        .entry(group_name.clone())
+        .entry(group_name)
         .or_insert_with(|| PeerGroupConfig {
-            channel: "telegram.default".into(),
+            channel: ChannelRef::new(channel_ref),
             ..PeerGroupConfig::default()
         });
 
     if group
         .external_peers
         .iter()
-        .any(|p| normalize_telegram_identity(p.as_str()) == normalized)
+        .any(|p| normalize(p.as_str()) == normalized)
     {
-        println!("✅ Telegram identity already bound: {normalized}");
+        return Ok(false);
+    }
+
+    group.external_peers.push(PeerUsername::new(normalized));
+    Ok(true)
+}
+
+/// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
+/// for the CLI entry point and its unit tests.
+fn bind_telegram_identity_into(config: &mut Config, identity: &str, alias: &str) -> Result<bool> {
+    bind_channel_identity_into(config, "telegram", alias, identity)
+}
+
+pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str) -> Result<()> {
+    let normalized = normalize_telegram_identity(identity);
+    let mut updated = config.clone();
+
+    if !bind_telegram_identity_into(&mut updated, identity, alias)? {
+        println!("✅ Telegram identity already bound to telegram.{alias}: {normalized}");
         return Ok(());
     }
 
-    group
-        .external_peers
-        .push(PeerUsername::new(normalized.clone()));
     updated.save().await?;
-    println!("✅ Bound Telegram identity: {normalized}");
+    println!("✅ Bound Telegram identity {normalized} to telegram.{alias}");
     println!("   Saved to {}", updated.config_path.display());
     match maybe_restart_managed_daemon_service() {
         Ok(true) => {
@@ -6689,30 +7441,26 @@ fn build_channel_by_id(
                 config.channels.wecom_ws.get(&alias).with_context(|| {
                     format!("WeCom WebSocket channel '{alias}' is not configured")
                 })?;
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
-                let configured_allowed_users = wc.allowed_users.clone();
+                let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut peers = configured_allowed_users.clone();
-                    for peer in config.channel_external_peers("wecom-ws", &alias) {
-                        if !peers.contains(&peer) {
-                            peers.push(peer);
-                        }
+                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
+                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+
+                    if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
+                        WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
+                    } else {
+                        WeComWsRuntimePolicy::from_config(&snapshot, external_peers)
                     }
-                    for peer in config.channel_external_peers("wecom_ws", &alias) {
-                        if !peers.contains(&peer) {
-                            peers.push(peer);
-                        }
-                    }
-                    peers
                 })
             };
             Ok(Arc::new(WeComWsChannel::new_with_alias(
                 wc,
                 alias.clone(),
-                peer_resolver,
+                policy_resolver,
                 &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
             )?))
         }
@@ -6985,6 +7733,25 @@ fn build_channel_by_id(
         "twitter" => {
             anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
         }
+        #[cfg(feature = "channel-git")]
+        "git" => {
+            let g = config
+                .channels
+                .git
+                .get("default")
+                .context("Git channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+            };
+            Ok(Arc::new(GitChannel::new(g.clone(), alias, peer_resolver)?))
+        }
+        #[cfg(not(feature = "channel-git"))]
+        "git" => {
+            anyhow::bail!("Git channel requires the `channel-git` feature");
+        }
         #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
@@ -7041,8 +7808,21 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
                 };
+                let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .line
+                            .get(&alias)
+                            .and_then(|ln| ln.sender_name.clone())
+                            .filter(|s| !s.is_empty())
+                    })
+                };
                 Ok(Arc::new(
-                    LineChannel::from_config(ln, alias, peer_resolver)
+                    LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
                         .with_persistence(config_arc.clone()),
                 ))
             }
@@ -7070,7 +7850,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
+            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -8360,11 +9140,24 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
         };
+        let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .line
+                    .get(&alias)
+                    .and_then(|ln| ln.sender_name.clone())
+                    .filter(|s| !s.is_empty())
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "LINE",
             alias: Some(alias.clone()),
             channel: Arc::new(
-                LineChannel::from_config(ln, alias.clone(), peer_resolver)
+                LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
                     .with_persistence(config_arc.clone())
                     .with_transcription(config.transcription.clone()),
             ),
@@ -8496,6 +9289,51 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-git")]
+    for (alias, g) in &config.channels.git {
+        if !active_channel_aliases.contains(&format!("git.{alias}")) {
+            continue;
+        }
+        if !g.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+        };
+        match GitChannel::new(g.clone(), alias.clone(), peer_resolver) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "Git",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias,
+                            "error": e.to_string(),
+                        })),
+                    "Git channel alias misconfigured; skipping"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-git"))]
+    if !config.channels.git.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Git channel is configured but this build was compiled without \
+             `channel-git`; skipping Git."
+        );
+    }
+
     #[cfg(feature = "channel-mochat")]
     for (alias, mc) in &config.channels.mochat {
         if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
@@ -8578,30 +9416,26 @@ fn collect_configured_channels(
         if !wc_ws.enabled {
             continue;
         }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
-            let configured_allowed_users = wc_ws.allowed_users.clone();
+            let snapshot = wc_ws.clone();
             Arc::new(move || {
                 let config = cfg_arc.read();
-                let mut peers = configured_allowed_users.clone();
-                for peer in config.channel_external_peers("wecom-ws", &alias) {
-                    if !peers.contains(&peer) {
-                        peers.push(peer);
-                    }
+                let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
+                external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+
+                if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
+                    WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
+                } else {
+                    WeComWsRuntimePolicy::from_config(&snapshot, external_peers)
                 }
-                for peer in config.channel_external_peers("wecom_ws", &alias) {
-                    if !peers.contains(&peer) {
-                        peers.push(peer);
-                    }
-                }
-                peers
             })
         };
         match WeComWsChannel::new_with_alias(
             wc_ws,
             alias.clone(),
-            peer_resolver,
+            policy_resolver,
             &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
         ) {
             Ok(channel) => channels.push(ConfiguredChannel {
@@ -9152,6 +9986,14 @@ pub async fn start_channels(
         return Ok(());
     }
 
+    // Start the live model-pricing refresher (once per process; idempotent and
+    // a no-op unless some provider sets `live_pricing = true`). Each call
+    // re-binds the refresher's config handle, so reload iterations that
+    // re-instantiate the config Arc (or toggle `live_pricing`) are honored
+    // without a restart. Fills cost rates for models the operator hasn't
+    // priced in `[cost.rates]`.
+    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
+
     // Every `[channels.<type>.<alias>]` block is owned by exactly one agent
     // (declared via `agents.<alias>.channels = [...]`). One
     // `ChannelRuntimeContext` per enabled agent; `AgentRouter::multi` resolves
@@ -9335,6 +10177,7 @@ pub async fn start_channels(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            Some(Arc::clone(&config_arc)),
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -9584,7 +10427,7 @@ pub async fn start_channels(
         ];
 
         if matches!(
-            config.skills.prompt_injection_mode,
+            config.effective_skills_prompt_mode(agent_alias),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -9667,7 +10510,7 @@ pub async fn start_channels(
             bootstrap_max_chars,
             Some(&risk_profile),
             native_tools,
-            config.skills.prompt_injection_mode,
+            config.effective_skills_prompt_mode(agent_alias),
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
@@ -10019,6 +10862,8 @@ pub async fn start_channels(
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: sop_engine.clone(),
+            sop_audit: sop_audit.clone(),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -10112,7 +10957,7 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -10141,14 +10986,13 @@ pub async fn deliver_announcement(
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
-    let _ = config;
 
-    // Scan for credential leaks before delivering
-    let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
-    let safe_output = match leak_detector.scan(output) {
-        zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => redacted,
-        zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
-    };
+    let safe_output = redact_channel_outbound_leaks(
+        output,
+        &config.security.leak_detection,
+        outbound_content_format_for_channel(channel),
+    );
+    let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
 
@@ -10585,6 +11429,8 @@ fn concurrent_persist_lock_serialization() {
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
         runtime_defaults_override: Arc::new(Mutex::new(None)),
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        sop_engine: None,
+        sop_audit: None,
     });
     ctx.conversation_histories
         .lock()
@@ -10708,7 +11554,7 @@ temperature = 0.3
     }
 
     use zeroclaw_runtime::observability::NoopObserver;
-    use zeroclaw_runtime::tools::{Tool, ToolResult};
+    use zeroclaw_runtime::tools::{Tool, ToolOutput, ToolResult};
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -11086,6 +11932,8 @@ temperature = 0.3
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -11168,7 +12016,7 @@ temperature = 0.3
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.clamps".to_string(), "clamps".to_string());
         owners.insert("discord.glados".to_string(), "glados".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
@@ -11191,7 +12039,7 @@ temperature = 0.3
         by_agent.insert("agent_a".to_string(), Arc::clone(&agent_a_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.bot_a".to_string(), "agent_a".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
@@ -11204,7 +12052,7 @@ temperature = 0.3
         by_agent.insert("ops".to_string(), Arc::clone(&notion_agent_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("notion".to_string(), "ops".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
@@ -11230,7 +12078,7 @@ temperature = 0.3
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
         by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
@@ -11539,62 +12387,6 @@ temperature = 0.3
         assert!(!is_context_window_overflow_error(&other_err));
     }
 
-    #[test]
-    fn memory_context_skip_rules_exclude_history_blobs() {
-        assert!(should_skip_memory_context_entry(
-            "telegram_123_history",
-            r#"[{"role":"user"}]"#
-        ));
-        assert!(should_skip_memory_context_entry(
-            "assistant_resp_legacy",
-            "fabricated memory"
-        ));
-        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
-
-        // Entries containing image markers must be skipped to prevent
-        // auto-saved photo messages from duplicating image blocks.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_99",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_100",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot"
-        ));
-        // Plain text without image markers should not be skipped.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
-
-        // Entries containing tool_result blocks must be skipped.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_200",
-            r#"[Tool results]
-<tool_result name="shell">Mon Feb 20</tool_result>"#
-        ));
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_201",
-            "plain text without tool results"
-        ));
-
-        // Per-turn user auto-save keys must be skipped to prevent exponential
-        // context bloat from re-injected conversation history.
-        assert!(should_skip_memory_context_entry(
-            "user_msg",
-            "original user message text"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "user_msg_a1b2c3d4e5f6",
-            "follow-up message embedding prior context"
-        ));
-        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
-    }
-
     fn channel_runtime_context_for_defaults_test(
         zeroclaw_dir: &std::path::Path,
         agent_alias: &str,
@@ -11679,6 +12471,8 @@ temperature = 0.3
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
@@ -12153,6 +12947,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -12248,6 +13044,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -12361,6 +13159,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -12478,6 +13278,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -12847,6 +13649,7 @@ api_key = "anthropic-key"
             recipient: &str,
             message_id: &str,
             text: &str,
+            _suppress_voice: bool,
         ) -> anyhow::Result<()> {
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
@@ -13017,6 +13820,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -13783,6 +14588,7 @@ BTC is currently around $65,000 based on latest tool output."#
         precheck_calls: AtomicUsize,
         main_calls: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        precheck_delay: Option<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -13801,6 +14607,9 @@ BTC is currently around $65,000 based on latest tool output."#
 
             if message.starts_with("Decide whether the assistant should send any visible reply") {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.precheck_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 return Ok("NO_REPLY[INFO]: background chatter".to_string());
             }
 
@@ -13847,14 +14656,14 @@ BTC is currently around $65,000 based on latest tool output."#
             if symbol != Some("BTC") {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("unexpected symbol".to_string()),
                 });
             }
 
             Ok(ToolResult {
                 success: true,
-                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
+                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into(),
                 error: None,
             })
         }
@@ -13889,7 +14698,7 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: None,
             })
         }
@@ -14080,6 +14889,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -14163,6 +14974,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -14281,6 +15094,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -14411,6 +15226,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -14564,6 +15381,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -14686,6 +15505,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -14826,6 +15647,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -14952,6 +15775,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15063,6 +15888,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15194,6 +16021,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15219,7 +16048,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("ModelProvider switched to `openrouter.default`"));
+        let expected_reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-runtime-set-provider-switched",
+            &[
+                ("provider", "openrouter.default"),
+                ("model", "default-model"),
+            ],
+        );
+        assert!(sent[0].contains(&expected_reply));
 
         let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
@@ -15342,6 +16178,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15381,6 +16219,260 @@ BTC is currently around $65,000 based on latest tool output."#
                 .as_slice(),
             &["route-model".to_string()]
         );
+    }
+
+    /// Regression for #6173: when a `model_switch` request is pending
+    /// (set by the `model_switch` tool during the previous tool
+    /// iteration), `process_channel_message` must:
+    ///
+    /// 1. resolve the route-specific `api_key` from `ctx.model_routes`
+    ///    when the switched provider/model matches a route entry,
+    /// 2. route provider construction through `get_or_create_provider`
+    ///    (so the new provider lands in the provider cache),
+    /// 3. persist the resolved route via `set_route_selection` so the
+    ///    next inbound message for the same sender uses the switched
+    ///    provider/model/key.
+    ///
+    /// The test pre-sets `MODEL_SWITCH_REQUEST` to simulate a previous
+    /// turn's tool call. `run_tool_call_loop` short-circuits to
+    /// `ModelSwitchRequested` on its first iteration because the
+    /// pending request already differs from the active route, exercising
+    /// the orchestrator's switch handler.
+    #[tokio::test]
+    async fn process_channel_message_persists_model_switch_with_route_credential() {
+        // Serialize on the process-wide model-switch state so this test
+        // doesn't race other tests that also touch the same static.
+        // `tokio::sync::Mutex` is held across the awaits below; the
+        // `OnceLock` wrapper gives us a `'static` initializer in a
+        // `static` context without `lazy_static`.
+        static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = MODEL_SWITCH_TEST_GUARD
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        clear_model_switch_request();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
+
+        // The switch handler resolves the requested provider `openrouter` to
+        // a configured `<type>.<alias>` ref via
+        // `resolve_provider_ref_for_runtime_switch`, so the provider that is
+        // built, cached, and persisted is the dotted form.
+        let switched_provider_ref = "openrouter.default";
+        let switched_key = Some("route-specific-key");
+
+        // Seed the provider cache so `get_or_create_provider` returns our
+        // mock for the switched provider instead of constructing a real one.
+        // The cache key hashes the route-specific api_key together with the
+        // resolved (dotted) provider ref at the current (startup) generation.
+        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        provider_cache_seed.insert(
+            "test-provider".to_string(),
+            Arc::clone(&default_model_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key(switched_provider_ref, switched_key, 0),
+            Arc::clone(&switched_model_provider),
+        );
+
+        let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openrouter".to_string(),
+            model: "switched-model".to_string(),
+            api_key: Some("route-specific-key".to_string()),
+        }];
+
+        // `resolve_provider_ref_for_runtime_switch` resolves `openrouter`
+        // against the configured providers, so the prompt config must define
+        // the `openrouter.default` entry for the switch to resolve and build.
+        let prompt_config = {
+            let mut cfg = zeroclaw_config::schema::Config::default();
+            {
+                let entry = cfg
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .expect("openrouter.default provider slot must be creatable");
+                entry.api_key = Some("config-openrouter-key".to_string());
+                entry.model = Some("switched-model".to_string());
+            }
+            Arc::new(cfg)
+        };
+
+        // Pre-set the model_switch request — simulates the tool having
+        // been called on a previous turn and waiting to be consumed.
+        {
+            let state = get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::clone(&default_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::clone(&prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "trigger model switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // After the switch handler runs, the route override must be
+        // persisted for this sender with the resolved api_key.
+        let route_key = "telegram_chat-1_alice";
+        let persisted = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect(
+                "switch handler must persist a route override under the sender's history key \
+                 (this is the regression #6173 — previously the new model was used only for \
+                 the current turn and the next inbound message reverted to the default)",
+            );
+        assert_eq!(persisted.model_provider, switched_provider_ref);
+        assert_eq!(persisted.model, "switched-model");
+        assert_eq!(
+            persisted.api_key.as_deref(),
+            Some("route-specific-key"),
+            "the route-specific api_key from model_routes must be persisted, \
+             not the global key or None — otherwise the next turn loses route auth"
+        );
+
+        // Send a second message from the same sender, with no pending
+        // model_switch this time. The persisted route override must be
+        // honored — `get_route_selection` should return the switched
+        // route and the switched provider should handle the request.
+        let calls_before = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "follow-up after switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls_after = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        assert!(
+            calls_after > calls_before,
+            "follow-up message must be served by the switched provider (the persisted \
+             route override), not by the original default provider"
+        );
+
+        // Clean up shared global state so we don't leak into other tests.
+        clear_model_switch_request();
     }
 
     #[tokio::test]
@@ -15465,6 +16557,196 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent_messages.is_empty(),
             "provider returns NO_REPLY from precheck, so no visible reply should be sent"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl;
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.primary",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-log".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-log".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 5,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut precheck_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m == "reply-intent precheck completed")
+                    {
+                        precheck_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = precheck_event.expect("reply-intent precheck log should be emitted");
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "test-agent",
+            "precheck record must inherit agent_alias from the channel turn span, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model"], "test-model",
+            "precheck record must preserve primary model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["classifier_model"], "test-model",
+            "classifier model must use a non-attribution attr key, got: {value}"
+        );
+        assert!(
+            value["attributes"].get("agent").is_none(),
+            "agent alias belongs in zeroclaw.agent_alias, not attributes.agent: {value}"
+        );
+        assert!(
+            value["attributes"].get("model").is_none(),
+            "classifier model must not shadow zeroclaw.model via attributes.model: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-disabled".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-disabled".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-disabled:visible reply"]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider {
+            precheck_delay: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-timeout".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-timeout".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-timeout:visible reply"]
         );
     }
 
@@ -15556,6 +16838,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15665,6 +16949,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15781,6 +17067,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -15949,6 +17237,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             }])
@@ -16153,6 +17444,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -16300,6 +17593,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -16457,6 +17752,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -16617,6 +17914,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -16767,6 +18066,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -16899,6 +18200,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17010,6 +18313,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17135,6 +18440,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17308,6 +18615,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -18221,7 +19530,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn wecom_ws_conversation_history_key_uses_reply_target_scope() {
+    fn reply_target_conversation_history_key_uses_room_scope() {
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "msg_wecom_ws".into(),
             sender: "zeroclaw_user".into(),
@@ -18231,9 +19540,10 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: Some("work".into()),
             timestamp: 1,
             thread_ts: Some("req-1".into()),
-            interruption_scope_id: None,
+            interruption_scope_id: Some("group--room-1".into()),
             attachments: vec![],
             subject: None,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
 
             ..Default::default()
         };
@@ -18436,6 +19746,491 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::NewSession)
         );
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
+    }
+
+    // Build a ChannelRuntimeContext with a Config that has peer_groups
+    // populated for the agent-scope authorization tests below. Mirrors
+    // `channel_runtime_context_for_defaults_test` but lets the caller
+    // inject a pre-built peer_groups map. See issue #8044.
+    fn channel_runtime_context_with_peer_groups(
+        zeroclaw_dir: &std::path::Path,
+        peer_groups: std::collections::HashMap<
+            String,
+            zeroclaw_config::multi_agent::PeerGroupConfig,
+        >,
+    ) -> ChannelRuntimeContext {
+        let prompt_config = zeroclaw_config::schema::Config {
+            peer_groups,
+            ..Default::default()
+        };
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "agentX",
+            "openrouter.default",
+            "config-default-model",
+        );
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx
+    }
+
+    fn agent_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn user_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --user gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group(
+        channel: &str,
+        members: &[&str],
+        admin_for_agent_scope: bool,
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, OutputModality, PeerGroupConfig, PeerUsername,
+        };
+        PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef(channel.into()),
+            agents: Vec::<AgentAlias>::new(),
+            external_peers: members
+                .iter()
+                .map(|s| PeerUsername(s.to_string()))
+                .collect(),
+            ignore: Vec::new(),
+            output_modality: OutputModality::default(),
+            admin_for_agent_scope,
+        }
+    }
+
+    #[test]
+    fn set_model_scoped_agent_allowed_for_listed_admin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice", "ops"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
+    }
+
+    #[test]
+    fn set_model_scoped_agent_rejected_for_non_admin_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        // Same peer group as the admin test, but the admin flag is OFF.
+        groups.insert(
+            "discord_users".into(),
+            peer_group("discord.clamps", &["alice", "ops"], false),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
+        // Even an unknown sender is rejected (not silently allowed).
+        assert!(!is_agent_scope_authorized(
+            &ctx,
+            &agent_scope_msg("mallory")
+        ));
+    }
+
+    #[test]
+    fn set_model_scoped_agent_rejected_when_no_peer_groups_configured() {
+        // Default config has no peer_groups — default deny.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
+
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+    }
+
+    #[test]
+    fn set_model_scoped_user_unaffected_by_agent_scope_authz() {
+        // The helper is only invoked on the Agent branch; this test pins
+        // that `/model --user` does not even consult the helper. We
+        // assert by behavior: the helper is gated on OverrideScope::Agent
+        // in `handle_runtime_command_if_needed`, so for the User case
+        // no authorization check runs and the override is written.
+        // Here we simply verify that even when the sender is not an
+        // admin, the auth helper treats them neutrally — i.e. the gate
+        // is on the dispatch site, not the helper itself.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
+        // For the User branch the helper is not consulted, so this
+        // negative assertion is structural: the gate sits at the
+        // SetModelScoped dispatch point, not in this helper.
+        assert!(!is_agent_scope_authorized(&ctx, &user_scope_msg("alice")));
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_filters_by_admin_flag() {
+        // The resolver itself honors `admin_for_agent_scope = true`
+        // only — build a `Config` with one admin-flagged group and one
+        // unflagged group covering the same channel; the admin-flagged
+        // group must surface while the unflagged group must not.
+        // (Note: the orchestrator gate reads through a snapshot of this
+        // `Config`, so operator edits become visible after restart — see
+        // `is_agent_scope_authorized` docstring.)
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice", "ops"], true),
+        );
+        config.peer_groups.insert(
+            "discord_users".into(),
+            peer_group("discord.clamps", &["bob", "carol"], false),
+        );
+        let admins = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        assert_eq!(admins, vec!["alice".to_string(), "ops".to_string()]);
+    }
+
+    /// Round-3 contract: when a peer group's `agents` list is non-empty,
+    /// the admin privilege is granted only for `agent_alias` values that
+    /// appear in that list. This pins the agent-bound semantics added in
+    /// round 3; without it, dropping or inverting the `agent_alias` filter
+    /// would not regress any existing test (because every prior fixture
+    /// constructs `agents: Vec::new()`, which falls through the legacy
+    /// channel-wide path).
+    fn peer_group_with_agents(
+        channel: &str,
+        members: &[&str],
+        admin_for_agent_scope: bool,
+        agents: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, OutputModality, PeerGroupConfig, PeerUsername,
+        };
+        PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef(channel.into()),
+            agents: agents.iter().map(|a| AgentAlias::new(*a)).collect(),
+            external_peers: members
+                .iter()
+                .map(|s| PeerUsername(s.to_string()))
+                .collect(),
+            ignore: Vec::new(),
+            output_modality: OutputModality::default(),
+            admin_for_agent_scope,
+        }
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_filters_by_agents_list_when_non_empty() {
+        // The same admin peer is granted the privilege for `agentX`
+        // (because `agents = ["agentX"]` includes it) and denied for
+        // `agentY` (because `agentY` is not in the list). The peer is
+        // also denied for `agentX` if the group is constructed with an
+        // empty `agents` list (the legacy channel-wide path), which is
+        // pinned separately below.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group_with_agents("discord.clamps", &["alice"], true, &["agentX"]),
+        );
+
+        let for_x = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        assert_eq!(
+            for_x,
+            vec!["alice".to_string()],
+            "agentX is in agents=[agentX], so alice must surface"
+        );
+
+        let for_y = config.channel_agent_scope_admins("discord", "clamps", "agentY");
+        assert!(
+            for_y.is_empty(),
+            "agentY is NOT in agents=[agentX], so the group must be filtered out"
+        );
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_empty_agents_list_means_channel_wide() {
+        // Backward-compatible legacy: an empty `agents` list means the
+        // admin privilege is granted for any agent_alias on the channel.
+        // This is the path every pre-round-3 config falls into.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let for_x = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        let for_y = config.channel_agent_scope_admins("discord", "clamps", "agentY");
+        assert_eq!(for_x, vec!["alice".to_string()]);
+        assert_eq!(for_y, vec!["alice".to_string()]);
+    }
+
+    // --- SSOT normalization + wildcard + leading-`@` + case-insensitive.
+    // The gate routes through `allowlist::is_user_allowed`, so the
+    // helpers below must mirror the inbound-channel normalization shape
+    // (strip leading `@`, ASCII-lowercase) and honor `["*"]` for the
+    // configured peer list. These tests pin that contract so a future
+    // refactor cannot silently fall back to the raw `==` shape that
+    // rejected correctly-configured admins. See issue #8044.
+
+    #[test]
+    fn normalize_peer_username_strips_leading_at_and_lowercases() {
+        assert_eq!(normalize_peer_username("@user_1"), "user_1");
+        assert_eq!(normalize_peer_username("user_1"), "user_1");
+        assert_eq!(normalize_peer_username("@Alice"), "alice");
+        assert_eq!(normalize_peer_username("ALICE"), "alice");
+        // Multiple leading `@` are collapsed to nothing: a config typo
+        // like "@@alice" still resolves to the bare identity.
+        assert_eq!(normalize_peer_username("@@alice"), "alice");
+        // Empty input stays empty (would deny everything downstream).
+        assert_eq!(normalize_peer_username(""), "");
+    }
+
+    #[test]
+    fn agent_scope_gate_matches_inbound_normalized_sender() {
+        // Telegram inbound path strips a leading `@` from the sender
+        // before calling `is_user_allowed`. The gate must accept a
+        // configured `"@user_1"` against a sender that arrived as
+        // `"user_1"` (no leading `@`).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "telegram_admins".into(),
+            peer_group("telegram.prod", &["@user_1"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("user_1", "telegram", "prod")
+            ),
+            "leading-`@` config entry must match Telegram's @-stripped sender identity"
+        );
+        // Without normalization, the raw `==` would deny this.
+    }
+
+    #[test]
+    fn agent_scope_gate_matches_case_insensitive_sender() {
+        // Inbound IRC and Matrix use `Match::CaseInsensitive`; the
+        // gate's ASCII-lowercase normalization must produce the same
+        // outcome so a configured `"Alice"` matches an inbound `"alice"`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "irc_admins".into(),
+            peer_group("irc.freenode", &["Alice"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("alice", "irc", "freenode")
+            ),
+            "configured `Alice` must match an inbound `alice` sender (RFC 2812 case-insensitive)"
+        );
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("ALICE", "irc", "freenode")
+            ),
+            "configured `Alice` must match an inbound `ALICE` sender"
+        );
+    }
+
+    #[test]
+    fn agent_scope_gate_honors_wildcard_admin() {
+        // A peer group with `external_peers = ["*"]` is the documented
+        // wildcard: every sender on the channel is an admin. The raw
+        // `==` shape denied this; the SSOT shape admits it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_open".into(),
+            peer_group("discord.clamps", &["*"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("anyone")));
+        assert!(is_agent_scope_authorized(
+            &ctx,
+            &agent_scope_msg("even_a_random_handle")
+        ));
+    }
+
+    fn agent_scope_msg_with_channel(
+        sender: &str,
+        channel: &str,
+        alias: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: channel.into(),
+            channel_alias: Some(alias.into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    // --- Dispatch-level wiring tests for the agent-scope authorization
+    // gate. These exercise `handle_runtime_command_if_needed` directly so
+    // a future refactor that drops `scope == OverrideScope::Agent &&
+    // !is_agent_scope_authorized(...)` from the dispatch site cannot
+    // silently re-open the hole — every helper-only test would still pass
+    // while the gate was bypassed. See issue #8044 review pass 2.
+
+    fn scope_user_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --user gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn scope_agent_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_writes_override_for_admin_sender() {
+        // Authorized sender: dispatch must reach the SetModelScoped(Agent)
+        // accept branch and write a scope override.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("alice"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "agent-scope command must be handled by dispatch");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "authorized admin must produce exactly one scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_unauthorized_sender_without_writing() {
+        // Unauthorized sender: dispatch must surface the rejection string
+        // and leave the override map empty. If the gate is dropped, the
+        // override would be written and this test would fail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("mallory"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "command must be handled even when rejected");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert!(
+            overrides.is_empty(),
+            "unauthorized sender must NOT write a scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_user_scope_writes_override_regardless_of_admin_status() {
+        // The agent-scope gate must NOT affect `--user`. Even when the
+        // sender is not in any admin peer group, `/model --user` writes
+        // its override. This pins the gate's scope: only the Agent branch
+        // consults `is_agent_scope_authorized`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_user_msg("mallory"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "user-scope command must be handled");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "`/model --user` must write a scope override even when sender is not an admin, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_when_no_peer_groups_configured() {
+        // Default config (no peer_groups) — every sender must be denied.
+        // Without the gate this would silently write the override.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("alice"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled);
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert!(
+            overrides.is_empty(),
+            "default-deny must produce zero overrides when no peer_groups are configured, got {overrides:?}"
+        );
     }
 
     #[test]
@@ -18669,19 +20464,21 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn explicit_wecom_group_address_bypasses_reply_intent_precheck() {
-        assert!(is_explicitly_addressed_channel_message(
-            "wecom_ws",
-            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
-        ));
-        assert!(!is_explicitly_addressed_channel_message(
-            "wecom_ws",
-            "@danya say hi"
-        ));
-        assert!(!is_explicitly_addressed_channel_message(
-            "telegram",
-            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
-        ));
+    fn reply_intent_precheck_uses_structured_addressing_signal() {
+        let marker_only = zeroclaw_api::channel::ChannelMessage {
+            content: "[WeCom group message addressed to this bot via @danya]\n@danya say hi".into(),
+            channel: "wecom_ws".into(),
+            explicitly_addressed: false,
+            ..Default::default()
+        };
+        assert!(!should_bypass_reply_intent_precheck(&marker_only, false));
+        assert!(should_bypass_reply_intent_precheck(&marker_only, true));
+
+        let addressed = zeroclaw_api::channel::ChannelMessage {
+            explicitly_addressed: true,
+            ..marker_only
+        };
+        assert!(should_bypass_reply_intent_precheck(&addressed, false));
     }
 
     #[test]
@@ -18782,17 +20579,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
-    #[tokio::test]
-    async fn build_memory_context_includes_recalled_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("Age is 45"));
+    /// Test shim: the old per-orchestrator renderer call shape, routed
+    /// through the unified engine pipeline (agent::memory_inject).
+    async fn render_for_sessions(
+        mem: &dyn zeroclaw_memory::Memory,
+        user_msg: &str,
+        min_relevance_score: f64,
+        session_ids: &[Option<&str>],
+    ) -> String {
+        zeroclaw_runtime::agent::memory_inject::render_memory_context(
+            mem,
+            &zeroclaw_runtime::observability::NoopObserver,
+            user_msg,
+            session_ids,
+            &zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                min_relevance_score,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -18828,8 +20634,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let session_ids = sender_memory_session_ids(&msg, &history_key);
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
 
         assert!(
             context.contains("Project codename is quartz"),
@@ -18892,12 +20697,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .map(|s| Some(s.as_str()))
             .collect();
         let sender_context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs)
-                .await;
+            render_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs).await;
         let group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_b_history_key)]).await;
         let source_group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_a_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_a_history_key)]).await;
 
         assert!(
             sender_context.is_empty(),
@@ -18953,52 +20757,10 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
         assert!(
             context.contains("Alice favors filtered coffee"),
             "sender recall must find migrated row stored under sanitized sender, got: {context}"
-        );
-    }
-
-    /// Auto-saved photo messages must not surface through memory context,
-    /// otherwise the image marker gets duplicated in the model_provider request.
-    #[tokio::test]
-    async fn build_memory_context_excludes_image_marker_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-
-        // Simulate auto-save of a photo message containing an [IMAGE:] marker.
-        mem.store(
-            "telegram_user_msg_photo",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nDescribe this screenshot",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-        // Also store a plain text entry that shares a word with the query
-        // so the FTS recall returns both entries.
-        mem.store(
-            "screenshot_preference",
-            "User prefers screenshot descriptions to be concise",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
-
-        // The image-marker entry must be excluded to prevent duplication.
-        assert!(
-            !context.contains("[IMAGE:"),
-            "memory context must not contain image markers, got: {context}"
-        );
-        // Plain text entries should still be included.
-        assert!(
-            context.contains("screenshot descriptions"),
-            "plain text entry should remain in context, got: {context}"
         );
     }
 
@@ -19084,6 +20846,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -19257,6 +21021,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -19655,6 +21421,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -19818,6 +21586,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
                 }])
@@ -20157,6 +21928,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -20169,6 +21942,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
@@ -20177,8 +21953,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
-
-                ..Default::default()
+                internal_sop_event: None,
             },
             CancellationToken::new(),
         )
@@ -20303,6 +22078,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -20384,6 +22161,10 @@ BTC is currently around $65,000 based on latest tool output."#
             "whatsapp block must identify itself"
         );
         assert!(
+            block.contains("[LOCATION:"),
+            "whatsapp block must include location pin instructions"
+        );
+        assert!(
             block.contains("[IMAGE:<path>]"),
             "whatsapp block must describe marker syntax"
         );
@@ -20404,6 +22185,40 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(block),
             "the compatibility alias should use the same WhatsApp Web guidance"
         );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_lark_and_feishu_encourage_tool_use() {
+        for channel_name in ["lark", "feishu"] {
+            let block = channel_delivery_instructions(channel_name)
+                .expect("lark and feishu must have a delivery-instructions block");
+            assert!(
+                block.contains("When responding on Lark/Feishu:"),
+                "{channel_name} block must identify itself"
+            );
+            assert!(
+                block.contains("use your tools"),
+                "{channel_name} block must steer the model toward the agent tool path"
+            );
+            assert!(
+                block.contains("Use tool results silently"),
+                "{channel_name} block must keep internal tool bookkeeping out of replies"
+            );
+
+            let prompt = build_channel_system_prompt("base prompt", channel_name, None);
+            assert!(
+                prompt.contains("base prompt"),
+                "{channel_name} system prompt must retain the base prompt"
+            );
+            assert!(
+                prompt.contains("When responding on Lark/Feishu:"),
+                "{channel_name} system prompt must include channel instructions"
+            );
+            assert!(
+                prompt.contains("Use tool results silently"),
+                "{channel_name} system prompt must include the tool-use guidance"
+            );
+        }
     }
 
     // Regression guard for #6646: web_search_tool / web_fetch never fired via
@@ -21768,6 +23583,9 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
@@ -21776,7 +23594,7 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
-                ..Default::default()
+                internal_sop_event: None,
             },
             CancellationToken::new(),
         )
@@ -21904,6 +23722,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -22022,6 +23842,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -22179,6 +24001,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -22415,6 +24239,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -22566,6 +24392,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -22709,6 +24537,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -22872,6 +24702,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -22962,6 +24794,159 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    fn config_with_telegram_alias(alias: &str) -> Config {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                stream_mode: zeroclaw_config::schema::StreamMode::Off,
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
+        config
+    }
+
+    /// The non-default-alias bug: the bound identity must land in the same
+    /// peer group the runtime resolves authorization from — otherwise the
+    /// bot keeps demanding `/bind` for a user the operator already approved.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_non_default_alias_is_resolvable() {
+        let mut config = config_with_telegram_alias("alerts");
+        let newly = bind_telegram_identity_into(&mut config, "123456789", "alerts").unwrap();
+        assert!(newly, "first bind should report newly added");
+        // The live resolver the channel uses must now see the identity.
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string()),
+            "identity bound to `alerts` must resolve for the `alerts` channel"
+        );
+        // And it must be scoped — not leaked onto a different alias.
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty(),
+            "binding must stay scoped to its alias"
+        );
+    }
+
+    /// Backward compatibility: the default alias still routes to
+    /// `telegram_default` / `telegram.default` exactly as before.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_default_alias_unchanged() {
+        let mut config = config_with_telegram_alias("default");
+        bind_telegram_identity_into(&mut config, "@zeroclaw_user", "default").unwrap();
+        let group = config
+            .peer_groups
+            .get("telegram_default")
+            .expect("default bind must use the telegram_default group");
+        assert_eq!(group.channel.as_str(), "telegram.default");
+        assert!(
+            config
+                .channel_external_peers("telegram", "default")
+                .contains(&"zeroclaw_user".to_string())
+        );
+    }
+
+    /// Idempotency: re-binding the same identity reports "already present".
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_is_idempotent() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(bind_telegram_identity_into(&mut config, "123", "alerts").unwrap());
+        assert!(
+            !bind_telegram_identity_into(&mut config, "123", "alerts").unwrap(),
+            "second bind of same identity should report already present"
+        );
+        assert_eq!(
+            config.channel_external_peers("telegram", "alerts").len(),
+            1,
+            "duplicate bind must not add a second peer entry"
+        );
+    }
+
+    /// A typo'd / unconfigured alias must fail loudly rather than mint a
+    /// phantom peer group that authorizes nobody.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_telegram_into_unconfigured_alias_bails() {
+        let mut config = config_with_telegram_alias("default");
+        let err = bind_telegram_identity_into(&mut config, "123", "typoalias")
+            .expect_err("unconfigured alias must bail");
+        assert!(
+            err.to_string().contains("typoalias"),
+            "error should name the bad alias, got: {err}"
+        );
+        assert!(
+            !config.peer_groups.contains_key("telegram_typoalias"),
+            "failed bind must not create a phantom peer group"
+        );
+    }
+
+    /// The generic bind must keep the SCOPED dotted `<type>.<alias>` channel
+    /// ref — never a bare type, which would broaden the peer across every
+    /// alias of that type (the bug the alias-aware fix closed).
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_uses_scoped_dotted_channel_ref() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(bind_channel_identity_into(&mut config, "telegram", "alerts", "@user").unwrap());
+        let group = config
+            .peer_groups
+            .get("telegram_alerts")
+            .expect("generic bind must use the telegram_alerts group");
+        assert_eq!(
+            group.channel.as_str(),
+            "telegram.alerts",
+            "channel ref must stay dotted/alias-scoped, never bare `telegram`"
+        );
+        // Resolves for `alerts`, and stays OFF a sibling alias.
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"user".to_string())
+        );
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty()
+        );
+    }
+
+    /// The closed-set gate: a non-pairing channel type cannot be bound.
+    #[test]
+    fn bind_channel_into_rejects_unsupported_type() {
+        let mut config = Config::default();
+        let err = bind_channel_identity_into(&mut config, "discord", "default", "123")
+            .expect_err("unsupported type must bail");
+        assert!(
+            err.to_string()
+                .contains("does not support identity binding"),
+            "error should explain the type is unsupported, got: {err}"
+        );
+        assert!(
+            channel_identity_normalizer("discord").is_none(),
+            "discord must not be in the bind closed-set"
+        );
+        assert!(channel_identity_normalizer("telegram").is_some());
+        assert!(channel_identity_normalizer("wechat").is_some());
+        assert!(channel_identity_normalizer("line").is_some());
     }
 
     #[cfg(feature = "channel-voice-call")]
@@ -23280,6 +25265,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -23344,6 +25331,370 @@ This is an example JSON object for profile settings."#;
 
         assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
         assert!(result.contains("[REDACTED"));
+    }
+
+    /// Regression test for a redaction bypass: an AWS-shaped credential
+    /// dropped into a markdown link destination -- exactly where a
+    /// prompt-injected model would try to exfiltrate one -- must not sail
+    /// through unredacted just because a link destination is otherwise
+    /// protected from the high-entropy heuristic.
+    #[test]
+    fn sanitize_channel_response_detects_aws_key_smuggled_in_markdown_link_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        // AKIAABCDEFGHIJKLMNOP gitleaks:allow
+        let target = "https://exfil.example.invalid/callback?key=AKIAABCDEFGHIJKLMNOP";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP"), "result: {result}"); // gitleaks:allow
+        assert!(
+            result.contains("[REDACTED_AWS_CREDENTIAL]"),
+            "result: {result}"
+        );
+    }
+
+    // A protected link destination shields the *shape-based* high-entropy
+    // heuristic (the #8722 false-positive), never a deterministic credential
+    // pattern. A real credential dropped into a link destination -- exactly
+    // where a prompt-injected model would try to smuggle one past the
+    // detector -- must still be caught.
+
+    #[test]
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_markdown_link_destination()
+     {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_markdown_reference_destination()
+     {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://example.invalid/callback?api_key=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let response = format!("See [callback][cb]\n\n[cb]: {target}");
+
+        let result = sanitize_channel_response(&response, &tools);
+
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_entity_escaped_markdown_destination()
+     {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_entity_destination_and_title() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?x=1&token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result =
+            sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
+
+        // The destination span computation is still correct (used by the
+        // entropy heuristic), but the deterministic "Token value" pattern is
+        // not suppressed by it, so both the destination and the distinct
+        // title copy are caught.
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_reference_destination_and_title() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?x=1&token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let response = format!("See [callback][cb]\n\n[cb]: {target} \"{title}\"");
+
+        let result = sanitize_channel_response(&response, &tools);
+
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_url_entity_destination_and_title() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https&colon;&sol;&sol;example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result =
+            sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
+
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_bot_token_in_markdown_autolink_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
+
+        let result = sanitize_channel_response(&format!("<{target}>"), &tools);
+
+        assert!(!result.contains("123456:ABC-def_GHI"), "result: {result}");
+        assert!(result.contains("[REDACTED_BOT_TOKEN]"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_scans_markdown_link_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let token = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let target = "https://example.invalid/callback?ticket=public-id";
+
+        let result = sanitize_channel_response(&format!("[token={token}]({target})"), &tools);
+
+        assert!(!result.contains(token));
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_scans_link_text_secret_when_match_overlaps_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md";
+
+        let result =
+            sanitize_channel_response(&format!("[password=longsecretvalue]({target})"), &tools);
+
+        // The generic-secret pattern is greedy and, starting outside the
+        // destination, can span into it; deterministic patterns are never
+        // suppressed by a protected span, so the whole overlapping match is
+        // redacted. That is the safe direction: losing an adjacent file
+        // reference is preferable to leaking the secret it was next to.
+        assert!(!result.contains("longsecretvalue"), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_scans_link_text_when_label_matches_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[{target}]({target})"), &tools);
+
+        assert!(
+            !result.starts_with(&format!("[{target}]")),
+            "result: {result}"
+        );
+        assert!(result.contains(&format!("]({target})")), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_escaped_markdown_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report\\(1\\).md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[report]({target})"), &tools);
+
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_raw_file_uri() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!("Recorded {target}.");
+
+        // The entropy-protected span is still computed correctly...
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        // ...but the deterministic "Token value" pattern inside it is not
+        // suppressed by that protection.
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(
+            result.contains("file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_keyed_raw_file_uri() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!("Recorded path={target}.");
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(
+            result.contains("path=file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_detects_credential_in_json_keyed_raw_file_uri() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!(r#"{{"uri":"{target}"}}"#);
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(
+            result.contains(r#""uri":"file:///tmp/report.md?"#),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn plain_text_leak_guard_preserves_raw_file_uri_filenames() {
+        let target = "file:///home/zeroclaw/.zeroclaw/agents/mission-orchestrator/workspace/tasks/inbox/2026-07-02-11-26-plan-b-for-something-useful.md";
+        let outbound = format!("Recorded {target}.");
+
+        let result = redact_channel_outbound_leaks(
+            &outbound,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::PlainText,
+        );
+
+        assert_eq!(result, outbound);
+    }
+
+    #[test]
+    fn irc_family_outbound_format_is_plain_text() {
+        assert_eq!(
+            outbound_content_format_for_channel("irc.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("twitch.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("twitch"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("telegram.default"),
+            OutboundContentFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_respects_disabled_leak_detection() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let result = sanitize_channel_response_with_leak_detection(leaked, &tools, &leak_detection);
+
+        assert_eq!(result, leaked);
+    }
+
+    #[test]
+    fn leak_only_guard_preserves_protocol_looking_announcement_text() {
+        let input = "[Used tools: shell]\n\nCron output completed.";
+
+        let result = redact_channel_outbound_leaks(
+            input,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn leak_only_guard_still_detects_credential_in_raw_file_uri() {
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let input = format!("Cron output: {target}");
+
+        let result = redact_channel_outbound_leaks(
+            &input,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+
+        assert!(
+            result.contains("file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
@@ -23817,6 +26168,131 @@ Done."#;
         );
     }
 
+    // --- Surface 1(a) regression tests (issue #8054) ---
+
+    fn build_msg_for_signal_test() -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            channel: "mattermost".to_string(),
+            reply_target: "ch:thread".to_string(),
+            sender: "user_test".to_string(),
+            content: "hello".to_string(),
+            id: "msg-001".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn channel_prompt_reflects_per_turn_signal_false_uses_no_tools_framing() {
+        // Regression for #8054 Surface 1(a): when the per-turn
+        // `native_tool_specs_present` is false (e.g. the base provider
+        // supports native but `non_cli_excluded_tools` removed the only
+        // native tool), the channel prompt must use
+        // `NO_TOOLS_TASK_FRAMING` and not `NATIVE_TOOLS_TASK_FRAMING`,
+        // even if the startup prompt had the latter baked in.
+        let base_prompt_with_native = format!(
+            "{}\n{}",
+            "Some base agent prompt.",
+            ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+        );
+        let msg = build_msg_for_signal_test();
+        let prompt = build_channel_system_prompt_for_message_with_signal(
+            &base_prompt_with_native,
+            &msg,
+            None,
+            false, // per-turn: no effective native specs
+        );
+        assert!(
+            prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING),
+            "per-turn signal=false must inject NO_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING),
+            "per-turn signal=false must remove NATIVE_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_keeps_startup_signal_when_per_turn_agrees() {
+        // Byte-stability: when the per-turn signal matches the anchor
+        // already present in the startup prompt, the helper returns a
+        // prompt that contains that anchor. We compare against the
+        // "expected" rendering (built via the non-signal helper with the
+        // same base) to assert no extra mutation happens. Cached-prefix
+        // byte-stability is what makes this safe to invoke every turn.
+        let base_prompt_with_no_tools = format!(
+            "{}\n{}",
+            "Some base agent prompt.",
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+        );
+        let msg = build_msg_for_signal_test();
+        let prompt_with_helper = build_channel_system_prompt_for_message_with_signal(
+            &base_prompt_with_no_tools,
+            &msg,
+            None,
+            false, // matches the anchor already in the base prompt
+        );
+        let prompt_baseline =
+            build_channel_system_prompt_for_message(&base_prompt_with_no_tools, &msg, None);
+        assert_eq!(
+            prompt_with_helper, prompt_baseline,
+            "per-turn signal matching the startup anchor must produce an identical prompt"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_rewrites_no_tools_to_native_when_per_turn_differs() {
+        // Override activation (the other direction): when the per-turn
+        // signal flips to true, the helper rewrites the anchor from
+        // NO_TOOLS_TASK_FRAMING to NATIVE_TOOLS_TASK_FRAMING. (This
+        // happens e.g. when a vision-routed message resolves to a
+        // native-capable provider different from the startup base
+        // provider, and the channel turn's filtered tool set is
+        // non-empty.)
+        let base_prompt_with_no_tools = format!(
+            "{}\n{}",
+            "Some base agent prompt.",
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+        );
+        let msg = build_msg_for_signal_test();
+        let prompt = build_channel_system_prompt_for_message_with_signal(
+            &base_prompt_with_no_tools,
+            &msg,
+            None,
+            true, // per-turn: native specs now present
+        );
+        assert!(
+            prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING),
+            "per-turn signal=true must inject NATIVE_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING),
+            "per-turn signal=true must remove NO_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_no_op_when_anchor_absent() {
+        // Cross-check: if neither anchor is present in the base prompt
+        // (e.g. a custom `system_prompt_prefix` overrides the default
+        // framing), the helper is a no-op — it returns the rendered
+        // prompt unchanged. This preserves the existing behavior for
+        // non-default startup prompts.
+        let base_prompt_no_anchor = "Custom agent prompt with no tool-availability anchor.";
+        let msg = build_msg_for_signal_test();
+        let prompt_with_helper = build_channel_system_prompt_for_message_with_signal(
+            base_prompt_no_anchor,
+            &msg,
+            None,
+            true,
+        );
+        let prompt_baseline =
+            build_channel_system_prompt_for_message(base_prompt_no_anchor, &msg, None);
+        assert_eq!(
+            prompt_with_helper, prompt_baseline,
+            "no-anchor base prompt must produce an identical prompt regardless of per-turn signal"
+        );
+    }
+
     #[test]
     fn build_channel_system_prompt_byte_stable_across_sender() {
         // Two system prompts built with the same base/channel/bot_mention
@@ -23952,25 +26428,17 @@ Done."#;
     }
 
     #[test]
-    fn compose_outgoing_user_turn_with_context_orders_preamble_memory_content() {
-        // Order on the wire: preamble → memory_context → raw user content,
-        // joined by blank lines. Empty preamble and empty memory leave the
-        // raw content untouched (CLI-style path).
+    fn compose_outgoing_user_turn_with_context_orders_preamble_content() {
+        // Order on the wire: preamble -> raw user content, joined by blank
+        // lines (the memory block is engine-injected ABOVE the whole turn).
+        // Empty preamble leaves the raw content untouched (CLI-style path).
         assert_eq!(
-            compose_outgoing_user_turn_with_context("", "", "hello"),
+            compose_outgoing_user_turn_with_context("", "hello"),
             "hello"
         );
         assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "", "hello"),
+            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "hello"),
             "[turn-context] x\n\n\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("", "[memory] y", "hello"),
-            "[memory] y\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "[memory] y", "hello"),
-            "[turn-context] x\n\n\n\n[memory] y\n\nhello"
         );
     }
 
@@ -24222,6 +26690,113 @@ Done."#;
         let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert!(sm.subject.is_none());
+    }
+
+    /// Router with no SOP engine wired. `dispatch_channel_sop_event` decides
+    /// whether a message is a channel SOP event before it ever touches the
+    /// engine, so this is enough to exercise the source/dispatch boundary.
+    fn router_without_sop_engine() -> AgentRouter {
+        AgentRouter {
+            by_agent: Arc::new(HashMap::new()),
+            owner_by_channel_key: Arc::new(HashMap::new()),
+            single_ctx: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_sop_event_ignores_user_controlled_subject() {
+        // An email-shaped message: the reserved prefix sits in the
+        // user-controlled `subject`, but the internal git-only marker is
+        // absent. It MUST NOT route to SOP.
+        let msg = ChannelMessage {
+            channel: "email".to_string(),
+            sender: "attacker@example.com".to_string(),
+            subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
+            content: r#"{"sop":"triage"}"#.to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "attacker@example.com", "", "", "email", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            !dispatch_channel_sop_event(&router, &msg).await,
+            "a forged subject must not select SOP ingress"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_sop_event_routes_git_produced_marker() {
+        // A genuine git-produced message: the internal marker carries the
+        // topic. It IS recognized as a SOP event (returns true; the missing
+        // engine is handled inside, but the routing decision fired).
+        let msg = ChannelMessage {
+            channel: "git".to_string(),
+            channel_alias: Some("main".to_string()),
+            sender: "test_user".to_string(),
+            subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
+            content: r#"{"sop":"triage"}"#.to_string(),
+            internal_sop_event: Some("git.main:pull_request.opened".to_string()),
+            ..ChannelMessage::new("1", "test_user", "octo/repo#12", "", "git", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_channel_sop_event(&router, &msg).await,
+            "a git-produced internal marker must select SOP ingress"
+        );
+    }
+
+    /// Pins #7809: the channel tool-loop reads `strict_tool_parsing` and
+    /// `parallel_tools` from `agent_cfg.resolved` (populated), not from
+    /// `prompt_config.agent(alias).resolved` (serde-skipped default).
+    #[test]
+    fn resolved_agent_config_carries_strict_tool_parsing_and_parallel_tools() {
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+
+        prompt_config.runtime_profiles.insert(
+            "strict-parallel".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                strict_tool_parsing: true,
+                parallel_tools: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let agent_alias = "test-agent";
+        prompt_config.agents.insert(
+            agent_alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
+                    "strict-parallel",
+                ),
+                ..Default::default()
+            },
+        );
+
+        let agent_cfg = prompt_config
+            .resolved_agent_config(agent_alias)
+            .expect("agent must resolve");
+
+        assert!(
+            agent_cfg.resolved.strict_tool_parsing,
+            "resolved.strict_tool_parsing should be true from the runtime profile"
+        );
+        assert!(
+            agent_cfg.resolved.parallel_tools,
+            "resolved.parallel_tools should be true from the runtime profile"
+        );
+
+        let raw_agent = prompt_config
+            .agent(agent_alias)
+            .expect("agent must exist in prompt_config");
+        assert!(
+            !raw_agent.resolved.strict_tool_parsing,
+            "raw agent resolved.strict_tool_parsing should be false (serde-skipped default)"
+        );
+        assert!(
+            !raw_agent.resolved.parallel_tools,
+            "raw agent resolved.parallel_tools should be false (serde-skipped default)"
+        );
     }
 }
 

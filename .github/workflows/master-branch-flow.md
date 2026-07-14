@@ -31,6 +31,7 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `cross-platform-clippy.yml` | `workflow_dispatch`; weekly schedule | Advisory macOS/Windows Clippy coverage, outside the required PR gate |
 | `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
+| `project-dashboard-plan.yml` | `workflow_dispatch` | Manual report-only issue Project Status planning; does not mutate ProjectV2, issues, or labels |
 
 ---
 
@@ -41,7 +42,7 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 | PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
 | PR added to the merge queue (`merge_group`) | **Inactive**: the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
-| Manual dispatch | `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, or `release-stable-manual.yml` |
+| Manual dispatch | `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `project-dashboard-plan.yml`, or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
 There is no automatic release on merge. `ci.yml` does run after trusted
@@ -58,14 +59,14 @@ tag push.
 1. Contributor opens or updates a PR targeting `master`.
 2. `ci.yml` runs:
    - `lint`: `cargo fmt --all -- --check`, `cargo clippy --workspace
-     --all-targets --features ci-all -- -D warnings`
+     --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
      (PRs only).
    - `build`: matrix across `x86_64-unknown-linux-gnu`,
      `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
    - `check`: matrix: all features + no default features.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
-   - `test`: `cargo nextest run --locked --workspace` on `ubuntu-latest`.
+   - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. Maintainer reviews. Once the gate is green and review policy is satisfied,

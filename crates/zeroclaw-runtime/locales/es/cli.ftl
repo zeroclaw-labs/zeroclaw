@@ -26,6 +26,7 @@ cli-config-about = Gestiona la configuración de ZeroClaw
 cli-update-about = Comprueba y aplica las actualizaciones de ZeroClaw
 cli-self-test-about = Ejecuta autopruebas de diagnóstico
 cli-completions-about = Genera scripts de autocompletado del shell
+cli-desktop-about = Inicia la aplicación de escritorio complementaria de ZeroClaw
 cli-config-schema-about = Vuelca el esquema JSON de configuración completo en stdout
 cli-config-list-about = Lista todas las propiedades de configuración con los valores actuales
 cli-config-get-about = Obtiene el valor de una propiedad de configuración
@@ -127,6 +128,7 @@ cli-models-set-about = Establece el modelo predeterminado en la configuración
 cli-models-status-about = Muestra la configuración actual del modelo y el estado de la caché
 cli-doctor-models-about = Sondea catálogos de modelos en todos los proveedores e informa sobre la disponibilidad
 cli-doctor-traces-about = Consulta eventos de traza en tiempo de ejecución (diagnósticos de herramientas y respuestas de modelos)
+cli-doctor-update-context-windows-about = Actualiza context_window en config.toml desde los endpoints /models del proveedor
 cli-hardware-discover-about = Enumera dispositivos USB y muestra placas conocidas
 cli-hardware-introspect-about = Inspecciona un dispositivo por su número de serie o ruta de dispositivo
 cli-hardware-info-about = Obtiene información del chip vía USB usando probe-rs sobre ST-Link
@@ -302,6 +304,16 @@ cli-completions-long-about =
     source <(zeroclaw completions bash)
     zeroclaw completions zsh > ~/.zfunc/_zeroclaw
     zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+cli-desktop-long-about =
+    Lanza la aplicación de escritorio complementaria de ZeroClaw.
+
+    La aplicación complementaria es una aplicación ligera de barra de menú / bandeja del sistema que se conecta al mismo gateway que la CLI. Proporciona acceso rápido al panel, monitoreo de estado y emparejamiento de dispositivos.
+
+    Usa --install para descargar la aplicación complementaria precompilada para tu plataforma.
+
+    Ejemplos:
+    zeroclaw desktop              # lanzar la aplicación complementaria
+    zeroclaw desktop --install    # descargarla e instalarla
 channel-needs-quickstart-reply = Este agente aún no está completamente configurado. El operador debe ejecutar Quickstart antes de que pueda responder.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web está configurado pero la característica 'whatsapp-web' no está compilada.
 channel-whatsapp-web-feature-missing-build = Compila/ejecuta con: cargo build --features whatsapp-web
@@ -350,6 +362,9 @@ channel-discord-delivery-failure-note-one = (nota: no pude entregar {$count} arc
 channel-discord-delivery-failure-note-many = (nota: no pude entregar {$count} archivos.)
 channel-whatsapp-web-delivery-failure-note-one = (nota: no pude entregar {$count} archivo multimedia de WhatsApp.)
 channel-whatsapp-web-delivery-failure-note-many = (nota: no pude entregar {$count} archivos multimedia de WhatsApp.)
+channel-line-bind-success = ✅ ¡Emparejado! Ya puedes chatear.
+channel-line-bind-invalid-code = ❌ Código no válido. Inténtalo de nuevo.
+channel-line-bind-rate-limited = ⏳ Demasiados intentos. Reintenta en { $secs }s.
 onboard-openai-auth-note =
     Autenticación de OpenAI:
     • Clave de API — acceso estándar a la API mediante platform.openai.com (sk-...)
@@ -363,10 +378,17 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = comienza con `~`, que no se expande
 cli-web-dist-dir-reason-dollar = contiene `$`, que no se expande
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-doctor-codex-auth-profile-no-slot = Las credenciales de OpenAI Codex tienen sesión iniciada, pero ningún slot de proveedor de modelo las usa. Establece `requires_openai_auth = true` en un slot de proveedor OpenAI y apunta el `model_provider` de un agente a él, o ejecuta `zeroclaw quickstart`.
+cli-doctor-codex-auth-slot-no-profile = Los slots OpenAI {$slots} tienen `requires_openai_auth = true`, pero no hay credenciales de OpenAI Codex con sesión iniciada. Ejecuta `zeroclaw auth login --provider openai-codex`.
+cli-doctor-codex-auth-ok = Las credenciales de OpenAI Codex tienen sesión iniciada y están referenciadas por un slot de proveedor de modelo.
+cli-doctor-systemd-linger-enabled = la permanencia de usuario de systemd está habilitada
+cli-doctor-systemd-linger-disabled = la permanencia de usuario de systemd está deshabilitada; el servicio de usuario puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = no se pudo comprobar la permanencia de usuario de systemd con loginctl
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = no establecido (usando detección automática)
 cli-self-test-web-dist-dir-pass-literal = {$path} (ruta literal)
 cli-self-test-web-dist-dir-fail-expansion = ADVERTENCIA: {$path} — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-service-systemd-linger-disabled-warning = la permanencia de usuario de systemd está deshabilitada. El servicio de usuario de ZeroClaw puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
 cli-peripherals-none = No hay periféricos configurados.
 cli-peripherals-add-hint = Agregue uno con: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}Ejemplo: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -382,12 +404,23 @@ cli-skills-create-hint = {"  "}Cree uno: mkdir -p ~/.zeroclaw/workspace/skills/m
 cli-skills-install-hint = {"  "}O instale: zeroclaw skills install <source>
 cli-skills-installed-header = Skills instaladas ({$count}):
 cli-skills-tags = Etiquetas:  {$tags}
+cli-skills-skipped-header = Omitidas ({$count}):
+cli-skills-skipped-reason = {"    "}Motivo: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Establece `skills.allow_scripts = true` en tu configuración de zeroclaw para habilitarla.
 cli-sop-none = No se encontraron SOP.
+cli-sop-pending-none = No hay ejecuciones de SOP esperando aprobación.
+cli-sop-pending-header = Ejecuciones de SOP esperando aprobación:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] paso {$step}/{$total}
+cli-sop-ws-invalid-approval = sop approval_response requiere run_id y una decisión approve o deny
+cli-sop-ws-resolve-failed = error al resolver SOP: {$error}
+cli-sop-ws-engine-lock-poisoned = bloqueo del motor SOP envenenado
+cli-sop-ws-subsystem-disabled = el subsistema SOP no está habilitado
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
 cli-sop-none-to-validate = No se encontraron SOP para validar.
 cli-sop-valid = ✅ {$name} — válido
+cli-sop-deleted = SOP eliminado: {$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} advertencia(s):
 cli-sop-all-passed = Todos los SOP pasaron la validación.
 cli-sop-priority = {"  "}Prioridad:       {$value}
@@ -430,6 +463,7 @@ cli-cron-added-oneshot = ✅ Tarea cron de una sola vez agregada {$id}
 cli-cron-added-interval-agent = ✅ Tarea cron de agente por intervalo agregada {$id}
 cli-cron-added-interval = ✅ Tarea cron de intervalo agregada {$id}
 cli-cron-updated = ✅ Tarea cron actualizada {$id}
+cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, o --uses-memory
 cli-cron-removed = ✅ Tarea cron eliminada {$id}
 cli-cron-paused = ⏸️  Tarea cron pausada {$id}
 cli-cron-resumed = ▶️  Tarea cron reanudada {$id}
@@ -589,6 +623,10 @@ cli-status-service-stopped = 🔴 Servicio:       detenido
 cli-status-channels = Canales:
 cli-status-cli-always = {"  "}CLI:      ✅ siempre
 cli-status-peripherals = Periféricos:
+cli-desktop-download = Descarga la aplicación complementaria de ZeroClaw:
+cli-desktop-homebrew = O instálala con Homebrew (próximamente):
+cli-desktop-linux-pkg = {"  "}Descarga el .deb o .AppImage para tu arquitectura.
+cli-desktop-launching = Iniciando la aplicación complementaria de ZeroClaw...
 cli-status-version = Versión:     {$v}
 cli-status-workspace = Espacio de trabajo:   {$v}
 cli-status-config = Configuración:      {$v}
@@ -627,6 +665,9 @@ cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
 cli-status-channel-not-compiled = 🚫 configurado, no compilado
+cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está instalada.
+cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
+cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
 cli-config-all-configured = Todas las secciones ya están configuradas.
 cli-config-schema-current = La configuración ya está en la versión actual del esquema.
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
@@ -639,6 +680,10 @@ cli-plugin-no-description = (sin descripción)
 cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de complementos...
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
+cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
+cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
 cli-plugin-legacy-detected = Nota: los complementos en una ubicación heredada ({$path}) no se cargan en el agente. Ejecuta `zeroclaw plugin migrate` para moverlos a {$target}.
@@ -653,6 +698,7 @@ cli-warn-crypto-provider = Advertencia: No se pudo instalar el proveedor de cifr
 cli-error-label = {"   "}Error: {$err}
 cli-warn-cost-usage = {"  "}⚠ No se pudo cargar el uso de costos: {$err}
 cli-warn-cost-tracker = {"  "}⚠ No se pudo inicializar el rastreador de costos: {$err}
+cli-desktop-download-at = {"  "}Descárgala en: {$url}
 cli-config-legend = Leyenda: 💉 anulado por entorno  🔒 secreto
 cli-config-secret-set = {$path} está establecido (secreto cifrado — valor no mostrado)
 cli-config-secret-unset = {$path} no está establecido (secreto cifrado)
@@ -721,9 +767,70 @@ turn-cancelled-client-rpc = [turno cancelado mediante el cliente]
 turn-stream-interrupted = [transmisión interrumpida]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = Esta solicitud no se procesó: { $reason }
 turn-tool-interrupted-before-result = [interrumpido por el usuario antes de que esta herramienta produjera un resultado]
 channel-runtime-malformed-tool-output = Generé un error de formato interno en la llamada de herramienta y no pude completar esta solicitud. Inténtalo de nuevo.
+channel-runtime-new-session = Historial de conversación borrado. Empezando de nuevo.
+channel-runtime-stop-sent = Señal de detención enviada.
+channel-runtime-stop-no-task = No hay una tarea en curso para este ámbito de remitente.
+channel-runtime-model-empty = El ID del modelo no puede estar vacío. Usa `/model <model-id>`.
+channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.
+channel-runtime-request-timeout = ⚠️ La solicitud agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
+channel-runtime-current-model-status =
+    model_provider actual: `{ $provider }`
+    Modelo actual: `{ $model }`
+channel-runtime-model-switch-hint = Cambia el modelo con `/model <model-id>` o `/model <hint>`.
+channel-runtime-provider-switch-hint = Cambia el model_provider con `/models <model_provider>`.
+channel-runtime-available-providers-header = model_providers disponibles:
+channel-runtime-configured-routes-header = Rutas de modelo configuradas:
+channel-runtime-no-cached-models = No se encontró una lista de modelos en caché para `{ $provider }`. Pide al operador que ejecute `zeroclaw models refresh --model-provider { $provider }`.
+channel-runtime-cached-model-ids-header = IDs de modelo en caché (primeros { $count }):
+channel-runtime-config-switch-hints =
+    Usa `/models <model_provider>` para cambiar el model_provider.
+    Usa `/model <model-id>` para cambiar el modelo.
+channel-runtime-config-block-title =
+    { "*" }Configuración del modelo{ "*" }
+    Actual: `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = Seleccionar model_provider
+channel-runtime-config-select-model-placeholder = Seleccionar modelo
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *Modelo*
+channel-runtime-scope-user = usuario
+channel-runtime-scope-agent = agente
+channel-runtime-scope-overrides-summary =
+    { "**" }Sobrescrituras de modelo{ "**" } (solo sesión; precedencia user > agent > session > default):
+    • user: { $user }
+    • agent: { $agent }
+    • session (este chat): { $session }
+    • default (config): { $default }
+    Define un ámbito con `/model --user|--agent <model-id>`; bórralo configurándolo de nuevo al valor predeterminado.
+channel-runtime-set-provider-switched =
+    ModelProvider cambiado a `{ $provider }` para esta sesión del remitente. El modelo actual es `{ $model }`.
+    Usa `/model <model-id>` para definir un modelo compatible con el provider.
+channel-runtime-set-provider-init-failed =
+    Error al inicializar model_provider `{ $provider }`. La ruta no cambió.
+    Detalles: { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` tiene varios alias configurados. Especifica cuál con `/models { $family }.<alias>`: { $list }
+channel-runtime-provider-no-alias = No hay una entrada de provider configurada para `{ $provider }`. Agrega `[providers.models.{ $provider }]` (con api_key/uri) o selecciona un provider configurado; `/models` lista los válidos.
+channel-runtime-provider-unknown = model_provider desconocido `{ $provider }`. Usa `/models` para listar model_providers válidos.
+channel-runtime-scoped-model-empty = El ID del modelo no puede estar vacío. Usa `/model --user|--agent <model-id>`.
+channel-runtime-scoped-model-switched = Modelo definido en `{ $model }` (model_provider: `{ $provider }`) para el ámbito **{ $scope }**. Solo para la sesión; se restablece al reiniciar.
+channel-runtime-shadow-note = ⚠️ Hay una sobrescritura de mayor precedencia activa, por lo que los mensajes usarán `{ $model }` (`{ $provider }`) en su lugar; consulta `/model`.
+channel-runtime-thinking-set =
+    Thinking definido en `{ $level }` para esta sesión del remitente.
+    Usa `/thinking reset` para volver al valor predeterminado del agente.
+channel-runtime-thinking-cleared = Sobrescritura de thinking borrada. Usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
+channel-runtime-thinking-default =
+    Thinking ya está usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
+    Usa `/thinking high`, `/thinking max` o `/thinking off` para sobrescribirlo.
+channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/thinking off|minimal|low|medium|high|max`, `/thinking on` o `/thinking reset`.
+channel-runtime-provider-turn-init-failed =
+    ⚠️ Error al inicializar model_provider `{ $provider }`. Ejecuta `/models` para elegir otro model_provider.
+    Detalles: { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` no está disponible — respuesta de **{ $actual }** (`{ $model }`)
+    Cambiar modelo: /models
 cli-alias-list-empty = (sin entradas en {$section})
 cli-alias-created = creado {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} ya existe (sin cambios)
@@ -764,3 +871,20 @@ cli-bundle-warn-archive = advertencia: falló el archivado del directorio del bu
 cli-bundle-deleted = eliminado skill_bundles.{$alias} (eliminado de {$count} agente(s))
 cli-bundle-warn-move = advertencia: falló el movimiento del directorio del bundle: {$error}
 cli-bundle-renamed = renombrado skill_bundles.{$from} → skill_bundles.{$to}
+
+cli-daemon-gateway-already-running = Ya hay un gateway de ZeroClaw ejecutándose en {$host}:{$port}. El daemon supervisa su propio gateway y no iniciará un segundo en la misma dirección. Detén ese gateway (o apunta el daemon a un puerto libre con `zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
+cli-daemon-gateway-port-occupied = La dirección del gateway {$host}:{$port} ya está en uso por otro proceso. Libera el puerto o apunta el daemon a un puerto libre (`zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: desconocido / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no hay modelo configurado, omitiendo
+cli-doctor-ctxwin-would-set = {$provider_ref}: establecería context_window = {$ctx} (simulación)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window establecido = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: no se encontró la entrada para actualizar
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: el proveedor no expone ventana de contexto o falló la obtención
+cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
+cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
+cli-doctor-ctxwin-none = No se necesitan actualizaciones.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}

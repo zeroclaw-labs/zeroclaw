@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::mcp_client::McpRegistry;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Generic MCP resource access tool. Routes through `McpRegistry`.
 pub struct McpResourcesTool {
@@ -21,14 +21,14 @@ impl McpResourcesTool {
     fn ok(output: String) -> ToolResult {
         ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         }
     }
     fn fail(msg: impl Into<String>) -> ToolResult {
         ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(msg.into()),
         }
     }
@@ -123,10 +123,14 @@ impl Tool for McpResourcesTool {
                     _ => return Ok(Self::fail("`read` requires a non-empty `uri`")),
                 };
                 match self.registry.read_resource(&uri).await {
-                    Ok(contents) => match serde_json::to_string_pretty(&contents) {
-                        Ok(s) => Ok(Self::ok(s)),
-                        Err(e) => Ok(Self::fail(format!("failed to serialize contents: {e}"))),
-                    },
+                    Ok(contents) => {
+                        let server = McpRegistry::split_prefixed(&uri)
+                            .map(|(s, _)| s)
+                            .unwrap_or_default();
+                        let wrapped =
+                            crate::mcp_context::wrap_resource_contents(&server, &uri, &contents);
+                        Ok(Self::ok(wrapped))
+                    }
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

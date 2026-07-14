@@ -60,7 +60,7 @@ tool-file-download-error-write-body = 写入已下载字节时失败：{ $err }
 tool-file-download-error-flush = 刷新已下载文件失败：{ $err }
 tool-file-download-error-move = 将已下载文件移动到位失败：{ $err }
 tool-file-download-success = 已下载 { $written } 字节到 { $dest_path }（{ $status }）
-tool-file-read = 读取带行号的文件内容。支持通过 offset 和 limit 进行部分读取。可从 PDF 提取文本；其他二进制文件以有损 UTF-8 转换方式读取。
+tool-file-read = 读取带行号的文件内容。支持通过 offset 和 limit 进行部分读取。二进制文件和图像文件会被拒绝（图像请使用 image_info 工具）。设置 encoding="base64" 可以返回经 base64 编码的原始字节（适用于 .pdf/.xlsx/.docx 等二进制文件）；该模式下 offset/limit 被忽略。
 tool-file-write = 将内容写入工作区中的文件
 tool-git-operations = 执行结构化的 Git 操作（status、diff、log、branch、commit、add、checkout、stash）。提供解析后的 JSON 输出，并与安全策略集成以实现自主控制。
 tool-git-operations-error-not-in-repo = 当前路径 '{ $path }' 不在 Git 仓库中。请选择一个 Git 工作树内的路径，通过 'path' 参数指定仓库子目录，或在运行 git_operations 前初始化一个仓库。
@@ -81,7 +81,6 @@ tool-memory-store = 在长期记忆中存储事实、偏好或备注。使用类
 tool-microsoft365 = Microsoft 365 集成：通过 Microsoft Graph API 管理 Outlook 邮件、Teams 消息、Calendar 事件、OneDrive 文件和 SharePoint 搜索
 tool-model-routing-config = 管理默认模型设置、基于场景的提供商/模型路由、分类规则和别名 agent 配置
 tool-notion = 与 Notion 交互：查询数据库、读取/创建/更新页面，以及搜索工作区。
-tool-pdf-read = 从工作区中的 PDF 文件提取纯文本。返回所有可读文本。仅含图像或加密的 PDF 返回空结果。需要 'rag-pdf' 构建功能。
 tool-project-intel = 项目交付智能：生成状态报告、检测风险、起草客户更新、总结冲刺，以及估算工作量。只读分析工具。
 tool-proxy-config = 管理 ZeroClaw 代理设置（范围：environment | zeroclaw | services），包括运行时和进程环境变量应用
 tool-pushover = 向你的设备发送 Pushover 通知。需要 .env 文件中的 PUSHOVER_TOKEN 和 PUSHOVER_USER_KEY。

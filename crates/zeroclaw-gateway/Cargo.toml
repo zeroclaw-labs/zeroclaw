@@ -81,6 +81,7 @@ rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
 
 [features]
 default = ["schema-export", "a2a"]
@@ -104,5 +105,5 @@ gateway-voice-duplex = []
 # JSON Schema body and the serde-side schemars derives transitively. Defaults
 # on; turning it off omits OPTIONS schema bodies (returns a small placeholder)
 # and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
-schema-export = ["zeroclaw-config/schema-export", "dep:schemars"]
+schema-export = ["zeroclaw-config/schema-export", "zeroclaw-runtime/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]

@@ -77,6 +77,28 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(engine, audit, event, None).await
+}
+
+/// Dispatch an incoming event to one named SOP, after normal trigger matching.
+///
+/// This is useful for channel routers that already selected a configured SOP
+/// name, while still requiring that SOP to declare a matching trigger.
+pub async fn dispatch_sop_event_to(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop)).await
+}
+
+async fn dispatch_sop_event_filtered(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: Option<&str>,
+) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
         Err(e) => {
@@ -115,7 +137,7 @@ pub async fn dispatch_sop_event(
         }
         ScreenVerdict::Block { reason } => {
             if let Err(e) = audit
-                .log_blocked_unsafe(None, event.source, event.topic.as_deref(), &reason)
+                .log_blocked_unsafe(target_sop, event.source, event.topic.as_deref(), &reason)
                 .await
             {
                 ::zeroclaw_log::record!(
@@ -127,7 +149,7 @@ pub async fn dispatch_sop_event(
                 );
             }
             return vec![DispatchResult::BlockedUnsafe {
-                sop_name: None,
+                sop_name: target_sop.map(str::to_string),
                 reason,
             }];
         }
@@ -139,6 +161,7 @@ pub async fn dispatch_sop_event(
             .match_trigger(&event)
             .iter()
             .map(|s| s.name.clone())
+            .filter(|name| target_sop.is_none_or(|target| name == target))
             .collect(),
         Err(e) => {
             crate::health::mark_component_error("sop_dispatch", format!("lock poisoned: {e}"));
@@ -156,7 +179,8 @@ pub async fn dispatch_sop_event(
     if matched_names.is_empty() {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"target_sop": target_sop})),
             "SOP dispatch: no match for event"
         );
         return vec![DispatchResult::NoMatch];
@@ -392,6 +416,75 @@ pub fn process_headless_results(results: &[DispatchResult]) {
     }
 }
 
+/// Headless fan-in chokepoint for untrusted external events (channel
+/// messages, AMQP deliveries, ...): caps oversized topic/payload at the
+/// configured `untrusted_payload_max_bytes` (with an explicit truncation
+/// marker), stamps the event, dispatches it against loaded SOP triggers,
+/// and audits the results. Callers should gate on
+/// `SopEngine::wants_source` first to skip the work when no SOP listens.
+pub async fn dispatch_untrusted_fan_in(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+) -> Vec<DispatchResult> {
+    let max_bytes = match engine.lock() {
+        Ok(eng) => eng.config().untrusted_payload_max_bytes,
+        Err(e) => {
+            crate::health::mark_component_error(
+                "sop_dispatch",
+                format!("SOP engine lock poisoned: {e}"),
+            );
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e), "source": source.to_string()})),
+                "SOP fan-in: engine lock poisoned while reading SOP safety config"
+            );
+            return vec![];
+        }
+    };
+    let (topic, topic_truncated) = match topic {
+        Some(t) => {
+            let (capped, truncated) = crate::security::cap_untrusted(t, max_bytes);
+            (Some(capped), truncated)
+        }
+        None => (None, false),
+    };
+    let (payload, payload_truncated) = match payload {
+        Some(p) => {
+            let (capped, truncated) = crate::security::cap_untrusted(p, max_bytes);
+            (Some(capped), truncated)
+        }
+        None => (None, false),
+    };
+    if topic_truncated || payload_truncated {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "source": source.to_string(),
+                    "topic_truncated": topic_truncated,
+                    "payload_truncated": payload_truncated,
+                    "max_bytes": max_bytes,
+                })),
+            "SOP fan-in: capped oversized untrusted event"
+        );
+    }
+    let event = SopEvent {
+        source,
+        topic,
+        payload,
+        timestamp: now_iso8601(),
+    };
+    let results = dispatch_sop_event(engine, audit, event).await;
+    process_headless_results(&results);
+    results
+}
+
 // ── Peripheral signal helper ────────────────────────────────────
 
 /// Convenience wrapper for peripheral hardware callbacks.
@@ -583,6 +676,7 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -626,6 +720,9 @@ mod tests {
                 namespace: namespace.unwrap_or("default").to_string(),
                 importance,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: agent_id.map(str::to_string),
                 agent_id: agent_id.map(str::to_string),
             }
@@ -790,6 +887,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_to_named_sop_filters_matching_channel_triggers() {
+        let channel_trigger = SopTrigger::Channel {
+            channel: "git".into(),
+            alias: Some("main".into()),
+            condition: None,
+        };
+        let engine = test_engine(vec![
+            test_sop("pr-triage", vec![channel_trigger.clone()]),
+            test_sop("other-handler", vec![channel_trigger]),
+        ]);
+        let audit = test_audit();
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"sop":"pr-triage"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+
+        let results = dispatch_sop_event_to(&engine, &audit, event.clone(), "pr-triage").await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], DispatchResult::Started { sop_name, .. } if sop_name == "pr-triage")
+        );
+
+        let results = dispatch_sop_event_to(&engine, &audit, event, "missing-sop").await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::NoMatch));
+    }
+
+    #[tokio::test]
     async fn dispatch_skips_when_cooldown_active() {
         let mut sop = test_sop("cooldown-sop", vec![SopTrigger::Manual]);
         sop.cooldown_secs = 3600;
@@ -821,6 +949,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -855,6 +984,77 @@ mod tests {
         let results = dispatch_sop_event(&engine, &audit, event).await;
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], DispatchResult::NoMatch));
+    }
+
+    #[tokio::test]
+    async fn untrusted_fan_in_caps_oversized_topic_and_payload() {
+        let config = SopConfig {
+            untrusted_payload_max_bytes: 16,
+            ..SopConfig::default()
+        };
+        let engine = test_engine_with_config(
+            vec![test_sop(
+                "channel-sop",
+                vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+            )],
+            config,
+        );
+        let audit = test_audit();
+
+        let long_payload = "x".repeat(64);
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Channel,
+            Some("telegram"),
+            Some(&long_payload),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::Started { .. }));
+        let eng = engine.lock().unwrap();
+        let run = eng.active_runs().values().next().unwrap();
+        let payload = run.trigger_event.payload.as_deref().unwrap();
+        assert!(
+            payload.starts_with(&"x".repeat(16)),
+            "capped payload must preserve the leading max_bytes: {payload}"
+        );
+        assert!(
+            payload.contains("...[truncated"),
+            "capped payload must carry the truncation marker: {payload}"
+        );
+        assert!(!payload.contains(&"x".repeat(17)));
+        assert_eq!(run.trigger_event.topic.as_deref(), Some("telegram"));
+        assert_eq!(run.trigger_event.source, SopTriggerSource::Channel);
+    }
+
+    #[tokio::test]
+    async fn untrusted_fan_in_no_match_for_unwanted_source() {
+        let engine = test_engine(vec![test_sop(
+            "webhook-sop",
+            vec![SopTrigger::Webhook {
+                path: "/hook".into(),
+            }],
+        )]);
+        let audit = test_audit();
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Channel,
+            Some("telegram"),
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::NoMatch));
+        assert!(engine.lock().unwrap().active_runs().is_empty());
     }
 
     #[tokio::test]

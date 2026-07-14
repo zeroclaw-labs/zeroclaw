@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::mcp_client::McpRegistry;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Generic MCP prompt access tool. Routes through `McpRegistry`.
 pub struct McpPromptsTool {
@@ -21,14 +21,14 @@ impl McpPromptsTool {
     fn ok(output: String) -> ToolResult {
         ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         }
     }
     fn fail(msg: impl Into<String>) -> ToolResult {
         ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(msg.into()),
         }
     }
@@ -125,10 +125,14 @@ impl Tool for McpPromptsTool {
                 };
                 let arguments = map.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 match self.registry.get_prompt(&name, arguments).await {
-                    Ok(result) => match serde_json::to_string_pretty(&result) {
-                        Ok(s) => Ok(Self::ok(s)),
-                        Err(e) => Ok(Self::fail(format!("failed to serialize prompt: {e}"))),
-                    },
+                    Ok(result) => {
+                        let server = McpRegistry::split_prefixed(&name)
+                            .map(|(s, _)| s)
+                            .unwrap_or_default();
+                        let rendered =
+                            crate::mcp_context::render_prompt_messages(&server, &name, &result);
+                        Ok(Self::ok(rendered))
+                    }
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

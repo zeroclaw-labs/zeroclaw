@@ -122,6 +122,7 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -140,8 +141,9 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13)",
+                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
+                uses_memory
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 expression,
@@ -156,6 +158,7 @@ pub fn add_agent_job(
                 agent_alias,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                if uses_memory { 1 } else { 0 },
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -1564,6 +1567,7 @@ mod tests {
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
+        job_id: &str,
     ) -> serde_json::Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -1574,7 +1578,12 @@ mod tests {
                     if value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|candidate| candidate == message) =>
+                        .is_some_and(|candidate| candidate == message)
+                        && value
+                            .get("attributes")
+                            .and_then(|a| a.get("job_id"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| id == job_id) =>
                 {
                     return value;
                 }
@@ -1583,7 +1592,7 @@ mod tests {
                 Err(_elapsed) => {}
             }
         }
-        panic!("did not find log event: {message}");
+        panic!("did not find log event: {message} for job {job_id}");
     }
 
     #[test]
@@ -1918,6 +1927,7 @@ mod tests {
             }),
             false,
             None,
+            true,
         )
         .unwrap_err();
 
@@ -1980,7 +1990,7 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
 
-        let value = recv_log_event(&mut rx, "Removed cron job").await;
+        let value = recv_log_event(&mut rx, "Removed cron job", &job.id).await;
         assert_eq!(value["event"]["category"], "cron");
         assert_eq!(value["event"]["action"], "delete");
         assert_eq!(value["event"]["outcome"], "success");
@@ -2086,6 +2096,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into(), "web_search".into()]),
+            true,
         )
         .unwrap();
 
@@ -2114,6 +2125,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 

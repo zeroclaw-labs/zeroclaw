@@ -81,10 +81,10 @@ impl LarkPlatform {
     }
 
     fn channel_name(self) -> &'static str {
-        match self {
-            Self::Lark => "lark",
-            Self::Feishu => "feishu",
-        }
+        // Always "lark" for routing identity. `use_feishu` only selects
+        // the API endpoint and display name — the config schema, agent
+        // bindings, and peer groups all use `lark.<alias>`.
+        "lark"
     }
 }
 
@@ -3190,6 +3190,7 @@ impl Channel for LarkChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if message_id.is_empty() {
             return self.send(&SendMessage::new(text, recipient)).await;
@@ -4884,7 +4885,7 @@ mod tests {
 
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
-        assert_eq!(ch.name(), "feishu");
+        assert_eq!(ch.name(), "lark");
     }
 
     #[test]
@@ -6113,9 +6114,9 @@ mod tests {
 
         assert_eq!(
             ch.name(),
-            "feishu",
-            "use_feishu=true must surface the channel identity as 'feishu' \
-             (registry key alignment — see orchestrator::deliver_announcement)"
+            "lark",
+            "use_feishu=true still uses 'lark' as routing identity — \
+             use_feishu only selects the API endpoint"
         );
 
         let message = SendMessage::new("hi from cron", "oc_test_chat_id");
@@ -6356,6 +6357,7 @@ mod tests {
             "oc_test_chat_id",
             "om_draft_media",
             "final caption [IMAGE:draft.png]",
+            false,
         )
         .await
         .expect("finalize_draft should clean text and send image");
