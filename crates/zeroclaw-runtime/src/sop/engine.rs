@@ -572,11 +572,14 @@ impl SopEngine {
     /// capacity, so it is never both claimless AND un-persisted (which a crash
     /// would turn into a lost park while newer triggers had already admitted into
     /// the "freed" slot). The slot is held until a later persist succeeds,
-    /// trading a little concurrency for no lost park.
-    fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) {
+    /// trading a little concurrency for no lost park. Returns whether the parked
+    /// snapshot is durable, so callers can defer external approval prompts until
+    /// the run is recoverable after a restart.
+    fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) -> bool {
         if self.persist_active_checked(run_id) {
             self.claims_pending_persist.remove(run_id);
             self.release_claim_on_park(run_id);
+            true
         } else {
             // Track this run so `heartbeat_active_claims` keeps renewing its KEPT
             // claim despite the park status (see `claims_pending_persist`'s doc):
@@ -591,12 +594,14 @@ impl SopEngine {
                     .with_attrs(::serde_json::json!({"run_id": run_id})),
                 "SOP engine: parked snapshot not persisted; KEEPING the exec claim (fail closed) so the park is not lost"
             );
+            false
         }
     }
 
     /// Retry the durable persist for every run in `claims_pending_persist`. A
     /// retry that now succeeds completes the deferred park transition (releases
-    /// the claim). One that still fails leaves the run tracked - but
+    /// the claim and emits its deferred approval prompt). One that still fails
+    /// leaves the run tracked - but
     /// `persist_active_checked` heartbeats the claim BEFORE attempting the write,
     /// unconditionally, so even a failing retry still renews the kept claim's
     /// lease. This is what keeps `reap_expired_claims` from reclaiming it: called
@@ -622,6 +627,7 @@ impl SopEngine {
                 // by that transition and must NOT be released out from under it.
                 if !holds_exec_claim(status) {
                     self.release_claim_on_park(&run_id);
+                    self.notify_park_request(&run_id);
                 }
             }
         }
@@ -1699,14 +1705,16 @@ impl SopEngine {
         // the parked snapshot is durably persisted (else keep the claim, fail
         // closed).
         if parked_for_approval {
-            self.persist_parked_snapshot_then_release_claim(run_id);
+            let persisted = self.persist_parked_snapshot_then_release_claim(run_id);
             // EPIC G route delivery: if the parked step's policy names a
             // `request_route`, deliver the approval request out-of-band (e.g. to a
             // Discord ops channel) so an approver can act without watching the
             // originating surface. Best-effort - the gate is already parked and
             // durable; a delivery failure never affects it, and the approval still
             // comes back through the normal HTTP/WS/tool -> broker path.
-            self.notify_park_request(run_id);
+            if persisted {
+                self.notify_park_request(run_id);
+            }
         } else {
             self.persist_active(run_id);
         }
@@ -2253,7 +2261,8 @@ impl SopEngine {
 
         // Same park sequence as the original checkpoint: refresh the state file,
         // durably persist the parked snapshot (releasing the claim taken above),
-        // then re-notify the approver with the new draft + new revision.
+        // then re-notify the approver with the new draft + new revision only after
+        // that parked state can be recovered.
         if let Err(e) = self.persist_deterministic_state(run_id, &sop) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2263,8 +2272,9 @@ impl SopEngine {
                 "SOP engine: revised state-file refresh failed (run store remains authoritative)"
             );
         }
-        self.persist_parked_snapshot_then_release_claim(run_id);
-        self.notify_park_request(run_id);
+        if self.persist_parked_snapshot_then_release_claim(run_id) {
+            self.notify_park_request(run_id);
+        }
         Ok(())
     }
 
@@ -3484,13 +3494,15 @@ impl SopEngine {
                 // row for restore_runs() to rehydrate. A1: free the exec slot while
                 // the run waits at the checkpoint - but only AFTER the parked
                 // snapshot is durably persisted (else keep the claim).
-                self.persist_parked_snapshot_then_release_claim(run_id);
+                let persisted = self.persist_parked_snapshot_then_release_claim(run_id);
                 // EPIC G route delivery, checkpoint flavor: a checkpoint step that
                 // names a `policy` with a `request_route` notifies the approver
                 // out-of-band on park (e.g. a Discord ops channel), exactly like a
-                // `WaitApproval` gate. Best-effort; the parked state is already
-                // durable and a delivery failure never affects it.
-                self.notify_park_request(run_id);
+                // `WaitApproval` gate. Best-effort after the parked state is
+                // durable; a delivery failure never affects it.
+                if persisted {
+                    self.notify_park_request(run_id);
+                }
 
                 Ok(SopRunAction::CheckpointWait {
                     run_id: run_id.to_string(),
@@ -7710,15 +7722,35 @@ mod tests {
         );
     }
 
-    /// Delegates to an in-memory store but fails every `save_run`, to prove a park
+    /// Delegates to an in-memory store but can fail `save_run`, to prove a park
     /// does NOT release its exec claim when the parked snapshot cannot be durably
-    /// persisted.
+    /// persisted and that a later retry can complete the transition.
     struct FailingSaveStore {
         inner: InMemoryRunStore,
+        fail_saves: std::sync::atomic::AtomicBool,
     }
+
+    impl FailingSaveStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryRunStore::new(),
+                fail_saves: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+
+        fn allow_saves(&self) {
+            self.fail_saves
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     impl SopRunStore for FailingSaveStore {
-        fn save_run(&self, _r: &PersistedRun) -> Result<(), StoreError> {
-            Err(StoreError::Backend("injected save_run failure".into()))
+        fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
+            if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(StoreError::Backend("injected save_run failure".into()))
+            } else {
+                self.inner.save_run(r)
+            }
         }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
@@ -7795,9 +7827,7 @@ mod tests {
         // the parked run is never both claimless AND un-persisted - a crash would
         // otherwise lose the approval while newer triggers had already admitted
         // into the "freed" slot.
-        let store = std::sync::Arc::new(FailingSaveStore {
-            inner: InMemoryRunStore::new(),
-        });
+        let store = std::sync::Arc::new(FailingSaveStore::new());
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
         let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
         let a = engine.start_run("s1", manual_event()).unwrap();
@@ -7817,12 +7847,48 @@ mod tests {
     }
 
     #[test]
+    fn approval_route_waits_for_durable_park_before_notifying_once() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let store = std::sync::Arc::new(FailingSaveStore::new());
+        let mut engine = policied_supervised_engine(Some("discord.ops:123456789"), adapter)
+            .with_store(store.clone());
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a failed parked-state persist must not emit an orphanable approval prompt"
+        );
+
+        store.allow_saves();
+        engine.run_maintenance_tick();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the first successful retry emits the deferred approval prompt"
+        );
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "the durable parked run releases its exec claim"
+        );
+
+        engine.run_maintenance_tick();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "later maintenance ticks must not resend the same initial prompt"
+        );
+    }
+
+    #[test]
     fn checkpoint_park_keeps_its_claim_when_the_snapshot_persist_fails() {
         // Same fail-closed guarantee as the approval-park case, for the
         // deterministic-checkpoint park site.
-        let store = std::sync::Arc::new(FailingSaveStore {
-            inner: InMemoryRunStore::new(),
-        });
+        let store = std::sync::Arc::new(FailingSaveStore::new());
         let mut engine =
             engine_with_sops(vec![deterministic_sop("det-cp")]).with_store(store.clone());
         let action = engine.start_run("det-cp", manual_event()).unwrap();
@@ -7849,9 +7915,7 @@ mod tests {
         // persistence kept it. Approval must be refused before reacquiring or
         // rolling back any claim; otherwise a failed approval attempt could release
         // that pre-existing claim and leave the run both claimless and unpersisted.
-        let store = std::sync::Arc::new(FailingSaveStore {
-            inner: InMemoryRunStore::new(),
-        });
+        let store = std::sync::Arc::new(FailingSaveStore::new());
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
         let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
         let a = engine.start_run("s1", manual_event()).unwrap();
@@ -7887,9 +7951,7 @@ mod tests {
     fn approve_step_refuses_to_resume_while_checkpoint_persist_is_pending() {
         // Same class of regression as `resolve_gate_refuses_to_approve_while_
         // park_persist_is_pending`, for the deterministic-checkpoint resume path.
-        let store = std::sync::Arc::new(FailingSaveStore {
-            inner: InMemoryRunStore::new(),
-        });
+        let store = std::sync::Arc::new(FailingSaveStore::new());
         let mut engine =
             engine_with_sops(vec![deterministic_sop("det-cp")]).with_store(store.clone());
         let action = engine.start_run("det-cp", manual_event()).unwrap();
@@ -7925,9 +7987,7 @@ mod tests {
     #[test]
     fn resume_deterministic_run_refuses_to_resume_while_checkpoint_persist_is_pending() {
         // Same class of regression, via the restore-path entry point.
-        let store = std::sync::Arc::new(FailingSaveStore {
-            inner: InMemoryRunStore::new(),
-        });
+        let store = std::sync::Arc::new(FailingSaveStore::new());
         let mut engine =
             engine_with_sops(vec![deterministic_sop("det-cp")]).with_store(store.clone());
         let action = engine.start_run("det-cp", manual_event()).unwrap();

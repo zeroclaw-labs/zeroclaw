@@ -43,24 +43,37 @@ where
     Ok((rx, handle))
 }
 
-/// Run `fut` on a dedicated bridge thread, waiting at most `timeout`.
-/// `what` names the operation for thread naming and error text. Timeout detaches
-/// the worker, so this is only safe for non-public/idempotent effects.
+/// Run `fut` on a dedicated bridge thread, cancelling it after `timeout`.
+/// `what` names the operation for thread naming and error text. The timeout runs
+/// inside the bridge runtime, so its elapsed branch drops the pending future
+/// before this function returns.
 pub(super) fn run_bridged<T, F>(fut: F, timeout: Duration, what: &str) -> Result<T, String>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, String>> + Send + 'static,
 {
-    let (rx, _handle) = spawn_bridge_thread(fut, what)?;
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "timed out after {}s waiting for the {what}",
-            timeout.as_secs()
-        )),
+    let timeout_error = format!(
+        "timed out after {}s waiting for the {what}",
+        timeout.as_secs()
+    );
+    let (rx, handle) = spawn_bridge_thread(
+        async move {
+            match tokio::time::timeout(timeout, fut).await {
+                Ok(result) => result,
+                Err(_) => Err(timeout_error),
+            }
+        },
+        what,
+    )?;
+    match rx.recv() {
+        Ok(result) => {
+            let _ = handle.join();
+            result
+        }
         // Sender dropped without a result: the bridged task died (panic) — a
         // different failure than a slow operation.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        Err(_) => {
+            let _ = handle.join();
             Err(format!("{what} task died before reporting a result"))
         }
     }
@@ -155,6 +168,35 @@ mod tests {
             "failop",
         );
         assert_eq!(failing.unwrap_err(), "boom");
+    }
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn timeout_drops_the_pending_future_before_returning() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let out = run_bridged(
+            async move {
+                let _marker = DropMarker(marker);
+                std::future::pending::<()>().await;
+                Ok::<_, String>(())
+            },
+            Duration::from_millis(50),
+            "cancellable",
+        );
+
+        assert!(out.unwrap_err().contains("timed out"));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the timed-out future must be dropped before the caller can retry"
+        );
     }
 
     #[test]
