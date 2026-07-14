@@ -2438,4 +2438,34 @@ mod tests {
             "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
         );
     }
+
+    #[test]
+    fn responses_provider_capabilities_with_vision_enabled() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None, Some(true));
+        let caps = provider.capabilities();
+        assert!(
+            caps.vision,
+            "vision capability should be enabled when configured with Some(true)"
+        );
+    }
+
+    #[test]
+    fn responses_provider_capabilities_with_vision_disabled() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None, Some(false));
+        let caps = provider.capabilities();
+        assert!(
+            !caps.vision,
+            "vision capability should be disabled when configured with Some(false)"
+        );
+    }
+
+    #[test]
+    fn responses_provider_capabilities_defaults_to_false_for_unknown_models() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None, None);
+        let caps = provider.capabilities();
+        assert!(
+            !caps.vision,
+            "vision capability should default to false when not configured (None)"
+        );
+    }
 }
