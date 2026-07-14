@@ -939,6 +939,7 @@ mod tests {
         assert_eq!(broadcast["attributes"]["login"]["state"], "qr");
 
         // Persisted copy: the credential never lands on disk.
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(
