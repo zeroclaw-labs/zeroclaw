@@ -107,9 +107,9 @@ as another selector.
 
 ## Configuration
 
-The canonical configuration examples — the typed
+The canonical configuration examples, covering the typed
 `[memory_enrichment.lucid.<alias>]` catalog and per-agent `enricher`
-selection, inheritance, and explicit disable (`enricher = "none"`) — live in
+selection, inheritance, and explicit disable (`enricher = "none"`), live in
 the operator reference:
 [Memory storage and enrichment](../reference/memory-backends.md).
 
@@ -156,8 +156,8 @@ cross-agent recall. Lucid declares no cleanup capability.
 ## Failure and consistency semantics
 
 SQLite remains usable when a connector is missing, slow, malformed, or
-unavailable. The operational behavior — local-first write ordering, the
-local-hit recall threshold, and the connector failure cooldown — is
+unavailable. The operational behavior (local-first write ordering, the
+local-hit recall threshold, and the connector failure cooldown) is
 documented canonically in
 [Memory storage and enrichment § Failure and backup behavior](../reference/memory-backends.md#failure-and-backup-behavior).
 Cleanup is best-effort and dispatched only when the adapter declares it.
@@ -223,8 +223,8 @@ non-SQLite backend; an agent that merely inherits the install-wide
 
 ### Legacy compatibility
 
-The pre-enrichment `backend = "lucid"` selector — global `memory.backend` and
-per-agent `agents.<alias>.memory.backend` — remains accepted as deprecated
+The pre-enrichment `backend = "lucid"` selector, both global `memory.backend`
+and per-agent `agents.<alias>.memory.backend`, remains accepted as deprecated
 compatibility input. It always meant SQLite-authoritative storage with Lucid
 syncing alongside, so config load normalizes it to the canonical shape before
 typed deserialization and logs a deprecation warning naming the migration
@@ -236,7 +236,7 @@ typed deserialization and logs a deprecation warning naming the migration
 - an explicit `enricher = "none"` at that scope wins and enrichment stays
   off;
 - the legacy backend combined with an explicit canonical Lucid enricher at
-  the same scope is rejected as ambiguous — remove the legacy value.
+  the same scope is rejected as ambiguous; remove the legacy value.
 
 The legacy `[storage.lucid.<alias>]` table is not part of the schema and is
 ignored; its `binary_path` moves to `[memory_enrichment.lucid.<alias>]`.

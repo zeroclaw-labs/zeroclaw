@@ -101,7 +101,7 @@ authoritative SQLite row and is not forwarded to Lucid.
 
 A successful write commits to SQLite before the external connector is
 called. Recall searches SQLite first and calls the connector only below its
-local-hit threshold. A connector timeout or failure — on store or recall —
+local-hit threshold. A connector timeout or failure, on store or recall,
 preserves the local result and starts a short cooldown during which both
 store and recall skip the connector, so repeated slow failures cannot keep
 adding latency.
