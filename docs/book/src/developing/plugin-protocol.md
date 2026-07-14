@@ -267,6 +267,20 @@ the runtime instantiates the plugin only when an enabled agent owns that exact
 reference. With no channel bindings anywhere, legacy admission behavior is
 preserved.
 
+A drop-in mirror instead declares `provides = "<channel-type>"`, where the value
+is the snake_case key of a built-in channel config family, such as `telegram` or
+`nextcloud_talk`. The manifest must include the `channel` capability. At runtime,
+ZeroClaw derives one mirror instance per enabled, owned
+`[channels.<type>.<alias>]` entry and passes that typed section to `configure`.
+The manifest must grant `config_read` for any mirror to activate. Credentials,
+enablement, and aliases stay solely in the canonical channel config; a mirror
+does not copy them into `plugins.entries`. The corresponding agent binding is
+`<channel-type>.<alias>`. If a native implementation already claimed that exact
+binding, it wins and the WASM component is not instantiated.
+If more than one installed manifest claims the same `provides` value, the
+identity is ambiguous and every claimant is rejected before any guest export
+or channel credential is reached.
+
 ### Permissions
 
 `permissions` is a list of `PluginPermission` values, also defined in
@@ -397,10 +411,12 @@ formatted inconsistently and would not reach all of the destinations
 
 **Permission:** `config_read`
 
-A plugin does not read process environment variables. For tool plugins the host
-resolves the plugin's own config section (the per-entry `config` map under the
-`plugins.entries` schema) and injects it into the `execute` input under the
-reserved `__config` key, but only when the manifest grants `config_read`:
+A plugin does not read process environment variables. For tool plugins and
+novel channel plugins, the host resolves the plugin's own config section (the
+per-entry `config` map under the `plugins.entries` schema). It injects tool
+config into the `execute` input under the reserved `__config` key and passes
+novel channel config to `configure`, but only when the manifest grants
+`config_read`:
 
 ```json
 {
@@ -412,14 +428,19 @@ reserved `__config` key, but only when the manifest grants `config_read`:
 `runtime.rs` strips any caller-supplied `__config` before injecting the resolved
 section, so the section cannot be spoofed, and withholds it entirely when the
 permission is absent. Operators populate this section through the configuration
-surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a
-file, with one current exception: a freshly installed plugin has no
-`plugins.entries` entry yet, and `config set` cannot materialize a missing
-natural-key entry, so the first entry must be added to the file by hand
-(tracked in issue #8636). The section's keys are whatever the plugin's schema
-declares. The field is marked secret, so CLI-written values encrypt at rest
-under the adjacent `.secret_key`; hand-written plaintext values are also
-accepted at load. A plugin only ever sees its own section.
+surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a file,
+with one current exception: a freshly installed plugin has no `plugins.entries`
+entry yet, and `config set` cannot materialize a missing natural-key entry, so
+the first entry must be added to the file by hand (tracked in issue #8636). The
+section's keys are whatever the plugin's schema declares. The field is marked
+secret, so CLI-written values encrypt at rest under the adjacent `.secret_key`;
+hand-written plaintext values are also accepted at load.
+
+A channel mirror intentionally expands `config_read` to its selected built-in
+channel alias. After duplicate-provider, enabled-owner, and native-collision
+admission, the host passes exactly that canonical `[channels.<type>.<alias>]`
+section to `configure`. It cannot select another channel family or alias, and
+the value is materialized on demand rather than copied into plugin config.
 
 ## WASI Component Host
 

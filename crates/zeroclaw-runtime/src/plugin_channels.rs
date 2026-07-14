@@ -79,6 +79,23 @@ fn mirror_sections<'a>(
         })
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn ambiguous_mirror_types<'a>(
+    manifests: impl IntoIterator<Item = &'a zeroclaw_plugins::PluginManifest>,
+) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut ambiguous = HashSet::new();
+    for channel_type in manifests
+        .into_iter()
+        .filter_map(|manifest| manifest.provides.as_deref())
+    {
+        if !seen.insert(channel_type) {
+            ambiguous.insert(channel_type);
+        }
+    }
+    ambiguous
+}
+
 /// Return whether installed manifests expose an owned channel that the daemon
 /// may need to supervise.
 #[cfg(feature = "plugins-wasm")]
@@ -87,22 +104,24 @@ pub(crate) fn has_channel_plugins(config: &Config) -> bool {
     let active = zeroclaw_config::schema::ActiveChannelAliases::compute(config);
     let channels_json = canonical_channels_json(config);
     load_plugin_host(config).is_some_and(|host| {
-        host.channel_plugin_details().iter().any(|(manifest, _)| {
-            match manifest.provides.as_deref() {
-                Some(channel_type)
-                    if manifest
-                        .permissions
-                        .contains(&zeroclaw_plugins::PluginPermission::ConfigRead) =>
-                {
-                    channels_json.as_ref().is_some_and(|sections| {
-                        mirror_sections(sections, channel_type)
-                            .any(|(alias, _)| active.contains(&format!("{channel_type}.{alias}")))
-                    })
+        let details = host.channel_plugin_details();
+        let ambiguous = ambiguous_mirror_types(details.iter().map(|(manifest, _)| *manifest));
+        details
+            .iter()
+            .any(|(manifest, _)| match manifest.provides.as_deref() {
+                Some(channel_type) => {
+                    !ambiguous.contains(channel_type)
+                        && manifest
+                            .permissions
+                            .contains(&zeroclaw_plugins::PluginPermission::ConfigRead)
+                        && channels_json.as_ref().is_some_and(|sections| {
+                            mirror_sections(sections, channel_type).any(|(alias, _)| {
+                                active.contains(&format!("{channel_type}.{alias}"))
+                            })
+                        })
                 }
-                Some(_) => false,
                 None => active.contains(&zeroclaw_api::channel::plugin_channel_ref(&manifest.name)),
-            }
-        })
+            })
     })
 }
 
@@ -149,10 +168,19 @@ pub async fn build_channel_plugins(
     let channels_json = canonical_channels_json(&config);
     let mut claimed_channel_keys = occupied_channel_keys.clone();
     let mut built: Vec<(String, Arc<dyn Channel>)> = Vec::new();
+    let plugin_details = host.channel_plugin_details();
+    let ambiguous = ambiguous_mirror_types(plugin_details.iter().map(|(manifest, _)| *manifest));
 
-    for (manifest, wasm_path) in host.channel_plugin_details() {
+    for (manifest, wasm_path) in plugin_details {
         match manifest.provides.as_deref() {
             Some(channel_type) => {
+                if ambiguous.contains(channel_type) {
+                    log_skipped_manifest(
+                        &manifest.name,
+                        "multiple installed plugins provide the same channel type",
+                    );
+                    continue;
+                }
                 if !manifest
                     .permissions
                     .contains(&zeroclaw_plugins::PluginPermission::ConfigRead)
@@ -425,5 +453,36 @@ mod tests {
             .filter(|key| channel_key_is_available(key, &claimed))
             .collect();
         assert_eq!(available, ["weather-alerts"]);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn duplicate_mirror_types_are_ambiguous_regardless_of_manifest_order() {
+        fn manifest(name: &str, provides: Option<&str>) -> zeroclaw_plugins::PluginManifest {
+            zeroclaw_plugins::PluginManifest {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: None,
+                author: None,
+                wasm_path: Some("plugin.wasm".to_string()),
+                wasm_sha256: None,
+                capabilities: vec![zeroclaw_plugins::PluginCapability::Channel],
+                provides: provides.map(str::to_string),
+                permissions: Vec::new(),
+                signature: None,
+                publisher_key: None,
+            }
+        }
+
+        let first = manifest("first", Some("telegram"));
+        let second = manifest("second", Some("telegram"));
+        let unique = manifest("unique", Some("slack"));
+        let novel = manifest("novel", None);
+        let manifests = [&second, &novel, &unique, &first];
+
+        assert_eq!(
+            ambiguous_mirror_types(manifests),
+            HashSet::from(["telegram"])
+        );
     }
 }

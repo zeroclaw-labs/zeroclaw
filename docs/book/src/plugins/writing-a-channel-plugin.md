@@ -235,6 +235,13 @@ For a channel: `capabilities` containing `channel`, and almost certainly both
 outbound `wasi:http` surface is the only network you have; without the
 permission, `send` has no way to reach the platform at all).
 
+For a drop-in replacement of a built-in channel, add `provides` with that
+channel's snake_case config key, for example `provides = "telegram"`. A mirror
+must grant `config_read`; ZeroClaw then supplies each enabled, agent-owned
+`[channels.<type>.<alias>]` section directly to `configure`. Do not add a
+parallel `plugins.entries` config block. Omit `provides` for a novel channel,
+which binds as `plugin.<manifest-name>` and reads its own plugin entry.
+
 ## Build and install
 
 {{#include ../_snippets/plugin-build-component.md}}

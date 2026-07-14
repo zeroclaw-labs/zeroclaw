@@ -433,6 +433,18 @@ fn validate_plugin_name(name: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+fn validate_provided_channel_type(channel_type: &str) -> Result<(), PluginError> {
+    let mut chars = channel_type.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_lowercase())
+        || !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(PluginError::InvalidManifest(format!(
+            "provides must name a snake_case built-in channel type (got {channel_type:?})"
+        )));
+    }
+    Ok(())
+}
+
 /// Read the same file object whose canonical path was checked. The caller then
 /// hashes, compiles, or writes this returned buffer without reopening the
 /// attacker-controlled source path.
@@ -486,6 +498,16 @@ fn validate_manifest_shape(
             "plugin '{}' declares no capabilities",
             manifest.name
         )));
+    }
+
+    if let Some(channel_type) = manifest.provides.as_deref() {
+        if !manifest.capabilities.contains(&PluginCapability::Channel) {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin '{}' declares `provides` without the channel capability",
+                manifest.name
+            )));
+        }
+        validate_provided_channel_type(channel_type)?;
     }
 
     let is_skill_only =
@@ -1035,6 +1057,46 @@ capabilities = ["tool"]
         let host = PluginHost::new(dir.path()).unwrap();
         // Discovery skips invalid manifests rather than failing.
         assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn provides_requires_channel_capability_and_snake_case_type() {
+        for manifest_toml in [
+            r#"name = "tool-mirror"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+provides = "telegram"
+"#,
+            r#"name = "empty-mirror"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+provides = ""
+"#,
+            r#"name = "kebab-mirror"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+provides = "gmail-push"
+"#,
+        ] {
+            let manifest: PluginManifest = toml::from_str(manifest_toml).unwrap();
+            let plugin_dir = tempdir().unwrap();
+            assert!(validate_manifest_shape(&manifest, plugin_dir.path()).is_err());
+        }
+
+        let manifest: PluginManifest = toml::from_str(
+            r#"name = "talk-mirror"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+provides = "nextcloud_talk"
+"#,
+        )
+        .unwrap();
+        let plugin_dir = tempdir().unwrap();
+        validate_manifest_shape(&manifest, plugin_dir.path()).unwrap();
     }
 
     #[test]
