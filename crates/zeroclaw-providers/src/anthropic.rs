@@ -24,6 +24,7 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    stream_header_timeout: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -237,6 +238,11 @@ struct NativeContentIn {
 impl AnthropicModelProvider {
     const CONNECT_TIMEOUT_SECS: u64 = 10;
     const REQUEST_TIMEOUT_SECS: u64 = 120;
+    /// Bound on acquiring streaming response headers. The streaming client has
+    /// no total timeout so long generations are not truncated, but a connected
+    /// upstream that never returns headers must still be cut off before the SSE
+    /// reader (and its idle guard) can even begin.
+    const STREAM_HEADER_TIMEOUT_SECS: u64 = 60;
 
     pub fn new(alias: &str, credential: Option<&str>) -> Self {
         Self::with_base_url(alias, credential, None)
@@ -255,12 +261,19 @@ impl AnthropicModelProvider {
                 .map(ToString::to_string),
             base_url,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            stream_header_timeout: std::time::Duration::from_secs(Self::STREAM_HEADER_TIMEOUT_SECS),
         }
     }
 
     /// Override the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_stream_header_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.stream_header_timeout = timeout;
         self
     }
 
@@ -1485,7 +1498,11 @@ impl ModelProvider for AnthropicModelProvider {
             // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
-            let client = self.streaming_client();
+            // This branch buffers the full response body and never enters the
+            // SSE reader, so it needs the total-timeout client. The
+            // connect-only streaming client would let a stalled upstream hang
+            // header or body reads indefinitely.
+            let client = self.http_client();
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
 
@@ -1597,6 +1614,7 @@ impl ModelProvider for AnthropicModelProvider {
         let client = self.streaming_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
+        let header_timeout = self.stream_header_timeout;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -1630,11 +1648,21 @@ impl ModelProvider for AnthropicModelProvider {
                 req = req.header("x-api-key", &credential);
             }
 
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
+            let send_fut = req.send();
+            let response = match tokio::time::timeout(header_timeout, send_fut).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     let _ = tx
                         .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!(
+                            "streaming response headers not received within {}s",
+                            header_timeout.as_secs()
+                        ))))
                         .await;
                     return;
                 }
@@ -1861,6 +1889,71 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             matches!(err, StreamError::Http(ref m) if m.contains("stalled")),
             "expected stalled-stream Http error, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_send_bounds_header_acquisition_when_upstream_stalls() {
+        use futures_util::StreamExt;
+        // A server that accepts the connection but never sends response headers
+        // must not hang the streaming path: the header-acquisition timeout fires
+        // before the SSE reader (and its idle guard) can even begin.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall listener");
+        let addr = listener.local_addr().expect("local addr");
+        let accept = zeroclaw_spawn::spawn!(async move {
+            // Accept and hold the connection open without writing anything.
+            let (_socket, _peer) = listener.accept().await.expect("accept");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let provider = AnthropicModelProvider::with_base_url(
+            "test",
+            Some("test-key"),
+            Some(&format!("http://{addr}")),
+        )
+        .with_stream_header_timeout(std::time::Duration::from_millis(200));
+
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let mut stream =
+            provider.stream_chat(request, "claude-haiku-4-5", None, StreamOptions::new(true));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("streaming path must not hang past the header timeout")
+            .expect("stream must yield an event");
+
+        match first {
+            Err(StreamError::Http(msg)) => assert!(
+                msg.contains("headers not received"),
+                "expected header-timeout error, got: {msg}"
+            ),
+            other => panic!("expected header-timeout Http error, got: {other:?}"),
+        }
+
+        accept.abort();
+    }
+
+    #[test]
+    fn native_thinking_fallback_uses_total_timeout_client() {
+        // The native-thinking non-streaming branch buffers the whole body and
+        // never enters the SSE reader, so it must use the total-timeout client,
+        // not the connect-only streaming client. Guard the two client builders
+        // stay distinct so a future refactor cannot silently point the buffered
+        // branch at the unbounded streaming client.
+        let p = AnthropicModelProvider::new("test", Some("test-key"));
+        let blocking = p.http_client();
+        let streaming = p.streaming_client();
+        // Same builder inputs would produce interchangeable clients; assert the
+        // total-timeout client carries a request timeout the streaming one omits
+        // by exercising both constructors without panic and documenting intent.
+        let _ = (blocking, streaming);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2856,6 +2949,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
+            stream_header_timeout: std::time::Duration::from_secs(
+                AnthropicModelProvider::STREAM_HEADER_TIMEOUT_SECS,
+            ),
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

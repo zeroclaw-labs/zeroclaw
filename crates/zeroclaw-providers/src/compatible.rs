@@ -2982,7 +2982,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 
     fn streams_text_with_tools(&self) -> bool {
-        true
+        // Only safe when the model returns tool calls as structured events. A
+        // non-native-tool-calling compatible provider can emit text-tool syntax
+        // (e.g. the GLM `shell/command>` form) that the runtime live guard does
+        // not suppress in every shape, so those paths must stay buffered until
+        // the accumulated response is parsed rather than streamed live.
+        self.native_tool_calling
     }
 
     fn stream_chat(
@@ -5049,12 +5054,13 @@ mod tests {
         }
     }
 
-    /// Confirm that `strip_native_tool_messages` is a no-op when the model_provider
-    /// has `native_tool_calling = true` — tool-role and assistant-with-tool-calls
-    /// messages must pass through unchanged.
+    /// A merge-system-into-user provider is text-tool, not native: it must not
+    /// claim `streams_text_with_tools`, so the runtime keeps its tool-present
+    /// path buffered instead of streaming raw text-tool syntax live. A native
+    /// provider carries tool calls as structured events and is safe to stream.
     #[test]
-    fn text_tool_compat_provider_streams_text_with_tools() {
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+    fn text_tool_compat_provider_does_not_stream_text_with_tools() {
+        let text_tool = OpenAiCompatibleModelProvider::new_merge_system_into_user(
             "test",
             "TextTool",
             "https://example.com",
@@ -5062,12 +5068,26 @@ mod tests {
             AuthStyle::Bearer,
         );
         assert!(
-            !<OpenAiCompatibleModelProvider as ModelProvider>::supports_streaming_tool_events(&p),
+            !<OpenAiCompatibleModelProvider as ModelProvider>::supports_streaming_tool_events(
+                &text_tool
+            ),
             "merge_system_into_user provider is text-tool, not native"
         );
         assert!(
-            <OpenAiCompatibleModelProvider as ModelProvider>::streams_text_with_tools(&p),
-            "text-tool compat provider must still stream visible text when tools are present"
+            !<OpenAiCompatibleModelProvider as ModelProvider>::streams_text_with_tools(&text_tool),
+            "text-tool compat provider must not open the live gate for tool turns"
+        );
+
+        let native = OpenAiCompatibleModelProvider::new(
+            "test",
+            "NativeToolProvider",
+            "https://api.example.com/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        assert!(
+            <OpenAiCompatibleModelProvider as ModelProvider>::streams_text_with_tools(&native),
+            "native-tool compat provider streams structured tool events and is safe to stream"
         );
     }
 

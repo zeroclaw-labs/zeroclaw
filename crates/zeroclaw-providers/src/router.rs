@@ -310,9 +310,16 @@ impl ModelProvider for RouterModelProvider {
     }
 
     fn streams_text_with_tools(&self) -> bool {
-        self.model_providers
-            .iter()
-            .any(|(_, model_provider)| model_provider.streams_text_with_tools())
+        // stream_chat resolves the model hint to one child, but this query is
+        // not model-aware. Answer conservatively: only claim the capability
+        // when every selectable route honors it, so a capable child can never
+        // open the runtime live gate for a route that would leak text-tool
+        // syntax.
+        !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|(_, model_provider)| model_provider.streams_text_with_tools())
     }
 
     fn stream_chat_with_system(
@@ -420,6 +427,7 @@ mod tests {
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
         vision: bool,
+        streams_text: bool,
     }
 
     impl MockModelProvider {
@@ -429,11 +437,17 @@ mod tests {
                 response,
                 last_model: parking_lot::Mutex::new(String::new()),
                 vision: false,
+                streams_text: false,
             }
         }
 
         fn with_vision(mut self, vision: bool) -> Self {
             self.vision = vision;
+            self
+        }
+
+        fn with_streams_text(mut self, streams_text: bool) -> Self {
+            self.streams_text = streams_text;
             self
         }
 
@@ -462,6 +476,10 @@ mod tests {
 
         fn supports_vision(&self) -> bool {
             self.vision
+        }
+
+        fn streams_text_with_tools(&self) -> bool {
+            self.streams_text
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
@@ -1405,5 +1423,53 @@ mod tests {
         );
 
         assert!(router.supports_vision());
+    }
+
+    #[test]
+    fn streams_text_with_tools_false_when_any_selectable_route_lacks_it() {
+        let capable = Box::new(MockModelProvider::new("ok").with_streams_text(true));
+        let incapable = Box::new(MockModelProvider::new("nope").with_streams_text(false));
+
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                ("capable".into(), capable as Box<dyn ModelProvider>),
+                ("incapable".into(), incapable as Box<dyn ModelProvider>),
+            ],
+            vec![(
+                "hint:incapable".into(),
+                Route {
+                    provider_name: "incapable".into(),
+                    model: "incapable-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router.streams_text_with_tools(),
+            "router must not claim streams_text_with_tools when a selectable route lacks it, or a capable child could open the live gate for the incapable route"
+        );
+    }
+
+    #[test]
+    fn streams_text_with_tools_true_only_when_every_route_supports_it() {
+        let a = Box::new(MockModelProvider::new("a").with_streams_text(true));
+        let b = Box::new(MockModelProvider::new("b").with_streams_text(true));
+
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                ("a".into(), a as Box<dyn ModelProvider>),
+                ("b".into(), b as Box<dyn ModelProvider>),
+            ],
+            vec![],
+            "default-model".into(),
+        );
+
+        assert!(
+            router.streams_text_with_tools(),
+            "router may claim streams_text_with_tools only when every selectable route honors it"
+        );
     }
 }

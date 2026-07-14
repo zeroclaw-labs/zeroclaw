@@ -66,7 +66,7 @@ inside the text stream to be parsed downstream from the accumulated response
 1. Reads the stream to completion: it collects any structured `ToolCall`
    events and accumulates visible text through the same read loop until `Final`
 2. Flushes buffered text to the channel as it arrives
-3. Recovers the tool calls once the stream ends — from the collected `ToolCall`
+3. Recovers the tool calls once the stream ends, from the collected `ToolCall`
    events, or by parsing them out of the accumulated response for the
    `streams_text_with_tools` path
 4. Runs the tools (subject to security validation, see [Security → Overview](../security/overview.md))
