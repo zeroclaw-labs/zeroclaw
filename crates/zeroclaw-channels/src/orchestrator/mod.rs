@@ -24706,7 +24706,7 @@ This is an example JSON object for profile settings."#;
     }
 
     // A protected link destination shields the *shape-based* high-entropy
-    // heuristic (the #8722 false-positive), never a deterministic credential
+    // heuristic (the shape false-positive), never a deterministic credential
     // pattern. A real credential dropped into a link destination -- exactly
     // where a prompt-injected model would try to smuggle one past the
     // detector -- must still be caught.

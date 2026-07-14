@@ -110,28 +110,6 @@ impl AppAuth {
     }
 }
 
-/// The private key is a long-lived credential: group/other access on the
-/// key file is operator error worth surfacing, but not worth refusing to
-/// start over.
-#[cfg(unix)]
-fn warn_on_loose_permissions(path: &str) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if meta.mode() & 0o077 != 0 {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"path": path})),
-            "GitHub App private key is readable by group/other; chmod 600 recommended"
-        );
-    }
-}
-
-#[cfg(not(unix))]
-fn warn_on_loose_permissions(_path: &str) {}
-
 /// Throwaway 2048-bit RSA key generated for unit tests only, never
 /// registered with any real GitHub App. Shared with the channel-level
 /// mock-server tests.

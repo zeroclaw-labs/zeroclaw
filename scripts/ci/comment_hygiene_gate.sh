@@ -66,6 +66,10 @@ def comment_of(path, lineno, content):
     text = dq.sub('""', content)
     if ext == "rs":
         idx = text.find("//")
+        block = text.find("/*")
+        if block >= 0 and (idx < 0 or block < idx):
+            end = text.find("*/", block + 2)
+            return text[block : end + 2] if end >= 0 else text[block:]
         return text[idx:] if idx >= 0 else None
     if ext in HASH_EXTS:
         text = sq.sub("''", text)
@@ -114,9 +118,17 @@ scan() {
     if [ "$flags" = "i" ]; then
         rg_flags+=(-i)
     fi
+    local raw rg_status=0
+    raw="$(rg "${rg_flags[@]}" "${GLOBS[@]}" "$rg_pattern" "${SCAN_ROOTS[@]}")" || rg_status=$?
+    if [ "$rg_status" != "0" ] && [ "$rg_status" != "1" ]; then
+        echo "FATAL: ripgrep failed (exit ${rg_status}) scanning ${label}" >&2
+        exit 2
+    fi
     local hits
-    hits="$(rg "${rg_flags[@]}" "${GLOBS[@]}" "$rg_pattern" "${SCAN_ROOTS[@]}" 2>/dev/null |
-        filter_comments "$py_pattern" "$flags" "$mode" || true)"
+    if ! hits="$(printf '%s' "$raw" | filter_comments "$py_pattern" "$flags" "$mode")"; then
+        echo "FATAL: comment filter failed scanning ${label}" >&2
+        exit 2
+    fi
     report "$label" "$hits"
 }
 

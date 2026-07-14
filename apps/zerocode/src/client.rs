@@ -1,5 +1,8 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
+//!
+//! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
+//! plumbing the daemon uses for bidirectional calls.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -187,6 +190,15 @@ pub struct RpcNotification {
     pub params: Value,
 }
 
+/// A server-initiated JSON-RPC request (has both `id` and `method`)
+/// that expects a response back on the same id.
+///
+/// The daemon issues these for ACP `elicitation/create` calls when
+/// the TUI advertised `clientCapabilities.elicitation.form` during
+/// `initialize`. The recipient of an `RpcInboundRequest` is the
+/// `Chat` widget for the targeted session — it surfaces a modal,
+/// waits for the user's choice, and writes a JSON-RPC response back
+/// via `RpcClient::respond_to_inbound_request`.
 #[derive(Debug, Clone)]
 pub struct RpcInboundRequest {
     /// The JSON-RPC `id`. Echoed back verbatim in the response.
@@ -195,6 +207,13 @@ pub struct RpcInboundRequest {
     pub params: Value,
 }
 
+/// Buffer capacity for the server-initiated inbound-request broadcast.
+///
+/// These frames are response-bearing (today: `elicitation/create`): a dropped
+/// one parks the daemon's tool call until the session timeout. The buffer is
+/// sized generously so a busy TUI draw loop does not lag the receiver and lose
+/// an elicitation. The Chat pane additionally surfaces a `Lagged` overflow so
+/// the rare drop is diagnosable rather than a silent hang.
 pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
 // ── Typed session updates ────────────────────────────────────────
@@ -437,6 +456,19 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
 
 // ── Client ───────────────────────────────────────────────────────
 
+/// Classify an incoming JSON-RPC frame and route it to the right
+/// sink.
+///
+/// Frames are one of three shapes (per JSON-RPC 2.0):
+/// 1. **Response** — has `id` plus `result` or `error`, but no
+///    `method`. Routed to `RpcOutbound::dispatch_response` to wake
+///    the pending outbound call on the same id.
+/// 2. **Server-initiated request** — has both `id` and `method`.
+///    Routed to `inbound_tx` for an in-TUI handler to answer (today:
+///    `elicitation/create`). The id is preserved verbatim so the
+///    response correlates correctly.
+/// 3. **Notification** — has `method` but no `id`. Routed to
+///    `notif_tx` for the existing notification router.
 fn route_inbound_frame(
     rpc: &Arc<RpcOutbound>,
     notif_tx: &broadcast::Sender<RpcNotification>,
@@ -499,6 +531,11 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    /// Connect to the daemon's local IPC endpoint and complete the
+    /// `initialize` handshake.
+    ///
+    /// Pass previous `tui_id` and `tui_sig` on reconnect to reclaim
+    /// the same identity. Pass `None` for both on first connect.
     pub async fn connect(
         socket: &Path,
         prev_tui_id: Option<&str>,
@@ -568,6 +605,12 @@ impl RpcClient {
 
         let mut init_params = serde_json::json!({
             "protocol_version": jsonrpc::ACP_PROTOCOL_VERSION,
+            // Advertise the ACP `elicitation` capability (form mode) so the
+            // daemon's per-session `RpcApprovalChannel` routes `request_choice`
+            // / `request_multi_choice` over `elicitation/create` instead of
+            // silently returning `Ok(None)`. The Code tab handles inbound
+            // `elicitation/create` requests via `route_inbound_frame` →
+            // the chat widget's pending-elicitation modal.
             "clientCapabilities": {
                 "elicitation": { "form": {} }
             }
@@ -578,6 +621,11 @@ impl RpcClient {
         if let Some(sig) = prev_tui_sig {
             init_params["tui_sig"] = serde_json::Value::String(sig.to_string());
         }
+        // Forward the TUI's full shell environment to the daemon so that
+        // subprocesses spawned by agents inherit the user's real env
+        // (PATH, SSH_AUTH_SOCK, credential helpers, etc.).  This is safe
+        // on a local Unix-socket connection because the daemon is on the
+        // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
         let resp = match rpc.request(method::INITIALIZE, init_params).await {
@@ -617,6 +665,13 @@ impl RpcClient {
         })
     }
 
+    /// Connect to the daemon via WebSocket Secure (WSS).
+    ///
+    /// Same handshake and reconnect semantics as [`Self::connect`] — pass
+    /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
+    ///
+    /// When `tls_skip_verify` is true, certificate verification is
+    /// disabled — required for self-signed certs on remote hosts.
     pub async fn connect_wss(
         url: &str,
         prev_tui_id: Option<&str>,
@@ -717,6 +772,13 @@ impl RpcClient {
         if let Some(sig) = prev_tui_sig {
             init_params["tui_sig"] = serde_json::Value::String(sig.to_string());
         }
+        // NOTE: We intentionally do NOT forward the TUI's environment here.
+        // In a WSS connection the daemon is on a remote machine, so env values
+        // like SSH_AUTH_SOCK, VIRTUAL_ENV, or any path-based socket/credential
+        // would refer to paths that don't exist on the remote host.  Forwarding
+        // them would be misleading at best and silently broken at worst.
+        // Env pass-through is only meaningful on a local Unix-socket connection
+        // (see `connect` above), where the TUI and daemon share the same filesystem.
         let resp = match rpc.request(method::INITIALIZE, init_params).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -1099,6 +1161,13 @@ impl RpcClient {
         )
         .await
     }
+
+    // ── Quickstart methods ───────────────────────────────────────
+    //
+    // Thin RPC mirror of the gateway's `/api/quickstart/*` HTTP routes.
+    // Same shapes both ways; the daemon-side handlers live in
+    // `zeroclaw_runtime::rpc::dispatch` and call into
+    // `zeroclaw_runtime::quickstart::{validate_only,apply}_with_surface`.
 
     pub async fn quickstart_state(&self) -> Result<QuickstartStateResult> {
         self.call(method::QUICKSTART_STATE, serde_json::json!({}))
@@ -1486,6 +1555,11 @@ impl RpcClient {
         .await
     }
 
+    /// Paginated variant of `session_messages`. `limit` caps the page
+    /// size, `before_index` paginates older slices. Returns
+    /// `(messages, total, start)` so the Sessions pane can size
+    /// scroll affordances and render "X of Y" without holding the
+    /// full history in memory.
     pub async fn session_messages_page(
         &self,
         session_id: &str,
@@ -1538,6 +1612,7 @@ impl RpcClient {
 
     // ── Test-only constructors ────────────────────────────────────
 
+    /// Test-only constructor that skips the Unix socket connect + initialize handshake.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
@@ -1808,6 +1883,17 @@ pub struct SkillsWriteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsDeleteResult {}
+
+// ── Quickstart types ─────────────────────────────────────────────
+//
+// **Mirror** of the wire shapes defined in
+// `zeroclaw_runtime::rpc::types` (the daemon-side single source of
+// truth, which itself mirrors the gateway's HTTP route shapes). The
+// types live in `zeroclaw-runtime`, but that crate is not on the
+// `apps/zerocode` dependency tree — pulling it in would compile the
+// entire runtime into the TUI binary. Instead we duplicate the wire
+// shape here; the integration drift test enforces equality across
+// surfaces, so divergence is a CI failure rather than a silent bug.
 
 /// Mirror of `zeroclaw_runtime::quickstart::Surface` (`snake_case` on the wire).
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2526,6 +2612,12 @@ pub struct LogsQueryParams {
 #[serde(rename_all = "snake_case")]
 pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
+    /// Legacy cursor: `(timestamp, id)` to feed back as `until_ts` +
+    /// `until_id` for older. Tie-breaks same-timestamp events by
+    /// lexicographic id, which can drop earlier-written events when id
+    /// order diverges from file insertion order. Prefer
+    /// [`Self::next_cursor_line_offset`] when available — it is
+    /// independent of id ordering.
     pub next_cursor: Option<(String, String)>,
     /// Byte offset past the OLDEST event on the current page. Pass back
     /// as [`LogsQueryParams::until_line_offset`] on the next request to
@@ -3338,6 +3430,9 @@ mod notification_tests {
         (rpc, notif_tx, notif_rx, inbound_tx, inbound_rx, writer_rx)
     }
 
+    /// Response frames — id + result/error, no method — should reach the
+    /// pending outbound call via `dispatch_response` and emit nothing on
+    /// the notification / inbound channels.
     #[tokio::test]
     async fn route_inbound_frame_routes_response_to_pending_call() {
         let (rpc, notif_tx, mut notif_rx, inbound_tx, mut inbound_rx, mut writer_rx) =
@@ -3364,6 +3459,8 @@ mod notification_tests {
         assert!(notif_rx.try_recv().is_err(), "notif rx must stay empty");
     }
 
+    /// Notification frames — method, no id — should reach the
+    /// notification broadcast and not the inbound-request channel.
     #[tokio::test]
     async fn route_inbound_frame_routes_notification() {
         let (rpc, notif_tx, mut notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
@@ -3378,6 +3475,9 @@ mod notification_tests {
         assert!(inbound_rx.try_recv().is_err());
     }
 
+    /// Server-initiated request frames — both id and method — should
+    /// reach the inbound-request broadcast and NOT be misclassified
+    /// as a response (which would silently drop the elicitation prompt).
     #[tokio::test]
     async fn route_inbound_frame_routes_server_initiated_request() {
         let (rpc, notif_tx, mut notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
@@ -3400,6 +3500,10 @@ mod notification_tests {
         assert!(notif_rx.try_recv().is_err());
     }
 
+    /// Frames with both fields but a numeric id — the JSON-RPC spec
+    /// permits int ids, even though the daemon emits strings — must
+    /// still route as a server-initiated request (we forward the
+    /// `Value` verbatim so the response carries the same shape).
     #[tokio::test]
     async fn route_inbound_frame_handles_numeric_request_id() {
         let (rpc, notif_tx, _notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();

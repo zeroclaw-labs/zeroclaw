@@ -46,10 +46,35 @@ fn resolve_github_private_key(cfg: &GitConfig) -> anyhow::Result<Option<String>>
         return Ok(None);
     };
     match std::fs::read_to_string(path) {
-        Ok(pem) => Ok(Some(pem)),
+        Ok(pem) => {
+            warn_on_loose_permissions(path);
+            Ok(Some(pem))
+        }
         Err(e) => anyhow::bail!("git channel: reading private_key_path `{path}` failed: {e}"),
     }
 }
+
+/// The private key is a long-lived credential: group/other access on the
+/// key file is operator error worth surfacing, but not worth refusing to
+/// start over.
+#[cfg(unix)]
+fn warn_on_loose_permissions(path: &str) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.mode() & 0o077 != 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"path": path})),
+            "GitHub App private key is readable by group/other; chmod 600 recommended"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_on_loose_permissions(_path: &str) {}
 
 /// Build the configured forge provider, or a clear error for an unknown
 /// `provider` value. The only forge-aware seam in the channel.

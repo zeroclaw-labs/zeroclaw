@@ -19,6 +19,16 @@ pub struct ToolCallSnapshot {
     pub arguments_json: String,
 }
 
+/// Full prompt/completion content for one `llm.call`, captured and
+/// credential-scrubbed at the agent-loop boundary so the OTel exporter can emit
+/// `gen_ai.input.messages` / `gen_ai.output.messages` / `gen_ai.system_instructions`.
+///
+/// Populated at the agent-loop capture boundary whenever the `observability-otel`
+/// feature is active; `None` otherwise (other observers and non-OTel builds leave
+/// it `None`). Capture is policy-agnostic: whether the snapshot is actually
+/// exported — and at which privacy level (`off` / `redacted` / `full`) — is
+/// decided by the owning `OtelObserver`'s instance content config at the OTel
+/// export boundary, not by the capture path.
 #[derive(Debug, Clone)]
 pub struct LlmMessageSnapshot {
     /// Non-system input messages, in send order.
@@ -38,6 +48,20 @@ pub struct TurnTokenUsage {
     pub output_tokens: u64,
 }
 
+/// Discrete events emitted by the agent runtime for observability.
+///
+/// Each variant represents a lifecycle event that observers can record,
+/// aggregate, or forward to external monitoring systems. Events carry
+/// just enough context for tracing and diagnostics without exposing
+/// sensitive prompt or response content.
+///
+/// Marked `#[non_exhaustive]` so out-of-tree observer implementations
+/// degrade gracefully when new variants are added in future minor
+/// releases — they must include a wildcard arm in their `match`
+/// expressions and will simply ignore unknown event kinds.
+/// Exception: under the `observability-otel` feature, [`ObserverEvent::LlmResponse`]
+/// carries credential-scrubbed prompt/completion content in `messages` for GenAI
+/// semantic-convention export. See [`LlmMessageSnapshot`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ObserverEvent {
@@ -50,6 +74,7 @@ pub enum ObserverEvent {
         turn_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
+    ///
     /// This is emitted immediately before a model_provider call so observers can print
     /// user-facing progress without leaking prompt contents.
     LlmRequest {
@@ -69,12 +94,18 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// Credential-scrubbed prompt/completion content for OTel GenAI export.
+        /// `None` unless the `observability-otel` feature is active. When
+        /// populated, whether the content is exported (and at which privacy
+        /// level) is gated by the receiving `OtelObserver`'s instance content
+        /// policy, not by the capture path. See [`LlmMessageSnapshot`].
         messages: Option<LlmMessageSnapshot>,
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// The agent session has finished.
+    ///
     /// Carries aggregate usage data (tokens, cost) when the model_provider reports it.
     AgentEnd {
         model_provider: String,
@@ -89,6 +120,13 @@ pub enum ObserverEvent {
     /// A tool call is about to be executed.
     ToolCallStart {
         tool: String,
+        /// Provider-assigned tool call identifier, when the underlying tool
+        /// call originated from a native structured tool call block (e.g.
+        /// OpenAI `tool_calls[].id`, Anthropic `tool_use.id`). `None` for
+        /// text-parsed (XML/markdown) tool calls.
+        ///
+        /// Observers can correlate `ToolCallStart` → `ToolCall` → the
+        /// emitting LLM response via this id.
         tool_call_id: Option<String>,
         /// Full JSON arguments the agent passed to the tool. `None` when
         /// arguments are unavailable at the call site.
@@ -105,6 +143,12 @@ pub enum ObserverEvent {
         tool_call_id: Option<String>,
         duration: Duration,
         success: bool,
+        /// Full JSON arguments the agent passed to the tool.
+        ///
+        /// Carried here (in addition to `ToolCallStart`) so observers that
+        /// build a single completed span per tool call — e.g. the OTel
+        /// exporter — can attach arguments at span-end time without holding
+        /// per-call state.
         arguments: Option<String>,
         /// Scrubbed tool output or error reason. Populated for both success
         /// and failure outcomes so backends can show the actual tool result
@@ -115,6 +159,14 @@ pub enum ObserverEvent {
         agent_alias: Option<String>,
         turn_id: Option<String>,
     },
+    /// A memory recall (search) operation has completed.
+    ///
+    /// Emitted at the runtime boundary after a hybrid-search query against
+    /// the brain DB. Carries an optional `query_summary` for diagnostics —
+    /// scrubbed and truncated user text, not a privacy-clean token. The
+    /// runtime applies `scrub_credentials` first and then truncates to ≤200
+    /// content chars (with a 3-char `...` ellipsis appended when truncation
+    /// occurred); short non-credential queries pass through unchanged.
     MemoryRecall {
         /// Scrubbed and truncated query summary. `None` when the caller has
         /// no meaningful query to record (e.g., session-scoped fetches).
@@ -126,6 +178,13 @@ pub enum ObserverEvent {
         backend: String,
         success: bool,
     },
+    /// A memory store (write) operation has completed.
+    ///
+    /// Emitted after persisting a memory entry. Carries only bounded
+    /// fields — the raw memory `key` is intentionally omitted because
+    /// keys can encode high-cardinality identifiers (UUIDs, phone
+    /// numbers, message timestamps) that would blow up Prometheus label
+    /// series.
     MemoryStore {
         /// Memory category (`"core"`, `"daily"`, `"conversation"`, etc.) —
         /// bounded set, safe to use as a Prometheus label.
@@ -135,6 +194,13 @@ pub enum ObserverEvent {
         duration: Duration,
         success: bool,
     },
+    /// A RAG retrieval pass has completed.
+    ///
+    /// Emitted after vector + keyword retrieval against the hardware
+    /// datasheet index. Reports cardinalities only; carries an optional
+    /// scrubbed-and-truncated query summary on the same terms as
+    /// [`Self::MemoryRecall`]. Has no `success` field because the underlying
+    /// `rag.retrieve` call is synchronous and infallible.
     RagRetrieve {
         query_summary: Option<String>,
         duration: Duration,
@@ -205,6 +271,7 @@ pub enum ObserverEvent {
 }
 
 /// Numeric metrics emitted by the agent runtime.
+///
 /// Observers can aggregate these into dashboards, alerts, or structured logs.
 /// Each variant carries a single scalar value with implicit units.
 #[derive(Debug, Clone)]
@@ -223,27 +290,56 @@ pub enum ObserverMetric {
     RecoveryTime(Duration),
 }
 
+/// Core observability trait for recording agent runtime telemetry.
+///
+/// Implement this trait to integrate with any monitoring backend (structured
+/// logging, Prometheus, OpenTelemetry, etc.). The agent runtime holds one or
+/// more `Observer` instances and calls [`record_event`](Observer::record_event)
+/// and [`record_metric`](Observer::record_metric) at key lifecycle points.
+///
+/// Implementations must be `Send + Sync + 'static` because the observer is
+/// shared across async tasks via `Arc`.
 pub trait Observer: Send + Sync + 'static {
+    /// Record a discrete lifecycle event.
+    ///
+    /// Called synchronously on the hot path; implementations should avoid
+    /// blocking I/O. Buffer events internally and flush asynchronously
+    /// when possible.
     fn record_event(&self, event: &ObserverEvent);
 
     /// Record a numeric metric sample.
+    ///
     /// Called synchronously; same non-blocking guidance as
     /// [`record_event`](Observer::record_event).
     fn record_metric(&self, metric: &ObserverMetric);
 
+    /// Flush any buffered telemetry data to the backend.
+    ///
+    /// The runtime calls this during graceful shutdown. The default
+    /// implementation is a no-op, which is appropriate for backends
+    /// that write synchronously.
     fn flush(&self) {}
 
     /// Return the human-readable name of this observer backend.
+    ///
     /// Used in logs and diagnostics (e.g., `"console"`, `"prometheus"`,
     /// `"opentelemetry"`).
     fn name(&self) -> &str;
 
     /// Downcast to `Any` for backend-specific operations.
+    ///
     /// Enables callers to access concrete observer types when needed
     /// (e.g., retrieving a Prometheus registry handle for custom metrics).
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Blanket implementation: `Arc<T>` delegates all `Observer` methods to `T`.
+///
+/// Lets a singleton observer be handed out as `Arc<MyObserver>` and still be
+/// used wherever `Box<dyn Observer>` is expected (e.g.
+/// `Box::new(MyObserver::shared())`). `as_any` deliberately delegates to the
+/// inner `T` so downcasts in handlers like `/metrics` recover the concrete
+/// type rather than the `Arc` wrapper.
 impl<T: Observer + ?Sized> Observer for std::sync::Arc<T> {
     fn record_event(&self, event: &ObserverEvent) {
         self.as_ref().record_event(event);

@@ -86,6 +86,12 @@ expect_fail "bare See stub" a.rs "bare See/Ref/Tracking"
 printf '//  git -C must not be conflated\n' > a.rs
 expect_fail "double-space lowercase stub" a.rs "double-space"
 
+printf '/* tracking #8519 in a block comment */\n' > a.rs
+expect_fail "rust block comment issue ref" a.rs "issue/PR refs"
+
+printf 'let s = "ok"; // workaround, see #4321 for context\n' > a.rs
+expect_fail "issue ref in comment beside a string literal" a.rs "tracking/see-issue"
+
 # ── legal shapes must pass ──────────────────────────────────────────────
 
 printf 'assert!(ok, "regression #6156 must stay fixed");\n' > b.rs
@@ -108,6 +114,20 @@ expect_pass "discord snowflake prose" b.rs
 
 printf '// (Will error on missing files\n//  since /tmp/x does not exist.)\n' > b.rs
 expect_pass "intentional double-space continuation under paren" b.rs
+
+printf '/* legitimate block comment describing the shape */\n' > b.rs
+expect_pass "clean rust block comment" b.rs
+
+if scanner_out="$(bash "$gate" '/nonexistent/dir/xyz' 2>&1)"; then
+    echo "SCANNER FAILURE NOT PROPAGATED (gate returned success on a bad path)"
+    fail_count=$((fail_count + 1))
+elif grep -qF 'FATAL' <<<"$scanner_out"; then
+    pass_count=$((pass_count + 1))
+else
+    echo "SCANNER FAILED WITHOUT FATAL DIAGNOSTIC"
+    echo "$scanner_out"
+    fail_count=$((fail_count + 1))
+fi
 
 echo
 echo "${pass_count} passed, ${fail_count} failed"

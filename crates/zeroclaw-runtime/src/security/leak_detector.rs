@@ -113,10 +113,10 @@ impl LeakDetector {
         // Deterministic credential patterns always scan the full, unprotected
         // content. They match precise, low-false-positive shapes (AWS key
         // format, PEM markers, JWT triple-base64, DB URL schemes, bot-token
-        // syntax) that ordinary generated file paths do not produce, so #8722's
-        // false-positive problem does not apply to them. A real credential can
-        // be placed inside a link destination or file reference exactly as
-        // easily as in visible text, and #8722 requires visible text to still
+        // syntax) that ordinary generated file paths do not produce, so the
+        // shape-based false-positive problem does not apply to them. A real
+        // credential can be placed inside a link destination or file reference
+        // exactly as easily as in visible text, and visible text must still
         // be scanned for real secrets -- the same must hold for non-visible
         // functional parts. Only the high-entropy heuristic, which misfires on
         // the *shape* of a path rather than on an actual secret token, honors
@@ -1024,7 +1024,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     // Protected spans are honored only by the high-entropy heuristic, which
-    // misfires on the *shape* of ordinary generated paths (#8722). Deterministic
+    // misfires on the *shape* of ordinary generated paths. Deterministic
     // credential patterns (API keys, AWS creds, private keys, JWTs, DB URLs,
     // bot tokens, generic secrets) are precise, low-false-positive signals that
     // a real credential can trigger just as easily inside a link destination or
