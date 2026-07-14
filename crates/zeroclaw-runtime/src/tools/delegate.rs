@@ -2551,11 +2551,20 @@ impl DelegateTool {
                             && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
                     })
                 };
+                // Gate the delegated memory tools by the TARGET agent's own risk
+                // profile, not just the caller's. A bounded delegation rebinds
+                // memory writes to the target scope, so retaining/replacing a
+                // memory tool the target itself is not allowed to run (e.g.
+                // `system_memory_store` for a non-admin target) would let the
+                // caller's grant leak authority into the target's scope. Only
+                // rebind memory tools the target policy also admits.
+                let target_policy_gate = Arc::clone(&target_policy);
                 let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
                 {
                     match self.memory_for_target_agent(agent_name).await {
                         Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
                             .into_iter()
+                            .filter(|tool| target_policy_gate.is_tool_allowed(tool.name()))
                             .map(|tool| (tool.name().to_string(), tool))
                             .collect(),
                         Ok(None) => HashMap::new(),
@@ -2579,10 +2588,23 @@ impl DelegateTool {
                     .filter(|tool| tool.name() != Self::NAME)
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
-                    .map(|tool| {
-                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                            Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
-                        })
+                    .filter_map(|tool| {
+                        let name = tool.name();
+                        if let Some(target_tool) = target_memory_tools.remove(name) {
+                            // A memory tool the target admits: rebind it to the
+                            // target agent scope.
+                            Some(target_tool)
+                        } else if zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&name) {
+                            // A memory tool the TARGET's own policy denies (or
+                            // whose backend is unsupported): drop it rather than
+                            // falling back to the caller-scoped tool, which would
+                            // let the caller's grant write into the caller scope
+                            // through a delegated turn.
+                            None
+                        } else {
+                            // Non-memory tool: pass the caller's tool through.
+                            Some(Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                        }
                     })
                     .collect()
             }
@@ -2929,6 +2951,57 @@ mod tests {
                 .lock()
                 .remove("test-cancel-missing")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn bounded_delegation_gates_memory_tools_by_target_policy() {
+        // Bounded delegation rebinds memory tools to the target scope. The set
+        // of rebound tools must be gated by the TARGET agent's own policy, not
+        // just the caller's, so a delegated turn cannot gain a memory-write
+        // authority (e.g. `system_memory_store`) the target is not allowed to
+        // run. This mirrors the filter applied in `execute` where the delegated
+        // memory tools are collected.
+        use zeroclaw_memory::HindsightMemory;
+
+        let memory: Arc<dyn Memory> = Arc::new(HindsightMemory::for_test(
+            "target",
+            "http://127.0.0.1:1",
+            "zeroclaw-target",
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+            "test-token",
+        ));
+
+        // Both tiers are supported, so both write tools are constructed.
+        let all_tools = DelegateTool::memory_tools_for_target(memory.clone(), test_security());
+        let all_names: Vec<&str> = all_tools.iter().map(|t| t.name()).collect();
+        assert!(all_names.contains(&"system_memory_store"));
+        assert!(all_names.contains(&"shared_memory_store"));
+
+        // A target policy that excludes the system tool must drop it from the
+        // rebound set while keeping every other memory tool.
+        let target_policy = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["system_memory_store".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let gated: Vec<String> =
+            DelegateTool::memory_tools_for_target(memory, Arc::clone(&target_policy))
+                .into_iter()
+                .filter(|tool| target_policy.is_tool_allowed(tool.name()))
+                .map(|tool| tool.name().to_string())
+                .collect();
+        assert!(
+            !gated.iter().any(|n| n == "system_memory_store"),
+            "system_memory_store must be gated out for a target that denies it: {gated:?}"
+        );
+        assert!(
+            gated.iter().any(|n| n == "shared_memory_store"),
+            "shared_memory_store must remain for the target: {gated:?}"
+        );
+        assert!(
+            gated.iter().any(|n| n == "memory_store"),
+            "ordinary memory tools must remain for the target: {gated:?}"
         );
     }
 
