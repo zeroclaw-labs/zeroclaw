@@ -129,6 +129,10 @@ pub struct SlackChannel {
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
+/// Bound first-interaction thread hydration independently from the number of
+/// messages retained in the prompt. Each page is attempted once, so this is
+/// also the hard upper bound on Slack API requests for one hydration.
+const SLACK_THREAD_BACKFILL_MAX_REQUESTS: usize = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
 const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
@@ -1456,8 +1460,12 @@ impl SlackChannel {
         rendered_message_lines: Vec<String>,
         dropped_by_allow_list: usize,
         reply_cap_omitted: usize,
+        fetch_budget_exhausted: bool,
     ) -> Option<String> {
-        if rendered_message_lines.is_empty() && dropped_by_allow_list == 0 && reply_cap_omitted == 0
+        if rendered_message_lines.is_empty()
+            && dropped_by_allow_list == 0
+            && reply_cap_omitted == 0
+            && !fetch_budget_exhausted
         {
             return None;
         }
@@ -1474,6 +1482,12 @@ impl SlackChannel {
                 "… {} earlier thread messages omitted …",
                 reply_cap_omitted
             ));
+        }
+        if fetch_budget_exhausted {
+            lines.push(
+                "… additional recent thread messages omitted because history fetch limit was reached …"
+                    .to_string(),
+            );
         }
         lines.extend(rendered_message_lines);
 
@@ -1813,8 +1827,13 @@ impl SlackChannel {
     ///   identified passthrough — they're useful self-context and don't
     ///   widen the channel's privacy boundary.
     /// - Reply cap: only the configured number of most recent allow-listed
-    ///   messages are rendered, with a `… N earlier thread
-    ///   messages omitted …` prefix marker when the cap activates.
+    ///   messages available within the bounded fetch window are rendered,
+    ///   with a `… N earlier thread messages omitted …` prefix marker when
+    ///   the cap activates.
+    /// - Request cap: hydration makes at most
+    ///   [`SLACK_THREAD_BACKFILL_MAX_REQUESTS`] single-attempt Slack requests.
+    ///   If another cursor remains, the partial context is committed with a
+    ///   visible marker so later messages do not restart the scan from page 1.
     /// - Char cap: the joined block is clipped to
     ///   `SLACK_PERMALINK_TEXT_MAX_CHARS` via `truncate_text`, which
     ///   appends a `…[truncated]` suffix on overflow.
@@ -1833,8 +1852,26 @@ impl SlackChannel {
         let mut retained = VecDeque::with_capacity(max_messages);
         let mut total_allowed = 0usize;
         let mut dropped_by_allow_list = 0usize;
+        let mut requests_made = 0usize;
+        let mut fetch_budget_exhausted = false;
 
         loop {
+            if requests_made == SLACK_THREAD_BACKFILL_MAX_REQUESTS {
+                fetch_budget_exhausted = true;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "channel_id": channel_id,
+                            "thread_ts": thread_ts,
+                            "request_budget": SLACK_THREAD_BACKFILL_MAX_REQUESTS,
+                        })),
+                    "Slack: thread-context backfill truncated at conversations.replies request budget"
+                );
+                break;
+            }
+            requests_made += 1;
             let Some(payload) = self
                 .fetch_thread_replies_page_with_retry(
                     channel_id,
@@ -1842,6 +1879,7 @@ impl SlackChannel {
                     "0",
                     (!trigger_ts.is_empty()).then_some(trigger_ts),
                     cursor.as_deref(),
+                    0,
                 )
                 .await
             else {
@@ -1935,6 +1973,7 @@ impl SlackChannel {
             rendered_message_lines,
             dropped_by_allow_list,
             reply_cap_omitted,
+            fetch_budget_exhausted,
         );
         if block.is_some() {
             ::zeroclaw_log::record!(
@@ -1946,6 +1985,8 @@ impl SlackChannel {
                         "rendered": total_allowed.saturating_sub(reply_cap_omitted),
                         "dropped_by_allow_list": dropped_by_allow_list,
                         "reply_cap_omitted": reply_cap_omitted,
+                        "requests_made": requests_made,
+                        "fetch_budget_exhausted": fetch_budget_exhausted,
                     })),
                 "Slack: thread-context backfill prepended"
             );
@@ -4275,8 +4316,15 @@ impl SlackChannel {
         thread_ts: &str,
         oldest: &str,
     ) -> Option<serde_json::Value> {
-        self.fetch_thread_replies_page_with_retry(channel_id, thread_ts, oldest, None, None)
-            .await
+        self.fetch_thread_replies_page_with_retry(
+            channel_id,
+            thread_ts,
+            oldest,
+            None,
+            None,
+            SLACK_HISTORY_MAX_RETRIES,
+        )
+        .await
     }
 
     async fn fetch_thread_replies_page_with_retry(
@@ -4286,6 +4334,7 @@ impl SlackChannel {
         oldest: &str,
         latest: Option<&str>,
         cursor: Option<&str>,
+        max_retries: u32,
     ) -> Option<serde_json::Value> {
         let mut total_wait = Duration::from_secs(0);
         let mut query = vec![
@@ -4301,7 +4350,7 @@ impl SlackChannel {
             query.push(("cursor", cursor));
         }
 
-        for attempt in 0..=SLACK_HISTORY_MAX_RETRIES {
+        for attempt in 0..=max_retries {
             let resp = match self
                 .http_client()
                 .get(self.slack_api_url("conversations.replies"))
@@ -4349,7 +4398,7 @@ impl SlackChannel {
                     .is_some_and(|err| err == "ratelimited");
 
             if is_ratelimited_http || is_ratelimited_payload {
-                if attempt >= SLACK_HISTORY_MAX_RETRIES {
+                if attempt >= max_retries {
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -4359,7 +4408,7 @@ impl SlackChannel {
                             thread_ts,
                             channel_id,
                             total_wait.as_secs(),
-                            SLACK_HISTORY_MAX_RETRIES
+                            max_retries
                         )
                     );
                     return None;
@@ -4381,7 +4430,7 @@ impl SlackChannel {
                         channel_id,
                         retry_after_secs,
                         attempt + 1,
-                        SLACK_HISTORY_MAX_RETRIES,
+                        max_retries,
                         next_retry_at
                     )
                 );
@@ -7451,6 +7500,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_backfill_stops_at_request_budget_and_commits_partial_context() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let pages = [
+            (None, "PAGE_2", "first page"),
+            (Some("PAGE_2"), "PAGE_3", "second page"),
+            (Some("PAGE_3"), "PAGE_4", "third page"),
+        ];
+        for (cursor, next_cursor, text) in pages {
+            let mut matcher = Mock::given(method("GET"))
+                .and(path("/conversations.replies"))
+                .and(query_param("channel", "C_ONE"))
+                .and(query_param("ts", "T_PARENT"))
+                .and(query_param("latest", "T_TRIGGER"));
+            matcher = if let Some(cursor) = cursor {
+                matcher.and(query_param("cursor", cursor))
+            } else {
+                matcher.and(query_param_is_missing("cursor"))
+            };
+            matcher
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "messages": [
+                        {"ts": text, "thread_ts": "T_PARENT", "user": "U_USER", "text": text},
+                    ],
+                    "response_metadata": {"next_cursor": next_cursor},
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .and(query_param("cursor", "PAGE_4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [
+                    {"ts": "fourth page", "thread_ts": "T_PARENT", "user": "U_USER", "text": "fourth page"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec!["C_ONE".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_USER".to_string()]),
+        )
+        .with_thread_context_max_messages_resolver(Arc::new(|| 2))
+        .with_api_base_url(server.uri());
+        ch.cache_sender_display_name("U_USER", "alice");
+
+        let mention = serde_json::json!({
+            "ts": "T_TRIGGER",
+            "thread_ts": "T_PARENT",
+            "user": "U_USER",
+            "text": "<@U_BOT> summarize",
+        });
+        let hydrated = ch
+            .build_incoming_content(&mention, "C_ONE", true, "U_BOT")
+            .await
+            .expect("mentioned reply must be forwarded");
+
+        assert!(!hydrated.contains("first page"));
+        assert!(hydrated.contains("second page"));
+        assert!(hydrated.contains("third page"));
+        assert!(!hydrated.contains("fourth page"));
+        assert!(hydrated.contains(
+            "… additional recent thread messages omitted because history fetch limit was reached …"
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+        let second_mention = serde_json::json!({
+            "ts": "T_LATER",
+            "thread_ts": "T_PARENT",
+            "user": "U_USER",
+            "text": "<@U_BOT> follow up",
+        });
+        ch.build_incoming_content(&second_mention, "C_ONE", true, "U_BOT")
+            .await
+            .expect("later mention must still be forwarded");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn thread_backfill_zero_depth_disables_fetch() {
         use wiremock::MockServer;
 
@@ -7841,7 +7982,7 @@ mod tests {
             "- bob: second".to_string(),
             "- alice: third".to_string(),
         ];
-        let block = SlackChannel::compose_thread_backfill_block(lines, 2, 0)
+        let block = SlackChannel::compose_thread_backfill_block(lines, 2, 0, false)
             .expect("block should be produced");
         assert!(block.starts_with("[Thread context]\n"));
         assert!(block.contains("… 2 messages from non-allow-listed users omitted …"));
@@ -7856,7 +7997,7 @@ mod tests {
     /// header and the allow-list gap marker (no rendered messages).
     #[test]
     fn thread_backfill_compose_with_only_dropped_senders() {
-        let block = SlackChannel::compose_thread_backfill_block(Vec::new(), 4, 0)
+        let block = SlackChannel::compose_thread_backfill_block(Vec::new(), 4, 0, false)
             .expect("block should still surface the gap signal");
         assert!(block.starts_with("[Thread context]\n"));
         assert!(block.contains("… 4 messages from non-allow-listed users omitted …"));
@@ -7871,7 +8012,7 @@ mod tests {
         let lines = (0..SLACK_PERMALINK_THREAD_MAX_REPLIES)
             .map(|i| format!("- alice: message {i}"))
             .collect::<Vec<_>>();
-        let block = SlackChannel::compose_thread_backfill_block(lines, 0, 5)
+        let block = SlackChannel::compose_thread_backfill_block(lines, 0, 5, false)
             .expect("block should be produced");
         assert!(block.starts_with("[Thread context]\n"));
         assert!(block.contains("… 5 earlier thread messages omitted …"));
@@ -7885,7 +8026,7 @@ mod tests {
     fn thread_backfill_compose_truncates_long_text() {
         let huge = "x".repeat(SLACK_PERMALINK_TEXT_MAX_CHARS + 1000);
         let lines = vec![format!("- alice: {huge}")];
-        let block = SlackChannel::compose_thread_backfill_block(lines, 0, 0)
+        let block = SlackChannel::compose_thread_backfill_block(lines, 0, 0, false)
             .expect("block should be produced");
         assert!(block.ends_with("…[truncated]"));
         assert!(block.starts_with("[Thread context]"));

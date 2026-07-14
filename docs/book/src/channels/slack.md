@@ -95,10 +95,16 @@ every message in a thread it's part of.
 On the first message ZeroClaw handles in an existing thread, it fetches prior
 replies and prepends a bounded `[Thread context]` block so the agent can answer
 with the earlier discussion. `thread_context_max_messages` controls how many of
-the newest prior messages are included while preserving chronological order.
-The default is `20`, the maximum is `50`, and `0` disables this automatic
-hydration. Fetch failures do not drop the current message and are retried on the
-next eligible reply.
+the newest prior messages available within the fetch window are included while
+preserving chronological order. The default is `20`, the maximum is `50`, and
+`0` disables this automatic hydration.
+
+One hydration makes at most three `conversations.replies` requests. If a longer
+thread still has another page, ZeroClaw uses the bounded partial context, adds an
+omission marker, and records the thread as hydrated so later replies do not
+restart the scan. A Slack API failure does not drop the current message; it
+skips hydration and releases the reservation so the next eligible reply can
+retry.
 
 ## Mentions and formatting
 
