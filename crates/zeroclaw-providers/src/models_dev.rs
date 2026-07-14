@@ -53,15 +53,15 @@ struct ModelCost {
     cache_read: Option<f64>,
 }
 
-/// models.dev `modalities` block. `input` and `output` are string lists;
-/// membership of `"image"` (or `"pdf"`) in `input` is what callers use to
-/// decide whether a model can accept vision attachments.
+/// models.dev `modalities` block — only the `input` dimension is consumed
+/// today. Membership of `"image"` in `input` is what callers use to decide
+/// whether a model can accept vision attachments; `output` (and any future
+/// modality vectors we do not yet read) are tolerated by `serde` defaults
+/// rather than deserialized into named fields.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 struct Modalities {
     #[serde(default)]
     input: Vec<String>,
-    #[serde(default)]
-    output: Vec<String>,
 }
 
 impl Modalities {
@@ -180,13 +180,9 @@ pub(crate) fn pricing_from_catalog(
 /// catalog entry has no `modalities` block at all — callers should fall
 /// back to the family default in that case.
 ///
-/// Pure / sync / no network. Wired into the async cache by
-/// [`model_supports_vision_for`] below. See #8733 for the
-/// parser-extends-with-capabilities half of the fix; the
-/// capability-routing half is a follow-up because the runtime
-/// `supports_vision()` call site
-/// (`crates/zeroclaw-channels/src/orchestrator/mod.rs:4514`) does not
-/// pass the selected model id.
+/// Pure / sync / no network. This is the parser half of #8733; wiring the
+/// result into `provider.capabilities()` and the orchestrator
+/// `supports_vision()` call site is a separate change tracked on #8733.
 pub(crate) fn model_supports_vision(
     catalog: &Catalog,
     provider_key: &str,
@@ -195,16 +191,6 @@ pub(crate) fn model_supports_vision(
     let entry = catalog.get(provider_key)?;
     let model = entry.models.get(model_id)?;
     Some(model.modalities.as_ref()?.supports_image_input())
-}
-
-/// Async wrapper around [`model_supports_vision`] that uses the
-/// process-lifetime catalog cache. Returns `None` if the cache hasn't
-/// been populated yet *and* the fetch fails (which is the same `None`
-/// shape the pure helper uses for "not in catalog", so callers always
-/// need a family-default fallback path).
-pub async fn model_supports_vision_for(provider_key: &str, model_id: &str) -> Option<bool> {
-    let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await.ok()?;
-    model_supports_vision(catalog, provider_key, model_id)
 }
 
 #[cfg(test)]
