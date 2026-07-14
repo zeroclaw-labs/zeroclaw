@@ -282,6 +282,7 @@ fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         poll_handle: None,
         escalate_handle: None,
         channel_room_handle: None,
+        pipeline_policy_handle: None,
         unfiltered_tool_arcs: Vec::new(),
     }
 }

@@ -8,9 +8,27 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
+
+use crate::tool_search::ToolAccessPolicy;
+
+/// Live per-agent access policy for pipeline sub-tool steps. Updated whenever
+/// the caller's tool registry is policy-filtered.
+pub type PipelineAccessPolicyHandle = Arc<RwLock<Option<ToolAccessPolicy>>>;
+
+/// Set the active access policy on a pipeline handle built at registry time.
+pub fn sync_pipeline_access_policy(
+    handle: Option<&PipelineAccessPolicyHandle>,
+    policy: Option<ToolAccessPolicy>,
+) {
+    if let Some(handle) = handle
+        && let Ok(mut guard) = handle.write()
+    {
+        *guard = policy;
+    }
+}
 
 /// Errors specific to pipeline execution.
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
@@ -74,16 +92,37 @@ pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
+    access_policy: PipelineAccessPolicyHandle,
 }
 
 impl PipelineTool {
-    pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn new(
+        config: PipelineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> (Self, PipelineAccessPolicyHandle) {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
-        Self {
-            config,
-            tools,
-            allowed_set,
+        let access_policy = Arc::new(RwLock::new(None));
+        let handle = Arc::clone(&access_policy);
+        (
+            Self {
+                config,
+                tools,
+                allowed_set,
+                access_policy,
+            },
+            handle,
+        )
+    }
+
+    fn is_step_allowed(&self, name: &str) -> bool {
+        if !self.allowed_set.contains(name) {
+            return false;
         }
+        self.access_policy
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .is_none_or(|policy| policy.is_tool_allowed(name))
     }
 
     /// Find a tool by name in the registry.
@@ -100,9 +139,10 @@ impl PipelineTool {
             return Err(PipelineError::TooManySteps(self.config.max_steps));
         }
 
-        // Check all tools are on the allowlist before executing any.
+        // Check all tools are on the pipeline allowlist and the caller's access
+        // policy before executing any.
         for step in &request.steps {
-            if !self.allowed_set.contains(&step.tool) {
+            if !self.is_step_allowed(&step.tool) {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
@@ -537,7 +577,7 @@ mod tests {
             max_steps: 2,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let (tool, _) = PipelineTool::new(config, vec![]);
 
         let request = PipelineRequest {
             steps: vec![
@@ -569,7 +609,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let (tool, _) = PipelineTool::new(config, vec![]);
 
         let request = PipelineRequest {
             steps: vec![PipelineStep {
@@ -591,7 +631,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let (tool, _) = PipelineTool::new(config, vec![]);
 
         let request = PipelineRequest {
             steps: vec![
@@ -618,7 +658,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec![],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let (tool, _) = PipelineTool::new(config, vec![]);
 
         let request = PipelineRequest {
             steps: vec![],
@@ -702,7 +742,39 @@ mod tests {
                 output: "final answer".into(),
             }),
         ];
-        PipelineTool::new(config, tools)
+        PipelineTool::new(config, tools).0
+    }
+
+    #[test]
+    fn validate_rejects_pipeline_step_denied_by_access_policy() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        let (tool, handle) = PipelineTool::new(config, vec![]);
+        sync_pipeline_access_policy(
+            Some(&handle),
+            Some(ToolAccessPolicy {
+                allowed: Some(vec![
+                    "file_read".to_string(),
+                    "execute_pipeline".to_string(),
+                ]),
+                ..ToolAccessPolicy::default()
+            }),
+        );
+
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        let err = tool.validate(&request).unwrap_err();
+        assert!(matches!(err, PipelineError::UnknownTool(_)));
     }
 
     #[tokio::test]

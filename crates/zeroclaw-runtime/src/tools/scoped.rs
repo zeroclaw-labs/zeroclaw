@@ -237,6 +237,7 @@ impl ScopedToolRegistry {
             poll_handle,
             escalate_handle,
             channel_room_handle,
+            pipeline_policy_handle,
             unfiltered_tool_arcs,
         } = built;
 
@@ -262,6 +263,10 @@ impl ScopedToolRegistry {
         //    `caller_allowed` narrows on top of the policy, for the `run` path only.
         let before_filter = tools_registry.len();
         apply_policy_tool_filter(&mut tools_registry, Some(security.as_ref()), caller_allowed);
+        crate::tools::sync_pipeline_access_policy(
+            pipeline_policy_handle.as_ref(),
+            mcp_tool_access_policy(security.as_ref(), caller_allowed),
+        );
         if emit_assembly_logs && tools_registry.len() != before_filter {
             ::zeroclaw_log::record!(
                 INFO,
@@ -634,6 +639,7 @@ mod tests {
             poll_handle: None,
             escalate_handle: None,
             channel_room_handle: None,
+            pipeline_policy_handle: None,
             unfiltered_tool_arcs: Vec::new(),
         }
     }

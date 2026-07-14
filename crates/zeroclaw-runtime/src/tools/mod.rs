@@ -108,7 +108,9 @@ pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
 pub use zeroclaw_tools::notion_tool::NotionTool;
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
-pub use zeroclaw_tools::pipeline::PipelineTool;
+pub use zeroclaw_tools::pipeline::{
+    PipelineAccessPolicyHandle, PipelineTool, sync_pipeline_access_policy,
+};
 pub use zeroclaw_tools::poll::PollTool;
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
@@ -510,6 +512,8 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// Handle for the per-agent access policy applied to `execute_pipeline` sub-tools.
+    pub pipeline_policy_handle: Option<zeroclaw_tools::pipeline::PipelineAccessPolicyHandle>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -1401,6 +1405,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    pipeline_policy_handle: None,
                 };
             }
 
@@ -1623,12 +1628,13 @@ pub fn all_tools_with_runtime(
     }
 
     // Pipeline tool (execute_pipeline) — multi-step tool chaining.
+    let mut pipeline_policy_handle = None;
     if root_config.pipeline.enabled {
         let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
-        tool_arcs.push(Arc::new(PipelineTool::new(
-            root_config.pipeline.clone(),
-            pipeline_tools,
-        )));
+        let (pipeline_tool, handle) =
+            PipelineTool::new(root_config.pipeline.clone(), pipeline_tools);
+        pipeline_policy_handle = Some(handle);
+        tool_arcs.push(Arc::new(pipeline_tool));
     }
 
     AllToolsResult {
@@ -1640,6 +1646,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        pipeline_policy_handle,
     }
 }
 

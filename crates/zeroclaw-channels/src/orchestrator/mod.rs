@@ -10221,6 +10221,10 @@ pub async fn start_channels(
         // still applies to them.
         let before_policy_filter_ch = built_tools.len();
         apply_policy_tool_filter(&mut built_tools, Some(security.as_ref()), None);
+        tools::sync_pipeline_access_policy(
+            all_tools_result_ch.pipeline_policy_handle.as_ref(),
+            mcp_tool_access_policy(security.as_ref(), None),
+        );
         if built_tools.len() != before_policy_filter_ch {
             ::zeroclaw_log::record!(
                 INFO,
