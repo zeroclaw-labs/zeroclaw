@@ -142,7 +142,7 @@ async fn channel_plugin_runs_end_to_end() {
     // Inbound: the host listen loop drains the plugin's `poll-message` and
     // forwards the one canned message the fixture delivers.
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let listener = tokio::spawn(async move { channel.listen(tx).await });
+    let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("inbound message arrives within timeout")
