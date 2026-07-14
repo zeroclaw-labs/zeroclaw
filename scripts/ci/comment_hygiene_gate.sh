@@ -124,9 +124,14 @@ scan() {
         echo "FATAL: ripgrep failed (exit ${rg_status}) scanning ${label}" >&2
         exit 2
     fi
-    local hits
-    if ! hits="$(printf '%s' "$raw" | filter_comments "$py_pattern" "$flags" "$mode")"; then
-        echo "FATAL: comment filter failed scanning ${label}" >&2
+    if [ -n "${HYGIENE_DEBUG:-}" ]; then
+        echo "DEBUG scan[${label}] roots=[${SCAN_ROOTS[*]}] rg_status=${rg_status} raw_lines=$(printf '%s' "$raw" | grep -c . || true)" >&2
+    fi
+    local hits filter_status=0
+    hits="$(printf '%s' "$raw" | filter_comments "$py_pattern" "$flags" "$mode" 2>/tmp/hygiene_pyerr)" || filter_status=$?
+    if [ "$filter_status" != "0" ]; then
+        echo "FATAL: comment filter failed scanning ${label} (exit ${filter_status})" >&2
+        cat /tmp/hygiene_pyerr >&2 || true
         exit 2
     fi
     report "$label" "$hits"

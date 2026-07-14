@@ -24,7 +24,7 @@ expect_fail() {
         fail_count=$((fail_count + 1))
     elif ! grep -qF "$label" <<<"$out"; then
         echo "WRONG DETECTOR: ${name} (wanted '${label}')"
-        echo "$out" | grep '^FAIL' || true
+        echo "$out" | grep -E '^FAIL|^FATAL|Traceback|Error' || true
         fail_count=$((fail_count + 1))
     else
         pass_count=$((pass_count + 1))
