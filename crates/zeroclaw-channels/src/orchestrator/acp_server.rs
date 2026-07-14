@@ -154,8 +154,8 @@ impl AcpServer {
 
     /// Set the connection-scoped default agent alias (`?agent=` query param
     /// on the gateway ACP endpoint, #8958). Blank values are treated as
-    /// absent. The alias is validated where an explicit `agentAlias` is —
-    /// at `session/new` — so an unknown alias yields the same clear error.
+    /// absent. The alias is validated at `session/new` with the same
+    /// dispatchable-agent checks as an explicit `agentAlias`.
     pub fn with_connection_default_agent(mut self, alias: Option<String>) -> Self {
         self.connection_default_agent = alias
             .as_deref()
@@ -477,6 +477,68 @@ impl AcpServer {
         }))
     }
 
+    /// True when `alias` names a configured agent that can dispatch a turn.
+    fn alias_if_dispatchable(&self, alias: &str) -> Option<String> {
+        if alias.trim().is_empty() {
+            return None;
+        }
+        self.config
+            .agent(alias)
+            .filter(|agent| agent.is_dispatchable())
+            .map(|_| alias.to_string())
+    }
+
+    /// Shared validation for explicit `agentAlias`, `?agent=`, config defaults,
+    /// and sole-agent auto-select (#8958 / #9026).
+    fn validate_dispatchable_agent_alias(&self, agent_alias: &str) -> Result<(), RpcError> {
+        match self.config.agent(agent_alias) {
+            None => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!(
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
+                ),
+                data: None,
+            }),
+            Some(agent) if !agent.is_dispatchable() => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!("Agent `{agent_alias}` is not enabled for dispatch"),
+                data: None,
+            }),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Restore alias precedence: persisted owner (when still dispatchable) →
+    /// connection default → `[acp].default_agent` → sole configured agent →
+    /// `"default"`.
+    fn resolve_restore_agent_alias(&self, persisted_agent_alias: &str) -> String {
+        self.alias_if_dispatchable(persisted_agent_alias)
+            .or_else(|| {
+                self.connection_default_agent
+                    .as_ref()
+                    .and_then(|alias| self.alias_if_dispatchable(alias))
+            })
+            .or_else(|| {
+                self.config
+                    .acp
+                    .default_agent
+                    .as_ref()
+                    .and_then(|alias| self.alias_if_dispatchable(alias))
+            })
+            .or_else(|| {
+                if self.config.agents.len() == 1 {
+                    self.config
+                        .agents
+                        .keys()
+                        .next()
+                        .and_then(|alias| self.alias_if_dispatchable(alias))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let requested_cwd = self.requested_session_cwd(params);
 
@@ -523,15 +585,7 @@ impl AcpServer {
                     .to_string(),
                 data: None,
             })?;
-        if self.config.agent(&agent_alias).is_none() {
-            return Err(RpcError {
-                code: INVALID_PARAMS,
-                message: format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
-                ),
-                data: None,
-            });
-        }
+        self.validate_dispatchable_agent_alias(&agent_alias)?;
 
         let session_id = Uuid::new_v4().to_string();
 
@@ -784,21 +838,9 @@ impl AcpServer {
         // Restore the agent the session was created with — its alias is
         // persisted on the session row. Fall back to the connection default
         // (`?agent=`, #8958), then the ACP default (or sole agent, or
-        // "default") only when that agent no longer exists in config, so a
-        // deleted owner degrades gracefully instead of failing the restore.
-        let restore_alias = Some(data.agent_alias.clone())
-            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
-            .or_else(|| self.connection_default_agent.clone())
-            .or_else(|| self.config.acp.default_agent.clone())
-            .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
-                    keys.next().cloned()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "default".to_string());
+        // "default") only when the persisted owner is missing or not
+        // dispatchable, so a deleted/disabled owner degrades gracefully.
+        let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -997,21 +1039,9 @@ impl AcpServer {
         // Restore the agent the session was created with — its alias is
         // persisted on the session row. Fall back to the connection default
         // (`?agent=`, #8958), then the ACP default (or sole agent, or
-        // "default") only when that agent no longer exists in config, so a
-        // deleted owner degrades gracefully instead of failing the restore.
-        let restore_alias = Some(data.agent_alias.clone())
-            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
-            .or_else(|| self.connection_default_agent.clone())
-            .or_else(|| self.config.acp.default_agent.clone())
-            .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
-                    keys.next().cloned()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "default".to_string());
+        // "default") only when the persisted owner is missing or not
+        // dispatchable, so a deleted/disabled owner degrades gracefully.
+        let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -2408,13 +2438,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -2607,13 +2637,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "only-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -2682,21 +2712,17 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "agent-alpha".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -2740,21 +2766,17 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "agent-alpha".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -2777,16 +2799,23 @@ mod tests {
 
     /// `make_test_config` plus `agent-alpha`/`agent-beta`, for exercising the
     /// connection-default slot of the alias precedence chain (#8958).
+    fn dispatchable_test_agent(
+        model_provider: &str,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: model_provider.into(),
+            risk_profile: "default".into(),
+            runtime_profile: "default".into(),
+            ..Default::default()
+        }
+    }
+
     fn two_agent_config(cwd: &std::path::Path) -> Config {
         let mut cfg = make_test_config(cwd);
         for alias in ["agent-alpha", "agent-beta"] {
             cfg.agents.insert(
                 alias.to_string(),
-                zeroclaw_config::schema::AliasedAgentConfig {
-                    model_provider: "anthropic.default".into(),
-                    risk_profile: "default".into(),
-                    ..Default::default()
-                },
+                dispatchable_test_agent("anthropic.default"),
             );
         }
         cfg
@@ -2933,6 +2962,120 @@ mod tests {
             }))
             .await
             .expect("session/load must succeed for a deleted persisted agent");
+
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_new_disabled_connection_default_agent_errors_like_explicit_alias() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.agents.get_mut("agent-beta").unwrap().enabled = false;
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("a disabled connection default must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("not enabled for dispatch"),
+            "expected disabled-agent error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_disabled_explicit_alias_errors() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.agents.get_mut("agent-beta").unwrap().enabled = false;
+        let server = AcpServer::new(config, AcpServerConfig::default());
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-beta",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("explicit disabled alias must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("not enabled for dispatch"));
+    }
+
+    #[tokio::test]
+    async fn session_load_restore_skips_disabled_connection_default() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-restore-disabled-conn-default";
+        store
+            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        config.agents.get_mut("agent-beta").unwrap().enabled = false;
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must skip a disabled connection default");
+
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_resume_restore_skips_disabled_persisted_owner() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-disabled-owner";
+        store
+            .create_session(session_id, "agent-alpha", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.agents.get_mut("agent-alpha").unwrap().enabled = false;
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must skip a disabled persisted owner");
 
         assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
     }
@@ -3332,36 +3475,10 @@ mod tests {
     #[tokio::test]
     async fn session_stop_finds_session_during_active_prompt_turn() {
         let cwd = tempfile::tempdir().unwrap();
-        let mut config = Config {
-            data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.anthropic.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::AnthropicModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            model: Some("claude-haiku-4-5".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
-            ..Default::default()
-        };
-        config.risk_profiles.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::RiskProfileConfig::default(),
-        );
-        config.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
-        );
-        let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
 
         // Create a real session via the normal path.
         let new_result = server
@@ -3469,13 +3586,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        cfg.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         cfg.agents.insert(
             "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("anthropic.default"),
         );
         cfg
     }
@@ -3792,6 +3909,7 @@ mod tests {
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
                 risk_profile: "default".into(),
+                runtime_profile: "default".into(),
                 mcp_bundles: vec!["b1".into()],
                 acp_enable_mcp: true,
                 ..Default::default()
