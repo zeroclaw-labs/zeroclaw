@@ -16260,7 +16260,7 @@ BTC is currently around $65,000 based on latest tool output."#
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
-                sender: "alice".to_string(),
+                sender: "zeroclaw_user".to_string(),
                 reply_target: "123".to_string(),
                 content: "Запусти инструмент".to_string(),
                 channel: "telegram".into(),
