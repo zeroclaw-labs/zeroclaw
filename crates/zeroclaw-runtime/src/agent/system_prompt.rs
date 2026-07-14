@@ -233,8 +233,11 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // act without per-call approval. The generic Safety block alone isn't
     // enough to overcome model safety-priors that produce simulated
     // refusal text without ever dispatching a tool call (see issue #6434).
-    // Name the power tools that the autonomy policy authorizes and tell
-    // the model directly that they are not blocked.
+    // Name the power tools the autonomy policy authorizes and tell the model
+    // it is authorized to *call/attempt* them (not that they are exempt from
+    // policy): command policy, forbidden_commands, forbidden_paths, and OS
+    // sandboxing may still reject a real call, so the model must not
+    // self-refuse merely because the request uses these tools.
     if has_tools && autonomy_config.map(|cfg| cfg.level) == Some(AutonomyLevel::Full) {
         let power_tools: Vec<&str> = ["shell", "file_write", "file_edit"]
             .into_iter()
