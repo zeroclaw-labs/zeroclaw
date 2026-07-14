@@ -5600,10 +5600,13 @@ impl ChatState {
             self.entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
             self.mark_dirty_append();
-        } else if !self.turn_had_streaming_text && !self.turn_had_tool_calls && full_text.is_empty()
+        } else if clean
+            && !self.turn_had_streaming_text
+            && !self.turn_had_tool_calls
+            && full_text.is_empty()
         {
-            // Turn completed with no streamed text, no tool calls, and no
-            // final content — render a diagnostic so the user knows the
+            // Clean completion with no streamed text, no tool calls, and
+            // no final content — render a diagnostic so the user knows the
             // turn finished rather than silently vanishing (#8644).
             self.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
@@ -7912,6 +7915,24 @@ mod tests {
             matches!(&s.entries()[0], ChatEntry::SystemMessage(t) if t.as_ref() == "Turn completed with no output."),
             "expected diagnostic SystemMessage for empty completion, got {:?}",
             s.entries()[0]
+        );
+    }
+
+    /// When a cancelled or failed turn has no output, commit_turn must NOT
+    /// append the "Turn completed with no output" diagnostic — cancelled/
+    /// failed turns are not clean completions and should not claim otherwise.
+    #[test]
+    fn commit_turn_no_diagnostic_when_not_clean() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // Clean=false (cancelled/failed), empty everything.
+        s.commit_turn(String::new(), false);
+
+        assert!(
+            s.entries().is_empty(),
+            "cancelled turn should not emit completion diagnostic, got {:?}",
+            s.entries()
         );
     }
 
