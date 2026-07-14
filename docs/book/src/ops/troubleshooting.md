@@ -144,14 +144,14 @@ Or, to edit a single stale field instead of wiping everything, use `zeroclaw con
 
 ### Homebrew install: config path mismatch
 
-Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works) while the default config dir is `~/.zeroclaw/`. Set `ZEROCLAW_WORKSPACE` to the Homebrew path before running quickstart so the two paths line up:
+Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works) while the default config dir is `~/.zeroclaw/`. Set `ZEROCLAW_DATA_DIR` to the Homebrew path before running quickstart so the two paths line up:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
+export ZEROCLAW_DATA_DIR="$HOMEBREW_PREFIX/var/zeroclaw"
 zeroclaw quickstart
 ```
 

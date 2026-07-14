@@ -305,7 +305,7 @@ let
 
       environment = {
         ZEROCLAW_CONFIG_DIR = instanceCfg.dataDir;
-        ZEROCLAW_WORKSPACE = "${instanceCfg.dataDir}/workspace";
+        ZEROCLAW_DATA_DIR = "${instanceCfg.dataDir}/workspace";
       };
 
       serviceConfig = {

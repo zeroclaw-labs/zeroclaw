@@ -16,7 +16,7 @@ that same typed schema.
 | --- | --- | --- | --- |
 | Config schema | `crates/zeroclaw-config/src/schema.rs` plus `Configurable` derives | Code, not generated docs | New binary build |
 | Generated reference | `cargo mdbook refs` / `markdown-schema` | `docs/book/src/reference/config.md` at build time | Documentation only |
-| Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
+| Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
 | CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | RPC context updates immediately; daemon-owned subsystems need reload |

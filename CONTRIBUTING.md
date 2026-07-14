@@ -86,7 +86,7 @@ ZEROCLAW_providers__models__openrouter__prod_v2__model=anthropic/claude-sonnet-4
 ZEROCLAW_gateway__request_timeout_secs=120
 ```
 
-The lowercase tail mirrors the dotted TOML path 1:1; each `__` (double underscore) is a path separator (`.` in TOML) and each single `_` is either a snake-case joiner inside a field name (`api_key` → `api-key`) or a literal char inside an alias key (`prod_v2`). Aliases are `[a-z0-9][a-z0-9_]{0,62}` — lowercase letters, digits, and single underscores; no leading underscore, no hyphen, no uppercase. Bootstrap variables (`ZEROCLAW_WORKSPACE`, `ZEROCLAW_CONFIG_DIR`) keep their UPPERCASE form; the case rule disambiguates them from the schema-mirror surface.
+The lowercase tail mirrors the dotted TOML path 1:1; each `__` (double underscore) is a path separator (`.` in TOML) and each single `_` is either a snake-case joiner inside a field name (`api_key` → `api-key`) or a literal char inside an alias key (`prod_v2`). Aliases are `[a-z0-9][a-z0-9_]{0,62}` — lowercase letters, digits, and single underscores; no leading underscore, no hyphen, no uppercase. Bootstrap variables (`ZEROCLAW_DATA_DIR`, `ZEROCLAW_CONFIG_DIR`) keep their UPPERCASE form; the case rule disambiguates them from the schema-mirror surface.
 
 V0.8.0 eradicated every per-provider env-var fallback (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, …), the generic `ZEROCLAW_API_KEY` / `API_KEY`, and the legacy `ZEROCLAW_PROVIDER` / `PROVIDER` / `ZEROCLAW_MODEL` dispatchers. Legacy names have no runtime effect — they're silently ignored. See `docs/book/src/reference/env-vars.md` for the migration table and the `💉` visibility behavior.
 

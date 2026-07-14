@@ -24,7 +24,7 @@ The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen, substitute
 
 ## Bootstrap (uppercase tail)
 
-These env vars decide *where* the config file and instance data live, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface. They resolve in the order `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE` (deprecated):
+These env vars decide *where* the config file and instance data live, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface. They resolve in the order `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR`:
 
 <div class="os-tabs-src">
 
@@ -33,7 +33,6 @@ These env vars decide *where* the config file and instance data live, before any
 ```sh
 ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location (takes precedence)
 ZEROCLAW_DATA_DIR=/srv/zeroclaw           # instance data directory (canonical)
-ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DATA_DIR
 ```
 
 </div>
@@ -102,3 +101,4 @@ A handful of fields live as schema fields, reachable via the standard mapping:
 4. **KiloCLI / Gemini CLI paths**: `[providers.models.kilocli.<alias>] binary_path` and `[providers.models.gemini_cli.<alias>] binary_path`.
 5. **Transcription / TTS keys**: `[transcription].api_key`, `[providers.tts.openai.<alias>].api_key`, `[providers.tts.elevenlabs.<alias>].api_key`, `[providers.tts.google.<alias>].api_key`.
 6. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).
+.<alias>].ws_url` (test/proxy WebSocket override).

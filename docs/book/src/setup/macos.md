@@ -43,7 +43,7 @@ Gets you `brew services` integration. Binary lives at `$HOMEBREW_PREFIX/bin/zero
 #### sh
 
 ```sh
-export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
+export ZEROCLAW_DATA_DIR="$HOMEBREW_PREFIX/var/zeroclaw"
 ```
 
 </div>
@@ -185,7 +185,7 @@ rm -rf ~/.zeroclaw ~/.config/zeroclaw
 
 ## Gotchas
 
-- **Homebrew config path mismatch.** The `brew services` daemon reads config from `$HOMEBREW_PREFIX/var/zeroclaw/`, not `~/.zeroclaw/`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_WORKSPACE` accordingly.
+- **Homebrew config path mismatch.** The `brew services` daemon reads config from `$HOMEBREW_PREFIX/var/zeroclaw/`, not `~/.zeroclaw/`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_DATA_DIR` accordingly.
 - **First launch of the browser tool** downloads Chromium (~150 MB) via Playwright.
 - **Apple Silicon** and **Intel** builds are both released. The bootstrap script auto-detects. Homebrew auto-selects.
 

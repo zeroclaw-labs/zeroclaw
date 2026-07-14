@@ -36,7 +36,7 @@ spec:
               value: "C.UTF-8"
             - name: HOME
               value: "/zeroclaw-data"
-            - name: ZEROCLAW_WORKSPACE
+            - name: ZEROCLAW_DATA_DIR
               value: "/zeroclaw-data/workspace"
             - name: ZEROCLAW_GATEWAY_PORT
               value: "42617"

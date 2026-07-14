@@ -64,7 +64,7 @@ RUN mkdir -p /app/data/config /app/data/workspace
 COPY demo/zeroclaw.toml.example /app/data/config/config.toml
 
 ENV ZEROCLAW_CONFIG_DIR=/app/data/config \
-    ZEROCLAW_WORKSPACE=/app/data/workspace \
+    ZEROCLAW_DATA_DIR=/app/data/workspace \
     RUST_LOG=zeroclaw=info,zeroclaw_hardware=info,esp32_sim=info
 
 EXPOSE 8080

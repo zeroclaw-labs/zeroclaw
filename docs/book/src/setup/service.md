@@ -174,11 +174,10 @@ The service reads config from whichever directory resolved at install time. Prec
 
 1. `$ZEROCLAW_CONFIG_DIR` (config lives directly under `$ZEROCLAW_CONFIG_DIR`)
 2. `$ZEROCLAW_DATA_DIR`
-3. `$ZEROCLAW_WORKSPACE` (**deprecated**, prefer `ZEROCLAW_DATA_DIR`; resolves either `$ZEROCLAW_WORKSPACE` or the legacy sibling `.zeroclaw/`)
-4. On macOS only, the Homebrew config dir (`$HOMEBREW_PREFIX/var/zeroclaw/`) when installed via Homebrew
-5. Default `~/.zeroclaw/` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\` (Windows)
+3. On macOS only, the Homebrew config dir (`$HOMEBREW_PREFIX/var/zeroclaw/`) when installed via Homebrew
+4. Default `~/.zeroclaw/` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\` (Windows)
 
-`ZEROCLAW_CONFIG_DIR` overrides everything; setting it alongside `ZEROCLAW_DATA_DIR` or `ZEROCLAW_WORKSPACE` logs a warning and ignores the others.
+`ZEROCLAW_CONFIG_DIR` overrides everything; setting it alongside `ZEROCLAW_DATA_DIR` logs a warning and ignores the other.
 
 If your service seems to ignore config changes, check which path the daemon resolved against, `zeroclaw status` reports the active config file, and the runtime logs a resolution-source line at startup:
 
