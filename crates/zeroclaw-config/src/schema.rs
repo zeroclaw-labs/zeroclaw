@@ -10674,8 +10674,24 @@ impl HindsightMemoryConfig {
     }
 }
 
+/// Canonical Hindsight API base URL. Single source of truth: the typed config
+/// default and the `zeroclaw-memory` driver (including its `from_env`
+/// compatibility path and tests) both consume this constant, so the base URL
+/// can never drift between the config layer and the driver.
+pub const DEFAULT_HINDSIGHT_BASE_URL: &str = "https://tokengate.appz.cloud/api/embedding/hindsight";
+
+/// Canonical default recall breadth (`top_k`) when a caller passes no limit.
+/// Single source of truth shared by the typed config default and the
+/// `zeroclaw-memory` driver so the two can never disagree.
+pub const DEFAULT_HINDSIGHT_TOP_K: usize = 5;
+
+/// Canonical name of the environment variable holding the Hindsight bearer
+/// token. Single source of truth shared by the typed config default and the
+/// driver's `from_env` compatibility path.
+pub const DEFAULT_HINDSIGHT_TOKEN_ENV: &str = "ZC_HINDSIGHT_TOKEN";
+
 fn default_hindsight_base_url() -> String {
-    "https://tokengate.appz.cloud/api/embedding/hindsight".into()
+    DEFAULT_HINDSIGHT_BASE_URL.into()
 }
 
 fn default_hindsight_bank_template() -> String {
@@ -10683,11 +10699,11 @@ fn default_hindsight_bank_template() -> String {
 }
 
 fn default_hindsight_top_k() -> usize {
-    5
+    DEFAULT_HINDSIGHT_TOP_K
 }
 
 fn default_hindsight_token_env() -> String {
-    "ZC_HINDSIGHT_TOKEN".into()
+    DEFAULT_HINDSIGHT_TOKEN_ENV.into()
 }
 
 fn default_retrieval_stages() -> Vec<String> {
