@@ -7555,7 +7555,7 @@ mod tests {
             "text": "<@U_BOT> summarize",
         });
         let task_ch = Arc::clone(&ch);
-        let task = tokio::spawn(async move {
+        let task = zeroclaw_spawn::spawn!(async move {
             task_ch
                 .build_incoming_content(&mention, "C_ONE", true, "U_BOT")
                 .await
