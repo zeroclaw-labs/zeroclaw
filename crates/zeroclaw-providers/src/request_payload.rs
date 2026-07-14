@@ -57,7 +57,10 @@ mod tests {
     #[test]
     fn normalize_native_tool_arguments_valid_array_passthrough() {
         let raw = r#"[1,2]"#;
-        assert_eq!(normalize_native_tool_arguments(raw, "shell"), raw.to_string());
+        assert_eq!(
+            normalize_native_tool_arguments(raw, "shell"),
+            raw.to_string()
+        );
     }
 
     #[test]

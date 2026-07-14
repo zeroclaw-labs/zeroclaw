@@ -2393,11 +2393,10 @@ impl OpenAiCompatibleModelProvider {
             .into_iter()
             .filter_map(|tc| {
                 let name = tc.function_name()?;
-                let normalized_arguments =
-                    crate::request_payload::normalize_native_tool_arguments(
-                        tc.function_arguments().as_deref().unwrap_or("{}"),
-                        &name,
-                    );
+                let normalized_arguments = crate::request_payload::normalize_native_tool_arguments(
+                    tc.function_arguments().as_deref().unwrap_or("{}"),
+                    &name,
+                );
                 Some(ProviderToolCall {
                     id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
                     name,
