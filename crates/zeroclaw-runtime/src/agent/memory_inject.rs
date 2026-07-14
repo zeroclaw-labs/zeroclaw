@@ -97,6 +97,11 @@ impl MemoryInjectConfig {
         memory: &zeroclaw_config::schema::MemoryConfig,
         limit: usize,
     ) -> Self {
+        let limit = if memory.rerank_enabled {
+            rerank::bounded_final_limit(limit)
+        } else {
+            limit
+        };
         Self {
             limit,
             min_relevance_score: memory.min_relevance_score,
@@ -141,6 +146,7 @@ fn build_rerank_config(
     // bounded so a mis-sized config or an over-returning backend cannot feed an
     // unbounded pool into the rerank scans. `candidate_multiplier` is validated
     // to `1..=MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER` at config load.
+    let final_limit = rerank::bounded_final_limit(final_limit);
     let candidate_pool_cap = final_limit
         .max(1)
         .saturating_mul(memory.candidate_multiplier.max(1));
@@ -151,8 +157,8 @@ fn build_rerank_config(
         importance_weight: memory.importance_weight,
         recency_weight: memory.recency_weight,
         min_relevance_score: memory.min_relevance_score,
-        final_limit: final_limit.max(1),
-        candidate_pool_cap,
+        final_limit,
+        candidate_pool_cap: rerank::bounded_pool_cap(final_limit, candidate_pool_cap),
     }
 }
 
@@ -256,9 +262,12 @@ pub async fn render_memory_context(
     // Over-fetch a larger candidate pool only when reranking is enabled;
     // otherwise recall exactly `limit` so the default path is unchanged.
     let recall_limit = if cfg.rerank_enabled {
-        cfg.limit
+        let requested_pool = cfg
+            .limit
             .saturating_mul(cfg.candidate_multiplier)
             .max(cfg.limit)
+            .max(cfg.rerank.candidate_pool_cap);
+        rerank::bounded_pool_cap(cfg.limit.max(cfg.rerank.final_limit), requested_pool)
     } else {
         cfg.limit
     };
@@ -1282,6 +1291,70 @@ mod tests {
         };
         render_memory_context(&mem, &RecordingObserver::default(), "q", &[], &cfg, false).await;
         assert_eq!(mem.recorded_limits.lock().as_slice(), &[5]);
+    }
+
+    #[tokio::test]
+    async fn rerank_bounds_unlimited_recall_sentinel_before_backend_and_scan() {
+        let now = chrono::Utc::now();
+        let mut pool: Vec<MemoryEntry> = (0..rerank::MAX_CANDIDATE_POOL)
+            .map(|i| {
+                scored_entry(
+                    &format!("bounded_{i:04}"),
+                    &format!("unique bounded topic {i} marker_{i}"),
+                    MemoryCategory::Daily,
+                    Some(0.2 + (i as f64 / 10_000.0)),
+                    Some(0.0),
+                    now,
+                )
+            })
+            .collect();
+        pool.push(scored_entry(
+            "out_of_bound_winner",
+            "tail candidate should never enter rerank scans",
+            MemoryCategory::Core,
+            Some(1.0),
+            Some(1.0),
+            now,
+        ));
+
+        let mem = FixtureMemory::with(pool);
+        let mut memory = zeroclaw_config::schema::MemoryConfig {
+            rerank_enabled: true,
+            candidate_multiplier: 20,
+            min_relevance_score: 0.0,
+            ..Default::default()
+        };
+        memory.rerank_strategy = "none".into();
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, usize::MAX);
+
+        assert_eq!(cfg.limit, rerank::MAX_CANDIDATE_POOL);
+        assert_eq!(cfg.rerank.final_limit, rerank::MAX_CANDIDATE_POOL);
+        assert_eq!(cfg.rerank.candidate_pool_cap, rerank::MAX_CANDIDATE_POOL);
+
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &cfg,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            mem.recorded_limits.lock().as_slice(),
+            &[rerank::MAX_CANDIDATE_POOL],
+            "unlimited profile sentinel must be capped before backend recall"
+        );
+        assert!(
+            !context.contains("out_of_bound_winner"),
+            "over-returned tail candidate must be truncated before rerank work"
+        );
+        assert_eq!(
+            context.matches("\n- ").count(),
+            DEFAULT_MAX_ENTRIES,
+            "renderer entry budget still applies after bounded rerank"
+        );
     }
 
     #[tokio::test]

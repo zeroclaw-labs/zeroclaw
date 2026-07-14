@@ -14,7 +14,20 @@ const DEFAULT_RECENCY_WEIGHT: f64 = 0.1;
 /// returns. Bounds the O(n^2) duplicate-collapse and MMR scans against a
 /// mis-sized config or a backend that ignores the requested recall limit
 /// (for example a no-embedding fallback that returns its whole list).
-const MAX_CANDIDATE_POOL: usize = 1024;
+pub const MAX_CANDIDATE_POOL: usize = 1024;
+
+#[must_use]
+pub fn bounded_final_limit(final_limit: usize) -> usize {
+    final_limit.min(MAX_CANDIDATE_POOL).max(1)
+}
+
+#[must_use]
+pub fn bounded_pool_cap(final_limit: usize, candidate_pool_cap: usize) -> usize {
+    candidate_pool_cap
+        .min(MAX_CANDIDATE_POOL)
+        .max(bounded_final_limit(final_limit))
+        .max(1)
+}
 
 /// Advanced rerank strategy.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,11 +82,8 @@ pub fn run(
     // limit and returns its whole list, never scan more than the configured
     // cap, itself held under an absolute ceiling. Applied to the raw pool in
     // backend order so a scoreless time-only recall keeps its newest-first head.
-    let pool_cap = config
-        .candidate_pool_cap
-        .min(MAX_CANDIDATE_POOL)
-        .max(config.final_limit)
-        .max(1);
+    let final_limit = bounded_final_limit(config.final_limit);
+    let pool_cap = bounded_pool_cap(config.final_limit, config.candidate_pool_cap);
     if pool.len() > pool_cap {
         pool.truncate(pool_cap);
     }
@@ -113,7 +123,7 @@ pub fn run(
     // media markers, orphan tool-result blocks) before the final trim so the
     // over-fetched candidates below the cutoff can fill the freed slots.
     candidates.retain(|entry| is_eligible(entry));
-    candidates.truncate(config.final_limit);
+    candidates.truncate(final_limit);
     candidates
 }
 
