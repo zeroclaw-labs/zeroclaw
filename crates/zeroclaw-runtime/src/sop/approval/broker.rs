@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use zeroclaw_config::schema::{ApprovalPolicyConfig, SopApprovalConfig};
 
 use super::decision::{ApprovalDecision, ResolveOutcome};
@@ -126,6 +127,22 @@ enum StepPolicy {
     MissingNamed(String),
 }
 
+fn checkpoint_decision_identity(decision: &ApprovalDecision) -> Option<(&'static str, String)> {
+    let (label, payload) = match decision {
+        ApprovalDecision::Approve => return Some(("approve", "approve".to_string())),
+        ApprovalDecision::Amend { text } => ("amend", text.as_str()),
+        ApprovalDecision::Revise { guidance } => ("revise", guidance.as_str()),
+        ApprovalDecision::Deny { .. } => return None,
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload.as_bytes());
+    let digest = hasher.finalize();
+    Some((label, format!("{label}:sha256:{digest:x}")))
+}
+
 /// Authorization + quorum layer over `resolve_gate`. Holds NO copy of the approval
 /// policy/group config - it resolves every policy and membership decision from the
 /// engine's live `[sop.approval]` at use-time (single source of truth), so a config
@@ -233,9 +250,9 @@ impl ApprovalBroker {
     /// Authorize a deterministic checkpoint through the same named policy model as
     /// approval gates. `None` means the caller may resolve the checkpoint now;
     /// `Some(outcome)` is a terminal broker answer and the checkpoint must stay
-    /// parked. Quorum votes record only the approver identity; the final decision
-    /// that satisfies quorum supplies any checkpoint-specific payload such as
-    /// amend text or revise guidance.
+    /// parked. Positive quorum votes are scoped to the current checkpoint
+    /// presentation revision and a canonical decision identity, so Approve, Amend,
+    /// and Revise votes for different public mutations cannot combine.
     pub(crate) fn authorize_checkpoint(
         &self,
         engine: &mut SopEngine,
@@ -274,6 +291,14 @@ impl ApprovalBroker {
         if matches!(decision, ApprovalDecision::Deny { .. }) {
             return Ok(None);
         }
+        let Some((decision_label, decision_identity)) = checkpoint_decision_identity(decision)
+        else {
+            return Ok(None);
+        };
+        let checkpoint_revision = engine
+            .get_run(run_id)
+            .map(|run| run.revision)
+            .unwrap_or_default();
 
         let need = policy
             .as_ref()
@@ -287,8 +312,20 @@ impl ApprovalBroker {
                 "cannot record checkpoint approval vote for run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
             );
         }
-        engine.record_gate_vote(run_id, step, principal)?;
-        let have = engine.distinct_gate_voters(run_id, step);
+        engine.record_checkpoint_gate_vote(
+            run_id,
+            step,
+            checkpoint_revision,
+            decision_label,
+            &decision_identity,
+            principal,
+        )?;
+        let have = engine.distinct_checkpoint_gate_voters(
+            run_id,
+            step,
+            checkpoint_revision,
+            &decision_identity,
+        );
         if have >= need {
             Ok(None)
         } else {
@@ -562,18 +599,30 @@ mod tests {
     }
 
     fn checkpoint_engine_with_broker(cfg: SopApprovalConfig) -> (SopEngine, String) {
+        checkpoint_engine_with_broker_sop(cfg, checkpoint_policy_sop("prod"), manual())
+    }
+
+    fn checkpoint_engine_with_broker_sop(
+        cfg: SopApprovalConfig,
+        sop: Sop,
+        event: SopEvent,
+    ) -> (SopEngine, String) {
+        let sop_name = sop.name.clone();
         let broker = Arc::new(ApprovalBroker::disabled());
         let sop_config = SopConfig {
             approval: cfg,
             ..SopConfig::default()
         };
         let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
-        e.set_sops_for_test(vec![checkpoint_policy_sop("prod")]);
-        let first = e.start_run("triage", manual()).unwrap();
+        e.set_sops_for_test(vec![sop]);
+        let first = e.start_run(&sop_name, event).unwrap();
         let id = run_id_from_action(&first).to_string();
-        let parked = e
-            .drive_headless_deterministic(&id, first)
-            .expect("drive to checkpoint");
+        let parked = if matches!(first, SopRunAction::CheckpointWait { .. }) {
+            first
+        } else {
+            e.drive_headless_deterministic(&id, first)
+                .expect("drive to checkpoint")
+        };
         assert!(
             matches!(parked, SopRunAction::CheckpointWait { .. }),
             "expected checkpoint wait, got {parked:?}"
@@ -581,6 +630,89 @@ mod tests {
         assert_eq!(
             e.get_run(&id).map(|r| r.status),
             Some(SopRunStatus::PausedCheckpoint)
+        );
+        (e, id)
+    }
+
+    fn editable_checkpoint_policy_sop(policy: &str) -> Sop {
+        let mut sop = checkpoint_policy_sop(policy);
+        sop.name = "editable-triage".into();
+        sop.steps.remove(0);
+        sop.steps[0].number = 1;
+        sop.steps[0].edit = Some("body".into());
+        sop.steps[1].number = 2;
+        sop
+    }
+
+    fn payload_event(payload: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: Some(payload.into()),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    struct StubLlmGenerate;
+
+    impl crate::sop::capability::SopCapability for StubLlmGenerate {
+        fn id(&self) -> &'static str {
+            "llm.generate"
+        }
+
+        fn describe(&self) -> crate::sop::capability::CapabilityInfo {
+            crate::sop::capability::CapabilityInfo {
+                id: self.id(),
+                description: "stub llm.generate",
+                deterministic: true,
+                idempotent: false,
+                reversible: true,
+                supports_retry: true,
+                required_permissions: vec![],
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: crate::sop::capability::CapabilityContext,
+            input: serde_json::Value,
+        ) -> anyhow::Result<crate::sop::capability::CapabilityResult> {
+            let feedback = input
+                .get("revision_feedback")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+            Ok(crate::sop::capability::CapabilityResult::success(
+                serde_json::json!({"body": format!("draft [feedback: {feedback}]")}),
+            ))
+        }
+    }
+
+    fn revisable_checkpoint_engine_with_broker(cfg: SopApprovalConfig) -> (SopEngine, String) {
+        let mut sop = checkpoint_policy_sop("prod");
+        sop.name = "revisable-triage".into();
+        sop.steps[0].capability = Some("llm.generate".into());
+        sop.steps.truncate(2);
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval: cfg,
+            ..SopConfig::default()
+        };
+        let mut registry = crate::sop::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(StubLlmGenerate);
+        let mut e = SopEngine::new(sop_config)
+            .with_approval_broker(broker)
+            .with_capabilities(Arc::new(registry));
+        e.set_sops_for_test(vec![sop]);
+        let first = e.start_run("revisable-triage", manual()).unwrap();
+        let id = run_id_from_action(&first).to_string();
+        let parked = e
+            .drive_headless_deterministic(&id, first)
+            .expect("drive to revisable checkpoint");
+        assert!(
+            matches!(parked, SopRunAction::CheckpointWait { .. }),
+            "expected checkpoint wait, got {parked:?}"
         );
         (e, id)
     }
@@ -663,6 +795,159 @@ mod tests {
             finished.step_results.len(),
             3,
             "the post-checkpoint tail runs only after quorum"
+        );
+    }
+
+    #[test]
+    fn checkpoint_quorum_votes_do_not_mix_approve_and_amend_payloads() {
+        let (mut e, id) = checkpoint_engine_with_broker_sop(
+            approval_cfg(&["alice", "bob"], 2),
+            editable_checkpoint_policy_sop("prod"),
+            payload_event(r#"{"body":"draft","repo":"o/r"}"#),
+        );
+
+        let approve = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            approve,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+
+        let amend = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Amend {
+                    text: "operator rewrite".into(),
+                },
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(amend, BrokerOutcome::PendingQuorum { have: 1, need: 2 }),
+            "an Approve vote must not combine with an Amend vote for another payload: {amend:?}"
+        );
+
+        let different_amend = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Amend {
+                    text: "different rewrite".into(),
+                },
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                different_amend,
+                BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+            ),
+            "Amend votes for different text must not combine: {different_amend:?}"
+        );
+        assert_eq!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "mixed positive decisions must leave the checkpoint parked"
+        );
+
+        let matching_amend = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Amend {
+                    text: "operator rewrite".into(),
+                },
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            matching_amend,
+            BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_revise_quorum_is_decision_scoped_and_revision_scoped() {
+        let (mut e, id) =
+            revisable_checkpoint_engine_with_broker(approval_cfg(&["alice", "bob"], 2));
+
+        let revise = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Revise {
+                    guidance: "shorter".into(),
+                },
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            revise,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+
+        let approve = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(approve, BrokerOutcome::PendingQuorum { have: 1, need: 2 }),
+            "a Revise vote must not combine with an Approve vote: {approve:?}"
+        );
+
+        let matching_revise = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Revise {
+                    guidance: "shorter".into(),
+                },
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            matching_revise,
+            BrokerOutcome::Resolved(ResolveOutcome::Revised)
+        ));
+        assert_eq!(
+            e.get_run(&id).map(|r| r.revision),
+            Some(1),
+            "the successful revise must present a new checkpoint revision"
+        );
+
+        let fresh_first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                fresh_first,
+                BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+            ),
+            "old revision-0 approve votes must not authorize the revised draft: {fresh_first:?}"
+        );
+
+        let fresh_second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            fresh_second,
+            BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+        ));
+        assert_eq!(
+            e.last_finished_run("revisable-triage").map(|r| r.status),
+            Some(SopRunStatus::Completed)
         );
     }
 
@@ -853,14 +1138,10 @@ mod tests {
 
     #[test]
     fn quorum_vote_refused_while_park_persist_is_pending() {
-        // Regression (Audacity88 B-rebase pass): a quorum vote is recorded BEFORE
-        // `resolve_gate` runs (only the FINAL vote that reaches quorum calls it), so
-        // `resolve_gate`'s own `is_park_persist_pending` guard cannot protect the
-        // first N-1 votes. A vote recorded while the run's parked snapshot is not
-        // yet durable would durably outlive the run if it never manages to persist
-        // and is lost across a restart - an orphaned `gate_vote` row for a run that
-        // no longer exists. The broker must refuse to record a vote at all while
-        // that pending-persist state holds.
+        // A quorum vote is recorded before `resolve_gate` runs; only the final vote
+        // that reaches quorum calls the resolver. The resolver's own pending-persist
+        // guard cannot protect the first N-1 votes, so the broker must refuse to
+        // record any vote while the parked snapshot is not yet durable.
         let store = std::sync::Arc::new(FailingSaveStore {
             inner: crate::sop::store::InMemoryRunStore::new(),
         });
@@ -911,13 +1192,10 @@ mod tests {
 
     #[test]
     fn quorum_vote_refused_from_a_principal_approval_mode_rejects() {
-        // Regression (Audacity88 B-rebase pass, round 2): `resolve_gate` enforces
-        // `approval_mode` (e.g. `OutOfBandRequired` rejects the agent principal), but
-        // a quorum vote is recorded BEFORE `resolve_gate` runs - only the FINAL vote
-        // that reaches quorum ever calls it. Without this guard, an agent principal
-        // under `OutOfBandRequired` (or an out-of-band principal under `AgentTool`)
-        // could durably record a vote toward a quorum it could never actually clear,
-        // even though `approval_mode` says it must not participate at all.
+        // `resolve_gate` enforces `approval_mode`, but a quorum vote is recorded
+        // before `resolve_gate` runs; only the final vote that reaches quorum ever
+        // calls it. A principal that `approval_mode` would reject must never record
+        // even a partial vote toward a quorum it cannot clear.
         let broker = Arc::new(ApprovalBroker::disabled());
         // "bot" is a bare (any-source) group member, so membership passes; the mode
         // check must be what blocks this, not group authorization.
@@ -996,12 +1274,9 @@ mod tests {
 
     #[test]
     fn empty_required_group_is_treated_as_no_membership_gate() {
-        // Regression (Audacity88 B-rebase pass, round 3): the config contract says
-        // `required_group`'s "`None`/empty" both mean no membership gate, but the
-        // broker only special-cased `None` - a blank `required_group = ""` matched
-        // `Some("")` and gated every principal against a group nobody could ever be
-        // a member of, permanently stuck. An empty string must behave exactly like
-        // `None`.
+        // The config contract says `required_group`'s `None` and empty values both
+        // mean no membership gate. A blank `required_group = ""` must not gate every
+        // principal against a group nobody could ever join.
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),
@@ -1045,11 +1320,9 @@ mod tests {
 
     #[test]
     fn escalation_route_empty_string_is_treated_as_none() {
-        // Regression (Audacity88 B-rebase pass, round 3): the config contract says
-        // `escalation_route`'s "`None`/empty" both re-surface to the same route, but
-        // `ApprovalBroker::escalation_route` returned `Some("")` verbatim, which
-        // timeout delivery would then send an escalation notice to (a nonsensical
-        // empty route name).
+        // The config contract says `escalation_route`'s `None` and empty values both
+        // re-surface to the same route. A blank string must not produce an escalation
+        // notice to a nonsensical empty route name.
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),

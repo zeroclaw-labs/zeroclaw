@@ -3464,6 +3464,64 @@ impl SopEngine {
         step: u32,
         principal: &super::approval::ApprovalPrincipal,
     ) -> Result<(), StoreError> {
+        self.record_gate_vote_scoped(run_id, step, None, None, None, principal)
+    }
+
+    /// Record a quorum vote for a deterministic checkpoint presentation. Checkpoint
+    /// votes must be scoped tighter than approval-gate votes because the same step
+    /// can be answered with materially different public-mutation decisions.
+    pub(crate) fn record_checkpoint_gate_vote(
+        &self,
+        run_id: &str,
+        step: u32,
+        checkpoint_revision: u32,
+        decision_label: &str,
+        decision_identity: &str,
+        principal: &super::approval::ApprovalPrincipal,
+    ) -> Result<(), StoreError> {
+        self.record_gate_vote_scoped(
+            run_id,
+            step,
+            Some(checkpoint_revision),
+            Some(decision_label),
+            Some(decision_identity),
+            principal,
+        )
+    }
+
+    fn record_gate_vote_scoped(
+        &self,
+        run_id: &str,
+        step: u32,
+        checkpoint_revision: Option<u32>,
+        decision_label: Option<&str>,
+        decision_identity: Option<&str>,
+        principal: &super::approval::ApprovalPrincipal,
+    ) -> Result<(), StoreError> {
+        let mut payload = serde_json::json!({
+            "step": step,
+            "source": principal.source_label(),
+        });
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(revision) = checkpoint_revision {
+                object.insert(
+                    "checkpoint_revision".to_string(),
+                    serde_json::Value::Number(revision.into()),
+                );
+            }
+            if let Some(label) = decision_label {
+                object.insert(
+                    "decision".to_string(),
+                    serde_json::Value::String(label.to_string()),
+                );
+            }
+            if let Some(identity) = decision_identity {
+                object.insert(
+                    "decision_identity".to_string(),
+                    serde_json::Value::String(identity.to_string()),
+                );
+            }
+        }
         let ev = SopEventRecord {
             run_id: run_id.to_string(),
             seq: 0,
@@ -3475,10 +3533,7 @@ impl SopEngine {
             // voter_key`'s own doc for the full canonicalization rationale.
             actor: Some(principal.voter_key()),
             reason: None,
-            payload: serde_json::json!({
-                "step": step,
-                "source": principal.source_label(),
-            }),
+            payload,
         };
         self.store.append_event(&ev).map(|_| ())
     }
@@ -3490,15 +3545,63 @@ impl SopEngine {
     /// repeat vote by the same identity on the same source counts once. Returns 0 on
     /// a store error (fail-closed: an unreadable ledger cannot satisfy a quorum).
     pub(crate) fn distinct_gate_voters(&self, run_id: &str, step: u32) -> usize {
+        self.distinct_gate_voters_scoped(run_id, step, None, None)
+    }
+
+    /// Count distinct checkpoint voters for exactly one gate presentation and one
+    /// canonical positive decision identity. Stale-prompt votes and mixed
+    /// approve/amend/revise payloads do not combine.
+    pub(crate) fn distinct_checkpoint_gate_voters(
+        &self,
+        run_id: &str,
+        step: u32,
+        checkpoint_revision: u32,
+        decision_identity: &str,
+    ) -> usize {
+        self.distinct_gate_voters_scoped(
+            run_id,
+            step,
+            Some(checkpoint_revision),
+            Some(decision_identity),
+        )
+    }
+
+    fn distinct_gate_voters_scoped(
+        &self,
+        run_id: &str,
+        step: u32,
+        checkpoint_revision: Option<u32>,
+        decision_identity: Option<&str>,
+    ) -> usize {
         let Ok(events) = self.store.list_events(run_id) else {
             return 0;
         };
         let mut voters: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for ev in events {
-            if ev.kind == "gate_vote"
-                && ev.payload.get("step").and_then(|s| s.as_u64()) == Some(u64::from(step))
-                && let Some(actor) = ev.actor
+            if ev.kind != "gate_vote"
+                || ev.payload.get("step").and_then(|s| s.as_u64()) != Some(u64::from(step))
             {
+                continue;
+            }
+            let scope_matches = match (checkpoint_revision, decision_identity) {
+                (Some(revision), Some(identity)) => {
+                    ev.payload
+                        .get("checkpoint_revision")
+                        .and_then(|r| r.as_u64())
+                        == Some(u64::from(revision))
+                        && ev.payload.get("decision_identity").and_then(|i| i.as_str())
+                            == Some(identity)
+                }
+                (None, None) => {
+                    ev.payload.get("checkpoint_revision").is_none()
+                        && ev.payload.get("decision_identity").is_none()
+                }
+                _ => false,
+            };
+            if !scope_matches {
+                continue;
+            }
+            if let Some(actor) = ev.actor {
                 voters.insert(actor);
             }
         }
@@ -7083,16 +7186,10 @@ mod tests {
 
     #[test]
     fn resolve_gate_refuses_to_approve_while_park_persist_is_pending() {
-        // Regression (Audacity88 round 4): `resolve_gate` used to reacquire the
-        // claim and, on a later ledger-append failure, roll it back
-        // unconditionally - correct for a claim freshly reacquired by THIS call,
-        // but wrong when the claim was ALREADY held (kept by
-        // `persist_parked_snapshot_then_release_claim`'s fail-closed keep,
-        // tracked in `claims_pending_persist`): rolling back would release a
-        // pre-existing claim, stranding the run both claimless AND still
-        // unpersisted. `is_park_persist_pending` must refuse the approve attempt
-        // outright while the park is pending, before it ever touches the claim
-        // or the ledger.
+        // A pending park can already hold the exec claim because fail-closed
+        // persistence kept it. Approval must be refused before reacquiring or
+        // rolling back any claim; otherwise a failed approval attempt could release
+        // that pre-existing claim and leave the run both claimless and unpersisted.
         let store = std::sync::Arc::new(FailingSaveStore {
             inner: InMemoryRunStore::new(),
         });
@@ -7362,13 +7459,10 @@ mod tests {
 
     #[test]
     fn parked_claim_kept_after_failed_persist_survives_maintenance_reap() {
-        // Regression (Audacity88 round 3): keeping the claim on a failed park
-        // persist is only fail-closed if the kept claim's lease keeps being
-        // renewed. Without tracking it in `claims_pending_persist`,
-        // `heartbeat_active_claims` skips it (parked status), its lease goes
-        // un-renewed, and `reap_expired_claims` reclaims it once the lease is in
-        // the past - silently undoing the fail-closed keep and letting a newer
-        // trigger over-admit.
+        // Keeping the claim on a failed park persist is only fail-closed if that
+        // claim's lease keeps being renewed. Otherwise the maintenance reaper can
+        // reclaim it while the run is still unpersisted, undoing the fail-closed
+        // keep and allowing a newer trigger to over-admit.
         let store = std::sync::Arc::new(FailingSaveLeasedStore::new());
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
         let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
@@ -8766,10 +8860,9 @@ type = "manual"
 
     #[test]
     fn failed_revise_writes_no_resolved_row_and_leaves_the_draft_unchanged() {
-        // Audacity88 blocking finding: the resolved ledger row must NOT be
-        // appended before the re-draft's (fallible) model call. A failed Revise
-        // must leave zero gate_resolved rows, the original draft parked, and the
-        // revision counter untouched — the run stays answerable.
+        // The resolved ledger row must not be appended before the re-draft's
+        // fallible model call. A failed Revise leaves zero gate_resolved rows, the
+        // original draft parked, and the revision counter untouched.
         let mut sop = capability_checkpoint_sop("cp-revise-fail");
         sop.steps[0].capability = Some("llm.generate".into());
         sop.steps.truncate(2);
@@ -9096,10 +9189,9 @@ type = "manual"
 
     #[tokio::test]
     async fn sop_approve_tool_resumes_deterministic_checkpoint() {
-        // Regression guard (#8304 review): the sop_approve tool must route a
-        // PausedCheckpoint to approve_step, because resolve_gate reports NotWaiting
-        // for it. Without that routing the tool answers "not waiting for approval"
-        // and a deterministic run is stuck unresumable through every surface.
+        // The sop_approve tool must route a PausedCheckpoint to approve_step because
+        // resolve_gate reports NotWaiting for it. Without that routing the tool
+        // answers "not waiting for approval" and the deterministic run is stuck.
         use crate::tools::SopApproveTool;
         use zeroclaw_api::tool::Tool;
 

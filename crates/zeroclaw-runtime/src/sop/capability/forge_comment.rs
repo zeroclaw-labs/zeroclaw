@@ -46,10 +46,10 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
 
-/// Upper bound on one forge write (a single HTTP POST). The capability blocks the
-/// engine lock while waiting, so this must stay small; a forge that can't accept a
-/// comment in this window is treated as failed and the step's `on_failure` policy
-/// takes over.
+/// Soft alert boundary for one forge write. If the channel send has not finished
+/// by this point, the bridge keeps waiting for the eventual result instead of
+/// letting a public mutation continue in the background while the SOP takes
+/// `on_failure`.
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Injected seam that performs the actual forge write. Kept **synchronous** because

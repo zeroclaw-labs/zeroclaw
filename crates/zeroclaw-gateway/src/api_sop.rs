@@ -471,15 +471,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn loopback_caller_with_a_valid_token_keeps_its_authenticated_identity() {
-        // Regression (Audacity88 B-rebase pass, round 3): a loopback caller is always
-        // allowed (`AdminReloadGate::Allow`), but `authorize()` used to map that
-        // straight to `ApprovalPrincipal::cli(None)` regardless of whether a valid
-        // paired bearer token was ALSO presented - discarding the authenticated
-        // identity. A local dashboard/HTTP client with a valid token whose hash is a
-        // policy's `required_group` member would then be rejected as an anonymous
-        // CLI (no identity, cannot satisfy ANY required-group membership), even
-        // though the exact same token from a non-loopback peer resolves correctly
-        // (see `http_surface_enforces_policy_membership_via_authenticated_subject`).
+        // A loopback caller is always allowed (`AdminReloadGate::Allow`), but a valid
+        // paired bearer token must still win over anonymous CLI attribution. Local
+        // dashboards with a member token need the same approval identity as remote
+        // HTTP clients, or required-group membership rejects them incorrectly.
         let run_status = |state: &AppState, id: &str| {
             state
                 .sop_engine
@@ -522,17 +517,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn loopback_bearer_identity_is_not_derived_when_pairing_is_disabled() {
-        // Regression (Audacity88 B-rebase pass, round 4): the round-3 fix above
-        // derived a loopback caller's identity from ANY bearer token that
-        // `authenticate_and_hash` accepted - but `PairingGuard::is_authenticated`
-        // treats EVERY token as valid when `require_pairing` is false (a
-        // pass-through for that mode, not real authentication). Without gating on
-        // `require_pairing`, a loopback caller with pairing disabled could present
-        // an arbitrary bearer value and be attributed the derived hash as its
-        // approval identity - fabricating membership in a required group from an
-        // unauthenticated header. The gate must NOT clear from an unauthenticated
-        // loopback request even if its (meaningless, pairing-off) token hash
-        // happens to match a real group member.
+        // Pairing-disabled mode treats every bearer as accepted for transport
+        // compatibility, not as a real authenticated subject. A loopback caller in
+        // that mode must not fabricate group membership by presenting an arbitrary
+        // bearer value whose derived hash happens to match a member.
         let run_status = |state: &AppState, id: &str| {
             state
                 .sop_engine
