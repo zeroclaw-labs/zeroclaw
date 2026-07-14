@@ -762,24 +762,15 @@ impl SopEngine {
             })
     }
 
-    /// Persist a run that has reached a terminal state (best-effort).
-    fn persist_terminal(&self, run: &SopRun) {
+    /// Persist a run that has reached a terminal state.
+    fn persist_terminal(&self, run: &SopRun) -> Result<(), StoreError> {
         let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
         // The terminal write is the run's final revision; advance past the last
         // active snapshot so the store's revision guard accepts it.
         pr.revision = self.next_run_revision(&run.run_id);
-        if let Err(e) = self.store.finish_run(&run.run_id, &pr) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"run_id": run.run_id, "error": e.to_string()})
-                    ),
-                "SOP engine: failed to persist terminal run"
-            );
-        }
+        self.store.finish_run(&run.run_id, &pr)?;
         self.notify_run(run, false);
+        Ok(())
     }
 
     fn record_transition_event(
@@ -2806,6 +2797,273 @@ impl SopEngine {
         })
     }
 
+    fn forge_comment_effect_payload(
+        &self,
+        sop: &Sop,
+        step_number: u32,
+        input: &Value,
+    ) -> Result<Value> {
+        let target =
+            super::capability::resolve_forge_comment_target(input).map_err(anyhow::Error::msg)?;
+        Ok(::serde_json::json!({
+            "capability": "forge.comment",
+            "sop_name": sop.name,
+            "step": step_number,
+            "channel": target.channel,
+            "repo": target.repo,
+            "number": target.number,
+            "body": target.body,
+        }))
+    }
+
+    fn forge_comment_success_output(&self, input: &Value) -> Result<Value> {
+        let target =
+            super::capability::resolve_forge_comment_target(input).map_err(anyhow::Error::msg)?;
+        Ok(::serde_json::json!({
+            "posted": true,
+            "repo": target.repo,
+            "number": target.number,
+        }))
+    }
+
+    fn forge_comment_effect_state(
+        &self,
+        run_id: &str,
+        effect_payload: &Value,
+    ) -> Result<(bool, bool), StoreError> {
+        let mut started = false;
+        let mut completed = false;
+        for event in self.store.list_events(run_id)? {
+            if event.payload == *effect_payload {
+                match event.kind.as_str() {
+                    "capability_effect_started" => started = true,
+                    "capability_effect_completed" => completed = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok((started, completed))
+    }
+
+    fn record_forge_comment_effect_marker(
+        &self,
+        run_id: &str,
+        kind: &str,
+        effect_payload: Value,
+    ) -> Result<(), StoreError> {
+        self.store
+            .append_event(&SopEventRecord {
+                run_id: run_id.to_string(),
+                seq: 0,
+                ts: now_iso8601(),
+                kind: kind.to_string(),
+                actor: None,
+                reason: None,
+                payload: effect_payload,
+            })
+            .map(|_| ())
+    }
+
+    fn record_forge_comment_failure(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step: &SopStep,
+        error: String,
+        started_at: String,
+    ) -> Result<SopRunAction> {
+        self.metrics.record_capability_executed(&sop.name);
+        let completed_at = Some(now_iso8601());
+        self.record_deterministic_step_result(
+            run_id,
+            sop,
+            step,
+            SopStepStatus::Failed,
+            error.clone(),
+            serde_json::Value::String(error),
+            started_at,
+            completed_at,
+        )
+    }
+
+    fn execute_forge_comment_step(
+        &mut self,
+        sop: &Sop,
+        run_id: &str,
+        step: &SopStep,
+        input: Value,
+        capability_input: Value,
+        started_at: String,
+    ) -> Result<SopRunAction> {
+        if !self.forge_comment_authorized_by_prior_checkpoint(
+            sop,
+            run_id,
+            step.number,
+            &capability_input,
+        ) {
+            return self.record_forge_comment_failure(
+                run_id,
+                sop,
+                step,
+                "forge.comment requires the immediately preceding checkpoint to approve the exact repo, number, and body"
+                    .to_string(),
+                started_at,
+            );
+        }
+
+        let effect_payload =
+            match self.forge_comment_effect_payload(sop, step.number, &capability_input) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    return self.record_forge_comment_failure(
+                        run_id,
+                        sop,
+                        step,
+                        format!("forge.comment: invalid target for effect ledger: {e}"),
+                        started_at,
+                    );
+                }
+            };
+        let success_output = match self.forge_comment_success_output(&capability_input) {
+            Ok(output) => output,
+            Err(e) => {
+                return self.record_forge_comment_failure(
+                    run_id,
+                    sop,
+                    step,
+                    format!("forge.comment: invalid target for success replay: {e}"),
+                    started_at,
+                );
+            }
+        };
+
+        match self.forge_comment_effect_state(run_id, &effect_payload) {
+            Ok((_started, true)) => {
+                self.metrics.record_capability_executed(&sop.name);
+                let completed_at = Some(now_iso8601());
+                return self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Completed,
+                    success_output.to_string(),
+                    success_output,
+                    started_at,
+                    completed_at,
+                );
+            }
+            Ok((true, false)) => {
+                return self.record_forge_comment_failure(
+                    run_id,
+                    sop,
+                    step,
+                    "forge.comment has a prior unconfirmed public-send attempt for this run/step/target; refusing to replay automatically"
+                        .to_string(),
+                    started_at,
+                );
+            }
+            Ok((false, false)) => {}
+            Err(e) => {
+                return self.record_forge_comment_failure(
+                    run_id,
+                    sop,
+                    step,
+                    format!(
+                        "forge.comment cannot inspect durable effect ledger (fail-closed): {e}"
+                    ),
+                    started_at,
+                );
+            }
+        }
+
+        if let Err(e) = self.record_forge_comment_effect_marker(
+            run_id,
+            "capability_effect_started",
+            effect_payload.clone(),
+        ) {
+            return self.record_forge_comment_failure(
+                run_id,
+                sop,
+                step,
+                format!(
+                    "forge.comment cannot persist public-send attempt marker (fail-closed): {e}"
+                ),
+                started_at,
+            );
+        }
+
+        let ctx = super::capability::CapabilityContext {
+            run_id: run_id.to_string(),
+            sop_name: sop.name.clone(),
+            step_number: step.number,
+            sop_location: sop.location.clone(),
+        };
+        let result = self.capabilities.execute_step(ctx, step, input);
+        self.metrics.record_capability_executed(&sop.name);
+        let completed_at = Some(now_iso8601());
+        match result {
+            Ok(result) if result.success => {
+                if let Err(e) = self.record_forge_comment_effect_marker(
+                    run_id,
+                    "capability_effect_completed",
+                    effect_payload,
+                ) {
+                    let error = format!(
+                        "forge.comment posted but could not persist success marker (fail-closed; refusing replay): {e}"
+                    );
+                    return self.record_deterministic_step_result(
+                        run_id,
+                        sop,
+                        step,
+                        SopStepStatus::Failed,
+                        error.clone(),
+                        serde_json::Value::String(error),
+                        started_at,
+                        completed_at,
+                    );
+                }
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Completed,
+                    result.output.to_string(),
+                    result.output,
+                    started_at,
+                    completed_at,
+                )
+            }
+            Ok(result) => {
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "capability returned failure".to_string());
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Failed,
+                    error.clone(),
+                    serde_json::Value::String(error),
+                    started_at,
+                    completed_at,
+                )
+            }
+            Err(e) => {
+                let error = e.to_string();
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Failed,
+                    error.clone(),
+                    serde_json::Value::String(error),
+                    started_at,
+                    completed_at,
+                )
+            }
+        }
+    }
+
     fn execute_capability_step(
         &mut self,
         sop: &Sop,
@@ -2815,28 +3073,14 @@ impl SopEngine {
     ) -> Result<SopRunAction> {
         let started_at = now_iso8601();
         let capability_input = step.capability_call_input(input.clone());
-        if step.capability_id() == Some("forge.comment")
-            && !self.forge_comment_authorized_by_prior_checkpoint(
+        if step.capability_id() == Some("forge.comment") {
+            return self.execute_forge_comment_step(
                 sop,
                 run_id,
-                step.number,
-                &capability_input,
-            )
-        {
-            self.metrics.record_capability_executed(&sop.name);
-            let completed_at = Some(now_iso8601());
-            let error =
-                "forge.comment requires the immediately preceding checkpoint to approve the exact repo, number, and body"
-                    .to_string();
-            return self.record_deterministic_step_result(
-                run_id,
-                sop,
                 step,
-                SopStepStatus::Failed,
-                error.clone(),
-                serde_json::Value::String(error),
+                input,
+                capability_input,
                 started_at,
-                completed_at,
             );
         }
 
@@ -3524,13 +3768,32 @@ impl SopEngine {
         status: SopRunStatus,
         reason: Option<String>,
     ) -> SopRunAction {
-        let mut run = self.active_runs.remove(run_id).unwrap();
+        let mut run = self.active_runs.get(run_id).cloned().unwrap();
         run.status = status;
         run.completed_at = Some(now_iso8601());
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
+        if let Err(e) = self.persist_terminal(&run) {
+            let error = format!("failed to persist terminal run (fail-closed): {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run.run_id.as_str(),
+                        "error": e.to_string(),
+                    })),
+                "SOP engine: failed to persist terminal run; keeping active run for retry"
+            );
+            return SopRunAction::Failed {
+                run_id: run_id_owned,
+                sop_name,
+                reason: error,
+            };
+        }
+
+        self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
-        self.persist_terminal(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
         // not leave one behind claiming `paused_at_checkpoint`. Decisions and the
         // final status live in the run store / approval ledger, not the snapshot.
@@ -9038,6 +9301,124 @@ type = "manual"
         }
     }
 
+    struct FailFirstFinishStore {
+        inner: InMemoryRunStore,
+        fail_next_finish: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailFirstFinishStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryRunStore::new(),
+                fail_next_finish: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl SopRunStore for FailFirstFinishStore {
+        fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.save_run(run)
+        }
+
+        fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
+            if self
+                .fail_next_finish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Backend(
+                    "injected first terminal persistence failure".into(),
+                ));
+            }
+            self.inner.finish_run(run_id, terminal)
+        }
+
+        fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_active_runs()
+        }
+
+        fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
+
+        fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
+            self.inner.load_run(run_id)
+        }
+
+        fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
+            self.inner.last_terminal_completed_at(sop_name)
+        }
+
+        fn try_claim_run(
+            &self,
+            run_id: &str,
+            sop_name: &str,
+            per_sop_cap: usize,
+            global_cap: usize,
+        ) -> Result<Option<ClaimToken>, StoreError> {
+            self.inner
+                .try_claim_run(run_id, sop_name, per_sop_cap, global_cap)
+        }
+
+        fn renew_claim_for_restore(
+            &self,
+            run_id: &str,
+            sop_name: &str,
+        ) -> Result<ClaimToken, StoreError> {
+            self.inner.renew_claim_for_restore(run_id, sop_name)
+        }
+
+        fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+            self.inner.claim_counts(sop_name)
+        }
+
+        fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.heartbeat_claim(token)
+        }
+
+        fn release_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.release_claim(token)
+        }
+
+        fn expired_claims(&self, now_iso: &str) -> Result<Vec<ClaimToken>, StoreError> {
+            self.inner.expired_claims(now_iso)
+        }
+
+        fn append_event(&self, event: &SopEventRecord) -> Result<u64, StoreError> {
+            self.inner.append_event(event)
+        }
+
+        fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+            self.inner.list_events(run_id)
+        }
+
+        fn save_proposal(&self, proposal: &ProposalRecord) -> Result<(), StoreError> {
+            self.inner.save_proposal(proposal)
+        }
+
+        fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+            self.inner.load_proposal(id)
+        }
+
+        fn list_proposals(
+            &self,
+            status: Option<ProposalStatus>,
+        ) -> Result<Vec<ProposalRecord>, StoreError> {
+            self.inner.list_proposals(status)
+        }
+
+        fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
+            self.inner.prune(policy)
+        }
+
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+
+        fn backend(&self) -> &'static str {
+            "fail-first-finish-test"
+        }
+    }
+
     #[test]
     fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
         // Marc's double-HITL shape: `checkpoint -> capability -> ...`. The
@@ -9203,9 +9584,141 @@ type = "manual"
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint resolution must append the ledger row before forge.comment executes: {events:?}"
         );
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.kind == "capability_effect_completed"),
+            "forge.comment success must write a durable effect marker: {events:?}"
+        );
         let run = engine
             .last_finished_run("forge-approved")
             .expect("run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Completed);
+    }
+
+    #[test]
+    fn forge_comment_reapproval_after_terminal_persist_failure_does_not_repost() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn SopRunStore> = Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-replay")])
+            .with_store(Arc::clone(&store))
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-replay", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "forge run must park before writing: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let first_outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("first checkpoint approve reaches forge tail");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(first_final_action),
+        ) = first_outcome
+        else {
+            panic!("expected Resolved(Resumed), got {first_outcome:?}");
+        };
+        assert!(
+            matches!(
+                &*first_final_action,
+                SopRunAction::Failed { reason, .. }
+                    if reason.contains("failed to persist terminal run")
+            ),
+            "injected terminal persistence failure must fail closed: {first_final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first approval performs the public forge write once"
+        );
+        assert!(
+            engine.get_run(&run_id).is_some(),
+            "terminal persistence failure keeps the in-memory run active"
+        );
+        assert!(
+            engine.last_finished_run("forge-replay").is_none(),
+            "terminal persistence failure must not move the run to finished_runs"
+        );
+        let first_events = engine.run_events(&run_id).unwrap();
+        assert_eq!(
+            first_events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_started")
+                .count(),
+            1,
+            "forge write must have a durable started marker before the public send: {first_events:?}"
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_completed")
+                .count(),
+            1,
+            "forge write must have a durable completed marker after the public send: {first_events:?}"
+        );
+
+        drop(engine);
+
+        let mut restarted = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-replay")])
+            .with_store(Arc::clone(&store))
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+        restarted.restore_runs();
+        assert_eq!(
+            restarted.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "restart restores the pre-terminal parked checkpoint snapshot"
+        );
+
+        let second_outcome = restarted
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("re-approval resolves from restored checkpoint");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(second_final_action),
+        ) = second_outcome
+        else {
+            panic!("expected Resolved(Resumed), got {second_outcome:?}");
+        };
+        assert!(
+            matches!(*second_final_action, SopRunAction::Completed { .. }),
+            "replay with a completed effect marker must complete without posting again: {second_final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "re-approval after terminal persistence failure must not create a second public comment"
+        );
+        let events = restarted.run_events(&run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_started")
+                .count(),
+            1,
+            "replay must not write a second started marker: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_completed")
+                .count(),
+            1,
+            "replay must reuse the completed effect marker: {events:?}"
+        );
+        let run = restarted
+            .last_finished_run("forge-replay")
+            .expect("replayed run reaches finished list");
         assert_eq!(run.status, SopRunStatus::Completed);
     }
 
@@ -10290,7 +10803,7 @@ type = "manual"
         // The terminal write advances again, is accepted, and leaves no active run.
         run.status = SopRunStatus::Completed;
         run.completed_at = Some(now_iso8601());
-        engine.persist_terminal(&run);
+        engine.persist_terminal(&run).unwrap();
         assert!(
             store.load_active_runs().unwrap().is_empty(),
             "terminal excluded from active"
