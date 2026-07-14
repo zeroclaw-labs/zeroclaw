@@ -20,10 +20,16 @@
 
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_memory::{Memory, MemoryCategory};
+
+/// Cached, locale-resolved descriptions. Resolved once per tier from the tools
+/// Fluent catalogue so `description()` can return a `&'static str` without
+/// re-running Fluent on every call (mirrors `file_download`'s pattern).
+static SHARED_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SYSTEM_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Which shared tier a write targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,22 +48,27 @@ impl SharedTier {
         }
     }
 
-    fn description(self) -> &'static str {
+    /// Fluent key for this tier's model-facing tool description.
+    fn description_key(self) -> &'static str {
         match self {
-            SharedTier::Shared => {
-                "Store a fact into the SHARED household memory that every agent can read. \
-                 Use ONLY when the user explicitly asks to remember something for everyone / \
-                 the whole household. Not for private notes (use memory_store for those)."
-            }
-            SharedTier::System => {
-                "Store a fact into the SYSTEM memory that every agent can read. Admin-only. \
-                 Use ONLY when explicitly asked to record a system-wide operating fact. \
-                 Not for private or household notes."
-            }
+            SharedTier::Shared => "tool-shared-memory-store",
+            SharedTier::System => "tool-system-memory-store",
         }
     }
 
-    /// Human label for the "no bank configured" graceful-refusal message.
+    /// Locale-resolved description, cached per tier.
+    fn description(self) -> &'static str {
+        let cell = match self {
+            SharedTier::Shared => &SHARED_DESCRIPTION,
+            SharedTier::System => &SYSTEM_DESCRIPTION,
+        };
+        cell.get_or_init(|| crate::i18n::get_required_tool_string(self.description_key()))
+            .as_str()
+    }
+
+    /// Stable tier-label token ('shared' / 'system'). Passed as the `$tier`
+    /// Fluent argument for the refusal/success/error messages; it is an
+    /// identifier, not translated prose.
     fn tier_label(self) -> &'static str {
         match self {
             SharedTier::Shared => "shared",
@@ -108,6 +119,16 @@ impl SharedMemoryStoreTool {
             }
         })
     }
+
+    /// Resolve a tools-catalogue Fluent string with no arguments.
+    fn tool_msg(key: &str) -> String {
+        crate::i18n::get_required_tool_string(key)
+    }
+
+    /// Resolve a tools-catalogue Fluent string with external arguments.
+    fn tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
+        crate::i18n::get_required_tool_string_with_args(key, args)
+    }
 }
 
 #[async_trait]
@@ -126,15 +147,15 @@ impl Tool for SharedMemoryStoreTool {
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Unique key for this memory (e.g. 'house_wifi', 'trash_day')"
+                    "description": Self::tool_msg("tool-shared-memory-store-param-key")
                 },
                 "content": {
                     "type": "string",
-                    "description": "The information to remember"
+                    "description": Self::tool_msg("tool-shared-memory-store-param-content")
                 },
                 "category": {
                     "type": "string",
-                    "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                    "description": Self::tool_msg("tool-shared-memory-store-param-category")
                 }
             },
             "required": ["key", "content"]
@@ -142,15 +163,18 @@ impl Tool for SharedMemoryStoreTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let key = args
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::Error::msg("Missing 'key' parameter"))?;
+        let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow::Error::msg(Self::tool_msg("tool-shared-memory-store-error-missing-key"))
+        })?;
 
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::Error::msg("Missing 'content' parameter"))?;
+            .ok_or_else(|| {
+                anyhow::Error::msg(Self::tool_msg(
+                    "tool-shared-memory-store-error-missing-content",
+                ))
+            })?;
 
         let category = match args.get("category").and_then(|v| v.as_str()) {
             Some("core") | None => MemoryCategory::Core,
@@ -167,7 +191,7 @@ impl Tool for SharedMemoryStoreTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
+                output: String::new(),
                 error: Some(error),
             });
         }
@@ -178,10 +202,10 @@ impl Tool for SharedMemoryStoreTool {
         let Some(writable) = self.memory.as_shared_writable() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
-                error: Some(format!(
-                    "{} memory is not available on this backend",
-                    self.tier.tier_label()
+                output: String::new(),
+                error: Some(Self::tool_msg_with_args(
+                    "tool-shared-memory-store-error-not-available",
+                    &[("tier", self.tier.tier_label())],
                 )),
             });
         };
@@ -193,8 +217,11 @@ impl Tool for SharedMemoryStoreTool {
         if bank.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
-                error: Some(format!("no {} bank configured", self.tier.tier_label())),
+                output: String::new(),
+                error: Some(Self::tool_msg_with_args(
+                    "tool-shared-memory-store-error-no-bank",
+                    &[("tier", self.tier.tier_label())],
+                )),
             });
         }
 
@@ -205,15 +232,18 @@ impl Tool for SharedMemoryStoreTool {
         match result {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Stored {} memory: {key}", self.tier.tier_label()).into(),
+                output: Self::tool_msg_with_args(
+                    "tool-shared-memory-store-success",
+                    &[("tier", self.tier.tier_label()), ("key", key)],
+                ),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
-                error: Some(format!(
-                    "Failed to store {} memory: {e}",
-                    self.tier.tier_label()
+                output: String::new(),
+                error: Some(Self::tool_msg_with_args(
+                    "tool-shared-memory-store-error-failed",
+                    &[("tier", self.tier.tier_label()), ("error", &e.to_string())],
                 )),
             }),
         }
@@ -258,6 +288,120 @@ mod tests {
         let schema = shared.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
         assert!(schema["properties"]["content"].is_object());
+    }
+
+    #[test]
+    fn descriptions_and_schema_resolve_through_fluent() {
+        // The model-facing surface must resolve through the tools Fluent
+        // catalogue, not bare literals: a missing key would surface as a
+        // `{tool-...}` stub, so assert the resolved strings are real prose.
+        let mem = hindsight_mem("http://127.0.0.1:1", Some("zeroclaw-house"), None);
+        let shared = SharedMemoryStoreTool::new_shared(mem.clone(), test_security());
+        let system = SharedMemoryStoreTool::new_system(mem, test_security());
+
+        for tool in [&shared, &system] {
+            let desc = tool.description();
+            assert!(
+                !desc.starts_with('{') && !desc.is_empty(),
+                "description must resolve through Fluent, got: {desc}"
+            );
+        }
+        // Tier-specific wording differs between the two descriptions.
+        assert_ne!(shared.description(), system.description());
+
+        let schema = shared.parameters_schema();
+        for param in ["key", "content", "category"] {
+            let d = schema["properties"][param]["description"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                !d.is_empty() && !d.starts_with('{'),
+                "param {param} description must resolve through Fluent, got: {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_locale_resolves_all_shared_keys() {
+        // In the active (CI: English) locale, every key must resolve to real
+        // prose and never the `{key}` missing-string stub.
+        let keys = [
+            "tool-shared-memory-store",
+            "tool-system-memory-store",
+            "tool-shared-memory-store-param-key",
+            "tool-shared-memory-store-param-content",
+            "tool-shared-memory-store-param-category",
+            "tool-shared-memory-store-error-missing-key",
+            "tool-shared-memory-store-error-missing-content",
+        ];
+        for key in keys {
+            let value = crate::i18n::get_required_tool_string(key);
+            assert!(
+                !value.starts_with('{') && !value.is_empty(),
+                "{key} must resolve in the active locale, got: {value}"
+            );
+        }
+        // Argumented messages must inline their $tier / $key / $error values.
+        let not_avail = crate::i18n::get_required_tool_string_with_args(
+            "tool-shared-memory-store-error-not-available",
+            &[("tier", "shared")],
+        );
+        assert!(not_avail.contains("shared"), "got: {not_avail}");
+        let success = crate::i18n::get_required_tool_string_with_args(
+            "tool-shared-memory-store-success",
+            &[("tier", "system"), ("key", "trash_day")],
+        );
+        assert!(success.contains("system") && success.contains("trash_day"));
+    }
+
+    #[test]
+    fn shared_fluent_keys_present_in_all_maintained_locales() {
+        // Each locale the repo ships a tools.ftl for must define every shared/
+        // system key, so switching locale never degrades the surface to a stub.
+        // Parse the embedded catalogues directly (hermetic, no process locale).
+        let catalogues = [
+            (
+                "en",
+                include_str!("../../zeroclaw-runtime/locales/en/tools.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../../zeroclaw-runtime/locales/es/tools.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../../zeroclaw-runtime/locales/fr/tools.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../../zeroclaw-runtime/locales/ja/tools.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../../zeroclaw-runtime/locales/zh-CN/tools.ftl"),
+            ),
+        ];
+        let keys = [
+            "tool-shared-memory-store",
+            "tool-system-memory-store",
+            "tool-shared-memory-store-param-key",
+            "tool-shared-memory-store-param-content",
+            "tool-shared-memory-store-param-category",
+            "tool-shared-memory-store-error-missing-key",
+            "tool-shared-memory-store-error-missing-content",
+            "tool-shared-memory-store-error-not-available",
+            "tool-shared-memory-store-error-no-bank",
+            "tool-shared-memory-store-success",
+            "tool-shared-memory-store-error-failed",
+        ];
+        for (locale, ftl) in catalogues {
+            for key in keys {
+                let defined = ftl
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{key} =")));
+                assert!(defined, "locale {locale} is missing Fluent key {key}");
+            }
+        }
     }
 
     #[tokio::test]

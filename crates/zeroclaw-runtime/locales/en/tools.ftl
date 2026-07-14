@@ -133,6 +133,22 @@ tool-memory-recall = Search long-term memory for relevant facts, preferences, or
 
 tool-memory-store = Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name.
 
+# Shared/system memory write tools (shared_memory_store / system_memory_store).
+# The `$tier` argument is the tier label ('shared' or 'system'); `$key` and
+# `$error` are runtime values. Descriptions are tier-specific; the parameter
+# and message keys are shared by both tiers.
+tool-shared-memory-store = Store a fact into the SHARED household memory that every agent can read. Use ONLY when the user explicitly asks to remember something for everyone / the whole household. Not for private notes (use memory_store for those).
+tool-system-memory-store = Store a fact into the SYSTEM memory that every agent can read. Admin-only. Use ONLY when explicitly asked to record a system-wide operating fact. Not for private or household notes.
+tool-shared-memory-store-param-key = Unique key for this memory (e.g. 'house_wifi', 'trash_day')
+tool-shared-memory-store-param-content = The information to remember
+tool-shared-memory-store-param-category = Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'.
+tool-shared-memory-store-error-missing-key = Missing 'key' parameter
+tool-shared-memory-store-error-missing-content = Missing 'content' parameter
+tool-shared-memory-store-error-not-available = { $tier } memory is not available on this backend
+tool-shared-memory-store-error-no-bank = no { $tier } bank configured
+tool-shared-memory-store-success = Stored { $tier } memory: { $key }
+tool-shared-memory-store-error-failed = Failed to store { $tier } memory: { $error }
+
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
