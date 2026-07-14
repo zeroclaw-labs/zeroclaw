@@ -360,6 +360,43 @@ impl SopEngine {
         saved
     }
 
+    fn persisted_active_snapshot(&self, run_id: &str) -> Result<(PersistedRun, SopRun)> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        self.heartbeat_claim_for_run(&run);
+        let mut persisted = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+        persisted.revision = self.next_run_revision(run_id);
+        Ok((persisted, run))
+    }
+
+    /// Persist an active run transition and append its gate event as one store
+    /// outcome. Used by `resolve_gate` so the durable gate ledger cannot get ahead
+    /// of the run state transition it authorizes.
+    pub(crate) fn persist_active_with_gate_event(
+        &self,
+        run_id: &str,
+        event: &SopEventRecord,
+    ) -> Result<()> {
+        let (persisted, run) = self.persisted_active_snapshot(run_id)?;
+        self.store.save_run_with_event(&persisted, event).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"run_id": run_id, "error": e.to_string()})
+                    ),
+                "SOP engine: gate resolution persistence failed; run transition and ledger remain uncommitted"
+            );
+            anyhow::Error::new(e)
+        })?;
+        self.notify_run(&run, true);
+        Ok(())
+    }
+
     /// Park a run (WaitingApproval / PausedCheckpoint) and free its exec slot, but
     /// ONLY after the parked snapshot is durably persisted. If the persist fails,
     /// the claim is KEPT (fail closed): the run stays correctly counted against
@@ -580,6 +617,30 @@ impl SopEngine {
             );
             anyhow::Error::new(e)
         })?;
+        self.notify_run(run, false);
+        Ok(())
+    }
+
+    /// Terminal counterpart to `persist_active_with_gate_event`: persist the
+    /// terminal run, release its claim, and append the gate-resolution ledger row
+    /// in one store transaction.
+    fn persist_terminal_with_gate_event(&self, run: &SopRun, event: &SopEventRecord) -> Result<()> {
+        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+        pr.revision = self.next_run_revision(&run.run_id);
+        self.store
+            .finish_run_with_event(&run.run_id, &pr, event)
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"run_id": run.run_id, "error": e.to_string()})
+                        ),
+                    "SOP engine: terminal gate resolution persistence failed; run and ledger remain uncommitted"
+                );
+                anyhow::Error::new(e)
+            })?;
         self.notify_run(run, false);
         Ok(())
     }
@@ -1508,6 +1569,17 @@ impl SopEngine {
         step_number: u32,
         reason: String,
     ) -> SopRunAction {
+        self.mark_step_pending_with_persist(run_id, sop, step_number, reason, true)
+    }
+
+    fn mark_step_pending_with_persist(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step_number: u32,
+        reason: String,
+        persist: bool,
+    ) -> SopRunAction {
         let now = now_iso8601();
         if let Some(run) = self.active_runs.get_mut(run_id) {
             run.current_step = step_number;
@@ -1548,7 +1620,9 @@ impl SopEngine {
                 "status": "pending",
             }),
         );
-        self.persist_active(run_id);
+        if persist {
+            self.persist_active(run_id);
+        }
         SopRunAction::Pending {
             run_id: run_id.to_string(),
             sop_name: sop.name.clone(),
@@ -1807,6 +1881,14 @@ impl SopEngine {
             Some(now),
         ) {
             Ok(action) => {
+                if !self.persist_active_checked(run_id) {
+                    self.active_runs.insert(run_id.to_string(), prior_run);
+                    self.claims_pending_persist.remove(run_id);
+                    self.release_claim_on_park(run_id);
+                    return Err(anyhow::Error::msg(format!(
+                        "failed to persist checkpoint denial transition for run {run_id}"
+                    )));
+                }
                 self.record_transition_event(
                     run_id,
                     "checkpoint_denied",
@@ -1879,11 +1961,12 @@ impl SopEngine {
             RunData::from_step_results(&run.step_results)
         };
         if !route::eligible(&step, &run_data) {
-            return Ok(self.mark_step_pending(
+            return Ok(self.mark_step_pending_with_persist(
                 run_id,
                 &sop,
                 step.number,
                 format!("step {} dependencies not satisfied", step.number),
+                false,
             ));
         }
 
@@ -1916,7 +1999,6 @@ impl SopEngine {
             .effective_agent(sop.agent.as_deref())
             .map(str::to_string);
 
-        self.persist_active(run_id);
         Ok(SopRunAction::ExecuteStep {
             run_id: run_id.to_string(),
             step,
@@ -2830,6 +2912,72 @@ impl SopEngine {
                 sop_name,
             },
         })
+    }
+
+    pub(crate) fn finish_run_with_gate_event(
+        &mut self,
+        run_id: &str,
+        status: SopRunStatus,
+        reason: Option<String>,
+        event: &SopEventRecord,
+    ) -> Result<SopRunAction> {
+        let mut run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        run.status = status;
+        run.completed_at = Some(now_iso8601());
+        let sop_name = run.sop_name.clone();
+        let run_id_owned = run.run_id.clone();
+        self.persist_terminal_with_gate_event(&run, event)?;
+        self.active_runs.remove(run_id);
+        self.metrics.record_run_complete(&run);
+        self.finished_runs.push(run);
+
+        let max = self.config.max_finished_runs;
+        if max > 0 && self.finished_runs.len() > max {
+            let excess = self.finished_runs.len() - max;
+            self.finished_runs.drain(..excess);
+        }
+
+        Ok(match status {
+            SopRunStatus::Failed => SopRunAction::Failed {
+                run_id: run_id_owned,
+                sop_name,
+                reason: reason.unwrap_or_default(),
+            },
+            _ => SopRunAction::Completed {
+                run_id: run_id_owned,
+                sop_name,
+            },
+        })
+    }
+
+    pub(crate) fn clear_waiting_gate_with_event(
+        &mut self,
+        run_id: &str,
+        event: &SopEventRecord,
+    ) -> Result<SopRunAction> {
+        let prior_run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let action = match self.clear_waiting_gate(run_id) {
+            Ok(action) => action,
+            Err(e) => {
+                self.active_runs.insert(run_id.to_string(), prior_run);
+                self.release_claim_on_park(run_id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.persist_active_with_gate_event(run_id, event) {
+            self.active_runs.insert(run_id.to_string(), prior_run);
+            self.release_claim_on_park(run_id);
+            return Err(e);
+        }
+        Ok(action)
     }
 
     // ── EPIC C: out-of-band approval plane ──────────────────────────
@@ -5755,8 +5903,23 @@ mod tests {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
             self.inner.save_run(r)
         }
+        fn save_run_with_event(
+            &self,
+            r: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.save_run_with_event(r, e)
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(
             &self,
@@ -5870,17 +6033,48 @@ mod tests {
     struct FailingAppendStore {
         inner: InMemoryRunStore,
         fail: std::sync::atomic::AtomicBool,
+        fail_save: std::sync::atomic::AtomicBool,
         fail_finish: std::sync::atomic::AtomicBool,
     }
     impl SopRunStore for FailingAppendStore {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected save_run failure".into()));
+            }
             self.inner.save_run(r)
+        }
+        fn save_run_with_event(
+            &self,
+            r: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected save_run failure".into()));
+            }
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected append failure".into()));
+            }
+            self.inner.save_run_with_event(r, e)
         }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             if self.fail_finish.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(StoreError::Backend("injected finish failure".into()));
             }
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            if self.fail_finish.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected finish failure".into()));
+            }
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected append failure".into()));
+            }
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(
             &self,
@@ -5962,6 +6156,7 @@ mod tests {
         let store = std::sync::Arc::new(FailingAppendStore {
             inner: InMemoryRunStore::new(),
             fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
             fail_finish: std::sync::atomic::AtomicBool::new(false),
         });
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
@@ -5996,6 +6191,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn approval_active_persist_failure_rolls_back_transition_and_ledger() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "the gate must be durably parked before this test flips save_run failures on"
+        );
+
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .resolve_gate(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .expect_err("active transition persistence failure must reject approval");
+        assert!(err.to_string().contains("injected save_run failure"));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval,
+            "failed active persistence must roll the in-memory gate back to waiting"
+        );
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "the claim reacquired for the rejected approval must be released"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a failed active transition must not append a gate_resolved row: {events:?}"
+        );
+    }
+
     /// Delegates to an in-memory store but fails every `save_run`, to prove a park
     /// does NOT release its exec claim when the parked snapshot cannot be durably
     /// persisted.
@@ -6006,8 +6247,23 @@ mod tests {
         fn save_run(&self, _r: &PersistedRun) -> Result<(), StoreError> {
             Err(StoreError::Backend("injected save_run failure".into()))
         }
+        fn save_run_with_event(
+            &self,
+            _r: &PersistedRun,
+            _e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected save_run failure".into()))
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(
             &self,
@@ -6298,8 +6554,23 @@ mod tests {
         fn save_run(&self, _r: &PersistedRun) -> Result<(), StoreError> {
             Err(StoreError::Backend("injected save_run failure".into()))
         }
+        fn save_run_with_event(
+            &self,
+            _r: &PersistedRun,
+            _e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected save_run failure".into()))
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(
             &self,
@@ -7581,6 +7852,122 @@ type = "manual"
     }
 
     #[test]
+    fn deny_checkpoint_goto_rolls_back_when_active_save_fails() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut sop = deterministic_sop("det-cp-deny-goto-save-fail");
+        sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine
+            .start_run("det-cp-deny-goto-save-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+
+        let before = engine.get_run(&run_id).unwrap();
+        let prior_waiting_since = before.waiting_since.clone();
+        let prior_step_results = before.step_results.len();
+        let prior_current_step = before.current_step;
+        assert_eq!(
+            store.claim_counts("det-cp-deny-goto-save-fail").unwrap(),
+            (0, 0),
+            "the checkpoint must be durably parked before the save failure is injected"
+        );
+
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .decide_checkpoint(&run_id, ApprovalDecision::Deny { reason: None })
+            .expect_err("active save failure must reject the denied checkpoint transition");
+        assert!(
+            err.to_string()
+                .contains("failed to persist checkpoint denial transition"),
+            "unexpected error: {err}"
+        );
+
+        let restored = engine.get_run(&run_id).unwrap();
+        assert_eq!(restored.status, SopRunStatus::PausedCheckpoint);
+        assert_eq!(restored.current_step, prior_current_step);
+        assert_eq!(restored.waiting_since, prior_waiting_since);
+        assert_eq!(restored.step_results.len(), prior_step_results);
+        assert_eq!(
+            store.claim_counts("det-cp-deny-goto-save-fail").unwrap(),
+            (0, 0),
+            "the claim reacquired for the rejected denial must be released"
+        );
+        let events = store.list_events(&run_id).unwrap();
+        assert!(
+            !events.iter().any(|event| event.kind == "checkpoint_denied"),
+            "a failed denied-checkpoint transition must not emit checkpoint_denied: {events:?}"
+        );
+    }
+
+    #[test]
+    fn deny_checkpoint_retry_rolls_back_when_active_save_fails() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut sop = deterministic_sop("det-cp-deny-retry-save-fail");
+        sop.steps[1].on_failure = StepFailure::Retry { max: 2 };
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine
+            .start_run("det-cp-deny-retry-save-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+
+        let before = engine.get_run(&run_id).unwrap();
+        let prior_waiting_since = before.waiting_since.clone();
+        let prior_step_results = before.step_results.len();
+        let prior_current_step = before.current_step;
+        assert_eq!(
+            store.claim_counts("det-cp-deny-retry-save-fail").unwrap(),
+            (0, 0),
+            "the checkpoint must be durably parked before the save failure is injected"
+        );
+
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .decide_checkpoint(&run_id, ApprovalDecision::Deny { reason: None })
+            .expect_err("active save failure must reject the denied checkpoint retry");
+        assert!(
+            err.to_string()
+                .contains("failed to persist checkpoint denial transition"),
+            "unexpected error: {err}"
+        );
+
+        let restored = engine.get_run(&run_id).unwrap();
+        assert_eq!(restored.status, SopRunStatus::PausedCheckpoint);
+        assert_eq!(restored.current_step, prior_current_step);
+        assert_eq!(restored.waiting_since, prior_waiting_since);
+        assert_eq!(restored.step_results.len(), prior_step_results);
+        assert_eq!(
+            store.claim_counts("det-cp-deny-retry-save-fail").unwrap(),
+            (0, 0),
+            "the claim reacquired for the rejected retry denial must be released"
+        );
+        let events = store.list_events(&run_id).unwrap();
+        assert!(
+            !events.iter().any(|event| event.kind == "checkpoint_denied"),
+            "a failed denied-checkpoint retry must not emit checkpoint_denied: {events:?}"
+        );
+    }
+
+    #[test]
     fn deny_checkpoint_defaults_to_terminal_failure() {
         // With the default on_failure (Fail), a denied checkpoint terminates the
         // run Failed. This is distinct from Cancelled: the operator declined and
@@ -7617,6 +8004,7 @@ type = "manual"
         let store = std::sync::Arc::new(FailingAppendStore {
             inner: InMemoryRunStore::new(),
             fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
             fail_finish: std::sync::atomic::AtomicBool::new(false),
         });
         let mut sop = deterministic_sop("det-cp-deny-finish-fail");

@@ -42,11 +42,29 @@ pub trait SopRunStore: Send + Sync {
     /// byte-identical idempotent retry, else `RevisionConflict`; a newer
     /// revision wins.
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError>;
+    /// Persist an active run transition and append its audit event as one store
+    /// outcome. Implementations must make both writes visible together or neither
+    /// visible at all; callers use this for approval gate resolution so a durable
+    /// `gate_resolved` row cannot exist without the run transition it authorizes.
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Move a run to terminal state (kept as a terminal record, not deleted) and
     /// release any live claim. Revision-guarded exactly like `save_run`, so a
     /// stale or divergent terminal write cannot clobber newer state or release a
     /// live claim.
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError>;
+    /// Move a run to terminal state and append its audit event as one store
+    /// outcome. Claim release is part of the terminal transition and must be in
+    /// the same atomic boundary as the audit append.
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Boot-rehydrate source: every non-terminal run (latest revision per id).
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
     /// Boot-rehydrate source for the display retention window: terminal runs,
@@ -292,12 +310,32 @@ fn revision_guard(
     Ok(())
 }
 
+fn append_event_locked(g: &mut Inner, ev: &SopEventRecord) -> u64 {
+    g.seq += 1;
+    let seq = g.seq;
+    let mut rec = ev.clone();
+    rec.seq = seq;
+    g.events.entry(ev.run_id.clone()).or_default().push(rec);
+    seq
+}
+
 impl SopRunStore for InMemoryRunStore {
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
         revision_guard(g.runs.get(run.run_id()), run)?;
         g.runs.insert(run.run_id().to_string(), run.clone());
         Ok(())
+    }
+
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
@@ -307,6 +345,20 @@ impl SopRunStore for InMemoryRunStore {
         g.terminal.insert(run_id.to_string());
         g.claims.remove(run_id);
         Ok(())
+    }
+
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        revision_guard(g.runs.get(run_id), terminal)?;
+        g.runs.insert(run_id.to_string(), terminal.clone());
+        g.terminal.insert(run_id.to_string());
+        g.claims.remove(run_id);
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
@@ -435,12 +487,7 @@ impl SopRunStore for InMemoryRunStore {
 
     fn append_event(&self, ev: &SopEventRecord) -> Result<u64, StoreError> {
         let mut g = self.lock()?;
-        g.seq += 1;
-        let seq = g.seq;
-        let mut rec = ev.clone();
-        rec.seq = seq;
-        g.events.entry(ev.run_id.clone()).or_default().push(rec);
-        Ok(seq)
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {

@@ -86,52 +86,26 @@ pub fn resolve_gate(
         engine.reacquire_claim_on_resume(run_id)?;
     }
 
-    // 3. Audit FIRST, fail-closed. Durably append the immutable ledger row
-    //    (WHO/what/when) BEFORE any gate transition, so a store failure aborts the
-    //    resolution and leaves the gate untouched: the gate cannot clear or deny
-    //    without its audit-of-record row. (The store ledger is the only audit
-    //    source now that the legacy Memory approval audit is gone.)
-    if let Err(e) = engine.record_gate_event(GateLedgerEntry {
+    // 3. Build the audit-of-record row, but do not append it independently.
+    //    The row and the run transition below must commit as ONE store outcome:
+    //    an immutable `gate_resolved` row is only true if the corresponding
+    //    `WaitingApproval -> Running/Cancelled` state transition also persisted.
+    let gate_event = GateLedgerEntry {
         run_id: run_id.to_string(),
         step,
         kind: GateEventKind::Resolved,
         decision: Some(decision.clone()),
         principal: principal.clone(),
         ts: now_iso8601(),
-    }) {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"run_id": run_id, "error": e.to_string()})),
-            "SOP gate resolution aborted: could not persist the audit ledger row (fail-closed)"
-        );
-        // Roll back the exec claim re-acquired in step 2c: the run stays parked at
-        // WaitingApproval, so it must NOT keep occupying an exec slot (which would
-        // wrongly defer later triggers). Deny took no claim, so this only matters for
-        // Approve.
-        if matches!(decision, ApprovalDecision::Approve) {
-            engine.release_claim_on_park(run_id);
-        }
-        return Err(anyhow::Error::msg(format!(
-            "failed to persist approval ledger event: {e}"
-        )));
     }
+    .into_event_record();
 
-    // 4. Apply the decision (only after the audit row is durable).
+    // 4. Apply the decision and persist it atomically with the ledger row.
     let outcome = match decision {
         ApprovalDecision::Approve => {
-            let action = match engine.clear_waiting_gate(run_id) {
+            let action = match engine.clear_waiting_gate_with_event(run_id, &gate_event) {
                 Ok(action) => action,
                 Err(e) => {
-                    // Defensive: step 2b pre-flighted the same lookups under this
-                    // lock, so this is unreachable in practice. If the transition
-                    // still fails, release the claim reacquired in step 2c so the
-                    // run - which stays parked at WaitingApproval - does not leak an
-                    // exec slot, then propagate. The gate_resolved row is already
-                    // durable here, but the pre-flight guarantees we never reach this
-                    // branch for the removed/shrunk-SOP case that would make it false.
-                    engine.release_claim_on_park(run_id);
                     return Err(e);
                 }
             };
@@ -144,7 +118,12 @@ pub fn resolve_gate(
         }
         ApprovalDecision::Deny { reason } => {
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
-            engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why))?;
+            engine.finish_run_with_gate_event(
+                run_id,
+                SopRunStatus::Cancelled,
+                Some(why),
+                &gate_event,
+            )?;
             ResolveOutcome::Denied
         }
     };
@@ -185,8 +164,23 @@ mod tests {
         fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
             self.inner.save_run(run)
         }
+        fn save_run_with_event(
+            &self,
+            _run: &PersistedRun,
+            _ev: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
+        }
         fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(run_id, terminal)
+        }
+        fn finish_run_with_event(
+            &self,
+            _run_id: &str,
+            _terminal: &PersistedRun,
+            _ev: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
         }
         fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
             self.inner.load_active_runs()
