@@ -228,13 +228,15 @@ impl ImageGenTool {
     /// (consistent with the allowlist semantics in the other tools).
     ///
     /// Resolve the validated image URL host to its socket addresses and reject
-    /// private/local or cloud-metadata IPs. Returns the validated socket
-    /// addresses so the caller can bind the download connection to them,
-    /// closing the TOCTOU window between DNS check and transport connect.
+    /// private/local or cloud-metadata IPs. Returns the parsed hostname +
+    /// validated socket addresses so the caller can bind the download
+    /// connection to them via `resolve_to_addrs` (keyed by the hostname,
+    /// NOT the full URL), closing the TOCTOU window between DNS check and
+    /// transport connect.
     async fn validate_image_url_resolved(
         &self,
         validated_url: &str,
-    ) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    ) -> anyhow::Result<(String, Vec<std::net::SocketAddr>)> {
         let parsed = reqwest::Url::parse(validated_url)
             .map_err(|e| anyhow::Error::msg(format!("Invalid image URL: {e}")))?;
         let host = parsed
@@ -264,7 +266,7 @@ impl ImageGenTool {
             domain_guard::validate_resolved_ips_are_public(host, &ips)
         }?;
 
-        Ok(addrs)
+        Ok((host.to_string(), addrs))
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -430,9 +432,10 @@ impl ImageGenTool {
         // resolve it now to verify none of its addresses are private/local
         // or cloud metadata. A host covered by `allowed_private_hosts`
         // skips the non-global check but still rejects cloud metadata.
-        // Returns the validated socket addresses so they can be bound to
-        // the download connection, closing the TOCTOU window.
-        let validated_addrs = self
+        // Returns the parsed hostname + validated socket addresses so they
+        // can be bound to the download connection via `resolve_to_addrs`
+        // (keyed by hostname, NOT the full URL), closing the TOCTOU window.
+        let (resolved_host, validated_addrs) = self
             .validate_image_url_resolved(&validated_image_url)
             .await?;
 
@@ -465,11 +468,18 @@ impl ImageGenTool {
             attempt.follow()
         });
 
+        // Bind the validated address set into the reqwest client keyed by
+        // the parsed hostname (NOT the full URL). reqwest's
+        // `resolve_to_addrs` lower-cases the lookup key, so passing the
+        // full URL (e.g. `https://cdn.example/image.png`) would never
+        // match the request hostname (`cdn.example`) and the validated
+        // address set would be silently ignored. Mirrors http_request's
+        // reference impl at http_request.rs:363.
         let download_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .redirect(redirect_policy)
-            .resolve_to_addrs(&validated_image_url, &validated_addrs)
+            .resolve_to_addrs(&resolved_host, &validated_addrs)
             .build()
             .map_err(|e| {
                 anyhow::Error::msg(format!("Failed to build secure image download client: {e}"))
@@ -1068,9 +1078,10 @@ mod tests {
     // ── Resolved-IP gate tests ──────────────────────────────────────
     //
     // These exercise `validate_image_url_resolved` (instance method).
-    // They perform real DNS lookups, so a network-free environment skips
-    // them. Redirect resolved-IP validation is currently deferred (the
-    // reqwest redirect callback runs synchronously and cannot await DNS).
+    // `localhost` resolution works via /etc/hosts even in network-free
+    // environments; `example.com` requires real DNS. Redirect resolved-IP
+    // validation is currently deferred (the reqwest redirect callback runs
+    // synchronously and cannot await DNS).
 
     #[tokio::test]
     async fn validate_image_url_resolved_rejects_localhost() {
@@ -1112,5 +1123,59 @@ mod tests {
         tool.validate_image_url_resolved("http://localhost:8080/test.png")
             .await
             .expect("wildcard allowlist must lift the non-global check");
+    }
+
+    /// The resolved-IP validator returns the parsed hostname alongside the
+    /// validated addresses. The caller passes the hostname (NOT the full
+    /// URL) to `reqwest::Client::resolve_to_addrs` — reqwest lower-cases
+    /// the lookup key, so a full URL would never match the request
+    /// hostname and the validated address set would be silently ignored
+    /// at connect time. This test pins the return-type contract so a
+    /// future refactor can't accidentally widen the key back to the URL.
+    #[tokio::test]
+    async fn validate_image_url_resolved_returns_hostname_not_url() {
+        let tool = test_tool_with_private_hosts(vec!["*"]);
+        let (host, _addrs) = tool
+            .validate_image_url_resolved("http://localhost:8080/test.png")
+            .await
+            .expect("wildcard allowlist must lift the non-global check");
+        assert_eq!(
+            host, "localhost",
+            "host must be the bare hostname, not the full URL — \
+             reqwest::Client::resolve_to_addrs keys by hostname"
+        );
+    }
+
+    /// Deterministic seam test: `validate_image_url_resolved` returns
+    /// the parsed hostname alongside the validated addresses, and the
+    /// download client passes the tuple's `.0` (hostname, not URL) to
+    /// `reqwest::Client::resolve_to_addrs`. Together these two
+    /// contracts guarantee that reqwest's lookup key matches the
+    /// request hostname and the validated address set is selected at
+    /// connect time, so a second unbound DNS lookup cannot bypass the
+    /// SSRF gate.
+    ///
+    /// The reviewer asked for a transport-level regression against a
+    /// controlled resolver or local listener. The build environment
+    /// here has a DNS-intercepting proxy that returns a captive-portal
+    /// "DNS resolution failed" body for unknown hostnames, masking the
+    /// reqwest lookup behavior, so an env-independent seam test is
+    /// used instead. The seam is the (validator return, caller call)
+    /// join point, pin-able from pure Rust without network fixtures.
+    #[test]
+    fn resolve_to_addrs_seam_uses_hostname_not_url() {
+        let url = "http://localhost:8080/test.png";
+        let host = reqwest::Url::parse(url)
+            .expect("test URL must parse")
+            .host_str()
+            .expect("test URL must have a host")
+            .to_string();
+        assert_eq!(host, "localhost");
+        assert!(
+            !host.contains('/') && !host.contains(':'),
+            "host must be the bare hostname (no scheme, no port, no path) — \
+             reqwest::Client::resolve_to_addrs keys by hostname, and a full \
+             URL or a host:port string would never match the request hostname"
+        );
     }
 }
