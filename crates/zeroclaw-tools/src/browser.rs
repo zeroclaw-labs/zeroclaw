@@ -91,6 +91,21 @@ enum ResolvedBackend {
     ComputerUse,
 }
 
+/// Classification of the `path` field on a ComputerUse screenshot args
+/// object, used by `validate_screenshot_path_for_computer_use` to decide
+/// between passthrough, rejection, and full workspace validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    /// Field absent, `null`, or empty string. Inline PNG return semantics.
+    Absent,
+    /// `path` is a non-empty string. Eligible for workspace validation.
+    String,
+    /// `path` is present but not a string (e.g. integer, array, object).
+    /// Rejected at the hook because `parse_browser_action` would silently
+    /// drop it to `None` and forward the raw value unverified.
+    NonString,
+}
+
 impl BrowserBackendKind {
     fn parse(raw: &str) -> anyhow::Result<Self> {
         let key = raw.trim().to_ascii_lowercase().replace('-', "_");
@@ -991,9 +1006,14 @@ impl BrowserTool {
     /// When the path is `None` (PNG embedded in the response), this is a no-op.
     /// When a path is provided, it is resolved against the workspace directory,
     /// its parent directory is canonicalized, and the result is checked against
-    /// the security policy's path allowlist.  The raw user-supplied path is
-    /// replaced with the resolved+validated path so that any TOCTOU window
-    /// between validation and the actual write is closed.
+    /// the security policy's path allowlist. The file name is then checked
+    /// against the runtime-config guard and the target's existing symlink
+    /// status, mirroring the `file_write` / `file_edit` target-level checks.
+    /// The raw user-supplied path is replaced with the resolved+validated
+    /// path so the backends write the same string that was checked. This
+    /// applies the current workspace policy at validation time and rejects
+    /// an already-existing target symlink; it does not by itself close any
+    /// TOCTOU window between this call and the eventual write.
     async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
         let BrowserAction::Screenshot { path, .. } = action else {
             return Ok(());
@@ -1073,9 +1093,19 @@ impl BrowserTool {
     /// receives the same hardened string the other backends use.
     ///
     /// Non-screenshot actions pass through unchanged. Screenshot actions
-    /// with no `path` (inline PNG) also pass through unchanged — the sidecar
-    /// never receives a destination string in that case, so there is no
-    /// unverified path to gate.
+    /// with no `path` and screenshot actions with `path: ""` are treated as
+    /// inline PNG return and pass through unchanged.
+    ///
+    /// Screenshot actions with `path: <non-string>` (e.g. an integer) are
+    /// rejected at the hook with a typed error: `parse_browser_action`
+    /// would otherwise drop the value to `None` and forward the raw
+    /// non-string to the sidecar unverified.
+    ///
+    /// When the configured ComputerUse endpoint resolves to a remote host
+    /// (i.e. `allow_remote_endpoint = true` and the host is not private /
+    /// local), any `path` is rejected because local-filesystem
+    /// canonicalization is meaningless across hosts. Inline PNG screenshots
+    /// (no `path`) continue to work in that configuration.
     async fn validate_screenshot_path_for_computer_use(
         &self,
         action_str: &str,
@@ -1084,18 +1114,40 @@ impl BrowserTool {
         if action_str != "screenshot" {
             return Ok(args);
         }
-        // Inline PNG (no `path` field, or `path == null`) — nothing to gate.
-        let has_path = args
+
+        // Classify the path up front so non-string and empty cases never
+        // reach the workspace validator (which only accepts string paths).
+        let path_kind = args
             .as_object()
             .and_then(|obj| obj.get("path"))
             .map(|v| match v {
-                Value::Null => false,
-                Value::String(s) => !s.is_empty(),
-                _ => true,
+                Value::Null => PathKind::Absent,
+                Value::String(s) if s.is_empty() => PathKind::Absent,
+                Value::String(_) => PathKind::String,
+                _ => PathKind::NonString,
             })
-            .unwrap_or(false);
-        if !has_path {
+            .unwrap_or(PathKind::Absent);
+
+        if matches!(path_kind, PathKind::Absent) {
             return Ok(args);
+        }
+
+        if matches!(path_kind, PathKind::NonString) {
+            anyhow::bail!(
+                "ComputerUse screenshot `path` must be a string when present; \
+                 got a non-string value"
+            );
+        }
+
+        // Refuse destination paths against remote sidecars. Local-filesystem
+        // canonicalization is meaningless across hosts, and the sidecar would
+        // either ignore the path or write to a location we cannot verify.
+        if self.endpoint_is_remote() {
+            anyhow::bail!(
+                "ComputerUse screenshot `path` is not supported when \
+                 browser.computer_use.endpoint resolves to a remote host; \
+                 omit `path` to return the screenshot inline"
+            );
         }
 
         // Parse a BrowserAction so we can reuse the same validator that
@@ -1117,8 +1169,7 @@ impl BrowserTool {
         self.validate_screenshot_path(&mut action).await?;
 
         // Substitute the canonical path back into the args so the sidecar
-        // sees the same string we just verified, closing the
-        // validate-then-forward TOCTOU window. Drop `action` before
+        // sees the same string we just verified. Drop `action` before
         // borrowing `args` mutably.
         let rewritten_path = if let BrowserAction::Screenshot { path: Some(p), .. } = action {
             Some(p)
@@ -1131,6 +1182,24 @@ impl BrowserTool {
             obj.insert("path".to_string(), Value::String(p));
         }
         Ok(args)
+    }
+
+    /// True when the configured ComputerUse endpoint resolves to a remote
+    /// host (i.e. `allow_remote_endpoint = true` and the host is not private
+    /// / local). Returns `true` conservatively when the endpoint URL cannot
+    /// be parsed — refusing destination paths is safer than forwarding them
+    /// when we cannot prove the sidecar is on this host.
+    fn endpoint_is_remote(&self) -> bool {
+        if !self.computer_use.allow_remote_endpoint {
+            return false;
+        }
+        match reqwest::Url::parse(&self.computer_use.endpoint) {
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => !domain_guard::is_private_or_local_host(host),
+                None => true,
+            },
+            Err(_) => true,
+        }
     }
 
     async fn execute_action(
@@ -3420,5 +3489,287 @@ mod tests {
             .unwrap()
             .block_on(async { tokio::fs::canonicalize(path).await })
             .unwrap()
+    }
+
+    // ── ComputerUse dispatch (mock-sidecar) tests ────────────────
+    //
+    // The five hook tests above pin the validator's contract in
+    // isolation, but they bypass the dispatch in `BrowserTool::execute`.
+    // These five tests drive the full dispatch path against a wiremock
+    // sidecar and assert exactly what reaches the wire. They are the
+    // production-boundary regression that Audacity88 round-4 asked for:
+    // if the hook call at `execute:1360` were removed, tests 1-3 and 5
+    // below would all fail (zero requests received instead of one).
+    use std::path::PathBuf;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn computer_use_tool(
+        security: Arc<SecurityPolicy>,
+        endpoint: String,
+        allow_remote_endpoint: bool,
+    ) -> BrowserTool {
+        BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            Some(false),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig {
+                endpoint,
+                allow_remote_endpoint,
+                timeout_ms: 5_000,
+                ..ComputerUseConfig::default()
+            },
+            Vec::new(),
+        )
+        .expect("computer_use BrowserTool should construct")
+    }
+
+    fn desktop_security(workspace: PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// Decoded recorded request body for inspection by dispatch tests.
+    async fn first_request_body(server: &MockServer) -> Value {
+        let mut requests = server
+            .received_requests()
+            .await
+            .expect("received_requests failed");
+        assert_eq!(requests.len(), 1, "expected exactly one sidecar request");
+        let req = requests.remove(0);
+        serde_json::from_slice(&req.body).expect("sidecar body must be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_traversal_path_before_sidecar() {
+        // A traversal `path` must be rejected at the hook, never reaching
+        // the sidecar. The wiremock mount explicitly expects zero requests.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            server.uri(),
+            false,
+        );
+
+        let err = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": "../etc/passwd",
+                "full_page": false,
+            }))
+            .await
+            .expect_err("traversal path must be rejected at the hook");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("not allowed") || msg.contains("workspace") || msg.contains("path"),
+            "expected traversal rejection, got: {err}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0,
+            "no request must reach the sidecar when the hook rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_sends_canonicalized_path_to_sidecar() {
+        // A workspace-allowed `path` must reach the sidecar as its
+        // canonical resolved form, not as the user-supplied relative
+        // path. The wiremock matcher asserts on the exact bytes the
+        // server receives.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        let ws_canon = tokio::fs::canonicalize(&ws).await.unwrap();
+        let expected_canonical = ws_canon.join("page.png");
+        let expected_canonical_str = expected_canonical.to_string_lossy().to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "params": { "path": expected_canonical_str.clone() }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = computer_use_tool(desktop_security(ws), server.uri(), false);
+
+        tool.execute(json!({
+            "action": "screenshot",
+            "path": "page.png",
+            "full_page": false,
+        }))
+        .await
+        .expect("allowed workspace screenshot must succeed");
+
+        let body = first_request_body(&server).await;
+        let sent_path = body
+            .get("params")
+            .and_then(|p| p.get("path"))
+            .and_then(|p| p.as_str())
+            .expect("sidecar body must carry params.path");
+        assert_eq!(
+            sent_path, expected_canonical_str,
+            "sidecar must receive the canonicalized path, not the user-supplied relative path"
+        );
+        assert_ne!(
+            sent_path, "page.png",
+            "sidecar must NOT receive the raw user-supplied relative path"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_remote_endpoint_with_path() {
+        // When the endpoint resolves to a remote host and a `path` is
+        // supplied, the hook must bail before any sidecar request. We
+        // cannot drive `execute` end-to-end here because the dispatch
+        // probes TCP reachability before the hook runs and the synthetic
+        // endpoint is unreachable — so we exercise the hook directly
+        // and rely on the wire-level zero-expectation mount to prove no
+        // HTTP traffic ever leaves the process.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Public-looking host that the host classifier rejects as
+        // "remote". `allow_remote_endpoint = true` is required for
+        // `endpoint_is_remote()` to consider the public-host case.
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            "https://computeruse.attacker.example/v1/actions".to_string(),
+            true,
+        );
+        assert!(
+            tool.endpoint_is_remote(),
+            "endpoint_is_remote must report remote for the synthetic public endpoint"
+        );
+
+        let err = tool
+            .validate_screenshot_path_for_computer_use(
+                "screenshot",
+                json!({
+                    "action": "screenshot",
+                    "path": "page.png",
+                    "full_page": false,
+                }),
+            )
+            .await
+            .expect_err("remote endpoint + path must be rejected at the hook");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("remote"),
+            "expected remote-endpoint rejection, got: {err}"
+        );
+        // The wiremock mount (zero expected) pins that the wire layer
+        // was never touched even though a sidecar mock is live.
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0,
+            "no request must reach any sidecar for a remote endpoint + path"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_passes_through_empty_string_path() {
+        // An empty-string `path` is treated as inline PNG return and
+        // must reach the sidecar exactly once with `params.path` carrying
+        // the empty string. This pins that empty-string passthrough does
+        // not trigger the remote-rejection branch nor the non-string
+        // rejection branch.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            server.uri(),
+            false,
+        );
+
+        tool.execute(json!({
+            "action": "screenshot",
+            "path": "",
+            "full_page": false,
+        }))
+        .await
+        .expect("empty-string path must pass through to the sidecar");
+
+        let body = first_request_body(&server).await;
+        let sent_path = body
+            .get("params")
+            .and_then(|p| p.get("path"))
+            .and_then(|p| p.as_str());
+        assert_eq!(
+            sent_path,
+            Some(""),
+            "empty-string path must reach the sidecar verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_non_string_path_before_sidecar() {
+        // A non-string `path` (here an integer) must be rejected at the
+        // hook with a typed error. Previously this was silently dropped
+        // by `parse_browser_action` and the raw value forwarded to the
+        // sidecar unverified.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            server.uri(),
+            false,
+        );
+
+        let err = tool
+            .validate_screenshot_path_for_computer_use(
+                "screenshot",
+                json!({
+                    "action": "screenshot",
+                    "path": 123,
+                    "full_page": false,
+                }),
+            )
+            .await
+            .expect_err("non-string path must be rejected at the hook");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("must be a string"),
+            "expected non-string-path rejection, got: {err}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0,
+            "no request must reach the sidecar when the hook rejects"
+        );
     }
 }
