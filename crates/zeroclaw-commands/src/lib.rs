@@ -261,6 +261,23 @@ mod tests {
     }
 
     #[test]
+    fn command_lookup_normalizes_case_whitespace_and_bot_suffix() {
+        assert_eq!(
+            normalize_command_name("  /MODEL@ZeroClaw_Bot  "),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            command_by_name("  /THINK@ZeroClaw_Bot  ").map(|spec| spec.id),
+            Some(BuiltinCommandId::Thinking)
+        );
+        assert_eq!(
+            parse_command_token("  /NEW-SESSION@ZeroClaw_Bot  ", CommandSurface::Channel)
+                .map(|parsed| parsed.command.id),
+            Some(BuiltinCommandId::New)
+        );
+    }
+
+    #[test]
     fn surface_filter_rejects_unavailable_commands() {
         assert!(parse_command_token("/config", CommandSurface::Channel).is_some());
         assert!(parse_command_token("/config", CommandSurface::Web).is_none());
