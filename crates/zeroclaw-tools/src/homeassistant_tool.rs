@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 const HA_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -211,7 +211,7 @@ impl Tool for HomeAssistantTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: action".into()),
                 });
             }
@@ -223,7 +223,7 @@ impl Tool for HomeAssistantTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Unknown action: {action}. Valid actions: list_entities, get_state, call_service"
                     )),
@@ -237,7 +237,7 @@ impl Tool for HomeAssistantTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -253,7 +253,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("get_state requires entity_id parameter".into()),
                         });
                     }
@@ -266,7 +266,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("call_service requires domain parameter".into()),
                         });
                     }
@@ -276,7 +276,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("call_service requires service parameter".into()),
                         });
                     }
@@ -290,12 +290,14 @@ impl Tool for HomeAssistantTool {
         match result {
             Ok(value) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                output: serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string())
+                    .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
