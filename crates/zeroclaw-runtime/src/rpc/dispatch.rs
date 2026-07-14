@@ -4179,6 +4179,21 @@ impl RpcDispatcher {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            let run_sop_name = guard
+                .get_run(&req.run_id)
+                .map(|run| run.sop_name.clone())
+                .ok_or_else(|| {
+                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                })?;
+            if run_sop_name != req.name {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "run '{}' belongs to SOP '{}', not '{}'",
+                        req.run_id, run_sop_name, req.name
+                    ),
+                ));
+            }
             guard
                 .resolve_via_broker(
                     &req.run_id,
@@ -5674,6 +5689,124 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "gate_resolved"),
             "rejected RPC decision must not append a gate_resolved row"
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_run_id_from_different_sop_before_broker_resolution() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        fn checkpoint_sop(name: &str) -> Sop {
+            Sop {
+                name: name.to_string(),
+                description: format!("{name} checkpoint"),
+                version: "1.0.0".to_string(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Deterministic,
+                triggers: vec![SopTrigger::Manual],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Gate".to_string(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: true,
+                agent: None,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-a")).expect("save rpc-a");
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-b")).expect("save rpc-b");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        assert_eq!(engine.sops().len(), 2, "both temp SOPs should load");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-b",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start rpc-b SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("rpc-b must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-a",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("mismatched name/run_id must be rejected before broker resolution");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("belongs to SOP 'rpc-b', not 'rpc-a'"),
+            "mismatch rejection must name both SOPs, got: {}",
+            err.message
+        );
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("rpc-b run still active");
+        assert_eq!(run.sop_name, "rpc-b");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "mismatched RPC decision must not append a gate_resolved row"
         );
     }
 

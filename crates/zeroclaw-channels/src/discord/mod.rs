@@ -4378,10 +4378,10 @@ impl Channel for DiscordChannel {
         gate_prompts::record(
             &prompt.reference,
             gate_prompts::GatePromptRecord {
+                channel_alias: self.alias.clone(),
                 channel_id: channel_id.to_string(),
                 message_id,
                 title: prompt.title.clone(),
-                bot_token: self.bot_token.clone(),
                 resolved_description: prompt.resolved_description.clone(),
                 inputs: prompt
                     .choices
@@ -4402,11 +4402,16 @@ impl Channel for DiscordChannel {
     async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
         // Process-wide registry (see `gate_prompts`): the instance that sent the
         // prompt and the one finalizing it are usually DIFFERENT instances of
-        // the same alias (separate channel maps), so the lookup and the PATCH
-        // token must not be tied to `self`.
+        // the same alias (separate channel maps). The registry records the
+        // sending alias but not credentials; the matching live channel instance
+        // owns the current bot token used for PATCH.
         let Some(record) = gate_prompts::take(reference) else {
             return Ok(false);
         };
+        if record.channel_alias != self.alias {
+            gate_prompts::record(reference, record);
+            return Ok(false);
+        }
         // Keep the approval CONTEXT in place and append the outcome under it —
         // a resolved prompt should still show what was approved, not erase it.
         // PATCH with an EXPLICIT empty components array: omitting the key would
@@ -4426,7 +4431,7 @@ impl Channel for DiscordChannel {
         let resp = self
             .http_client()
             .patch(&url)
-            .header("Authorization", format!("Bot {}", record.bot_token))
+            .header("Authorization", format!("Bot {}", self.bot_token))
             .json(&body)
             .send()
             .await;

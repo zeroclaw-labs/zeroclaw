@@ -6,8 +6,9 @@
 //! that SENDS a gate prompt and the one that later FINALIZES it are different
 //! instances of the same alias. A per-instance registry made the finalize a
 //! silent no-op (the resolved gate's embed never updated). One shared registry
-//! makes finalize instance-agnostic; each record carries the sending instance's
-//! bot token so the PATCH is correct even across aliases with different tokens.
+//! makes finalize instance-agnostic while keeping credentials on the live
+//! `DiscordChannel`: each record carries the sending alias so only the matching
+//! channel instance can PATCH the message with its current owner token.
 //!
 //! In-memory only: a restart loses the mapping, after which finalize no-ops and
 //! the stale buttons resolve as already-answered via the marker path — the same
@@ -24,20 +25,14 @@ use std::time::{Duration, Instant};
 /// the same mode as a restart, never a wrong edit.
 const SWEEP_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
-/// One sent gate prompt: where its message lives, how to authenticate the
-/// finalize PATCH, and any input-bearing choices (for modal pre-fill).
-///
-/// `Debug` is hand-written to REDACT `bot_token`: the record holds a bearer
-/// secret, so a future `record!(… {rec:?})` must never spill it (a derived
-/// `Debug` would). The token is only ever read into an `Authorization` header.
+/// One sent gate prompt: where its message lives, which configured alias sent
+/// it, and any input-bearing choices (for modal pre-fill).
 #[derive(Clone)]
 pub(crate) struct GatePromptRecord {
+    pub(crate) channel_alias: String,
     pub(crate) channel_id: String,
     pub(crate) message_id: String,
     pub(crate) title: String,
-    /// Bot token of the instance that SENT the prompt — the finalize PATCH must
-    /// use it even when a different alias/instance resolves the answer.
-    pub(crate) bot_token: String,
     /// Body the finalized embed keeps (the approval context, minus the reply
     /// instructions); the outcome line is appended under it so the record of
     /// WHAT was approved survives resolution. `None` = outcome-only.
@@ -51,10 +46,10 @@ pub(crate) struct GatePromptRecord {
 impl std::fmt::Debug for GatePromptRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatePromptRecord")
+            .field("channel_alias", &self.channel_alias)
             .field("channel_id", &self.channel_id)
             .field("message_id", &self.message_id)
             .field("title", &self.title)
-            .field("bot_token", &"<redacted>")
             .field("resolved_description", &self.resolved_description)
             .field("inputs", &self.inputs)
             .finish()
@@ -109,10 +104,10 @@ mod tests {
 
     fn rec(title: &str) -> GatePromptRecord {
         GatePromptRecord {
+            channel_alias: "primary".into(),
             channel_id: "c1".into(),
             message_id: "m1".into(),
             title: title.into(),
-            bot_token: "t1".into(),
             resolved_description: Some("the approval context".into()),
             inputs: vec![GatePromptInput {
                 choice_id: "edit".into(),
@@ -130,7 +125,7 @@ mod tests {
         // Any caller (a different channel instance) sees it…
         let got = take(reference).expect("recorded entry is visible process-wide");
         assert_eq!(got.title, "A");
-        assert_eq!(got.bot_token, "t1");
+        assert_eq!(got.channel_alias, "primary");
         // …and take consumed it.
         assert!(take(reference).is_none());
     }
