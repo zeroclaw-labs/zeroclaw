@@ -85,11 +85,13 @@ impl LeakDetector {
         self.scan_with_protected_spans(content, &[])
     }
 
-    /// Scan content while preserving caller-supplied byte ranges.
+    /// Scan content while applying caller-supplied byte ranges to heuristics.
     ///
-    /// Protected spans are intentionally opaque. Callers may use whatever
-    /// structured parser is appropriate to identify ranges that must not be
-    /// rewritten, while this detector remains format-agnostic.
+    /// Protected spans mark ranges that the high-entropy heuristic must not
+    /// rewrite. Deterministic credential detectors still scan the full content
+    /// and may redact precise credential patterns inside protected ranges. This
+    /// keeps format-specific paths, URLs, and references from tripping entropy
+    /// detection without letting real secrets hide in functional destinations.
     pub fn scan_with_protected_spans(
         &self,
         content: &str,
@@ -114,14 +116,25 @@ impl LeakDetector {
         );
         let mut redactions = Vec::new();
 
-        // Check each pattern type
-        self.check_api_keys(content, &protected_spans, &mut patterns, &mut redactions);
-        self.check_aws_credentials(content, &protected_spans, &mut patterns, &mut redactions);
-        self.check_generic_secrets(content, &protected_spans, &mut patterns, &mut redactions);
-        self.check_private_keys(content, &protected_spans, &mut patterns, &mut redactions);
-        self.check_jwt_tokens(content, &protected_spans, &mut patterns, &mut redactions);
-        self.check_database_urls(content, &protected_spans, &mut patterns, &mut redactions);
-        self.check_bot_token(content, &protected_spans, &mut patterns, &mut redactions);
+        // Deterministic credential patterns always scan the full, unprotected
+        // content. They match precise, low-false-positive shapes (AWS key
+        // format, PEM markers, JWT triple-base64, DB URL schemes, bot-token
+        // syntax) that ordinary generated file paths do not produce, so #8722's
+        // false-positive problem does not apply to them. A real credential can
+        // be placed inside a link destination or file reference exactly as
+        // easily as in visible text, and #8722 requires visible text to still
+        // be scanned for real secrets -- the same must hold for non-visible
+        // functional parts. Only the high-entropy heuristic, which misfires on
+        // the *shape* of a path rather than on an actual secret token, honors
+        // caller-supplied protected spans.
+        let no_protected_spans: &[Range<usize>] = &[];
+        self.check_api_keys(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_aws_credentials(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_generic_secrets(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_private_keys(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_jwt_tokens(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_database_urls(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_bot_token(content, no_protected_spans, &mut patterns, &mut redactions);
         if self.high_entropy_tokens {
             self.check_high_entropy_tokens(
                 content,
@@ -1032,10 +1045,18 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         assert!(values.contains(&"val"));
     }
 
+    // Protected spans are honored only by the high-entropy heuristic, which
+    // misfires on the *shape* of ordinary generated paths (#8722). Deterministic
+    // credential patterns (API keys, AWS creds, private keys, JWTs, DB URLs,
+    // bot tokens, generic secrets) are precise, low-false-positive signals that
+    // a real credential can trigger just as easily inside a link destination or
+    // file reference as in visible text, so they always scan full content and
+    // are never suppressed by a caller-supplied protected span.
+
     #[test]
-    fn protected_spans_are_opaque_to_detector() {
+    fn protected_spans_are_opaque_only_to_the_entropy_heuristic() {
         let detector = LeakDetector::new();
-        let content = "link-target token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let content = "link-target aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let protected = "link-target ".len()..content.len();
 
         assert!(matches!(
@@ -1045,28 +1066,51 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn protected_spans_can_cover_outer_uri_with_inner_secret_syntax() {
+    fn deterministic_secret_syntax_is_still_detected_inside_a_protected_uri() {
         let detector = LeakDetector::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let content = format!("Recorded {target}.");
         let start = "Recorded ".len();
         let protected = start..start + target.len();
 
-        let result = detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected));
-        assert!(matches!(result, LeakResult::Clean), "result: {result:?}");
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(
+                    patterns.iter().any(|p| p == "Token value"),
+                    "patterns: {patterns:?}"
+                );
+                assert!(
+                    redacted.contains("[REDACTED_SECRET]"),
+                    "redacted: {redacted}"
+                );
+            }
+            LeakResult::Clean => {
+                panic!(
+                    "a deterministic secret pattern inside a protected span must still be caught"
+                )
+            }
+        }
     }
 
     #[test]
-    fn protected_spans_can_cover_private_key_markers() {
+    fn private_key_markers_are_still_detected_inside_a_protected_span() {
         let detector = LeakDetector::new();
         let target = "file:///tmp/-----BEGIN PRIVATE KEY-----abc-----END PRIVATE KEY-----.pem";
         let content = format!("Recorded {target}.");
         let start = "Recorded ".len();
         let protected = start..start + target.len();
 
-        let result = detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected));
-
-        assert!(matches!(result, LeakResult::Clean), "result: {result:?}");
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    redacted.contains("[REDACTED_PRIVATE_KEY]"),
+                    "redacted: {redacted}"
+                );
+            }
+            LeakResult::Clean => {
+                panic!("private key markers should still be detected regardless of protected spans")
+            }
+        }
     }
 
     #[test]
@@ -1084,71 +1128,35 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn protected_private_key_markers_do_not_hide_later_private_key() {
+    fn private_key_detection_ignores_protected_spans() {
         let detector = LeakDetector::new();
-        let target = "file:///tmp/-----BEGIN PRIVATE KEY-----fake-----END PRIVATE KEY-----.pem";
         let leaked_key = "-----BEGIN PRIVATE KEY-----\nrealkeybody\n-----END PRIVATE KEY-----";
-        let content = format!("Recorded {target}.\nLeaked:\n{leaked_key}");
-        let start = "Recorded ".len();
-        let protected = start..start + target.len();
+        let content = format!("Recorded a reference.\nLeaked:\n{leaked_key}");
+        // Marking the whole message as "protected" must not suppress a real
+        // leaked key.
+        let protected = 0..content.len();
 
         match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
             LeakResult::Detected { redacted, .. } => {
-                assert!(redacted.contains(target));
-                assert!(!redacted.contains("realkeybody"));
-                assert!(redacted.contains("[REDACTED_PRIVATE_KEY]"));
+                assert!(!redacted.contains("realkeybody"), "redacted: {redacted}");
+                assert!(
+                    redacted.contains("[REDACTED_PRIVATE_KEY]"),
+                    "redacted: {redacted}"
+                );
             }
-            LeakResult::Clean => panic!("unprotected private key should still be detected"),
+            LeakResult::Clean => {
+                panic!("private key should still be detected even under a protected span")
+            }
         }
     }
 
     #[test]
-    fn protected_private_key_begin_marker_does_not_pair_with_later_end_marker() {
-        let detector = LeakDetector::new();
-        let target = "file:///tmp/-----BEGIN PRIVATE KEY-----.pem";
-        let leaked_key = "-----BEGIN PRIVATE KEY-----\nrealkeybody\n-----END PRIVATE KEY-----";
-        let content = format!("Recorded {target}.\nLeaked:\n{leaked_key}");
-        let start = "Recorded ".len();
-        let protected = start..start + target.len();
-
-        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
-            LeakResult::Detected { redacted, .. } => {
-                assert!(redacted.contains(target));
-                assert!(!redacted.contains("realkeybody"));
-                assert!(redacted.contains("[REDACTED_PRIVATE_KEY]"));
-            }
-            LeakResult::Clean => panic!("unprotected private key should still be detected"),
-        }
-    }
-
-    #[test]
-    fn protected_span_inside_private_key_block_does_not_hide_unprotected_private_key() {
-        let detector = LeakDetector::new();
-        let target = "file:///tmp/key-material-note.txt";
-        let content = format!(
-            "-----BEGIN PRIVATE KEY-----\nrealkeybody\n{target}\nmorekeybody\n-----END PRIVATE KEY-----"
-        );
-        let protected_start = content.find(target).unwrap();
-        let protected = protected_start..protected_start + target.len();
-
-        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
-            LeakResult::Detected { redacted, .. } => {
-                assert!(redacted.contains(target));
-                assert!(!redacted.contains("realkeybody"));
-                assert!(!redacted.contains("morekeybody"));
-                assert!(redacted.contains("[REDACTED_PRIVATE_KEY]"));
-            }
-            LeakResult::Clean => panic!("unprotected private key should still be detected"),
-        }
-    }
-
-    #[test]
-    fn protected_spans_do_not_hide_unprotected_tokens() {
+    fn protected_spans_do_not_hide_unprotected_high_entropy_tokens() {
         let detector = LeakDetector::new();
         let protected_token = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let leaked_token = "zC9vN4mK8pQ2rL7xT5yU1hD6jF0gB3wE";
-        let content = format!("safe-target token={protected_token}\nactual token={leaked_token}");
-        let protected = 0.."safe-target token=".len() + protected_token.len();
+        let content = format!("safe-target {protected_token}\nactual {leaked_token}");
+        let protected = 0.."safe-target ".len() + protected_token.len();
 
         match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
             LeakResult::Detected { redacted, .. } => {
@@ -1160,7 +1168,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn protected_spans_do_not_hide_overlapping_secret_prefix() {
+    fn protected_spans_do_not_hide_a_secret_pattern_that_overlaps_them() {
         let detector = LeakDetector::new();
         let target = "file:///tmp/report.md";
         let content = format!("[password=longsecretvalue]({target})");
@@ -1169,8 +1177,14 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
 
         match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
             LeakResult::Detected { redacted, .. } => {
-                assert!(!redacted.contains("longsecretvalue"));
-                assert!(redacted.contains(target), "redacted: {redacted}");
+                assert!(
+                    !redacted.contains("longsecretvalue"),
+                    "redacted: {redacted}"
+                );
+                assert!(
+                    redacted.contains("[REDACTED_SECRET]"),
+                    "redacted: {redacted}"
+                );
             }
             LeakResult::Clean => panic!("unprotected link text secret should still be detected"),
         }
