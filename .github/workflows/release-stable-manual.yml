@@ -237,7 +237,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: ubuntu-22.04
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
@@ -245,7 +244,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -311,16 +309,11 @@ jobs:
           fi
           # Resolve the feature set from the canonical registry
           # (`cargo generate features`), the single source of truth that
-          # install.sh and packaging surfaces also consume. `dist` is the
-          # full-channel, no-heavyweight distribution set; it is self-contained
-          # (carries the default leaves), so every target builds with
-          # --no-default-features against the explicit list, no implicit drift.
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist)"
-          # skip_prometheus targets (ARMv6/ARMv7) drop observability-prometheus,
-          # which pulls a backtrace path that segfaults on those devices.
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            FEATURES="$(printf '%s' "$FEATURES" | tr ',' '\n' | grep -vx 'observability-prometheus' | paste -sd,)"
-          fi
+          # install.sh and packaging surfaces also consume. `dist` is the lean
+          # standard distribution set and carries the default leaves, so every
+          # target builds with --no-default-features against the explicit list,
+          # with no implicit feature drift.
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           # MUSL targets build via cross-rs (cross-compiled in a container);
           # all other targets use the host cargo toolchain directly.
@@ -340,7 +333,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB cap for standard release builds
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
