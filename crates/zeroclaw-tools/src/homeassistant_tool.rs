@@ -9,8 +9,49 @@ const HA_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Maximum number of characters to include from an error response body.
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
+// ── Input validation ──────────────────────────────────────────────────────────
+
+/// True when `slug` is a non-empty lowercase Home Assistant slug matching
+/// `^[a-z0-9_]+$` (the character class HA uses for domains, services, and
+/// entity object ids).
+fn is_valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Validates a Home Assistant `domain` or `service` name. Prevents path
+/// traversal if a crafted value like `../../other` were interpolated directly
+/// into the request URL.
+fn validate_slug(kind: &str, value: &str) -> anyhow::Result<()> {
+    if is_valid_slug(value) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Invalid {kind} '{value}'. Expected a lowercase slug matching [a-z0-9_]+ (e.g. light, turn_on)"
+        )
+    }
+}
+
+/// Validates an entity id of the form `<domain>.<object_id>` where both parts
+/// match `^[a-z0-9_]+$` (exactly one dot). Prevents path traversal via crafted
+/// ids interpolated into the request URL.
+fn validate_entity_id(entity_id: &str) -> anyhow::Result<()> {
+    let valid = entity_id
+        .split_once('.')
+        .is_some_and(|(domain, object_id)| is_valid_slug(domain) && is_valid_slug(object_id));
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Invalid entity_id '{entity_id}'. Expected format: <domain>.<object_id> with both parts matching [a-z0-9_]+ (e.g. light.kitchen)"
+        )
+    }
+}
+
 /// Tool for interacting with a Home Assistant instance over its native REST
-/// API (the same path Hermes used: `HASS_URL` + a long-lived access token).
+/// API (`HASS_URL` + a long-lived access token).
 ///
 /// Actions are gated by the appropriate security operation:
 /// - `list_entities` / `get_state` are read-only (`Read`).
@@ -27,7 +68,7 @@ pub struct HomeAssistantTool {
 
 impl HomeAssistantTool {
     /// Create a new Home Assistant tool. `base_url` is the HA origin
-    /// (e.g. `http://10.10.10.100:8123`); `token` is a long-lived access token.
+    /// (e.g. `http://192.0.2.10:8123`); `token` is a long-lived access token.
     pub fn new(base_url: String, token: String, security: Arc<SecurityPolicy>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -45,6 +86,9 @@ impl HomeAssistantTool {
     /// List all entity ids and their current state (compact — no attributes),
     /// optionally filtered to a single domain prefix (e.g. `light`).
     async fn list_entities(&self, domain: Option<&str>) -> anyhow::Result<Value> {
+        if let Some(d) = domain {
+            validate_slug("domain", d)?;
+        }
         let url = format!("{}/api/states", self.base_url);
         let resp = self.authed(self.http.get(&url)).send().await?;
         let status = resp.status();
@@ -78,6 +122,7 @@ impl HomeAssistantTool {
 
     /// Read the full state (including attributes) of one entity.
     async fn get_state(&self, entity_id: &str) -> anyhow::Result<Value> {
+        validate_entity_id(entity_id)?;
         let url = format!("{}/api/states/{entity_id}", self.base_url);
         let resp = self.authed(self.http.get(&url)).send().await?;
         let status = resp.status();
@@ -98,6 +143,8 @@ impl HomeAssistantTool {
         service: &str,
         service_data: Option<&Value>,
     ) -> anyhow::Result<Value> {
+        validate_slug("domain", domain)?;
+        validate_slug("service", service)?;
         let url = format!("{}/api/services/{domain}/{service}", self.base_url);
         let body = service_data.cloned().unwrap_or_else(|| json!({}));
         let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
@@ -164,7 +211,7 @@ impl Tool for HomeAssistantTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new().into(),
+                    output: String::new(),
                     error: Some("Missing required parameter: action".into()),
                 });
             }
@@ -176,7 +223,7 @@ impl Tool for HomeAssistantTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new().into(),
+                    output: String::new(),
                     error: Some(format!(
                         "Unknown action: {action}. Valid actions: list_entities, get_state, call_service"
                     )),
@@ -190,7 +237,7 @@ impl Tool for HomeAssistantTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
+                output: String::new(),
                 error: Some(error),
             });
         }
@@ -206,7 +253,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new().into(),
+                            output: String::new(),
                             error: Some("get_state requires entity_id parameter".into()),
                         });
                     }
@@ -219,7 +266,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new().into(),
+                            output: String::new(),
                             error: Some("call_service requires domain parameter".into()),
                         });
                     }
@@ -229,7 +276,7 @@ impl Tool for HomeAssistantTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new().into(),
+                            output: String::new(),
                             error: Some("call_service requires service parameter".into()),
                         });
                     }
@@ -243,14 +290,12 @@ impl Tool for HomeAssistantTool {
         match result {
             Ok(value) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| value.to_string())
-                    .into(),
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
+                output: String::new(),
                 error: Some(e.to_string()),
             }),
         }
@@ -363,5 +408,249 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("read-only"));
+    }
+
+    // ── Input validation tests ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_slug_accepts_lowercase_slugs() {
+        assert!(validate_slug("domain", "light").is_ok());
+        assert!(validate_slug("service", "turn_on").is_ok());
+        assert!(validate_slug("domain", "sensor2").is_ok());
+    }
+
+    #[test]
+    fn validate_slug_rejects_invalid() {
+        assert!(validate_slug("domain", "").is_err()); // empty
+        assert!(validate_slug("domain", "Light").is_err()); // uppercase
+        assert!(validate_slug("service", "turn on").is_err()); // space
+        assert!(validate_slug("domain", "../../etc/passwd").is_err()); // traversal
+        assert!(validate_slug("service", "turn_on/../..").is_err()); // traversal
+        assert!(validate_slug("domain", "light.kitchen").is_err()); // dot not allowed
+    }
+
+    #[test]
+    fn validate_entity_id_accepts_valid_ids() {
+        assert!(validate_entity_id("light.kitchen").is_ok());
+        assert!(validate_entity_id("sensor.living_room_temp").is_ok());
+        assert!(validate_entity_id("binary_sensor.front_door_2").is_ok());
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_invalid() {
+        assert!(validate_entity_id("").is_err()); // empty
+        assert!(validate_entity_id("light").is_err()); // missing dot
+        assert!(validate_entity_id("light.").is_err()); // empty object id
+        assert!(validate_entity_id(".kitchen").is_err()); // empty domain
+        assert!(validate_entity_id("light.kitchen.extra").is_err()); // extra dots
+        assert!(validate_entity_id("Light.Kitchen").is_err()); // uppercase
+        assert!(validate_entity_id("../../secrets").is_err()); // traversal
+        assert!(validate_entity_id("light/../../etc").is_err()); // traversal
+    }
+
+    #[tokio::test]
+    async fn execute_get_state_rejects_traversal_entity_id() {
+        let result = test_tool()
+            .execute(json!({"action": "get_state", "entity_id": "../../etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Invalid entity_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_call_service_rejects_traversal_domain() {
+        let result = test_tool()
+            .execute(json!({"action": "call_service", "domain": "../../etc", "service": "turn_on"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("Invalid domain"));
+    }
+
+    #[tokio::test]
+    async fn execute_call_service_rejects_uppercase_service() {
+        let result = test_tool()
+            .execute(json!({"action": "call_service", "domain": "light", "service": "Turn_On"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("Invalid service"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_entities_rejects_bad_domain() {
+        let result = test_tool()
+            .execute(json!({"action": "list_entities", "domain": "../etc"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("Invalid domain"));
+    }
+
+    // ── HTTP-level (wiremock) tests ──────────────────────────────────────────
+
+    fn wiremock_tool(base_url: String, autonomy: AutonomyLevel) -> HomeAssistantTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy,
+            ..SecurityPolicy::default()
+        });
+        HomeAssistantTool::new(base_url, "test-token".into(), security)
+    }
+
+    #[tokio::test]
+    async fn list_entities_filters_domain_and_projects_compactly() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/states"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "entity_id": "light.kitchen", "state": "on", "attributes": { "brightness": 200 } },
+                { "entity_id": "light.bedroom", "state": "off", "attributes": {} },
+                { "entity_id": "sensor.temp",   "state": "21", "attributes": {} }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({"action": "list_entities", "domain": "light"}))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 2);
+        let entities = output["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 2);
+        // Compact projection: only entity_id + state, no attributes.
+        assert_eq!(entities[0]["entity_id"], "light.kitchen");
+        assert_eq!(entities[0]["state"], "on");
+        assert!(entities[0].get("attributes").is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn read_action_succeeds_under_readonly_autonomy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/states"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "entity_id": "light.kitchen", "state": "on" }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Positive gate: a Read action must SUCCEED under ReadOnly autonomy so
+        // an over-blocking regression is caught (complements the Act-blocked case).
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "list_entities"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "read action should succeed under ReadOnly: {:?}",
+            result.error
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_state_error_status_body_is_truncated() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let long_body = "E".repeat(MAX_ERROR_BODY_CHARS + 200);
+        Mock::given(method("GET"))
+            .and(path("/api/states/light.kitchen"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(long_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({"action": "get_state", "entity_id": "light.kitchen"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("500"));
+        assert!(err.ends_with("..."), "expected truncation ellipsis: {err}");
+        // Truncated well below the raw body length.
+        assert!(err.len() < MAX_ERROR_BODY_CHARS + 200);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_service_passes_body_when_args_provided() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let expected_body = json!({ "entity_id": "light.kitchen" });
+        Mock::given(method("POST"))
+            .and(path("/api/services/light/turn_on"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({
+                "action": "call_service",
+                "domain": "light",
+                "service": "turn_on",
+                "service_data": { "entity_id": "light.kitchen" }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_service_defaults_to_empty_body_when_no_args() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/services/light/turn_off"))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({
+                "action": "call_service",
+                "domain": "light",
+                "service": "turn_off"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
     }
 }

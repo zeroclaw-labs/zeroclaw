@@ -16714,7 +16714,7 @@ impl Default for NotionConfig {
 /// When `enabled = true`, registers the `homeassistant` tool which talks to a
 /// Home Assistant instance over its native REST API (NOT the MCP server
 /// integration). It can list entities, read one entity's state, and call a
-/// service. `url` is the HA origin (e.g. `http://10.10.10.100:8123`); `token`
+/// service. `url` is the HA origin (e.g. `http://192.0.2.10:8123`); `token`
 /// is a long-lived access token. Both may be supplied via env (`HASS_URL` /
 /// `HASS_TOKEN`) so no secret is committed to `config.toml`.
 ///
@@ -16727,7 +16727,7 @@ pub struct HomeAssistantConfig {
     /// Enable the `homeassistant` tool. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// HA base URL (origin), e.g. `http://10.10.10.100:8123`.
+    /// HA base URL (origin), e.g. `http://192.0.2.10:8123`.
     /// Falls back to the `HASS_URL` env var when empty.
     #[serde(default)]
     pub url: String,

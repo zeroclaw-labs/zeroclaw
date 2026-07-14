@@ -102,3 +102,4 @@ A handful of fields live as schema fields, reachable via the standard mapping:
 4. **KiloCLI / Gemini CLI paths**: `[providers.models.kilocli.<alias>] binary_path` and `[providers.models.gemini_cli.<alias>] binary_path`.
 5. **Transcription / TTS keys**: `[transcription].api_key`, `[providers.tts.openai.<alias>].api_key`, `[providers.tts.elevenlabs.<alias>].api_key`, `[providers.tts.google.<alias>].api_key`.
 6. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).
+7. **Home Assistant**: `[homeassistant].url` and `[homeassistant].token` fall back to the `HASS_URL` / `HASS_TOKEN` env vars when left empty, so no secret is committed to `config.toml`.
