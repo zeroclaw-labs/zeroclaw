@@ -157,6 +157,15 @@ fn resolve(
                 )
             })?
     };
+    if let ResolveOutcome::Resumed(action) = &outcome {
+        let config = state.config.read().clone();
+        zeroclaw_runtime::sop::spawn_headless_run_driver(
+            config,
+            std::sync::Arc::clone(engine),
+            state.sop_audit.clone(),
+            action.as_ref().clone(),
+        );
+    }
     let (code, label) = outcome_response(&outcome);
     Ok((
         code,

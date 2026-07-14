@@ -129,13 +129,13 @@ impl Tool for TodoWriteTool {
                     .count();
                 Ok(ToolResult {
                     success: true,
-                    output: format!("{total} todos tracked ({done} done)"),
+                    output: format!("{total} todos tracked ({done} done)").into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(e.to_string()),
             }),
         }
