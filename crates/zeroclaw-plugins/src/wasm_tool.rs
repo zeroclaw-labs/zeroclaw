@@ -11,7 +11,7 @@ use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
 
-tool_attribution!(WasmTool, ToolKind::Plugin);
+tool_attribution!(WasmTool, ToolKind::WasmPlugin);
 
 /// A tool backed by a WASM plugin function.
 pub struct WasmTool {
@@ -157,6 +157,7 @@ impl Tool for WasmTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
     #[test]
     fn new_exposes_metadata_via_tool_accessors() {
@@ -178,6 +179,7 @@ mod tests {
         assert_eq!(tool.name(), "my_tool");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.role(), Role::Tool(ToolKind::WasmPlugin));
     }
 
     #[test]

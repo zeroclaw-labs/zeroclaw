@@ -1,6 +1,7 @@
 //! Post-execution recording: result log line, the `after_tool_call` hook, the
 //! completion Status, and filling the executed calls' `ordered_results` slots.
 
+use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
@@ -15,15 +16,15 @@ pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
-    stream_arguments: &[Option<std::sync::Arc<serde_json::Value>>],
+    stream_calls: &[Option<StreamToolCall>],
     executed_outcomes: Vec<ToolExecutionOutcome>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for (((idx, call), stream_arguments), outcome) in executable_indices
+    for (((idx, call), stream_call), outcome) in executable_indices
         .iter()
         .zip(executable_calls.iter())
-        .zip(stream_arguments.iter())
+        .zip(stream_calls.iter())
         .zip(executed_outcomes)
     {
         // The pending ToolCall and terminal ToolResult are emitted by the
@@ -65,7 +66,7 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         // ── Progress: tool completion ───────────────────────
-        if let (Some(tx), Some(arguments)) = (ctx.on_delta, stream_arguments) {
+        if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
             let secs = outcome.duration.as_secs();
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -77,7 +78,8 @@ pub(crate) async fn record_executed_outcomes(
             let _ = tx
                 .send(StreamDelta::ToolComplete {
                     tool: call.name.clone(),
-                    arguments: std::sync::Arc::clone(arguments),
+                    arguments: std::sync::Arc::clone(&stream_call.arguments),
+                    tool_role: stream_call.tool_role,
                     secs,
                     success: outcome.success,
                     error: outcome.error_reason.as_deref().map(scrub_credentials),

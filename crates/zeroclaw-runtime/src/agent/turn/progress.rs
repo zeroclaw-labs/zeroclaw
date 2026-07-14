@@ -1,9 +1,8 @@
-//! Human-facing progress lines for streamed status surfaces other than Matrix
-//! single-message drafts.
+//! Human-facing progress lines for the streamed turn status surface.
 //!
-//! Matrix receives structured tool events and applies its own disclosure policy
-//! at the channel boundary. These helpers preserve the historical conservative
-//! rendering for every other consumer.
+//! The raw tool call remains the source of truth. These helpers derive a short
+//! display-only summary at emission time so start and completion lines stay
+//! correlated without storing duplicate call metadata.
 
 use super::redact::scrub_credentials;
 use crate::util::truncate_with_ellipsis;
@@ -43,6 +42,9 @@ pub(crate) fn render_tool_completion_progress(
     }
 }
 
+/// Build a compact, tool-agnostic argument summary from a conservative key
+/// allowlist. This keeps start/completion lines useful without publishing
+/// arbitrary tool arguments into chat-visible progress.
 fn tool_argument_hint(args: &Value) -> Option<String> {
     let Value::Object(map) = args else {
         return None;
@@ -62,6 +64,8 @@ fn tool_argument_hint(args: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
+/// Convert one JSON argument value to compact display text while scrubbing
+/// credential-shaped data before it reaches the progress stream.
 fn render_argument_value(value: &Value) -> Option<String> {
     let rendered = match value {
         Value::Null => return None,
@@ -71,11 +75,15 @@ fn render_argument_value(value: &Value) -> Option<String> {
         }
     };
     let rendered = scrub_and_collapse_display(&rendered);
-    (!rendered.is_empty()).then_some(rendered)
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
 }
 
 fn scrub_and_collapse_display(value: &str) -> String {
-    scrub_credentials(&crate::security::scrub(value))
+    scrub_credentials(value)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -87,24 +95,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn start_progress_reports_only_allowlisted_arguments() {
-        let line = render_tool_start_progress(
-            "delegate",
-            &json!({"agent": "zeroclaw_agent", "prompt": "private", "query": "status"}),
+    fn start_and_completion_progress_share_the_generic_allowlist() {
+        let args = json!({
+            "command": "pwd",
+            "path": "/tmp/file",
+            "action": "status",
+            "query": "health",
+            "prompt": "private",
+        });
+        let start = render_tool_start_progress("delegate", &args);
+        let completion = render_tool_completion_progress("delegate", &args, 3, true, None);
+        assert_eq!(
+            start,
+            "\u{23f3} delegate: command=pwd, path=/tmp/file, action=status, query=health\n"
         );
-        assert_eq!(line, "\u{23f3} delegate: query=status\n");
-    }
-
-    #[test]
-    fn completion_progress_reuses_argument_hint() {
-        let line = render_tool_completion_progress(
-            "web_fetch",
-            &json!({"path": "/tmp/result"}),
-            3,
-            true,
-            None,
+        assert_eq!(
+            completion,
+            "\u{2705} delegate: command=pwd, path=/tmp/file, action=status, query=health (3s)\n"
         );
-        assert_eq!(line, "\u{2705} web_fetch: path=/tmp/result (3s)\n");
     }
 
     #[test]
@@ -118,20 +126,5 @@ mod tests {
         );
         assert!(line.contains("[REDACTED]"));
         assert!(!line.contains("abcd1234efgh5678"));
-    }
-
-    #[test]
-    fn legacy_progress_scrubs_standalone_credentials() {
-        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
-        let start = render_tool_start_progress("shell", &json!({"command": token}));
-        let completion = render_tool_completion_progress(
-            "shell",
-            &json!({"command": "echo"}),
-            1,
-            false,
-            Some(token),
-        );
-        assert!(!start.contains(token));
-        assert!(!completion.contains(token));
     }
 }

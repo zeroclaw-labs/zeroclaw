@@ -4787,7 +4787,8 @@ fn push_matrix_single_message_pending(
 
 const RUNTIME_ONLY_TOOL_ARGUMENTS: &[&str] = &["approved", "__config"];
 
-/// Matrix's canonical safe-display policy for standard tools.
+/// Matrix's canonical safe-display policy for native standard tools. WASM and
+/// unresolved events never use this table, even when their public name collides.
 ///
 /// A schema-annotation alternative could mark displayable properties in each
 /// provider-facing `ToolSpec` and recursively traverse nested schemas. It is
@@ -4958,18 +4959,23 @@ fn matrix_tool_progress(
         .get(matrix_alias)
         .map_or(&[][..], |matrix| matrix.stream_tool_arguments.as_slice());
     match event {
-        zeroclaw_runtime::agent::loop_::StreamDelta::ToolStart { tool, arguments } => {
-            let subject = matrix_tool_subject(tool, arguments, settings);
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolStart {
+            tool,
+            arguments,
+            tool_role,
+        } => {
+            let subject = matrix_tool_subject(tool, arguments, *tool_role, settings);
             Some(format!("\u{23f3} {subject}\n"))
         }
         zeroclaw_runtime::agent::loop_::StreamDelta::ToolComplete {
             tool,
             arguments,
+            tool_role,
             secs,
             success,
             error,
         } => {
-            let subject = matrix_tool_subject(tool, arguments, settings);
+            let subject = matrix_tool_subject(tool, arguments, *tool_role, settings);
             if *success {
                 Some(format!("\u{2705} {subject} ({secs}s)\n"))
             } else if let Some(error) = error {
@@ -4988,15 +4994,17 @@ fn matrix_tool_progress(
 fn matrix_tool_subject(
     tool: &str,
     arguments: &serde_json::Value,
+    tool_role: Option<zeroclaw_api::attribution::Role>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
 ) -> String {
-    matrix_tool_argument_hint(tool, arguments, settings)
+    matrix_tool_argument_hint(tool, arguments, tool_role, settings)
         .map_or_else(|| tool.to_string(), |hint| format!("{tool}: {hint}"))
 }
 
 fn matrix_tool_argument_hint(
     tool: &str,
     arguments: &serde_json::Value,
+    tool_role: Option<zeroclaw_api::attribution::Role>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
 ) -> Option<String> {
     use zeroclaw_config::schema::{
@@ -5045,7 +5053,8 @@ fn matrix_tool_argument_hint(
     );
     let mut keys: Vec<(&str, bool)> = match base {
         StreamToolArgumentBase::None => Vec::new(),
-        StreamToolArgumentBase::Safe => matrix_safe_tool_arguments(tool)
+        StreamToolArgumentBase::Safe => matrix_safe_display_tool(tool_role)
+            .then(|| matrix_safe_tool_arguments(tool).unwrap_or_default())
             .unwrap_or_default()
             .iter()
             .copied()
@@ -5074,6 +5083,16 @@ fn matrix_tool_argument_hint(
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Matrix owns this disclosure policy. Only a resolved non-WASM `Tool` role
+/// may use its reviewed safe argument list; every other role is name-only.
+fn matrix_safe_display_tool(tool_role: Option<zeroclaw_api::attribution::Role>) -> bool {
+    matches!(
+        tool_role,
+        Some(zeroclaw_api::attribution::Role::Tool(kind))
+            if kind != zeroclaw_api::attribution::ToolKind::WasmPlugin
+    )
 }
 
 fn matrix_render_argument(
@@ -12414,6 +12433,9 @@ mod tests {
             matrix_tool_argument_hint(
                 "delegate",
                 &serde_json::json!({"agent": "ops"}),
+                Some(zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )),
                 single_policy
             ),
             None,
@@ -12438,7 +12460,15 @@ mod tests {
             "token": "should-never-leak",
         });
         assert_eq!(
-            matrix_tool_argument_hint("delegate", &arguments, &[]).as_deref(),
+            matrix_tool_argument_hint(
+                "delegate",
+                &arguments,
+                Some(zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )),
+                &[],
+            )
+            .as_deref(),
             Some("action=start, agent=sysadmin, background=true, timeout_ms=30000"),
         );
 
@@ -12454,7 +12484,15 @@ mod tests {
             argument_chars: Some(0),
         }];
         assert_eq!(
-            matrix_tool_argument_hint("delegate", &arguments, &policy).as_deref(),
+            matrix_tool_argument_hint(
+                "delegate",
+                &arguments,
+                Some(zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )),
+                &policy,
+            )
+            .as_deref(),
             Some("prompt=inspect secrets, metadata={\"room\":\"private\"}, token=[redacted]"),
         );
     }
@@ -12463,8 +12501,62 @@ mod tests {
     fn matrix_tool_argument_policy_keeps_unknown_tools_name_only_by_default() {
         let arguments = serde_json::json!({"path": "/private", "count": 3});
         assert_eq!(
-            matrix_tool_argument_hint("mcp-private", &arguments, &[]),
+            matrix_tool_argument_hint("mcp-private", &arguments, None, &[],),
             None
+        );
+    }
+
+    #[test]
+    fn matrix_safe_policy_keeps_wasm_and_unresolved_name_collisions_name_only() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_config::schema::{
+            StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+
+        let arguments = serde_json::json!({"action": "navigate"});
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(Role::Tool(ToolKind::WasmPlugin)),
+                &[],
+            ),
+            None,
+            "a WASM extension named like a standard tool stays name-only in safe mode"
+        );
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(Role::Tool(ToolKind::Plugin)),
+                &[],
+            )
+            .as_deref(),
+            Some("action=navigate"),
+            "the canonical standard tool keeps its reviewed safe field"
+        );
+        assert_eq!(
+            matrix_tool_argument_hint("browser", &arguments, None, &[]),
+            None,
+            "an unresolved tool named like a standard tool stays name-only"
+        );
+        let explicit_policy = [Entry::Tool {
+            tool: "browser".to_string(),
+            base: Some(Base::None),
+            include: vec!["action".to_string()],
+            exclude: Vec::new(),
+            argument_chars: None,
+        }];
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(Role::Tool(ToolKind::WasmPlugin)),
+                &explicit_policy,
+            )
+            .as_deref(),
+            Some("action=navigate"),
+            "an operator can explicitly disclose extension fields"
         );
     }
 
@@ -12547,6 +12639,7 @@ mod tests {
 
     #[test]
     fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
         let config = Config::default();
@@ -12555,6 +12648,7 @@ mod tests {
             &StreamDelta::ToolStart {
                 tool: "delegate".to_string(),
                 arguments: Arc::new(arguments.clone()),
+                tool_role: Some(Role::Tool(ToolKind::Plugin)),
             },
             &config,
             "missing",
@@ -12564,6 +12658,7 @@ mod tests {
             &StreamDelta::ToolComplete {
                 tool: "delegate".to_string(),
                 arguments: Arc::new(arguments),
+                tool_role: Some(Role::Tool(ToolKind::Plugin)),
                 secs: 4,
                 success: true,
                 error: None,
@@ -12575,6 +12670,31 @@ mod tests {
 
         assert_eq!(start, "⏳ delegate: agent=sysadmin\n");
         assert_eq!(completion, "✅ delegate: agent=sysadmin (4s)\n");
+    }
+
+    #[test]
+    fn matrix_tool_progress_treats_carried_wasm_or_missing_roles_as_untrusted() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let config = Config::default();
+        let arguments = serde_json::json!({"action": "navigate"});
+        for tool_role in [Some(Role::Tool(ToolKind::WasmPlugin)), None] {
+            let progress = matrix_tool_progress(
+                &StreamDelta::ToolStart {
+                    tool: "browser".to_string(),
+                    arguments: Arc::new(arguments.clone()),
+                    tool_role,
+                },
+                &config,
+                "missing",
+            )
+            .expect("tool start renders");
+            assert_eq!(
+                progress, "⏳ browser\n",
+                "WASM and unresolved roles must cross the event boundary without revealing safe arguments"
+            );
+        }
     }
 
     #[test]

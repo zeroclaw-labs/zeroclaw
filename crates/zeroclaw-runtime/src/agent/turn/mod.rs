@@ -979,9 +979,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
-            stream_arguments,
+            stream_calls,
         } = prepare_tool_calls(
             &ctx,
+            tools_registry,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,
@@ -1042,19 +1043,19 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
-        let mut executed_completed_stream_arguments = Vec::new();
+        let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, ((call_idx, call), stream_arguments)) in executed_slots.into_iter().zip(
+        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
             executable_indices
                 .iter()
                 .copied()
                 .zip(executable_calls.iter())
-                .zip(stream_arguments.iter()),
+                .zip(stream_calls),
         ) {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
-                executed_completed_stream_arguments.push(stream_arguments.clone());
+                executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
         }
@@ -1063,7 +1064,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
-            &executed_completed_stream_arguments,
+            &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
             iteration,

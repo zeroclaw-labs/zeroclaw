@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::attribution::Role;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying live model text to draft surfaces.
@@ -77,11 +78,17 @@ pub enum StreamDelta {
     ToolStart {
         tool: String,
         arguments: std::sync::Arc<serde_json::Value>,
+        /// Canonical attribution carried from the resolved tool. `None`
+        /// means the name did not resolve in the static tool registry.
+        tool_role: Option<Role>,
     },
     /// A completed tool call paired with its original arguments.
     ToolComplete {
         tool: String,
         arguments: std::sync::Arc<serde_json::Value>,
+        /// The same attribution observed when the matching start event was
+        /// emitted; consumers must treat `None` as untrusted.
+        tool_role: Option<Role>,
         secs: u64,
         success: bool,
         error: Option<String>,
@@ -96,15 +103,16 @@ impl StreamDelta {
     #[must_use]
     pub fn legacy_status(&self) -> Option<String> {
         match self {
-            Self::ToolStart { tool, arguments } => {
-                Some(super::progress::render_tool_start_progress(tool, arguments))
-            }
+            Self::ToolStart {
+                tool, arguments, ..
+            } => Some(super::progress::render_tool_start_progress(tool, arguments)),
             Self::ToolComplete {
                 tool,
                 arguments,
                 secs,
                 success,
                 error,
+                ..
             } => Some(super::progress::render_tool_completion_progress(
                 tool,
                 arguments,
