@@ -986,6 +986,41 @@ impl SopEngine {
     /// authoritative requires a store-level two-phase reservation (a follow-up); the
     /// single-daemon deployment - the common case - is fully authoritative today.
     pub fn evaluate_admission(&self, sop_name: &str) -> SopAdmission {
+        self.evaluate_admission_with_reserved(sop_name, 0, 0)
+    }
+
+    /// Evaluate a group of matched SOPs as one delivery unit. Each `Admit` reserves
+    /// one simulated exec slot before evaluating later siblings, so all-or-nothing
+    /// transports can detect a batch that would exceed per-SOP or global capacity
+    /// before starting any run.
+    pub(crate) fn evaluate_admission_batch_all_or_nothing(
+        &self,
+        sop_names: &[String],
+    ) -> Vec<(String, SopAdmission)> {
+        let mut reserved_by_sop: HashMap<String, usize> = HashMap::new();
+        let mut reserved_total = 0usize;
+        let mut out = Vec::with_capacity(sop_names.len());
+
+        for sop_name in sop_names {
+            let reserved_for_sop = *reserved_by_sop.get(sop_name).unwrap_or(&0);
+            let admission =
+                self.evaluate_admission_with_reserved(sop_name, reserved_for_sop, reserved_total);
+            if matches!(admission, SopAdmission::Admit) {
+                *reserved_by_sop.entry(sop_name.clone()).or_default() += 1;
+                reserved_total += 1;
+            }
+            out.push((sop_name.clone(), admission));
+        }
+
+        out
+    }
+
+    fn evaluate_admission_with_reserved(
+        &self,
+        sop_name: &str,
+        reserved_for_sop: usize,
+        reserved_total: usize,
+    ) -> SopAdmission {
         let sop = match self.get_sop(sop_name) {
             Some(s) => s,
             None => {
@@ -1001,6 +1036,8 @@ impl SopEngine {
         }
 
         let (exec_for_sop, exec_total) = self.exec_counts(sop_name);
+        let exec_for_sop = exec_for_sop.saturating_add(reserved_for_sop);
+        let exec_total = exec_total.saturating_add(reserved_total);
         let pending_for_sop = self.pending_count_for_sop(sop_name);
         let exec_slot_free = exec_for_sop < sop.max_concurrent as usize
             && exec_total < self.config.max_concurrent_total;

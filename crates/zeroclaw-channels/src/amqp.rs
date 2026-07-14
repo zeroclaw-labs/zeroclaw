@@ -890,6 +890,39 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         );
     }
 
+    #[tokio::test]
+    async fn sop_only_delivery_over_global_exec_capacity_starts_none_and_requeues() {
+        let (engine, audit) = sop_handles_with_global_exec_capacity_one();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::Sop,
+            Some(Arc::clone(&engine)),
+            Some(audit),
+        )
+        .expect("sop-only channel with handles constructs");
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(1);
+
+        let outcome = ch
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .await;
+
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Deferred,
+            "a SOP-only delivery that exceeds global exec capacity must requeue as one broker unit"
+        );
+        let eng = engine.lock().unwrap();
+        assert!(
+            eng.run_summaries(Some("amqp-a")).is_empty(),
+            "the first matching SOP must not start before the whole delivery can fit"
+        );
+        assert!(
+            eng.run_summaries(Some("amqp-b")).is_empty(),
+            "the second matching SOP must not start when the delivery exceeds global capacity"
+        );
+    }
+
     /// Build sop/audit handles with `amqp-sop` already occupying its single exec
     /// slot (`max_concurrent = 1`), so the next matching AMQP delivery is
     /// backpressured and `dispatch_sop_event` returns a `Deferred` result.
@@ -997,6 +1030,53 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             .expect("first run fills amqp-full slot");
         }
         (engine, audit)
+    }
+
+    fn sop_handles_with_global_exec_capacity_one() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+        use zeroclaw_config::schema::SopConfig;
+        use zeroclaw_memory::NoneMemory;
+        use zeroclaw_runtime::sop::SopStepKind;
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+        };
+
+        fn amqp_sop(name: &str) -> Sop {
+            Sop {
+                name: name.into(),
+                description: "test".into(),
+                version: "1.0.0".into(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Auto,
+                triggers: vec![SopTrigger::Amqp {
+                    routing_key: "anitya.update".into(),
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+            }
+        }
+
+        let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
+        let mut config = SopConfig::default();
+        config.max_concurrent_total = 1;
+        let mut eng = SopEngine::new(config);
+        eng.set_sops_for_test(vec![amqp_sop("amqp-a"), amqp_sop("amqp-b")]);
+        (Arc::new(Mutex::new(eng)), audit)
     }
 
     #[tokio::test]

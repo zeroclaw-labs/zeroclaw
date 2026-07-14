@@ -250,10 +250,7 @@ async fn dispatch_sop_event_filtered(
         };
 
         if start_mode == DispatchStartMode::AllOrNothing {
-            let preflight: Vec<(String, SopAdmission)> = matched_names
-                .iter()
-                .map(|sop_name| (sop_name.clone(), eng.evaluate_admission(sop_name)))
-                .collect();
+            let preflight = eng.evaluate_admission_batch_all_or_nothing(&matched_names);
             if preflight
                 .iter()
                 .any(|(_, admission)| matches!(admission, SopAdmission::Defer { .. }))
