@@ -100,7 +100,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        run: bash scripts/ci/apt_install.sh libudev-dev
+        run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
