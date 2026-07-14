@@ -750,14 +750,13 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_section_and_tool_search_see_same_filtered_set() {
-        // Regression for #8054 Surface 1(b): the prompt-side
+        // The prompt-side
         // `build_deferred_tools_section_filtered` and the runtime
         // `ToolSearchTool` constructor (built from the same
-        // `filtered_deferred` value, the centralized single source of
-        // truth) must agree on which tools are visible. Before this
-        // fix, the prompt and the search tool could each apply the
-        // access policy independently, and a denied tool could leak
-        // through one of them.
+        // `filtered_deferred` value, the single source of
+        // truth) must agree on which tools are visible. If the
+        // prompt and the search tool each applied the access policy
+        // independently, a denied tool could leak through one of them.
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
         let set = make_deferred_set(vec![
             make_stub("srv__visible", "Visible tool"),
@@ -793,12 +792,11 @@ mod tests {
 
     #[tokio::test]
     async fn omission_safety_pre_filtered_set_suffices_without_reapplied_policy() {
-        // Regression for #8054 Surface 1(b): prove that the centralized
-        // `filter_by_policy` helper alone (the single source of truth) is
-        // sufficient to keep a denied tool schema out of both consumers,
-        // even when the policy is NOT reapplied at the consumer level.
-        // This validates the PR-body claim that a missed `with_access_policy`
-        // builder step on `ToolSearchTool` is no longer load-bearing.
+        // The `filter_by_policy` helper alone (the single source of
+        // truth) is sufficient to keep a denied tool schema out of
+        // both consumers, even when the policy is NOT reapplied at the
+        // consumer level. A missed `with_access_policy` builder step
+        // on `ToolSearchTool` is therefore not load-bearing.
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
         let set = make_deferred_set(vec![
             make_stub("srv__visible", "Visible tool"),

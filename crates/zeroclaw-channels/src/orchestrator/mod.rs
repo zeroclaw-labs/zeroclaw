@@ -10016,15 +10016,12 @@ pub async fn start_channels(
                                         registry.server_count()
                                     )
                                 );
-                                // Centralized single source of truth
-                                // for the deferred-MCP tool set — see
-                                // the matching comment in
-                                // `loop_.rs`. The same
-                                // `filtered_deferred` drives the
+                                // Single source of truth for the
+                                // deferred-MCP tool set: the same
+                                // `filtered_deferred` drives both the
                                 // prompt section and the
-                                // `ToolSearchTool` so a denied tool
-                                // cannot leak into either (issue
-                                // #8054 Surface 1(b)).
+                                // `ToolSearchTool`, so a policy-denied
+                                // tool cannot leak into either.
                                 let filtered_deferred = deferred_set
                                     .filter_by_policy(mcp_policy.as_ref());
                                 deferred_section =

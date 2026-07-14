@@ -98,7 +98,7 @@ impl DeferredMcpToolSet {
     /// `if let Some(policy) = ...` pattern at every production
     /// call site. Centralizes the per-stub filter logic so the
     /// prompt-side claim and the `ToolSearchTool` constructor see
-    /// exactly the same tool set (issue #8054 Surface 1(b)).
+    /// exactly the same tool set.
     pub fn filter_by_policy(&self, policy: Option<&ToolAccessPolicy>) -> Self {
         let filtered_stubs: Vec<DeferredMcpToolStub> = self
             .stubs
@@ -511,9 +511,9 @@ mod tests {
 
     #[test]
     fn filter_by_policy_none_returns_unchanged() {
-        // Regression for #8054 Surface 1(b): the centralized filter
-        // helper must be a no-op when no policy is set (the common
-        // case for callers that do not configure a `ToolAccessPolicy`).
+        // The centralized filter helper must be a no-op when no
+        // policy is set (the common case for callers that do not
+        // configure a `ToolAccessPolicy`).
         let stubs = vec![
             make_stub("fs__read_file", "Read a file"),
             make_stub("git__status", "Git status"),
@@ -528,10 +528,10 @@ mod tests {
 
     #[test]
     fn filter_by_policy_denied_removes_stubs() {
-        // Regression for #8054 Surface 1(b): a policy that denies
-        // a tool by name must drop that stub from the filtered set.
-        // The stub registry is irrelevant to the policy decision
-        // (it is the named filter), so an empty registry is fine.
+        // A policy that denies a tool by name must drop that stub
+        // from the filtered set. The stub registry is irrelevant to
+        // the policy decision (it is the named filter), so an empty
+        // registry is fine.
         let stubs = vec![
             make_stub("srv__visible", "Visible tool"),
             make_stub("srv__hidden", "Hidden tool"),
