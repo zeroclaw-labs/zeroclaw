@@ -46,7 +46,7 @@ enricher = "shodh.semantic"
 [storage.sqlite.default]
 
 [memory_enrichment.shodh.semantic]
-base_url = "http://127.0.0.1:3030"
+socket_path = "/run/user/1000/shodh-memory.sock"
 api_key = "replace-with-the-shodh-api-key"
 recall_timeout_ms = 2000
 store_timeout_ms = 5000
@@ -86,7 +86,7 @@ enricher = "none"
 | Connector | Protocol | Recall result | Agent scope | Remote cleanup |
 |---|---|---|---|---|
 | Lucid | local CLI | derived context | unscoped only | none |
-| Shodh | authenticated REST over HTTP | canonical SQLite references | configured agent allowlist | agent-scoped |
+| Shodh | authenticated local IPC | canonical SQLite references | configured agent allowlist | agent-scoped |
 
 Lucid-derived context can supplement a session-scoped recall because it is not
 presented as an exact durable row. Lucid external recall is skipped when an
@@ -101,15 +101,14 @@ Cross-agent recall makes one bounded request for each UUID already allowed by
 `read_memory_from`; the connector cannot widen that allowlist. Session,
 namespace, category, and ZeroClaw key metadata are mirrored as tags.
 
-Shodh's downloadable local binary and a remote Shodh deployment use the same
-connector transport. The binary is a server, not a Lucid-style command invoked
-once per store or recall: start it with `shodh server`, keep the default
-loopback `base_url`, and configure the API key created by `shodh init`. For a
-remote deployment, change `base_url` and use that server's key. ZeroClaw does
-not spawn or supervise the Shodh server; a service manager keeps one shared
-process independent from individual agent-memory handles. See Shodh's
-[direct server documentation](https://github.com/varun29ankuS/shodh-memory/blob/main/docs/direct-server-systemd.md)
-for a local service example.
+Shodh's downloadable binary is an independently supervised local server, not a
+Lucid-style command invoked once per store or recall. Configure both processes
+with the same explicit socket path and API key. Unix uses a Unix-domain socket;
+Windows uses a named pipe such as `socket_path = '\\.\pipe\shodh-memory'`.
+ZeroClaw opens one connection per operation and does not fall back to HTTP or
+connect to a remote Shodh deployment. A service manager keeps one shared Shodh
+process independent from individual agent-memory handles. See Shodh's server
+documentation for service-manager setup and its local IPC options.
 
 Shodh candidates never become authoritative. ZeroClaw maps each remote result
 back to its SQLite key and agent UUID and returns the canonical local row. A

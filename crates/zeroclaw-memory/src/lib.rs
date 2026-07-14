@@ -1601,6 +1601,7 @@ exit 1
             ..MemoryConfig::default()
         };
         let storage = ShodhEnrichmentConfig {
+            socket_path: "test-shodh.sock".into(),
             api_key: Some("test-key".into()),
             ..ShodhEnrichmentConfig::default()
         };

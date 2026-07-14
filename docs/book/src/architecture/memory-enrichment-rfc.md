@@ -64,8 +64,8 @@ memory.enricher ─► connector factory ─┴─► EnrichedMemory<E>
                                                 │
                                   ┌─────────────┴─────────────┐
                                   ▼                           ▼
-                          Lucid CLI adapter          Shodh REST adapter
-                                                    local or remote server
+                          Lucid CLI adapter          Shodh local IPC adapter
+                                                    supervised local server
 ```
 
 The initial seam supports SQLite as the authoritative store. Extending it over
@@ -101,10 +101,10 @@ The typed configuration is authoritative:
 - the factory resolves these selectors once for each handle construction.
 
 Connector handles retain only the immutable operational projection they need,
-such as a command path, URL, credential header, and deadline. They do not own a
-second mutable selector or connector catalog. A configuration change takes
-effect when the owning memory handle is reconstructed, following the existing
-factory lifecycle used by other runtime integrations.
+such as a command path, socket or pipe path, credential, and deadline. They do
+not own a second mutable selector or connector catalog. A configuration change
+takes effect when the owning memory handle is reconstructed, following the
+existing factory lifecycle used by other runtime integrations.
 
 Status strings such as `sqlite+lucid` are derived views. They are never stored
 as another selector.
@@ -119,7 +119,7 @@ enricher = "shodh.semantic"
 [storage.sqlite.default]
 
 [memory_enrichment.shodh.semantic]
-base_url = "http://127.0.0.1:3030"
+socket_path = "/run/user/1000/shodh-memory.sock"
 api_key = "replace-with-the-shodh-api-key"
 recall_timeout_ms = 2000
 store_timeout_ms = 5000
@@ -148,7 +148,7 @@ enricher = "none"
 
 Enrichment with a non-SQLite durable backend fails validation. Dotted aliases
 must resolve. Bare `lucid` remains a zero-configuration convenience; Shodh
-requires a typed alias because its API credential and deployment details are
+requires a typed alias because its IPC credential and socket details are
 operationally significant.
 
 ## Shared runtime contract
@@ -190,17 +190,23 @@ cross-agent recall. Lucid declares no cleanup capability.
 
 ### Shodh
 
-Shodh uses its authenticated REST API. The same adapter targets either:
-
-- the official local binary started with `shodh server` on loopback; or
-- a separately managed remote Shodh deployment.
+Shodh uses authenticated local IPC to an independently supervised server. Unix
+uses a Unix-domain socket and Windows uses a named pipe. The configured
+`socket_path` and `api_key` are both mandatory; ZeroClaw has no derived default,
+HTTP fallback, or remote Shodh transport.
 
 The binary is a server deployment, not a Lucid-style executable invoked for
-each memory operation. ZeroClaw therefore does not create a second binary
-adapter or spawn one server per agent-memory handle. Operators supervise one
-shared local process with their normal service manager and point `base_url` at
-it. This preserves one request/response implementation for local and remote
-deployments.
+each memory operation. Operators supervise one shared local process with their
+normal service manager and configure the server and ZeroClaw with the same IPC
+endpoint and key. The server can reuse its existing REST and MCP request
+handlers internally without exposing HTTP to the ZeroClaw connector.
+
+Each connection carries one UTF-8 JSON request line and one response line. The
+versioned envelope includes a request ID, authentication value, method, path,
+and JSON body; the response echoes the version and request ID with an HTTP-like
+status and JSON body. ZeroClaw rejects mismatched versions and IDs, frames over
+8 MiB, and non-success statuses. One operation-wide deadline covers connect,
+write, and read.
 
 Each stable ZeroClaw agent UUID maps to a Shodh `user_id`. Cross-agent recall
 makes bounded calls only for UUIDs already admitted by `read_memory_from`.
@@ -237,10 +243,10 @@ state is a rebuildable derivative, not another authority.
 - Lucid-derived context is marked as untrusted external enrichment before it
   becomes model-visible.
 - Shodh credentials use the existing secret-field machinery.
-- Shodh URLs reject embedded credentials, query strings, fragments, and
-  non-HTTP schemes.
-- A local Shodh server should bind to loopback. Remote exposure requires the
-  server's own TLS and access-control deployment policy.
+- Shodh requires an explicit local endpoint and never falls back to HTTP.
+- The Shodh server restricts its Unix socket to the owning user and applies an
+  owner-only DACL to its Windows named pipe. The API key remains required as a
+  second boundary and is never included in connector errors.
 
 ## Product surface
 
@@ -312,16 +318,16 @@ locking, and repeats policy and product wiring.
 
 ### One adapter with protocol conditionals
 
-Rejected. Lucid's per-operation CLI and Shodh's REST API have genuinely
+Rejected. Lucid's per-operation CLI and Shodh's local IPC protocol have genuinely
 different translation and capability behavior. Sharing the policy wrapper is
 useful; merging unrelated transports into one adapter is not.
 
-### Separate Shodh binary and HTTP adapters
+### Add a Shodh HTTP fallback
 
-Rejected. The official binary exposes the same HTTP API used remotely. A
-second adapter would duplicate request translation and encourage one server
-process per memory handle. Deployment lifecycle is distinct from connector
-protocol.
+Rejected. HTTP would expand the connector's exposure and configuration surface
+without helping the local ZeroClaw integration. Shodh may retain its REST and
+MCP surfaces for other clients while routing local IPC requests through the
+same server-side handlers.
 
 ### Embed the Shodh Rust crate
 
@@ -369,8 +375,9 @@ The implementation includes tests for:
 - aggregate cross-agent recall deadlines and partial Shodh failures;
 - derived-context and canonical-reference session behavior;
 - stale Shodh row rejection and agent allowlist enforcement;
-- Lucid process deadlines and Shodh authenticated REST translation;
-- loopback Shodh defaults for the official local binary server;
+- Lucid process deadlines and Shodh authenticated local IPC translation;
+- strict Shodh envelope version, request ID, status, size, and secret handling;
+- fake Unix-socket and Windows-named-pipe servers with no network access;
 - storage and enrichment pickers, Quickstart wiring, generated config
   references, and documentation consistency.
 

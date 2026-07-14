@@ -6,31 +6,35 @@ use super::enriched::{
 #[cfg(test)]
 use super::sqlite::SqliteMemory;
 use super::traits::{MemoryCategory, MemoryEntry};
+use anyhow::Context;
 use async_trait::async_trait;
-use reqwest::header::HeaderValue;
-use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::time::sleep;
 use tokio::time::{Instant, timeout};
+use uuid::Uuid;
 use zeroclaw_api::attribution::MemoryKind;
 use zeroclaw_config::schema::ShodhEnrichmentConfig;
 
-const API_KEY_HEADER: &str = "X-API-Key";
 const UNSCOPED_USER_ID: &str = "zeroclaw-unscoped";
 const MARKER_TAG: &str = "zeroclaw";
 const KEY_TAG_PREFIX: &str = "zc-key:";
 const CATEGORY_TAG_PREFIX: &str = "zc-category:";
 const NAMESPACE_TAG_PREFIX: &str = "zc-namespace:";
 const SESSION_TAG_PREFIX: &str = "zc-session:";
+const IPC_PROTOCOL_VERSION: u8 = 1;
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// REST connector for an independently supervised local Shodh binary or remote
-/// Shodh deployment.
+/// Local-IPC connector for an independently supervised Shodh server.
 pub struct ShodhConnector {
-    client: Client,
-    base_url: Url,
-    api_key: HeaderValue,
+    socket_path: PathBuf,
+    api_key: String,
     recall_timeout: Duration,
     store_timeout: Duration,
 }
@@ -55,8 +59,6 @@ struct RecallRequest<'a> {
     query: &'a str,
     limit: usize,
     mode: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<&'a str>,
     tags: Vec<&'static str>,
 }
 
@@ -90,9 +92,67 @@ struct ForgetByTagsRequest<'a> {
     tags: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct IpcRequest<'a> {
+    v: u8,
+    id: &'a str,
+    auth: &'a str,
+    method: &'a str,
+    path: &'a str,
+    body: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpcResponse {
+    v: u8,
+    id: String,
+    status: u16,
+    body: Value,
+}
+
+#[cfg(unix)]
+type LocalStream = tokio::net::UnixStream;
+
+#[cfg(windows)]
+type LocalStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(unix)]
+async fn open_local_stream(path: &Path) -> anyhow::Result<LocalStream> {
+    tokio::net::UnixStream::connect(path)
+        .await
+        .with_context(|| format!("connecting to Shodh socket {}", path.display()))
+}
+
+#[cfg(windows)]
+async fn open_local_stream(path: &Path) -> anyhow::Result<LocalStream> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let name = path.to_string_lossy().into_owned();
+    loop {
+        match ClientOptions::new().open(&name) {
+            Ok(client) => return Ok(client),
+            Err(error) if error.raw_os_error() == Some(231) => {
+                // ERROR_PIPE_BUSY. The operation-wide deadline bounds retries.
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error))
+                    .with_context(|| format!("connecting to Shodh pipe {name}"));
+            }
+        }
+    }
+}
+
 impl ShodhConnector {
     pub(crate) fn new(config: &ShodhEnrichmentConfig) -> anyhow::Result<Self> {
-        let base_url = Self::validated_base_url(&config.base_url)?;
+        let socket_path = config.socket_path.trim();
+        if socket_path.is_empty() {
+            anyhow::bail!(
+                "memory enricher 'shodh' requires `socket_path` in \
+                 [memory_enrichment.shodh.<alias>]"
+            );
+        }
         let api_key = config
             .api_key
             .as_deref()
@@ -105,49 +165,141 @@ impl ShodhConnector {
                 )
             })?
             .to_string();
-        let api_key = HeaderValue::from_str(&api_key)
-            .map_err(|error| anyhow::Error::msg(format!("invalid Shodh api_key: {error}")))?;
         if config.recall_timeout_ms == 0 || config.store_timeout_ms == 0 {
             anyhow::bail!("Shodh recall and store timeouts must be greater than zero");
         }
 
         Ok(Self {
-            client: Client::new(),
-            base_url,
+            socket_path: PathBuf::from(socket_path),
             api_key,
             recall_timeout: Duration::from_millis(config.recall_timeout_ms),
             store_timeout: Duration::from_millis(config.store_timeout_ms),
         })
     }
 
-    fn validated_base_url(raw: &str) -> anyhow::Result<Url> {
-        let mut url = Url::parse(raw.trim())
-            .map_err(|error| anyhow::Error::msg(format!("invalid Shodh base_url: {error}")))?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            anyhow::bail!("Shodh base_url must be an HTTP(S) origin with a host");
+    async fn request<T: Serialize>(
+        &self,
+        method: &'static str,
+        path: &str,
+        body: &T,
+        timeout_window: Duration,
+    ) -> anyhow::Result<Value> {
+        let id = Uuid::new_v4().to_string();
+        let body = serde_json::to_value(body).context("serializing Shodh IPC request body")?;
+        let request = IpcRequest {
+            v: IPC_PROTOCOL_VERSION,
+            id: &id,
+            auth: &self.api_key,
+            method,
+            path,
+            body,
+        };
+        let mut frame = serde_json::to_vec(&request).context("serializing Shodh IPC request")?;
+        if frame.len().saturating_add(1) > MAX_FRAME_BYTES {
+            anyhow::bail!("Shodh IPC request exceeds {MAX_FRAME_BYTES} bytes");
         }
-        if !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
+        frame.push(b'\n');
+
+        let response = timeout(timeout_window, self.exchange(&frame))
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "Shodh IPC {method} {path} timed out after {}ms",
+                    timeout_window.as_millis()
+                ))
+            })??;
+        if !response.ends_with(b"\n") {
+            anyhow::bail!("Shodh IPC response ended before its newline delimiter");
+        }
+        let response: IpcResponse = serde_json::from_slice(&response).map_err(|error| {
+            anyhow::Error::msg(format!(
+                "decoding Shodh IPC response: {}",
+                self.redact(error)
+            ))
+        })?;
+        if response.v != IPC_PROTOCOL_VERSION {
             anyhow::bail!(
-                "Shodh base_url must not contain credentials, a query string, or a fragment"
+                "Shodh IPC protocol version mismatch: expected {}, received {}",
+                IPC_PROTOCOL_VERSION,
+                response.v
             );
         }
-        let normalized_path = format!("{}/", url.path().trim_end_matches('/'));
-        url.set_path(&normalized_path);
-        Ok(url)
+        if response.id != id {
+            anyhow::bail!("Shodh IPC response id did not match its request");
+        }
+        if !(100..=599).contains(&response.status) {
+            anyhow::bail!("Shodh IPC response status was invalid");
+        }
+        if !(200..300).contains(&response.status) {
+            let detail = response
+                .body
+                .get("error")
+                .or_else(|| response.body.get("message"))
+                .and_then(Value::as_str)
+                .map(|message| message.replace(&self.api_key, "[redacted]"))
+                .map(|message| message.chars().take(512).collect::<String>());
+            if let Some(detail) = detail {
+                anyhow::bail!(
+                    "Shodh IPC {method} {path} returned status {}: {detail}",
+                    response.status
+                );
+            }
+            anyhow::bail!(
+                "Shodh IPC {method} {path} returned status {}",
+                response.status
+            );
+        }
+        Ok(response.body)
     }
 
-    fn endpoint(&self, path: &str) -> anyhow::Result<Url> {
-        self.base_url
-            .join(path)
-            .map_err(|error| anyhow::Error::msg(format!("invalid Shodh API endpoint: {error}")))
+    #[cfg(any(unix, windows))]
+    async fn exchange(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let stream = open_local_stream(&self.socket_path).await?;
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        write_half
+            .write_all(request)
+            .await
+            .context("writing Shodh IPC request")?;
+        write_half
+            .flush()
+            .await
+            .context("flushing Shodh IPC request")?;
+
+        let mut reader = BufReader::new(read_half);
+        let mut limited = (&mut reader).take((MAX_FRAME_BYTES + 1) as u64);
+        let mut response = Vec::new();
+        let bytes_read = limited
+            .read_until(b'\n', &mut response)
+            .await
+            .context("reading Shodh IPC response")?;
+        if bytes_read == 0 {
+            anyhow::bail!("Shodh IPC server closed without a response");
+        }
+        if response.len() > MAX_FRAME_BYTES {
+            anyhow::bail!("Shodh IPC response exceeds {MAX_FRAME_BYTES} bytes");
+        }
+        let mut trailing = Vec::new();
+        limited
+            .read_to_end(&mut trailing)
+            .await
+            .context("finishing Shodh IPC response")?;
+        if !trailing.is_empty() {
+            anyhow::bail!("Shodh IPC response contained data after its newline delimiter");
+        }
+        Ok(response)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    async fn exchange(&self, _request: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("Shodh local IPC is unsupported on this platform")
     }
 
     fn user_id(agent_id: Option<&str>) -> &str {
         agent_id.unwrap_or(UNSCOPED_USER_ID)
+    }
+
+    fn redact(&self, value: impl ToString) -> String {
+        value.to_string().replace(&self.api_key, "[redacted]")
     }
 
     fn external_id(key: &str) -> String {
@@ -263,25 +415,28 @@ impl ShodhConnector {
         user_id: &str,
         agent_id: Option<&str>,
         request: EnrichmentRecallRequest<'_>,
+        timeout_window: Duration,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let response = self
-            .client
-            .post(self.endpoint("api/recall")?)
-            .header(API_KEY_HEADER, self.api_key.clone())
-            .timeout(self.recall_timeout)
-            .json(&RecallRequest {
-                user_id,
-                query: request.query,
-                limit: request.limit,
-                mode: "hybrid",
-                session_id: request.session_id,
-                tags: vec![MARKER_TAG],
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<RecallResponse>()
+            .request(
+                "POST",
+                "/api/recall",
+                &RecallRequest {
+                    user_id,
+                    query: request.query,
+                    limit: request.limit,
+                    mode: "hybrid",
+                    tags: vec![MARKER_TAG],
+                },
+                timeout_window,
+            )
             .await?;
+        let response: RecallResponse = serde_json::from_value(response).map_err(|error| {
+            anyhow::Error::msg(format!(
+                "decoding Shodh recall response body: {}",
+                self.redact(error)
+            ))
+        })?;
         Ok(response
             .memories
             .into_iter()
@@ -290,29 +445,27 @@ impl ShodhConnector {
     }
 
     async fn forget_by_tag(&self, user_id: &str, tag: String) -> anyhow::Result<()> {
-        self.client
-            .post(self.endpoint("api/forget/tags")?)
-            .header(API_KEY_HEADER, self.api_key.clone())
-            .timeout(self.store_timeout)
-            .json(&ForgetByTagsRequest {
+        self.request(
+            "POST",
+            "/api/forget/tags",
+            &ForgetByTagsRequest {
                 user_id,
                 tags: vec![tag],
-            })
-            .send()
-            .await?
-            .error_for_status()?;
+            },
+            self.store_timeout,
+        )
+        .await?;
         Ok(())
     }
 
     async fn delete_user(&self, agent_id: &str) -> anyhow::Result<()> {
-        let endpoint = self.endpoint(&format!("api/users/{agent_id}"))?;
-        self.client
-            .delete(endpoint)
-            .header(API_KEY_HEADER, self.api_key.clone())
-            .timeout(self.store_timeout)
-            .send()
-            .await?
-            .error_for_status()?;
+        self.request(
+            "DELETE",
+            &format!("/api/users/{agent_id}"),
+            &serde_json::json!({}),
+            self.store_timeout,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -338,11 +491,10 @@ impl MemoryEnricher for ShodhConnector {
 
     async fn store(&self, request: EnrichmentStoreRequest<'_>) -> anyhow::Result<()> {
         let user_id = Self::user_id(request.agent_id);
-        self.client
-            .post(self.endpoint("api/upsert")?)
-            .header(API_KEY_HEADER, self.api_key.clone())
-            .timeout(self.store_timeout)
-            .json(&UpsertRequest {
+        self.request(
+            "POST",
+            "/api/upsert",
+            &UpsertRequest {
                 user_id,
                 external_id: Self::external_id(request.key),
                 content: request.content,
@@ -350,10 +502,10 @@ impl MemoryEnricher for ShodhConnector {
                 memory_type: Self::category_to_memory_type(request.category),
                 change_type: "content_updated",
                 importance: request.importance.map(|value| value.clamp(0.0, 1.0)),
-            })
-            .send()
-            .await?
-            .error_for_status()?;
+            },
+            self.store_timeout,
+        )
+        .await?;
         Ok(())
     }
 
@@ -383,7 +535,7 @@ impl MemoryEnricher for ShodhConnector {
                     }
                     match timeout(
                         remaining,
-                        self.recall_user(agent_id, Some(agent_id), request),
+                        self.recall_user(agent_id, Some(agent_id), request, remaining),
                     )
                     .await
                     {
@@ -425,7 +577,10 @@ impl MemoryEnricher for ShodhConnector {
                 }
             }
             None => {
-                results.extend(self.recall_user(UNSCOPED_USER_ID, None, request).await?);
+                results.extend(
+                    self.recall_user(UNSCOPED_USER_ID, None, request, self.recall_timeout)
+                        .await?,
+                );
             }
         }
         results.sort_by(|left, right| {
@@ -464,13 +619,188 @@ mod tests {
     use crate::enriched::RecallKind;
     use crate::traits::Memory;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    use wiremock::matchers::{body_partial_json, header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-    fn test_config(server: &MockServer) -> ShodhEnrichmentConfig {
+    struct FakeResponse {
+        version: u8,
+        id: Option<String>,
+        status: u16,
+        body: Value,
+        delay: Duration,
+        trailing: Vec<u8>,
+        extra_field: Option<(String, Value)>,
+        raw: Option<Vec<u8>>,
+        omit_newline: bool,
+    }
+
+    impl FakeResponse {
+        fn ok(body: Value) -> Self {
+            Self {
+                version: IPC_PROTOCOL_VERSION,
+                id: None,
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+                trailing: Vec::new(),
+                extra_field: None,
+                raw: None,
+                omit_newline: false,
+            }
+        }
+
+        fn error(status: u16, message: &str) -> Self {
+            Self {
+                version: IPC_PROTOCOL_VERSION,
+                id: None,
+                status,
+                body: json!({ "error": message }),
+                delay: Duration::ZERO,
+                trailing: Vec::new(),
+                extra_field: None,
+                raw: None,
+                omit_newline: false,
+            }
+        }
+
+        fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+
+        fn with_trailing_data(mut self, trailing: &[u8]) -> Self {
+            self.trailing = trailing.to_vec();
+            self
+        }
+
+        fn with_extra_field(mut self, name: &str, value: Value) -> Self {
+            self.extra_field = Some((name.to_string(), value));
+            self
+        }
+
+        fn raw(bytes: &[u8]) -> Self {
+            let mut response = Self::ok(Value::Null);
+            response.raw = Some(bytes.to_vec());
+            response
+        }
+
+        fn without_newline(mut self) -> Self {
+            self.omit_newline = true;
+            self
+        }
+    }
+
+    type FakeResponder = Arc<dyn Fn(&Value) -> FakeResponse + Send + Sync>;
+    type CapturedRequests = Arc<Mutex<Vec<Value>>>;
+
+    fn responder(
+        callback: impl Fn(&Value) -> FakeResponse + Send + Sync + 'static,
+    ) -> FakeResponder {
+        Arc::new(callback)
+    }
+
+    async fn serve_fake_connection<S>(
+        stream: S,
+        captured: &CapturedRequests,
+        responder: &FakeResponder,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let mut request_line = Vec::new();
+        reader.read_until(b'\n', &mut request_line).await.unwrap();
+        assert!(request_line.len() <= MAX_FRAME_BYTES);
+        let request: Value = serde_json::from_slice(&request_line).unwrap();
+        captured.lock().unwrap().push(request.clone());
+
+        let response = responder(&request);
+        if !response.delay.is_zero() {
+            tokio::time::sleep(response.delay).await;
+        }
+        if let Some(raw) = response.raw.as_ref() {
+            let _ = write_half.write_all(raw).await;
+            return;
+        }
+        let id = response
+            .id
+            .unwrap_or_else(|| request["id"].as_str().unwrap().to_string());
+        let mut envelope = json!({
+            "v": response.version,
+            "id": id,
+            "status": response.status,
+            "body": response.body,
+        });
+        if let Some((name, value)) = response.extra_field {
+            envelope.as_object_mut().unwrap().insert(name, value);
+        }
+        let mut response_line = serde_json::to_vec(&envelope).unwrap();
+        if !response.omit_newline {
+            response_line.push(b'\n');
+        }
+        response_line.extend_from_slice(&response.trailing);
+        let _ = write_half.write_all(&response_line).await;
+    }
+
+    #[cfg(unix)]
+    fn spawn_fake_server(
+        temp: &TempDir,
+        connection_count: usize,
+        responder: FakeResponder,
+    ) -> (PathBuf, CapturedRequests, tokio::task::JoinHandle<()>) {
+        let path = temp.path().join("shodh.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let server_captured = captured.clone();
+        let cleanup_path = path.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_fake_connection(stream, &server_captured, &responder).await;
+            }
+            let _ = tokio::fs::remove_file(cleanup_path).await;
+        });
+        (path, captured, handle)
+    }
+
+    #[cfg(windows)]
+    fn spawn_fake_server(
+        _temp: &TempDir,
+        connection_count: usize,
+        responder: FakeResponder,
+    ) -> (PathBuf, CapturedRequests, tokio::task::JoinHandle<()>) {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let path = PathBuf::from(format!(r"\\.\pipe\zeroclaw-shodh-test-{}", Uuid::new_v4()));
+        let name = path.to_string_lossy().into_owned();
+        let mut listener = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let server_captured = captured.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..connection_count {
+                listener.connect().await.unwrap();
+                let next = ServerOptions::new().create(&name).unwrap();
+                let connected = std::mem::replace(&mut listener, next);
+                serve_fake_connection(connected, &server_captured, &responder).await;
+            }
+        });
+        (path, captured, handle)
+    }
+
+    async fn finish_fake_server(handle: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("fake Shodh server did not receive its expected connections")
+            .unwrap();
+    }
+
+    fn test_config(socket_path: &Path) -> ShodhEnrichmentConfig {
         ShodhEnrichmentConfig {
-            base_url: server.uri(),
+            socket_path: socket_path.to_string_lossy().into_owned(),
             api_key: Some("test-api-key".into()),
             local_hit_threshold: 10,
             ..ShodhEnrichmentConfig::default()
@@ -519,15 +849,21 @@ mod tests {
     }
 
     #[test]
-    fn base_url_rejects_embedded_credentials() {
-        let error = ShodhConnector::validated_base_url("https://user:pass@example.com")
-            .expect_err("credentials must not be accepted");
-        assert!(error.to_string().contains("must not contain credentials"));
+    fn constructor_requires_explicit_socket_path() {
+        let error = match ShodhConnector::new(&ShodhEnrichmentConfig::default()) {
+            Ok(_) => panic!("missing socket path must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires `socket_path`"));
     }
 
     #[test]
     fn constructor_requires_api_key() {
-        let error = match ShodhConnector::new(&ShodhEnrichmentConfig::default()) {
+        let config = ShodhEnrichmentConfig {
+            socket_path: "shodh-test.sock".to_string(),
+            ..ShodhEnrichmentConfig::default()
+        };
+        let error = match ShodhConnector::new(&config) {
             Ok(_) => panic!("missing API key must fail closed"),
             Err(error) => error,
         };
@@ -535,51 +871,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_scoped_store_and_recall_use_authenticated_http_api() {
-        let server = MockServer::start().await;
+    async fn agent_scoped_store_and_recall_use_authenticated_local_ipc() {
         let temp = TempDir::new().unwrap();
+        let (socket_path, captured, server) = spawn_fake_server(
+            &temp,
+            2,
+            responder(|request| match request["path"].as_str().unwrap() {
+                "/api/upsert" => FakeResponse::ok(json!({
+                    "id": "remote-id",
+                    "success": true,
+                    "was_update": false,
+                    "version": 1
+                })),
+                "/api/recall" => {
+                    let agent_id = request["body"]["user_id"].as_str().unwrap();
+                    FakeResponse::ok(recall_body(
+                        "local-key",
+                        "stale remote payload",
+                        agent_id,
+                        Some("session:alpha"),
+                    ))
+                }
+                path => panic!("unexpected path {path}"),
+            }),
+        );
         let local = SqliteMemory::new("sqlite", temp.path()).unwrap();
-        let memory = crate::build_shodh_enriched_memory(local, &test_config(&server)).unwrap();
+        let memory = crate::build_shodh_enriched_memory(local, &test_config(&socket_path)).unwrap();
         let agent_id = memory.ensure_agent_uuid("alpha").await.unwrap();
         let agent_id = agent_id.as_str();
         let key = "local-key";
         let session_id = "session:alpha";
-
-        Mock::given(method("POST"))
-            .and(path("/api/upsert"))
-            .and(header(API_KEY_HEADER, "test-api-key"))
-            .and(body_partial_json(json!({
-                "user_id": agent_id,
-                "content": "canonical local payload",
-                "memory_type": "learning",
-                "importance": 0.7
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "remote-id",
-                "success": true,
-                "was_update": false,
-                "version": 1
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/recall"))
-            .and(header(API_KEY_HEADER, "test-api-key"))
-            .and(body_partial_json(json!({
-                "user_id": agent_id,
-                "query": "semantic-only-query",
-                "session_id": session_id
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recall_body(
-                key,
-                "stale remote payload",
-                agent_id,
-                Some(session_id),
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
 
         memory
             .store_with_agent(
@@ -610,53 +931,60 @@ mod tests {
         assert_eq!(recalled[0].content, "canonical local payload");
         assert_eq!(recalled[0].agent_id.as_deref(), Some(agent_id));
         assert_eq!(recalled[0].score, Some(0.91));
+
+        finish_fake_server(server).await;
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request["v"] == 1));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["auth"] == "test-api-key")
+        );
+        assert_eq!(requests[0]["method"], "POST");
+        assert_eq!(requests[0]["path"], "/api/upsert");
+        assert_eq!(requests[0]["body"]["user_id"], agent_id);
+        assert_eq!(requests[0]["body"]["content"], "canonical local payload");
+        assert_eq!(requests[1]["path"], "/api/recall");
+        assert!(requests[1]["body"].get("session_id").is_none());
     }
 
     #[tokio::test]
     async fn stale_remote_row_cannot_resurrect_after_local_deletion() {
-        let server = MockServer::start().await;
         let agent_id = "f879192b-5fa2-4dc0-97fc-63c049dc66ec";
-        Mock::given(method("POST"))
-            .and(path("/api/recall"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recall_body(
-                "deleted-key",
-                "remote residue",
-                agent_id,
-                None,
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
-
         let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(move |_| {
+                FakeResponse::ok(recall_body("deleted-key", "remote residue", agent_id, None))
+            }),
+        );
+
         let local = SqliteMemory::new("sqlite", temp.path()).unwrap();
-        let memory = crate::build_shodh_enriched_memory(local, &test_config(&server)).unwrap();
+        let memory = crate::build_shodh_enriched_memory(local, &test_config(&socket_path)).unwrap();
         let recalled = memory
             .recall_for_agents(&[agent_id], "residue", 5, None, None, None)
             .await
             .unwrap();
         assert!(recalled.is_empty());
+        finish_fake_server(server).await;
     }
 
     #[tokio::test]
     async fn remote_recall_failure_preserves_local_results() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/upsert"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/recall"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(1)
-            .mount(&server)
-            .await;
-
         let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            2,
+            responder(|request| match request["path"].as_str().unwrap() {
+                "/api/upsert" => FakeResponse::ok(json!({})),
+                "/api/recall" => FakeResponse::error(503, "temporarily unavailable"),
+                path => panic!("unexpected path {path}"),
+            }),
+        );
         let local = SqliteMemory::new("sqlite", temp.path()).unwrap();
-        let memory = crate::build_shodh_enriched_memory(local, &test_config(&server)).unwrap();
+        let memory = crate::build_shodh_enriched_memory(local, &test_config(&socket_path)).unwrap();
         let agent_id = memory.ensure_agent_uuid("alpha").await.unwrap();
         memory
             .store_with_agent(
@@ -677,34 +1005,34 @@ mod tests {
             .unwrap();
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].content, "local anchor survives");
+        finish_fake_server(server).await;
     }
 
     #[tokio::test]
     async fn cross_agent_recall_returns_successes_when_one_request_fails() {
-        let server = MockServer::start().await;
         let successful_agent = "11111111-1111-4111-8111-111111111111";
         let failed_agent = "22222222-2222-4222-8222-222222222222";
-        Mock::given(method("POST"))
-            .and(path("/api/recall"))
-            .and(body_partial_json(json!({ "user_id": successful_agent })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recall_body(
-                "remote-key",
-                "remote payload",
-                successful_agent,
-                None,
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/recall"))
-            .and(body_partial_json(json!({ "user_id": failed_agent })))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            2,
+            responder(move |request| {
+                let agent_id = request["body"]["user_id"].as_str().unwrap();
+                if agent_id == successful_agent {
+                    FakeResponse::ok(recall_body(
+                        "remote-key",
+                        "remote payload",
+                        successful_agent,
+                        None,
+                    ))
+                } else {
+                    assert_eq!(agent_id, failed_agent);
+                    FakeResponse::error(503, "temporarily unavailable")
+                }
+            }),
+        );
 
-        let connector = ShodhConnector::new(&test_config(&server)).unwrap();
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
         let allowed_agents = [successful_agent, failed_agent];
         let recalled = connector
             .recall(EnrichmentRecallRequest {
@@ -720,43 +1048,39 @@ mod tests {
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].key, "remote-key");
         assert_eq!(recalled[0].agent_id.as_deref(), Some(successful_agent));
+        finish_fake_server(server).await;
     }
 
     #[tokio::test]
     async fn cross_agent_recall_timeout_bounds_the_whole_operation() {
-        let server = MockServer::start().await;
         let successful_agent = "11111111-1111-4111-8111-111111111111";
         let slow_agents = [
             "22222222-2222-4222-8222-222222222222",
             "33333333-3333-4333-8333-333333333333",
             "44444444-4444-4444-8444-444444444444",
         ];
-        Mock::given(method("POST"))
-            .and(path("/api/recall"))
-            .and(body_partial_json(json!({ "user_id": successful_agent })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(recall_body(
-                "remote-key",
-                "remote payload",
-                successful_agent,
-                None,
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
-        for agent_id in slow_agents {
-            Mock::given(method("POST"))
-                .and(path("/api/recall"))
-                .and(body_partial_json(json!({ "user_id": agent_id })))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_delay(Duration::from_millis(400))
-                        .set_body_json(recall_body("slow-key", "slow payload", agent_id, None)),
-                )
-                .mount(&server)
-                .await;
-        }
+        let temp = TempDir::new().unwrap();
+        let (socket_path, captured, server) = spawn_fake_server(
+            &temp,
+            2,
+            responder(move |request| {
+                let agent_id = request["body"]["user_id"].as_str().unwrap();
+                if agent_id == successful_agent {
+                    FakeResponse::ok(recall_body(
+                        "remote-key",
+                        "remote payload",
+                        successful_agent,
+                        None,
+                    ))
+                } else {
+                    assert!(slow_agents.contains(&agent_id));
+                    FakeResponse::ok(recall_body("slow-key", "slow payload", agent_id, None))
+                        .delayed(Duration::from_millis(400))
+                }
+            }),
+        );
 
-        let mut config = test_config(&server);
+        let mut config = test_config(&socket_path);
         config.recall_timeout_ms = 100;
         let connector = ShodhConnector::new(&config).unwrap();
         let allowed_agents = [
@@ -781,37 +1105,30 @@ mod tests {
 
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].agent_id.as_deref(), Some(successful_agent));
+        finish_fake_server(server).await;
+        assert_eq!(captured.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn scoped_forget_deletes_locally_and_propagates_by_tag() {
-        let server = MockServer::start().await;
         let temp = TempDir::new().unwrap();
+        let (socket_path, captured, server) = spawn_fake_server(
+            &temp,
+            2,
+            responder(|request| match request["path"].as_str().unwrap() {
+                "/api/upsert" => FakeResponse::ok(json!({})),
+                "/api/forget/tags" => FakeResponse::ok(json!({
+                    "success": true,
+                    "deleted_count": 1
+                })),
+                path => panic!("unexpected path {path}"),
+            }),
+        );
         let local = SqliteMemory::new("sqlite", temp.path()).unwrap();
-        let memory = crate::build_shodh_enriched_memory(local, &test_config(&server)).unwrap();
+        let memory = crate::build_shodh_enriched_memory(local, &test_config(&socket_path)).unwrap();
         let agent_id = memory.ensure_agent_uuid("alpha").await.unwrap();
         let agent_id = agent_id.as_str();
         let key = "forget-me";
-        Mock::given(method("POST"))
-            .and(path("/api/upsert"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/forget/tags"))
-            .and(header(API_KEY_HEADER, "test-api-key"))
-            .and(body_partial_json(json!({
-                "user_id": agent_id,
-                "tags": [ShodhConnector::encoded_tag(KEY_TAG_PREFIX, key)]
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "success": true,
-                "deleted_count": 1
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
 
         memory
             .store_with_agent(
@@ -827,5 +1144,223 @@ mod tests {
             .unwrap();
         assert!(memory.forget_for_agent(key, agent_id).await.unwrap());
         assert!(memory.get_for_agent(key, agent_id).await.unwrap().is_none());
+        finish_fake_server(server).await;
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests[1]["auth"], "test-api-key");
+        assert_eq!(requests[1]["method"], "POST");
+        assert_eq!(requests[1]["path"], "/api/forget/tags");
+        assert_eq!(requests[1]["body"]["user_id"], agent_id);
+        assert_eq!(
+            requests[1]["body"]["tags"],
+            json!([ShodhConnector::encoded_tag(KEY_TAG_PREFIX, key)])
+        );
+    }
+
+    #[tokio::test]
+    async fn response_protocol_version_must_match() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| FakeResponse {
+                version: IPC_PROTOCOL_VERSION + 1,
+                id: None,
+                status: 200,
+                body: json!({}),
+                delay: Duration::ZERO,
+                trailing: Vec::new(),
+                extra_field: None,
+                raw: None,
+                omit_newline: false,
+            }),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("POST", "/api/recall", &json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("protocol version mismatch"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn response_id_must_match_request() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| FakeResponse {
+                version: IPC_PROTOCOL_VERSION,
+                id: Some("wrong-request-id".into()),
+                status: 200,
+                body: json!({}),
+                delay: Duration::ZERO,
+                trailing: Vec::new(),
+                extra_field: None,
+                raw: None,
+                omit_newline: false,
+            }),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("POST", "/api/recall", &json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response id did not match"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn non_success_response_does_not_expose_auth_secret() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| FakeResponse::error(401, "authentication failed for test-api-key")),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("POST", "/api/recall", &json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("status 401"));
+        assert!(!error.contains("test-api-key"));
+        assert!(error.contains("[redacted]"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_envelope_does_not_expose_auth_secret() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| {
+                FakeResponse::ok(json!({})).with_extra_field("test-api-key", json!(true))
+            }),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("POST", "/api/recall", &json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("an unknown envelope field must fail closed")
+            .to_string();
+        assert!(!error.contains("test-api-key"));
+        assert!(error.contains("[redacted]"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_before_connecting() {
+        let config = ShodhEnrichmentConfig {
+            socket_path: "definitely-missing-shodh.sock".into(),
+            api_key: Some("test-api-key".into()),
+            ..ShodhEnrichmentConfig::default()
+        };
+        let connector = ShodhConnector::new(&config).unwrap();
+        let body = json!({ "payload": "x".repeat(MAX_FRAME_BYTES) });
+
+        let error = connector
+            .request("POST", "/api/upsert", &body, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("request exceeds"));
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| {
+                FakeResponse::ok(json!({
+                    "payload": "x".repeat(MAX_FRAME_BYTES)
+                }))
+            }),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("POST", "/api/recall", &json!({}), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response exceeds"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn response_rejects_data_after_newline_delimiter() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| FakeResponse::ok(json!({})).with_trailing_data(b"{}\n")),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("GET", "/health", &json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("a second response frame must fail closed");
+        assert!(error.to_string().contains("after its newline delimiter"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn response_must_be_valid_utf8_json() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) =
+            spawn_fake_server(&temp, 1, responder(|_| FakeResponse::raw(&[0xff, b'\n'])));
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("GET", "/health", &json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("invalid UTF-8 JSON must fail closed");
+        assert!(error.to_string().contains("decoding Shodh IPC response"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn response_requires_newline_delimiter() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| FakeResponse::ok(json!({})).without_newline()),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("GET", "/health", &json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("a response without LF must fail closed");
+        assert!(error.to_string().contains("before its newline delimiter"));
+        finish_fake_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn response_status_must_be_an_http_status() {
+        let temp = TempDir::new().unwrap();
+        let (socket_path, _, server) = spawn_fake_server(
+            &temp,
+            1,
+            responder(|_| FakeResponse::error(600, "invalid status")),
+        );
+        let connector = ShodhConnector::new(&test_config(&socket_path)).unwrap();
+
+        let error = connector
+            .request("GET", "/health", &json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("an out-of-range status must fail closed");
+        assert!(error.to_string().contains("response status was invalid"));
+        finish_fake_server(server).await;
     }
 }

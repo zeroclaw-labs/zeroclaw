@@ -725,7 +725,8 @@ fn memory_enrichment_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<Picker
                 "Local lucid-memory CLI connector with best-effort derived context.".to_string(),
             ),
             "shodh" => Some(
-                "Shodh REST connector for a local binary server or remote deployment.".to_string(),
+                "Authenticated local Shodh IPC over a Unix socket or Windows named pipe."
+                    .to_string(),
             ),
             _ => None,
         };

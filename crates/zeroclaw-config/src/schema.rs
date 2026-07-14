@@ -4625,7 +4625,7 @@ pub enum ActiveMemoryEnricher<'a> {
     None,
     /// Lucid CLI connector settings.
     Lucid(&'a LucidEnrichmentConfig),
-    /// Shodh REST connector settings for a local binary server or remote host.
+    /// Shodh authenticated local-IPC connector settings.
     Shodh(&'a ShodhEnrichmentConfig),
 }
 
@@ -10346,7 +10346,7 @@ pub struct MemoryEnrichmentConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub lucid: HashMap<String, LucidEnrichmentConfig>,
-    /// Shodh Memory REST connector instances
+    /// Shodh Memory local-IPC connector instances
     /// (`[memory_enrichment.shodh.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10467,20 +10467,19 @@ pub struct LucidEnrichmentConfig {
     pub store_timeout_ms: Option<u64>,
 }
 
-/// Shodh Memory REST enrichment connector.
+/// Shodh Memory local-IPC enrichment connector.
 ///
-/// SQLite remains authoritative. Shodh provides semantic recall enrichment
-/// through its authenticated HTTP API. The origin may be an independently
-/// supervised local `shodh server` binary or a remote deployment.
+/// SQLite remains authoritative. An independently supervised local Shodh
+/// server provides semantic recall over authenticated bounded NDJSON.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory_enrichment_shodh"]
 #[serde(default)]
 pub struct ShodhEnrichmentConfig {
-    /// Shodh server origin, without an `/api` suffix. The default targets the
-    /// official local binary server on loopback.
-    pub base_url: String,
-    /// API key sent in the `X-API-Key` request header.
+    /// Explicit Unix-domain socket or Windows named-pipe endpoint.
+    /// No platform default is inferred; this path must match the Shodh server.
+    pub socket_path: String,
+    /// API key sent in the authenticated local-IPC request envelope.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -10490,16 +10489,16 @@ pub struct ShodhEnrichmentConfig {
     pub recall_timeout_ms: u64,
     /// Maximum time to wait for stores and deletions.
     pub store_timeout_ms: u64,
-    /// Skip remote recall once SQLite already produced this many hits.
+    /// Skip external semantic recall once SQLite already produced this many hits.
     pub local_hit_threshold: usize,
-    /// Suppress repeated remote recall attempts after a failure.
+    /// Suppress repeated external recall attempts after a failure.
     pub failure_cooldown_ms: u64,
 }
 
 impl Default for ShodhEnrichmentConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://127.0.0.1:3030".into(),
+            socket_path: String::new(),
             api_key: None,
             recall_timeout_ms: 2_000,
             store_timeout_ms: 5_000,
@@ -19005,6 +19004,20 @@ impl Config {
             Self::validate_lucid_enrichment_deadlines(alias, lucid, "memory_enrichment.lucid")?;
         }
         for (alias, shodh) in &self.memory_enrichment.shodh {
+            if shodh.socket_path.trim().is_empty() {
+                let path = format!("memory_enrichment.shodh.{alias}.socket_path");
+                validation_bail!(RequiredFieldEmpty, path, "{path} must not be empty");
+            }
+            if shodh
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                let path = format!("memory_enrichment.shodh.{alias}.api_key");
+                validation_bail!(RequiredFieldEmpty, path, "{path} must not be empty");
+            }
             for (field, value) in [
                 ("recall_timeout_ms", shodh.recall_timeout_ms),
                 ("store_timeout_ms", shodh.store_timeout_ms),
@@ -23741,7 +23754,7 @@ auto_save = true
     async fn enrichment_shodh_alias_roundtrip_and_resolves() {
         let toml = r#"
             [shodh.semantic]
-            base_url = "https://memory.example.test"
+            socket_path = "/run/user/1000/shodh-memory.sock"
             api_key = "secret"
             recall_timeout_ms = 1200
             store_timeout_ms = 3400
@@ -23750,7 +23763,7 @@ auto_save = true
         "#;
         let enrichment: MemoryEnrichmentConfig = toml::from_str(toml).unwrap();
         let shodh = enrichment.shodh.get("semantic").expect("alias present");
-        assert_eq!(shodh.base_url, "https://memory.example.test");
+        assert_eq!(shodh.socket_path, "/run/user/1000/shodh-memory.sock");
         assert_eq!(shodh.api_key.as_deref(), Some("secret"));
         assert_eq!(shodh.recall_timeout_ms, 1200);
         assert_eq!(shodh.store_timeout_ms, 3400);
@@ -23764,13 +23777,13 @@ auto_save = true
         let ActiveMemoryEnricher::Shodh(resolved) = config.resolve_active_enricher() else {
             panic!("shodh alias should resolve to its typed enrichment config");
         };
-        assert_eq!(resolved.base_url, "https://memory.example.test");
+        assert_eq!(resolved.socket_path, "/run/user/1000/shodh-memory.sock");
     }
 
     #[test]
-    async fn enrichment_shodh_defaults_target_local_binary_server_and_are_bounded() {
+    async fn enrichment_shodh_defaults_require_explicit_socket_and_are_bounded() {
         let config = ShodhEnrichmentConfig::default();
-        assert_eq!(config.base_url, "http://127.0.0.1:3030");
+        assert!(config.socket_path.is_empty());
         assert!(config.api_key.is_none());
         assert!(config.recall_timeout_ms > 0);
         assert!(config.store_timeout_ms > 0);
@@ -23792,13 +23805,52 @@ auto_save = true
             .shodh
             .get("semantic")
             .expect("property surface should create a typed Shodh alias");
-        assert_eq!(created.base_url, "http://127.0.0.1:3030");
+        assert!(created.socket_path.is_empty());
         assert!(config.prop_fields().iter().any(|field| {
             field.name == "memory_enrichment.shodh.semantic.api_key"
                 && field.is_secret
                 && field.credential_class
                     == Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         }));
+    }
+
+    #[test]
+    async fn validate_rejects_shodh_alias_without_explicit_socket() {
+        let mut config = Config::default();
+        config
+            .memory_enrichment
+            .shodh
+            .insert("semantic".to_string(), ShodhEnrichmentConfig::default());
+
+        let error = config
+            .validate()
+            .expect_err("Shodh aliases must name their local IPC endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("memory_enrichment.shodh.semantic.socket_path")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_shodh_alias_without_api_key() {
+        let mut config = Config::default();
+        config.memory_enrichment.shodh.insert(
+            "semantic".to_string(),
+            ShodhEnrichmentConfig {
+                socket_path: "/run/user/1000/shodh-memory.sock".to_string(),
+                ..ShodhEnrichmentConfig::default()
+            },
+        );
+
+        let error = config
+            .validate()
+            .expect_err("Shodh aliases must provide their IPC API key");
+        assert!(
+            error
+                .to_string()
+                .contains("memory_enrichment.shodh.semantic.api_key")
+        );
     }
 
     #[test]
@@ -33123,10 +33175,14 @@ allowed_users = []
         config.memory.backend = "sqlite.default".to_string();
         config.agents.get_mut("alpha").unwrap().memory.enricher =
             Some("shodh.semantic".to_string());
-        config
-            .memory_enrichment
-            .shodh
-            .insert("semantic".to_string(), ShodhEnrichmentConfig::default());
+        config.memory_enrichment.shodh.insert(
+            "semantic".to_string(),
+            ShodhEnrichmentConfig {
+                socket_path: "/run/user/1000/shodh-memory.sock".to_string(),
+                api_key: Some("test-key".to_string()),
+                ..ShodhEnrichmentConfig::default()
+            },
+        );
 
         assert_eq!(
             config.memory_backend_ref_for_agent("alpha").unwrap(),
@@ -33165,10 +33221,14 @@ allowed_users = []
             .memory_enrichment
             .lucid
             .insert("local".to_string(), LucidEnrichmentConfig::default());
-        config
-            .memory_enrichment
-            .shodh
-            .insert("semantic".to_string(), ShodhEnrichmentConfig::default());
+        config.memory_enrichment.shodh.insert(
+            "semantic".to_string(),
+            ShodhEnrichmentConfig {
+                socket_path: "/run/user/1000/shodh-memory.sock".to_string(),
+                api_key: Some("test-key".to_string()),
+                ..ShodhEnrichmentConfig::default()
+            },
+        );
 
         config.validate().unwrap();
         assert!(matches!(
@@ -33181,10 +33241,14 @@ allowed_users = []
     async fn agent_memory_enricher_inherits_and_explicit_none_disables() {
         let mut config = multi_agent_test_config();
         config.memory.enricher = Some("shodh.semantic".to_string());
-        config
-            .memory_enrichment
-            .shodh
-            .insert("semantic".to_string(), ShodhEnrichmentConfig::default());
+        config.memory_enrichment.shodh.insert(
+            "semantic".to_string(),
+            ShodhEnrichmentConfig {
+                socket_path: "/run/user/1000/shodh-memory.sock".to_string(),
+                api_key: Some("test-key".to_string()),
+                ..ShodhEnrichmentConfig::default()
+            },
+        );
 
         assert_eq!(
             config.memory_enricher_ref_for_agent("alpha").unwrap(),
