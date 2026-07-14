@@ -623,20 +623,34 @@ impl AcpServer {
                     .agent(&agent_alias)
                     .map(|a| a.model_provider.to_string())
                     .unwrap_or_default();
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "session_id": session_id,
-                            "workspace_dir": workspace_dir,
-                            "agent_alias": agent_alias,
-                            "model_provider": model_provider,
-                            "error": e.to_string(),
-                        })),
-                    "ACP session/new failed: agent init error"
-                );
+                let model = self
+                    .config
+                    .model_provider_for_agent(&agent_alias)
+                    .and_then(|mp| mp.model.clone())
+                    .unwrap_or_default();
+                ::zeroclaw_log::scope!(
+                    session_key: session_id.as_str(),
+                    agent_alias: agent_alias.as_str(),
+                    model_provider: model_provider.as_str(),
+                    model: model.as_str()
+                    => async {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "workspace_dir": workspace_dir,
+                                "error": e.to_string(),
+                            })),
+                            "ACP session/new failed: agent init error"
+                        );
+                    }
+                )
+                .await;
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to create agent: {e}"),
