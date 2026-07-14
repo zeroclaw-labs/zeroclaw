@@ -4578,7 +4578,13 @@ impl Config {
     /// Return the effective enrichment reference for one configured agent.
     ///
     /// `Some("none")` on the agent explicitly disables inheritance. An omitted
-    /// agent value inherits the install-wide selector.
+    /// agent value inherits the install-wide selector — but only when the
+    /// agent's typed backend can actually enrich (SQLite). An agent that
+    /// merely inherits `[memory].enricher` over a non-SQLite backend resolves
+    /// to `None` (enrichment silently off) instead of failing validation and
+    /// the factory on `agents.<alias>.memory.enricher` — a field the operator
+    /// never set. An *explicit* per-agent enricher is always returned, so
+    /// validation still rejects it over a non-enrichable backend.
     pub fn memory_enricher_ref_for_agent(&self, agent_alias: &str) -> Result<Option<String>> {
         let agent = self
             .agents
@@ -4591,6 +4597,13 @@ impl Config {
                 (!enricher.is_empty() && !enricher.eq_ignore_ascii_case("none"))
                     .then(|| enricher.to_string()),
             );
+        }
+
+        if !matches!(
+            agent.memory.backend,
+            crate::multi_agent::MemoryBackendKind::Sqlite
+        ) {
+            return Ok(None);
         }
 
         Ok(self.memory_enricher_ref())
@@ -10481,6 +10494,11 @@ pub struct MarkdownStorageConfig {
     /// When unset, defaults to `<workspace_dir>/memory/`.
     pub directory: Option<String>,
 }
+
+/// Single source of truth for the Lucid deadline rule's wording. Cited by
+/// both `Config::validate` and the connector's defensive check in
+/// `zeroclaw-memory` so the two layers cannot drift apart.
+pub const LUCID_DEADLINE_RULE: &str = "must be greater than 0 when configured";
 
 /// Lucid CLI memory-enrichment connector.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -18948,7 +18966,7 @@ impl Config {
             ("store_timeout_ms", config.store_timeout_ms),
         ] {
             if value == Some(0) {
-                anyhow::bail!("{root}.{alias}.{field} must be greater than 0 when configured");
+                anyhow::bail!("{root}.{alias}.{field} {LUCID_DEADLINE_RULE}");
             }
         }
         Ok(())
@@ -33157,6 +33175,153 @@ allowed_users = []
             .expect_err("enrichment must not hide a non-SQLite authoritative store");
         assert!(error.to_string().contains("authoritative SQLite backend"));
         assert!(error.to_string().contains("postgres"));
+    }
+
+    #[test]
+    async fn legacy_lucid_backend_normalizes_to_sqlite_with_lucid_enricher() {
+        // Pre-enrichment configs selected the hybrid SQLite + Lucid CLI
+        // backend via `memory.backend = "lucid"`. The load-time compat pass
+        // must keep SQLite authoritative and imply the Lucid enricher instead
+        // of silently falling back to markdown (losing brain.db).
+        for backend in ["lucid", "lucid.local"] {
+            let raw = format!("schema_version = 3\n\n[memory]\nbackend = \"{backend}\"\n");
+            let config =
+                crate::migration::migrate_to_current(&raw).expect("legacy lucid value loads");
+            assert_eq!(config.memory.backend, "sqlite", "backend={backend}");
+            assert_eq!(config.memory.enricher.as_deref(), Some("lucid"));
+            assert_eq!(config.effective_memory_label(), "sqlite+lucid");
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    async fn legacy_per_agent_lucid_backend_deserializes_and_resolves() {
+        // The typed per-agent enum has no `lucid` variant; the compat pass
+        // must rewrite the legacy value before serde or upgraded installs
+        // hard-fail with an unknown-variant error.
+        let raw = r#"schema_version = 3
+
+[providers.models.ollama.default]
+
+[risk_profiles.shared]
+
+[agents.helper]
+model_provider = "ollama.default"
+risk_profile = "shared"
+
+[agents.helper.memory]
+backend = "lucid"
+"#;
+        let config =
+            crate::migration::migrate_to_current(raw).expect("legacy per-agent value loads");
+        let agent = &config.agents["helper"];
+        assert_eq!(
+            agent.memory.backend,
+            crate::multi_agent::MemoryBackendKind::Sqlite
+        );
+        assert_eq!(agent.memory.enricher.as_deref(), Some("lucid"));
+        assert_eq!(
+            config.memory_enricher_ref_for_agent("helper").unwrap(),
+            Some("lucid".to_string())
+        );
+    }
+
+    #[test]
+    async fn explicit_enricher_none_beats_legacy_lucid_implication() {
+        let raw = r#"schema_version = 3
+
+[memory]
+backend = "lucid"
+enricher = "none"
+"#;
+        let config = crate::migration::migrate_to_current(raw).expect("explicit none loads");
+        assert_eq!(config.memory.backend, "sqlite");
+        assert_eq!(config.memory.enricher.as_deref(), Some("none"));
+        assert_eq!(config.memory_enricher_ref(), None);
+        assert_eq!(config.effective_memory_label(), "sqlite");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn legacy_lucid_backend_with_canonical_enricher_is_rejected() {
+        // RFC compatibility rule: the removed legacy backend and the
+        // canonical enricher surface must not select Lucid together — it is
+        // ambiguous which selection carries the connector settings.
+        let global = r#"schema_version = 3
+
+[memory]
+backend = "lucid"
+enricher = "lucid.pi"
+
+[memory_enrichment.lucid.pi]
+binary_path = "/opt/lucid/bin/lucid"
+"#;
+        let error = crate::migration::migrate_to_current(global)
+            .expect_err("legacy + canonical together must be rejected");
+        let msg = format!("{error:#}");
+        assert!(msg.contains("memory.backend = \"lucid\""), "got: {msg}");
+        assert!(msg.contains("memory.enricher"), "got: {msg}");
+
+        let per_agent = r#"schema_version = 3
+
+[providers.models.ollama.default]
+
+[risk_profiles.shared]
+
+[agents.helper]
+model_provider = "ollama.default"
+risk_profile = "shared"
+
+[agents.helper.memory]
+backend = "lucid"
+enricher = "lucid"
+"#;
+        let error = crate::migration::migrate_to_current(per_agent)
+            .expect_err("per-agent legacy + canonical together must be rejected");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("agents.helper.memory.backend = \"lucid\""),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn inherited_global_enricher_skips_non_enrichable_agent_backend() {
+        // An agent that merely inherits [memory].enricher over a backend that
+        // cannot enrich must resolve to no enricher (silently off) instead of
+        // failing validation at agents.<alias>.memory.enricher — a field the
+        // operator never set.
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "sqlite".to_string();
+        config.memory.enricher = Some("lucid".to_string());
+
+        for backend in [
+            crate::multi_agent::MemoryBackendKind::Markdown,
+            crate::multi_agent::MemoryBackendKind::None,
+        ] {
+            config.agents.get_mut("alpha").unwrap().memory.backend = backend;
+            assert_eq!(
+                config.memory_enricher_ref_for_agent("alpha").unwrap(),
+                None,
+                "backend={backend:?}"
+            );
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    async fn explicit_agent_enricher_over_non_enrichable_backend_still_fails() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha.memory.enricher = Some("lucid".to_string());
+
+        let error = config
+            .validate()
+            .expect_err("explicit enricher over markdown must fail");
+        let msg = error.to_string();
+        assert!(msg.contains("agents.alpha.memory.enricher"), "got: {msg}");
+        assert!(msg.contains("authoritative SQLite backend"), "got: {msg}");
     }
 
     #[test]

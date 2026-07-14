@@ -62,6 +62,27 @@ backend = "sqlite"
 enricher = "none"
 ```
 
+An agent whose backend cannot enrich (markdown, postgres, qdrant, `none`)
+silently opts out of an inherited `memory.enricher`; only an enricher set
+explicitly on such an agent is a validation error.
+
+## Legacy Lucid backend
+
+Configs written before the enrichment split selected Lucid as a backend
+(`memory.backend = "lucid"`, or per-agent
+`agents.<alias>.memory.backend = "lucid"`). That value is still accepted:
+SQLite was always the authoritative store behind it, so config load
+normalizes it to `backend = "sqlite"` plus `enricher = "lucid"` and logs a
+deprecation warning. Update the config to the canonical form to silence the
+warning.
+
+- An explicit `enricher = "none"` at the same scope wins: the backend
+  normalizes to SQLite and enrichment stays off.
+- The legacy backend combined with an explicit canonical Lucid enricher at
+  the same scope is rejected as ambiguous; remove the legacy backend value.
+- The old `[storage.lucid.<alias>]` table is ignored by the current schema.
+  Move `binary_path` to `[memory_enrichment.lucid.<alias>]` (see above).
+
 ## Connector capabilities
 
 | Connector | Protocol | Recall result | Agent scope | Remote cleanup |
@@ -80,8 +101,10 @@ authoritative SQLite row and is not forwarded to Lucid.
 
 A successful write commits to SQLite before the external connector is
 called. Recall searches SQLite first and calls the connector only below its
-local-hit threshold. Connector timeout or failure preserves local results and
-enters a short cooldown to avoid repeated slow failures.
+local-hit threshold. A connector timeout or failure — on store or recall —
+preserves the local result and starts a short cooldown during which both
+store and recall skip the connector, so repeated slow failures cannot keep
+adding latency.
 
 Back up `data/memory/` as usual. External Lucid state is derived and may be
 backed up separately only when preserving its index is operationally useful.

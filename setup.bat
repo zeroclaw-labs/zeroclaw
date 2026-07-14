@@ -139,7 +139,7 @@ echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary - Download pre-compiled release (fastest)
 echo   2) minimal build - core only, no default features
-echo   3) dist build - all channels, no heavyweight extras (recommended)
+echo   3) dist build - lean standard distribution (recommended)
 echo   4) default build - default feature set
 echo   5) all build - every feature including hardware and browser
 echo.
@@ -216,8 +216,8 @@ set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :build_dist
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
-set "BUILD_DESC=dist (all channels, no heavyweight extras (recommended))"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+set "BUILD_DESC=dist (lean standard distribution (recommended))"
 goto :do_build
 
 :build_default
@@ -395,7 +395,7 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build core only ^(--no-default-features^)
-echo   --dist        Build all channels, no heavyweight extras (recommended)
+echo   --dist        Build lean standard distribution (recommended)
 echo   --default     Build the default feature set
 echo   --all         Build every feature including hardware and browser
 echo   --dry-run     Show what would happen without building or installing

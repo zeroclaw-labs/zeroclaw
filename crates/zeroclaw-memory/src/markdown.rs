@@ -201,41 +201,7 @@ impl Memory for MarkdownMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let since_dt = since
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(
-                            ::serde_json::json!({"field": "since", "error": format!("{}", e)})
-                        ),
-                    "recall window bound rejected"
-                );
-                anyhow::Error::msg(format!("invalid 'since' date (expected RFC 3339): {e}"))
-            })?;
-        let until_dt = until
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(
-                            ::serde_json::json!({"field": "until", "error": format!("{}", e)})
-                        ),
-                    "recall window bound rejected"
-                );
-                anyhow::Error::msg(format!("invalid 'until' date (expected RFC 3339): {e}"))
-            })?;
-        if let (Some(s), Some(u)) = (&since_dt, &until_dt)
-            && s >= u
-        {
-            anyhow::bail!("'since' must be before 'until'");
-        }
+        let (since_dt, until_dt) = crate::recall_window::parse_recall_window(since, until)?;
 
         let all = self.read_all_entries().await?;
         let keywords: Vec<String> = if is_recent_recall_query(query) {

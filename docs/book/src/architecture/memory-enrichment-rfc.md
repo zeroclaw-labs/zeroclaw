@@ -107,32 +107,11 @@ as another selector.
 
 ## Configuration
 
-```toml
-[memory]
-backend = "sqlite.default"
-enricher = "lucid.local"
-
-[storage.sqlite.default]
-
-[memory_enrichment.lucid.local]
-binary_path = "/opt/lucid/bin/lucid"
-recall_timeout_ms = 2500
-store_timeout_ms = 3000
-```
-
-An agent inherits the global connector when its field is omitted. A dotted
-reference selects another typed alias. The string `none` explicitly disables
-enrichment for that agent.
-
-```toml
-[agents.research.memory]
-backend = "sqlite"
-enricher = "lucid.local"
-
-[agents.private.memory]
-backend = "sqlite"
-enricher = "none"
-```
+The canonical configuration examples — the typed
+`[memory_enrichment.lucid.<alias>]` catalog and per-agent `enricher`
+selection, inheritance, and explicit disable (`enricher = "none"`) — live in
+the operator reference:
+[Memory storage and enrichment](../reference/memory-backends.md).
 
 Enrichment with a non-SQLite durable backend fails validation. Dotted aliases
 must resolve. Bare `lucid` remains a zero-configuration convenience.
@@ -177,14 +156,11 @@ cross-agent recall. Lucid declares no cleanup capability.
 ## Failure and consistency semantics
 
 SQLite remains usable when a connector is missing, slow, malformed, or
-unavailable:
-
-1. A write succeeds locally before connector synchronization is attempted.
-2. Recall queries SQLite first.
-3. The connector runs only when local results do not meet the configured
-   threshold and its capabilities match the request.
-4. A connector error returns local results and starts a bounded cooldown.
-5. Cleanup is best-effort and dispatched only when the adapter declares it.
+unavailable. The operational behavior — local-first write ordering, the
+local-hit recall threshold, and the connector failure cooldown — is
+documented canonically in
+[Memory storage and enrichment § Failure and backup behavior](../reference/memory-backends.md#failure-and-backup-behavior).
+Cleanup is best-effort and dispatched only when the adapter declares it.
 
 There is no distributed transaction between SQLite and a connector. Connector
 state is a rebuildable derivative, not another authority.
@@ -240,7 +216,30 @@ internal because Lucid is a first-party composition of the existing
 
 Lucid is an enrichment connector only. It is not accepted by the
 backend enum, storage catalog, memory factory, migration factory, or Quickstart
-wire shape. Validation rejects enrichment over a non-SQLite backend.
+wire shape. Validation rejects an explicitly configured enricher over a
+non-SQLite backend; an agent that merely inherits the install-wide
+`memory.enricher` over a backend that cannot enrich resolves to no enricher
+(enrichment is silently off for that agent).
+
+### Legacy compatibility
+
+The pre-enrichment `backend = "lucid"` selector — global `memory.backend` and
+per-agent `agents.<alias>.memory.backend` — remains accepted as deprecated
+compatibility input. It always meant SQLite-authoritative storage with Lucid
+syncing alongside, so config load normalizes it to the canonical shape before
+typed deserialization and logs a deprecation warning naming the migration
+(`backend = "sqlite"` + `enricher = "lucid"`):
+
+- with no explicit `enricher` at the same scope, `enricher = "lucid"` is
+  implied (a `[memory_enrichment.lucid.default]` entry supplies typed
+  settings when present; built-in defaults otherwise);
+- an explicit `enricher = "none"` at that scope wins and enrichment stays
+  off;
+- the legacy backend combined with an explicit canonical Lucid enricher at
+  the same scope is rejected as ambiguous — remove the legacy value.
+
+The legacy `[storage.lucid.<alias>]` table is not part of the schema and is
+ignored; its `binary_path` moves to `[memory_enrichment.lucid.<alias>]`.
 
 ## Rollout and rollback
 

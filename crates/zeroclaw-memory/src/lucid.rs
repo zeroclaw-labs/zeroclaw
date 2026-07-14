@@ -1,11 +1,11 @@
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use super::enriched::EnrichmentPolicy;
 use super::enriched::{
     CleanupSupport, EnrichedMemory, EnricherCapabilities, EnrichmentCleanupRequest,
     EnrichmentRecallRequest, EnrichmentStoreRequest, MemoryEnricher, RecallScope, RecallSupport,
     ResultKind,
 };
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use super::sqlite::SqliteMemory;
 use super::traits::{MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
@@ -49,6 +49,8 @@ impl LucidConnector {
         workspace_dir: &Path,
         config: &LucidEnrichmentConfig,
     ) -> anyhow::Result<Self> {
+        // Defense in depth behind `Config::validate_lucid_enrichment_deadlines`;
+        // both layers cite the shared LUCID_DEADLINE_RULE wording.
         fn configured_timeout(
             value: Option<u64>,
             default_ms: u64,
@@ -56,7 +58,10 @@ impl LucidConnector {
         ) -> anyhow::Result<Duration> {
             let millis = value.unwrap_or(default_ms);
             if millis == 0 {
-                anyhow::bail!("memory_enrichment.lucid.{field} must be greater than zero");
+                anyhow::bail!(
+                    "memory_enrichment.lucid.{field} {}",
+                    zeroclaw_config::schema::LUCID_DEADLINE_RULE
+                );
             }
             Ok(Duration::from_millis(millis))
         }
@@ -84,7 +89,7 @@ impl LucidConnector {
         })
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn with_options(
         workspace_dir: &Path,
         lucid_cmd: String,
@@ -231,7 +236,7 @@ impl LucidConnector {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl EnrichedMemory<LucidConnector> {
     #[allow(clippy::too_many_arguments)]
     fn with_options(
@@ -299,13 +304,30 @@ impl MemoryEnricher for LucidConnector {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::traits::Memory;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    fn test_memory(workspace: &Path, command: String) -> LucidEnrichedMemory {
+        let sqlite = SqliteMemory::new("sqlite", workspace).unwrap();
+        LucidEnrichedMemory::with_options(
+            "test",
+            workspace,
+            sqlite,
+            command,
+            200,
+            3,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+    }
+
+    // ── Platform-independent tests (no fake-lucid shell script) ─────────
+    // These run everywhere, including Windows CI. Executing a real script
+    // is unix-only; those tests live in `process` below.
 
     #[test]
     fn refresh_embedder_forwards_to_local_sqlite() {
@@ -356,150 +378,12 @@ mod tests {
             let error = LucidConnector::from_config(tmp.path(), &config)
                 .err()
                 .expect("zero deadline must fail");
-            assert!(error.to_string().contains("must be greater than zero"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(zeroclaw_config::schema::LUCID_DEADLINE_RULE)
+            );
         }
-    }
-
-    fn write_fake_lucid_script(dir: &Path) -> String {
-        let script_path = dir.join("fake-lucid.sh");
-        let script = r#"#!/bin/sh
-set -eu
-
-if [ "${1:-}" = "store" ]; then
-  echo '{"success":true,"id":"mem_1"}'
-  exit 0
-fi
-
-if [ "${1:-}" = "context" ]; then
-  cat <<'EOF'
-<lucid-context>
-Auth context snapshot
-- [decision] Use token refresh middleware
-- [context] Working in src/auth.rs
-</lucid-context>
-EOF
-  exit 0
-fi
-
-echo "unsupported command" >&2
-exit 1
-"#;
-
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-        script_path.display().to_string()
-    }
-
-    fn write_delayed_lucid_script(dir: &Path) -> String {
-        let script_path = dir.join("delayed-lucid.sh");
-        let script = r#"#!/bin/sh
-set -eu
-
-if [ "${1:-}" = "store" ]; then
-  echo '{"success":true,"id":"mem_1"}'
-  exit 0
-fi
-
-if [ "${1:-}" = "context" ]; then
-  sleep 0.2
-  cat <<'EOF'
-<lucid-context>
-- [decision] Delayed token refresh guidance
-</lucid-context>
-EOF
-  exit 0
-fi
-
-echo "unsupported command" >&2
-exit 1
-"#;
-
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-        script_path.display().to_string()
-    }
-
-    fn write_probe_lucid_script(dir: &Path, marker_path: &Path) -> String {
-        let script_path = dir.join("probe-lucid.sh");
-        let marker = marker_path.display();
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-
-if [ "${{1:-}}" = "store" ]; then
-  echo '{{"success":true,"id":"mem_store"}}'
-  exit 0
-fi
-
-if [ "${{1:-}}" = "context" ]; then
-  printf 'context\n' >> "{marker}"
-  cat <<'EOF'
-<lucid-context>
-- [decision] should not be used when local hits are enough
-</lucid-context>
-EOF
-  exit 0
-fi
-
-echo "unsupported command" >&2
-exit 1
-"#
-        );
-
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-        script_path.display().to_string()
-    }
-
-    fn write_failing_lucid_script(dir: &Path, marker_path: &Path) -> String {
-        let script_path = dir.join("failing-lucid.sh");
-        let marker = marker_path.display();
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-
-if [ "${{1:-}}" = "store" ]; then
-  echo '{{"success":true,"id":"mem_store"}}'
-  exit 0
-fi
-
-if [ "${{1:-}}" = "context" ]; then
-  printf 'context\n' >> "{marker}"
-  echo "simulated lucid failure" >&2
-  exit 1
-fi
-
-echo "unsupported command" >&2
-exit 1
-"#
-        );
-
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-        script_path.display().to_string()
-    }
-
-    fn test_memory(workspace: &Path, command: String) -> LucidEnrichedMemory {
-        let sqlite = SqliteMemory::new("sqlite", workspace).unwrap();
-        LucidEnrichedMemory::with_options(
-            "test",
-            workspace,
-            sqlite,
-            command,
-            200,
-            3,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        )
     }
 
     #[tokio::test]
@@ -523,186 +407,264 @@ exit 1
         assert_eq!(entry.unwrap().content, "User prefers Rust");
     }
 
-    #[tokio::test]
-    async fn recall_merges_lucid_and_local_results() {
-        let tmp = TempDir::new().unwrap();
-        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+    // ── Tests that execute a real fake-lucid shell script (unix-only) ───
 
-        memory
-            .store(
-                "local_note",
-                "Local sqlite auth fallback note",
-                MemoryCategory::Core,
-                None,
+    #[cfg(unix)]
+    mod process {
+        use super::*;
+        use crate::test_support::write_lucid_script;
+
+        const STORE_OK: &str = r#"  echo '{"success":true,"id":"mem_store"}'
+  exit 0"#;
+
+        fn write_fake_lucid_script(dir: &Path) -> String {
+            write_lucid_script(
+                dir,
+                "fake-lucid.sh",
+                "",
+                STORE_OK,
+                r#"  cat <<'EOF'
+<lucid-context>
+Auth context snapshot
+- [decision] Use token refresh middleware
+- [context] Working in src/auth.rs
+</lucid-context>
+EOF
+  exit 0"#,
             )
-            .await
-            .unwrap();
+        }
 
-        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.content.contains("Local sqlite auth fallback note"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.content.contains("token refresh"))
-        );
-    }
-
-    #[tokio::test]
-    async fn session_scoped_recall_keeps_lucid_derived_context() {
-        let tmp = TempDir::new().unwrap();
-        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
-
-        let entries = memory
-            .recall("auth", 5, Some("session-a"), None, None)
-            .await
-            .unwrap();
-
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.content.contains("token refresh"))
-        );
-    }
-
-    #[tokio::test]
-    async fn recent_recall_invokes_lucid_when_local_results_are_insufficient() {
-        let tmp = TempDir::new().unwrap();
-        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
-
-        let entries = memory.recall("*", 5, None, None, None).await.unwrap();
-
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.content.contains("token refresh"))
-        );
-    }
-
-    #[tokio::test]
-    async fn recall_handles_lucid_cold_start_delay_within_timeout() {
-        let tmp = TempDir::new().unwrap();
-        let memory = test_memory(tmp.path(), write_delayed_lucid_script(tmp.path()));
-
-        memory
-            .store(
-                "local_note",
-                "Local sqlite auth fallback note",
-                MemoryCategory::Core,
-                None,
+        fn write_delayed_lucid_script(dir: &Path) -> String {
+            write_lucid_script(
+                dir,
+                "delayed-lucid.sh",
+                "",
+                STORE_OK,
+                r#"  sleep 0.2
+  cat <<'EOF'
+<lucid-context>
+- [decision] Delayed token refresh guidance
+</lucid-context>
+EOF
+  exit 0"#,
             )
-            .await
-            .unwrap();
+        }
 
-        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.content.contains("Delayed token refresh guidance"))
-        );
-    }
-
-    #[tokio::test]
-    async fn recall_skips_lucid_when_local_hits_are_enough() {
-        let tmp = TempDir::new().unwrap();
-        let marker = tmp.path().join("context_calls.log");
-        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory = LucidEnrichedMemory::with_options(
-            "test",
-            tmp.path(),
-            sqlite,
-            write_probe_lucid_script(tmp.path(), &marker),
-            200,
-            1,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        );
-
-        memory
-            .store(
-                "pref",
-                "Rust should stay local-first",
-                MemoryCategory::Core,
-                None,
+        fn write_probe_lucid_script(dir: &Path, marker_path: &Path) -> String {
+            write_lucid_script(
+                dir,
+                "probe-lucid.sh",
+                "",
+                STORE_OK,
+                &format!(
+                    r#"  printf 'context\n' >> "{marker}"
+  cat <<'EOF'
+<lucid-context>
+- [decision] should not be used when local hits are enough
+</lucid-context>
+EOF
+  exit 0"#,
+                    marker = marker_path.display()
+                ),
             )
-            .await
-            .unwrap();
+        }
 
-        let entries = memory.recall("rust", 5, None, None, None).await.unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.content.contains("Rust should stay local-first"))
-        );
-        let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
-        assert!(context_calls.trim().is_empty());
-    }
+        fn write_failing_lucid_script(dir: &Path, marker_path: &Path) -> String {
+            write_lucid_script(
+                dir,
+                "failing-lucid.sh",
+                "",
+                STORE_OK,
+                &format!(
+                    r#"  printf 'context\n' >> "{marker}"
+  echo "simulated lucid failure" >&2
+  exit 1"#,
+                    marker = marker_path.display()
+                ),
+            )
+        }
 
-    #[tokio::test]
-    async fn agent_scoped_recall_does_not_query_unscoped_lucid() {
-        let tmp = TempDir::new().unwrap();
-        let marker = tmp.path().join("scoped_context_calls.log");
-        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory = LucidEnrichedMemory::with_options(
-            "test",
-            tmp.path(),
-            sqlite,
-            write_probe_lucid_script(tmp.path(), &marker),
-            200,
-            99,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        );
-        let agent_id = memory.ensure_agent_uuid("agent-a").await.unwrap();
+        #[tokio::test]
+        async fn recall_merges_lucid_and_local_results() {
+            let tmp = TempDir::new().unwrap();
+            let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
 
-        let entries = memory
-            .recall_for_agents(&[agent_id.as_str()], "missing", 5, None, None, None)
-            .await
-            .unwrap();
-
-        assert!(entries.is_empty());
-        let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
-        assert!(context_calls.trim().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failure_cooldown_avoids_repeated_lucid_calls() {
-        let tmp = TempDir::new().unwrap();
-        let marker = tmp.path().join("failing_context_calls.log");
-        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory = LucidEnrichedMemory::with_options(
-            "test",
-            tmp.path(),
-            sqlite,
-            write_failing_lucid_script(tmp.path(), &marker),
-            200,
-            99,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-        );
-
-        assert!(
             memory
-                .recall("auth", 5, None, None, None)
+                .store(
+                    "local_note",
+                    "Local sqlite auth fallback note",
+                    MemoryCategory::Core,
+                    None,
+                )
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            memory
-                .recall("auth", 5, None, None, None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap();
 
-        let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
-        assert_eq!(calls.lines().count(), 1);
+            let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.content.contains("Local sqlite auth fallback note"))
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.content.contains("token refresh"))
+            );
+        }
+
+        #[tokio::test]
+        async fn session_scoped_recall_keeps_lucid_derived_context() {
+            let tmp = TempDir::new().unwrap();
+            let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+
+            let entries = memory
+                .recall("auth", 5, Some("session-a"), None, None)
+                .await
+                .unwrap();
+
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.content.contains("token refresh"))
+            );
+        }
+
+        #[tokio::test]
+        async fn recent_recall_invokes_lucid_when_local_results_are_insufficient() {
+            let tmp = TempDir::new().unwrap();
+            let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+
+            let entries = memory.recall("*", 5, None, None, None).await.unwrap();
+
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.content.contains("token refresh"))
+            );
+        }
+
+        #[tokio::test]
+        async fn recall_handles_lucid_cold_start_delay_within_timeout() {
+            let tmp = TempDir::new().unwrap();
+            let memory = test_memory(tmp.path(), write_delayed_lucid_script(tmp.path()));
+
+            memory
+                .store(
+                    "local_note",
+                    "Local sqlite auth fallback note",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.content.contains("Delayed token refresh guidance"))
+            );
+        }
+
+        #[tokio::test]
+        async fn recall_skips_lucid_when_local_hits_are_enough() {
+            let tmp = TempDir::new().unwrap();
+            let marker = tmp.path().join("context_calls.log");
+            let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+            let memory = LucidEnrichedMemory::with_options(
+                "test",
+                tmp.path(),
+                sqlite,
+                write_probe_lucid_script(tmp.path(), &marker),
+                200,
+                1,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+            );
+
+            memory
+                .store(
+                    "pref",
+                    "Rust should stay local-first",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let entries = memory.recall("rust", 5, None, None, None).await.unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.content.contains("Rust should stay local-first"))
+            );
+            let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
+            assert!(context_calls.trim().is_empty());
+        }
+
+        #[tokio::test]
+        async fn agent_scoped_recall_does_not_query_unscoped_lucid() {
+            let tmp = TempDir::new().unwrap();
+            let marker = tmp.path().join("scoped_context_calls.log");
+            let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+            let memory = LucidEnrichedMemory::with_options(
+                "test",
+                tmp.path(),
+                sqlite,
+                write_probe_lucid_script(tmp.path(), &marker),
+                200,
+                99,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+            );
+            let agent_id = memory.ensure_agent_uuid("agent-a").await.unwrap();
+
+            let entries = memory
+                .recall_for_agents(&[agent_id.as_str()], "missing", 5, None, None, None)
+                .await
+                .unwrap();
+
+            assert!(entries.is_empty());
+            let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
+            assert!(context_calls.trim().is_empty());
+        }
+
+        #[tokio::test]
+        async fn failure_cooldown_avoids_repeated_lucid_calls() {
+            let tmp = TempDir::new().unwrap();
+            let marker = tmp.path().join("failing_context_calls.log");
+            let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+            let memory = LucidEnrichedMemory::with_options(
+                "test",
+                tmp.path(),
+                sqlite,
+                write_failing_lucid_script(tmp.path(), &marker),
+                200,
+                99,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            );
+
+            assert!(
+                memory
+                    .recall("auth", 5, None, None, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                memory
+                    .recall("auth", 5, None, None, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
+            assert_eq!(calls.lines().count(), 1);
+        }
     }
 }

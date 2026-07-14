@@ -11,14 +11,12 @@ use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage,
     StoreOptions, is_recent_recall_query, normalize_recent_recall_query,
 };
+use crate::recall_window::{RecallTimestamp, parse_recall_window};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use zeroclaw_api::attribution::{Attributable, MemoryKind, Role};
-
-type RecallTimestamp = chrono::DateTime<chrono::FixedOffset>;
-type RecallWindow = (Option<RecallTimestamp>, Option<RecallTimestamp>);
 
 /// Per-call view of a memory write forwarded to an enricher.
 ///
@@ -170,7 +168,9 @@ impl EnrichmentPolicy {
 ///
 /// Exact storage operations are delegated to SQLite. Enricher writes are
 /// best-effort, and enriched recall is used only when local results do not
-/// satisfy the configured threshold.
+/// satisfy the configured threshold. Any connector failure or timeout starts
+/// the shared failure cooldown, during which both store and recall skip the
+/// connector.
 pub struct EnrichedMemory<E> {
     alias: String,
     local: SqliteMemory,
@@ -262,52 +262,6 @@ impl<E> EnrichedMemory<E> {
         merged
     }
 
-    fn parse_recall_window(
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> anyhow::Result<RecallWindow> {
-        let since_dt = since
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "field": "since",
-                            "error": error.to_string()
-                        })),
-                    "recall window bound rejected"
-                );
-                anyhow::Error::msg(format!("invalid 'since' date (expected RFC 3339): {error}"))
-            })?;
-        let until_dt = until
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "field": "until",
-                            "error": error.to_string()
-                        })),
-                    "recall window bound rejected"
-                );
-                anyhow::Error::msg(format!("invalid 'until' date (expected RFC 3339): {error}"))
-            })?;
-
-        if let (Some(since), Some(until)) = (&since_dt, &until_dt)
-            && since >= until
-        {
-            anyhow::bail!("'since' must be before 'until'");
-        }
-
-        Ok((since_dt, until_dt))
-    }
-
     fn filter_enrichment_window(
         entries: Vec<MemoryEntry>,
         since: Option<&RecallTimestamp>,
@@ -348,17 +302,30 @@ impl<E> EnrichedMemory<E> {
 }
 
 impl<E: MemoryEnricher> EnrichedMemory<E> {
+    /// Best-effort connector write, called after the local write committed.
+    /// Skipped entirely while the failure cooldown is active, and a failure
+    /// or timeout trips the same cooldown recall failures do — otherwise a
+    /// hung connector would add up to its store deadline of blocking latency
+    /// to every write indefinitely.
     async fn sync_enricher(&self, request: EnrichmentStoreRequest<'_>) {
-        if let Err(error) = self.enricher.store(request).await {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "backend": self.enricher.name(),
-                        "error": error.to_string()
-                    })),
-                "memory enrichment store failed; sqlite remains authoritative"
-            );
+        if self.in_failure_cooldown() {
+            return;
+        }
+
+        match self.enricher.store(request).await {
+            Ok(()) => self.clear_failure(),
+            Err(error) => {
+                self.mark_failure_now();
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "backend": self.enricher.name(),
+                            "error": error.to_string()
+                        })),
+                    "memory enrichment store failed; sqlite remains authoritative"
+                );
+            }
         }
     }
 
@@ -445,9 +412,30 @@ impl<E: MemoryEnricher> EnrichedMemory<E> {
         match self.enricher.recall(request).await {
             Ok(enrichment_results) if !enrichment_results.is_empty() => {
                 self.clear_failure();
-                let enrichment_results = self
+                // Rehydration reads the canonical store; a transient local
+                // error there must not fail a recall that already holds
+                // valid local results — enrichment is best-effort.
+                let enrichment_results = match self
                     .prepare_enrichment_results(enrichment_results, request.allowed_agent_ids)
-                    .await?;
+                    .await
+                {
+                    Ok(enrichment_results) => enrichment_results,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "backend": self.enricher.name(),
+                                "error": error.to_string()
+                            })),
+                            "memory enrichment rehydration failed; using local sqlite results"
+                        );
+                        return Ok(local_results);
+                    }
+                };
                 let derived_source = (capabilities.result_kind == ResultKind::DerivedContext)
                     .then(|| self.enricher.name());
                 let merged = Self::merge_results(
@@ -487,6 +475,52 @@ impl<E: MemoryEnricher> EnrichedMemory<E> {
                 Ok(local_results)
             }
         }
+    }
+
+    /// Shared body of [`Memory::recall`] and [`Memory::recall_for_agents`]:
+    /// canonical local recall first, then capability-gated enrichment.
+    /// `allowed_agent_ids` is the only difference between the two entry
+    /// points and is forwarded verbatim to both layers.
+    async fn recall_enriched(
+        &self,
+        allowed_agent_ids: Option<&[&str]>,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (since_dt, until_dt) = parse_recall_window(since, until)?;
+        let kind = if is_recent_recall_query(query) {
+            RecallKind::Recent
+        } else {
+            RecallKind::Semantic
+        };
+        let local_results = match allowed_agent_ids {
+            Some(allowed) => {
+                self.local
+                    .recall_for_agents(allowed, query, limit, session_id, since, until)
+                    .await?
+            }
+            None => {
+                self.local
+                    .recall(query, limit, session_id, since, until)
+                    .await?
+            }
+        };
+        self.enrich_recall(
+            local_results,
+            EnrichmentRecallRequest {
+                query: normalize_recent_recall_query(query),
+                limit,
+                session_id,
+                allowed_agent_ids,
+                kind,
+            },
+            since_dt.as_ref(),
+            until_dt.as_ref(),
+        )
+        .await
     }
 }
 
@@ -543,29 +577,8 @@ impl<E: MemoryEnricher> Memory for EnrichedMemory<E> {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let (since_dt, until_dt) = Self::parse_recall_window(since, until)?;
-        let kind = if is_recent_recall_query(query) {
-            RecallKind::Recent
-        } else {
-            RecallKind::Semantic
-        };
-        let local_results = self
-            .local
-            .recall(query, limit, session_id, since, until)
-            .await?;
-        self.enrich_recall(
-            local_results,
-            EnrichmentRecallRequest {
-                query: normalize_recent_recall_query(query),
-                limit,
-                session_id,
-                allowed_agent_ids: None,
-                kind,
-            },
-            since_dt.as_ref(),
-            until_dt.as_ref(),
-        )
-        .await
+        self.recall_enriched(None, query, limit, session_id, since, until)
+            .await
     }
 
     /// Namespaced recall is intentionally canonical and local-only.
@@ -816,27 +829,13 @@ impl<E: MemoryEnricher> Memory for EnrichedMemory<E> {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let (since_dt, until_dt) = Self::parse_recall_window(since, until)?;
-        let kind = if is_recent_recall_query(query) {
-            RecallKind::Recent
-        } else {
-            RecallKind::Semantic
-        };
-        let local_results = self
-            .local
-            .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
-            .await?;
-        self.enrich_recall(
-            local_results,
-            EnrichmentRecallRequest {
-                query: normalize_recent_recall_query(query),
-                limit,
-                session_id,
-                allowed_agent_ids: Some(allowed_agent_ids),
-                kind,
-            },
-            since_dt.as_ref(),
-            until_dt.as_ref(),
+        self.recall_enriched(
+            Some(allowed_agent_ids),
+            query,
+            limit,
+            session_id,
+            since,
+            until,
         )
         .await
     }
@@ -894,6 +893,10 @@ mod tests {
         recall_results: Vec<MemoryEntry>,
         fail_store: bool,
         fail_recall: bool,
+        /// Run once inside `recall`, after the local recall but before the
+        /// wrapper rehydrates canonical rows — lets a test sabotage the
+        /// canonical store so only the rehydration lookup fails.
+        on_recall: Option<Box<dyn FnOnce() + Send>>,
     }
 
     struct FakeEnricher {
@@ -948,6 +951,9 @@ mod tests {
                 .push((request.kind, request.allowed_agent_ids.is_some()));
             if state.fail_recall {
                 anyhow::bail!("simulated enrichment recall failure");
+            }
+            if let Some(hook) = state.on_recall.take() {
+                hook();
             }
             Ok(state.recall_results.clone())
         }
@@ -1313,6 +1319,8 @@ mod tests {
             "local remains authoritative"
         );
 
+        // The store failure already started the cooldown, so recalls skip
+        // the connector entirely while it is active.
         for _ in 0..2 {
             assert!(
                 memory
@@ -1324,7 +1332,133 @@ mod tests {
         }
         let state = memory.enricher.state.lock();
         assert_eq!(state.store_calls.len(), 1);
-        assert_eq!(state.recall_calls.len(), 1);
+        assert_eq!(state.recall_calls.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn store_skips_connector_during_active_cooldown() {
+        let temp = TempDir::new().unwrap();
+        let memory = test_memory(&temp, derived_capabilities(), 10, Duration::from_secs(30));
+        memory.enricher.state.lock().fail_recall = true;
+
+        // Trip the cooldown with a failing recall.
+        assert!(
+            memory
+                .recall("missing", 5, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(memory.enricher.state.lock().recall_calls.len(), 1);
+
+        // The local write still lands; the connector store is skipped.
+        memory
+            .store("local", "local write survives", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.get("local").await.unwrap().unwrap().content,
+            "local write survives"
+        );
+        assert!(memory.enricher.state.lock().store_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_failure_starts_cooldown_that_expires() {
+        let temp = TempDir::new().unwrap();
+        let memory = test_memory(
+            &temp,
+            derived_capabilities(),
+            10,
+            Duration::from_millis(500),
+        );
+        memory.enricher.state.lock().fail_store = true;
+
+        // First store reaches the connector, fails, and starts the cooldown.
+        memory
+            .store("first", "first payload", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // While the cooldown is active, stores and recalls skip the connector.
+        memory
+            .store("second", "second payload", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(
+            memory
+                .recall("missing", 5, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        {
+            let state = memory.enricher.state.lock();
+            assert_eq!(state.store_calls.len(), 1);
+            assert!(state.recall_calls.is_empty());
+        }
+        // Local durability was never at stake.
+        assert!(memory.get("first").await.unwrap().is_some());
+        assert!(memory.get("second").await.unwrap().is_some());
+
+        // Once the cooldown expires the connector is tried again.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        memory.enricher.state.lock().fail_store = false;
+        memory
+            .store("third", "third payload", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(memory.enricher.state.lock().store_calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rehydration_errors_degrade_to_local_results() {
+        let temp = TempDir::new().unwrap();
+        let memory = test_memory(
+            &temp,
+            capabilities(
+                ResultKind::CanonicalRowReference,
+                RecallScope::AgentAllowlist,
+                RecallSupport::SemanticOnly,
+                CleanupSupport::None,
+            ),
+            10,
+            Duration::from_secs(1),
+        );
+        let agent_id = memory.ensure_agent_uuid("agent-a").await.unwrap();
+        memory
+            .store_with_agent(
+                "local-row",
+                "local rehydration payload",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&agent_id),
+            )
+            .await
+            .unwrap();
+
+        let connection = Arc::clone(memory.local.connection());
+        {
+            let mut state = memory.enricher.state.lock();
+            state.recall_results = vec![entry("local-row", "remote payload", Some(&agent_id), 0.9)];
+            // Drop the canonical table between the enricher recall and the
+            // rehydration lookup so only the lookup fails.
+            state.on_recall = Some(Box::new(move || {
+                connection
+                    .lock()
+                    .execute_batch("DROP TABLE memories")
+                    .unwrap();
+            }));
+        }
+
+        let recalled = memory
+            .recall_for_agents(&[&agent_id], "rehydration", 5, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].content, "local rehydration payload");
     }
 
     #[tokio::test]

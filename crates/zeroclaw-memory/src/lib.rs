@@ -32,10 +32,13 @@ pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+mod recall_window;
 pub mod response_cache;
 pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
+#[cfg(all(test, unix))]
+pub(crate) mod test_support;
 pub mod traits;
 pub mod vector;
 
@@ -913,10 +916,6 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
     #[cfg(unix)]
@@ -929,67 +928,46 @@ mod tests {
         completions: &Path,
         context_pid: &Path,
     ) -> String {
-        let script_path = directory.join("timed-lucid.sh");
         let context_fifo = directory.join("timed-lucid-context.fifo");
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-
-printf '%s\n' "${{1:-}}" >> "{}"
-if [ "${{1:-}}" = "store" ]; then
-  printf 'store\n' >> "{}"
+        test_support::write_lucid_script(
+            directory,
+            "timed-lucid.sh",
+            &format!(
+                r#"printf '%s\n' "${{1:-}}" >> "{invocations}""#,
+                invocations = invocations.display()
+            ),
+            &format!(
+                r#"  printf 'store\n' >> "{completions}"
   echo '{{"success":true,"id":"configured_store"}}'
-  exit 0
-fi
-
-if [ "${{1:-}}" = "context" ]; then
-  rm -f "{}"
-  mkfifo "{}"
-  printf '%s\n' "$$" > "{}"
-  read -r _value < "{}"
-fi
-
-exit 1
-"#,
-            invocations.display(),
-            completions.display(),
-            context_fifo.display(),
-            context_fifo.display(),
-            context_pid.display(),
-            context_fifo.display()
-        );
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-        script_path.display().to_string()
+  exit 0"#,
+                completions = completions.display()
+            ),
+            // Block on a fifo until killed, so the recall deadline fires.
+            &format!(
+                r#"  rm -f "{fifo}"
+  mkfifo "{fifo}"
+  printf '%s\n' "$$" > "{pid}"
+  read -r _value < "{fifo}""#,
+                fifo = context_fifo.display(),
+                pid = context_pid.display()
+            ),
+        )
     }
 
     #[cfg(unix)]
     fn write_recording_lucid_script(directory: &Path, invocations: &Path) -> String {
-        let script_path = directory.join("recording-lucid.sh");
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-
-printf '%s\n' "${{1:-}}" >> "{}"
-if [ "${{1:-}}" = "store" ]; then
-  echo '{{"success":true,"id":"configured_store"}}'
-  exit 0
-fi
-if [ "${{1:-}}" = "context" ]; then
-  echo '<lucid-context></lucid-context>'
-  exit 0
-fi
-exit 1
-"#,
-            invocations.display()
-        );
-        fs::write(&script_path, script).unwrap();
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-        script_path.display().to_string()
+        test_support::write_lucid_script(
+            directory,
+            "recording-lucid.sh",
+            &format!(
+                r#"printf '%s\n' "${{1:-}}" >> "{invocations}""#,
+                invocations = invocations.display()
+            ),
+            r#"  echo '{"success":true,"id":"configured_store"}'
+  exit 0"#,
+            r#"  echo '<lucid-context></lucid-context>'
+  exit 0"#,
+        )
     }
 
     #[test]

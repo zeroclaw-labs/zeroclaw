@@ -80,7 +80,8 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         );
     }
-    let migrated_value = run_chain(value, from)?;
+    let mut migrated_value = run_chain(value, from)?;
+    apply_legacy_lucid_memory_compat(&mut migrated_value)?;
     let migrated_table = match migrated_value {
         toml::Value::Table(t) => t,
         _ => {
@@ -282,8 +283,8 @@ pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
 fn migrate_value(input: &str) -> Result<toml::Value> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
-    if from == CURRENT_SCHEMA_VERSION {
-        Ok(value)
+    let mut value = if from == CURRENT_SCHEMA_VERSION {
+        value
     } else if from > CURRENT_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             ERROR,
@@ -299,8 +300,114 @@ fn migrate_value(input: &str) -> Result<toml::Value> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         )
     } else {
-        run_chain(value, from)
+        run_chain(value, from)?
+    };
+    apply_legacy_lucid_memory_compat(&mut value)?;
+    Ok(value)
+}
+
+/// Legacy Lucid memory-backend compatibility (pre-enrichment configs).
+///
+/// Before the storage/enrichment split, `memory.backend = "lucid"` (and
+/// per-agent `agents.<alias>.memory.backend = "lucid"`) selected the hybrid
+/// SQLite + Lucid CLI backend: SQLite was always the authoritative store and
+/// the Lucid CLI only synced alongside it. The V3 schema expresses that
+/// composition as `backend = "sqlite"` + `enricher = "lucid"`, and the typed
+/// backend enum no longer carries a `lucid` variant — without this pass an
+/// upgraded install would hard-fail per-agent deserialization and silently
+/// fall back to markdown on the global path.
+///
+/// The legacy selector is rewritten to the canonical shape *before* typed
+/// deserialization, so every downstream consumer (factory, validation,
+/// status labels) sees `sqlite` + `lucid`:
+///
+/// - no explicit `enricher` at the same scope → `enricher = "lucid"` is
+///   implied (a bare reference; a `[memory_enrichment.lucid.default]` entry
+///   supplies typed settings when present, built-in defaults otherwise);
+/// - an explicit `enricher = "none"` (or empty) wins: enrichment stays off;
+/// - an explicit canonical enricher alongside the legacy backend is rejected
+///   as ambiguous — the config selects Lucid through both the removed and
+///   the canonical surface — per the memory-enrichment RFC's compatibility
+///   section.
+///
+/// Legacy `[storage.lucid.<alias>]` tables are not part of the V3 schema and
+/// are silently ignored by deserialization; `binary_path` moves to
+/// `[memory_enrichment.lucid.<alias>]`.
+fn apply_legacy_lucid_memory_compat(value: &mut toml::Value) -> Result<()> {
+    let Some(root) = value.as_table_mut() else {
+        return Ok(());
+    };
+    if let Some(memory) = root.get_mut("memory").and_then(toml::Value::as_table_mut) {
+        normalize_legacy_lucid_scope(memory, "memory")?;
     }
+    if let Some(agents) = root.get_mut("agents").and_then(toml::Value::as_table_mut) {
+        for (alias, agent) in agents.iter_mut() {
+            let Some(memory) = agent
+                .as_table_mut()
+                .and_then(|agent| agent.get_mut("memory"))
+                .and_then(toml::Value::as_table_mut)
+            else {
+                continue;
+            };
+            normalize_legacy_lucid_scope(memory, &format!("agents.{alias}.memory"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite one `[memory]`-shaped table (global or per-agent) whose `backend`
+/// is the legacy `"lucid"` selector. See [`apply_legacy_lucid_memory_compat`].
+fn normalize_legacy_lucid_scope(memory: &mut toml::Table, scope: &str) -> Result<()> {
+    let is_legacy_lucid = memory
+        .get("backend")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|backend| {
+            let backend = backend.trim().to_ascii_lowercase();
+            backend == "lucid" || backend.starts_with("lucid.")
+        });
+    if !is_legacy_lucid {
+        return Ok(());
+    }
+
+    match memory.get("enricher") {
+        Some(toml::Value::String(enricher))
+            if !enricher.trim().is_empty() && !enricher.trim().eq_ignore_ascii_case("none") =>
+        {
+            anyhow::bail!(
+                "{scope}.backend = \"lucid\" is the removed legacy Lucid backend and cannot \
+                 be combined with the explicit {scope}.enricher = {:?}; remove the legacy \
+                 value (SQLite stays the authoritative store: set {scope}.backend = \
+                 \"sqlite\")",
+                enricher.trim()
+            );
+        }
+        // Explicit "none" (or empty, or a malformed non-string the typed
+        // deserializer will reject itself) wins: no enricher is implied.
+        Some(_) => {}
+        None => {
+            memory.insert(
+                "enricher".to_string(),
+                toml::Value::String("lucid".to_string()),
+            );
+        }
+    }
+    memory.insert(
+        "backend".to_string(),
+        toml::Value::String("sqlite".to_string()),
+    );
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "path": format!("{scope}.backend") })),
+        &format!(
+            "{scope}.backend = \"lucid\" is deprecated; it now runs as SQLite storage with \
+             the Lucid enricher. Set {scope}.backend = \"sqlite\" and {scope}.enricher = \
+             \"lucid\" in config.toml to silence this warning (typed connector settings \
+             live under [memory_enrichment.lucid.<alias>])"
+        )
+    );
+    Ok(())
 }
 
 /// Deserialize a migrated `toml::Value` into `Config`, never failing.
