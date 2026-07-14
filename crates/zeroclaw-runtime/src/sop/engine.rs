@@ -2655,21 +2655,35 @@ impl SopEngine {
         let Some(run) = self.active_runs.get(run_id) else {
             return false;
         };
-        let has_completed_checkpoint = run.step_results.iter().any(|result| {
-            result.status == SopStepStatus::Completed
-                && result.step_number < step_number
-                && sop.steps.iter().any(|step| {
-                    step.number == result.step_number && step.kind == SopStepKind::Checkpoint
-                })
-        });
-        if !has_completed_checkpoint {
+        let Some(checkpoint_step_number) = run
+            .step_results
+            .iter()
+            .rev()
+            .find(|result| {
+                result.status == SopStepStatus::Completed
+                    && result.step_number < step_number
+                    && sop.steps.iter().any(|step| {
+                        step.number == result.step_number && step.kind == SopStepKind::Checkpoint
+                    })
+            })
+            .map(|result| result.step_number)
+        else {
             return false;
-        }
+        };
 
         self.run_events(run_id).is_ok_and(|events| {
-            events
-                .iter()
-                .any(|event| event.kind.as_str() == "gate_resolved")
+            events.iter().any(|event| {
+                event.kind.as_str() == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64())
+                        == Some(u64::from(checkpoint_step_number))
+                    && matches!(
+                        event
+                            .payload
+                            .get("decision")
+                            .and_then(|value| value.as_str()),
+                        Some("approve") | Some("amend")
+                    )
+            })
         })
     }
 
@@ -8574,6 +8588,46 @@ type = "manual"
         }
     }
 
+    fn two_checkpoint_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> noop -> checkpoint -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "First checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Bridge".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("noop".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 3,
+                    title: "Second checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                forge_comment_step(4),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
     #[test]
     fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
         // Marc's double-HITL shape: `checkpoint -> capability -> ...`. The
@@ -8741,6 +8795,82 @@ type = "manual"
             .last_finished_run("forge-approved")
             .expect("run reached the finished list");
         assert_eq!(run.status, SopRunStatus::Completed);
+    }
+
+    #[test]
+    fn forge_comment_rejects_stale_ledger_from_prior_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine =
+            engine_with_sops(vec![two_checkpoint_forge_comment_sop("forge-stale-ledger")])
+                .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-stale-ledger", manual_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the first checkpoint: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let first_outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("first checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(parked_at_second),
+        ) = first_outcome
+        else {
+            panic!("expected first checkpoint to resume into second gate, got {first_outcome:?}");
+        };
+        assert!(
+            matches!(*parked_at_second, SopRunAction::CheckpointWait { .. }),
+            "first approval should drive the noop bridge and park at checkpoint 3: {parked_at_second:?}"
+        );
+
+        let final_action = engine
+            .decide_checkpoint(&run_id, super::super::approval::ApprovalDecision::Approve)
+            .expect("direct second checkpoint approval should resume into guarded forge step");
+        assert!(
+            matches!(final_action, SopRunAction::Failed { .. }),
+            "unaudited second checkpoint must fail before forge.comment, got {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stale checkpoint-1 ledger row must not authorize checkpoint-3 forge write"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+            }),
+            "first checkpoint must write the audited ledger row: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(3)
+            }),
+            "direct checkpoint approval must not synthesize a ledger row for step 3: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-stale-ledger")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 4)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("ledger-audited checkpoint"),
+            "failure should name the missing checkpoint-specific ledger row: {result:?}"
+        );
     }
 
     #[test]

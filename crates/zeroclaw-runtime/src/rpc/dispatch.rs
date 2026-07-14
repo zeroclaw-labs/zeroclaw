@@ -4175,13 +4175,30 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        {
+        let outcome = {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
             guard
-                .decide_checkpoint(&req.run_id, decision)
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                .resolve_via_broker(
+                    &req.run_id,
+                    decision,
+                    crate::sop::approval::ApprovalPrincipal::ws(
+                        self.peer_label.clone(),
+                        self.tui_id.clone(),
+                    ),
+                )
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
+        };
+        match outcome {
+            crate::sop::approval::BrokerOutcome::Resolved(_)
+            | crate::sop::approval::BrokerOutcome::PendingQuorum { .. } => {}
+            other => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("checkpoint decision rejected: {}", other.label()),
+                ));
+            }
         }
 
         let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
@@ -5330,6 +5347,211 @@ mod tests {
             .handle_sops_runs(&serde_json::json!({ "sop": "some-sop" }))
             .expect_err("missing engine must error");
         assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn sops_decide_uses_broker_for_named_policy_and_quorum() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{
+            ApprovalGroupConfig, ApprovalPolicyConfig, Config, SopApprovalConfig, SopConfig,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+            peer_label: &str,
+            tui_id: Option<&str>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, peer_label.to_string());
+            dispatcher.set_tui_id_for_test(tui_id.map(str::to_string));
+            dispatcher
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["ws:alice".to_string(), "ws:bob".to_string()],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".to_string()),
+                quorum: 2,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            approval: SopApprovalConfig { groups, policies },
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        let sop = Sop {
+            name: "rpc-policy".to_string(),
+            description: "rpc policy checkpoint".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Policy gate".to_string(),
+                kind: SopStepKind::Checkpoint,
+                policy: Some("prod".to_string()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        assert_eq!(engine.sops().len(), 1, "temp SOP should load");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-policy",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start policy-gated SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("policy SOP must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+        let params = serde_json::json!({
+            "name": "rpc-policy",
+            "run_id": run_id,
+            "decision": "approve",
+        });
+
+        let anonymous = dispatcher_with_sop_engine(
+            config.clone(),
+            Arc::clone(&engine),
+            "test-peer-anon:pid=1",
+            None,
+        );
+        let err = anonymous
+            .handle_sops_decide(&params)
+            .await
+            .expect_err("identityless RPC caller must not satisfy named policy");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("not_authorized"),
+            "broker rejection must surface, got: {}",
+            err.message
+        );
+        {
+            let guard = engine.lock().expect("engine lock");
+            assert_eq!(
+                guard.get_run(&run_id).expect("run still active").status,
+                SopRunStatus::PausedCheckpoint
+            );
+            assert!(
+                !guard
+                    .run_events(&run_id)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|event| event.kind == "gate_resolved"),
+                "rejected RPC decision must not append a gate_resolved row"
+            );
+        }
+
+        let alice = dispatcher_with_sop_engine(
+            config.clone(),
+            Arc::clone(&engine),
+            "test-peer-alice:pid=1",
+            Some("alice"),
+        );
+        alice
+            .handle_sops_decide(&params)
+            .await
+            .expect("first authorized vote should be accepted as pending quorum");
+        {
+            let guard = engine.lock().expect("engine lock");
+            assert_eq!(
+                guard.get_run(&run_id).expect("run still active").status,
+                SopRunStatus::PausedCheckpoint,
+                "first authorized vote should not clear quorum-2 gate"
+            );
+            assert!(
+                !guard
+                    .run_events(&run_id)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|event| event.kind == "gate_resolved"),
+                "pending quorum must not append gate_resolved yet"
+            );
+        }
+
+        let bob = dispatcher_with_sop_engine(
+            config,
+            Arc::clone(&engine),
+            "test-peer-bob:pid=1",
+            Some("bob"),
+        );
+        bob.handle_sops_decide(&params)
+            .await
+            .expect("second authorized vote should satisfy quorum");
+        {
+            let guard = engine.lock().expect("engine lock");
+            assert_eq!(
+                guard.get_run(&run_id).expect("run retained").status,
+                SopRunStatus::Completed
+            );
+            let events = guard.run_events(&run_id).unwrap_or_default();
+            assert!(
+                events.iter().any(|event| {
+                    event.kind == "gate_resolved"
+                        && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                        && event
+                            .payload
+                            .get("decision")
+                            .and_then(|value| value.as_str())
+                            == Some("approve")
+                }),
+                "second RPC decision must resolve through the broker ledger path: {events:?}"
+            );
+        }
     }
 
     #[test]
