@@ -225,7 +225,7 @@ pub fn apply_compat_options(
 
 /// Build an `OpenAiResponsesModelProvider` from the per-alias runtime options,
 /// applying the same `max_tokens` / `reasoning_effort` / `timeout_secs` /
-/// `extra_headers` overrides every family that speaks the responses wire
+/// `extra_headers` / `vision` overrides every family that speaks the responses wire
 /// shares. Returns `None` unless `wire_api` selects the responses protocol,
 /// so a caller can route with a single
 /// `if let Some(p) = build_responses_provider_if_requested(..)` and fall
@@ -240,7 +240,7 @@ fn build_responses_provider_if_requested(
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
-    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key);
+    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key, opts.vision);
     if let Some(t) = opts.provider_timeout_secs {
         p = p.with_timeout_secs(t);
     }

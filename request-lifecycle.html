@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZeroClaw 请求生命周期</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            margin: 0;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .diagram-wrapper {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            border: 1px solid #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ZeroClaw 请求生命周期</h1>
+        <p class="subtitle">从用户输入到响应输出的完整流程</p>
+        
+        <div class="diagram-wrapper">
+            <svg viewBox="0 0 1400 600" xmlns="http://www.w3.org/2000/svg">
+                <!-- Define arrow markers -->
+                <defs>
+                    <marker id="arrowhead-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#1976d2"/>
+                    </marker>
+                    <marker id="arrowhead-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#388e3c"/>
+                    </marker>
+                    <marker id="arrowhead-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#f57c00"/>
+                    </marker>
+                    <marker id="arrowhead-purple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#7b1fa2"/>
+                    </marker>
+                </defs>
+                
+                <!-- Title and flow direction -->
+                <text x="700" y="40" text-anchor="middle" font-size="16" font-weight="bold" fill="#666">请求处理流程 (从左到右)</text>
+                
+                <!-- Step 1: Input Sources -->
+                <g id="step1-input">
+                    <rect x="20" y="100" width="180" height="400" fill="#e3f2fd" stroke="#1976d2" stroke-width="2" rx="8"/>
+                    <text x="110" y="130" text-anchor="middle" font-size="15" font-weight="bold" fill="#1976d2">1. 输入源</text>
+                    
+                    <!-- Channel inputs -->
+                    <rect x="35" y="150" width="150" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="110" y="170" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Channel 接收</text>
+                    <text x="110" y="187" text-anchor="middle" font-size="10" fill="#555">Discord/Telegram/Email等</text>
+                    
+                    <!-- Gateway webhook -->
+                    <rect x="35" y="210" width="150" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="110" y="230" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Gateway Webhook</text>
+                    <text x="110" y="247" text-anchor="middle" font-size="10" fill="#555">HTTP POST /webhook</text>
+                    
+                    <!-- ACP Bridge -->
+                    <rect x="35" y="270" width="150" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="110" y="290" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">ACP Bridge</text>
+                    <text x="110" y="307" text-anchor="middle" font-size="10" fill="#555">本地编辑器集成</text>
+                    
+                    <!-- CLI Command -->
+                    <rect x="35" y="330" width="150" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="110" y="350" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">CLI 命令</text>
+                    <text x="110" y="367" text-anchor="middle" font-size="10" fill="#555">zeroclaw memory/tool等</text>
+                    
+                    <!-- Cron Schedule -->
+                    <rect x="35" y="390" width="150" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="110" y="410" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Cron 定时任务</text>
+                    <text x="110" y="427" text-anchor="middle" font-size="10" fill="#555">计划任务触发</text>
+                </g>
+                
+                <!-- Arrow from step 1 to step 2 -->
+                <path d="M 200 300 L 240 300" stroke="#1976d2" stroke-width="3" marker-end="url(#arrowhead-blue)"/>
+                
+                <!-- Step 2: Inbound Processing -->
+                <g id="step2-inbound">
+                    <rect x="240" y="100" width="220" height="400" fill="#fff3e0" stroke="#f57c00" stroke-width="2" rx="8"/>
+                    <text x="350" y="130" text-anchor="middle" font-size="15" font-weight="bold" fill="#f57c00">2. 入站处理</text>
+                    
+                    <!-- Validation -->
+                    <rect x="255" y="150" width="190" height="45" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="350" y="170" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">权限验证</text>
+                    <text x="350" y="187" text-anchor="middle" font-size="10" fill="#555">allowed_users, peer_groups</text>
+                    
+                    <!-- Attribution -->
+                    <rect x="255" y="210" width="190" height="45" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="350" y="230" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Attribution 追踪</text>
+                    <text x="350" y="247" text-anchor="middle" font-size="10" fill="#555">session_id, request_id生成</text>
+                    
+                    <!-- Log Event Creation -->
+                    <rect x="255" y="270" width="190" height="45" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="350" y="290" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">LogEvent 创建</text>
+                    <text x="350" y="307" text-anchor="middle" font-size="10" fill="#555">zeroclaw-log记录事件</text>
+                    
+                    <!-- Message Normalization -->
+                    <rect x="255" y="330" width="190" height="45" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="350" y="350" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">消息标准化</text>
+                    <text x="350" y="367" text-anchor="middle" font-size="10" fill="#555">统一格式转换</text>
+                    
+                    <!-- Tool Receipt Check -->
+                    <rect x="255" y="390" width="190" height="45" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="350" y="410" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Tool Receipt 检查</text>
+                    <text x="350" y="427" text-anchor="middle" font-size="10" fill="#555">工具调用审批策略</text>
+                </g>
+                
+                <!-- Arrow from step 2 to step 3 -->
+                <path d="M 460 300 L 500 300" stroke="#f57c00" stroke-width="3" marker-end="url(#arrowhead-orange)"/>
+                
+                <!-- Step 3: Agent Runtime Core -->
+                <g id="step3-runtime">
+                    <rect x="500" y="100" width="300" height="400" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2" rx="8"/>
+                    <text x="650" y="130" text-anchor="middle" font-size="15" font-weight="bold" fill="#7b1fa2">3. Agent Runtime Core</text>
+                    
+                    <!-- Agent Loop -->
+                    <rect x="515" y="150" width="270" height="50" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="650" y="175" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Agent Loop 主循环</text>
+                    <text x="650" y="192" text-anchor="middle" font-size="10" fill="#555">streaming_turn / non_streaming_turn</text>
+                    
+                    <!-- Context Assembly -->
+                    <rect x="515" y="220" width="270" height="45" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="650" y="240" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">上下文组装</text>
+                    <text x="650" y="257" text-anchor="middle" font-size="10" fill="#555">系统提示词 + 历史对话 + Memory检索</text>
+                    
+                    <!-- Provider Call -->
+                    <rect x="515" y="280" width="270" height="45" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="650" y="300" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Provider 调用</text>
+                    <text x="650" y="317" text-anchor="middle" font-size="10" fill="#555">ResilientWrapper 重试逻辑</text>
+                    
+                    <!-- Response Parsing -->
+                    <rect x="515" y="340" width="270" height="45" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="650" y="360" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">响应解析</text>
+                    <text x="650" y="377" text-anchor="middle" font-size="10" fill="#555">tool_calls提取与验证</text>
+                    
+                    <!-- Security Sandbox -->
+                    <rect x="515" y="400" width="270" height="45" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="650" y="420" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Security Sandbox</text>
+                    <text x="650" y="437" text-anchor="middle" font-size="10" fill="#555">Landlock/Bubblewrap沙箱隔离</text>
+                </g>
+                
+                <!-- Arrow from step 3 to step 4 -->
+                <path d="M 800 300 L 840 300" stroke="#7b1fa2" stroke-width="3" marker-end="url(#arrowhead-purple)"/>
+                
+                <!-- Step 4: Tool Execution & Memory -->
+                <g id="step4-execution">
+                    <rect x="840" y="100" width="260" height="400" fill="#e8f5e8" stroke="#388e3c" stroke-width="2" rx="8"/>
+                    <text x="970" y="130" text-anchor="middle" font-size="15" font-weight="bold" fill="#388e3c">4. 工具执行与记忆</text>
+                    
+                    <!-- Tool Router -->
+                    <rect x="855" y="150" width="230" height="45" fill="#c8e6c9" stroke="#388e3c" rx="4"/>
+                    <text x="970" y="170" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Tool Router</text>
+                    <text x="970" y="187" text-anchor="middle" font-size="10" fill="#555">内置工具 vs WASM插件</text>
+                    
+                    <!-- Built-in Tools -->
+                    <rect x="855" y="210" width="230" height="45" fill="#c8e6c9" stroke="#388e3c" rx="4"/>
+                    <text x="970" y="230" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">内置工具执行</text>
+                    <text x="970" y="247" text-anchor="middle" font-size="10" fill="#555">shell/file/memory/browser等</text>
+                    
+                    <!-- Plugin Host -->
+                    <rect x="855" y="270" width="230" height="45" fill="#c8e6c9" stroke="#388e3c" rx="4"/>
+                    <text x="970" y="290" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Plugin Host (WASM)</text>
+                    <text x="970" y="307" text-anchor="middle" font-size="10" fill="#555">Cranelift/Pulley JIT编译</text>
+                    
+                    <!-- Memory Operations -->
+                    <rect x="855" y="330" width="230" height="45" fill="#c8e6c9" stroke="#388e3c" rx="4"/>
+                    <text x="970" y="350" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Memory 操作</text>
+                    <text x="970" y="367" text-anchor="middle" font-size="10" fill="#555">写入对话历史/向量嵌入</text>
+                    
+                    <!-- Result Aggregation -->
+                    <rect x="855" y="390" width="230" height="45" fill="#c8e6c9" stroke="#388e3c" rx="4"/>
+                    <text x="970" y="410" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">结果聚合</text>
+                    <text x="970" y="427" text-anchor="middle" font-size="10" fill="#555">多轮工具调用结果收集</text>
+                </g>
+                
+                <!-- Arrow from step 4 to step 5 -->
+                <path d="M 1100 300 L 1140 300" stroke="#388e3c" stroke-width="3" marker-end="url(#arrowhead-green)"/>
+                
+                <!-- Step 5: Outbound & Response -->
+                <g id="step5-outbound">
+                    <rect x="1140" y="100" width="240" height="400" fill="#e3f2fd" stroke="#1976d2" stroke-width="2" rx="8"/>
+                    <text x="1260" y="130" text-anchor="middle" font-size="15" font-weight="bold" fill="#1976d2">5. 出站响应</text>
+                    
+                    <!-- Response Formatting -->
+                    <rect x="1155" y="150" width="210" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="1260" y="170" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">响应格式化</text>
+                    <text x="1260" y="187" text-anchor="middle" font-size="10" fill="#555">Markdown/文本/媒体</text>
+                    
+                    <!-- Localization -->
+                    <rect x="1155" y="210" width="210" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="1260" y="230" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Localization</text>
+                    <text x="1260" y="247" text-anchor="middle" font-size="10" fill="#555">Fluent国际化字符串</text>
+                    
+                    <!-- Channel Dispatch -->
+                    <rect x="1155" y="270" width="210" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="1260" y="290" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Channel 分发</text>
+                    <text x="1260" y="307" text-anchor="middle" font-size="10" fill="#555">返回原始通信平台</text>
+                    
+                    <!-- Media Pipeline -->
+                    <rect x="1155" y="330" width="210" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="1260" y="350" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Media Pipeline</text>
+                    <text x="1260" y="367" text-anchor="middle" font-size="10" fill="#555">图片/文件/语音处理</text>
+                    
+                    <!-- Logging & Observability -->
+                    <rect x="1155" y="390" width="210" height="45" fill="#bbdefb" stroke="#1976d2" rx="4"/>
+                    <text x="1260" y="410" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Logging & Metrics</text>
+                    <text x="1260" y="427" text-anchor="middle" font-size="10" fill="#555">JSONL持久化+Prometheus指标</text>
+                </g>
+                
+                <!-- Feedback loop arrows -->
+                <path d="M 970 500 C 970 550, 430 550, 430 500" stroke="#999" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#arrowheaddashed)" fill="none"/>
+                <text x="700" y="540" text-anchor="middle" font-size="12" fill="#666">Memory 持久化反馈循环</text>
+            </svg>
+            
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #e3f2fd; border-color: #1976d2;"></div>
+                    <span>输入/输出阶段</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #fff3e0; border-color: #f57c00;"></div>
+                    <span>入站处理</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #f3e5f5; border-color: #7b1fa2;"></div>
+                    <span>Runtime核心</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #e8f5e8; border-color: #388e3c;"></div>
+                    <span>执行阶段</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 20px; height: 3px; background: #1976d2; display: inline-block; vertical-align: middle;"></div>
+                    <span>主流程</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 20px; height: 3px; background: #999; border-top: 3px dashed #999; display: inline-block; vertical-align: middle;"></div>
+                    <span>反馈循环</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

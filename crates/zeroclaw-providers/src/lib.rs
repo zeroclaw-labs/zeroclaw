@@ -644,6 +644,9 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// Whether this provider supports vision/image inputs.
+    /// Configured per-model via the `vision` field in the alias config.
+    pub vision: Option<bool>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -668,6 +671,7 @@ impl Default for ModelProviderRuntimeOptions {
             think: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
+            vision: None,
         }
     }
 }
@@ -738,6 +742,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         think: entry.and_then(|e| e.think),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        vision: entry.and_then(|e| e.vision),
     }
 }
 

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZeroClaw 架构可视化 - 索引</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 40px 20px;
+            margin: 0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        .subtitle {
+            color: rgba(255,255,255,0.9);
+            text-align: center;
+            font-size: 1.2em;
+            margin-bottom: 50px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+            margin-top: 40px;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+        }
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        }
+        .card-header {
+            height: 200px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+        .card-header svg {
+            width: 100%;
+            height: 100%;
+        }
+        .card-body {
+            padding: 25px;
+        }
+        .card-title {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .card-description {
+            color: #666;
+            line-height: 1.6;
+            font-size: 0.95em;
+        }
+        .card-meta {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #eee;
+            font-size: 0.85em;
+            color: #888;
+        }
+        .tag {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-right: 8px;
+            margin-bottom: 5px;
+        }
+        .tag-blue { background: #e3f2fd; color: #1976d2; }
+        .tag-purple { background: #f3e5f5; color: #7b1fa2; }
+        .tag-green { background: #e8f5e8; color: #388e3c; }
+        .tag-orange { background: #fff3e0; color: #f57c00; }
+        
+        .intro-section {
+            background: rgba(255,255,255,0.95);
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 40px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
+        .intro-section h2 {
+            color: #333;
+            margin-bottom: 15px;
+        }
+        .intro-section p {
+            color: #555;
+            line-height: 1.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏗️ ZeroClaw 架构可视化</h1>
+        <p class="subtitle">微内核架构的多维度视图</p>
+        
+        <div class="intro-section">
+            <h2>关于这套架构图</h2>
+            <p>
+                ZeroClaw是一个采用微内核架构设计的Rust AI代理运行时。这套可视化图表从四个关键维度展示了系统的架构设计:
+            </p>
+            <ul style="color: #555; line-height: 2;">
+                <li><strong>核心层次结构</strong> - API traits定义 → Runtime核心 → 具体实现的三层架构</li>
+                <li><strong>Crate组织</strong> - 按稳定性层级(workspace crate tier)组织的模块依赖关系</li>
+                <li><strong>请求生命周期</strong> - 从用户输入到响应输出的完整处理流程</li>
+                <li><strong>扩展点设计</strong> - 六大核心trait及其实现方式</li>
+            </ul>
+            <p style="margin-top: 15px;">
+                每个图表都聚焦于架构的一个特定方面，共同构成了对ZeroClaw系统设计的全面理解。建议使用现代浏览器查看这些SVG-based的交互式图表。
+            </p>
+        </div>
+        
+        <div class="grid">
+            <!-- Card 1: Architecture Overview -->
+            <a href="architecture-overview.html" class="card">
+                <div class="card-header" style="background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);">
+                    <svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+                        <!-- Simplified preview of architecture overview -->
+                        <rect x="50" y="20" width="300" height="60" fill="#1976d2" rx="8" opacity="0.8"/>
+                        <text x="200" y="55" text-anchor="middle" font-size="16" fill="white" font-weight="bold">API Traits Layer</text>
+                        
+                        <rect x="80" y="100" width="240" height="60" fill="#7b1fa2" rx="8" opacity="0.8"/>
+                        <text x="200" y="135" text-anchor="middle" font-size="16" fill="white" font-weight="bold">Runtime Core</text>
+                        
+                        <rect x="50" y="160" width="300" height="30" fill="#388e3c" rx="4" opacity="0.6"/>
+                        <text x="200" y="180" text-anchor="middle" font-size="12" fill="white">Implementation Layer</text>
+                        
+                        <path d="M 200 80 L 200 100" stroke="#666" stroke-width="3" marker-end="url(#arrow)"/>
+                        <path d="M 200 160 L 200 180" stroke="#666" stroke-width="3" marker-end="url(#arrow)"/>
+                        
+                        <defs>
+                            <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+                            </marker>
+                        </defs>
+                    </svg>
+                </div>
+                <div class="card-body">
+                    <div class="card-title">架构总览图</div>
+                    <div class="card-description">
+                        展示ZeroClaw的核心层次结构，包括API traits层、Runtime核心层以及实现层。清晰呈现了主要crates的组织方式和相互关系。
+                    </div>
+                    <div class="card-meta">
+                        <span class="tag tag-blue">分层架构</span>
+                        <span class="tag tag-purple">微内核模式</span>
+                        <span class="tag tag-green">Trait驱动</span>
+                    </div>
+                </div>
+            </a>
+            
+            <!-- Card 2: Request Lifecycle -->
+            <a href="request-lifecycle.html" class="card">
+                <div class="card-header" style="background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);">
+                    <svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+                        <!-- Simplified preview of request lifecycle -->
+                        <rect x="20" y="80" width="60" height="60" fill="#f57c00" rx="8" opacity="0.8"/>
+                        <text x="50" y="115" text-anchor="middle" font-size="12" fill="white" font-weight="bold">输入源</text>
+                        
+                        <rect x="110" y="80" width="60" height="60" fill="#ff9800" rx="8" opacity="0.8"/>
+                        <text x="140" y="110" text-anchor="middle" font-size="11" fill="white" font-weight="bold">入站处理</text>
+                        
+                        <rect x="200" y="80" width="80" height="60" fill="#7b1fa2" rx="8" opacity="0.8"/>
+                        <text x="240" y="110" text-anchor="middle" font-size="11" fill="white" font-weight="bold">Runtime Core</text>
+                        
+                        <rect x="300" y="80" width="60" height="60" fill="#388e3c" rx="8" opacity="0.8"/>
+                        <text x="330" y="110" text-anchor="middle" font-size="11" fill="white" font-weight="bold">执行</text>
+                        
+                        <path d="M 80 110 L 110 110" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+                        <path d="M 170 110 L 200 110" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+                        <path d="M 280 110 L 300 110" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+                        
+                        <defs>
+                            <marker id="arrow2" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+                            </marker>
+                        </defs>
+                    </svg>
+                </div>
+                <div class="card-body">
+                    <div class="card-title">请求生命周期流程图</div>
+                    <div class="card-description">
+                        详细展示从用户输入(通过Channel/Gateway/CLI等)到最终响应输出的完整处理流程，包含5个关键阶段和反馈循环。
+                    </div>
+                    <div class="card-meta">
+                        <span class="tag tag-orange">流程可视化</span>
+                        <span class="tag tag-blue">数据流</span>
+                        <span class="tag tag-purple">Agent Loop</span>
+                    </div>
+                </div>
+            </a>
+            
+            <!-- Card 3: Extension Points -->
+            <a href="extension-points.html" class="card">
+                <div class="card-header" style="background: linear-gradient(135deg, #f3e5f5 0%, #e1bee7 100%);">
+                    <svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+                        <!-- Simplified preview of extension points -->
+                        <circle cx="200" cy="50" r="30" fill="#1976d2" opacity="0.8"/>
+                        <text x="200" y="55" text-anchor="middle" font-size="11" fill="white" font-weight="bold">API Traits</text>
+                        
+                        <rect x="30" y="100" width="70" height="50" fill="#7b1fa2" rx="6" opacity="0.8"/>
+                        <text x="65" y="125" text-anchor="middle" font-size="9" fill="white">Provider</text>
+                        
+                        <rect x="110" y="100" width="70" height="50" fill="#388e3c" rx="6" opacity="0.8"/>
+                        <text x="145" y="125" text-anchor="middle" font-size="9" fill="white">Channel</text>
+                        
+                        <rect x="190" y="100" width="70" height="50" fill="#f57c00" rx="6" opacity="0.8"/>
+                        <text x="225" y="125" text-anchor="middle" font-size="9" fill="white">Tool</text>
+                        
+                        <rect x="270" y="100" width="70" height="50" fill="#c2185b" rx="6" opacity="0.8"/>
+                        <text x="305" y="125" text-anchor="middle" font-size="9" fill="white">Memory</text>
+                        
+                        <path d="M 180 70 L 100 100" stroke="#666" stroke-width="1.5"/>
+                        <path d="M 195 75 L 145 100" stroke="#666" stroke-width="1.5"/>
+                        <path d="M 210 75 L 225 100" stroke="#666" stroke-width="1.5"/>
+                        <path d="M 220 70 L 305 100" stroke="#666" stroke-width="1.5"/>
+                    </svg>
+                </div>
+                <div class="card-body">
+                    <div class="card-title">关键扩展点详解</div>
+                    <div class="card-description">
+                        深入展示六大核心API trait(Provider, Channel, Tool, Memory, Observer, Peripheral)的定义、实现方式和扩展示例。
+                    </div>
+                    <div class="card-meta">
+                        <span class="tag tag-purple">扩展性设计</span>
+                        <span class="tag tag-blue">Trait系统</span>
+                        <span class="tag tag-green">插件架构</span>
+                    </div>
+                </div>
+            </a>
+            
+            <!-- Card 4: Crates Dependencies -->
+            <a href="crates-dependencies.html" class="card">
+                <div class="card-header" style="background: linear-gradient(135deg, #fce4ec 0%, #f8bbd0 100%);">
+                    <svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+                        <!-- Simplified preview of crates dependencies -->
+                        <rect x="20" y="30" width="100" height="50" fill="#1976d2" rx="6" opacity="0.8"/>
+                        <text x="70" y="55" text-anchor="middle" font-size="10" fill="white" font-weight="bold">zeroclaw-api</text>
+                        <text x="70" y="70" text-anchor="middle" font-size="8" fill="white">Stable@v1.0.0</text>
+                        
+                        <rect x="150" y="20" width="120" height="70" fill="#7b1fa2" rx="6" opacity="0.8"/>
+                        <text x="210" y="40" text-anchor="middle" font-size="10" fill="white" font-weight="bold">Beta Crates</text>
+                        <text x="210" y="55" text-anchor="middle" font-size="8" fill="white">config, log, providers</text>
+                        <text x="210" y="70" text-anchor="middle" font-size="8" fill="white">memory, infra, macros</text>
+                        
+                        <rect x="300" y="30" width="80" height="50" fill="#c62828" rx="6" opacity="0.8"/>
+                        <text x="340" y="50" text-anchor="middle" font-size="9" fill="white" font-weight="bold">Runtime</text>
+                        <text x="340" y="65" text-anchor="middle" font-size="8" fill="white">Experimental</text>
+                        
+                        <rect x="150" y="110" width="120" height="60" fill="#c2185b" rx="6" opacity="0.8"/>
+                        <text x="210" y="130" text-anchor="middle" font-size="10" fill="white" font-weight="bold">Gateway & Apps</text>
+                        <text x="210" y="148" text-anchor="middle" font-size="8" fill="white">gateway, zerocode</text>
+                        <text x="210" y="163" text-anchor="middle" font-size="8" fill="white">plugins</text>
+                        
+                        <path d="M 120 55 L 150 55" stroke="#666" stroke-width="2"/>
+                        <path d="M 270 55 L 300 55" stroke="#666" stroke-width="2"/>
+                        <path d="M 210 90 L 210 110" stroke="#666" stroke-width="2"/>
+                    </svg>
+                </div>
+                <div class="card-body">
+                    <div class="card-title">Crates依赖关系图</div>
+                    <div class="card-description">
+                        按稳定性层级(Stable/Beta/Experimental)组织的workspace crates全景图，展示各模块间的依赖关系和职责划分。
+                    </div>
+                    <div class="card-meta">
+                        <span class="tag tag-orange">依赖管理</span>
+                        <span class="tag tag-purple">模块化设计</span>
+                        <span class="tag tag-blue">稳定性层级</span>
+                    </div>
+                </div>
+            </a>
+        </div>
+        
+        <div style="text-align: center; margin-top: 50px; color: rgba(255,255,255,0.9);">
+            <p style="font-size: 0.9em;">
+                📚 这些图表基于ZeroClaw的实际代码结构和架构文档生成<br>
+                🔍 点击任意卡片查看详细架构图
+            </p>
+        </div>
+    </div>
+</body>
+</html>

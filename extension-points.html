@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZeroClaw 关键扩展点</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            margin: 0;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .diagram-wrapper {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            border: 1px solid #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ZeroClaw 关键扩展点</h1>
+        <p class="subtitle">六大核心 trait 及其实现示例</p>
+        
+        <div class="diagram-wrapper">
+            <svg viewBox="0 0 1400 900" xmlns="http://www.w3.org/2000/svg">
+                <!-- Define arrow markers -->
+                <defs>
+                    <marker id="arrowhead-ext" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+                    </marker>
+                </defs>
+                
+                <!-- Central API Traits Hub -->
+                <g id="central-hub">
+                    <circle cx="700" cy="100" r="70" fill="#e3f2fd" stroke="#1976d2" stroke-width="3"/>
+                    <text x="700" y="95" text-anchor="middle" font-size="14" font-weight="bold" fill="#1976d2">API Traits</text>
+                    <text x="700" y="115" text-anchor="middle" font-size="11" fill="#555">(zeroclaw-api)</text>
+                </g>
+                
+                <!-- Extension Point 1: Provider -->
+                <g id="provider-extension">
+                    <rect x="50" y="180" width="300" height="320" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2" rx="8"/>
+                    <text x="200" y="210" text-anchor="middle" font-size="16" font-weight="bold" fill="#7b1fa2">Provider Trait</text>
+                    <text x="200" y="230" text-anchor="middle" font-size="11" fill="#666">模型提供商适配器</text>
+                    
+                    <!-- Trait methods -->
+                    <rect x="65" y="250" width="270" height="60" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="200" y="270" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">核心方法</text>
+                    <text x="200" y="290" text-anchor="middle" font-size="10" fill="#555">completion(), streaming_completion()</text>
+                    <text x="200" y="305" text-anchor="middle" font-size="10" fill="#555">validate_response(), parse_tool_calls()</text>
+                    
+                    <!-- Implementations -->
+                    <rect x="65" y="330" width="270" height="35" fill="#d1c4e9" stroke="#7b1fa2" rx="4"/>
+                    <text x="200" y="352" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">zeroclaw-providers crate</text>
+                    
+                    <!-- Examples -->
+                    <rect x="65" y="380" width="270" height="100" fill="#ede7f6" stroke="#7b1fa2" stroke-dasharray="4,2" rx="4"/>
+                    <text x="200" y="400" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">实现示例:</text>
+                    <text x="80" y="420" font-size="10" fill="#666">• OpenAI / GPT-4</text>
+                    <text x="80" y="437" font-size="10" fill="#666">• Anthropic / Claude</text>
+                    <text x="80" y="454" font-size="10" fill="#666">• Ollama (本地模型)</text>
+                    <text x="80" y="471" font-size="10" fill="#666">• Zhipu / GLM (智谱)</text>
+                    
+                    <!-- Connection to hub -->
+                    <path d="M 200 180 L 200 170 L 650 140 L 650 100" stroke="#7b1fa2" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Extension Point 2: Channel -->
+                <g id="channel-extension">
+                    <rect x="400" y="180" width="300" height="320" fill="#e8f5e8" stroke="#388e3c" stroke-width="2" rx="8"/>
+                    <text x="550" y="210" text-anchor="middle" font-size="16" font-weight="bold" fill="#388e3c">Channel Trait</text>
+                    <text x="550" y="230" text-anchor="middle" font-size="11" fill="#666">通信平台集成</text>
+                    
+                    <!-- Trait methods -->
+                    <rect x="415" y="250" width="270" height="60" fill="#c8e6c9" stroke="#388e3c" rx="4"/>
+                    <text x="550" y="270" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">核心方法</text>
+                    <text x="550" y="290" text-anchor="middle" font-size="10" fill="#555">receive_message(), send_response()</text>
+                    <text x="550" y="305" text-anchor="middle" font-size="10" fill="#555">handle_media(), validate_inbound()</text>
+                    
+                    <!-- Implementations -->
+                    <rect x="415" y="330" width="270" height="35" fill="#a5d6a7" stroke="#388e3c" rx="4"/>
+                    <text x="550" y="352" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">zeroclaw-channels crate</text>
+                    
+                    <!-- Examples -->
+                    <rect x="415" y="380" width="270" height="100" fill="#e8f5e8" stroke="#388e3c" stroke-dasharray="4,2" rx="4"/>
+                    <text x="550" y="400" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">实现示例 (30+):</text>
+                    <text x="430" y="420" font-size="10" fill="#666">• Discord / Telegram / Slack</text>
+                    <text x="430" y="437" font-size="10" fill="#666">• Email (SMTP/IMAP)</text>
+                    <text x="430" y="454" font-size="10" fill="#666">• WhatsApp / Signal</text>
+                    <text x="430" y="471" font-size="10" fill="#666">• Lark / DingTalk / QQ</text>
+                    
+                    <!-- Connection to hub -->
+                    <path d="M 550 180 L 550 170 L 630 140 L 630 100" stroke="#388e3c" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Extension Point 3: Tool -->
+                <g id="tool-extension">
+                    <rect x="750" y="180" width="300" height="320" fill="#fff3e0" stroke="#f57c00" stroke-width="2" rx="8"/>
+                    <text x="900" y="210" text-anchor="middle" font-size="16" font-weight="bold" fill="#f57c00">Tool Trait</text>
+                    <text x="900" y="230" text-anchor="middle" font-size="11" fill="#666">工具执行表面</text>
+                    
+                    <!-- Trait methods -->
+                    <rect x="765" y="250" width="270" height="60" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="900" y="270" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">核心方法</text>
+                    <text x="900" y="290" text-anchor="middle" font-size="10" fill="#555">execute(ctx, params) -> Result</text>
+                    <text x="900" y="305" text-anchor="middle" font-size="10" fill="#555">name(), description(), schema()</text>
+                    
+                    <!-- Implementations -->
+                    <rect x="765" y="330" width="270" height="35" fill="#ffcc80" stroke="#f57c00" rx="4"/>
+                    <text x="900" y="352" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">zeroclaw-tools crate</text>
+                    
+                    <!-- Examples -->
+                    <rect x="765" y="380" width="270" height="100" fill="#fff3e0" stroke="#f57c00" stroke-dasharray="4,2" rx="4"/>
+                    <text x="900" y="400" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">内置工具:</text>
+                    <text x="780" y="420" font-size="10" fill="#666">• shell (命令执行)</text>
+                    <text x="780" y="437" font-size="10" fill="#666">• file (文件读写)</text>
+                    <text x="780" y="454" font-size="10" fill="#666">• memory (记忆管理)</text>
+                    <text x="780" y="471" font-size="10" fill="#666">• browser (网页抓取)</text>
+                    
+                    <!-- Connection to hub -->
+                    <path d="M 900 180 L 900 170 L 770 140 L 770 100" stroke="#f57c00" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Extension Point 4: Memory -->
+                <g id="memory-extension">
+                    <rect x="1100" y="180" width="280" height="320" fill="#fce4ec" stroke="#c2185b" stroke-width="2" rx="8"/>
+                    <text x="1240" y="210" text-anchor="middle" font-size="16" font-weight="bold" fill="#c2185b">Memory Trait</text>
+                    <text x="1240" y="230" text-anchor="middle" font-size="11" fill="#666">记忆后端实现</text>
+                    
+                    <!-- Trait methods -->
+                    <rect x="1115" y="250" width="250" height="60" fill="#f8bbd0" stroke="#c2185b" rx="4"/>
+                    <text x="1240" y="270" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">核心方法</text>
+                    <text x="1240" y="290" text-anchor="middle" font-size="10" fill="#555">store_conversation(), retrieve()</text>
+                    <text x="1240" y="305" text-anchor="middle" font-size="10" fill="#555">search_embeddings(), merge_vectors()</text>
+                    
+                    <!-- Implementations -->
+                    <rect x="1115" y="330" width="250" height="35" fill="#f48fb1" stroke="#c2185b" rx="4"/>
+                    <text x="1240" y="352" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">zeroclaw-memory crate</text>
+                    
+                    <!-- Examples -->
+                    <rect x="1115" y="380" width="250" height="100" fill="#fce4ec" stroke="#c2185b" stroke-dasharray="4,2" rx="4"/>
+                    <text x="1240" y="400" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">后端实现:</text>
+                    <text x="1130" y="420" font-size="10" fill="#666">• Markdown文件系统</text>
+                    <text x="1130" y="437" font-size="10" fill="#666">• SQLite数据库</text>
+                    <text x="1130" y="454" font-size="10" fill="#666">• PostgreSQL向量</text>
+                    <text x="1130" y="471" font-size="10" fill="#666">• 嵌入向量合并</text>
+                    
+                    <!-- Connection to hub -->
+                    <path d="M 1240 180 L 1240 170 L 750 140 L 750 100" stroke="#c2185b" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Extension Point 5: Observer -->
+                <g id="observer-extension">
+                    <rect x="150" y="550" width="300" height="280" fill="#e0f7fa" stroke="#0097a7" stroke-width="2" rx="8"/>
+                    <text x="300" y="580" text-anchor="middle" font-size="16" font-weight="bold" fill="#0097a7">Observer Trait</text>
+                    <text x="300" y="600" text-anchor="middle" font-size="11" fill="#666">可观测性接口</text>
+                    
+                    <!-- Trait methods -->
+                    <rect x="165" y="620" width="270" height="50" fill="#b2ebf2" stroke="#0097a7" rx="4"/>
+                    <text x="300" y="640" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">核心方法</text>
+                    <text x="300" y="660" text-anchor="middle" font-size="10" fill="#555">record_event(), emit_log()</text>
+                    
+                    <!-- Implementations -->
+                    <rect x="165" y="685" width="270" height="35" fill="#80deea" stroke="#0097a7" rx="4"/>
+                    <text x="300" y="707" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">zeroclaw-log + runtime</text>
+                    
+                    <!-- Examples -->
+                    <rect x="165" y="735" width="270" height="80" fill="#e0f7fa" stroke="#0097a7" stroke-dasharray="4,2" rx="4"/>
+                    <text x="300" y="755" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">实现方式:</text>
+                    <text x="180" y="775" font-size="10" fill="#666">• JSONL持久化日志</text>
+                    <text x="180" y="792" font-size="10" fill="#666">• Prometheus指标导出</text>
+                    <text x="180" y="809" font-size="10" fill="#666">• OpenTelemetry追踪</text>
+                    
+                    <!-- Connection to hub -->
+                    <path d="M 300 550 L 300 480 L 600 200 L 650 160" stroke="#0097a7" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Extension Point 6: Peripheral -->
+                <g id="peripheral-extension">
+                    <rect x="500" y="550" width="300" height="280" fill="#f1f8e9" stroke="#558b2f" stroke-width="2" rx="8"/>
+                    <text x="650" y="580" text-anchor="middle" font-size="16" font-weight="bold" fill="#558b2f">Peripheral Trait</text>
+                    <text x="650" y="600" text-anchor="middle" font-size="11" fill="#666">硬件外设接口</text>
+                    
+                    <!-- Trait methods -->
+                    <rect x="515" y="620" width="270" height="50" fill="#dcedc8" stroke="#558b2f" rx="4"/>
+                    <text x="650" y="640" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">核心方法</text>
+                    <text x="650" y="660" text-anchor="middle" font-size="10" fill="#555">read_gpio(), write_serial()</text>
+                    <text x="650" y="675" text-anchor="middle" font-size="10" fill="#555">i2c_transfer(), spi_exchange()</text>
+                    
+                    <!-- Implementations -->
+                    <rect x="515" y="685" width="270" height="35" fill="#c5e1a5" stroke="#558b2f" rx="4"/>
+                    <text x="650" y="707" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">zeroclaw-hardware crate</text>
+                    
+                    <!-- Examples -->
+                    <rect x="515" y="735" width="270" height="80" fill="#f1f8e9" stroke="#558b2f" stroke-dasharray="4,2" rx="4"/>
+                    <text x="650" y="755" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">硬件支持:</text>
+                    <text x="530" y="775" font-size="10" fill="#666">• STM32微控制器</text>
+                    <text x="530" y="792" font-size="10" fill="#666">• Raspberry Pi GPIO</text>
+                    <text x="530" y="809" font-size="10" fill="#666">• Aardvark I2C/SPI适配器</text>
+                    
+                    <!-- Connection to hub -->
+                    <path d="M 650 550 L 650 480 L 680 200 L 700 160" stroke="#558b2f" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Plugin System (bottom right) -->
+                <g id="plugin-system">
+                    <rect x="850" y="550" width="280" height="280" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2" rx="8"/>
+                    <text x="990" y="580" text-anchor="middle" font-size="16" font-weight="bold" fill="#7b1fa2">Plugin Host</text>
+                    <text x="990" y="600" text-anchor="middle" font-size="11" fill="#666">WASM 插件运行时</text>
+                    
+                    <!-- Runtime engines -->
+                    <rect x="865" y="620" width="250" height="50" fill="#e1bee7" stroke="#7b1fa2" rx="4"/>
+                    <text x="990" y="640" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">JIT编译引擎</text>
+                    <text x="990" y="660" text-anchor="middle" font-size="10" fill="#555">Cranelift / Pulley解释器</text>
+                    
+                    <!-- ABI surface -->
+                    <rect x="865" y="685" width="250" height="35" fill="#d1c4e9" stroke="#7b1fa2" rx="4"/>
+                    <text x="990" y="707" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">Plugin ABI 接口</text>
+                    
+                    <!-- Examples -->
+                    <rect x="865" y="735" width="250" height="80" fill="#ede7f6" stroke="#7b1fa2" stroke-dasharray="4,2" rx="4"/>
+                    <text x="990" y="755" text-anchor="middle" font-size="11" font-weight="bold" fill="#555">插件类型:</text>
+                    <text x="880" y="775" font-size="10" fill="#666">• 自定义工具实现</text>
+                    <text x="880" y="792" font-size="10" fill="#666">• 第三方服务集成</text>
+                    <text x="880" y="809" font-size="10" fill="#666">• 领域专用逻辑</text>
+                    
+                    <!-- Connection to tools -->
+                    <path d="M 990 550 L 990 520 L 1050 500" stroke="#7b1fa2" stroke-width="2" fill="none" marker-end="url(#arrowhead-ext)"/>
+                </g>
+                
+                <!-- Config System (bottom left) -->
+                <g id="config-system">
+                    <rect x="1180" y="550" width="200" height="280" fill="#fff3e0" stroke="#f57c00" stroke-width="2" rx="8"/>
+                    <text x="1280" y="580" text-anchor="middle" font-size="16" font-weight="bold" fill="#f57c00">Config Schema</text>
+                    <text x="1280" y="600" text-anchor="middle" font-size="11" fill="#666">配置系统</text>
+                    
+                    <!-- Derive macro -->
+                    <rect x="1195" y="620" width="170" height="40" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="1280" y="640" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">#[derive(Configurable)]</text>
+                    <text x="1280" y="655" text-anchor="middle" font-size="10" fill="#555">zeroclaw-macros</text>
+                    
+                    <!-- Features -->
+                    <rect x="1195" y="675" width="170" height="35" fill="#ffcc80" stroke="#f57c00" rx="4"/>
+                    <text x="1280" y="697" text-anchor="middle" font-size="11" fill="#333">feature gates</text>
+                    
+                    <!-- Environment vars -->
+                    <rect x="1195" y="720" width="170" height="35" fill="#ffe0b2" stroke="#f57c00" rx="4"/>
+                    <text x="1280" y="742" text-anchor="middle" font-size="11" fill="#333">环境变量映射</text>
+                    
+                    <!-- Connection to all traits -->
+                    <path d="M 1180 600 L 1100 600" stroke="#f57c00" stroke-width="2" stroke-dasharray="5,5" fill="none"/>
+                    <path d="M 1180 650 L 1000 700" stroke="#f57c00" stroke-width="2" stroke-dasharray="5,5" fill="none"/>
+                    <path d="M 1180 700 L 850 700" stroke="#f57c00" stroke-width="2" stroke-dasharray="5,5" fill="none"/>
+                </g>
+                
+                <!-- Cross-cutting concerns arrows -->
+                <path d="M 200 500 L 200 530" stroke="#7b1fa2" stroke-width="1.5" stroke-dasharray="4,2" fill="none"/>
+                <path d="M 550 500 L 550 530" stroke="#388e3c" stroke-width="1.5" stroke-dasharray="4,2" fill="none"/>
+                <path d="M 900 500 L 900 530" stroke="#f57c00" stroke-width="1.5" stroke-dasharray="4,2" fill="none"/>
+                <path d="M 1240 500 L 1240 530" stroke="#c2185b" stroke-width="1.5" stroke-dasharray="4,2" fill="none"/>
+            </svg>
+            
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #f3e5f5; border-color: #7b1fa2;"></div>
+                    <span>Provider (模型适配)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #e8f5e8; border-color: #388e3c;"></div>
+                    <span>Channel (通信平台)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #fff3e0; border-color: #f57c00;"></div>
+                    <span>Tool (工具执行)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #fce4ec; border-color: #c2185b;"></div>
+                    <span>Memory (记忆后端)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #e0f7fa; border-color: #0097a7;"></div>
+                    <span>Observer (可观测性)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #f1f8e9; border-color: #558b2f;"></div>
+                    <span>Peripheral (硬件外设)</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 20px; height: 2px; background: #666; display: inline-block; vertical-align: middle;"></div>
+                    <span>Trait实现关系</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 20px; height: 2px; background: #999; border-top: 2px dashed #999; display: inline-block; vertical-align: middle;"></div>
+                    <span>配置依赖</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

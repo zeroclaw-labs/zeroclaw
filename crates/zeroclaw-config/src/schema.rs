@@ -913,6 +913,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<usize>,
+    /// Whether this model supports vision (image) inputs.
+    /// When set, overrides the provider-family default capability.
+    /// Use this when a provider serves models with mixed vision support
+    /// (e.g., an OpenAI-compatible family where only some models are multimodal).
+    /// Leave unset to use the provider-family default.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
     /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
     /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
     /// Leave unset to use the system's default trust store.
