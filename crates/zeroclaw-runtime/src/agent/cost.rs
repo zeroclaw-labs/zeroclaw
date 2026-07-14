@@ -197,6 +197,8 @@ pub struct ToolLoopCostTrackingContext {
     /// Trusted principal for this runtime turn. Used only to resolve the active
     /// goal from canonical `TaskRecord` fields at record time.
     pub principal_id: Option<String>,
+    /// Exact durable goal task when trusted controller plumbing resolved one.
+    pub goal_task_id: Option<String>,
     /// Whether this scoped turn is allowed to resolve a goal for ledger
     /// attribution.
     ///
@@ -218,6 +220,7 @@ impl ToolLoopCostTrackingContext {
             agent_alias: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -236,6 +239,7 @@ impl ToolLoopCostTrackingContext {
             agent_alias: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -262,6 +266,7 @@ impl ToolLoopCostTrackingContext {
     ) -> Self {
         self.originator_route.clone_from(&ctx.originator_route);
         self.principal_id.clone_from(&ctx.principal_id);
+        self.goal_task_id.clone_from(&ctx.goal_task_id);
         self
     }
 
@@ -272,7 +277,8 @@ impl ToolLoopCostTrackingContext {
         self,
         ctx: &crate::control_plane::GoalAdmissionContext,
     ) -> Self {
-        let context = self.with_goal_admission_filters(ctx);
+        let mut context = self.with_goal_admission_filters(ctx);
+        context.goal_task_id = ctx.goal_task_id.clone();
         context.enable_goal_attribution();
         context
     }
@@ -528,18 +534,24 @@ pub async fn record_tool_loop_cost_usage(
 
     if let Some(tracker) = &ctx.tracker {
         let attributed_task_id = if goal_attributed {
-            let agent_alias = ctx.agent_alias.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("goal accounting attribution is missing agent identity")
-            })?;
-            Some(
-                active_goal_task_id_for_context(
-                    agent_alias,
-                    ctx.originator_route.as_deref(),
-                    ctx.principal_id.as_deref(),
+            if let Some(task_id) = ctx.goal_task_id.clone() {
+                Some(task_id)
+            } else {
+                let agent_alias = ctx.agent_alias.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("goal accounting attribution is missing agent identity")
+                })?;
+                Some(
+                    active_goal_task_id_for_context(
+                        agent_alias,
+                        ctx.originator_route.as_deref(),
+                        ctx.principal_id.as_deref(),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("goal accounting attribution has no active task")
+                    })?,
                 )
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("goal accounting attribution has no active task"))?,
-            )
+            }
         } else {
             None
         };
@@ -1446,6 +1458,56 @@ mod tests {
                 .map(|stats| stats.request_count),
             Some(1)
         );
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_keeps_exact_controller_task_id() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let original_goal_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let goal_ctx = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("route-a".into()))
+            .with_principal_id(Some("principal-a".into()))
+            .with_goal_task_id(Some(original_goal_id.clone()));
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "mock-provider".to_string(),
+                HashMap::from([
+                    ("mock-model.input".to_string(), 1.0),
+                    ("mock-model.output".to_string(), 2.0),
+                ]),
+            )])),
+        )
+        .with_agent_alias("agent-a")
+        .with_goal_admission_context(&goal_ctx);
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            cached_input_tokens: None,
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    record_tool_loop_cost_usage("mock-provider", "mock-model", &usage).await
+                })
+                .await
+                .expect("cost usage");
+        });
+
+        let summary = tracker.get_summary_for_task(&original_goal_id).unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_500);
     }
 
     #[test]
