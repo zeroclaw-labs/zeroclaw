@@ -531,4 +531,125 @@ mod tests {
             "partial marker suffix held back across stream end must not appear in forwarded output; forwarded={forwarded:?}"
         );
     }
+
+    /// Splits `<|eom|>` across multiple chunks. The longer 7-byte marker is
+    /// the harder case: every byte of the prefix is also a marker-prefix
+    /// candidate, so the stripper must hold back several intermediate
+    /// states before reaching the final discard.
+    struct SplitPipeTerminalMarkerProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for SplitPipeTerminalMarkerProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SplitPipeTerminalMarkerProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SplitPipeTerminalMarkerProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("Summary"))),
+                // Fragment the 7-byte `<|eom|>` marker across four chunks
+                // so the stripper has to track several intermediate
+                // partial-prefix states before the final discard.
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("<"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("|eom"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("|"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(">"))),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_consume_strips_pipe_eom_split_across_chunks() {
+        let provider = SplitPipeTerminalMarkerProvider;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(event_tx);
+
+        let mut forwarded = String::new();
+        while let Some(event) = event_rx.recv().await {
+            if let TurnEvent::Chunk { delta } = event {
+                forwarded.push_str(&delta);
+            }
+        }
+
+        assert_eq!(outcome.response_text, "Summary");
+        assert!(
+            !outcome.response_text.contains("<|eom|>"),
+            "<|eom|> must never leak into response_text; got={:?}",
+            outcome.response_text
+        );
+        assert!(
+            !forwarded.contains("<|eom|>"),
+            "<|eom|> must never leak into forwarded chunks; forwarded={forwarded:?}"
+        );
+        assert!(
+            !forwarded.contains("<"),
+            "partial marker prefix held back across stream end must not appear in forwarded output; forwarded={forwarded:?}"
+        );
+    }
 }
