@@ -253,6 +253,20 @@ every capability except a plugin whose only capability is `skill`, which carries
 no WASM payload and is rejected at discovery if it omits a valid `skills/`
 bundle (`validate_manifest_shape` in `host.rs`).
 
+`name` must begin with an ASCII letter or digit and contain only ASCII letters,
+digits, `.`, `-`, or `_`, so it is one portable filesystem component.
+`wasm_path` must be relative and confined to the plugin directory; absolute,
+parent-traversing, and symlink-escaping paths are rejected. Executable plugins
+may declare `wasm_sha256` as the 64-character hexadecimal SHA-256 of those exact
+component bytes. Strict signature mode requires it.
+
+A novel channel plugin's canonical agent binding is `plugin.<manifest-name>`.
+The name must also exist as a `[[plugins.entries]]` row; that row remains the
+only home for the plugin's config. Once any explicit channel binding exists,
+the runtime instantiates the plugin only when an enabled agent owns that exact
+reference. With no channel bindings anywhere, legacy admission behavior is
+preserved.
+
 ### Permissions
 
 `permissions` is a list of `PluginPermission` values, also defined in
@@ -478,8 +492,10 @@ plugin boundary as 32-bit by construction.
 Plugin manifests may carry an Ed25519 signature
 (`crates/zeroclaw-plugins/src/signature.rs`). The signature is base64url-encoded
 over the canonical manifest bytes (the TOML with the `signature` and
-`publisher_key` lines stripped); the publisher's public key is hex-encoded. The
-host enforces one of three modes from `plugins.security.signature_mode`:
+`publisher_key` lines stripped); this includes `wasm_path` and `wasm_sha256`, so
+the signature binds the executable payload by digest. The publisher's public
+key is hex-encoded. The host enforces one of three modes from
+`plugins.security.signature_mode`:
 
 | Mode | Unsigned plugin | Untrusted or invalid signature |
 |------|-----------------|--------------------------------|
@@ -489,6 +505,11 @@ host enforces one of three modes from `plugins.security.signature_mode`:
 
 Verification runs at both discovery and install. Discovery skips a plugin that
 fails its policy rather than aborting the whole host; install returns the error.
+Installation parses, verifies, and writes one manifest buffer, and copies the
+same opened payload bytes whose digest it checks. Immediately before component
+loading, every executable adapter identity-checks one open file, checks
+`wasm_sha256`, and compiles or deserializes that same buffer. Replacing a path
+after verification therefore cannot change the component that is executed.
 
 ## Writing a plugin in Rust
 

@@ -12,7 +12,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     ChannelCapabilities, InboundMessage as WitInboundMessage,
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
-use crate::component::{PluginState, call_plugin, engine, load_component, wt};
+use crate::component::{PluginState, call_plugin, engine, load_component_with_digest, wt};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -111,7 +111,20 @@ impl WasmChannel {
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
-        let component = load_component(wasm_path)?;
+        Self::from_wasm_with_digest(alias, wasm_path, None, permissions, config, limits).await
+    }
+
+    /// Instantiate a channel plugin while binding the compiled component to
+    /// the digest carried by its verified manifest.
+    pub async fn from_wasm_with_digest(
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
+        let component = load_component_with_digest(wasm_path, expected_sha256)?;
         let inbound = InboundQueue::default();
         let mut store =
             crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
@@ -221,8 +234,10 @@ fn from_wit_inbound(msg: WitInboundMessage, channel_name: &str) -> ChannelMessag
         sender: msg.sender,
         reply_target: msg.reply_target,
         content: msg.content,
-        channel: channel_name.to_string(),
-        channel_alias: msg.channel_alias,
+        channel: zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE.to_string(),
+        // Host-stamp the verified manifest name. Guest-provided aliases cannot
+        // select a different agent route.
+        channel_alias: Some(channel_name.to_string()),
         timestamp: msg.timestamp,
         thread_ts: msg.thread_ts,
         interruption_scope_id: msg.interruption_scope_id,
@@ -254,7 +269,7 @@ fn from_wit_approval_response(r: WitApprovalResponse) -> ChannelApprovalResponse
 #[async_trait]
 impl Channel for WasmChannel {
     fn name(&self) -> &str {
-        &self.alias
+        zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -276,61 +291,54 @@ impl Channel for WasmChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         let channel_name = self.alias.clone();
-        let state = Arc::clone(&self.state);
-        let poll_healthy = Arc::clone(&self.poll_healthy);
-        zeroclaw_spawn::spawn!(async move {
-            const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
-            const MAX_BACKOFF: Duration = Duration::from_millis(500);
-            let mut backoff = INITIAL_BACKOFF;
-            loop {
-                let polled = {
-                    let mut guard = state.lock().await;
-                    let (ref mut store, ref mut bindings) = *guard;
-                    crate::component::refuel(store);
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_poll_message(store)
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+        const MAX_BACKOFF: Duration = Duration::from_millis(500);
+        let mut backoff = INITIAL_BACKOFF;
+
+        loop {
+            let polled = {
+                let mut guard = self.state.lock().await;
+                let (ref mut store, ref mut bindings) = *guard;
+                crate::component::refuel(store);
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_poll_message(store)
+                    .await
+            };
+            match polled {
+                Ok(Some(wit_msg)) => {
+                    mark_poll_healthy(&self.poll_healthy, true);
+                    backoff = INITIAL_BACKOFF;
+                    if tx
+                        .send(from_wit_inbound(wit_msg, &channel_name))
                         .await
-                };
-                match polled {
-                    Ok(Some(wit_msg)) => {
-                        mark_poll_healthy(&poll_healthy, true);
-                        backoff = INITIAL_BACKOFF;
-                        if tx
-                            .send(from_wit_inbound(wit_msg, &channel_name))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        .is_err()
+                    {
+                        return Ok(());
                     }
-                    Ok(None) => {
-                        mark_poll_healthy(&poll_healthy, true);
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
-                    Err(e) => {
-                        mark_poll_healthy(&poll_healthy, false);
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Inbound
-                            )
+                }
+                Ok(None) => {
+                    mark_poll_healthy(&self.poll_healthy, true);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+                Err(e) => {
+                    mark_poll_healthy(&self.poll_healthy, false);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "channel_alias": channel_name,
                                 "error": format!("{e:#}"),
                             })),
-                            "channel plugin poll-message trapped; backing off"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
+                        "channel plugin poll-message trapped; backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
-        });
-        Ok(())
+        }
     }
 
     async fn health_check(&self) -> bool {
@@ -811,6 +819,29 @@ mod tests {
         let json = resolve_configure_json(&config, &[PluginPermission::ConfigRead]);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["identity"], "on-call", "granted section round-trips");
+    }
+
+    #[test]
+    fn inbound_route_is_stamped_from_verified_manifest_name() {
+        let message = from_wit_inbound(
+            WitInboundMessage {
+                id: "evt-1".to_string(),
+                sender: "sender".to_string(),
+                reply_target: "room".to_string(),
+                content: "hello".to_string(),
+                channel: "guest-controlled".to_string(),
+                channel_alias: Some("other-owner".to_string()),
+                timestamp: 0,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: Vec::new(),
+                subject: None,
+            },
+            "weather-alerts",
+        );
+
+        assert_eq!(message.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
+        assert_eq!(message.channel_alias.as_deref(), Some("weather-alerts"));
     }
 
     #[test]

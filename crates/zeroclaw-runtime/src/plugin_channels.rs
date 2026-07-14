@@ -50,7 +50,12 @@ fn load_plugin_host(config: &Config) -> Option<zeroclaw_plugins::host::PluginHos
 #[cfg(feature = "plugins-wasm")]
 #[must_use]
 pub(crate) fn has_channel_plugins(config: &Config) -> bool {
-    load_plugin_host(config).is_some_and(|host| !host.channel_plugin_details().is_empty())
+    let active = zeroclaw_config::schema::ActiveChannelAliases::compute(config);
+    load_plugin_host(config).is_some_and(|host| {
+        host.channel_plugin_details().iter().any(|(manifest, _)| {
+            active.contains(&zeroclaw_api::channel::plugin_channel_ref(&manifest.name))
+        })
+    })
 }
 
 /// Builds without a WASM host cannot contribute plugin channels.
@@ -100,6 +105,7 @@ pub async fn build_channel_plugins(
     };
 
     let mut built: Vec<(String, Arc<dyn Channel>)> = Vec::new();
+    let active = zeroclaw_config::schema::ActiveChannelAliases::compute(config);
     for (manifest, wasm_path) in host.channel_plugin_details() {
         if !should_build_channel_plugin(&manifest.name, native_channel_ids) {
             ::zeroclaw_log::record!(
@@ -114,6 +120,21 @@ pub async fn build_channel_plugins(
             continue;
         }
 
+        let binding = zeroclaw_api::channel::plugin_channel_ref(&manifest.name);
+        if !active.contains(&binding) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": manifest.name.clone(),
+                        "binding": binding,
+                    })),
+                "Channel plugin has no enabled owning agent; skipping before instantiation"
+            );
+            continue;
+        }
+
         // Per-plugin config comes from `[[plugins.entries.<name>]]`. A plugin
         // that mirrors a built-in channel will instead resolve that channel's
         // canonical `[channels.<id>.*]` section (via the `provides` manifest
@@ -124,9 +145,10 @@ pub async fn build_channel_plugins(
             .entry_config(&manifest.name)
             .cloned()
             .unwrap_or_default();
-        match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
+        match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_digest(
             manifest.name.clone(),
-            wasm_path,
+            &wasm_path,
+            manifest.wasm_sha256.as_deref(),
             &manifest.permissions,
             &plugin_config,
             limits,

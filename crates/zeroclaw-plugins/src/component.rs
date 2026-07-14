@@ -278,12 +278,31 @@ pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
 /// component is compiled on load; in runtime-only builds the file is a
 /// precompiled `.cwasm` deserialized directly.
 pub fn load_component(wasm_path: &Path) -> Result<Component> {
-    wt(load_inner(wasm_path), "failed to load WASM component")
+    load_component_with_digest(wasm_path, None)
+}
+
+/// Load a component from one identity-checked file handle while binding
+/// execution to an optional signed payload digest. The bytes are compiled or
+/// deserialized from that same buffer, so no path reopen can swap the
+/// executable after confinement or digest verification.
+pub fn load_component_with_digest(
+    wasm_path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<Component> {
+    let bytes = crate::host::read_stable_file(wasm_path).map_err(anyhow::Error::new)?;
+    if let Some(expected_sha256) = expected_sha256 {
+        crate::signature::verify_payload_digest(&bytes, expected_sha256)
+            .map_err(anyhow::Error::new)?;
+    }
+    wt(
+        load_inner_bytes(&bytes),
+        "failed to load confined WASM component",
+    )
 }
 
 #[cfg(feature = "plugins-wasm-cranelift")]
-fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
-    Component::from_file(engine(), wasm_path)
+fn load_inner_bytes(bytes: &[u8]) -> wasmtime::Result<Component> {
+    Component::from_binary(engine(), bytes)
 }
 
 #[cfg(not(feature = "plugins-wasm-cranelift"))]
@@ -291,6 +310,19 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     // SAFETY: the file is a wasmtime-produced `.cwasm` for this engine; a
     // mismatched artifact is rejected by deserialize's version check.
     unsafe { Component::deserialize_file(engine(), wasm_path) }
+}
+
+#[cfg(not(feature = "plugins-wasm-cranelift"))]
+fn load_inner_bytes(bytes: &[u8]) -> wasmtime::Result<Component> {
+    // Keep the only unsafe deserialization call in `load_inner`: materialize
+    // the already-opened buffer in a private directory, then deserialize that
+    // exact file before the directory is dropped.
+    let dir = tempfile::Builder::new()
+        .prefix("zeroclaw-component-")
+        .tempdir()?;
+    let path = dir.path().join("component.cwasm");
+    std::fs::write(&path, bytes)?;
+    load_inner(&path)
 }
 
 /// Run an async call against a warm `Arc<Mutex<(Store, bindings)>>` plugin,

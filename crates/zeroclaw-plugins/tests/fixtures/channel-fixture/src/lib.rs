@@ -9,8 +9,8 @@
 //! → capabilities → send → poll). No network, no filesystem, no config
 //! needed.
 //!
-//! Build:  rustup target add wasm32-wasip2
-//!         cargo build --target wasm32-wasip2 --release
+//! The host E2E tests build this source on demand with the checked-in lockfile.
+//! Manual build: `cargo build --locked --target wasm32-wasip2`.
 
 #[cfg(target_family = "wasm")]
 mod component {
@@ -34,6 +34,7 @@ mod component {
     const PLUGIN_NAME: &str = "echo-channel";
     const PLUGIN_VERSION: &str = "0.1.0";
     const CONFIGURE_MARKER: &str = "channel-fixture configure export invoked";
+    const POLL_MARKER: &str = "channel-fixture poll-message export invoked";
 
     struct EchoChannel;
 
@@ -77,6 +78,17 @@ mod component {
         }
 
         fn poll_message() -> Option<InboundMessage> {
+            log_record(
+                LogLevel::Info,
+                &PluginEvent {
+                    function_name: "channel_fixture::poll_message".to_string(),
+                    action: PluginAction::Inbound,
+                    outcome: Some(PluginOutcome::Success),
+                    duration_ms: None,
+                    attrs: None,
+                    message: POLL_MARKER.to_string(),
+                },
+            );
             let already = DELIVERED.with(|d| d.replace(true));
             if already {
                 return None;

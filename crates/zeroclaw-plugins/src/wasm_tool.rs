@@ -1,12 +1,14 @@
 //! Bridge between WASM plugins and the Tool trait.
 
 use crate::PluginPermission;
-use crate::component::PluginLimits;
+use crate::component::{PluginLimits, load_component_with_digest};
 use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use wasmtime::component::Component;
 use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
@@ -18,33 +20,13 @@ pub struct WasmTool {
     name: String,
     description: String,
     parameters_schema: Value,
-    wasm_path: PathBuf,
+    component: Arc<Component>,
     permissions: Vec<PluginPermission>,
     config: HashMap<String, String>,
     limits: PluginLimits,
 }
 
 impl WasmTool {
-    pub fn new(
-        name: String,
-        description: String,
-        parameters_schema: Value,
-        wasm_path: PathBuf,
-        permissions: Vec<PluginPermission>,
-        config: HashMap<String, String>,
-        limits: PluginLimits,
-    ) -> Self {
-        Self {
-            name,
-            description,
-            parameters_schema,
-            wasm_path,
-            permissions,
-            config,
-            limits,
-        }
-    }
-
     /// Create a WasmTool by loading metadata from the plugin's `tool` export.
     /// Falls back to manifest-supplied values if the export is missing.
     pub fn from_wasm(
@@ -54,12 +36,36 @@ impl WasmTool {
         fallback_description: String,
         config: HashMap<String, String>,
         limits: PluginLimits,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        Self::from_wasm_with_digest(
+            wasm_path,
+            None,
+            permissions,
+            fallback_name,
+            fallback_description,
+            config,
+            limits,
+        )
+    }
+
+    /// Create a tool whose reusable compiled component comes from the exact
+    /// bytes covered by the verified manifest digest.
+    pub fn from_wasm_with_digest(
+        wasm_path: PathBuf,
+        expected_sha256: Option<&str>,
+        permissions: Vec<PluginPermission>,
+        fallback_name: String,
+        fallback_description: String,
+        config: HashMap<String, String>,
+        limits: PluginLimits,
+    ) -> anyhow::Result<Self> {
+        let component = Arc::new(load_component_with_digest(&wasm_path, expected_sha256)?);
         let probe = {
-            let wasm_path = wasm_path.clone();
+            let component = Arc::clone(&component);
             let permissions = permissions.clone();
             block_probe(async move {
-                let mut plugin = runtime::create_plugin(&wasm_path, &permissions, limits).await?;
+                let mut plugin =
+                    runtime::create_plugin_from_component(&component, &permissions, limits).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -83,15 +89,15 @@ impl WasmTool {
             }
         };
 
-        Self {
+        Ok(Self {
             name,
             description,
             parameters_schema: schema,
-            wasm_path,
+            component,
             permissions,
             config,
             limits,
-        }
+        })
     }
 }
 
@@ -149,7 +155,8 @@ impl Tool for WasmTool {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
         let mut plugin =
-            runtime::create_plugin(&self.wasm_path, &self.permissions, self.limits).await?;
+            runtime::create_plugin_from_component(&self.component, &self.permissions, self.limits)
+                .await?;
         runtime::call_execute(&mut plugin, &args_json, &self.config, &self.permissions).await
     }
 }
@@ -157,28 +164,6 @@ impl Tool for WasmTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn new_exposes_metadata_via_tool_accessors() {
-        let schema = serde_json::json!({"type": "object", "properties": {}});
-        let tool = WasmTool::new(
-            "my_tool".to_string(),
-            "does things".to_string(),
-            schema.clone(),
-            PathBuf::from("/tmp/plugin.wasm"),
-            Vec::new(),
-            HashMap::new(),
-            PluginLimits {
-                call_fuel: 0,
-                max_memory_bytes: 256 * 1024 * 1024,
-                max_table_elements: 100_000,
-                max_instances: 64,
-            },
-        );
-        assert_eq!(tool.name(), "my_tool");
-        assert_eq!(tool.description(), "does things");
-        assert_eq!(tool.parameters_schema(), schema);
-    }
 
     #[test]
     fn default_schema_requires_a_string_input() {

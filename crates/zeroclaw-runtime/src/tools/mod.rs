@@ -1552,7 +1552,7 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let count = details.len();
+                    let mut count = 0_usize;
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1577,14 +1577,37 @@ pub fn all_tools_with_runtime(
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                            wasm_path.to_path_buf(),
+                        match zeroclaw_plugins::wasm_tool::WasmTool::from_wasm_with_digest(
+                            wasm_path,
+                            manifest.wasm_sha256.as_deref(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             plugin_config,
                             plugin_limits,
-                        )));
+                        ) {
+                            Ok(tool) => {
+                                count += 1;
+                                tool_arcs.push(Arc::new(tool));
+                            }
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": manifest.name.clone(),
+                                            "error": format!("{error:#}"),
+                                        })
+                                    ),
+                                    "Failed to load verified WASM tool plugin"
+                                );
+                            }
+                        }
                     }
                     ::zeroclaw_log::record!(
                         INFO,

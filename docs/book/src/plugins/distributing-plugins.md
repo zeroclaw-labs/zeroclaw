@@ -20,10 +20,10 @@ them, and verification strips them back out before checking.
 
 Two consequences worth knowing:
 
-- The `.wasm` component itself is **not** covered by the signature. What the
-  signature attests is the manifest: the name, version, capabilities, and
-  permissions a publisher stands behind. Pair it with a registry `sha256`
-  digest (below) when the artifact integrity matters in transit.
+- Set `wasm_sha256` to the component's hexadecimal SHA-256 before signing. The
+  field remains in the canonical bytes, so the signature binds the executable
+  payload as well as its name, version, capabilities, and permissions. The
+  registry `sha256` below independently protects the archive in transit.
 - Canonicalization is line-based. Reformatting the manifest (reordering
   lines, changing whitespace within a kept line) invalidates the signature.
   Sign last, after the manifest is final.
@@ -39,9 +39,10 @@ recovers the public key from a stored private key. There is no CLI wrapper
 for signing today; publishers drive these functions from a short Rust helper
 in their release pipeline.
 
-The signed manifest then carries two extra fields: `signature` (the base64url
-value) and `publisher_key` (your hex public key). Operators who want to trust
-you add that hex key to their `plugins.security.trusted_publisher_keys` list:
+The manifest carries `wasm_sha256` before signing, then `signature` (the
+base64url value) and `publisher_key` (your hex public key). Operators who want
+to trust you add that hex key to their
+`plugins.security.trusted_publisher_keys` list:
 
 ```bash
 zeroclaw config set plugins.security.signature_mode strict
@@ -62,8 +63,10 @@ returns the error. The mode matrix, from the operator's side:
 
 Note what `strict` means for you as a publisher: an operator in strict mode
 loads your plugin only if your exact key is in their trusted set **and** the
-manifest bytes verify. Any post-signing manifest edit, by you or by anyone in
-the distribution path, bricks the install. That is the point.
+manifest bytes verify. Executable plugins must also declare `wasm_sha256`; the
+installer and loader verify that digest against the exact bytes they copy or
+pass to Wasmtime. Any post-signing manifest or component edit bricks the
+install. That is the point.
 
 ## Registry publication
 
@@ -117,8 +120,9 @@ accordingly: assume everything before install is untrusted transport.
    permission set the code uses.
 2. Build the component; for skill bundles, validate frontmatter on every
    `SKILL.md` (discovery enforces `name` and `description`).
-3. Sign: generate or load your Ed25519 key, sign the canonical manifest
-   bytes, embed `signature` and `publisher_key`.
+3. Compute the component's SHA-256, set `wasm_sha256`, then generate or load
+   your Ed25519 key, sign the canonical manifest bytes, and embed `signature`
+   and `publisher_key`.
 4. Zip the plugin directory (one manifest, no path tricks, under {{#include ../_snippets/plugin-archive-max-mib.md}} MiB).
 5. Compute the zip's SHA-256 and publish the registry entry with the digest.
 6. Publish your public key hex somewhere operators can verify independently

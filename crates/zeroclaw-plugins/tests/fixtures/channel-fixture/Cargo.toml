@@ -1,10 +1,9 @@
 # Standalone crate (own [workspace]): built for wasm32-wasip2 as a test fixture,
 # NOT part of the host workspace. Mirrors the published reference-plugin setup.
 #
-# Build:  rustup target add wasm32-wasip2
-#         cargo build --target wasm32-wasip2 --release
-# then copy target/wasm32-wasip2/release/channel_fixture.wasm to
-# crates/zeroclaw-plugins/tests/fixtures/channel-fixture.wasm
+# The host E2E tests build this source on demand with the checked-in lockfile.
+# Manual build: rustup target add wasm32-wasip2
+#               cargo build --locked --target wasm32-wasip2
 [package]
 name = "channel-fixture"
 version = "0.1.0"

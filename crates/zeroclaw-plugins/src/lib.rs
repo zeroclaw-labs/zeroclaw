@@ -39,6 +39,11 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// SHA-256 of the exact bytes at `wasm_path`, encoded as 64 hexadecimal
+    /// characters. Strict signature mode requires this for executable plugins;
+    /// the field is covered by the manifest signature.
+    #[serde(default)]
+    pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
     /// Permissions this plugin requests

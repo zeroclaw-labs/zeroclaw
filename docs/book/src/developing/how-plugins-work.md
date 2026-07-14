@@ -38,9 +38,11 @@ one.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
    containing a `manifest.toml`.
-3. **Validate shape.** Each manifest must declare at least one capability, and a
-   non-skill plugin must name a `wasm_path` that exists. A malformed manifest is
-   skipped with a warning, never loaded.
+3. **Validate shape.** Each manifest must use a portable single-component name,
+   declare at least one capability, and a non-skill plugin must name a confined
+   relative `wasm_path`. An absolute, parent-traversing, or symlink-escaping path
+   is rejected. When present, `wasm_sha256` must be a 64-character hexadecimal
+   SHA-256.
 4. **Enforce signature policy.** Each plugin is checked against the configured
    `[plugins.security] signature_mode` and `trusted_publisher_keys`. A plugin
    that fails the policy is dropped from the loaded set, not surfaced as a tool.
@@ -66,11 +68,13 @@ signature is enforced through `[plugins.security] signature_mode`:
 
 In `strict` mode the manifest's `publisher_key` must appear in
 `[plugins.security] trusted_publisher_keys`, and the signature must verify
-against the canonical manifest bytes. A plugin that is unsigned, signed by an
-untrusted key, or whose signature does not verify is dropped at discovery and
-never becomes a tool. The default is `disabled` so a fresh local checkout works
-without key management, but a host that loads plugins from anywhere you do not
-control should run `strict`.
+against the canonical manifest bytes. Executable plugins must declare a signed
+`wasm_sha256`; executable adapters hash the component immediately before load
+and compile or deserialize the same bytes they verified. A plugin that is unsigned, signed by
+an untrusted key, missing that digest, or whose signature does not verify is
+dropped before execution. The default is `disabled` so a fresh local checkout
+works without key management, but a host that loads plugins from anywhere you
+do not control should run `strict`.
 
 This policy is enforced uniformly: the same check that the host applies when you
 list plugins is the check the agent runtime applies when it builds the tool set,

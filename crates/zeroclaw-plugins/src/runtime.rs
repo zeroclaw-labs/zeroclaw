@@ -4,7 +4,7 @@
 use crate::PluginPermission;
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
-use crate::component::{PluginState, call_plugin, engine, load_component, wt};
+use crate::component::{PluginState, call_plugin, engine, load_component_with_digest, wt};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use wasmtime::Store;
-use wasmtime::component::Linker;
+use wasmtime::component::{Component, Linker};
 use zeroclaw_api::tool::ToolResult;
 
 /// Tool metadata read from a plugin's exported `tool` interface.
@@ -71,7 +71,17 @@ pub async fn create_plugin(
     permissions: &[PluginPermission],
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
-    let component = load_component(wasm_path)?;
+    let component = load_component_with_digest(wasm_path, None)?;
+    create_plugin_from_component(&component, permissions, limits).await
+}
+
+/// Instantiate a fresh tool store from a component that was already compiled
+/// from verified bytes.
+pub async fn create_plugin_from_component(
+    component: &Component,
+    permissions: &[PluginPermission],
+    limits: crate::component::PluginLimits,
+) -> Result<Plugin> {
     let mut store = crate::component::new_store(permissions, limits);
     let http = store.data().http_enabled();
     let linker = if http {
@@ -81,7 +91,7 @@ pub async fn create_plugin(
     };
     crate::component::ensure_http_coherent(&store, http)?;
     let bindings = wt(
-        ToolPlugin::instantiate_async(&mut store, &component, linker).await,
+        ToolPlugin::instantiate_async(&mut store, component, linker).await,
         "failed to instantiate tool plugin",
     )?;
     Ok(Plugin {

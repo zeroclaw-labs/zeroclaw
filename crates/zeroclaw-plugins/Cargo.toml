@@ -22,8 +22,10 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 ring = "0.17"
+same-file = "1.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tempfile = "3.26"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
 toml = "1.0"
@@ -42,5 +44,4 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
 ], optional = true }
 
 [dev-dependencies]
-tempfile = "3.26"
 zeroclaw-config = { path = "../zeroclaw-config" }
