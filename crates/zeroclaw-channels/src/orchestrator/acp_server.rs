@@ -618,6 +618,25 @@ impl AcpServer {
             Ok(agent) => agent,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
+                let model_provider = self
+                    .config
+                    .agent(&agent_alias)
+                    .map(|a| a.model_provider.to_string())
+                    .unwrap_or_default();
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": session_id,
+                            "workspace_dir": workspace_dir,
+                            "agent_alias": agent_alias,
+                            "model_provider": model_provider,
+                            "error": e.to_string(),
+                        })),
+                    "ACP session/new failed: agent init error"
+                );
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to create agent: {e}"),
