@@ -4242,7 +4242,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     // / systemd-supervised callers stay silent so we
                     // don't pollute the journal with the seven
                     // pre-#7934 informational lines.
-                    !cli.verbose && std::io::stderr().is_terminal(),
+                    !cli.verbose && std::io::IsTerminal::is_terminal(&std::io::stderr()),
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
