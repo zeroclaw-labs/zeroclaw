@@ -15,7 +15,8 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getStatus } from '@/lib/api';
 
 interface NavItem {
@@ -73,62 +74,109 @@ const navGroups: NavGroup[] = [
 
 // ── Desktop rail item ───────────────────────────────────────────────────────
 // Icon-only nav item for the slim rail. The icon is the affordance; the label
-// is exposed three ways: title (native tooltip), aria-label (screen readers),
-// and a token-styled popover to the right shown on hover OR keyboard focus.
-// Active state = accent icon + a 2px left accent bar + subtle accent tint, with
-// aria-current="page" so assistive tech announces the current section.
+// is exposed three ways: title (native tooltip, used as a screen-reader /
+// no-JS fallback), aria-label (screen readers), and a token-styled popover to
+// the right shown on hover OR keyboard focus.
+//
+// The popover is rendered into `document.body` via `createPortal` so it
+// escapes the desktop `<nav>`'s `overflow-x-hidden` clipping context (the
+// `<nav>` is a scroll container with `overflow-y: auto` + `overflow-x:
+// hidden`, and any absolutely-positioned descendant that extends past its
+// right border — including this popover — is clipped by the nav). With the
+// portal, the popover is rendered outside the nav's DOM subtree and the
+// clipping no longer applies; `position: fixed` then pins it to viewport
+// coords computed from the NavLink's bounding rect, with `scroll` /
+// `resize` listeners re-anchoring it while it is visible.
 function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
+  const linkRef = useRef<HTMLAnchorElement>(null);
+  // Vertical center of the hovered / focused NavLink in viewport coords.
+  // `null` when the popover should not render.
+  const [tooltipTop, setTooltipTop] = useState<number | null>(null);
+
+  const showTooltip = () => {
+    const rect = linkRef.current?.getBoundingClientRect();
+    if (rect) setTooltipTop(rect.top + rect.height / 2);
+  };
+  const hideTooltip = () => setTooltipTop(null);
+
+  // Re-anchor while the popover is visible so it tracks the NavLink across
+  // viewport scrolls and resize events. Cleanup on unmount.
+  useEffect(() => {
+    if (tooltipTop === null) return;
+    const update = () => {
+      const rect = linkRef.current?.getBoundingClientRect();
+      if (rect) setTooltipTop(rect.top + rect.height / 2);
+    };
+    window.addEventListener('scroll', update, true);
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update, true);
+      window.removeEventListener('resize', update);
+    };
+  }, [tooltipTop !== null]);
+
   return (
-    <NavLink
-      to={to}
-      end={to === '/'}
-      onClick={onClick}
-      title={text}
-      aria-label={text}
-      className={({ isActive }) =>
-        [
-          'group relative flex h-10 w-10 mx-auto items-center justify-center',
-          'rounded-[var(--radius-md)] transition-colors duration-150',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-          isActive
-            ? 'bg-pc-accent/10 text-pc-accent'
-            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
-        ].join(' ')
-      }
-    >
-      {({ isActive }) => (
-        <>
-          {/* 2px left accent bar marking the active item against the rail edge. */}
-          {isActive && (
-            <span
-              aria-hidden="true"
-              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+    <>
+      <NavLink
+        ref={linkRef}
+        to={to}
+        end={to === '/'}
+        onClick={onClick}
+        onMouseEnter={showTooltip}
+        onMouseLeave={hideTooltip}
+        onFocus={showTooltip}
+        onBlur={hideTooltip}
+        title={text}
+        aria-label={text}
+        className={({ isActive }) =>
+          [
+            'group relative flex h-10 w-10 mx-auto items-center justify-center',
+            'rounded-[var(--radius-md)] transition-colors duration-150',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+            isActive
+              ? 'bg-pc-accent/10 text-pc-accent'
+              : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
+          ].join(' ')
+        }
+      >
+        {({ isActive }) => (
+          <>
+            {/* 2px left accent bar marking the active item against the rail edge. */}
+            {isActive && (
+              <span
+                aria-hidden="true"
+                className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+              />
+            )}
+            <Icon
+              className={`h-[22px] w-[22px] shrink-0 transition-colors ${
+                isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
+              }`}
             />
-          )}
-          <Icon
-            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
-              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
-            }`}
-          />
-          {/* Tooltip popover to the right — appears on pointer hover and on
-              keyboard focus (focus-within) so the rail is usable without a
-              mouse. Token-styled; non-interactive so it never traps focus. */}
+          </>
+        )}
+      </NavLink>
+      {tooltipTop !== null &&
+        createPortal(
           <span
             role="tooltip"
-            className="pointer-events-none absolute left-full ml-2 z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+            className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
             style={{
+              top: tooltipTop,
+              left: 64, // rail width (56 px) + 8 px gap, matches the round-1 ml-2
+              transform: 'translateY(-50%)',
               background: 'var(--pc-bg-elevated)',
               color: 'var(--pc-text-primary)',
               border: '1px solid var(--pc-border)',
             }}
           >
             {text}
-          </span>
-        </>
-      )}
-    </NavLink>
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }
 
