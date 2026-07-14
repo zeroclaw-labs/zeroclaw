@@ -261,6 +261,14 @@ pub async fn handle_api_status(
     // (so the dashboard's old shape still renders during onboarding,
     // before any agent exists).
     let agent_alias = query.agent.as_deref().filter(|s| !s.trim().is_empty());
+
+    // A KNOWN agent is one with a `[agents.<alias>]` entry. Distinguishing it
+    // from an unscoped/unknown request matters for the count below: a known
+    // agent whose backend handle fails to build must report 0 (its backend is
+    // unreachable/misconfigured), NOT the install-wide `state.mem` count. Only a
+    // truly unscoped/unknown request falls back to the install-wide count.
+    let known_agent = agent_alias.filter(|alias| config.agent(alias).is_some());
+
     let (model_provider, model, temperature, memory_backend) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
@@ -313,11 +321,23 @@ pub async fn handle_api_status(
     // Semantics: for hindsight this is the PRIVATE per-agent bank only (an
     // agent's own footprint), not the read-merged shared/system tiers, so the
     // dashboard's per-agent sum is not inflated by household-shared entries.
-    let memory_count: usize = match agent_alias {
-        Some(alias) => match resolve_memory_handle(&state, Some(alias)).await {
-            Ok(handle) => handle.count().await.unwrap_or(0),
-            Err(_) => 0,
-        },
+    //
+    // A KNOWN agent whose handle fails to build reports 0 (its backend is
+    // unreachable/misconfigured) instead of the install-wide `state.mem` count,
+    // which would misreport another scope's total. Only a genuinely
+    // unscoped/unknown request falls back to the install-wide cross-agent view.
+    let agent_memory_handle: Option<std::sync::Arc<dyn zeroclaw_memory::Memory>> = match known_agent
+    {
+        Some(alias) => resolve_memory_handle(&state, Some(alias)).await.ok(),
+        None => None,
+    };
+    let memory_count: usize = match &agent_memory_handle {
+        Some(handle) => handle.count().await.unwrap_or(0),
+        // Known agent whose handle failed to build: its backend is
+        // unreachable/misconfigured, so its own footprint is 0 - NOT the
+        // install-wide count (which would misreport another scope's total).
+        None if known_agent.is_some() => 0,
+        // Genuinely unscoped/unknown request: the install-wide cross-agent view.
         None => state.mem.count().await.unwrap_or(0),
     };
 
@@ -2437,6 +2457,125 @@ pub(crate) mod tests {
 
         let json = response_json(response).await;
         assert_eq!(json["memory_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_reports_scoped_hindsight_count() {
+        // A KNOWN agent whose handle builds and reaches its backend must report
+        // the REAL per-agent count from that handle, not the install-wide
+        // `state.mem`. Agent `and` selects hindsight install-wide; its private
+        // bank is `zeroclaw-and`. The install-wide handle holds a single entry,
+        // so a count equal to the bank total (7) proves the scoped handle - not
+        // `state.mem` - produced the number.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v1/default/banks/zeroclaw-and/memories/list",
+            ))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer test-token",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "items": [{ "id": "1", "text": "a" }],
+                    "total": 7
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        config.memory.hindsight.base_url = server.uri();
+        config.memory.hindsight.token = Some("test-token".to_string());
+        config.agents.insert(
+            "and".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        // Install-wide handle deliberately holds a single row so a count of 7
+        // can only come from the scoped hindsight bank, never `state.mem`.
+        let state = test_state_with_memory(config, vec![memory_entry_with_content("one".into())]);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("and".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_known_agent_handle_failure_counts_zero() {
+        // A KNOWN agent whose per-agent handle FAILS to build (backend
+        // unreachable/misconfigured) must report 0 - its own footprint is
+        // unknown, NOT the install-wide `state.mem` count. Here agent `and`
+        // selects hindsight but no token resolves (a missing env var name and no
+        // inline token), so `create_memory_for_agent` errors and the handle is
+        // None. With `state.mem` holding three rows, a correct fix reports 0, and
+        // a regression to the old `state.mem` fallback would report 3.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        config.memory.hindsight.token = None;
+        config.memory.hindsight.token_env = "ZC_HINDSIGHT_TOKEN_ABSENT_FOR_STATUS_TEST".to_string();
+        config.agents.insert(
+            "and".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let entries = vec![
+            memory_entry_with_content("one".into()),
+            memory_entry_with_content("two".into()),
+            memory_entry_with_content("three".into()),
+        ];
+        let state = test_state_with_memory(config, entries);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("and".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_unknown_agent_falls_back_to_install_wide_count() {
+        // An UNKNOWN alias (no `[agents.<alias>]` entry) is not a known agent, so
+        // it stays on the install-wide `state.mem` view rather than reporting 0.
+        // This guards the distinction: only known-agent handle failures report 0.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let entries = vec![
+            memory_entry_with_content("one".into()),
+            memory_entry_with_content("two".into()),
+        ];
+        let state = test_state_with_memory(config, entries);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("nonexistent".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 2);
     }
 
     #[tokio::test]
