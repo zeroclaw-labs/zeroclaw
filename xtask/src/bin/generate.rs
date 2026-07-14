@@ -26,6 +26,10 @@ enum Cmd {
         /// Selection id from the canonical menu (e.g. `dist`, `all`, `minimal`).
         #[arg(long)]
         selection: String,
+        /// Feature(s) to remove from the resolved selection for target-specific
+        /// compatibility. Repeat the flag or pass a comma-separated list.
+        #[arg(long, value_delimiter = ',')]
+        exclude: Vec<String>,
     },
 }
 
@@ -33,6 +37,6 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Installers { targets, check } => xtask::generate::run(&targets, check),
-        Cmd::Features { selection } => xtask::generate::features(&selection),
+        Cmd::Features { selection, exclude } => xtask::generate::features(&selection, &exclude),
     }
 }
