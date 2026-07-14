@@ -1928,6 +1928,7 @@ impl SlackChannel {
 
             let next_cursor = match payload.pointer("/response_metadata/next_cursor") {
                 None => break,
+                Some(serde_json::Value::Null) => break,
                 Some(serde_json::Value::String(value)) if value.is_empty() => break,
                 Some(serde_json::Value::String(value)) => value.as_str(),
                 Some(_) => {
@@ -4374,21 +4375,31 @@ impl SlackChannel {
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
 
             let is_ratelimited_http = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-            let payload: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            // Slack defines rate limiting through HTTP 429 plus Retry-After and
+            // does not require a JSON response body. Avoid rejecting a valid
+            // bodyless rate-limit response before the retry branch can run.
+            let payload: serde_json::Value = if is_ratelimited_http {
+                serde_json::Value::Null
+            } else {
+                match serde_json::from_str(&body) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
                                 "channel_id": channel_id,
                                 "thread_ts": thread_ts,
                                 "error": error.to_string(),
                             })),
-                        "Slack conversations.replies returned malformed JSON"
-                    );
-                    return None;
+                            "Slack conversations.replies returned malformed JSON"
+                        );
+                        return None;
+                    }
                 }
             };
             let is_ratelimited_payload = payload.get("ok") == Some(&serde_json::Value::Bool(false))
@@ -6850,6 +6861,50 @@ mod tests {
         assert_eq!(delay, Duration::from_secs(120) + Duration::from_millis(250));
     }
 
+    #[tokio::test]
+    async fn fetch_thread_replies_retries_bodyless_http_429() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [],
+                "response_metadata": {"next_cursor": ""},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec!["C_ONE".into()],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_api_base_url(server.uri());
+
+        let payload = ch
+            .fetch_thread_replies_page_with_retry("C_ONE", "T_PARENT", "0", None, None, 1)
+            .await;
+
+        assert_eq!(
+            payload.as_ref().and_then(|value| value.get("ok")),
+            Some(&serde_json::Value::Bool(true))
+        );
+        server.verify().await;
+    }
+
     // ── Thread reply handling ────────────────────────────────────
 
     #[test]
@@ -7827,6 +7882,59 @@ mod tests {
                 ch.build_incoming_content(&message, "C_ONE", true, "U_BOT")
                     .await
                     .is_some()
+            );
+        }
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn thread_backfill_null_pagination_cursor_is_terminal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [
+                    {
+                        "ts": "T_CONTEXT",
+                        "thread_ts": "T_PARENT",
+                        "user": "U_USER",
+                        "text": "context before a null cursor"
+                    },
+                ],
+                "response_metadata": {"next_cursor": null},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec!["C_ONE".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_USER".to_string()]),
+        )
+        .with_api_base_url(server.uri());
+
+        for (ts, should_contain_context) in [("T_FIRST", true), ("T_SECOND", false)] {
+            let message = serde_json::json!({
+                "ts": ts,
+                "thread_ts": "T_PARENT",
+                "user": "U_USER",
+                "text": "<@U_BOT> use the prior context",
+            });
+            let hydrated = ch
+                .build_incoming_content(&message, "C_ONE", true, "U_BOT")
+                .await
+                .expect("eligible Slack mention");
+            assert_eq!(
+                hydrated.contains("context before a null cursor"),
+                should_contain_context
             );
         }
 
