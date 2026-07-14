@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 5
+> Starting v0.7.0 · Type: Governance · Rev. 6
 >
-> **Canonical reference** · Ratified by the team · Rev. 5
+> **Canonical reference** · Ratified by the team · Rev. 6
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -23,6 +23,7 @@
 | 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
 | 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
 | 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
+| 6 | 2026-07-14 | Defined long-lived product-area Projects, bounded Initiatives, tracker hierarchy, and numbered-release milestone ownership |
 
 ---
 
@@ -97,6 +98,24 @@ Operational details intentionally live close to the workflow that uses them:
 
 ## 3. GitHub Projects: The Work Pipeline
 
+Use one long-lived GitHub Project for each ongoing product area. A Project is
+the workspace for that area, not a finite delivery batch. Within it, an
+**Initiative** is a bounded outcome with a parent tracker issue that owns the
+definition, scope, and close criteria. The Project `Initiative` field groups
+the tracker, its implementation issues, and directly linked pull requests.
+
+Keep these dimensions separate:
+
+- `Status` owns delivery workflow and remains the Kanban column field.
+- The parent tracker and native sub-issue hierarchy own issue decomposition.
+- Native pull request links and closing relationships own implementation links.
+- Native milestones own numbered release scheduling. Leave an item unmilestoned
+  until the team commits it to a release.
+- Labels classify work; they do not establish Initiative membership.
+
+An Initiative can span multiple numbered releases. Do not turn Initiatives into
+Status values or use a non-release milestone as their canonical container.
+
 ### 3.1 The Pipeline Stages
 
 The Project board has a single **Status** field with seven values. Each value is a stage in the pipeline. The sequence is linear but items can be moved back:
@@ -160,7 +179,8 @@ Create these fields in the GitHub Project settings:
 | **Size** | Single select | XS · S · M · L · XL |
 | **Risk Tier** | Single select | Low · Medium · High (mirrors `AGENTS.md` risk tiers) |
 | **Component** | Single select | Kernel · Gateway · Channels · Tools · Memory · Security · Hardware · Docs · Infrastructure |
-| **Milestone** | Milestone | v0.7.0 · v0.8.0 · v0.9.0 · v1.0.0 · Icebox |
+| **Initiative** | Single select | Bounded outcomes named by their tracker issue |
+| **Milestone** | Native milestone | A numbered release such as v0.9.0, or empty when unscheduled |
 
 **On sizing (T-shirt sizes):** Story points require calibration and historical data the team does not have yet. T-shirt sizes are immediately intuitive and good enough for a team at this stage:
 
@@ -176,36 +196,36 @@ XL items should almost always be broken down before they enter In Progress. If y
 
 ### 3.4 Views
 
-Create four named views in the Project:
+Create four baseline views in each product-area Project. Useful existing views
+can remain; do not duplicate a view that already serves the same purpose.
 
-#### View 1: Roadmap
-
-- Type: Roadmap (timeline)
-- Grouped by: Milestone
-- Visible fields: Title, Type, Size, Component, Assignee
-- Purpose: Public-facing. "Here is what is coming and when." Share this link in the README and with the community. Keep it updated.
-
-#### View 2: Board
-
-- Type: Board (Kanban)
-- Columns: Status field values
-- Filtered to: Current milestone only
-- Visible fields: Title, Assignee, Size, Risk Tier
-- Purpose: Day-to-day work visibility. What is everyone working on right now? What is blocked?
-
-#### View 3: Backlog
-
-- Type: Table
-- Sorted by: Priority (descending), then Size (ascending)
-- Filtered to: Status = Backlog OR Defined
-- Visible fields: Title, Type, Priority, Size, Component, Milestone, Risk Tier
-- Purpose: Used during grooming sessions. What needs to be worked on next? What is sized and ready to pick up?
-
-#### View 4: My Work
+#### Delivery Board
 
 - Type: Board
-- Filtered to: Assignee = @me
-- Purpose: Personal dashboard. Each contributor can see their own items without noise.
+- Columns: Status
+- Visible fields: Initiative, Milestone, Assignee, Parent issue
+- Purpose: Day-to-day delivery across all active Initiatives in the area.
+
+#### Initiatives
+
+- Type: Table or roadmap
+- Grouped by: Initiative
+- Visible fields: Title, Status, Milestone, Assignee, Parent issue, Sub-issues progress
+- Purpose: Review bounded outcomes and their tracker issues without changing the delivery workflow.
+
+#### Releases
+
+- Type: Table or board
+- Grouped by: Milestone
+- Filtered to: Numbered release milestones or no milestone
+- Purpose: Discuss committed release scope while keeping an explicit unscheduled group.
+
+#### Unscheduled Backlog
+
+- Type: Table
+- Filtered to: Open items with no milestone
+- Visible fields: Initiative, Status, Priority, Assignee
+- Purpose: Review work that is valid for the area but not yet committed to a numbered release.
 
 ### 3.5 Pinned Items
 
@@ -227,7 +247,7 @@ Use this split:
 | Surface | Owns | Does not own |
 |---|---|---|
 | Labels | durable classification: type, scope, risk, size, contributor tier, stale/triage policy | per-push review state, active CI status, personal task lists |
-| Project board | planning state: readiness, routing evidence, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks |
+| Project board | planning state: readiness, Initiative membership, routing evidence, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks, release commitment without a native milestone |
 | Native PR state | review decision, required checks, branch freshness, conflicts, mergeability, draft/ready state | long-term roadmap ownership |
 | Issues/RFCs | durable discussion record, acceptance state, user need, linked implementation trail | live replacement for maintainer docs after policy promotion |
 
@@ -840,9 +860,13 @@ By v1.0.0, the governance model should be self-sustaining: the team should not n
 
 **Lazy consensus**: A decision-making approach in which a proposed action proceeds unless someone objects within a defined time period. Reduces the overhead of requiring explicit approval for routine decisions.
 
+**Initiative**: A finite, bounded outcome inside a product-area Project. Its parent tracker issue owns scope and close criteria, while the Project `Initiative` field groups related issues and pull requests.
+
 **Meritocracy**: A governance model in which authority and influence are earned through demonstrated contribution, not through seniority or title. Standard in open source projects.
 
 **Milestone**: A GitHub feature that groups issues and PRs by release target. A milestone represents a version of the software.
+
+**Product-area Project**: A long-lived GitHub Project that contains planning and delivery state for one ongoing product area.
 
 **T-shirt sizing**: An estimation technique that uses abstract sizes (XS, S, M, L, XL) rather than numeric story points. Easier to use without historical calibration data and sufficient for teams at an early stage.
 

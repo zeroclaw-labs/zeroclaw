@@ -2,9 +2,10 @@
   "schema_version": 1,
   "contract_name": "project-board-planning-contract",
   "status": "dry_run_planner",
-  "description": "GitHub Project board fields are planning signals. The current automation produces a report-only plan from live issue metadata; fast PR review and mergeability state is derived from native GitHub PR state.",
+  "description": "GitHub Project board fields are planning signals. The current automation produces report-only Status plans and Initiative consistency findings; fast PR review and mergeability state is derived from native GitHub PR state.",
   "canonical_sources": {
     "prose": [
+      "../foundations/fnd-003-governance.md#3-github-projects-the-work-pipeline",
       "../foundations/fnd-003-governance.md#31-the-pipeline-stages",
       "labels.md#ownership-boundaries",
       "pr-workflow.md#project-board-contract"
@@ -12,6 +13,7 @@
     "automation": {
       "dry_run_workflow": ".github/workflows/project-dashboard-plan.yml",
       "dry_run_script": "scripts/github/project_dashboard_plan.py",
+      "initiative_validator": "scripts/github/project_initiative_validate.py",
       "live_project_writes": "disabled_until_project_scoped_credential_and_field_mapping_are_approved"
     }
   },

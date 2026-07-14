@@ -27,9 +27,37 @@ The Project board is an automated planning board, not the authoritative PR revie
 
 Use the board for issue readiness, routing evidence, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
 
+Treat a Project as the long-lived workspace for one product area. Use a parent
+tracker issue for each finite Initiative and put the matching value in the
+Project `Initiative` field on clearly related issues and pull requests. Make
+implementation issues sub-issues of the tracker when the ownership is clear;
+pull requests keep their native linked-issue and closing relationships. Keep
+`Status` as the delivery workflow and Kanban column field.
+
+Native milestones are release commitments. Use numbered release milestones,
+and leave valid but unscheduled items without a milestone until the team makes
+that commitment. An Initiative can span more than one release. Labels remain
+classification and routing metadata; do not use them as the canonical record
+of Initiative membership.
+
 The current automation is manual and report-only. [`project-dashboard-plan.yml`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/.github/workflows/project-dashboard-plan.yml) runs on `workflow_dispatch` for a single issue number, reads the issue payload, and writes a step summary proposing the existing Project Status value that best matches the issue's live labels and state. It does not write Project fields, edit issues, add labels, post comments, or run automatically on issue events.
 
 A JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as the contract for the report-only planner and future board refresh automation, not as approval for automatic issue-event runs or active GitHub Project mutation yet. Live ProjectV2 writes need an approved field mapping, a project-scoped credential or app installation, and readback that compares planned status with live Project state before maintainers rely on it.
+
+The report-only Initiative validator accepts a transient snapshot of live
+Project, hierarchy, relationship, and milestone state:
+
+```sh
+python3 scripts/github/project_initiative_validate.py \
+  --snapshot /path/to/project-initiative-snapshot.json \
+  --format markdown
+```
+
+It reports missing or unsupported Initiative membership, tracker hierarchy
+drift, retired capability milestones, unsupported release assignments, duplicate
+or missing tracker items, and closed trackers with open sub-issues. The snapshot
+is an on-demand materialized view of GitHub's canonical state, not a file to
+commit or maintain. The command never writes to GitHub.
 
 Do not mirror native PR review state into manual board lanes. GitHub PR state owns review decision, required checks, mergeability, conflicts, stale approvals, and merge readiness. If the board later displays derived PR routing such as `DIRTY`, `BEHIND`, or `APPROVED`, treat it as a dashboard view of GitHub state, not a separate source of truth.
 

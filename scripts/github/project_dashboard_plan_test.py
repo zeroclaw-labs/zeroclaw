@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import project_dashboard_plan as planner
+import project_initiative_validate as initiative_validator
 
 
 def issue(state: str = "open", labels: list[str] | None = None, **extra: object) -> dict[str, object]:
@@ -105,6 +106,126 @@ class ProjectDashboardPlanTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "open catchall"):
             planner.validate_contract(bad_contract)
+
+
+def initiative_snapshot() -> dict[str, object]:
+    initiative = "Runtime Safety (#101)"
+    return {
+        "tracker": {
+            "number": 101,
+            "state": "open",
+            "listed_item_numbers": [102, 103],
+        },
+        "initiative": initiative,
+        "retired_milestone": "Runtime Safety",
+        "items": [
+            {
+                "number": 101,
+                "type": "Issue",
+                "state": "open",
+                "initiative": initiative,
+                "milestone": None,
+            },
+            {
+                "number": 102,
+                "type": "Issue",
+                "state": "open",
+                "initiative": initiative,
+                "milestone": None,
+                "parent_issue_number": 101,
+            },
+            {
+                "number": 103,
+                "type": "PullRequest",
+                "state": "open",
+                "initiative": initiative,
+                "milestone": None,
+                "linked_issue_numbers": [101],
+            },
+            {
+                "number": 104,
+                "type": "PullRequest",
+                "state": "closed",
+                "initiative": initiative,
+                "milestone": "v0.9.0",
+                "related_item_numbers": [102],
+                "release_evidence": "Release tracker explicitly schedules this pull request.",
+            },
+        ],
+    }
+
+
+class ProjectInitiativeValidateTest(unittest.TestCase):
+    def codes(self, snapshot: dict[str, object]) -> list[str]:
+        return [
+            finding.code
+            for finding in initiative_validator.validate_initiative_snapshot(snapshot)
+        ]
+
+    def test_valid_initiative_snapshot_has_no_findings(self) -> None:
+        self.assertEqual(self.codes(initiative_snapshot()), [])
+
+    def test_missing_initiative_variants_are_detected(self) -> None:
+        snapshot = initiative_snapshot()
+        for item in snapshot["items"]:
+            if item["number"] in {101, 102, 103}:
+                item["initiative"] = None
+        self.assertEqual(
+            self.codes(snapshot),
+            [
+                "tracker-missing-initiative",
+                "sub-issue-missing-initiative",
+                "direct-pr-missing-initiative",
+            ],
+        )
+
+    def test_unsupported_initiative_membership_is_detected(self) -> None:
+        snapshot = initiative_snapshot()
+        snapshot["items"].append(
+            {
+                "number": 110,
+                "type": "Issue",
+                "state": "open",
+                "initiative": snapshot["initiative"],
+                "milestone": None,
+            }
+        )
+        self.assertEqual(self.codes(snapshot), ["unsupported-initiative-membership"])
+
+    def test_retired_capability_milestone_is_detected(self) -> None:
+        snapshot = initiative_snapshot()
+        snapshot["items"][1]["milestone"] = snapshot["retired_milestone"]
+        self.assertEqual(
+            self.codes(snapshot),
+            [
+                "retired-milestone-still-assigned",
+                "initiative-with-capability-milestone",
+            ],
+        )
+
+    def test_numbered_release_requires_evidence(self) -> None:
+        snapshot = initiative_snapshot()
+        snapshot["items"][3]["release_evidence"] = None
+        self.assertEqual(self.codes(snapshot), ["release-milestone-without-evidence"])
+
+    def test_closed_tracker_with_open_sub_issue_is_detected(self) -> None:
+        snapshot = initiative_snapshot()
+        snapshot["tracker"]["state"] = "closed"
+        self.assertEqual(self.codes(snapshot), ["closed-tracker-with-open-sub-issue"])
+
+    def test_missing_retired_milestone_name_does_not_flag_unscheduled_items(self) -> None:
+        snapshot = initiative_snapshot()
+        snapshot["retired_milestone"] = None
+        self.assertEqual(self.codes(snapshot), [])
+
+    def test_missing_and_duplicate_tracker_items_are_detected(self) -> None:
+        snapshot = initiative_snapshot()
+        snapshot["tracker"]["listed_item_numbers"].append(111)
+        snapshot["items"].append(dict(snapshot["items"][2]))
+        self.assertEqual(
+            self.codes(snapshot),
+            ["duplicate-project-item", "tracker-item-missing-from-project"],
+        )
 
 
 if __name__ == "__main__":
