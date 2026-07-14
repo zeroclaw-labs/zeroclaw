@@ -17,7 +17,7 @@ The piped path chooses a prebuilt binary when one is available and falls back to
 ./install.sh
 ```
 
-Run this path in an interactive terminal to choose prebuilt or source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based setup.
+When the platform maps to a supported prebuilt target, run this path in an interactive terminal to choose prebuilt or source; other platforms build from source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based setup.
 
 **Homebrew (Linuxbrew):**
 
@@ -43,7 +43,7 @@ The piped path chooses a prebuilt binary when one is available and falls back to
 ./install.sh
 ```
 
-Run this path in an interactive terminal to choose prebuilt or source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based setup.
+When the platform maps to a supported prebuilt target, run this path in an interactive terminal to choose prebuilt or source; other platforms build from source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based setup.
 
 **Homebrew:**
 
