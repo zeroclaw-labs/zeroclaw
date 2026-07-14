@@ -148,11 +148,6 @@ function blankSop(name: string): Sop {
     cooldown_secs: 0,
     max_concurrent: 1,
     deterministic: false,
-    // Concurrency-admission defaults (match the Rust SopMeta defaults:
-    // SopAdmissionPolicy::Parallel, no pending-approval cap). Required fields
-    // on the generated Sop type, so a new draft must carry them.
-    admission_policy: 'parallel',
-    max_pending_approvals: 0,
   };
 }
 

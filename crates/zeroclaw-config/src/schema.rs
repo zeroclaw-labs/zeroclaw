@@ -21517,7 +21517,7 @@ pub struct ApprovalPolicyConfig {
     #[serde(default)]
     pub quorum: u32,
     /// Channel to deliver the INITIAL approval request to when a run parks at a
-    /// gate this policy governs, formatted `channel[:recipient]` (e.g.
+    /// gate this policy governs, formatted `channel:recipient` (e.g.
     /// `discord.ops:123456789012345678`). The `channel` names a configured channel
     /// (the `<channel>.<alias>` / bare-`<channel>` key from the channel map); the
     /// `recipient` is that channel's addressee (a Discord channel id, a chat id,
@@ -21531,7 +21531,7 @@ pub struct ApprovalPolicyConfig {
     pub request_route: Option<String>,
     /// Route to escalate to on timeout (the distinct "second route"). `None`/empty
     /// re-surfaces to the same route (today's `Escalate` behavior). Same
-    /// `channel[:recipient]` format as `request_route`.
+    /// `channel:recipient` format as `request_route`.
     #[serde(default)]
     pub escalation_route: Option<String>,
 }
