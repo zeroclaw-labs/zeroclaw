@@ -1,6 +1,6 @@
 # ZeroClaw v0.8.3
 
-This release is a large consolidation cycle spanning **378 commits** from **56 contributors**, focused on the new Standard Operating Procedure (SOP) engine, a WebAssembly plugin host, a Git forge channel, and a broad round of runtime, provider, and security hardening. If you run ZeroClaw agents in production, the headline changes are the procedural-memory/SOP substrate, tighter context-budget accounting, and a wave of SSRF and secret-leak fixes. Desktop and quickstart flows also get meaningful polish.
+This release is a large consolidation cycle spanning **379 commits** from **56 contributors**, focused on the new Standard Operating Procedure (SOP) engine, a WebAssembly plugin host, a Git forge channel, and a broad round of runtime, provider, and security hardening. If you run ZeroClaw agents in production, the headline changes are the procedural-memory/SOP substrate, tighter context-budget accounting, and a wave of SSRF and secret-leak fixes. Desktop and quickstart flows also get meaningful polish.
 
 ## Highlights
 
@@ -37,8 +37,10 @@ This release is a large consolidation cycle spanning **378 commits** from **56 c
 
 ### ZeroCode (Desktop / TUI)
 - A TodoWrite tracker (RPC + ACP + durable persistence) and cron run history/trigger were added, along with a Cost tab with by-period and org-billed views (#8639, #7905, #8483).
+- ACP multiple-choice elicitation now uses `elicitation/create` when the client advertises form support, with single- and multi-select prompts rendered in the ZeroCode Code tab (#8338).
 - You can now choose a saved Code session on entry, switch agents in active sessions, and use ctrl-w word delete (#8922, #8477, #8774).
 - The self-contained desktop app is reintroduced as a Quickstart-first companion with a bundled kernel sidecar (#8565, #8708).
+- Quickstart supports subscription authentication modes and inline CLI subscription auth, while release workflows publish self-contained desktop installers for macOS, Linux, and Windows (#8980, #8981, #8709).
 
 ### Providers, Tools & Cost
 - Provider requests now thread `provider_timeout_secs` and `extra_headers` through the responses path (#8229).
@@ -52,6 +54,11 @@ This release is a large consolidation cycle spanning **378 commits** from **56 c
 - Skills install/list/remove are now bundle-aware, surface security-audit-skipped skills, and support an opt-in bounded SKILL.md reflection for skill creation (#8335, #8699, #8261).
 - Observability adds a runtime OpenTelemetry content policy for LLM/tool I/O and a rotating log-persistence mode (#8567, #8307).
 - Per-turn output routing via `send_via` with voice-delivery fixes landed (#7361).
+
+### Install, Release & Supply Chain
+- Standard prebuilts remain on the lean supported channel set, correcting an unreleased broadening introduced after v0.8.2; target-specific Android and ARM exclusions are now resolved centrally, and `install.sh --full` remains available for the broader source-build surface (#9051, #8566).
+- Release automation adds CycloneDX SBOM generation, cosign signing, SLSA provenance, and self-contained desktop installers (#8158, #8404, #8277, #8709).
+- Release verification Markdown is escaped before it reaches GitHub workflow output (#9031).
 
 ### Improvements
 - Tool assembly across the runtime (agent creation, independent delegates, `process_message`, and `loop_::run`) was routed through a single `ScopedToolRegistry` seam (#8711, #8744, #8701, #8700).
@@ -81,6 +88,10 @@ This release is a large consolidation cycle spanning **378 commits** from **56 c
 | Deps | Bump crossbeam-epoch (RUSTSEC-2026-0204), anyhow (RUSTSEC-2026-0190), and remove rag-pdf/ttf-parser (RUSTSEC-2026-0192) (#8783, #8500, #8547) |
 | Install | Prebuild dashboard for embedded web; exclude Tauri apps from `--full` app sweep; register `zerocode.exe` in the Scoop manifest (#8643, #8786, #8276) |
 | Tools | Pin `http_request` to vetted DNS addresses; cap calculator values array to prevent OOM; bound `browser_open` launcher waits (#7902, #8481, #8564) |
+
+## Breaking Changes
+
+- **Rust toolchain floor**: the workspace MSRV is now Rust 1.96.1, with CI, containers, and documentation aligned to that version (#8801).
 
 ## Contributors
 
