@@ -10617,6 +10617,14 @@ pub struct HindsightMemoryConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Per-request timeout (seconds) applied to every outbound Hindsight HTTP
+    /// call (`store`, `recall`, `list`, `forget`, `count`, health). Bounds the
+    /// underlying `reqwest` client so a stalled or never-responding service
+    /// returns a typed timeout error instead of parking the agent turn
+    /// indefinitely. Must be greater than zero. Default:
+    /// [`DEFAULT_HINDSIGHT_TIMEOUT_SECS`].
+    #[serde(default = "default_hindsight_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 impl Default for HindsightMemoryConfig {
@@ -10627,6 +10635,7 @@ impl Default for HindsightMemoryConfig {
             top_k: default_hindsight_top_k(),
             token_env: default_hindsight_token_env(),
             token: None,
+            timeout_secs: default_hindsight_timeout_secs(),
         }
     }
 }
@@ -10670,6 +10679,9 @@ impl HindsightMemoryConfig {
                 "[memory.hindsight] token_env must name an environment variable".to_string(),
             );
         }
+        if self.timeout_secs == 0 {
+            return Err("[memory.hindsight] timeout_secs must be greater than zero".to_string());
+        }
         Ok(())
     }
 }
@@ -10690,6 +10702,12 @@ pub const DEFAULT_HINDSIGHT_TOP_K: usize = 5;
 /// driver's `from_env` compatibility path.
 pub const DEFAULT_HINDSIGHT_TOKEN_ENV: &str = "ZC_HINDSIGHT_TOKEN";
 
+/// Canonical per-request timeout (seconds) for every outbound Hindsight HTTP
+/// call. Bounds `store`/`recall`/`list`/`forget`/`count`/health so a stalled
+/// service can never park an agent turn indefinitely. Single source of truth
+/// shared by the typed config default and the driver's `from_env` path.
+pub const DEFAULT_HINDSIGHT_TIMEOUT_SECS: u64 = 30;
+
 fn default_hindsight_base_url() -> String {
     DEFAULT_HINDSIGHT_BASE_URL.into()
 }
@@ -10704,6 +10722,10 @@ fn default_hindsight_top_k() -> usize {
 
 fn default_hindsight_token_env() -> String {
     DEFAULT_HINDSIGHT_TOKEN_ENV.into()
+}
+
+fn default_hindsight_timeout_secs() -> u64 {
+    DEFAULT_HINDSIGHT_TIMEOUT_SECS
 }
 
 fn default_retrieval_stages() -> Vec<String> {
