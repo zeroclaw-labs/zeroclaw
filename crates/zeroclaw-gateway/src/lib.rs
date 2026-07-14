@@ -188,6 +188,11 @@ pub fn gateway_long_running_request_timeout_secs(
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+/// Maximum time an unauthenticated plugin webhook may occupy its channel's
+/// parser. Dropping the handler also cancels the same parse through the request
+/// token carried by `RawWebhook`.
+const PLUGIN_WEBHOOK_TIMEOUT_SECS: u64 = 10;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
@@ -441,6 +446,16 @@ fn client_key_from_request(
     peer_addr
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn webhook_rate_limit_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        })),
+    )
 }
 
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
@@ -1693,11 +1708,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
-        // Inbound webhooks for plugin channels: a plugin claims `<segment>` via
-        // its `webhook-path` export; the registry carries the sink. Disjoint
-        // from every native channel route by the `/plugin/` prefix.
-        .route("/plugin/{path}", post(handle_plugin_webhook))
-        .layer(axum::Extension(plugin_webhooks.clone()))
+        .merge(plugin_webhook_routes(plugin_webhooks.clone()))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -2732,7 +2743,17 @@ pub struct WebhookQuery {
 /// its own `parse-webhook` export; the reply drives the status code. The turn is
 /// never run inline: the message goes through the plugin's bounded inbound queue
 /// (429 when full) and the normal dispatch loop.
+fn plugin_webhook_routes(
+    registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+) -> Router<AppState> {
+    Router::new()
+        .route("/plugin/{path}", post(handle_plugin_webhook))
+        .layer(axum::Extension(registry))
+}
+
 async fn handle_plugin_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
     axum::extract::Path(path): axum::extract::Path<String>,
     headers: HeaderMap,
@@ -2740,8 +2761,25 @@ async fn handle_plugin_webhook(
 ) -> axum::response::Response {
     use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
 
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "plugin_webhook_rate_limited",
+                    "path": path,
+                    "client_key": rate_key,
+                })),
+            "plugin webhook rate limit exceeded"
+        );
+        return webhook_rate_limit_response().into_response();
+    }
+
     let Some(sink) = registry.get(&path) else {
-        return (StatusCode::NOT_FOUND, "no plugin serves this webhook path").into_response();
+        return (StatusCode::NOT_FOUND, "webhook not found").into_response();
     };
 
     // Lower-cased header names → values; non-UTF-8 header values are dropped.
@@ -2754,35 +2792,68 @@ async fn handle_plugin_webhook(
         })
         .collect();
 
+    let cancellation = zeroclaw_api::webhook::WebhookCancellation::new();
+    // This guard also fires when Axum drops the handler because the outer
+    // gateway timeout elapsed or the request task was otherwise cancelled.
+    let _cancel_parse_on_exit = cancellation.clone().drop_guard();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let raw = RawWebhook {
         headers: header_pairs,
         body: body.to_vec(),
+        cancellation,
         reply: reply_tx,
     };
-    if sink.try_send(raw).is_err() {
-        // Bounded queue full or the channel is gone — shed load rather than
-        // block the HTTP worker.
-        return (StatusCode::TOO_MANY_REQUESTS, "plugin webhook queue full").into_response();
+    match sink.try_send(raw) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return (StatusCode::TOO_MANY_REQUESTS, "webhook queue full").into_response();
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response();
+        }
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PLUGIN_WEBHOOK_TIMEOUT_SECS),
+        reply_rx,
+    )
+    .await
+    {
         Ok(Ok(Ok(()))) => StatusCode::OK.into_response(),
-        Ok(Ok(Err(WebhookReject::Unauthorized(m)))) => {
-            (StatusCode::UNAUTHORIZED, m).into_response()
+        Ok(Ok(Err(WebhookReject::Unauthorized(detail)))) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "plugin_webhook_unauthorized",
+                        "path": path,
+                        "error": detail,
+                    })),
+                "plugin rejected webhook authentication"
+            );
+            (StatusCode::UNAUTHORIZED, "unauthorized webhook").into_response()
         }
-        Ok(Ok(Err(WebhookReject::BadRequest(m)))) => (StatusCode::BAD_REQUEST, m).into_response(),
+        Ok(Ok(Err(WebhookReject::BadRequest(detail)))) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "plugin_webhook_invalid",
+                        "path": path,
+                        "error": detail,
+                    })),
+                "plugin failed to decode webhook"
+            );
+            (StatusCode::BAD_REQUEST, "invalid webhook").into_response()
+        }
+        Ok(Ok(Err(WebhookReject::Timeout))) => {
+            (StatusCode::GATEWAY_TIMEOUT, "webhook processing timed out").into_response()
+        }
         // The plugin dropped the reply (e.g. its channel task ended).
-        Ok(Err(_)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "plugin channel unavailable",
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            "plugin webhook decode timed out",
-        )
-            .into_response(),
+        Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "webhook processing timed out").into_response(),
     }
 }
 
@@ -2803,11 +2874,7 @@ async fn handle_webhook(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "/webhook rate limit exceeded"
         );
-        let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return webhook_rate_limit_response();
     }
 
     // ── Bearer token auth (pairing) with auth rate limiting ──
@@ -4473,11 +4540,13 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use axum::http::{HeaderValue, Uri};
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -4809,6 +4878,336 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    fn plugin_webhook_test_router(
+        state: AppState,
+        registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    ) -> Router {
+        plugin_webhook_routes(registry)
+            .with_state(state)
+            .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+    }
+
+    fn plugin_webhook_request(
+        path: &str,
+        body: impl Into<Body>,
+        peer: SocketAddr,
+        forwarded_for: Option<&str>,
+    ) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("/plugin/{path}"));
+        if let Some(forwarded_for) = forwarded_for {
+            request = request.header("x-forwarded-for", forwarded_for);
+        }
+        let mut request = request
+            .body(body.into())
+            .expect("valid plugin webhook request");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    async fn response_text(response: axum::response::Response) -> String {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body collects")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("fixed webhook response is utf-8")
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_delivers_exact_request() {
+        use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let (sink, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        zeroclaw_spawn::spawn!(async move {
+            let raw = rx.recv().await.expect("route sends raw webhook");
+            let _ = seen_tx.send((raw.headers.clone(), raw.body.clone()));
+            let _ = raw.reply.send(Ok(()));
+        });
+
+        let peer = SocketAddr::from(([203, 0, 113, 7], 30_300));
+        let mut request = plugin_webhook_request("fixture", "signed body", peer, None);
+        request
+            .headers_mut()
+            .insert("x-fixture-secret", HeaderValue::from_static("test-secret"));
+        let response = plugin_webhook_test_router(state, registry)
+            .oneshot(request)
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, body) = seen_rx.await.expect("sink records request");
+        assert_eq!(body, b"signed body");
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-fixture-secret" && value == "test-secret"),
+            "Axum request headers reach the plugin normalized to lower-case names"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_sanitizes_auth_and_parse_failures() {
+        use zeroclaw_api::webhook::{PluginWebhookRegistry, WebhookReject};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let (sink, mut rx) = tokio::sync::mpsc::channel(2);
+        assert!(registry.insert("fixture".to_string(), sink));
+        zeroclaw_spawn::spawn!(async move {
+            while let Some(raw) = rx.recv().await {
+                let rejection = if raw.body == b"auth" {
+                    WebhookReject::Unauthorized(
+                        "signature mismatch for secret operator-token".to_string(),
+                    )
+                } else {
+                    WebhookReject::BadRequest("wasmtime trap: private plugin backtrace".to_string())
+                };
+                let _ = raw.reply.send(Err(rejection));
+            }
+        });
+        let app = plugin_webhook_test_router(state, registry);
+        let peer = SocketAddr::from(([203, 0, 113, 8], 30_301));
+
+        let unauthorized = app
+            .clone()
+            .oneshot(plugin_webhook_request("fixture", "auth", peer, None))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_text(unauthorized).await, "unauthorized webhook");
+
+        let malformed = app
+            .oneshot(plugin_webhook_request("fixture", "malformed", peer, None))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_text(malformed).await, "invalid webhook");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plugin_webhook_router_timeout_cancels_worker_request() {
+        use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let (sink, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        zeroclaw_spawn::spawn!(async move {
+            let raw = rx.recv().await.expect("route sends raw webhook");
+            raw.cancellation.cancelled().await;
+            let _ = cancelled_tx.send(());
+        });
+
+        let response = plugin_webhook_test_router(state, registry)
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                "slow",
+                SocketAddr::from(([203, 0, 113, 9], 30_302)),
+                None,
+            ))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response_text(response).await,
+            "webhook processing timed out"
+        );
+        cancelled_rx
+            .await
+            .expect("handler timeout propagates cancellation to worker");
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_distinguishes_queue_and_unavailable_channel() {
+        use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let full_registry = Arc::new(PluginWebhookRegistry::new());
+        let (full_sink, mut full_rx) = tokio::sync::mpsc::channel(1);
+        let (prefill_reply, _prefill_rx) = tokio::sync::oneshot::channel();
+        full_sink
+            .try_send(RawWebhook {
+                headers: Vec::new(),
+                body: Vec::new(),
+                cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
+                reply: prefill_reply,
+            })
+            .expect("prefill bounded queue");
+        assert!(full_registry.insert("full".to_string(), full_sink));
+        let peer = SocketAddr::from(([203, 0, 113, 10], 30_303));
+        let full = plugin_webhook_test_router(state.clone(), full_registry)
+            .oneshot(plugin_webhook_request("full", "body", peer, None))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(full.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_text(full).await, "webhook queue full");
+        let _ = full_rx.recv().await;
+
+        let closed_registry = Arc::new(PluginWebhookRegistry::new());
+        let (closed_sink, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        assert!(closed_registry.insert("closed".to_string(), closed_sink));
+        let closed = plugin_webhook_test_router(state, closed_registry)
+            .oneshot(plugin_webhook_request("closed", "body", peer, None))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_text(closed).await, "webhook unavailable");
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_uses_canonical_client_key_policy_and_recovers() {
+        use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+        async fn response_loop(
+            mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::webhook::RawWebhook>,
+        ) {
+            while let Some(raw) = rx.recv().await {
+                let _ = raw.reply.send(Ok(()));
+            }
+        }
+
+        fn limiter(limit: u32, window: Duration) -> Arc<GatewayRateLimiter> {
+            Arc::new(GatewayRateLimiter {
+                pair: SlidingWindowRateLimiter::new(100, window, 100),
+                webhook: SlidingWindowRateLimiter::new(limit, window, 100),
+            })
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let peer = SocketAddr::from(([203, 0, 113, 11], 30_304));
+
+        let mut untrusted_state = admin_paircode_state(&tmp, false, false);
+        untrusted_state.rate_limiter = limiter(1, Duration::from_millis(25));
+        let untrusted_registry = Arc::new(PluginWebhookRegistry::new());
+        let (untrusted_sink, untrusted_rx) = tokio::sync::mpsc::channel(4);
+        assert!(untrusted_registry.insert("fixture".to_string(), untrusted_sink));
+        zeroclaw_spawn::spawn!(response_loop(untrusted_rx));
+        let untrusted = plugin_webhook_test_router(untrusted_state, untrusted_registry);
+
+        let first = untrusted
+            .clone()
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                "one",
+                peer,
+                Some("198.51.100.1"),
+            ))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = untrusted
+            .clone()
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                "two",
+                peer,
+                Some("198.51.100.2"),
+            ))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let rate_body: serde_json::Value =
+            serde_json::from_str(&response_text(second).await).expect("canonical rate JSON");
+        assert_eq!(
+            rate_body
+                .get("retry_after")
+                .and_then(serde_json::Value::as_u64),
+            Some(RATE_LIMIT_WINDOW_SECS)
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let recovered = untrusted
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                "three",
+                peer,
+                Some("198.51.100.2"),
+            ))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(recovered.status(), StatusCode::OK);
+
+        let mut trusted_state = admin_paircode_state(&tmp, false, false);
+        trusted_state.trust_forwarded_headers = true;
+        trusted_state.rate_limiter = limiter(1, Duration::from_secs(1));
+        let trusted_registry = Arc::new(PluginWebhookRegistry::new());
+        let (trusted_sink, trusted_rx) = tokio::sync::mpsc::channel(4);
+        assert!(trusted_registry.insert("fixture".to_string(), trusted_sink));
+        zeroclaw_spawn::spawn!(response_loop(trusted_rx));
+        let trusted = plugin_webhook_test_router(trusted_state, trusted_registry);
+
+        for forwarded in ["198.51.100.1", "198.51.100.2"] {
+            let response = trusted
+                .clone()
+                .oneshot(plugin_webhook_request(
+                    "fixture",
+                    "body",
+                    peer,
+                    Some(forwarded),
+                ))
+                .await
+                .expect("plugin route is infallible");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let repeated_forwarded_client = trusted
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                "body",
+                peer,
+                Some("198.51.100.1"),
+            ))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(
+            repeated_forwarded_client.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_rejects_unknown_path_and_oversized_body() {
+        use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let peer = SocketAddr::from(([203, 0, 113, 12], 30_305));
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let unknown = plugin_webhook_test_router(state.clone(), Arc::clone(&registry))
+            .oneshot(plugin_webhook_request("missing", "body", peer, None))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_text(unknown).await, "webhook not found");
+
+        let (sink, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+        let oversized = plugin_webhook_test_router(state, registry)
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                vec![b'x'; MAX_BODY_SIZE + 1],
+                peer,
+                None,
+            ))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            rx.try_recv().is_err(),
+            "body ceiling rejects before registry delivery"
+        );
     }
 
     fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {

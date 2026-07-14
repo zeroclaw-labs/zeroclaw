@@ -38,6 +38,11 @@ fn authorize_fixture_sender(config: &mut Config) {
     );
 }
 
+fn config_resolver(config: &Config) -> zeroclaw_runtime::plugin_channels::ChannelConfigResolver {
+    let config = config.clone();
+    Arc::new(move || config.clone())
+}
+
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
     FIXTURE
@@ -275,6 +280,7 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     // logging import.
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &config,
+        config_resolver(&config),
         &HashSet::new(),
         None,
     )
@@ -290,6 +296,7 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     let occupied = HashSet::from([PLUGIN_NAME.to_string()]);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &config,
+        config_resolver(&config),
         &occupied,
         None,
     )
@@ -326,8 +333,13 @@ async fn supervised_wasm_listener_cancels_its_only_poll_generation() {
     zeroclaw_log::try_install_capture_subscriber();
     let mut logs = zeroclaw_log::subscribe_or_install();
 
-    let mut built =
-        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new()).await;
+    let mut built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &config,
+        config_resolver(&config),
+        &HashSet::new(),
+        None,
+    )
+    .await;
     assert_eq!(built.len(), 1, "real fixture is instantiated once");
     receive_configure_marker(&mut logs).await;
     let (id, channel) = built.pop().expect("one built channel");
@@ -446,8 +458,13 @@ async fn disabled_plugin_owner_blocks_guest_startup_before_configure() {
     zeroclaw_log::try_install_capture_subscriber();
     let mut logs = zeroclaw_log::subscribe_or_install();
 
-    let built =
-        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new()).await;
+    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &config,
+        config_resolver(&config),
+        &HashSet::new(),
+        None,
+    )
+    .await;
     assert_eq!(built.len(), 1, "enabled plugin owner admits the guest");
     receive_configure_marker(&mut logs).await;
     while logs.try_recv().is_ok() {}
@@ -462,8 +479,13 @@ async fn disabled_plugin_owner_blocks_guest_startup_before_configure() {
         .read()
         .validate()
         .expect("disabling the plugin owner preserves a valid daemon config");
-    let built =
-        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new()).await;
+    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &config,
+        config_resolver(&config),
+        &HashSet::new(),
+        None,
+    )
+    .await;
     assert!(built.is_empty(), "disabled plugin owner blocks startup");
     while let Ok(event) = logs.try_recv() {
         assert!(
@@ -499,8 +521,13 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     );
     let selected_config = mirror_config(&selected_plugins, true);
     let occupied = HashSet::from(["telegram.main".to_string()]);
-    let mut built =
-        zeroclaw_runtime::plugin_channels::build_channel_plugins(&selected_config, &occupied).await;
+    let mut built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &selected_config,
+        config_resolver(&selected_config),
+        &occupied,
+        None,
+    )
+    .await;
     assert_eq!(built.len(), 1, "only the unshadowed alias is admitted");
     assert_eq!(
         drain_configure_markers(&mut logs),
@@ -545,9 +572,13 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         None,
     );
     let disabled_config = mirror_config(&disabled_plugins, false);
-    let built =
-        zeroclaw_runtime::plugin_channels::build_channel_plugins(&disabled_config, &HashSet::new())
-            .await;
+    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &disabled_config,
+        config_resolver(&disabled_config),
+        &HashSet::new(),
+        None,
+    )
+    .await;
     assert!(built.is_empty(), "disabled mirror owner blocks startup");
     assert_eq!(drain_configure_markers(&mut logs), 0);
 
@@ -566,7 +597,9 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     let ungranted_config = mirror_config(&ungranted_plugins, true);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &ungranted_config,
+        config_resolver(&ungranted_config),
         &HashSet::new(),
+        None,
     )
     .await;
     assert!(built.is_empty(), "config_read is required for a mirror");
@@ -595,7 +628,9 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     let duplicate_config = mirror_config(&duplicate_plugins, true);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &duplicate_config,
+        config_resolver(&duplicate_config),
         &HashSet::new(),
+        None,
     )
     .await;
     assert!(built.is_empty(), "ambiguous mirror providers fail closed");

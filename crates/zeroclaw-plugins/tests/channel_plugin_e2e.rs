@@ -14,12 +14,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+use zeroclaw_api::webhook::{RawWebhook, WebhookCancellation, WebhookReject};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::error::PluginError;
@@ -268,17 +269,30 @@ async fn unauthorized_poll_sender_is_not_forwarded() {
 #[tokio::test]
 async fn webhook_ingress_delivers_inbound() {
     let wasm = fixture();
+    let digest = fixture_digest(&wasm);
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
+    let resolver_counter = Arc::clone(&resolver_calls);
+    let runtime = Arc::new(move || {
+        let call = resolver_counter.fetch_add(1, Ordering::SeqCst);
+        let secret = if call == 0 {
+            "startup-secret"
+        } else {
+            "test-secret"
+        };
+        Ok((secret.to_string(), test_limits()))
+    }) as zeroclaw_plugins::wasm_channel::ChannelRuntimeResolver;
 
-    // The fixture serves webhook path "fixture" and authenticates the
-    // `x-fixture-secret` header against its configured value.
+    // The warm instance receives `startup-secret`; each disposable parser
+    // resolves `test-secret`. A valid request therefore proves runtime config
+    // is materialized per request rather than cached at channel startup.
     let channel = Arc::new(
-        WasmChannel::from_wasm_mirror(
+        WasmChannel::from_wasm_mirror_with_runtime_resolver_and_digest(
             "fixture",
             "default",
             &wasm,
+            Some(&digest),
             &[PluginPermission::ConfigRead],
-            "test-secret",
-            test_limits(),
+            runtime,
             allow_all(),
         )
         .await
@@ -286,14 +300,13 @@ async fn webhook_ingress_delivers_inbound() {
     );
     assert_eq!(channel.webhook_path().await.as_deref(), Some("fixture"));
 
-    // Register the sink drain end + start the listener (which drains webhooks
-    // on a second task), then feed raw webhooks as the gateway would.
+    // Register the sink drain end and run the owned listener while feeding raw
+    // webhooks as the gateway would.
     let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
     channel.set_webhook_rx(sink_rx);
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     let listener_channel = Arc::clone(&channel);
-    let listener =
-        ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
 
     // Valid signature → the body is decoded into an inbound message and the
     // reply resolves Ok.
@@ -302,6 +315,7 @@ async fn webhook_ingress_delivers_inbound() {
         .send(RawWebhook {
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"hello from webhook".to_vec(),
+            cancellation: WebhookCancellation::new(),
             reply: reply_tx,
         })
         .await
@@ -309,6 +323,10 @@ async fn webhook_ingress_delivers_inbound() {
     assert!(
         matches!(reply_rx.await, Ok(Ok(()))),
         "valid webhook → reply Ok"
+    );
+    assert!(
+        resolver_calls.load(Ordering::SeqCst) >= 2,
+        "webhook parser resolves config after warm startup"
     );
 
     // Both the fixture's one-shot config echo (poll) and the webhook message
@@ -331,6 +349,7 @@ async fn webhook_ingress_delivers_inbound() {
         .send(RawWebhook {
             headers: vec![("x-fixture-secret".to_string(), "wrong".to_string())],
             body: b"nope".to_vec(),
+            cancellation: WebhookCancellation::new(),
             reply: reply_tx2,
         })
         .await
@@ -340,6 +359,127 @@ async fn webhook_ingress_delivers_inbound() {
         "bad signature → Unauthorized"
     );
 
+    // A valid signature with a malformed payload is a distinct 400-class
+    // rejection in the canonical WIT contract.
+    let (reply_tx3, reply_rx3) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+            body: vec![0xff],
+            cancellation: WebhookCancellation::new(),
+            reply: reply_tx3,
+        })
+        .await
+        .expect("sink accepts malformed payload");
+    assert!(
+        matches!(reply_rx3.await, Ok(Err(WebhookReject::BadRequest(_)))),
+        "malformed payload → BadRequest"
+    );
+
     listener.abort();
-    let _ = listener.await;
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
+}
+
+#[tokio::test]
+async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
+    let wasm = fixture();
+
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror(
+            "fixture",
+            "default",
+            &wasm,
+            &[PluginPermission::ConfigRead],
+            "test-secret",
+            test_limits(),
+            allow_all(),
+        )
+        .await
+        .expect("fixture instantiates"),
+    );
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    let cancellation = WebhookCancellation::new();
+    let cancel_from_deadline = cancellation.clone();
+    let (stalled_reply_tx, stalled_reply_rx) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+            body: b"stall-parse".to_vec(),
+            cancellation,
+            reply: stalled_reply_tx,
+        })
+        .await
+        .expect("sink accepts stalled parse");
+    zeroclaw_spawn::spawn!(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_from_deadline.cancel();
+    });
+    let stalled = tokio::time::timeout(Duration::from_secs(3), stalled_reply_rx)
+        .await
+        .expect("cancelled parse resolves promptly")
+        .expect("webhook worker keeps reply channel");
+    assert!(matches!(stalled, Err(WebhookReject::Timeout)));
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        channel.send(&outbound("store-probe")),
+    )
+    .await
+    .expect("store mutex is released after cancellation")
+    .expect("same warm component remains callable after cancellation");
+
+    let (recovery_reply_tx, recovery_reply_rx) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+            body: b"after-timeout".to_vec(),
+            cancellation: WebhookCancellation::new(),
+            reply: recovery_reply_tx,
+        })
+        .await
+        .expect("sink accepts recovery parse");
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), recovery_reply_rx).await,
+            Ok(Ok(Ok(())))
+        ),
+        "later webhook succeeds on the same channel instance"
+    );
+
+    let mut delivered = Vec::new();
+    for _ in 0..2 {
+        if let Ok(Some(message)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            delivered.push(message.content);
+        }
+    }
+    assert!(
+        delivered.iter().any(|content| content == "after-timeout"),
+        "recovered parse reaches normal inbound delivery: {delivered:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !channel.health_check().await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("poll health recovers after the cancelled parse");
+
+    listener.abort();
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
 }

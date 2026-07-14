@@ -37,7 +37,10 @@ fn load_plugin_host(config: &Config) -> Option<zeroclaw_plugins::host::PluginHos
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{error:#}"),
+                        "error_key": "plugin_channel_config_serialize_failed",
+                    })),
                 "Failed to load WASM channel plugins"
             );
             None
@@ -202,9 +205,22 @@ pub async fn build_channel_plugins(
     occupied_channel_keys: &HashSet<String>,
     webhooks: Option<&PluginWebhookRegistry>,
 ) -> Vec<(String, Arc<dyn Channel>)> {
+    fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::PluginLimits {
+        zeroclaw_plugins::component::PluginLimits {
+            call_fuel: config.plugins.limits.call_fuel,
+            max_memory_bytes: config
+                .plugins
+                .limits
+                .max_memory_mb
+                .saturating_mul(1024 * 1024),
+            max_table_elements: config.plugins.limits.max_table_elements,
+            max_instances: config.plugins.limits.max_instances,
+        }
+    }
+
     // Build-time plugin settings are a per-call materialized view. The sender
-    // authorizer below retains the shared handle and resolves peer membership
-    // from it on every message.
+    // authorizer and disposable webhook factories retain only the shared
+    // handle and resolve canonical config at use time.
     let config_handle = Arc::clone(config);
     let config = config.read().clone();
 
@@ -212,16 +228,6 @@ pub async fn build_channel_plugins(
         return Vec::new();
     };
 
-    let limits = zeroclaw_plugins::component::PluginLimits {
-        call_fuel: config.plugins.limits.call_fuel,
-        max_memory_bytes: config
-            .plugins
-            .limits
-            .max_memory_mb
-            .saturating_mul(1024 * 1024),
-        max_table_elements: config.plugins.limits.max_table_elements,
-        max_instances: config.plugins.limits.max_instances,
-    };
     let active = zeroclaw_config::schema::ActiveChannelAliases::compute(&config);
     let channels_json = canonical_channels_json(&config);
     let mut claimed_channel_keys = occupied_channel_keys.clone();
@@ -261,7 +267,7 @@ pub async fn build_channel_plugins(
                     continue;
                 }
 
-                for (alias, section) in mirror_sections(sections, channel_type) {
+                for (alias, _) in mirror_sections(sections, channel_type) {
                     let channel_key = format!("{channel_type}.{alias}");
                     if !active.contains(&channel_key) {
                         log_unowned_plugin(&manifest.name, &channel_key).await;
@@ -271,13 +277,51 @@ pub async fn build_channel_plugins(
                         log_shadowed_plugin(&manifest.name, &channel_key);
                         continue;
                     }
-                    let resolved = resolve_mirror_config(&config, channel_type, alias, section);
-                    let config_json = match serde_json::to_string(&resolved) {
-                        Ok(json) => json,
-                        Err(error) => {
-                            log_instantiate_failure(&manifest.name, &error.into());
-                            continue;
-                        }
+                    let runtime = {
+                        let runtime_config = Arc::clone(&config_handle);
+                        let runtime_channel_type = channel_type.to_string();
+                        let runtime_alias = alias.clone();
+                        Arc::new(move || {
+                            let config = runtime_config.read();
+                            let channels_json =
+                                canonical_channels_json(&config).ok_or_else(|| {
+                                    anyhow::Error::msg(
+                                        "canonical channel config could not be serialized",
+                                    )
+                                })?;
+                            let section =
+                                channels_json
+                                    .get(&runtime_channel_type)
+                                    .and_then(|channels| channels.get(&runtime_alias))
+                                    .ok_or_else(|| {
+                                        ::zeroclaw_log::record!(
+                                            ERROR,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail,
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure,)
+                                            .with_attrs(::serde_json::json!({
+                                                "channel": &runtime_channel_type,
+                                                "alias": &runtime_alias,
+                                                "error_key": "plugin_channel_config_unavailable",
+                                            })),
+                                            "Canonical channel config became unavailable"
+                                        );
+                                        anyhow::Error::msg(format!(
+                                            "canonical channel config {}.{} is unavailable",
+                                            runtime_channel_type, runtime_alias
+                                        ))
+                                    })?;
+                            let resolved = resolve_mirror_config(
+                                &config,
+                                &runtime_channel_type,
+                                &runtime_alias,
+                                section,
+                            );
+                            Ok((serde_json::to_string(&resolved)?, plugin_limits(&config)))
+                        })
+                            as zeroclaw_plugins::wasm_channel::ChannelRuntimeResolver
                     };
                     let authorizer = channel_authorizer(
                         &config_handle,
@@ -286,14 +330,13 @@ pub async fn build_channel_plugins(
                         manifest.sender_match,
                     );
                     note_if_no_allowlist(&config, channel_type, alias, &manifest.name);
-                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_digest(
+                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_runtime_resolver_and_digest(
                         channel_type,
                         alias.as_str(),
                         &wasm_path,
                         manifest.wasm_sha256.as_deref(),
                         &manifest.permissions,
-                        &config_json,
-                        limits,
+                        runtime,
                         authorizer,
                     )
                     .await
@@ -323,21 +366,36 @@ pub async fn build_channel_plugins(
                     log_shadowed_plugin(&manifest.name, &manifest.name);
                     continue;
                 }
-                let plugin_config = config
-                    .plugins
-                    .entry_config(&manifest.name)
-                    .cloned()
-                    .unwrap_or_default();
+                let runtime = {
+                    let runtime_config = Arc::clone(&config_handle);
+                    let plugin_name = manifest.name.clone();
+                    let config_read = manifest
+                        .permissions
+                        .contains(&zeroclaw_plugins::PluginPermission::ConfigRead);
+                    Arc::new(move || {
+                        let config = runtime_config.read();
+                        let config_json = if config_read {
+                            let plugin_config = config
+                                .plugins
+                                .entry_config(&plugin_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            serde_json::to_string(&plugin_config)?
+                        } else {
+                            "{}".to_string()
+                        };
+                        Ok((config_json, plugin_limits(&config)))
+                    }) as zeroclaw_plugins::wasm_channel::ChannelRuntimeResolver
+                };
                 let authorizer =
                     channel_authorizer(&config_handle, &manifest.name, "", manifest.sender_match);
                 note_if_no_allowlist(&config, &manifest.name, "", &manifest.name);
-                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_digest(
+                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_runtime_resolver_and_digest(
                     manifest.name.clone(),
                     &wasm_path,
                     manifest.wasm_sha256.as_deref(),
                     &manifest.permissions,
-                    &plugin_config,
-                    limits,
+                    runtime,
                     authorizer,
                 )
                 .await

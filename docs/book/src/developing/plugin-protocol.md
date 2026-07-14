@@ -399,6 +399,29 @@ inbound-pending: func() -> u32;
 The host side owns an `InboundQueue` per channel; `WasmChannel::inbound` hands a
 clone to the listener task so enqueued traffic is visible to the plugin's drain.
 
+### Webhook ingress
+
+A channel that advertises `webhook-ingress` claims one host-validated path at
+`POST /plugin/<path>`. The gateway preserves the raw body and normalized headers
+for the plugin's `parse-webhook` export, where platform signature verification
+and payload decoding remain plugin-owned. Its typed rejection distinguishes an
+authentication failure (`401`) from a malformed authenticated payload (`400`).
+The gateway applies its canonical
+per-client webhook limiter before route lookup, using forwarded client headers
+only when `gateway.trust_forwarded_headers` is enabled, and rejects request
+bodies above the gateway's 64 KiB ceiling.
+
+This route is intentionally unauthenticated at the gateway because platform
+authentication belongs to the plugin parser. Public responses therefore contain
+only fixed status text; plugin rejection strings and Wasmtime diagnostics are
+logged with route context but never returned to the caller.
+
+Each request is parsed in a disposable component store configured from the live
+canonical config resolver. The gateway-owned request cancellation token bounds
+instantiation, configuration, and `parse-webhook`; queue admission is
+nonblocking. A timeout or dropped handler discards that request's store, leaving
+the channel's warm polling/outbound store available for later work.
+
 ### `logging`
 
 `wit/v0/logging.wit` is imported by all three worlds. Plugins call `log-record`

@@ -86,6 +86,17 @@ interface channel {
         deny-with-edit(string),
     }
 
+    /// A webhook rejection with an explicit public HTTP classification. The
+    /// string is private diagnostic context for host logs and is never returned
+    /// verbatim to the unauthenticated caller.
+    @unstable(feature = plugins-wit-v0)
+    variant webhook-rejection {
+        /// Platform signature or authenticity verification failed (HTTP 401).
+        unauthorized(string),
+        /// The authenticated payload is malformed or unsupported (HTTP 400).
+        bad-request(string),
+    }
+
     /// Bitmask of optional capabilities this plugin implements.
     ///
     /// The runtime calls `get-channel-capabilities` once at load time. For each
@@ -317,14 +328,15 @@ interface channel {
     /// `/plugin/<segment>` route into inbound messages. The plugin owns both its
     /// platform payload shape and its authenticity check: it verifies the
     /// platform signature over `body` (secret from its own config, signature
-    /// from `headers`) and returns `err(reason)` to make the gateway reply
-    /// 401/400 and enqueue nothing. `headers` are lower-cased; `body` is the
+    /// from `headers`) and returns a typed rejection to make the gateway reply
+    /// 401 or 400 and enqueue nothing. `headers` are lower-cased; `body` is the
     /// exact received bytes.
-    /// Gated by `webhook-ingress`; stub: return `err("unsupported")`.
+    /// Gated by `webhook-ingress`; stub: return
+    /// `err(bad-request("unsupported"))`.
     parse-webhook: func(
         headers: list<tuple<string, string>>,
         body: list<u8>,
-    ) -> result<list<inbound-message>, string>;
+    ) -> result<list<inbound-message>, webhook-rejection>;
 }
 
 /// A component that exports `channel` is a messaging-platform channel plugin.

@@ -1,8 +1,9 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
 //!
-//! Warm lifecycle: the store and bindings are created once and held in an async
-//! mutex. `listen` runs a poll-to-push bridge with exponential backoff.
+//! The polling/outbound store is warm and held behind an async mutex. Webhook
+//! parsing uses a disposable configured store per request so host cancellation
+//! cannot poison the warm instance. `listen` runs the inbound bridges.
 
 use crate::PluginPermission;
 use crate::component::InboundQueue;
@@ -11,6 +12,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     ApprovalRequest as WitApprovalRequest, ApprovalResponse as WitApprovalResponse,
     ChannelCapabilities, InboundMessage as WitInboundMessage,
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
+    WebhookRejection as WitWebhookRejection,
 };
 use crate::component::{PluginState, call_plugin, engine, load_component_with_digest, wt};
 use anyhow::Result;
@@ -23,7 +25,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use wasmtime::Store;
-use wasmtime::component::Linker;
+use wasmtime::component::{Component, Linker};
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
@@ -45,6 +47,11 @@ pub struct WasmChannel {
     channel_ref: String,
     capabilities: ChannelCapabilities,
     state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
+    /// Verified executable and permission recipe plus an on-demand resolver for
+    /// canonical config/limits. Webhook parsing materializes a disposable store
+    /// from this factory so cancelling one request never poisons the warm channel
+    /// instance used by polling and outbound calls.
+    webhook_factory: ChannelInstanceFactory,
     inbound: InboundQueue,
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
@@ -56,6 +63,68 @@ pub struct WasmChannel {
     /// Sink-drain end for host-fed webhooks (set by the orchestrator when this
     /// channel declares a `webhook-path`). Taken once by `listen`.
     webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
+}
+
+/// Resolves the current configure payload and execution limits for a channel
+/// component. Production resolvers read the canonical shared `Config` handle on
+/// every call; the tuple is a per-call materialized view and is never cached.
+pub type ChannelRuntimeResolver =
+    Arc<dyn Fn() -> Result<(String, crate::component::PluginLimits)> + Send + Sync>;
+
+#[derive(Clone)]
+struct ChannelInstanceFactory {
+    component: Arc<Component>,
+    permissions: Arc<[PluginPermission]>,
+    runtime: ChannelRuntimeResolver,
+}
+
+impl ChannelInstanceFactory {
+    async fn instantiate(
+        &self,
+        inbound: InboundQueue,
+    ) -> Result<(Store<PluginState>, ChannelPlugin)> {
+        let (config_json, limits) = (self.runtime)()?;
+        let mut store =
+            crate::component::new_store_with_inbound(self.permissions.as_ref(), inbound, limits);
+        let http = store.data().http_enabled();
+        let linker = build_linker(http)?;
+        crate::component::ensure_http_coherent(&store, http)?;
+        let bindings = wt(
+            ChannelPlugin::instantiate_async(&mut store, self.component.as_ref(), &linker).await,
+            "failed to instantiate channel plugin",
+        )?;
+        wt(
+            bindings
+                .zeroclaw_plugin_channel()
+                .call_configure(&mut store, &config_json)
+                .await,
+            "channel.configure trapped",
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok((store, bindings))
+    }
+
+    async fn parse_webhook(
+        &self,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Result<Vec<WitInboundMessage>, WitWebhookRejection>> {
+        let (mut store, bindings) = self.instantiate(InboundQueue::default()).await?;
+        wt(
+            bindings
+                .zeroclaw_plugin_channel()
+                .call_parse_webhook(&mut store, headers, body)
+                .await,
+            "channel.parse-webhook trapped",
+        )
+    }
+}
+
+fn fixed_runtime_resolver(
+    config_json: String,
+    limits: crate::component::PluginLimits,
+) -> ChannelRuntimeResolver {
+    Arc::new(move || Ok((config_json.clone(), limits)))
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -124,37 +193,26 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 
 impl WasmChannel {
     /// Compile and instantiate one channel plugin from digest-bound bytes.
-    /// `channel_ref` is the host-owned routing identity and `config_json` is the
-    /// permission-filtered canonical config passed to `configure` before any
-    /// other guest export.
+    /// `channel_ref` is the host-owned routing identity. `runtime` resolves the
+    /// current permission-filtered config and execution limits whenever a warm
+    /// or disposable instance is configured.
     async fn instantiate(
         channel_ref: String,
         wasm_path: &Path,
         expected_sha256: Option<&str>,
         permissions: &[PluginPermission],
-        config_json: String,
-        limits: crate::component::PluginLimits,
+        runtime: ChannelRuntimeResolver,
         authorizer: SenderAuthorizer,
     ) -> Result<Self> {
-        let component = load_component_with_digest(wasm_path, expected_sha256)?;
+        let factory = ChannelInstanceFactory {
+            component: Arc::new(load_component_with_digest(wasm_path, expected_sha256)?),
+            permissions: Arc::from(permissions),
+            runtime,
+        };
         let inbound = InboundQueue::default();
-        let mut store =
-            crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
-        let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
-        crate::component::ensure_http_coherent(&store, http)?;
-        let bindings = wt(
-            ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
-            "failed to instantiate channel plugin",
-        )?;
+        let (mut store, bindings) = factory.instantiate(inbound.clone()).await?;
 
         let channel = bindings.zeroclaw_plugin_channel();
-
-        wt(
-            channel.call_configure(&mut store, &config_json).await,
-            "channel.configure trapped",
-        )?
-        .map_err(anyhow::Error::msg)?;
 
         let capabilities = wt(
             channel.call_get_channel_capabilities(&mut store).await,
@@ -192,6 +250,7 @@ impl WasmChannel {
             channel_ref,
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
+            webhook_factory: factory,
             inbound,
             cached_self_handle,
             cached_self_addressed_mention,
@@ -275,13 +334,55 @@ impl WasmChannel {
     ) -> Result<Self> {
         let plugin_name = plugin_name.into();
         let config_json = resolve_configure_json(config, permissions);
-        Self::instantiate(
-            zeroclaw_api::channel::plugin_channel_ref(&plugin_name),
+        Self::from_wasm_with_runtime_resolver_and_digest(
+            plugin_name,
             wasm_path,
             expected_sha256,
             permissions,
-            config_json,
-            limits,
+            fixed_runtime_resolver(config_json, limits),
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel while resolving config and limits on demand.
+    /// The resolver is called at startup and for each disposable webhook parser.
+    pub async fn from_wasm_with_runtime_resolver(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        Self::from_wasm_with_runtime_resolver_and_digest(
+            plugin_name,
+            wasm_path,
+            None,
+            permissions,
+            runtime,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel from a live runtime resolver while binding
+    /// the executable to the digest from its verified manifest.
+    pub async fn from_wasm_with_runtime_resolver_and_digest(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        let plugin_name = plugin_name.into();
+        let channel_ref = zeroclaw_api::channel::plugin_channel_ref(&plugin_name);
+        Self::instantiate(
+            channel_ref,
+            wasm_path,
+            expected_sha256,
+            permissions,
+            runtime,
             authorizer,
         )
         .await
@@ -329,13 +430,59 @@ impl WasmChannel {
         } else {
             "{}".to_string()
         };
+        Self::from_wasm_mirror_with_runtime_resolver_and_digest(
+            channel_type,
+            alias,
+            wasm_path,
+            expected_sha256,
+            permissions,
+            fixed_runtime_resolver(config_json, limits),
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a mirrored channel while resolving config and limits on
+    /// demand. The resolver must already enforce `ConfigRead` withholding.
+    pub async fn from_wasm_mirror_with_runtime_resolver(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        Self::from_wasm_mirror_with_runtime_resolver_and_digest(
+            channel_type,
+            alias,
+            wasm_path,
+            None,
+            permissions,
+            runtime,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a mirrored channel from a live runtime resolver while
+    /// binding the executable to the digest from its verified manifest.
+    pub async fn from_wasm_mirror_with_runtime_resolver_and_digest(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        let channel_type = channel_type.into();
+        let alias = alias.into();
         Self::instantiate(
             format!("{channel_type}.{alias}"),
             wasm_path,
             expected_sha256,
             permissions,
-            config_json,
-            limits,
+            runtime,
             authorizer,
         )
         .await
@@ -468,115 +615,164 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_ref = self.channel_ref.clone();
-        let authorizer = Arc::clone(&self.authorizer);
-
-        let mut webhook_rx = self
+        let poll_channel_ref = self.channel_ref.clone();
+        let webhook_channel_ref = poll_channel_ref.clone();
+        let webhook_tx = tx.clone();
+        let poll_authorizer = Arc::clone(&self.authorizer);
+        let webhook_authorizer = Arc::clone(&self.authorizer);
+        let webhook_rx = self
             .webhook_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(mut webhook_rx) = webhook_rx.take() {
-            let webhook_state = Arc::clone(&self.state);
-            let webhook_channel_ref = channel_ref.clone();
-            let webhook_tx = tx.clone();
-            let webhook_authorizer = Arc::clone(&authorizer);
-            zeroclaw_spawn::spawn!(async move {
-                while let Some(RawWebhook {
-                    headers,
-                    body,
-                    reply,
-                }) = webhook_rx.recv().await
-                {
-                    let decoded = {
-                        let mut guard = webhook_state.lock().await;
-                        let (ref mut store, ref mut bindings) = *guard;
-                        crate::component::refuel(store);
-                        bindings
-                            .zeroclaw_plugin_channel()
-                            .call_parse_webhook(store, &headers, &body)
-                            .await
-                    };
-                    match decoded {
-                        Ok(Ok(messages)) => {
-                            for message in messages {
-                                if forward_if_authorized(
+
+        let poll_loop = async {
+            const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+            const MAX_BACKOFF: Duration = Duration::from_millis(500);
+            let mut backoff = INITIAL_BACKOFF;
+
+            loop {
+                if tx.is_closed() {
+                    return Ok(());
+                }
+                let polled = {
+                    let mut guard = self.state.lock().await;
+                    let (ref mut store, ref mut bindings) = *guard;
+                    crate::component::refuel(store);
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_poll_message(store)
+                        .await
+                };
+                match polled {
+                    Ok(Some(wit_msg)) => {
+                        mark_poll_healthy(&self.poll_healthy, true);
+                        backoff = INITIAL_BACKOFF;
+                        if forward_if_authorized(
+                            &tx,
+                            &poll_authorizer,
+                            &poll_channel_ref,
+                            from_wit_inbound(wit_msg, &poll_channel_ref),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => {
+                        mark_poll_healthy(&self.poll_healthy, true);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                    Err(error) => {
+                        mark_poll_healthy(&self.poll_healthy, false);
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Inbound
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_ref": poll_channel_ref,
+                                "error": format!("{error:#}"),
+                            })),
+                            "channel plugin poll-message trapped; backing off"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                }
+            }
+        };
+        tokio::pin!(poll_loop);
+
+        let Some(mut webhook_rx) = webhook_rx else {
+            return poll_loop.await;
+        };
+        let webhook_factory = self.webhook_factory.clone();
+        let webhook_loop = async move {
+            while let Some(RawWebhook {
+                headers,
+                body,
+                cancellation,
+                reply,
+            }) = webhook_rx.recv().await
+            {
+                let decoded = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => None,
+                    result = webhook_factory.parse_webhook(&headers, &body) => Some(result),
+                };
+                match decoded {
+                    Some(Ok(Ok(messages))) => {
+                        let mut delivery_failed = false;
+                        for message in messages {
+                            let message = from_wit_inbound(message, &webhook_channel_ref);
+                            let sent = tokio::select! {
+                                biased;
+                                () = cancellation.cancelled() => None,
+                                result = forward_if_authorized(
                                     &webhook_tx,
                                     &webhook_authorizer,
                                     &webhook_channel_ref,
-                                    from_wit_inbound(message, &webhook_channel_ref),
-                                )
-                                    .await
-                                    .is_err()
-                                {
+                                    message,
+                                ) => Some(result),
+                            };
+                            match sent {
+                                Some(Ok(())) => {}
+                                Some(Err(_)) => {
+                                    delivery_failed = true;
                                     break;
                                 }
+                                None => break,
                             }
-                            let _ = reply.send(Ok(()));
                         }
-                        Ok(Err(reason)) => {
-                            let _ = reply.send(Err(WebhookReject::Unauthorized(reason)));
-                        }
-                        Err(error) => {
-                            let _ =
-                                reply.send(Err(WebhookReject::BadRequest(format!("{error:#}"))));
-                        }
+                        let response = if cancellation.is_cancelled() {
+                            Err(WebhookReject::Timeout)
+                        } else if delivery_failed {
+                            Err(WebhookReject::BadRequest(
+                                "channel inbound receiver closed".to_string(),
+                            ))
+                        } else {
+                            Ok(())
+                        };
+                        let _ = reply.send(response);
                     }
-                }
-            });
-        }
-
-        const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
-        const MAX_BACKOFF: Duration = Duration::from_millis(500);
-        let mut backoff = INITIAL_BACKOFF;
-
-        loop {
-            let polled = {
-                let mut guard = self.state.lock().await;
-                let (ref mut store, ref mut bindings) = *guard;
-                crate::component::refuel(store);
-                bindings
-                    .zeroclaw_plugin_channel()
-                    .call_poll_message(store)
-                    .await
-            };
-            match polled {
-                Ok(Some(wit_msg)) => {
-                    mark_poll_healthy(&self.poll_healthy, true);
-                    backoff = INITIAL_BACKOFF;
-                    if forward_if_authorized(
-                        &tx,
-                        &authorizer,
-                        &channel_ref,
-                        from_wit_inbound(wit_msg, &channel_ref),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return Ok(());
+                    Some(Ok(Err(WitWebhookRejection::Unauthorized(reason)))) => {
+                        let _ = reply.send(Err(WebhookReject::Unauthorized(reason)));
                     }
-                }
-                Ok(None) => {
-                    mark_poll_healthy(&self.poll_healthy, true);
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                }
-                Err(e) => {
-                    mark_poll_healthy(&self.poll_healthy, false);
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                    Some(Ok(Err(WitWebhookRejection::BadRequest(reason)))) => {
+                        let _ = reply.send(Err(WebhookReject::BadRequest(reason)));
+                    }
+                    Some(Err(error)) => {
+                        let _ = reply.send(Err(WebhookReject::BadRequest(format!("{error:#}"))));
+                    }
+                    None => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Inbound
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "channel_ref": channel_ref,
-                                "error": format!("{e:#}"),
+                                "channel_ref": webhook_channel_ref,
+                                "error_key": "plugin_webhook_parse_cancelled",
                             })),
-                        "channel plugin poll-message trapped; backing off"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                            "channel plugin webhook parse cancelled at request deadline"
+                        );
+                        let _ = reply.send(Err(WebhookReject::Timeout));
+                    }
                 }
             }
+        };
+        tokio::pin!(webhook_loop);
+
+        tokio::select! {
+            result = &mut poll_loop => result,
+            () = &mut webhook_loop => poll_loop.await,
         }
     }
 

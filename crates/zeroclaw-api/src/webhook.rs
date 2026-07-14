@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{mpsc, oneshot};
 
+/// Cancellation signal for one gateway-owned plugin webhook request.
+pub type WebhookCancellation = tokio_util::sync::CancellationToken;
+
 /// A raw inbound webhook the gateway received on `/plugin/<path>`, plus a
 /// one-shot the plugin side resolves so the HTTP handler can pick a status code.
 pub struct RawWebhook {
@@ -21,6 +24,11 @@ pub struct RawWebhook {
     pub headers: Vec<(String, String)>,
     /// Exact received body bytes.
     pub body: Vec<u8>,
+    /// Request-lifetime cancellation owned by the gateway. The plugin worker
+    /// observes this same token while instantiating the disposable store and
+    /// executing `parse-webhook`, so an HTTP timeout or dropped handler cancels
+    /// the actual component call instead of only abandoning its reply.
+    pub cancellation: WebhookCancellation,
     /// Resolved once the plugin has decoded (or rejected) the webhook: `Ok` →
     /// 200, `Err(reject)` → the reject's status.
     pub reply: oneshot::Sender<Result<(), WebhookReject>>,
@@ -33,6 +41,8 @@ pub enum WebhookReject {
     Unauthorized(String),
     /// The plugin could not decode the payload → the gateway replies 400.
     BadRequest(String),
+    /// The request lifetime ended before plugin decoding completed → 504.
+    Timeout,
 }
 
 /// Path → sink registry, shared (`Arc`) between the gateway and the channel

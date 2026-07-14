@@ -24,7 +24,7 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::logging::{
@@ -222,7 +222,7 @@ mod component {
         fn parse_webhook(
             headers: Vec<(String, String)>,
             body: Vec<u8>,
-        ) -> Result<Vec<InboundMessage>, String> {
+        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
             // Auth: the caller must present this fixture's configured secret in
             // `x-fixture-secret`; otherwise reject (the host replies 401 and
             // enqueues nothing). Stands in for a real platform HMAC check.
@@ -232,9 +232,19 @@ mod component {
                 .find(|(k, _)| k == "x-fixture-secret")
                 .map(|(_, v)| v.as_str());
             if presented != Some(secret.as_str()) {
-                return Err("bad signature".to_string());
+                return Err(WebhookRejection::Unauthorized(
+                    "bad signature".to_string(),
+                ));
             }
-            let content = String::from_utf8(body).map_err(|_| "non-utf8 body".to_string())?;
+            if body == b"stall-parse" {
+                // WASI clocks suspend through an async host call. The host E2E
+                // cancels this invocation at the request deadline and then
+                // proves the same warm channel store can process another call.
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            let content = String::from_utf8(body).map_err(|_| {
+                WebhookRejection::BadRequest("non-utf8 body".to_string())
+            })?;
             Ok(vec![InboundMessage {
                 id: "webhook-1".to_string(),
                 sender: "webhook".to_string(),
