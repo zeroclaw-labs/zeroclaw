@@ -28,6 +28,7 @@
 //! | `ZC_HINDSIGHT_BASE` | API base URL                              | `https://tokengate.appz.cloud/api/embedding/hindsight` |
 //! | `ZC_HINDSIGHT_BANK` | Explicit bank id (overrides per-agent)    | `zeroclaw-<alias>` |
 //! | `ZC_HINDSIGHT_TOP_K`| Default recall limit when caller passes 0 | `5` |
+//! | `ZC_HINDSIGHT_TIMEOUT_SECS`| Per-request HTTP timeout (bounds every call) | `30` |
 //! | `ZC_HINDSIGHT_SHARED_BANK`| Extra read-only bank merged into recall/list (never written) | (none) |
 //!
 //! Shared read bank: `ZC_HINDSIGHT_SHARED_BANK` names a second bank every
@@ -41,12 +42,40 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use zeroclaw_config::schema::{
-    DEFAULT_HINDSIGHT_BASE_URL, DEFAULT_HINDSIGHT_TOKEN_ENV, DEFAULT_HINDSIGHT_TOP_K,
-    HindsightMemoryConfig,
+    DEFAULT_HINDSIGHT_BASE_URL, DEFAULT_HINDSIGHT_TIMEOUT_SECS, DEFAULT_HINDSIGHT_TOKEN_ENV,
+    DEFAULT_HINDSIGHT_TOP_K, HindsightMemoryConfig,
 };
 
 /// Env var naming the extra shared read-only bank (merged into recall/list).
 const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
+
+/// Percent-encode a single URL path segment (bank id or server-provided memory
+/// id). Encodes everything that is not an unreserved URL character so a bank
+/// name or id containing `/`, `?`, `#`, spaces, or other reserved bytes cannot
+/// break out of its path segment or inject query/fragment components. Mirrors
+/// the repo convention of routing configurable/remote strings through
+/// `urlencoding` before interpolating them into a request URL.
+fn encode_segment(segment: &str) -> String {
+    urlencoding::encode(segment).into_owned()
+}
+
+/// Build the shared `reqwest::Client` with a per-request timeout so every
+/// outbound Hindsight call is bounded. A `timeout_secs` of `0` (which config
+/// validation rejects, but the env path could still yield) falls back to the
+/// canonical [`DEFAULT_HINDSIGHT_TIMEOUT_SECS`] so the client is never built
+/// unbounded. If the builder itself fails (it does not under the pinned TLS
+/// features), fall back to a default client rather than panicking.
+fn build_client(timeout_secs: u64) -> reqwest::Client {
+    let secs = if timeout_secs == 0 {
+        DEFAULT_HINDSIGHT_TIMEOUT_SECS
+    } else {
+        timeout_secs
+    };
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(secs))
+        .build()
+        .unwrap_or_default()
+}
 
 /// Hindsight-backed memory store bound to a single bank.
 pub struct HindsightMemory {
@@ -126,7 +155,7 @@ impl HindsightMemory {
             shared_bank,
             token,
             default_top_k,
-            client: reqwest::Client::new(),
+            client: build_client(cfg.timeout_secs),
         })
     }
 
@@ -169,6 +198,13 @@ impl HindsightMemory {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|k| *k > 0)
             .unwrap_or(DEFAULT_HINDSIGHT_TOP_K);
+        // Per-request timeout: an explicit positive env override wins, else the
+        // canonical default. Bounds every outbound call on the env/CLI path too.
+        let timeout_secs = std::env::var("ZC_HINDSIGHT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|t| *t > 0)
+            .unwrap_or(DEFAULT_HINDSIGHT_TIMEOUT_SECS);
 
         Ok(Self {
             alias: agent_alias.to_string(),
@@ -177,7 +213,7 @@ impl HindsightMemory {
             shared_bank,
             token,
             default_top_k,
-            client: reqwest::Client::new(),
+            client: build_client(timeout_secs),
         })
     }
 
@@ -201,12 +237,17 @@ impl HindsightMemory {
     fn recall_url_for(&self, bank: &str) -> String {
         format!(
             "{}/v1/default/banks/{}/memories/recall",
-            self.base_url, bank
+            self.base_url,
+            encode_segment(bank)
         )
     }
 
     fn list_url_for(&self, bank: &str) -> String {
-        format!("{}/v1/default/banks/{}/memories/list", self.base_url, bank)
+        format!(
+            "{}/v1/default/banks/{}/memories/list",
+            self.base_url,
+            encode_segment(bank)
+        )
     }
 
     /// Recall against a single named bank.
@@ -600,7 +641,7 @@ mod tests {
             shared_bank: None,
             token: "test-token".to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
-            client: reqwest::Client::new(),
+            client: build_client(DEFAULT_HINDSIGHT_TIMEOUT_SECS),
         }
     }
 
@@ -877,5 +918,101 @@ mod tests {
         let items = mem.list(None, None).await.expect("list should succeed");
         assert_eq!(items[0].category, MemoryCategory::Daily);
         assert_eq!(items[1].category, MemoryCategory::Core);
+    }
+
+    /// A memory pointed at `base_url` whose client carries a very short
+    /// timeout, so a delayed/never-responding mock trips the deadline quickly
+    /// instead of blocking the test for the production default.
+    fn memory_with_short_timeout(base_url: &str, bank: &str) -> HindsightMemory {
+        HindsightMemory {
+            alias: "tester".to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            bank: bank.to_string(),
+            shared_bank: None,
+            token: "test-token".to_string(),
+            default_top_k: DEFAULT_HINDSIGHT_TOP_K,
+            // 1s is comfortably above the mock's response latency floor yet far
+            // below the ~30s artificial delay, so the deadline is what fires.
+            client: build_client(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_times_out_against_a_stalled_server() {
+        // A read path (recall) against a server that never responds in time must
+        // surface a typed timeout error, not hang the caller. wiremock delays
+        // the response past the client deadline.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "results": [] }))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_short_timeout(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .recall("otter", 3, None, None, None)
+            .await
+            .expect_err("a stalled recall must return a timeout error, not hang");
+        // The underlying reqwest error must be a timeout (reqwest reports it via
+        // `is_timeout()` on the chained source).
+        assert!(
+            err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+            }),
+            "expected a reqwest timeout in the error chain, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_times_out_against_a_stalled_server() {
+        // The write path (store) must be bounded too: a never-responding retain
+        // endpoint returns a typed timeout error instead of parking the turn.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "ok": true }))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_short_timeout(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .store("fact", "PURPLE-OTTER-42", MemoryCategory::Core, None)
+            .await
+            .expect_err("a stalled store must return a timeout error, not hang");
+        assert!(
+            err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+            }),
+            "expected a reqwest timeout in the error chain, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn urls_percent_encode_bank_and_id_segments() {
+        // A bank name and memory id with reserved URL bytes must be encoded as
+        // path segments so they cannot break out into extra path/query parts.
+        let mem = memory_for("https://host.test", "team/space room");
+        let recall = mem.recall_url_for("team/space room");
+        assert!(
+            recall.contains("team%2Fspace%20room") || recall.contains("team%2Fspace+room"),
+            "bank segment must be percent-encoded: {recall}"
+        );
+        assert!(
+            !recall.contains("banks/team/space"),
+            "raw slash must not leak into the path: {recall}"
+        );
     }
 }
