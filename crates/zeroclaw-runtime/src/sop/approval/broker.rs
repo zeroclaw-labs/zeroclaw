@@ -430,10 +430,15 @@ impl ApprovalBroker {
                         "cannot record approval vote for run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
                     );
                 }
+                let gate_revision = engine
+                    .get_run(run_id)
+                    .map(|run| run.revision)
+                    .unwrap_or_default();
                 // Quorum > 1: durably record this vote, then count distinct approvers
-                // FOR THE CURRENT STEP so a multi-gate run does not reuse earlier votes.
-                engine.record_gate_vote(run_id, step, &principal)?;
-                let have = engine.distinct_gate_voters(run_id, step);
+                // FOR THE CURRENT STEP PRESENTATION so a repeated gate cannot reuse
+                // votes from an earlier visit to the same step.
+                engine.record_gate_vote(run_id, step, gate_revision, &principal)?;
+                let have = engine.distinct_gate_voters(run_id, step, gate_revision);
                 if have >= need {
                     Ok(BrokerOutcome::Resolved(
                         engine.resolve_gate(run_id, decision, principal)?,
@@ -453,7 +458,8 @@ mod tests {
     use crate::sop::store::SopRunStore;
     use crate::sop::types::{
         Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
-        SopRunStatus, SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus, SopTrigger,
+        SopTriggerSource,
     };
     use std::collections::HashMap;
     use zeroclaw_config::schema::{ApprovalGroupConfig, ApprovalPolicyConfig, SopConfig};
@@ -499,6 +505,27 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+        }
+    }
+
+    fn looping_policy_sop(policy: &str) -> Sop {
+        let mut sop = policy_sop(policy);
+        sop.name = "looping-deploy".into();
+        sop.steps[1].routing = crate::sop::step_contract::StepRouting {
+            next: Some(1),
+            ..Default::default()
+        };
+        sop
+    }
+
+    fn completed_step(step_number: u32, output: serde_json::Value) -> SopStepResult {
+        SopStepResult {
+            step_number,
+            status: SopStepStatus::Completed,
+            output: output.to_string(),
+            started_at: now_iso8601(),
+            completed_at: Some(now_iso8601()),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -1010,6 +1037,125 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn quorum_votes_do_not_cross_revisited_approval_gate_presentations() {
+        let cfg = approval_cfg(&["alice", "bob"], 2);
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval: cfg,
+            ..SopConfig::default()
+        };
+        let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
+        e.set_sops_for_test(vec![looping_policy_sop("prod")]);
+        let action = e.start_run("looping-deploy", manual()).unwrap();
+        let id = match action {
+            SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected first WaitApproval, got {other:?}"),
+        };
+        assert_eq!(e.get_run(&id).map(|run| run.revision), Some(0));
+
+        let first_alice = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first_alice,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+        let first_bob = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        let BrokerOutcome::Resolved(ResolveOutcome::Resumed(step1_action)) = first_bob else {
+            panic!("expected first quorum to resolve step 1, got {first_bob:?}");
+        };
+        assert!(
+            matches!(*step1_action, SopRunAction::ExecuteStep { .. }),
+            "first quorum should resume step 1 execution: {step1_action:?}"
+        );
+
+        let step2_action = e
+            .advance_step(&id, completed_step(1, serde_json::json!({"step": 1})))
+            .expect("step 1 completes");
+        assert!(
+            matches!(step2_action, SopRunAction::ExecuteStep { .. }),
+            "step 1 should advance to step 2: {step2_action:?}"
+        );
+        let second_gate = e
+            .advance_step(&id, completed_step(2, serde_json::json!({"step": 2})))
+            .expect("step 2 loops to step 1");
+        assert!(
+            matches!(second_gate, SopRunAction::WaitApproval { .. }),
+            "step 2 should route back to approval gate step 1: {second_gate:?}"
+        );
+        assert_eq!(
+            e.get_run(&id)
+                .map(|run| (run.status, run.current_step, run.revision)),
+            Some((SopRunStatus::WaitingApproval, 1, 1)),
+            "the repeated approval gate must get a fresh presentation revision"
+        );
+
+        let second_alice = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                second_alice,
+                BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+            ),
+            "alice's second-presentation vote must not combine with bob's stale revision-0 vote: {second_alice:?}"
+        );
+        assert_eq!(
+            e.get_run(&id).map(|run| run.status),
+            Some(SopRunStatus::WaitingApproval),
+            "second gate remains waiting until a second current-revision approver votes"
+        );
+
+        let events = e.run_events(&id).unwrap_or_default();
+        let revision0_votes = events
+            .iter()
+            .filter(|event| {
+                event.kind == "gate_vote"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                    && event
+                        .payload
+                        .get("gate_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(0)
+            })
+            .count();
+        let revision1_votes = events
+            .iter()
+            .filter(|event| {
+                event.kind == "gate_vote"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                    && event
+                        .payload
+                        .get("gate_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(1)
+            })
+            .count();
+        assert_eq!(
+            revision0_votes, 2,
+            "first gate should have two revision-0 votes"
+        );
+        assert_eq!(
+            revision1_votes, 1,
+            "second gate should have only alice's revision-1 vote"
+        );
+    }
+
     /// Delegates to an in-memory store but fails every `save_run`, to prove a
     /// quorum vote cannot be recorded while a park's snapshot cannot be durably
     /// persisted (mirrors `crate::sop::engine::tests::FailingSaveStore`).
@@ -1177,7 +1323,7 @@ mod tests {
             "the vote must be refused while the park's snapshot is not yet durably persisted"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1),
+            e.distinct_gate_voters(&id, 1, 0),
             0,
             "no gate_vote row must be recorded for a refused vote attempt"
         );
@@ -1229,7 +1375,7 @@ mod tests {
             "the agent principal must be rejected under OutOfBandRequired, got {out:?}"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1),
+            e.distinct_gate_voters(&id, 1, 0),
             0,
             "no gate_vote row must be recorded for a principal approval_mode rejects"
         );

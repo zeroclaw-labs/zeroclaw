@@ -289,6 +289,7 @@ impl SopEngine {
             if let Err(e) = self.record_gate_event(GateLedgerEntry {
                 run_id: run_id.to_string(),
                 step,
+                gate_revision: Some(checkpoint_revision),
                 checkpoint_revision: Some(checkpoint_revision),
                 decision_identity: checkpoint_decision_identity.clone(),
                 kind: GateEventKind::Resolved,
@@ -1643,9 +1644,21 @@ impl SopEngine {
         // approval_mode-conditional escalation), so the mode param is gone.
         let action = resolve_step_action(sop, &step, run_id.to_string(), context);
         let parked_for_approval = matches!(action, SopRunAction::WaitApproval { .. });
+        let has_prior_gate_presentation = parked_for_approval
+            && self.run_events(run_id).is_ok_and(|events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event.kind.as_str(),
+                        "gate_vote" | "gate_resolved" | "gate_escalated" | "gate_timed_out"
+                    )
+                })
+            });
         if parked_for_approval && let Some(run) = self.active_runs.get_mut(run_id) {
             run.status = SopRunStatus::WaitingApproval;
             run.waiting_since = Some(now_iso8601());
+            if run.revision > 0 || has_prior_gate_presentation {
+                run.revision += 1;
+            }
         }
 
         // A1: free the exec slot while the run waits on a human - but only AFTER
@@ -2171,6 +2184,7 @@ impl SopEngine {
         if let Err(e) = self.record_gate_event(super::approval::GateLedgerEntry {
             run_id: run_id.to_string(),
             step: checkpoint_step,
+            gate_revision: Some(checkpoint_revision),
             checkpoint_revision: Some(checkpoint_revision),
             decision_identity,
             kind: super::approval::GateEventKind::Resolved,
@@ -3592,9 +3606,10 @@ impl SopEngine {
         &self,
         run_id: &str,
         step: u32,
+        gate_revision: u32,
         principal: &super::approval::ApprovalPrincipal,
     ) -> Result<(), StoreError> {
-        self.record_gate_vote_scoped(run_id, step, None, None, None, principal)
+        self.record_gate_vote_scoped(run_id, step, Some(gate_revision), None, None, principal)
     }
 
     /// Record a quorum vote for a deterministic checkpoint presentation. Checkpoint
@@ -3623,7 +3638,7 @@ impl SopEngine {
         &self,
         run_id: &str,
         step: u32,
-        checkpoint_revision: Option<u32>,
+        gate_revision: Option<u32>,
         decision_label: Option<&str>,
         decision_identity: Option<&str>,
         principal: &super::approval::ApprovalPrincipal,
@@ -3633,11 +3648,17 @@ impl SopEngine {
             "source": principal.source_label(),
         });
         if let Some(object) = payload.as_object_mut() {
-            if let Some(revision) = checkpoint_revision {
+            if let Some(revision) = gate_revision {
                 object.insert(
-                    "checkpoint_revision".to_string(),
+                    "gate_revision".to_string(),
                     serde_json::Value::Number(revision.into()),
                 );
+                if decision_identity.is_some() {
+                    object.insert(
+                        "checkpoint_revision".to_string(),
+                        serde_json::Value::Number(revision.into()),
+                    );
+                }
             }
             if let Some(label) = decision_label {
                 object.insert(
@@ -3674,8 +3695,13 @@ impl SopEngine {
     /// not carry step-1 votes into step 2; the voter key is source-qualified, so a
     /// repeat vote by the same identity on the same source counts once. Returns 0 on
     /// a store error (fail-closed: an unreadable ledger cannot satisfy a quorum).
-    pub(crate) fn distinct_gate_voters(&self, run_id: &str, step: u32) -> usize {
-        self.distinct_gate_voters_scoped(run_id, step, None, None)
+    pub(crate) fn distinct_gate_voters(
+        &self,
+        run_id: &str,
+        step: u32,
+        gate_revision: u32,
+    ) -> usize {
+        self.distinct_gate_voters_scoped(run_id, step, Some(gate_revision), None)
     }
 
     /// Count distinct checkpoint voters for exactly one gate presentation and one
@@ -3700,7 +3726,7 @@ impl SopEngine {
         &self,
         run_id: &str,
         step: u32,
-        checkpoint_revision: Option<u32>,
+        gate_revision: Option<u32>,
         decision_identity: Option<&str>,
     ) -> usize {
         let Ok(events) = self.store.list_events(run_id) else {
@@ -3713,17 +3739,24 @@ impl SopEngine {
             {
                 continue;
             }
-            let scope_matches = match (checkpoint_revision, decision_identity) {
+            let event_revision = ev
+                .payload
+                .get("gate_revision")
+                .or_else(|| ev.payload.get("checkpoint_revision"))
+                .and_then(|r| r.as_u64());
+            let scope_matches = match (gate_revision, decision_identity) {
                 (Some(revision), Some(identity)) => {
-                    ev.payload
-                        .get("checkpoint_revision")
-                        .and_then(|r| r.as_u64())
-                        == Some(u64::from(revision))
+                    event_revision == Some(u64::from(revision))
                         && ev.payload.get("decision_identity").and_then(|i| i.as_str())
                             == Some(identity)
                 }
+                (Some(revision), None) => {
+                    event_revision == Some(u64::from(revision))
+                        && ev.payload.get("decision_identity").is_none()
+                }
                 (None, None) => {
-                    ev.payload.get("checkpoint_revision").is_none()
+                    ev.payload.get("gate_revision").is_none()
+                        && ev.payload.get("checkpoint_revision").is_none()
                         && ev.payload.get("decision_identity").is_none()
                 }
                 _ => false,
@@ -5720,51 +5753,63 @@ mod tests {
 
     #[test]
     fn gate_votes_are_per_step_and_canonical_per_subject() {
-        // Broker quorum reads distinct_gate_voters(run_id, step). Votes are scoped to
-        // the current step (a two-gate SOP does not reuse step-1 votes), and the voter
-        // key is the CANONICAL subject: HTTP and WS share the paired credential, so the
-        // same subject over both transports counts ONCE (cannot inflate quorum), while
-        // a genuinely different source (CLI) is a distinct voter.
+        // Broker quorum reads distinct_gate_voters(run_id, step, revision). Votes are
+        // scoped to the current step presentation (a repeated gate does not reuse
+        // earlier votes), and the voter key is the CANONICAL subject: HTTP and WS
+        // share the paired credential, so the same subject over both transports counts
+        // ONCE (cannot inflate quorum), while a genuinely different source (CLI) is a
+        // distinct voter.
         use crate::sop::approval::ApprovalPrincipal;
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let engine = engine_with_sops(vec![]).with_store(store);
 
         // Same subject "alice" over HTTP then WS: collapses to gateway:alice.
         engine
-            .record_gate_vote("run-1", 1, &ApprovalPrincipal::http(Some("alice".into())))
+            .record_gate_vote(
+                "run-1",
+                1,
+                0,
+                &ApprovalPrincipal::http(Some("alice".into())),
+            )
             .unwrap();
         engine
             .record_gate_vote(
                 "run-1",
                 1,
+                0,
                 &ApprovalPrincipal::ws("c".into(), Some("alice".into())),
             )
             .unwrap();
         // A repeat over HTTP: still the same canonical voter.
         engine
-            .record_gate_vote("run-1", 1, &ApprovalPrincipal::http(Some("alice".into())))
+            .record_gate_vote(
+                "run-1",
+                1,
+                0,
+                &ApprovalPrincipal::http(Some("alice".into())),
+            )
             .unwrap();
         // A CLI actor is a genuinely distinct source (cli:bob).
         engine
-            .record_gate_vote("run-1", 1, &ApprovalPrincipal::cli(Some("bob".into())))
+            .record_gate_vote("run-1", 1, 0, &ApprovalPrincipal::cli(Some("bob".into())))
             .unwrap();
         // A vote on step 2 is a separate tally.
         engine
-            .record_gate_vote("run-1", 2, &ApprovalPrincipal::cli(Some("carol".into())))
+            .record_gate_vote("run-1", 2, 0, &ApprovalPrincipal::cli(Some("carol".into())))
             .unwrap();
 
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 1),
+            engine.distinct_gate_voters("run-1", 1, 0),
             2,
             "gateway:alice (http+ws collapsed) + cli:bob = 2 distinct step-1 voters"
         );
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 2),
+            engine.distinct_gate_voters("run-1", 2, 0),
             1,
             "step-2 quorum does not include step-1 voters"
         );
         assert_eq!(
-            engine.distinct_gate_voters("run-1", 3),
+            engine.distinct_gate_voters("run-1", 3, 0),
             0,
             "no votes recorded for step 3"
         );

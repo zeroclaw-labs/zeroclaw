@@ -118,9 +118,14 @@ pub fn resolve_gate(
     //    resolution and leaves the gate untouched: the gate cannot clear or deny
     //    without its audit-of-record row. (The store ledger is the only audit
     //    source now that the legacy Memory approval audit is gone.)
+    let gate_revision = engine
+        .get_run(run_id)
+        .map(|run| run.revision)
+        .unwrap_or_default();
     if let Err(e) = engine.record_gate_event(GateLedgerEntry {
         run_id: run_id.to_string(),
         step,
+        gate_revision: Some(gate_revision),
         checkpoint_revision: None,
         decision_identity: None,
         kind: GateEventKind::Resolved,

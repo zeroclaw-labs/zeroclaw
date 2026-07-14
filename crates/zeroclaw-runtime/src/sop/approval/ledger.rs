@@ -42,6 +42,7 @@ impl GateEventKind {
 pub struct GateLedgerEntry {
     pub run_id: String,
     pub step: u32,
+    pub gate_revision: Option<u32>,
     pub checkpoint_revision: Option<u32>,
     pub decision_identity: Option<String>,
     pub kind: GateEventKind,
@@ -81,6 +82,9 @@ impl GateLedgerEntry {
             "decision": decision_label,
         });
         if let Some(object) = payload.as_object_mut() {
+            if let Some(revision) = self.gate_revision {
+                object.insert("gate_revision".into(), serde_json::json!(revision));
+            }
             if let Some(revision) = self.checkpoint_revision {
                 object.insert("checkpoint_revision".into(), serde_json::json!(revision));
             }
@@ -109,6 +113,7 @@ mod tests {
         let entry = GateLedgerEntry {
             run_id: "r1".into(),
             step: 2,
+            gate_revision: None,
             checkpoint_revision: None,
             decision_identity: None,
             kind: GateEventKind::Resolved,
@@ -130,6 +135,7 @@ mod tests {
         let entry = GateLedgerEntry {
             run_id: "r1".into(),
             step: 1,
+            gate_revision: None,
             checkpoint_revision: None,
             decision_identity: None,
             kind: GateEventKind::Resolved,
