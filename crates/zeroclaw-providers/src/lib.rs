@@ -1969,7 +1969,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("baseten", "Baseten", false),
             ("nscale", "Nscale", false),
             ("anyscale", "Anyscale", false),
-            ("nebius", "Nebius AI Studio", false),
+            ("nebius", "Nebius Token Factory", false),
             ("friendli", "Friendli AI", false),
             ("lepton", "Lepton AI", false),
         ],
