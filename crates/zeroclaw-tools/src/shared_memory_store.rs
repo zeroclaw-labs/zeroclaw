@@ -183,6 +183,25 @@ impl Tool for SharedMemoryStoreTool {
             Some(other) => MemoryCategory::Custom(other.to_string()),
         };
 
+        // Authority gate at the target-owned boundary: the tier write tool must
+        // itself be permitted by this agent's risk profile. The agent loop
+        // already filters the toolset by `allowed_tools`/`excluded_tools`, but
+        // shared/system writes cross an agent's private boundary (system writes
+        // are admin/system-tier authority), so we re-check here rather than
+        // trusting only the dispatch-site filter. A denied name (e.g.
+        // `system_memory_store` excluded for a non-admin profile) is refused
+        // even if the tool were reached through a path that skipped the filter.
+        if !self.security.is_tool_allowed(self.name()) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(Self::tool_msg_with_args(
+                    "tool-shared-memory-store-error-not-authorized",
+                    &[("tier", self.tier.tier_label())],
+                )),
+            });
+        }
+
         // Same write gate as the private memory tool: shared/system writes are
         // an Act and must respect read-only / rate-limit posture.
         if let Err(error) = self
@@ -496,6 +515,72 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("read-only mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn system_write_denied_when_tool_excluded_by_profile() {
+        // Authority gate: a profile that excludes `system_memory_store` must
+        // not be able to write the system tier even though the backend supports
+        // it and autonomy would otherwise permit the Act. This is the
+        // admin/system-tier authority boundary enforced target-side.
+        let mem = hindsight_mem(
+            "http://127.0.0.1:1",
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+        );
+        let non_admin = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["system_memory_store".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = SharedMemoryStoreTool::new_system(mem, non_admin);
+        let result = tool
+            .execute(serde_json::json!({"key": "k", "content": "v"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "excluded system write must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not authorized")
+                || result.error.as_deref().unwrap_or("").contains("authorized"),
+            "expected an authorization error, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_write_allowed_when_only_system_excluded() {
+        // Excluding the system tool must NOT block the shared tool: the two
+        // tiers are gated independently by name.
+        let mem = hindsight_mem(
+            "http://127.0.0.1:1",
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+        );
+        let policy = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["system_memory_store".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        // The shared tool is still allowed; it fails only later at the network
+        // (unreachable mock host) rather than at the authority gate.
+        let tool = SharedMemoryStoreTool::new_shared(mem, policy);
+        let result = tool
+            .execute(serde_json::json!({"key": "k", "content": "v"}))
+            .await
+            .unwrap();
+        // Not blocked by authorization: the error, if any, must not be the
+        // authorization refusal.
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not authorized"),
+            "shared write must not be blocked by the system exclusion: {:?}",
+            result.error
         );
     }
 

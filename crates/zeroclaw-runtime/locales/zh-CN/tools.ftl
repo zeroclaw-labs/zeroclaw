@@ -98,6 +98,7 @@ tool-shared-memory-store-error-missing-key = 缺少 'key' 参数
 tool-shared-memory-store-error-missing-content = 缺少 'content' 参数
 tool-shared-memory-store-error-not-available = 此后端不提供 { $tier } 记忆
 tool-shared-memory-store-error-no-bank = 未配置 { $tier } 存储库
+tool-shared-memory-store-error-not-authorized = 此代理无权写入 { $tier } 记忆
 tool-shared-memory-store-success = 已存储 { $tier } 记忆：{ $key }
 tool-shared-memory-store-error-failed = 存储 { $tier } 记忆失败：{ $error }
 tool-microsoft365 = Microsoft 365 集成：通过 Microsoft Graph API 管理 Outlook 邮件、Teams 消息、Calendar 事件、OneDrive 文件和 SharePoint 搜索
