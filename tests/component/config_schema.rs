@@ -51,7 +51,9 @@ foo = "bar"
 "#;
     let unknown = Config::unknown_keys_for_version(raw, Some(3));
     assert!(
-        !unknown.iter().any(|k| k == "composio" || k == "notion" || k == "jira"),
+        !unknown
+            .iter()
+            .any(|k| k == "composio" || k == "notion" || k == "jira"),
         "V3-removed sections must not warn during migration, got: {unknown:?}",
     );
     assert!(

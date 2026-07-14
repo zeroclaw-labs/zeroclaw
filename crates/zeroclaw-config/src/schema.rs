@@ -16390,8 +16390,8 @@ impl Config {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let suppress_migrated = source_version
-            .is_some_and(|v| v != crate::migration::CURRENT_SCHEMA_VERSION);
+        let suppress_migrated =
+            source_version.is_some_and(|v| v != crate::migration::CURRENT_SCHEMA_VERSION);
         static DEFAULTS: OnceLock<toml::Table> = OnceLock::new();
         let defaults = DEFAULTS.get_or_init(|| {
             toml::to_string(&Config::default())
@@ -16407,9 +16407,7 @@ impl Config {
                 if crate::migration::V1_LEGACY_KEYS.contains(&key.as_str()) {
                     return false;
                 }
-                if suppress_migrated
-                    && v3::V4_DROPPED_TOP_LEVEL_KEYS.contains(&key.as_str())
-                {
+                if suppress_migrated && v3::V4_DROPPED_TOP_LEVEL_KEYS.contains(&key.as_str()) {
                     return false;
                 }
                 let mut t = toml::Table::new();
