@@ -503,6 +503,7 @@ pub async fn run(
                 &config.memory,
                 &config.embedding_routes,
                 config.resolve_active_storage(),
+                config.resolve_active_enricher(),
                 &config.data_dir,
                 None,
                 Some(&config.providers.models),
@@ -1121,6 +1122,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 &config.memory,
                 &config.embedding_routes,
                 config.resolve_active_storage(),
+                config.resolve_active_enricher(),
                 &config.data_dir,
                 config
                     .model_provider_for_agent(&agent_alias)

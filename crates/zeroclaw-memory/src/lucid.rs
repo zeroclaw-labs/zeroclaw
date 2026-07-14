@@ -1,94 +1,104 @@
+#[cfg(all(test, unix))]
+use super::enriched::EnrichmentPolicy;
+use super::enriched::{
+    CleanupSupport, EnrichedMemory, EnricherCapabilities, EnrichmentCleanupRequest,
+    EnrichmentRecallRequest, EnrichmentStoreRequest, MemoryEnricher, RecallScope, RecallSupport,
+    ResultKind,
+};
+#[cfg(all(test, unix))]
 use super::sqlite::SqliteMemory;
-use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
+use super::traits::{MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 use chrono::Local;
-use parking_lot::Mutex;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
+use zeroclaw_api::attribution::MemoryKind;
+use zeroclaw_config::schema::LucidEnrichmentConfig;
 
-pub struct LucidMemory {
-    alias: String,
-    local: SqliteMemory,
+/// External-process connector for the `lucid-memory` command-line tool.
+pub struct LucidConnector {
     lucid_cmd: String,
     token_budget: usize,
     workspace_dir: PathBuf,
     recall_timeout: Duration,
     store_timeout: Duration,
-    local_hit_threshold: usize,
-    failure_cooldown: Duration,
-    last_failure_at: Mutex<Option<Instant>>,
 }
 
-impl LucidMemory {
+/// SQLite-authoritative memory enriched by Lucid process recall.
+pub type LucidEnrichedMemory = EnrichedMemory<LucidConnector>;
+
+impl LucidConnector {
     const DEFAULT_LUCID_CMD: &'static str = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    // Lucid CLI cold start can exceed 120ms on slower machines, which causes
-    // avoidable fallback to local-only memory and premature cooldown.
     const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
     const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
-    const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
-    const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
-    pub fn new(alias: &str, workspace_dir: &Path, local: SqliteMemory) -> Self {
+    pub(crate) fn new(workspace_dir: &Path) -> Self {
         Self {
-            alias: alias.to_string(),
-            local,
             lucid_cmd: Self::DEFAULT_LUCID_CMD.to_string(),
             token_budget: Self::DEFAULT_TOKEN_BUDGET,
             workspace_dir: workspace_dir.to_path_buf(),
             recall_timeout: Duration::from_millis(Self::DEFAULT_RECALL_TIMEOUT_MS),
             store_timeout: Duration::from_millis(Self::DEFAULT_STORE_TIMEOUT_MS),
-            local_hit_threshold: Self::DEFAULT_LOCAL_HIT_THRESHOLD,
-            failure_cooldown: Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
-            last_failure_at: Mutex::new(None),
         }
     }
 
-    #[cfg(all(test, unix))]
-    #[allow(clippy::too_many_arguments)]
-    fn with_options(
-        alias: &str,
+    pub(crate) fn from_config(
         workspace_dir: &Path,
-        local: SqliteMemory,
+        config: &LucidEnrichmentConfig,
+    ) -> anyhow::Result<Self> {
+        fn configured_timeout(
+            value: Option<u64>,
+            default_ms: u64,
+            field: &str,
+        ) -> anyhow::Result<Duration> {
+            let millis = value.unwrap_or(default_ms);
+            if millis == 0 {
+                anyhow::bail!("memory_enrichment.lucid.{field} must be greater than zero");
+            }
+            Ok(Duration::from_millis(millis))
+        }
+
+        let lucid_cmd = config
+            .binary_path
+            .as_ref()
+            .filter(|path| !path.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string());
+        Ok(Self {
+            lucid_cmd,
+            token_budget: Self::DEFAULT_TOKEN_BUDGET,
+            workspace_dir: workspace_dir.to_path_buf(),
+            recall_timeout: configured_timeout(
+                config.recall_timeout_ms,
+                Self::DEFAULT_RECALL_TIMEOUT_MS,
+                "recall_timeout_ms",
+            )?,
+            store_timeout: configured_timeout(
+                config.store_timeout_ms,
+                Self::DEFAULT_STORE_TIMEOUT_MS,
+                "store_timeout_ms",
+            )?,
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_options(
+        workspace_dir: &Path,
         lucid_cmd: String,
         token_budget: usize,
-        local_hit_threshold: usize,
         recall_timeout: Duration,
         store_timeout: Duration,
-        failure_cooldown: Duration,
     ) -> Self {
         Self {
-            alias: alias.to_string(),
-            local,
             lucid_cmd,
             token_budget,
             workspace_dir: workspace_dir.to_path_buf(),
             recall_timeout,
             store_timeout,
-            local_hit_threshold: local_hit_threshold.max(1),
-            failure_cooldown,
-            last_failure_at: Mutex::new(None),
         }
-    }
-
-    fn in_failure_cooldown(&self) -> bool {
-        let guard = self.last_failure_at.lock();
-        guard
-            .as_ref()
-            .is_some_and(|last| last.elapsed() < self.failure_cooldown)
-    }
-
-    fn mark_failure_now(&self) {
-        let mut guard = self.last_failure_at.lock();
-        *guard = Some(Instant::now());
-    }
-
-    fn clear_failure(&self) {
-        let mut guard = self.last_failure_at.lock();
-        *guard = None;
     }
 
     fn to_lucid_type(category: &MemoryCategory) -> &'static str {
@@ -114,36 +124,6 @@ impl LucidMemory {
         }
     }
 
-    fn merge_results(
-        primary_results: Vec<MemoryEntry>,
-        secondary_results: Vec<MemoryEntry>,
-        limit: usize,
-    ) -> Vec<MemoryEntry> {
-        if limit == 0 {
-            return Vec::new();
-        }
-
-        let mut merged = Vec::new();
-        let mut seen = HashSet::new();
-
-        for entry in primary_results.into_iter().chain(secondary_results) {
-            let signature = format!(
-                "{}\u{0}{}",
-                entry.key.to_lowercase(),
-                entry.content.to_lowercase()
-            );
-
-            if seen.insert(signature) {
-                merged.push(entry);
-                if merged.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        merged
-    }
-
     fn parse_lucid_context(raw: &str) -> Vec<MemoryEntry> {
         let mut in_context_block = false;
         let mut entries = Vec::new();
@@ -166,11 +146,9 @@ impl LucidMemory {
             let Some(rest) = line.strip_prefix("- [") else {
                 continue;
             };
-
             let Some((label, content_part)) = rest.split_once(']') else {
                 continue;
             };
-
             let content = content_part.trim();
             if content.is_empty() {
                 continue;
@@ -199,30 +177,32 @@ impl LucidMemory {
         entries
     }
 
-    async fn run_lucid_command_raw(
-        lucid_cmd: &str,
+    async fn run_command(
+        &self,
         args: &[String],
         timeout_window: Duration,
     ) -> anyhow::Result<String> {
-        let mut cmd = Command::new(lucid_cmd);
-        cmd.args(args);
+        let mut command = Command::new(&self.lucid_cmd);
+        command.args(args).kill_on_drop(true);
 
-        let output = timeout(timeout_window, cmd.output()).await.map_err(|_| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "command": lucid_cmd,
-                        "timeout_ms": timeout_window.as_millis() as u64,
-                    })),
-                "lucid command timed out"
-            );
-            anyhow::Error::msg(format!(
-                "lucid command timed out after {}ms",
-                timeout_window.as_millis()
-            ))
-        })??;
+        let output = timeout(timeout_window, command.output())
+            .await
+            .map_err(|_| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": self.lucid_cmd,
+                            "timeout_ms": timeout_window.as_millis() as u64
+                        })),
+                    "lucid command timed out"
+                );
+                anyhow::Error::msg(format!(
+                    "lucid command timed out after {}ms",
+                    timeout_window.as_millis()
+                ))
+            })??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -232,21 +212,12 @@ impl LucidMemory {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    async fn run_lucid_command(
-        &self,
-        args: &[String],
-        timeout_window: Duration,
-    ) -> anyhow::Result<String> {
-        Self::run_lucid_command_raw(&self.lucid_cmd, args, timeout_window).await
-    }
-
     fn build_store_args(&self, key: &str, content: &str, category: &MemoryCategory) -> Vec<String> {
-        let payload = format!("{key}: {content}");
         vec![
             "store".to_string(),
-            payload,
+            format!("{key}: {content}"),
             format!("--type={}", Self::to_lucid_type(category)),
-            format!("--project={}", self.workspace_dir.display().to_string()),
+            format!("--project={}", self.workspace_dir.display()),
         ]
     }
 
@@ -255,289 +226,83 @@ impl LucidMemory {
             "context".to_string(),
             query.to_string(),
             format!("--budget={}", self.token_budget),
-            format!("--project={}", self.workspace_dir.display().to_string()),
+            format!("--project={}", self.workspace_dir.display()),
         ]
     }
+}
 
-    async fn sync_to_lucid_async(&self, key: &str, content: &str, category: &MemoryCategory) {
-        let args = self.build_store_args(key, content, category);
-        if let Err(error) = self.run_lucid_command(&args, self.store_timeout).await {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(
-                        ::serde_json::json!({"command": self.lucid_cmd, "error": format!("{}", error)})
-                    ),
-                "Lucid store sync failed; sqlite remains authoritative"
-            );
-        }
-    }
-
-    async fn recall_from_lucid(&self, query: &str) -> anyhow::Result<Vec<MemoryEntry>> {
-        let args = self.build_recall_args(query);
-        let output = self.run_lucid_command(&args, self.recall_timeout).await?;
-        Ok(Self::parse_lucid_context(&output))
-    }
-
-    /// Dimensions of the underlying local SQLite embedder (0 = Noop). Lets
-    /// callers confirm a live embedder refresh reached the local backend
-    pub fn embedder_dimensions(&self) -> usize {
-        self.local.embedder_dimensions()
+#[cfg(all(test, unix))]
+impl EnrichedMemory<LucidConnector> {
+    #[allow(clippy::too_many_arguments)]
+    fn with_options(
+        alias: &str,
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        lucid_cmd: String,
+        token_budget: usize,
+        local_hit_threshold: usize,
+        recall_timeout: Duration,
+        store_timeout: Duration,
+        failure_cooldown: Duration,
+    ) -> Self {
+        Self::from_parts(
+            alias,
+            local,
+            LucidConnector::with_options(
+                workspace_dir,
+                lucid_cmd,
+                token_budget,
+                recall_timeout,
+                store_timeout,
+            ),
+            EnrichmentPolicy::new(local_hit_threshold, failure_cooldown),
+        )
     }
 }
 
 #[async_trait]
-impl Memory for LucidMemory {
-    fn name(&self) -> &str {
+impl MemoryEnricher for LucidConnector {
+    fn name(&self) -> &'static str {
         "lucid"
     }
 
-    fn refresh_embedder(
-        &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
-    ) {
-        // Lucid delegates all local storage/embedding to the wrapped SQLite
-        // backend, so forward the refresh there Without this, a
-        // Lucid-backed handle (including the install-wide RPC handle when
-        // `backend = lucid`) would keep a stale embedder.
-        self.local
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+    fn attribution_kind(&self) -> MemoryKind {
+        MemoryKind::Lucid
     }
 
-    async fn store(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.local
-            .store(key, content, category.clone(), session_id)
-            .await?;
-        self.sync_to_lucid_async(key, content, &category).await;
+    fn capabilities(&self) -> EnricherCapabilities {
+        EnricherCapabilities {
+            result_kind: ResultKind::DerivedContext,
+            recall_scope: RecallScope::UnscopedOnly,
+            recall_support: RecallSupport::SemanticAndRecent,
+            cleanup_support: CleanupSupport::None,
+        }
+    }
+
+    async fn store(&self, request: EnrichmentStoreRequest<'_>) -> anyhow::Result<()> {
+        let args = self.build_store_args(request.key, request.content, request.category);
+        self.run_command(&args, self.store_timeout).await?;
         Ok(())
     }
 
     async fn recall(
         &self,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
+        request: EnrichmentRecallRequest<'_>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let since_dt = since
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(
-                            ::serde_json::json!({"field": "since", "error": format!("{}", e)})
-                        ),
-                    "recall window bound rejected"
-                );
-                anyhow::Error::msg(format!("invalid 'since' date (expected RFC 3339): {e}"))
-            })?;
-        let until_dt = until
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(
-                            ::serde_json::json!({"field": "until", "error": format!("{}", e)})
-                        ),
-                    "recall window bound rejected"
-                );
-                anyhow::Error::msg(format!("invalid 'until' date (expected RFC 3339): {e}"))
-            })?;
-        if let (Some(s), Some(u)) = (&since_dt, &until_dt)
-            && s >= u
-        {
-            anyhow::bail!("'since' must be before 'until'");
-        }
-
-        let recall_query = normalize_recent_recall_query(query);
-
-        let local_results = self
-            .local
-            .recall(recall_query, limit, session_id, since, until)
-            .await?;
-        if limit == 0
-            || local_results.len() >= limit
-            || local_results.len() >= self.local_hit_threshold
-        {
-            return Ok(local_results);
-        }
-
-        if self.in_failure_cooldown() {
-            return Ok(local_results);
-        }
-
-        match self.recall_from_lucid(recall_query).await {
-            Ok(lucid_results) if !lucid_results.is_empty() => {
-                self.clear_failure();
-                let merged = Self::merge_results(local_results, lucid_results, limit);
-                let filtered: Vec<MemoryEntry> = merged
-                    .into_iter()
-                    .filter(|e| {
-                        if let Some(ref s) = since_dt
-                            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
-                            && ts < *s
-                        {
-                            return false;
-                        }
-                        if let Some(ref u) = until_dt
-                            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
-                            && ts > *u
-                        {
-                            return false;
-                        }
-                        true
-                    })
-                    .collect();
-                Ok(filtered)
-            }
-            Ok(_) => {
-                self.clear_failure();
-                Ok(local_results)
-            }
-            Err(error) => {
-                self.mark_failure_now();
-                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"command": self.lucid_cmd, "error": format!("{}", error)})), "Lucid context unavailable; using local sqlite results");
-                Ok(local_results)
-            }
-        }
+        let args = self.build_recall_args(request.query);
+        let output = self.run_command(&args, self.recall_timeout).await?;
+        Ok(Self::parse_lucid_context(&output))
     }
 
-    async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        self.local.get(key).await
-    }
-
-    async fn get_for_agent(
-        &self,
-        key: &str,
-        agent_id: &str,
-    ) -> anyhow::Result<Option<MemoryEntry>> {
-        self.local.get_for_agent(key, agent_id).await
-    }
-
-    async fn list(
-        &self,
-        category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.local.list(category, session_id).await
-    }
-
-    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        self.local.forget(key).await
-    }
-
-    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
-        self.local.forget_for_agent(key, agent_id).await
-    }
-
-    async fn purge_session_for_agent(
-        &self,
-        session_id: &str,
-        agent_id: &str,
-    ) -> anyhow::Result<usize> {
-        self.local
-            .purge_session_for_agent(session_id, agent_id)
-            .await
-    }
-
-    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
-        self.local.purge_agent(agent_alias).await
-    }
-
-    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.local.export_agent(agent_alias).await
-    }
-
-    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
-        // The remote Lucid daemon has no agent_id concept; alias→UUID lives in
-        // the local SQLite mirror, so rename is a local update (mirrors purge).
-        self.local.rename_agent(from, to).await
-    }
-
-    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
-        // Attribution lives only on the local SQLite mirror (see rename_agent).
-        self.local.count_agent(agent_alias).await
-    }
-
-    async fn count(&self) -> anyhow::Result<usize> {
-        self.local.count().await
-    }
-
-    async fn health_check(&self) -> bool {
-        self.local.health_check().await
-    }
-
-    async fn store_with_agent(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-        namespace: Option<&str>,
-        importance: Option<f64>,
-        agent_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        // Lucid composes a local SqliteMemory + a remote Lucid daemon; the
-        // remote side has no agent_id concept, so the attribution lives
-        // only on the local SQLite mirror. The async sync to the daemon
-        // continues unchanged.
-        self.local
-            .store_with_agent(
-                key,
-                content,
-                category.clone(),
-                session_id,
-                namespace,
-                importance,
-                agent_id,
-            )
-            .await?;
-        self.sync_to_lucid_async(key, content, &category).await;
-        Ok(())
-    }
-
-    async fn recall_for_agents(
-        &self,
-        allowed_agent_ids: &[&str],
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        // Lucid's remote-daemon recall has no agent_id awareness; the
-        // cross-agent allowlist is enforced on the local SQLite mirror
-        // only. If the local hits clear the threshold the remote leg
-        // never runs (matching `recall`'s short-circuit semantics).
-        self.local
-            .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
-            .await
-    }
-
-    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
-        self.local.ensure_agent_uuid(alias).await
+    async fn cleanup(&self, _request: EnrichmentCleanupRequest<'_>) -> anyhow::Result<()> {
+        anyhow::bail!("Lucid does not support agent-scoped cleanup")
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::traits::Memory;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -546,7 +311,7 @@ mod tests {
     fn refresh_embedder_forwards_to_local_sqlite() {
         let tmp = TempDir::new().unwrap();
         let local = SqliteMemory::new("test", tmp.path()).unwrap();
-        let lucid = LucidMemory::new("lucid", tmp.path(), local);
+        let lucid = crate::build_lucid_enriched_memory(tmp.path(), local, None).unwrap();
         assert_eq!(lucid.embedder_dimensions(), 0);
 
         Memory::refresh_embedder(
@@ -557,11 +322,42 @@ mod tests {
             1536,
         );
 
-        assert_eq!(
-            lucid.embedder_dimensions(),
-            1536,
-            "LucidMemory must forward refresh_embedder to the local SQLite backend"
-        );
+        assert_eq!(lucid.embedder_dimensions(), 1536);
+    }
+
+    #[test]
+    fn connector_consumes_typed_binary_and_deadlines() {
+        let tmp = TempDir::new().unwrap();
+        let config = LucidEnrichmentConfig {
+            binary_path: Some("/opt/lucid/bin/lucid".to_string()),
+            recall_timeout_ms: Some(2500),
+            store_timeout_ms: Some(3000),
+        };
+
+        let connector = LucidConnector::from_config(tmp.path(), &config).unwrap();
+        assert_eq!(connector.lucid_cmd, "/opt/lucid/bin/lucid");
+        assert_eq!(connector.recall_timeout, Duration::from_millis(2500));
+        assert_eq!(connector.store_timeout, Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn connector_rejects_zero_deadlines() {
+        let tmp = TempDir::new().unwrap();
+        for config in [
+            LucidEnrichmentConfig {
+                recall_timeout_ms: Some(0),
+                ..LucidEnrichmentConfig::default()
+            },
+            LucidEnrichmentConfig {
+                store_timeout_ms: Some(0),
+                ..LucidEnrichmentConfig::default()
+            },
+        ] {
+            let error = LucidConnector::from_config(tmp.path(), &config)
+                .err()
+                .expect("zero deadline must fail");
+            assert!(error.to_string().contains("must be greater than zero"));
+        }
     }
 
     fn write_fake_lucid_script(dir: &Path) -> String {
@@ -590,9 +386,9 @@ exit 1
 "#;
 
         fs::write(&script_path, script).unwrap();
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
         script_path.display().to_string()
     }
 
@@ -607,7 +403,6 @@ if [ "${1:-}" = "store" ]; then
 fi
 
 if [ "${1:-}" = "context" ]; then
-  # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
   sleep 0.2
   cat <<'EOF'
 <lucid-context>
@@ -622,15 +417,15 @@ exit 1
 "#;
 
         fs::write(&script_path, script).unwrap();
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
         script_path.display().to_string()
     }
 
     fn write_probe_lucid_script(dir: &Path, marker_path: &Path) -> String {
         let script_path = dir.join("probe-lucid.sh");
-        let marker = marker_path.display().to_string();
+        let marker = marker_path.display();
         let script = format!(
             r#"#!/bin/sh
 set -eu
@@ -656,19 +451,49 @@ exit 1
         );
 
         fs::write(&script_path, script).unwrap();
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
         script_path.display().to_string()
     }
 
-    fn test_memory(workspace: &Path, cmd: String) -> LucidMemory {
+    fn write_failing_lucid_script(dir: &Path, marker_path: &Path) -> String {
+        let script_path = dir.join("failing-lucid.sh");
+        let marker = marker_path.display();
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+
+if [ "${{1:-}}" = "store" ]; then
+  echo '{{"success":true,"id":"mem_store"}}'
+  exit 0
+fi
+
+if [ "${{1:-}}" = "context" ]; then
+  printf 'context\n' >> "{marker}"
+  echo "simulated lucid failure" >&2
+  exit 1
+fi
+
+echo "unsupported command" >&2
+exit 1
+"#
+        );
+
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        script_path.display().to_string()
+    }
+
+    fn test_memory(workspace: &Path, command: String) -> LucidEnrichedMemory {
         let sqlite = SqliteMemory::new("sqlite", workspace).unwrap();
-        LucidMemory::with_options(
+        LucidEnrichedMemory::with_options(
             "test",
             workspace,
             sqlite,
-            cmd,
+            command,
             200,
             3,
             Duration::from_secs(5),
@@ -695,15 +520,13 @@ exit 1
             .unwrap();
 
         let entry = memory.get("lang").await.unwrap();
-        assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "User prefers Rust");
     }
 
     #[tokio::test]
     async fn recall_merges_lucid_and_local_results() {
         let tmp = TempDir::new().unwrap();
-        let fake_cmd = write_fake_lucid_script(tmp.path());
-        let memory = test_memory(tmp.path(), fake_cmd);
+        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
 
         memory
             .store(
@@ -716,20 +539,53 @@ exit 1
             .unwrap();
 
         let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.content.contains("Local sqlite auth fallback note"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.content.contains("token refresh"))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_scoped_recall_keeps_lucid_derived_context() {
+        let tmp = TempDir::new().unwrap();
+        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+
+        let entries = memory
+            .recall("auth", 5, Some("session-a"), None, None)
+            .await
+            .unwrap();
 
         assert!(
             entries
                 .iter()
-                .any(|e| e.content.contains("Local sqlite auth fallback note"))
+                .any(|entry| entry.content.contains("token refresh"))
         );
-        assert!(entries.iter().any(|e| e.content.contains("token refresh")));
+    }
+
+    #[tokio::test]
+    async fn recent_recall_invokes_lucid_when_local_results_are_insufficient() {
+        let tmp = TempDir::new().unwrap();
+        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+
+        let entries = memory.recall("*", 5, None, None, None).await.unwrap();
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.content.contains("token refresh"))
+        );
     }
 
     #[tokio::test]
     async fn recall_handles_lucid_cold_start_delay_within_timeout() {
         let tmp = TempDir::new().unwrap();
-        let delayed_cmd = write_delayed_lucid_script(tmp.path());
-        let memory = test_memory(tmp.path(), delayed_cmd);
+        let memory = test_memory(tmp.path(), write_delayed_lucid_script(tmp.path()));
 
         memory
             .store(
@@ -742,16 +598,10 @@ exit 1
             .unwrap();
 
         let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
-
         assert!(
             entries
                 .iter()
-                .any(|e| e.content.contains("Local sqlite auth fallback note"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.content.contains("Delayed token refresh guidance"))
+                .any(|entry| entry.content.contains("Delayed token refresh guidance"))
         );
     }
 
@@ -759,14 +609,12 @@ exit 1
     async fn recall_skips_lucid_when_local_hits_are_enough() {
         let tmp = TempDir::new().unwrap();
         let marker = tmp.path().join("context_calls.log");
-        let probe_cmd = write_probe_lucid_script(tmp.path(), &marker);
-
         let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory = LucidMemory::with_options(
+        let memory = LucidEnrichedMemory::with_options(
             "test",
             tmp.path(),
             sqlite,
-            probe_cmd,
+            write_probe_lucid_script(tmp.path(), &marker),
             200,
             1,
             Duration::from_secs(5),
@@ -788,58 +636,50 @@ exit 1
         assert!(
             entries
                 .iter()
-                .any(|e| e.content.contains("Rust should stay local-first"))
+                .any(|entry| entry.content.contains("Rust should stay local-first"))
         );
-
         let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
-        assert!(
-            context_calls.trim().is_empty(),
-            "Expected local-hit short-circuit; got calls: {context_calls}"
-        );
+        assert!(context_calls.trim().is_empty());
     }
 
-    fn write_failing_lucid_script(dir: &Path, marker_path: &Path) -> String {
-        let script_path = dir.join("failing-lucid.sh");
-        let marker = marker_path.display().to_string();
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-
-if [ "${{1:-}}" = "store" ]; then
-  echo '{{"success":true,"id":"mem_store"}}'
-  exit 0
-fi
-
-if [ "${{1:-}}" = "context" ]; then
-  printf 'context\n' >> "{marker}"
-  echo "simulated lucid failure" >&2
-  exit 1
-fi
-
-echo "unsupported command" >&2
-exit 1
-"#
+    #[tokio::test]
+    async fn agent_scoped_recall_does_not_query_unscoped_lucid() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("scoped_context_calls.log");
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidEnrichedMemory::with_options(
+            "test",
+            tmp.path(),
+            sqlite,
+            write_probe_lucid_script(tmp.path(), &marker),
+            200,
+            99,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
         );
+        let agent_id = memory.ensure_agent_uuid("agent-a").await.unwrap();
 
-        fs::write(&script_path, script).unwrap();
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).unwrap();
-        script_path.display().to_string()
+        let entries = memory
+            .recall_for_agents(&[agent_id.as_str()], "missing", 5, None, None, None)
+            .await
+            .unwrap();
+
+        assert!(entries.is_empty());
+        let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
+        assert!(context_calls.trim().is_empty());
     }
 
     #[tokio::test]
     async fn failure_cooldown_avoids_repeated_lucid_calls() {
         let tmp = TempDir::new().unwrap();
         let marker = tmp.path().join("failing_context_calls.log");
-        let failing_cmd = write_failing_lucid_script(tmp.path(), &marker);
-
         let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory = LucidMemory::with_options(
+        let memory = LucidEnrichedMemory::with_options(
             "test",
             tmp.path(),
             sqlite,
-            failing_cmd,
+            write_failing_lucid_script(tmp.path(), &marker),
             200,
             99,
             Duration::from_secs(5),
@@ -847,22 +687,22 @@ exit 1
             Duration::from_secs(5),
         );
 
-        let first = memory.recall("auth", 5, None, None, None).await.unwrap();
-        let second = memory.recall("auth", 5, None, None, None).await.unwrap();
-
-        assert!(first.is_empty());
-        assert!(second.is_empty());
+        assert!(
+            memory
+                .recall("auth", 5, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            memory
+                .recall("auth", 5, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
-    }
-}
-
-impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
-    fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Lucid)
-    }
-    fn alias(&self) -> &str {
-        &self.alias
     }
 }

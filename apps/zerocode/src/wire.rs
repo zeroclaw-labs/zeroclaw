@@ -135,7 +135,6 @@ pub enum MemoryBackendKind {
     Postgres,
     Qdrant,
     Markdown,
-    Lucid,
 }
 
 // ── Quickstart state / step / surface ──────────────────────────

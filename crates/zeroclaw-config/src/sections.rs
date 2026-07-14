@@ -298,9 +298,17 @@ sections! {
         group: Storage,
         help:  "SQLite is the safe default for single-node installs (file-based, \
                 zero-config, no extra services). Pick Postgres for shared or \
-                multi-instance deployments, Qdrant for vector search, Markdown or \
-                Lucid for human-readable files. Each backend supports multiple \
-                aliased instances; agents reference them via `memory.storage_ref`.",
+                multi-instance deployments, Qdrant for vector search, Markdown for \
+                human-readable files. Each backend supports multiple aliased instances; \
+                `memory.backend` selects the authoritative store.",
+    },
+    MemoryEnrichment => {
+        key:   "memory_enrichment",
+        shape: TypedFamilyMap,
+        group: Foundation,
+        help:  "Optional enrichment connectors layered over authoritative SQLite memory. \
+                Configure a Lucid alias here, then select it with \
+                `memory.enricher`; connector failures never replace durable local storage.",
     },
     Memory => {
         key:   "memory",
@@ -514,6 +522,7 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
         | Section::RuntimeProfiles
         | Section::PeerGroups
         | Section::Storage
+        | Section::MemoryEnrichment
         | Section::Cron
         | Section::Mcp
         | Section::McpBundles
@@ -569,6 +578,11 @@ mod tests {
                 Section::RuntimeProfiles,
             ),
             ("storage", "storage", Section::Storage),
+            (
+                "memory-enrichment",
+                "memory_enrichment",
+                Section::MemoryEnrichment,
+            ),
             ("cron", "cron", Section::Cron),
             ("mcp", "mcp", Section::Mcp),
         ];
@@ -665,6 +679,10 @@ mod tests {
         assert!(
             idx(Section::Storage) < idx(Section::Memory),
             "Storage must precede Memory (memory.backend points at a storage instance)",
+        );
+        assert!(
+            idx(Section::MemoryEnrichment) < idx(Section::Memory),
+            "Memory enrichment must precede Memory (memory.enricher points at a connector)",
         );
 
         // Topology references agents.
@@ -881,7 +899,7 @@ mod tests {
             help.contains("default") || help.contains("safe") || help.contains("recommend"),
             "storage help must signal SQLite is the default/safe/recommended choice; got: {help}",
         );
-        for other in ["postgres", "qdrant", "markdown", "lucid"] {
+        for other in ["postgres", "qdrant", "markdown"] {
             let other_pos = help.find(other).unwrap_or_else(|| {
                 panic!(
                     "storage help must still name `{other}` so operators know the alternatives \
@@ -894,5 +912,14 @@ mod tests {
                  the default recommendation lands first",
             );
         }
+    }
+
+    #[test]
+    fn enrichment_help_names_connectors_without_calling_them_storage() {
+        let help = section_help("memory_enrichment").to_lowercase();
+        assert!(help.contains("lucid"));
+        assert!(help.contains("sqlite"));
+        assert!(help.contains("connector"));
+        assert!(!help.contains("backend"));
     }
 }

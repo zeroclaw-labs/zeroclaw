@@ -7181,6 +7181,7 @@ mod tests {
                 &cfg.memory,
                 &cfg.embedding_routes,
                 cfg.resolve_active_storage(),
+                cfg.resolve_active_enricher(),
                 &cfg.data_dir,
                 None,
                 Some(&cfg.providers.models),

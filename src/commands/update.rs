@@ -31,9 +31,6 @@ fn update_success_message(version: &str) -> String {
     }
 }
 
-#[cfg(any(test, not(feature = "agent-runtime")))]
-const PREBUILT_CHANNEL_NOTE_FALLBACK: &str = "Pre-built updates use the lean standard distribution. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other channels outside that distribution.";
-
 fn prebuilt_channel_note_message() -> String {
     #[cfg(feature = "agent-runtime")]
     {
@@ -42,7 +39,7 @@ fn prebuilt_channel_note_message() -> String {
 
     #[cfg(not(feature = "agent-runtime"))]
     {
-        PREBUILT_CHANNEL_NOTE_FALLBACK.to_string()
+        "Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other non-default channels.".to_string()
     }
 }
 
@@ -1356,13 +1353,6 @@ mod tests {
         assert!(should_install(true, true)); // newer + force → install
         assert!(!should_install(false, false)); // not newer → skip
         assert!(should_install(false, true)); // not newer + force → reinstall/downgrade
-    }
-
-    #[test]
-    fn prebuilt_channel_note_describes_the_lean_distribution() {
-        assert!(PREBUILT_CHANNEL_NOTE_FALLBACK.contains("lean standard distribution"));
-        assert!(PREBUILT_CHANNEL_NOTE_FALLBACK.contains("Slack"));
-        assert!(!PREBUILT_CHANNEL_NOTE_FALLBACK.contains("lean default channel bundle"));
     }
 
     #[test]

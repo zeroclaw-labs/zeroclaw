@@ -12,7 +12,7 @@ but "which surface owns this data, and how long does it live?"
 
 | Surface | Owner | Durability | What reviewers should check |
 | --- | --- | --- | --- |
-| Long-term memory | `zeroclaw-memory` behind `Arc<dyn Memory>` | Backend-specific: SQLite/Postgres/Lucid/Qdrant/shared stores, or per-agent Markdown files | Stores and recalls must stay agent-scoped. A tool result, log line, or session row is not long-term memory unless a memory write happened. |
+| Long-term memory | `zeroclaw-memory` behind `Arc<dyn Memory>` | Backend-specific: shared SQLite/Postgres/Qdrant stores or per-agent Markdown files; SQLite may use optional Lucid enrichment | Stores and recalls must stay agent-scoped. A tool result, log line, or session row is not long-term memory unless a memory write happened. |
 | Relationship memory | `knowledge` tool and knowledge graph | Graph backend, when enabled | Capture is explicit. Enabling the graph does not automatically ingest conversations, files, or channel data. |
 | Session history | `zeroclaw-infra` session backends, ACP store, and live RPC/session maps | Chat/ACP history can persist; live RPC handles are process-local | History preserves conversation continuity. It is not the canonical store for user preferences, config, or files. |
 | Current prompt context | Agent loop prompt assembly | Ephemeral provider request | Recalled memory, hardware RAG, current input, system prompt, skills, and tool results may be sent to the provider. This does not make them durable. |
@@ -44,6 +44,12 @@ Do not treat prompt context, tool output, files, or logs as durable memory by
 default. A PR that makes one of those surfaces persistent must name the memory
 category, session scope, agent scope, retention behavior, and operator-visible
 control.
+
+Local-first external integrations use one enrichment seam. SQLite owns the
+durable row; the enricher owns only its protocol. Enricher stores and
+deletions are best-effort, remote recall is skipped after enough local hits,
+and failures enter a short cooldown. Derived-context enrichers such as Lucid
+are not canonicalized as exact rows.
 
 ## Prompt context and recall
 
@@ -176,6 +182,9 @@ Key code entry points:
 - Memory factory and agent scoping: `crates/zeroclaw-memory/src/lib.rs`,
   `crates/zeroclaw-memory/src/agent_scoped.rs`, and
   `crates/zeroclaw-memory/src/agent_scoped_markdown.rs`
+- Local-first external seam and connectors:
+  `crates/zeroclaw-memory/src/enriched.rs`,
+  `crates/zeroclaw-memory/src/lucid.rs`
 - Memory tool registry and examples: `crates/zeroclaw-tools/src/lib.rs`
   (`MEMORY_TOOL_NAMES`), `crates/zeroclaw-tools/src/memory_store.rs`, and
   `crates/zeroclaw-tools/src/memory_recall.rs`

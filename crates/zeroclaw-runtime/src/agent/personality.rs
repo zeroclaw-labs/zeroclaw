@@ -283,7 +283,10 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                memory: zeroclaw_config::multi_agent::AgentMemoryConfig { backend },
+                memory: zeroclaw_config::multi_agent::AgentMemoryConfig {
+                    backend,
+                    enricher: None,
+                },
                 ..Default::default()
             },
         );

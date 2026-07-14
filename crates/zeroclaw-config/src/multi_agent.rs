@@ -43,9 +43,20 @@ pub enum MemoryBackendKind {
     /// Markdown files in the agent's workspace
     /// (`crates/zeroclaw-memory/src/markdown.rs`).
     Markdown,
-    /// Hybrid local SQLite + external Lucid CLI
-    /// (`crates/zeroclaw-memory/src/lucid.rs`).
-    Lucid,
+}
+
+impl MemoryBackendKind {
+    /// Canonical storage kind used in dotted backend references.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+            Self::Qdrant => "qdrant",
+            Self::Markdown => "markdown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -73,6 +84,13 @@ pub struct AgentMemoryConfig {
     /// The backend kind this agent uses. Defaults to `Sqlite` for new
     /// agents; once an agent has on-disk data the value is locked.
     pub backend: MemoryBackendKind,
+    /// Optional per-agent memory-enricher reference (`<kind>.<alias>`).
+    ///
+    /// `None` inherits `[memory].enricher`; `Some("none")` explicitly disables
+    /// enrichment for this agent. Changing an enricher does not change the
+    /// authoritative store and is therefore not backend-locked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enricher: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,9 +248,9 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Postgres, "\"postgres\""),
             (MemoryBackendKind::Qdrant, "\"qdrant\""),
             (MemoryBackendKind::Markdown, "\"markdown\""),
-            (MemoryBackendKind::Lucid, "\"lucid\""),
         ];
         for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected.trim_matches('"'));
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, expected, "backend={kind:?}");
             let back: MemoryBackendKind = serde_json::from_str(&json).unwrap();
