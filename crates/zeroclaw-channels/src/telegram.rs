@@ -8094,6 +8094,136 @@ mod tests {
         );
     }
 
+    /// The truncation WARN must carry channel attribution (`zeroclaw.channel`
+    /// composite) when `register_bot_commands` runs under the attribution span
+    /// the orchestrator opens around `listen()` (orchestrator/mod.rs:4032).
+    ///
+    /// The event-level counters (`TELEGRAM_MAX_BOT_COMMANDS`, `total_before_cap`,
+    /// `registered`) correctly live in `attributes`; the "who/where" identity
+    /// (`channel = telegram.<alias>`) must ride in from the span, never from the
+    /// call site. This pins the attribution/attrs split the logging contract
+    /// requires and answers the L1082 review question with executable evidence:
+    /// operators see the WARN attributed to the emitting Telegram channel.
+    #[tokio::test]
+    async fn register_bot_commands_truncation_warn_carries_channel_attribution() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_log::Instrument;
+
+        let mock_server = MockServer::start().await;
+
+        // 6 built-ins + 101 tools = 107, exceeding the 100-command cap.
+        let specs: Vec<(String, String)> = (0..101)
+            .map(|i| {
+                (
+                    format!("tool_{i:02}"),
+                    format!("Description for tool {i:02}"),
+                )
+            })
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "clamps",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_tool_command_specs(specs);
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // Run under the same attribution span the orchestrator opens around
+        // `listen()` — this is what carries the channel identity into the WARN.
+        async {
+            ch.register_bot_commands().await;
+        }
+        .instrument(zeroclaw_log::attribution_span!(&ch))
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found_warn = false;
+        while !found_warn && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            s.contains(
+                                "Telegram limits bots to 100 commands; configured 107, registering first 100",
+                            )
+                        })
+                        .unwrap_or(false)
+                    {
+                        found_warn = true;
+
+                        // Attribution ("who/where") rides in from the span.
+                        let zc = value
+                            .get("zeroclaw")
+                            .expect("WARN event must carry the zeroclaw attribution block");
+                        assert_eq!(
+                            zc.get("channel").and_then(|v| v.as_str()),
+                            Some("telegram.clamps"),
+                            "truncation WARN must be attributed to the emitting channel, got: {zc:?}"
+                        );
+                        assert_eq!(
+                            zc.get("channel_type").and_then(|v| v.as_str()),
+                            Some("telegram"),
+                        );
+                        assert_eq!(
+                            zc.get("channel_alias").and_then(|v| v.as_str()),
+                            Some("clamps"),
+                        );
+
+                        // Event-level counters stay in attrs, not attribution.
+                        let attrs = value
+                            .get("attributes")
+                            .expect("WARN event must carry structured attributes");
+                        assert_eq!(
+                            attrs.get("TELEGRAM_MAX_BOT_COMMANDS").and_then(|v| v.as_u64()),
+                            Some(TELEGRAM_MAX_BOT_COMMANDS as u64),
+                        );
+                        assert_eq!(
+                            attrs.get("total_before_cap").and_then(|v| v.as_u64()),
+                            Some(107),
+                        );
+                        assert_eq!(
+                            attrs.get("registered").and_then(|v| v.as_u64()),
+                            Some(100),
+                        );
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_timeout) => break,
+            }
+        }
+        assert!(
+            found_warn,
+            "truncation WARN must be captured with channel attribution",
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
     // ── Approval inline keyboard tests ────────────────────────
 
     #[test]
