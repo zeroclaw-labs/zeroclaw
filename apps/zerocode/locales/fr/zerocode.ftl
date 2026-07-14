@@ -313,6 +313,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = Aucun agent activé. Configurez un agent dans l'onglet Config.
 zc-chat-error-fetch-agents = Échec de la récupération des agents : { $error }
 zc-chat-error-create-session = Échec de la création de la session : { $error }
+zc-chat-session-switch-error = Échec du changement de session : { $error }
 zc-chat-elicitation-dropped = Une question de l'agent a été abandonnée avant de pouvoir être affichée (le client a pris du retard). La question de l'agent est peut-être toujours en attente ; réessayez.
 zc-chat-session-restarted = Nouvelle session démarrée.
 zc-chat-session-restart-error = Échec du démarrage d'une nouvelle session : { $error }
@@ -355,6 +356,8 @@ zc-chat-help-browse-mode = Mode navigation
 zc-chat-help-scroll-conversation = Faire défiler la conversation
 zc-chat-help-toggle-thoughts = Basculer les réflexions
 zc-chat-help-new-session = Nouvelle session
+zc-chat-session-list-resume-title = Sessions enregistrées (Entrée=reprendre, Échap=nouveau)
+zc-chat-session-list-switch-title = Sessions (Entrée=changer, Échap=fermer)
 zc-elicit-help-toggle = Basculer le choix
 zc-elicit-help-confirm = Confirmer le choix
 zc-elicit-help-cancel = Annuler

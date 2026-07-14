@@ -256,16 +256,13 @@ non_row_features = [
     "metrics",
     "embedded-web",
 ]
-# Heavyweight non-channel features excluded from the default binary
-# distribution (`Selection::Dist`): they pull large native/ML deps and would
-# bloat the single artifact for users who never use them. Still opt-in via
-# source `--features`, the docker `:all-features` tag, or a nix override. This
-# "too big for the default download" bit is not derivable from the feature
-# graph, so it lives here in the canonical registry; never shadowed.
-heavyweight_features = [
-    "hardware",
-    "browser-native",
-    "voice-wake",
+# Features intentionally added to the lean Cargo defaults for standard
+# distribution artifacts. This list is the complete positive policy beyond
+# `default`; target-specific exclusions are resolved from the table below.
+dist_extra_features = [
+    "channel-matrix",
+    "channel-lark",
+    "whatsapp-web",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -276,6 +273,13 @@ heavyweight_features = [
 container_excluded_features = [
     "voice-wake",
 ]
+
+# Compatibility exclusions for standard distribution artifacts. Release
+# workflows pass only their target triple; feature policy stays here.
+[package.metadata.zeroclaw.dist_target_exclusions]
+aarch64-linux-android = ["whatsapp-web"]
+arm-unknown-linux-gnueabihf = ["observability-prometheus"]
+armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
 
 [features]
 default = [
