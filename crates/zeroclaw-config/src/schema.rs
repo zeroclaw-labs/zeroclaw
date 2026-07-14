@@ -966,13 +966,23 @@ impl ModelEndpoint for OpenAIEndpoint {
 /// on the base struct without family awareness; this wrapper is a thin
 /// typed slot, no extra fields.
 ///
-/// New OpenAI provider entries default to `wire_api = "responses"` because
-/// OpenAI has moved recent GPT models onto `POST /v1/responses` as the
-/// primary wire. OpenAI-compatible families (`custom`, `llamacpp`, branded
-/// vendors, …) keep the shared `ModelProviderConfig` default of unset /
-/// chat-completions. Existing configs that omit `wire_api` still deserialize
-/// as `None` and the factory falls back to chat-completions for backward
-/// compatibility.
+/// New OpenAI provider entries **persisted via `create_map_key` / `ensure`**
+/// (quickstart, gateway/config UI, programmatic slot creation) default to
+/// `wire_api = "responses"` because OpenAI has moved recent GPT models onto
+/// `POST /v1/responses` as the primary wire. OpenAI-compatible families
+/// (`custom`, `llamacpp`, branded vendors, …) keep the shared
+/// `ModelProviderConfig` default of unset / chat-completions.
+///
+/// This default governs **persisted slot creation only**. Two paths keep the
+/// legacy chat-completions wire for backward compatibility:
+/// - Existing persisted configs that omit `wire_api` deserialize as `None`, and
+///   the factory falls back to chat-completions.
+/// - Implicit dispatch with no config entry at all — a bare
+///   `model_provider = "openai"` reference or a dotted ref to a nonexistent
+///   alias — is built from a chat-anchored fallback config (see
+///   `openai_missing_entry_fallback_config` in `zeroclaw-providers`), not this
+///   `Default`, and stays on the chat wire so existing bare-ref installs don't
+///   flip wire + tool-calling mode on upgrade.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.openai"]

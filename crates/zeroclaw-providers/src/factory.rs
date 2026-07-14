@@ -296,6 +296,17 @@ pub fn dispatch_family_factory(
     api_url: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> Result<Box<dyn ModelProvider>> {
+    // openai missing-entry fallback: see `openai_missing_entry_fallback_config`.
+    // A persisted entry keeps its stored `wire_api`; an implicit dispatch with no
+    // entry (bare `openai` ref or a dangling alias) stays on the chat-completions
+    // wire so existing installs don't flip wire + tool-calling mode on upgrade.
+    if family == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .and_then(|c| c.providers.models.openai.get(alias))
+            .unwrap_or(&default_cfg);
+        return cfg.create_provider(alias, key, api_url, opts);
+    }
     macro_rules! emit_dispatch {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match family {
@@ -353,6 +364,21 @@ pub(crate) fn fallback_auth_ready_for_alias(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(family);
+
+    // openai missing-entry fallback: keep construction symmetric with
+    // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
+    // but constructing the same chat-anchored fallback avoids any future
+    // divergence if that changes.
+    if provider_kind == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .providers
+            .models
+            .openai
+            .get(alias)
+            .unwrap_or(&default_cfg);
+        return cfg.fallback_auth_ready(key, opts);
+    }
 
     macro_rules! emit_auth_ready {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
@@ -997,6 +1023,27 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     }
 }
 
+/// Config used when the `openai` family is dispatched with **no persisted
+/// entry** — a bare `model_provider = "openai"` reference or a dotted ref to a
+/// nonexistent alias.
+///
+/// This deliberately differs from [`OpenAIModelProviderConfig::default`], which
+/// selects the responses wire for *new persisted slots* created via
+/// `create_map_key` / `ensure`. Implicit dispatch must instead leave `wire_api`
+/// unset so it resolves to the historical chat-completions wire; otherwise an
+/// existing install with a bare `openai` ref would silently flip both its wire
+/// protocol and its tool-calling mode on upgrade, contradicting the
+/// backward-compatibility guarantee. Persisted entries are never routed through
+/// this helper — they keep whatever `wire_api` they stored.
+fn openai_missing_entry_fallback_config() -> OpenAIModelProviderConfig {
+    OpenAIModelProviderConfig {
+        base: zeroclaw_config::schema::ModelProviderConfig {
+            wire_api: None,
+            ..zeroclaw_config::schema::ModelProviderConfig::default()
+        },
+    }
+}
+
 impl FamilyProviderFactory for OpenAIModelProviderConfig {
     fn create_provider(
         &self,
@@ -1013,7 +1060,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         // Responses wire protocol with standard API key — full streaming tool calls.
         // New OpenAI provider slots default wire_api to Responses via
-        // OpenAIModelProviderConfig::default(); unset/legacy configs fall through.
+        // OpenAIModelProviderConfig::default() (persisted-slot creation). Bare/
+        // dangling dispatch uses openai_missing_entry_fallback_config() and stays
+        // on the chat wire; unset/legacy configs also fall through below.
         if let Some(p) =
             build_responses_provider_if_requested(self.base.wire_api, alias, api_url, key, opts)
         {
@@ -1674,6 +1723,61 @@ mod tests {
                 &ModelProviderRuntimeOptions::default(),
             )
             .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn openai_dispatch_missing_entry_stays_on_chat_wire() {
+        // Blocking-review regression (#9021): the new responses default must apply
+        // to *persisted slot creation* only. An implicit dispatch with no config
+        // entry — a bare `model_provider = "openai"` ref or a dangling alias —
+        // must keep the historical chat-completions wire and prompt-guided tools,
+        // so existing installs don't silently flip wire + tool-calling on upgrade.
+        let provider = dispatch_family_factory(
+            None,
+            "openai",
+            "default",
+            Some("sk-test"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("bare openai dispatch should build");
+        assert_eq!(
+            provider.default_wire_api(),
+            "chat_completions",
+            "missing-entry openai dispatch must not adopt the responses wire"
+        );
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "missing-entry openai dispatch must keep prompt-guided tool calling"
+        );
+    }
+
+    #[test]
+    fn openai_dispatch_persisted_entry_honors_responses_default() {
+        // The counterpart to the missing-entry test: a persisted openai slot that
+        // stored wire_api = responses (as create_map_key now writes) still routes
+        // through the responses provider when dispatched.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    wire_api: Some(WireApi::Responses),
+                    ..Default::default()
+                },
+            },
+        );
+        let provider = dispatch_family_factory(
+            Some(&config),
+            "openai",
+            "default",
+            Some("sk-test"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("persisted openai dispatch should build");
         assert_eq!(provider.default_wire_api(), "responses");
         assert!(provider.capabilities().native_tool_calling);
     }

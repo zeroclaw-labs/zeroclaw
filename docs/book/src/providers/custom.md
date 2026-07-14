@@ -67,9 +67,12 @@ Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog
 
 ## Wire protocol: `wire_api = "responses"`
 
-New **OpenAI** provider slots (`providers.models.openai.<alias>`) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
+New **OpenAI** provider slots that are *written to config* (`providers.models.openai.<alias>`, as created by `zeroclaw quickstart` or the gateway/config UI) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
 
-When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Set `"chat_completions"` to force the legacy wire. Existing OpenAI configs that omit the field keep chat-completions at runtime for backward compatibility.
+When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Set `"chat_completions"` to force the legacy wire. Two cases keep chat-completions at runtime for backward compatibility, so no existing setup changes wire on upgrade:
+
+- A **persisted** `providers.models.openai.<alias>` entry that omits `wire_api` deserializes as unset and stays on chat-completions.
+- A **bare** `model_provider = "openai"` reference (or a dotted ref to a nonexistent alias) has no config entry to read; it is built from the family fallback and stays on chat-completions. The responses default applies only when a slot is actually written to config.
 
 `wire_api` is honored by the bring-your-own-endpoint families where the wire is operator-configurable: `openai`, `llamacpp`, and `custom` (plus the generic openai-compatible path). Branded vendor slots (`groq`, `mistral`, `deepseek`, …) have a fixed wire protocol and ignore the field, with one exception: `opencode` honors `wire_api = "responses"` because OpenCode Zen serves both wires. With no `uri` override, the OpenCode responses route targets `https://opencode.ai/zen/v1/responses`:
 
