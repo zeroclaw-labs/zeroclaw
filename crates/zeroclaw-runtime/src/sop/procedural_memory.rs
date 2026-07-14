@@ -548,6 +548,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
                     output: format!("used {redaction_fixture}"),
                     started_at: "2026-06-30T00:00:00Z".into(),
                     completed_at: Some("2026-06-30T00:01:00Z".into()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();

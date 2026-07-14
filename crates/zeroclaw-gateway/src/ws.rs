@@ -309,23 +309,36 @@ where
     };
     let frame = if let Some(engine) = state.sop_engine.as_ref() {
         let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
-        match engine.lock() {
-            Ok(mut g) => match g.resolve_gate(&run_id, decision, principal) {
-                Ok(outcome) => serde_json::json!({
+        let resolved = match engine.lock() {
+            Ok(mut g) => Some(g.resolve_gate(&run_id, decision, principal)),
+            Err(_) => None,
+        };
+        match resolved {
+            Some(Ok(outcome)) => {
+                if let zeroclaw_runtime::sop::approval::ResolveOutcome::Resumed(action) = &outcome {
+                    let config = state.config.read().clone();
+                    zeroclaw_runtime::sop::spawn_headless_run_driver(
+                        config,
+                        std::sync::Arc::clone(engine),
+                        state.sop_audit.clone(),
+                        action.as_ref().clone(),
+                    );
+                }
+                serde_json::json!({
                     "type": "sop_approval_result",
                     "run_id": run_id,
                     "outcome": outcome.label(),
-                }),
-                Err(e) => serde_json::json!({
-                    "type": "error",
-                    "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                        "cli-sop-ws-resolve-failed",
-                        &[("error", &e.to_string())],
-                    ),
-                    "code": "SOP_RESOLVE_FAILED"
-                }),
-            },
-            Err(_) => serde_json::json!({
+                })
+            }
+            Some(Err(e)) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-sop-ws-resolve-failed",
+                    &[("error", &e.to_string())],
+                ),
+                "code": "SOP_RESOLVE_FAILED"
+            }),
+            None => serde_json::json!({
                 "type": "error",
                 "message": zeroclaw_runtime::i18n::get_required_cli_string(
                     "cli-sop-ws-engine-lock-poisoned"
@@ -1014,6 +1027,15 @@ async fn process_chat_message(
         ))
     });
 
+    // Resolve context budget for this agent. Wire field is named
+    // `max_context_tokens` and must track the runtime-profile budget
+    // (same source Zerocode's context meter uses), not the provider
+    // model-window helper which falls back to 32_000 when unset.
+    let max_context_tokens = {
+        let cfg = state.config.read();
+        cfg.effective_max_context_tokens(&turn_alias) as u64
+    };
+
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
@@ -1093,6 +1115,11 @@ async fn process_chat_message(
     // surfaces usage; we sum to produce a single done-frame total.
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
+
+    // Track the most recent absolute provider-reported prompt size
+    // (replaces on each TurnEvent::Usage; not accumulated).
+    // Used for accurate context-bar rendering on the client.
+    let mut last_input_tokens: Option<u64> = None;
 
     // Routes the three concurrent streams that the running turn cares about:
     //   1. inbound `approval_response` frames from the WebSocket client,
@@ -1243,6 +1270,7 @@ async fn process_chat_message(
                             // cache reads.
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                                last_input_tokens = Some(it);
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
@@ -1283,6 +1311,10 @@ async fn process_chat_message(
                             "dropped_messages": dropped_messages,
                             "kept_turns": kept_turns,
                             "reason": reason,
+                        }),
+                        TurnEvent::Plan { entries } => serde_json::json!({
+                            "type": "plan",
+                            "entries": entries,
                         }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
@@ -1478,6 +1510,8 @@ async fn process_chat_message(
                 "cost_usd": cost_usd,
                 "model": turn_model,
                 "provider": provider_label,
+                "max_context_tokens": max_context_tokens,
+                "last_input_tokens": last_input_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -1508,6 +1542,7 @@ async fn process_chat_message(
                         "output_tokens": total_output_tokens,
                         "tokens_used": total_tokens,
                         "cost_usd": cost_usd,
+                        "last_input_tokens": last_input_tokens,
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"

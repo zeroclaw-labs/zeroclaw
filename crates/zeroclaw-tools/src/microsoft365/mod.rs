@@ -11,7 +11,7 @@ pub mod types;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -70,7 +70,7 @@ impl Microsoft365Tool {
             "sharepoint_search" => self.handle_sharepoint_search(args).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown action: {action}")),
             }),
         }
@@ -102,7 +102,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -152,7 +152,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -208,7 +208,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -235,7 +235,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -291,7 +291,8 @@ impl Microsoft365Tool {
             output: format!(
                 "Downloaded {} bytes (base64 encoded):\n{encoded}",
                 bytes.len()
-            ),
+            )
+            .into(),
             error: None,
         })
     }
@@ -330,7 +331,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -402,7 +403,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Email sent to: {}", to.join(", ")),
+            output: format!("Email sent to: {}", to.join(", ")).into(),
             error: None,
         })
     }
@@ -458,7 +459,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: "Teams message sent".to_string(),
+            output: "Teams message sent".to_string().into(),
             error: None,
         })
     }
@@ -532,7 +533,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Calendar event created (id: {event_id})"),
+            output: format!("Calendar event created (id: {event_id})").into(),
             error: None,
         })
     }
@@ -570,7 +571,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Calendar event {event_id} deleted"),
+            output: format!("Calendar event {event_id} deleted").into(),
             error: None,
         })
     }
@@ -680,7 +681,7 @@ impl Tool for Microsoft365Tool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("'action' parameter is required".to_string()),
                 });
             }
@@ -690,7 +691,7 @@ impl Tool for Microsoft365Tool {
             Ok(result) => Ok(result),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("microsoft365.{action} failed: {e}")),
             }),
         }
