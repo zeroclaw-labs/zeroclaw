@@ -28,6 +28,60 @@ fn config_valid_keys_not_flagged_as_unknown() {
     );
 }
 
+/// A stale V3 file being auto-migrated in memory must not emit unknown-key
+/// warnings for the top-level sections V3→V4 intentionally consumes
+/// (`composio`, `notion`, `jira`, ...). The version-aware suppression path
+/// keys on the detected on-disk version, not on a static allowlist.
+#[test]
+fn v3_removed_top_level_sections_are_suppressed_when_migrating() {
+    let raw = r#"
+schema_version = 3
+
+[composio]
+enabled = false
+
+[notion]
+enabled = true
+
+[jira]
+enabled = true
+
+[genuinely_unknown]
+foo = "bar"
+"#;
+    let unknown = Config::unknown_keys_for_version(raw, Some(3));
+    assert!(
+        !unknown.iter().any(|k| k == "composio" || k == "notion" || k == "jira"),
+        "V3-removed sections must not warn during migration, got: {unknown:?}",
+    );
+    assert!(
+        unknown.iter().any(|k| k == "genuinely_unknown"),
+        "a real unknown section must still be flagged during migration, got: {unknown:?}",
+    );
+}
+
+/// The suppression only applies to a stale source version. A current-version
+/// file that names a removed section is a genuine typo/dead key and must be
+/// flagged, so the warning is not silently swallowed once migration is locked
+/// in with `zeroclaw config migrate`.
+#[test]
+fn v3_removed_top_level_sections_still_warn_at_current_version() {
+    let raw = r#"
+[composio]
+enabled = false
+"#;
+    let current = Config::unknown_keys_for_version(raw, Some(migration::CURRENT_SCHEMA_VERSION));
+    assert!(
+        current.iter().any(|k| k == "composio"),
+        "a removed section in a current-version file must be flagged, got: {current:?}",
+    );
+    let untagged = Config::unknown_keys(raw);
+    assert!(
+        untagged.iter().any(|k| k == "composio"),
+        "the version-agnostic entry point must not suppress removed sections, got: {untagged:?}",
+    );
+}
+
 #[test]
 fn config_unknown_keys_parse_without_error() {
     let config = migrate(

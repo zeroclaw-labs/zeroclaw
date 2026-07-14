@@ -35,6 +35,7 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "api_url",
     "api_path",
     "default_model_provider",
+    "model_provider",
     "default_model",
     "model_providers",
     "default_temperature",

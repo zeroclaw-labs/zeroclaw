@@ -16375,10 +16375,23 @@ impl Config {
     /// consumed it (covers `Option<T>` fields and `#[serde(alias)]` names).
     /// V1 legacy keys (consumed by migration) are also accepted.
     pub fn unknown_keys(raw_toml: &str) -> Vec<String> {
+        Self::unknown_keys_for_version(raw_toml, None)
+    }
+
+    /// Like [`Config::unknown_keys`], but when `source_version` names a
+    /// pre-current schema being auto-migrated in memory, the top-level
+    /// sections that the version-aware migration intentionally consumes
+    /// (`V4_DROPPED_TOP_LEVEL_KEYS`) are not reported. A stale V3 file on
+    /// disk therefore loads without spurious unknown-key warnings for the
+    /// exact sections migration is designed to drop, while a genuine typo
+    /// in a current-version file is still surfaced.
+    pub fn unknown_keys_for_version(raw_toml: &str, source_version: Option<u32>) -> Vec<String> {
         let raw: toml::Table = match raw_toml.parse() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
+        let suppress_migrated = source_version
+            .is_some_and(|v| v != crate::migration::CURRENT_SCHEMA_VERSION);
         static DEFAULTS: OnceLock<toml::Table> = OnceLock::new();
         let defaults = DEFAULTS.get_or_init(|| {
             toml::to_string(&Config::default())
@@ -16394,7 +16407,17 @@ impl Config {
                 if crate::migration::V1_LEGACY_KEYS.contains(&key.as_str()) {
                     return false;
                 }
+                if suppress_migrated
+                    && v3::V4_DROPPED_TOP_LEVEL_KEYS.contains(&key.as_str())
+                {
+                    return false;
+                }
                 let mut t = toml::Table::new();
+                if let Some(sv) = defaults.get("schema_version") {
+                    // Baseline schema_version so the probe diff isolates the
+                    // key under test; the deserializer always re-stamps it.
+                    t.insert("schema_version".to_string(), sv.clone());
+                }
                 t.insert((*key).clone(), raw[key.as_str()].clone());
                 let consumed = toml::to_string(&t)
                     .ok()
@@ -16739,7 +16762,7 @@ impl Config {
             // TOML table keys against what Config actually deserializes.
             // This replaces the previous serde_ignored-based approach which
             // had false-positive issues with #[serde(default)] nested structs.
-            for key in Self::unknown_keys(&contents) {
+            for key in Self::unknown_keys_for_version(&contents, stale_version) {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

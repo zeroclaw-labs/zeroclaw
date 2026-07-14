@@ -52,7 +52,7 @@ const V4_INERT_AGENT_KEYS: &[&str] = &[
 /// tools, structs, and (for twitter/reddit/notion) channels were cut; the
 /// top-level `Config` already ignores these keys on load, so migration strips
 /// them so a re-serialized V4 config no longer advertises dead sections.
-const V4_DROPPED_TOP_LEVEL_KEYS: &[&str] = &[
+pub(crate) const V4_DROPPED_TOP_LEVEL_KEYS: &[&str] = &[
     "composio",
     "microsoft365",
     "project_intel",
