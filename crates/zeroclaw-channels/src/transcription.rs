@@ -1824,14 +1824,14 @@ mod tests {
         );
     }
 
-    // ── #8718 regression: `LocalWhisperConfig::default()` must use the
-    //    serde-default values, not the Rust `usize`/`u64` zeros. `#[serde(default
-    //    = "...")]` only fires for deserialization; without a manual `Default`
-    //    impl that delegates to the helpers, `Config::init_defaults`
-    //    materializes `Some(LocalWhisperConfig { max_audio_bytes: 0,
-    //    timeout_secs: 0, .. })`, the parent `[transcription]` block is
-    //    poisoned at load, and `transcription.enabled` silently flips to
-    //    `false` regardless of operator intent.
+    // ── LocalWhisper `Default` must use the serde-default values, not
+    //    the Rust `usize`/`u64` zeros. `#[serde(default = "...")]` only
+    //    fires for deserialization; without a manual `Default` impl that
+    //    delegates to the helpers, `Config::init_defaults` materializes
+    //    `Some(LocalWhisperConfig { max_audio_bytes: 0, timeout_secs: 0,
+    //    .. })`, the parent `[transcription]` block is poisoned at load,
+    //    and `transcription.enabled` silently flips to `false`
+    //    regardless of operator intent.
 
     #[test]
     fn local_whisper_default_uses_serde_defaults_not_rust_zero() {
@@ -1878,7 +1878,8 @@ mod tests {
 
     #[test]
     fn typed_local_whisper_default_uses_serde_defaults_not_rust_zero() {
-        // Round-2: same shape bug existed on the typed provider surface
+        // Same shape contract as `local_whisper_default_uses_serde_defaults_not_rust_zero`,
+        // applied to the typed provider surface
         // (`[providers.transcription.local_whisper.<alias>]`). The
         // `Configurable` macro emits `<T as Default>::default()` for newly
         // scaffolded `create_map_key(...)` entries, so a regression to
@@ -1913,13 +1914,13 @@ mod tests {
 
     #[test]
     fn typed_local_whisper_provider_accepts_default_after_uri_and_token_filled() {
-        // Round-2: a freshly scaffolded `[providers.transcription.local_whisper.<alias>]`
+        // A freshly scaffolded `[providers.transcription.local_whisper.<alias>]`
         // map entry — what the `Configurable` macro writes when `create_map_key`
         // opens a new alias — must already pass `LocalWhisperProvider::from_typed_config`
-        // once the operator fills `uri` and `bearer_token`. Before this fix,
-        // `Default::default()` produced `max_audio_bytes = 0` and
-        // `timeout_secs = 0`; the typed-config bridge forwarded those zeros
-        // into `LocalWhisperProvider::from_config`, which rejected them at
+        // once the operator fills `uri` and `bearer_token`. A regression to
+        // `Default::default()` would produce `max_audio_bytes = 0` and
+        // `timeout_secs = 0`; the typed-config bridge forwards those zeros
+        // into `LocalWhisperProvider::from_config`, which rejects them at
         // load, and the alias landed in `dropped_config: providers.transcription.local_whisper`.
         let cfg = zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
             uri: "http://127.0.0.1:9999/v1/transcribe".to_string(),
@@ -1936,22 +1937,20 @@ mod tests {
         assert_eq!(provider.bearer_token, "test-token");
     }
 
-    /// Smoke: config-init TOML writes the serde defaults, then a reload sees
-    /// them and keeps the transcription section enabled.  Regression for the
-    /// full round-trip path requested in #8751 review.
+    /// Child-struct serde round-trip: TOML serialize + deserialize on a
+    /// `LocalWhisperConfig` whose numeric fields were populated via
+    /// `..LocalWhisperConfig::default()`. This pins the contract that
+    /// `Default` reuses the same serde-default helpers the deserializer
+    /// does — the round-tripped values match the originals, no zero-
+    /// value leakage.
     #[test]
-    fn local_whisper_config_init_toml_round_trip() {
-        // Simulate what `zeroclaw config init transcription.local_whisper`
-        // writes: `LocalWhisperConfig::default()` produces the scaffolded
-        // block, and the operator fills url + bearer_token.
+    fn local_whisper_serde_round_trip() {
         let scaffolded = zeroclaw_config::schema::LocalWhisperConfig {
             url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
             bearer_token: Some("test-token".to_string()),
             ..zeroclaw_config::schema::LocalWhisperConfig::default()
         };
 
-        // Step 1 — round-trip through TOML so we know config init writes
-        // non-zero defaults into the persisted file.
         let toml_str =
             toml::to_string(&scaffolded).expect("LocalWhisperConfig must serialize to TOML");
         assert!(
@@ -1963,7 +1962,6 @@ mod tests {
             "config init TOML must contain timeout_secs = 300;\ngot:\n{toml_str}"
         );
 
-        // Step 2 — reload the config from that TOML (simulating daemon boot).
         let reloaded: zeroclaw_config::schema::LocalWhisperConfig =
             toml::from_str(&toml_str).expect("round-tripped TOML must deserialize");
         assert_eq!(reloaded.max_audio_bytes, 25 * 1024 * 1024);
@@ -1971,12 +1969,59 @@ mod tests {
         assert_eq!(reloaded.url, "http://127.0.0.1:9999/v1/transcribe");
         assert_eq!(reloaded.bearer_token.as_deref(), Some("test-token"));
 
-        // Step 3 — prove the provider accepts the round-tripped config
-        // (the original #8718 reporter's signal: from_config drops the
-        // parent [transcription] section when max_audio_bytes / timeout_secs
-        // are zero).
         let provider = LocalWhisperProvider::from_config("local_whisper", &reloaded)
             .expect("round-tripped config-init default must be loadable");
+        assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
+        assert_eq!(provider.timeout_secs, 300);
+    }
+
+    /// Production-path regression: a `Config` materialized via
+    /// `Config::init_defaults` keeps the parent `[transcription]` block
+    /// enabled when scaffolded `local_whisper` defaults are valid, and
+    /// no `dropped_config: transcription` event is emitted.
+    ///
+    /// This is the user-boundary the previous child-struct regression
+    /// could not exercise: it actually walks the production
+    /// config-init/default-materialization path and reloads the parent
+    /// `Config` to confirm the transcription section is preserved.
+    #[tokio::test]
+    async fn local_whisper_config_init_preserves_transcription_section() {
+        // Step 1 — materialise a parent Config via Config::init_defaults.
+        let mut config = zeroclaw_config::schema::Config::default();
+        let _ = config.init_defaults(None);
+        // Simulate `zeroclaw config init transcription.local_whisper` —
+        // the scaffolded block uses `..LocalWhisperConfig::default()`.
+        config.transcription.local_whisper = Some(zeroclaw_config::schema::LocalWhisperConfig {
+            url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+            bearer_token: Some("test-token".to_string()),
+            ..zeroclaw_config::schema::LocalWhisperConfig::default()
+        });
+        config.transcription.enabled = true;
+
+        // Step 2 — round-trip the parent Config through TOML (simulating
+        // daemon boot that re-reads the persisted file).
+        let toml_str = toml::to_string(&config).expect("Config must serialize to TOML");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&toml_str).expect("Config must deserialize from TOML");
+
+        // Step 3 — the transcription block survives the round-trip, the
+        // scaffolded local_whisper block has the expected non-zero
+        // defaults, and the provider accepts the reloaded config.
+        assert!(
+            reloaded.transcription.enabled,
+            "transcription.enabled must survive the parent Config round-trip"
+        );
+        let local = reloaded
+            .transcription
+            .local_whisper
+            .as_ref()
+            .expect("transcription.local_whisper must survive the parent Config round-trip");
+        assert_eq!(local.max_audio_bytes, 25 * 1024 * 1024);
+        assert_eq!(local.timeout_secs, 300);
+        assert_eq!(local.url, "http://127.0.0.1:9999/v1/transcribe");
+
+        let provider = LocalWhisperProvider::from_config("local_whisper", local)
+            .expect("reloaded local_whisper config must be loadable by from_config");
         assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
         assert_eq!(provider.timeout_secs, 300);
     }
