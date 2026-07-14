@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_providers::ChatMessage;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -21,6 +22,22 @@ fn unix_now() -> u64 {
 
 fn completion_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Given the client's full `messages` array and the index of the final
+/// `user` message (extracted as the turn's prompt), returns the messages
+/// that should be seeded into the agent's history so multi-turn context
+/// from earlier in the array isn't discarded. System messages are excluded
+/// here since they're merged separately via `set_caller_system_prompt`.
+fn history_seed_from_messages(messages: &[Message], last_user_idx: usize) -> Vec<ChatMessage> {
+    messages[..last_user_idx]
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| ChatMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect()
 }
 
 /// Human-readable status message shown to the user when a tool is invoked.
@@ -256,14 +273,16 @@ pub async fn handle_openai_chat_completion_stream(
         return e.into_response();
     }
 
-    // Extract the last user message as the agent prompt.
-    let prompt = match req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-    {
+    // Extract the last user message as the agent prompt. OpenAI-compatible
+    // clients (Home Assistant, Open WebUI, etc.) resend the full `messages`
+    // array on every request per the stateless chat completions wire
+    // protocol; everything before the last user message is seeded into the
+    // agent's history below so multi-turn context isn't discarded. The
+    // client's array is treated as the source of truth for conversation
+    // history here — no separate server-owned history store is introduced
+    // for this channel, avoiding a second copy of the same state.
+    let last_user_idx = req.messages.iter().rposition(|m| m.role == "user");
+    let prompt = match last_user_idx.map(|i| req.messages[i].content.clone()) {
         Some(p) => p,
         None => {
             return (
@@ -356,6 +375,20 @@ pub async fn handle_openai_chat_completion_stream(
         .join("\n\n");
     if !caller_system_prompt.trim().is_empty() {
         agent.set_caller_system_prompt(Some(caller_system_prompt));
+    }
+
+    // Seed the agent's in-memory history with every message the client
+    // resent before the final user turn (system messages excluded — they're
+    // merged above via set_caller_system_prompt instead). This is a
+    // per-request seed only: it lives in `agent` for the lifetime of this
+    // single turn and is dropped afterward, so it does not create a second,
+    // persistent copy of conversation state — the client's array remains
+    // the sole source of truth across requests.
+    if let Some(idx) = last_user_idx {
+        let seed = history_seed_from_messages(&req.messages, idx);
+        if !seed.is_empty() {
+            agent.seed_history(&seed);
+        }
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -469,6 +502,48 @@ mod tests {
     #[test]
     fn unknown_tool_returns_generic_message() {
         assert_eq!(tool_status_message("some_unknown_tool"), "🛠️ Using tool...");
+    }
+
+    // ── history_seed_from_messages ───────────────────────────────────────────
+
+    #[test]
+    fn history_seed_excludes_last_user_message_and_system_messages() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "be nice".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "what's my name?".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "your name is Bob".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "and my favorite color?".to_string(),
+            },
+        ];
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user").unwrap();
+        let seed = history_seed_from_messages(&messages, last_user_idx);
+        assert_eq!(seed.len(), 2);
+        assert_eq!(seed[0].role, "user");
+        assert_eq!(seed[0].content, "what's my name?");
+        assert_eq!(seed[1].role, "assistant");
+        assert_eq!(seed[1].content, "your name is Bob");
+    }
+
+    #[test]
+    fn history_seed_is_empty_when_last_user_message_is_first() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user").unwrap();
+        let seed = history_seed_from_messages(&messages, last_user_idx);
+        assert!(seed.is_empty());
     }
 
     // ── OpenAI wire format ───────────────────────────────────────────────────
