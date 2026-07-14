@@ -778,6 +778,7 @@ channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
 channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model <model-id>`.
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
+channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à cette session, ou demandez à un administrateur de définir `admin_for_agent_scope = true` pour un peer group dont vous êtes membre.
 channel-runtime-request-timeout = ⚠️ La requête a expiré en attendant le modèle. Veuillez réessayer.
 channel-runtime-current-model-status =
     model_provider actuel : `{ $provider }`

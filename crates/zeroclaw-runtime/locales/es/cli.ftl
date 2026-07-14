@@ -776,6 +776,7 @@ channel-runtime-stop-sent = Señal de detención enviada.
 channel-runtime-stop-no-task = No hay una tarea en curso para este ámbito de remitente.
 channel-runtime-model-empty = El ID del modelo no puede estar vacío. Usa `/model <model-id>`.
 channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.
+channel-runtime-agent-scope-rejected = El remitente `{ $sender }` no está autorizado para usar `/model --agent` en el agente `{ $agent }`. Usa `/model --user { $model }` para una sustitución solo de esta sesión, o pide a un administrador que marque un peer group con `admin_for_agent_scope = true` y te incluya como miembro.
 channel-runtime-request-timeout = ⚠️ La solicitud agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
 channel-runtime-current-model-status =
     model_provider actual: `{ $provider }`

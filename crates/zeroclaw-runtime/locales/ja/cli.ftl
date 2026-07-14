@@ -775,6 +775,7 @@ channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
 channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
+channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` には、エージェント `{ $agent }` で `/model --agent` を使用する権限がありません。セッション内だけで上書きするには `/model --user { $model }` を使用するか、管理者に `admin_for_agent_scope = true` を設定した peer group のメンバーとして追加してもらってください。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
 channel-runtime-current-model-status =
     現在の model_provider: `{ $provider }`
