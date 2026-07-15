@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
+// tempfile is used so large system prompts never hit OS ARG_MAX via `-p`.
 
 /// Default `grok` binary name (resolved via `PATH`).
 const DEFAULT_GROK_CLI_BINARY: &str = "grok";
@@ -99,11 +100,12 @@ impl GrokCliModelProvider {
         format!("{clipped}...")
     }
 
-    /// Build argv after the binary. Uses `-p` headless mode with plain output.
-    fn build_cli_args(model: &str, prompt: &str) -> Vec<String> {
+    /// Build argv after the binary. Prompt is always passed via
+    /// `--prompt-file` so large system prompts never hit OS ARG_MAX.
+    fn build_cli_args(model: &str, prompt_file: &std::path::Path) -> Vec<String> {
         let mut args = vec![
-            "-p".to_string(),
-            prompt.to_string(),
+            "--prompt-file".to_string(),
+            prompt_file.display().to_string(),
             "--output-format".to_string(),
             "plain".to_string(),
             "--no-auto-update".to_string(),
@@ -124,8 +126,22 @@ impl GrokCliModelProvider {
     }
 
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
+        // Write prompt to a temp file — ZeroClaw system prompts routinely
+        // exceed ARG_MAX when passed as a `-p` argv token.
+        let mut prompt_file = tempfile::NamedTempFile::new().map_err(|err| {
+            anyhow::Error::msg(format!("Failed to create temp prompt file for Grok CLI: {err}"))
+        })?;
+        use std::io::Write;
+        prompt_file.write_all(message.as_bytes()).map_err(|err| {
+            anyhow::Error::msg(format!("Failed to write Grok CLI prompt file: {err}"))
+        })?;
+        prompt_file.flush().map_err(|err| {
+            anyhow::Error::msg(format!("Failed to flush Grok CLI prompt file: {err}"))
+        })?;
+        let prompt_path = prompt_file.path().to_path_buf();
+
         let mut cmd = Command::new(&self.binary_path);
-        cmd.args(Self::build_cli_args(model, message));
+        cmd.args(Self::build_cli_args(model, &prompt_path));
         cmd.kill_on_drop(true);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -182,6 +198,9 @@ impl GrokCliModelProvider {
                 );
                 anyhow::Error::msg(format!("Grok Build CLI process failed: {err}"))
             })?;
+
+        // Keep prompt_file alive until the process exits (NamedTempFile drops unlink).
+        drop(prompt_file);
 
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
@@ -326,19 +345,22 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_args_uses_headless_flags() {
-        let args = GrokCliModelProvider::build_cli_args(DEFAULT_MODEL_MARKER, "hello");
-        assert_eq!(args[0], "-p");
-        assert_eq!(args[1], "hello");
+    fn build_cli_args_uses_prompt_file_and_headless_flags() {
+        let path = PathBuf::from("/tmp/prompt.md");
+        let args = GrokCliModelProvider::build_cli_args(DEFAULT_MODEL_MARKER, &path);
+        assert_eq!(args[0], "--prompt-file");
+        assert_eq!(args[1], "/tmp/prompt.md");
         assert!(args.iter().any(|a| a == "--output-format"));
         assert!(args.iter().any(|a| a == "plain"));
         assert!(args.iter().any(|a| a == "--always-approve"));
         assert!(!args.iter().any(|a| a == "-m"));
+        assert!(!args.iter().any(|a| a == "-p"));
     }
 
     #[test]
     fn build_cli_args_forwards_explicit_model() {
-        let args = GrokCliModelProvider::build_cli_args("grok-4.5", "hi");
+        let path = PathBuf::from("/tmp/prompt.md");
+        let args = GrokCliModelProvider::build_cli_args("grok-4.5", &path);
         let m_idx = args.iter().position(|a| a == "-m").expect("-m flag");
         assert_eq!(args[m_idx + 1], "grok-4.5");
     }
