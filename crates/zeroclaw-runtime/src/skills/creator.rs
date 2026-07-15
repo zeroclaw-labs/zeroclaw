@@ -87,14 +87,14 @@ impl SkillCreator {
         Ok(Some(slug))
     }
 
-    /// Like [`create_from_execution`], but synthesizes a canonical `SKILL.md`
+    /// Like [`Self::create_from_execution`], but synthesizes a canonical `SKILL.md`
     /// from a *bounded* slice of the execution via a model-provider reflection
     /// call. If reflection fails — provider error, malformed output, empty
     /// body — it falls back to the deterministic `SKILL.toml` generator so a
     /// creation attempt is never left half-done.
     ///
     /// Gating (enabled flag, minimum tool calls, dedup, slug, LRU) is shared
-    /// with [`create_from_execution`].
+    /// with [`Self::create_from_execution`].
     pub async fn create_from_execution_reflected(
         &self,
         task_description: &str,

@@ -148,9 +148,20 @@ mod tests {
     }
 
     #[test]
-    fn dist_preset_ships_all_channels_not_stale_pair() {
-        let p = render_presets(&root()).unwrap();
-        assert!(p.contains("channel-discord"), "dist must ship all channels");
+    fn dist_preset_ships_lean_release_channels() {
+        let presets = render_presets(&root()).unwrap();
+        let (_, dist_and_rest) = presets.split_once(":build_dist").unwrap();
+        let (dist, _) = dist_and_rest.split_once("goto :do_build").unwrap();
+        assert!(dist.contains("channel-matrix"));
+        assert!(dist.contains("whatsapp-web"));
+        assert!(!dist.contains("channel-slack"));
+    }
+
+    #[test]
+    fn real_setup_bat_help_describes_dist_as_lean() {
+        let setup = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        assert!(setup.contains("--dist        Build lean standard distribution"));
+        assert!(!setup.contains("--dist        Build all channels"));
     }
 
     #[test]

@@ -150,7 +150,7 @@ pub fn current_snapshot() -> Arc<PriceSnapshot> {
 
 /// Model-id candidate forms, most specific first: the id verbatim, then the
 /// path-suffix form (`vendor/slug` → `slug`). The single owner of the
-/// candidate policy: snapshot assembly ([`match_pricing`]) and lookup both
+/// candidate policy: snapshot assembly (`match_pricing`) and lookup both
 /// consume it, and the config-rate resolver mirrors it.
 pub fn model_id_candidates(model_id: &str) -> impl Iterator<Item = &str> {
     std::iter::once(model_id).chain(model_id.rsplit_once('/').map(|(_, suffix)| suffix))
@@ -202,7 +202,7 @@ fn any_live_pricing(config: &Config) -> bool {
 /// gateway after the channels supervisor, in a combined process) returns at the
 /// guard without building any provider handles.
 ///
-/// Every call re-binds [`CONFIG_HANDLE`] before anything else, and the running
+/// Every call re-binds `CONFIG_HANDLE` before anything else, and the running
 /// task re-resolves it each cycle, so a daemon reload (which re-instantiates
 /// the config `Arc` and re-runs both call sites) re-points the refresher at
 /// the current config, and toggling `live_pricing` on a provider (or changing
