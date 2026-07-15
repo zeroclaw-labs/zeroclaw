@@ -29,6 +29,7 @@ pub(crate) struct ProviderEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))] // `modalities` is parsed and exposed via `model_supports_vision`, which only has test callers until #8733 capability-routing lands.
 struct ModelEntry {
     id: String,
     #[serde(default)]
@@ -69,6 +70,7 @@ impl Modalities {
     /// an explicit `"image"` token in `input` flips it on. Malformed
     /// catalog entries (missing `modalities` or empty `input`) yield
     /// `false`; callers fall back to the family default in that case.
+    #[cfg_attr(not(test), allow(dead_code))] // only test callers until #8733 capability-routing lands
     fn supports_image_input(&self) -> bool {
         self.input.iter().any(|m| m == "image")
     }
@@ -183,6 +185,7 @@ pub(crate) fn pricing_from_catalog(
 /// Pure / sync / no network. This is the parser half of #8733; wiring the
 /// result into `provider.capabilities()` and the orchestrator
 /// `supports_vision()` call site is a separate change tracked on #8733.
+#[cfg_attr(not(test), allow(dead_code))] // only test callers until #8733 capability-routing lands
 pub(crate) fn model_supports_vision(
     catalog: &Catalog,
     provider_key: &str,
