@@ -37,9 +37,8 @@ pub mod field {
 /// Used for deserializing bidirectional RPC traffic where incoming frames
 /// may be responses to our outbound requests.
 ///
-/// `result_present`/`error_present` track raw field presence so an explicit
-/// `result: null` success response still classifies as a response, which the
-/// default `Option<Value>` folding would erase.
+/// The custom Deserialize impl preserves explicit `result: null` as `Some(Value::Null)`
+/// so valid JSON-RPC 2.0 success responses are not silently dropped.
 #[derive(Debug)]
 pub struct JsonRpcFrame {
     pub jsonrpc: String,
@@ -47,9 +46,7 @@ pub struct JsonRpcFrame {
     pub params: Option<Value>,
     pub id: Option<Value>,
     pub result: Option<Value>,
-    pub result_present: bool,
     pub error: Option<JsonRpcError>,
-    pub error_present: bool,
 }
 
 impl<'de> Deserialize<'de> for JsonRpcFrame {
@@ -78,17 +75,15 @@ impl<'de> Deserialize<'de> for JsonRpcFrame {
         let params = obj.remove(field::PARAMS);
         let id = obj.remove(field::ID);
 
-        let (result, result_present) = match obj.remove(field::RESULT) {
-            Some(v) => (Some(v), true),
-            None => (None, false),
-        };
-        let (error, error_present) = match obj.remove(field::ERROR) {
-            Some(v) => {
-                let err: JsonRpcError = serde_json::from_value(v).map_err(D::Error::custom)?;
-                (Some(err), true)
-            }
-            None => (None, false),
-        };
+        // Result: remove field; explicit null is preserved as Some(Value::Null).
+        let result = obj.remove(field::RESULT);
+
+        // Error: remove field, attempt deserialization, transpose Option<Result> to Result<Option>.
+        let error = obj
+            .remove(field::ERROR)
+            .map(serde_json::from_value::<JsonRpcError>)
+            .transpose()
+            .map_err(D::Error::custom)?;
 
         Ok(JsonRpcFrame {
             jsonrpc,
@@ -96,28 +91,22 @@ impl<'de> Deserialize<'de> for JsonRpcFrame {
             params,
             id,
             result,
-            result_present,
             error,
-            error_present,
         })
     }
 }
 
 impl JsonRpcFrame {
     /// Whether this frame is a response to an outbound request: no method,
-    /// and a `result` or `error` field was present (even if `result` is null).
+    /// and a `result` or `error` field was present (including explicit null).
     pub fn is_response(&self) -> bool {
-        self.method.is_none() && (self.result_present || self.error_present)
+        self.method.is_none() && (self.result.is_some() || self.error.is_some())
     }
 
     /// The response result value when present (including explicit null),
     /// otherwise None.
     pub fn response_result(&self) -> Option<&Value> {
-        if self.result_present {
-            self.result.as_ref()
-        } else {
-            None
-        }
+        self.result.as_ref()
     }
 
     /// The request method (for incoming client requests).
@@ -589,7 +578,7 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":"x","result":null}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(frame.result_present);
+        assert!(frame.result.is_some());
         assert_eq!(frame.result, Some(Value::Null));
         assert!(frame.is_response());
         assert_eq!(frame.response_result(), Some(&Value::Null));
@@ -652,7 +641,7 @@ mod tests {
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
         assert!(frame.is_response());
-        assert!(frame.result_present);
+        assert!(frame.result.is_some());
         assert_eq!(frame.result, Some(Value::Null));
         assert_eq!(frame.response_result(), Some(&Value::Null));
     }
