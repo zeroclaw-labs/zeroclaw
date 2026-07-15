@@ -925,7 +925,7 @@ impl DelegateTool {
             return (
                 type_key.to_string(),
                 if cfg.requires_openai_auth {
-                    None
+                    cfg.api_key.clone()
                 } else {
                     cfg.api_key
                         .clone()
@@ -8418,6 +8418,37 @@ command = "echo hi"
             "OAuth target must not inherit global coordinator credential"
         );
         assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_preserves_explicit_alias_key() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: Some("sk-codex-custom-gateway-key".to_string()),
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-codex-custom-gateway-key"),
+            "OAuth target with explicit api_key must preserve the alias key"
+        );
     }
 
     #[test]
