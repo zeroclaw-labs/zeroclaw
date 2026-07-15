@@ -2,7 +2,7 @@
 pub use zeroclaw_runtime::skills::*;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
 
@@ -57,53 +57,136 @@ pub async fn handle_command(
     command: crate::SkillCommands,
     config: &crate::config::Config,
 ) -> Result<()> {
-    let workspace_dir = &config.data_dir;
     match command {
-        crate::SkillCommands::List => {
-            let skills = load_skills_with_config(workspace_dir, config);
-            if skills.is_empty() {
+        crate::SkillCommands::List { agent, bundle } => {
+            let install_root = config.install_root_dir();
+            let allow_scripts = config.skills.allow_scripts;
+
+            // Build the ordered (label, skills) groups to display.
+            let mut rendered: Vec<(String, Vec<Skill>)> = Vec::new();
+            let mut skipped: Vec<DroppedSkill> = Vec::new();
+            if let Some(ref b) = bundle {
+                // A single bundle's on-disk skills.
+                let dir =
+                    zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, b)
+                        .map_err(anyhow::Error::msg)?;
+                rendered.push((
+                    get_required_cli_string_with_args(
+                        "cli-skills-list-group-bundle",
+                        &[("alias", b)],
+                    ),
+                    load_skills_from_directory(&dir, allow_scripts).0,
+                ));
+            } else if let Some(ref a) = agent {
+                // Exactly what this agent loads at runtime — the same loader the
+                // agent boot/loop uses (workspace + open-skills + plugins +
+                // assigned bundles), so `list --agent` mirrors runtime behavior.
+                if config.agent(a).is_none() {
+                    anyhow::bail!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-agent-not-configured",
+                            &[("alias", a)],
+                        )
+                    );
+                }
+                let (skills, dropped, _shadowed) =
+                    load_skills_for_agent_from_config_audited(config, a);
+                skipped.extend(dropped);
+                rendered.push((
+                    get_required_cli_string_with_args(
+                        "cli-skills-list-group-agent",
+                        &[("alias", a)],
+                    ),
+                    skills,
+                ));
+            } else {
+                // Full inventory: every bundle, then the agent-agnostic sources
+                // (global dir + open-skills + plugins). `load_skills_with_config`
+                // is the same loader the old `list` used, so those rows are
+                // preserved (#8334 review).
+                for alias in config.skill_bundles.keys() {
+                    if let Ok(dir) = zeroclaw_config::skill_bundles::resolve_directory(
+                        config,
+                        &install_root,
+                        alias,
+                    ) {
+                        rendered.push((
+                            get_required_cli_string_with_args(
+                                "cli-skills-list-group-bundle",
+                                &[("alias", alias)],
+                            ),
+                            load_skills_from_directory(&dir, allow_scripts).0,
+                        ));
+                    }
+                }
+                let (skills, dropped) = load_skills_with_config_audited(&config.data_dir, config);
+                skipped.extend(dropped);
+                rendered.push((
+                    get_required_cli_string("cli-skills-list-group-global"),
+                    skills,
+                ));
+            }
+
+            let total: usize = rendered.iter().map(|(_, s)| s.len()).sum();
+
+            if total == 0 {
                 println!("{}", get_required_cli_string("cli-skills-none-installed"));
                 println!();
                 println!("{}", get_required_cli_string("cli-skills-create-hint"));
-                println!(
-                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md" // i18n-exempt: literal shell command example
-                );
-                println!();
                 println!("{}", get_required_cli_string("cli-skills-install-hint"));
             } else {
                 println!(
                     "{}",
                     get_required_cli_string_with_args(
                         "cli-skills-installed-header",
-                        &[("count", &skills.len().to_string())],
+                        &[("count", &total.to_string())],
                     )
                 );
                 println!();
-                for skill in &skills {
-                    println!(
-                        "  {} {} — {}",
-                        console::style(&skill.name).white().bold(),
-                        console::style(format!("v{}", skill.version)).dim(),
-                        skill.description
-                    );
-                    if !skill.tools.is_empty() {
-                        println!(
-                            "    Tools: {}",
-                            skill
-                                .tools
-                                .iter()
-                                .map(|t| t.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
+                for (label, skills) in &rendered {
+                    if skills.is_empty() {
+                        continue;
                     }
-                    if !skill.tags.is_empty() {
+                    println!("  {}", console::style(format!("[{label}]")).dim());
+                    for skill in skills {
+                        print_skill(skill);
+                    }
+                    println!();
+                }
+            }
+            if !skipped.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-skipped-header",
+                        &[("count", &skipped.len().to_string())],
+                    )
+                );
+                println!();
+                for entry in &skipped {
+                    let (reason, scripts_blocked) = match &entry.reason {
+                        SkillDropReason::AuditFindings {
+                            summary,
+                            scripts_blocked,
+                        } => (summary.clone(), *scripts_blocked),
+                        SkillDropReason::AuditError(s) | SkillDropReason::ManifestParseError(s) => {
+                            (s.clone(), false)
+                        }
+                    };
+                    println!("  {}", console::style(&entry.name).yellow().bold());
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-skipped-reason",
+                            &[("reason", &reason)],
+                        )
+                    );
+                    if scripts_blocked && !config.skills.allow_scripts {
                         println!(
-                            "    {}",
-                            get_required_cli_string_with_args(
-                                "cli-skills-tags",
-                                &[("tags", &skill.tags.join(", "))],
-                            )
+                            "{}",
+                            get_required_cli_string("cli-skills-skipped-scripts-hint")
                         );
                     }
                 }
@@ -116,12 +199,8 @@ pub async fn handle_command(
             let target = if source_path.exists() {
                 source_path
             } else {
-                skills_dir(workspace_dir).join(&source)
+                locate_installed_skill_dir(config, &source)?
             };
-
-            if !target.exists() {
-                anyhow::bail!("Skill source or installed skill not found: {source}");
-            }
 
             let report = audit::audit_skill_directory_with_options(
                 &target,
@@ -147,52 +226,118 @@ pub async fn handle_command(
             for finding in report.findings {
                 println!("    - {finding}");
             }
-            anyhow::bail!("Skill audit failed.");
+            anyhow::bail!(get_required_cli_string("cli-skills-audit-failed"));
         }
         crate::SkillCommands::Install {
             source,
+            agent,
+            bundle,
             no_tier_banner,
             accept_risk,
             force,
-        } => handle_install(config, source, no_tier_banner, accept_risk, force).await,
+        } => {
+            handle_install(config, source, agent, bundle, no_tier_banner, accept_risk, force)
+                .await
+        }
         crate::SkillCommands::Screen { source } => handle_screen(config, source).await,
         crate::SkillCommands::Verify { name } => handle_verify(config, name),
-        crate::SkillCommands::Remove { name } => {
+        crate::SkillCommands::Remove {
+            name,
+            agent,
+            bundle,
+        } => {
             // Reject path traversal attempts
             if name.contains("..") || name.contains('/') || name.contains('\\') {
                 anyhow::bail!("Invalid skill name: {name}");
             }
+            let status = console::style("✓").green().bold().to_string();
 
-            let skill_path = skills_dir(workspace_dir).join(&name);
+            if let Some(ref a) = agent
+                && config.agent(a).is_none()
+            {
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-agent-not-configured",
+                        &[("alias", a)],
+                    )
+                );
+            }
 
-            // Verify the resolved path is actually inside the skills directory
-            let canonical_skills = skills_dir(workspace_dir)
-                .canonicalize()
-                .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
+            // Explicit bundle: archive through the service (recoverable).
+            if let Some(ref b) = bundle {
+                let service = SkillsService::new(config, config.install_root_dir());
+                let target = service
+                    .resolve_ref(&name, Some(b))
+                    .map_err(anyhow::Error::msg)?;
+                service
+                    .remove_skill(&target, zeroclaw_runtime::skills::RemoveMode::Archive)
+                    .map_err(anyhow::Error::msg)?;
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-removed-archived",
+                        &[("status", &status), ("name", &name), ("bundle", b)],
+                    )
+                );
+                return Ok(());
+            }
+
+            // Otherwise locate the skill across bundles (+ global) and disambiguate.
+            let matches = collect_skill_locations(config, &name, agent.as_deref());
+            match matches.as_slice() {
+                [] => anyhow::bail!("Skill not found: {name}"),
+                [(label, dir)] => {
+                    if let Some(alias) = label.strip_prefix("bundle:") {
+                        let service = SkillsService::new(config, config.install_root_dir());
+                        let target = service
+                            .resolve_ref(&name, Some(alias))
+                            .map_err(anyhow::Error::msg)?;
+                        service
+                            .remove_skill(&target, zeroclaw_runtime::skills::RemoveMode::Archive)
+                            .map_err(anyhow::Error::msg)?;
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-skills-removed-archived",
+                                &[("status", &status), ("name", &name), ("bundle", alias)],
+                            )
+                        );
+                    } else {
+                        // Global dir: plain delete with a containment guard.
+                        let global_root = skills_dir(&config.data_dir);
+                        let canonical_root =
+                            global_root.canonicalize().unwrap_or(global_root.clone());
+                        if let Ok(c) = dir.canonicalize()
+                            && !c.starts_with(&canonical_root)
+                        {
+                            anyhow::bail!("Skill path escapes skills directory: {name}");
+                        }
+                        std::fs::remove_dir_all(dir)?;
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-skills-removed-global",
+                                &[("status", &status), ("name", &name)],
+                            )
+                        );
+                    }
+                }
+                many => {
+                    let locs = many
+                        .iter()
+                        .map(|(l, _)| l.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    anyhow::bail!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-multiple-locations-bundle",
+                            &[("name", &name), ("locations", &locs)],
+                        )
+                    );
                 }
             }
-
-            if !skill_path.exists() {
-                anyhow::bail!("Skill not found: {name}");
-            }
-
-            std::fs::remove_dir_all(&skill_path)?;
-            // Remove the install receipt too, so a later skill reusing this
-            // name is not classified by the removed skill's provenance (a
-            // scaffolded local `foo` would otherwise be refused from testing,
-            // or reported modified by `verify`, on the stale remote receipt).
-            let _ = std::fs::remove_file(zeroclaw_runtime::skills::receipt::receipt_path(
-                &config.install_root_dir(),
-                &name,
-            ));
-            println!(
-                "  {} Skill '{}' removed.",
-                console::style("✓").green().bold(),
-                name
-            );
             Ok(())
         }
         crate::SkillCommands::Add {
@@ -233,623 +378,237 @@ pub async fn handle_command(
             }
             crate::SkillBundleCommands::Show { alias } => handle_bundle_show(config, alias),
         },
-        crate::SkillCommands::Test { name, verbose } => handle_test(config, name, verbose),
-    }
-}
+        crate::SkillCommands::Test { name, verbose } => {
+            let results = if let Some(ref skill_name) = name {
+                // Test a single skill
+                let source_path = PathBuf::from(skill_name);
+                let target = if source_path.exists() {
+                    source_path
+                } else {
+                    locate_installed_skill_dir(config, skill_name)?
+                };
 
-/// True when the named installed skill's receipt records a remote source.
-/// Without a receipt (dev-local or pre-provenance skills) the skill is treated
-/// as local and its TEST.sh is allowed to run.
-fn skill_is_remote_origin(config: &crate::config::Config, skill_name: &str) -> bool {
-    let install_root = config.install_root_dir();
-    zeroclaw_runtime::skills::receipt::read_receipt(&install_root, skill_name)
-        .is_some_and(|r| r.source.is_remote())
-}
-
-/// Run TEST.sh validation. Under the current no-OS-sandbox posture, a skill
-/// whose receipt records a remote source is refused (its unaudited commands
-/// would run with only environment scrubbing) — a hard refusal that the
-/// sandboxed detonation work in a later RFC lifts. Local / no-receipt skills
-/// keep the existing warn-and-run behavior.
-fn handle_test(config: &crate::config::Config, name: Option<String>, verbose: bool) -> Result<()> {
-    let workspace_dir = &config.data_dir;
-    let results = if let Some(ref skill_name) = name {
-        // A bare name (no path separators) always addresses the *installed*
-        // skill of that name, so the remote-origin refusal below cannot be
-        // sidestepped by running from inside the skills directory (where a
-        // cwd-relative `foo` would otherwise resolve to a local path and skip
-        // the gate). Only an explicit path-like argument is treated as a local
-        // directory a developer is iterating on.
-        let looks_like_path =
-            skill_name.contains('/') || skill_name.contains('\\') || skill_name.starts_with('.');
-        let (target, is_installed) = if looks_like_path {
-            (PathBuf::from(skill_name), false)
-        } else {
-            (skills_dir(workspace_dir).join(skill_name), true)
-        };
-
-        if !target.exists() {
-            anyhow::bail!("Skill not found: {}", skill_name);
-        }
-        if is_installed && skill_is_remote_origin(config, skill_name) {
-            anyhow::bail!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-skills-test-remote-refused",
-                    &[("name", skill_name)]
-                )
-            );
-        }
-
-        let r = testing::test_skill(&target, skill_name, verbose)?;
-        if r.tests_run == 0 {
-            println!(
-                "  {} No TEST.sh found for skill '{}'.",
-                console::style("-").dim(),
-                skill_name,
-            );
-            return Ok(());
-        }
-        vec![r]
-    } else {
-        // Test all skills, skipping (with a note) any remote-origin skill.
-        let skills_path = skills_dir(workspace_dir);
-        let mut results = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&skills_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let skill_name = entry.file_name().to_string_lossy().into_owned();
-                if !path.join("TEST.sh").exists() {
-                    continue;
-                }
-                if skill_is_remote_origin(config, &skill_name) {
-                    eprintln!(
-                        "{}",
-                        get_required_cli_string_with_args(
-                            "cli-skills-test-remote-refused",
-                            &[("name", &skill_name)]
-                        )
+                let r = testing::test_skill(&target, skill_name, verbose)?;
+                if r.tests_run == 0 {
+                    println!(
+                        "  {} No TEST.sh found for skill '{}'.",
+                        console::style("-").dim(),
+                        skill_name,
                     );
-                    continue;
+                    return Ok(());
                 }
-                results.push(testing::test_skill(&path, &skill_name, verbose)?);
+                vec![r]
+            } else {
+                // Test all skills across every bundle plus the global dir.
+                let install_root = config.install_root_dir();
+                let mut dirs: Vec<PathBuf> = config
+                    .skill_bundles
+                    .keys()
+                    .filter_map(|a| {
+                        zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, a)
+                            .ok()
+                    })
+                    .collect();
+                dirs.push(skills_dir(&config.data_dir));
+                testing::test_all_skills(&dirs, verbose)?
+            };
+
+            testing::print_results(&results);
+
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
             }
+            Ok(())
         }
-        results
-    };
-
-    testing::print_results(&results);
-
-    let any_failed = results.iter().any(|r| !r.failures.is_empty());
-    if any_failed {
-        anyhow::bail!("Some skill tests failed.");
-    }
-    Ok(())
-}
-
-/// Whether an install spec is remote provenance. Delegates to
-/// [`SkillSource::is_remote`] — the single classification authority — so the
-/// gate class can never disagree with the installer the dispatch picks (a new
-/// remote source kind added there is remote here automatically, rather than
-/// silently falling through to the warn-only local gate).
-fn source_is_remote(source: &str) -> bool {
-    zeroclaw_runtime::skills::SkillSource::parse(source).is_remote()
-}
-
-/// Reject a skill name that could act as a path component and escape the skills
-/// directory (or the receipts directory). Mirrors the guard the `remove`
-/// command enforces, so `verify`/`test` cannot be pointed outside the skills
-/// tree via `../` or an absolute-looking name.
-fn reject_unsafe_skill_name(name: &str) -> Result<()> {
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        anyhow::bail!("Invalid skill name: {name}");
-    }
-    Ok(())
-}
-
-/// Build the screening gate for an install spec: remote sources use
-/// `[skills.install_screening].remote_action` (carrying any `--accept-risk`
-/// override), local sources use `local_action`.
-fn screening_gate_for(
-    config: &crate::config::Config,
-    source: &str,
-    accept_risk: Option<String>,
-) -> SkillScreeningGate {
-    let cfg = &config.skills.install_screening;
-    if source_is_remote(source) {
-        SkillScreeningGate::for_remote(cfg.remote_action, accept_risk)
-    } else {
-        SkillScreeningGate::for_local(cfg.local_action)
     }
 }
 
-/// Dispatch an install spec to the matching installer with the screening gate
-/// and install mode threaded in.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_install(
-    config: &crate::config::Config,
-    source: &str,
-    workspace_dir: &std::path::Path,
-    skills_path: &std::path::Path,
-    no_tier_banner: bool,
-    gate: &SkillScreeningGate,
-    mode: &InstallMode,
-    allow_scripts: bool,
-) -> Result<SkillInstallReport> {
-    if is_clawhub_source(source) {
-        install_clawhub_skill_source(source, skills_path, allow_scripts, gate, mode)
-            .await
-            .with_context(|| format!("failed to install skill from ClawHub: {source}"))
-    } else if is_git_source(source) {
-        install_git_skill_source(source, skills_path, allow_scripts, gate, mode)
-            .with_context(|| format!("failed to install git skill source: {source}"))
-    } else if is_registry_source(source) {
-        println!(
-            "{}",
-            get_required_cli_string_with_args(
-                "cli-skills-install-resolving-registry",
-                &[("source", source)]
-            )
-        );
-        install_registry_skill_source(
-            source,
-            skills_path,
-            allow_scripts,
-            workspace_dir,
-            config.skills.registry_url.as_deref(),
-            no_tier_banner,
-            gate,
-            mode,
-        )
-        .with_context(|| format!("failed to install skill from registry: {source}"))
-    } else if is_extra_registry_source(source) {
-        let registry_label = parse_extra_registry_source(source)
-            .map(|(name, _)| name)
-            .unwrap_or_default();
-        println!(
-            "{}",
-            get_required_cli_string_with_args(
-                "cli-skills-install-resolving-extra-registry",
-                &[("source", source), ("registry", &registry_label)]
-            )
-        );
-        install_extra_registry_skill_source(
-            source,
-            skills_path,
-            allow_scripts,
-            workspace_dir,
-            &config.skills.extra_registries,
-            no_tier_banner,
-            gate,
-            mode,
-        )
-        .with_context(|| format!("failed to install skill from extra registry: {source}"))
-    } else {
-        install_local_skill_source(source, skills_path, allow_scripts, gate, mode)
-            .with_context(|| format!("failed to install local skill source: {source}"))
-    }
+/// Where `skills install` writes, and where `list`/`remove`/`audit`/`test`
+/// look. A [`SkillLocation::Bundle`] directory is loaded by every agent that
+/// lists its alias in `skill_bundles`; the [`SkillLocation::Global`] directory
+/// (`<install>/data/skills/`) is NOT loaded by any agent until the skill is
+/// assigned to a bundle — installing there prints a note saying so (#8334).
+enum SkillLocation {
+    Bundle { alias: String, dir: PathBuf },
+    Global { dir: PathBuf },
 }
 
-/// Derive the installed directory name a source spec would use, for looking up
-/// its prior receipt when building an update review.
-fn install_dir_name(source: &str) -> Option<String> {
-    match SkillSource::parse(source) {
-        SkillSource::ClawHub { .. } => clawhub_skill_dir_name(source).ok(),
-        // Resolve the git destination name through the same runtime helper the
-        // installer uses (`git_clone_dir_name`), so the receipt lookup and the
-        // actual install directory can never disagree.
-        SkillSource::Git { .. } => {
-            zeroclaw_runtime::skills::git_clone_dir_name(source).ok()
+impl SkillLocation {
+    fn dir(&self) -> &Path {
+        match self {
+            SkillLocation::Bundle { dir, .. } | SkillLocation::Global { dir } => dir,
         }
-        SkillSource::Registry { skill, .. } => Some(skill),
-        SkillSource::Local { path } => path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string),
     }
 }
 
-/// Build the install mode for a `--force` (re)install: look up the prior
-/// receipt so the differentiated update review can compare versions and
-/// content hashes. A plain (non-force) install always uses the fresh mode.
-fn install_mode_for(config: &crate::config::Config, source: &str, force: bool) -> InstallMode {
-    if !force {
-        return InstallMode::fresh();
-    }
-    let review = install_dir_name(source)
-        .and_then(|name| {
-            zeroclaw_runtime::skills::receipt::read_receipt(&config.install_root_dir(), &name)
-        })
-        .map(|r| UpdateReview {
-            prior_version: r.version,
-            prior_tree_hash: r.tree_hash,
-        });
-    InstallMode::forced(review)
-}
-
-/// Install a skill, applying install-boundary screening. On a screening denial
-/// under `confirm`, prints the report and the staged content hash, then either
-/// prompts on a TTY or instructs a rerun with `--accept-risk=<hash>`.
-async fn handle_install(
+/// Resolve where `skills install` should write. Precedence: an explicit
+/// `--bundle`, then the target agent's single assigned bundle, then the global
+/// fallback dir. `--agent` selects the target agent (default: the active agent).
+fn resolve_install_location(
     config: &crate::config::Config,
-    source: String,
-    no_tier_banner: bool,
-    accept_risk: Option<String>,
-    force: bool,
-) -> Result<()> {
-    let workspace_dir = &config.data_dir;
-    println!(
-        "{}",
-        get_required_cli_string_with_args("cli-skills-install-start", &[("source", &source)])
-    );
+    agent: Option<&str>,
+    bundle: Option<&str>,
+) -> Result<SkillLocation> {
+    let install_root = config.install_root_dir();
 
-    let skills_path = skills_dir(workspace_dir);
-    std::fs::create_dir_all(&skills_path)?;
-
-    let gate = screening_gate_for(config, &source, accept_risk.clone());
-    let mode = install_mode_for(config, &source, force);
-    let outcome = dispatch_install(
-        config,
-        &source,
-        workspace_dir,
-        &skills_path,
-        no_tier_banner,
-        &gate,
-        &mode,
-        config.skills.allow_scripts,
-    )
-    .await;
-
-    let report = match outcome {
-        Ok(report) => report,
-        Err(err) => {
-            // A screening denial or update content-swap surfaces as
-            // RiskAcceptanceRequired; show the report + hash and, on a TTY,
-            // offer to re-run with the override.
-            if let Some(risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
-                return handle_screening_denial(config, &source, no_tier_banner, force, risk).await;
-            }
-            return Err(err);
-        }
-    };
-
-    if let Some(screening) = &report.screening
-        && !screening.is_clean()
+    // Validate an explicit --agent up front, so a typo'd alias errors even when
+    // --bundle is also given (which otherwise returns before the agent block).
+    if let Some(a) = agent
+        && config.agent(a).is_none()
     {
-        eprint!("{}", screening.render());
-    }
-
-    record_install_receipt(config, &source, &report);
-    print_install_success(&report);
-    Ok(())
-}
-
-/// Handle a screening denial: print the report + staged hash. Under `block`
-/// (no override possible) abort. Under `confirm`, on an interactive TTY prompt
-/// y/N against the displayed hash and, if accepted, re-run the install with a
-/// content-bound override; otherwise instruct a `--accept-risk` rerun.
-async fn handle_screening_denial(
-    config: &crate::config::Config,
-    source: &str,
-    no_tier_banner: bool,
-    force: bool,
-    risk: &RiskAcceptanceRequired,
-) -> Result<()> {
-    eprint!("{}", risk.report.render());
-    eprintln!(
-        "{}",
-        get_required_cli_string_with_args(
-            "cli-skills-screen-staged-hash",
-            &[("hash", &risk.staged_hash)]
-        )
-    );
-
-    if risk.blocked {
-        anyhow::bail!("{}", get_required_cli_string("cli-skills-screen-blocked"));
-    }
-
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    if !interactive {
         anyhow::bail!(
             "{}",
-            get_required_cli_string_with_args(
-                "cli-skills-screen-accept-hint",
-                &[("hash", &risk.staged_hash)]
-            )
+            get_required_cli_string_with_args("cli-skills-agent-not-configured", &[("alias", a)],)
         );
     }
 
-    let proceed = dialoguer::Confirm::new()
-        .with_prompt(get_required_cli_string("cli-skills-screen-confirm-prompt"))
-        .default(false)
-        .interact()?;
-    if !proceed {
-        anyhow::bail!("{}", get_required_cli_string("cli-skills-screen-declined"));
+    // 1. An explicit bundle wins outright (mirrors `skills add`/`edit`).
+    if let Some(alias) = bundle {
+        if !config.skill_bundles.contains_key(alias) {
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args("cli-bundle-not-configured", &[("alias", alias)])
+            );
+        }
+        let dir = zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
+            .map_err(anyhow::Error::msg)?;
+        return Ok(SkillLocation::Bundle {
+            alias: alias.to_string(),
+            dir,
+        });
     }
 
-    // Re-run with the content-bound override. The install re-stages and
-    // re-hashes; if the source now serves different bytes the hash differs and
-    // this stale override is rejected.
-    let workspace_dir = &config.data_dir;
-    let skills_path = skills_dir(workspace_dir);
-    let gate = screening_gate_for(config, source, Some(risk.staged_hash.clone()));
-    let mode = install_mode_for(config, source, force);
-    let report = match dispatch_install(
-        config,
-        source,
-        workspace_dir,
-        &skills_path,
-        no_tier_banner,
-        &gate,
-        &mode,
-        config.skills.allow_scripts,
-    )
-    .await
+    // 2. Pick the target agent: explicit `--agent`, else the active agent.
+    let target_agent: Option<String> = match agent {
+        Some(a) => Some(a.to_string()),
+        None => config.resolved_runtime_agent_alias().map(str::to_string),
+    };
+
+    // 3. Derive the destination from that agent's assigned bundles.
+    if let Some(alias) = target_agent.as_deref()
+        && let Some(agent_cfg) = config.agent(alias)
     {
-        Ok(report) => report,
-        Err(err) => {
-            // The override is content-bound. If the re-stage now hashes
-            // differently, the source served different bytes *between* the hash
-            // the user just approved and this install — the exact upstream-swap
-            // case the content-bound hash exists to catch. Surface the new
-            // report and hash (never silently install the swapped content, and
-            // never leave the user with a bare error) so they can review and
-            // re-approve the new hash rather than pasting it sight-unseen.
-            if let Some(new_risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
-                eprintln!(
-                    "{}",
-                    get_required_cli_string("cli-skills-screen-content-changed")
-                );
-                eprint!("{}", new_risk.report.render());
-                eprintln!(
-                    "{}",
-                    get_required_cli_string_with_args(
-                        "cli-skills-screen-staged-hash",
-                        &[("hash", &new_risk.staged_hash)]
-                    )
-                );
+        match agent_cfg.skill_bundles.as_slice() {
+            [one] => {
+                let dir =
+                    zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, one)
+                        .map_err(anyhow::Error::msg)?;
+                return Ok(SkillLocation::Bundle {
+                    alias: one.clone(),
+                    dir,
+                });
+            }
+            [] => {} // no bundle assigned — fall through to the global dir
+            many => {
+                let bundles = many.join(", ");
                 anyhow::bail!(
                     "{}",
                     get_required_cli_string_with_args(
-                        "cli-skills-screen-accept-hint",
-                        &[("hash", &new_risk.staged_hash)]
+                        "cli-skills-agent-multiple-bundles",
+                        &[("alias", alias), ("bundles", bundles.as_str())],
                     )
                 );
             }
-            return Err(err);
         }
-    };
+    }
 
-    record_install_receipt(config, source, &report);
-    print_install_success(&report);
-    Ok(())
+    // 4. Global fallback — installed but not auto-loaded (caller prints a note).
+    Ok(SkillLocation::Global {
+        dir: skills_dir(&config.data_dir),
+    })
 }
 
-/// Print the standard install-success lines from a completed install report.
-fn print_install_success(report: &SkillInstallReport) {
-    let status = console::style("✓").green().bold().to_string();
-    let installed_path = report.dir.display().to_string();
-    let files_scanned = report.files_scanned.to_string();
-    println!(
-        "{}",
-        get_required_cli_string_with_args(
-            "cli-skills-install-installed-audited",
-            &[
-                ("status", &status),
-                ("path", &installed_path),
-                ("files", &files_scanned)
-            ]
-        )
-    );
-    println!(
-        "{}",
-        get_required_cli_string("cli-skills-install-security-audit-completed")
-    );
-}
-
-/// Assemble and persist an install receipt. A write failure is a warning, not
-/// a rollback — the skill is already installed.
-fn record_install_receipt(
+/// Every location (bundle dirs + the global dir) that contains a skill named
+/// `name`, as `(label, skill-dir)` pairs. Bundle labels are `bundle:<alias>`;
+/// the global dir is `global`. `agent_filter` restricts the bundle search to
+/// the bundles assigned to that agent (and drops the global dir).
+fn collect_skill_locations(
     config: &crate::config::Config,
-    source: &str,
-    report: &SkillInstallReport,
-) {
+    name: &str,
+    agent_filter: Option<&str>,
+) -> Vec<(String, PathBuf)> {
     let install_root = config.install_root_dir();
-    let name = match report.dir.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name.to_string(),
-        None => return,
-    };
-    let tier_at_install = resolve_tier_label(config, source, &name);
-    let receipt = zeroclaw_runtime::skills::receipt::SkillInstallReceipt {
-        schema_version: zeroclaw_runtime::skills::receipt::RECEIPT_SCHEMA_VERSION,
-        name: name.clone(),
-        source: SkillSourceRecord::from_source(&SkillSource::parse(source)),
-        immutable_resolution: report.resolution.clone(),
-        tree_hash: report.tree_hash.clone(),
-        tree_hash_scheme: zeroclaw_runtime::skills::receipt::TREE_HASH_SCHEME,
-        version: zeroclaw_runtime::skills::read_manifest_version(&report.dir),
-        tier_at_install,
-        screening_ruleset_version: 0,
-        screening_max_impact: None,
-        screening_counts: std::collections::BTreeMap::new(),
-        unscanned_count: 0,
-        audit_options: format!("allow_scripts={}", config.skills.allow_scripts),
-        installer_version: env!("CARGO_PKG_VERSION").to_string(),
-        installed_at: install_timestamp(),
-        accepted_hash: report.accepted_override.clone(),
-    }
-    .with_screening(report.screening.as_ref());
+    let allowed: Option<Vec<String>> =
+        agent_filter.and_then(|a| config.agent(a).map(|c| c.skill_bundles.clone()));
 
-    if let Err(err) = zeroclaw_runtime::skills::receipt::write_receipt(&install_root, &receipt) {
-        eprintln!(
-            "{}",
-            get_required_cli_string_with_args(
-                "cli-skills-receipt-write-failed",
-                &[("name", &name), ("error", &err.to_string())]
-            )
-        );
-    }
-}
-
-/// Best-effort trust-tier label for the receipt. Registry sources resolve the
-/// live registry tier; other sources have no tier and record `"unknown"`.
-fn resolve_tier_label(config: &crate::config::Config, source: &str, skill_name: &str) -> String {
-    if is_registry_source(source) {
-        let registry_dir = config.data_dir.join("skills-registry");
-        let (tier, _version) = lookup_registry_skill_tier(&registry_dir, skill_name);
-        format!("{tier:?}").to_lowercase()
-    } else {
-        "unknown".to_string()
-    }
-}
-
-/// Current Unix timestamp in seconds for the receipt's `installed_at`.
-fn install_timestamp() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Verify installed skills against their receipts.
-fn handle_verify(config: &crate::config::Config, name: Option<String>) -> Result<()> {
-    use zeroclaw_runtime::skills::VerifyStatus;
-    let install_root = config.install_root_dir();
-    let skills_path = skills_dir(&config.data_dir);
-
-    let names: Vec<String> = match name {
-        Some(name) => {
-            reject_unsafe_skill_name(&name)?;
-            vec![name]
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for alias in config.skill_bundles.keys() {
+        if let Some(ref allow) = allowed
+            && !allow.contains(alias)
+        {
+            continue;
         }
-        None => {
-            let Ok(entries) = std::fs::read_dir(&skills_path) else {
-                println!("{}", get_required_cli_string("cli-skills-none-installed"));
-                return Ok(());
-            };
-            entries
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        }
-    };
-
-    let mut any_modified = false;
-    for name in names {
-        let skill_dir = skills_path.join(&name);
-        if !skill_dir.is_dir() {
-            anyhow::bail!("Skill not found: {name}");
-        }
-        // A per-skill hashing failure (e.g. `compute_tree_hash` bailing on an
-        // injected symlink — itself a tamper signal) must count as Modified for
-        // this skill, not abort the whole sweep and hide every skill after it.
-        let status = match verify_skill(&install_root, &name, &skill_dir) {
-            Ok(status) => status,
-            Err(_) => VerifyStatus::Modified,
-        };
-        let (glyph, key) = match status {
-            VerifyStatus::Ok => (console::style("✓").green().bold(), "cli-skills-verify-ok"),
-            VerifyStatus::Modified => {
-                any_modified = true;
-                (
-                    console::style("✗").red().bold(),
-                    "cli-skills-verify-modified",
-                )
+        if let Ok(dir) =
+            zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
+        {
+            let candidate = dir.join(name);
+            if candidate.is_dir() {
+                out.push((format!("bundle:{alias}"), candidate));
             }
-            VerifyStatus::NoReceipt => (console::style("-").dim(), "cli-skills-verify-no-receipt"),
-        };
-        println!(
-            "  {} {}",
-            glyph,
-            get_required_cli_string_with_args(key, &[("name", &name)])
-        );
+        }
     }
-
-    if any_modified {
-        anyhow::bail!(
-            "{}",
-            get_required_cli_string("cli-skills-verify-found-modified")
-        );
+    if agent_filter.is_none() {
+        let global = skills_dir(&config.data_dir).join(name);
+        if global.is_dir() {
+            out.push(("global".to_string(), global));
+        }
     }
-    Ok(())
+    out
 }
 
-/// Screen a skill source without installing it. Remote sources are staged to a
-/// temporary directory, scanned, and discarded; local sources are scanned in
-/// place. The exit code matches what an install of the same source would do:
-/// nonzero when the source's install gate would refuse the report (a remote
-/// `confirm`/`block` install refuses a denial or an unscanned file), zero for a
-/// local (warn-only) source that an install would never block.
-async fn handle_screen(config: &crate::config::Config, source: String) -> Result<()> {
-    let report = if source_is_remote(&source) {
-        screen_remote_source(config, &source).await?
-    } else {
-        let path = PathBuf::from(&source);
-        if !path.exists() {
+/// Locate a single installed skill directory by name (across bundles + global),
+/// erroring when absent or ambiguous. Used by `audit`/`test`.
+fn locate_installed_skill_dir(config: &crate::config::Config, name: &str) -> Result<PathBuf> {
+    let mut matches = collect_skill_locations(config, name, None);
+    match matches.len() {
+        0 => anyhow::bail!("Skill not found: {name}"),
+        1 => Ok(matches.remove(0).1),
+        _ => {
+            let locs = matches
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
             anyhow::bail!(
                 "{}",
                 get_required_cli_string_with_args(
-                    "cli-skills-screen-source-missing",
-                    &[("source", &source)]
+                    "cli-skills-multiple-locations-path",
+                    &[("name", name), ("locations", &locs)],
                 )
-            );
+            )
         }
-        screen_skill_directory(&path)?
-    };
-
-    print!("{}", report.render());
-    // Exit code exactly matches whether an install of this source would refuse
-    // the report. Remote (confirm/block) refuses a denial or an unscanned file;
-    // local is warn-only and never refuses, so a local screen does not fail
-    // where a local install would succeed.
-    let gate = screening_gate_for(config, &source, None);
-    if gate.refuses(&report) {
-        anyhow::bail!(
-            "{}",
-            get_required_cli_string("cli-skills-screen-found-blocking")
-        );
     }
-    Ok(())
 }
 
-/// Stage a remote source into a throwaway temp directory and screen it without
-/// installing. Reuses the real installers with a disabled gate, pointed at a
-/// temp skills dir, then screens the promoted copy.
-///
-/// Staging passes `allow_scripts = true` so the structural audit does not abort
-/// on a script-bearing skill — the whole point of `skills screen` is to inspect
-/// exactly that kind of content before installing, and nothing here is
-/// executed: the tree is promoted into a temp dir, screened, then discarded.
-async fn screen_remote_source(
-    config: &crate::config::Config,
-    source: &str,
-) -> Result<zeroclaw_runtime::skills::ScreeningReport> {
-    let tmp = tempfile::tempdir().context("failed to create temp dir for screening")?;
-    let skills_path = tmp.path().join("skills");
-    std::fs::create_dir_all(&skills_path)?;
-    // Promote into the throwaway temp `skills_path`, but resolve the registry
-    // cache against the real workspace (`config.data_dir`) so a registry source
-    // reuses the already-synced `skills-registry` clone instead of re-cloning
-    // the whole registry over the network on every `skills screen` (and failing
-    // offline). Staging/promote stay under `skills_path`, so the real skills
-    // directory is never touched.
-    let report = dispatch_install(
-        config,
-        source,
-        &config.data_dir,
-        &skills_path,
-        true,
-        &SkillScreeningGate::disabled(),
-        &InstallMode::fresh(),
-        true,
-    )
-    .await?;
-    screen_skill_directory(&report.dir).context("failed to screen staged skill")
+/// Render one skill row for `skills list` (name + version + tools + tags).
+fn print_skill(skill: &Skill) {
+    println!(
+        "  {} {} — {}",
+        console::style(&skill.name).white().bold(),
+        console::style(format!("v{}", skill.version)).dim(),
+        skill.description
+    );
+    if !skill.tools.is_empty() {
+        println!(
+            "    Tools: {}", // i18n-exempt: "Tools" label mirrors existing list output
+            skill
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !skill.tags.is_empty() {
+        println!(
+            "    {}",
+            get_required_cli_string_with_args(
+                "cli-skills-tags",
+                &[("tags", &skill.tags.join(", "))],
+            )
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1383,5 +1142,762 @@ fn fallback_editors() -> &'static [&'static str] {
         &["notepad.exe", "nano", "vim"]
     } else {
         &["nano", "vi", "vim", "editor"]
+    }
+}
+
+fn source_is_remote(source: &str) -> bool {
+    zeroclaw_runtime::skills::SkillSource::parse(source).is_remote()
+}
+
+/// Reject a skill name that could act as a path component and escape the skills
+/// directory (or the receipts directory). Mirrors the guard the `remove`
+/// command enforces, so `verify`/`test` cannot be pointed outside the skills
+/// tree via `../` or an absolute-looking name.
+fn reject_unsafe_skill_name(name: &str) -> Result<()> {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: {name}");
+    }
+    Ok(())
+}
+
+/// Build the screening gate for an install spec: remote sources use
+/// `[skills.install_screening].remote_action` (carrying any `--accept-risk`
+/// override), local sources use `local_action`.
+fn screening_gate_for(
+    config: &crate::config::Config,
+    source: &str,
+    accept_risk: Option<String>,
+) -> SkillScreeningGate {
+    let cfg = &config.skills.install_screening;
+    if source_is_remote(source) {
+        SkillScreeningGate::for_remote(cfg.remote_action, accept_risk)
+    } else {
+        SkillScreeningGate::for_local(cfg.local_action)
+    }
+}
+
+/// Dispatch an install spec to the matching installer with the screening gate
+/// and install mode threaded in.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_install(
+    config: &crate::config::Config,
+    source: &str,
+    workspace_dir: &std::path::Path,
+    skills_path: &std::path::Path,
+    no_tier_banner: bool,
+    gate: &SkillScreeningGate,
+    mode: &InstallMode,
+    allow_scripts: bool,
+) -> Result<SkillInstallReport> {
+    if is_clawhub_source(source) {
+        install_clawhub_skill_source(source, skills_path, allow_scripts, gate, mode)
+            .await
+            .with_context(|| format!("failed to install skill from ClawHub: {source}"))
+    } else if is_git_source(source) {
+        install_git_skill_source(source, skills_path, allow_scripts, gate, mode)
+            .with_context(|| format!("failed to install git skill source: {source}"))
+    } else if is_registry_source(source) {
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-install-resolving-registry",
+                &[("source", source)]
+            )
+        );
+        install_registry_skill_source(
+            source,
+            skills_path,
+            allow_scripts,
+            workspace_dir,
+            config.skills.registry_url.as_deref(),
+            no_tier_banner,
+            gate,
+            mode,
+        )
+        .with_context(|| format!("failed to install skill from registry: {source}"))
+    } else if is_extra_registry_source(source) {
+        let registry_label = parse_extra_registry_source(source)
+            .map(|(name, _)| name)
+            .unwrap_or_default();
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-install-resolving-extra-registry",
+                &[("source", source), ("registry", &registry_label)]
+            )
+        );
+        install_extra_registry_skill_source(
+            source,
+            skills_path,
+            allow_scripts,
+            workspace_dir,
+            &config.skills.extra_registries,
+            no_tier_banner,
+            gate,
+            mode,
+        )
+        .with_context(|| format!("failed to install skill from extra registry: {source}"))
+    } else {
+        install_local_skill_source(source, skills_path, allow_scripts, gate, mode)
+            .with_context(|| format!("failed to install local skill source: {source}"))
+    }
+}
+
+/// Derive the installed directory name a source spec would use, for looking up
+/// its prior receipt when building an update review.
+fn install_dir_name(source: &str) -> Option<String> {
+    match SkillSource::parse(source) {
+        SkillSource::ClawHub { .. } => clawhub_skill_dir_name(source).ok(),
+        // Resolve the git destination name through the same runtime helper the
+        // installer uses (`git_clone_dir_name`), so the receipt lookup and the
+        // actual install directory can never disagree.
+        SkillSource::Git { .. } => {
+            zeroclaw_runtime::skills::git_clone_dir_name(source).ok()
+        }
+        SkillSource::Registry { skill, .. } => Some(skill),
+        SkillSource::Local { path } => path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string),
+    }
+}
+
+/// Build the install mode for a `--force` (re)install: look up the prior
+/// receipt so the differentiated update review can compare versions and
+/// content hashes. A plain (non-force) install always uses the fresh mode.
+fn install_mode_for(config: &crate::config::Config, source: &str, force: bool) -> InstallMode {
+    if !force {
+        return InstallMode::fresh();
+    }
+    let review = install_dir_name(source)
+        .and_then(|name| {
+            zeroclaw_runtime::skills::receipt::read_receipt(&config.install_root_dir(), &name)
+        })
+        .map(|r| UpdateReview {
+            prior_version: r.version,
+            prior_tree_hash: r.tree_hash,
+        });
+    InstallMode::forced(review)
+}
+
+/// Install a skill, applying install-boundary screening. On a screening denial
+/// under `confirm`, prints the report and the staged content hash, then either
+/// prompts on a TTY or instructs a rerun with `--accept-risk=<hash>`.
+async fn handle_install(
+    config: &crate::config::Config,
+    source: String,
+    agent: Option<String>,
+    bundle: Option<String>,
+    no_tier_banner: bool,
+    accept_risk: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let workspace_dir = &config.data_dir;
+    println!(
+        "{}",
+        get_required_cli_string_with_args("cli-skills-install-start", &[("source", &source)])
+    );
+
+    let location = resolve_install_location(config, agent.as_deref(), bundle.as_deref())?;
+    let skills_path = location.dir().to_path_buf();
+    std::fs::create_dir_all(&skills_path)?;
+
+    let gate = screening_gate_for(config, &source, accept_risk.clone());
+    let mode = install_mode_for(config, &source, force);
+    let outcome = dispatch_install(
+        config,
+        &source,
+        workspace_dir,
+        &skills_path,
+        no_tier_banner,
+        &gate,
+        &mode,
+        config.skills.allow_scripts,
+    )
+    .await;
+
+    let report = match outcome {
+        Ok(report) => report,
+        Err(err) => {
+            // A screening denial or update content-swap surfaces as
+            // RiskAcceptanceRequired; show the report + hash and, on a TTY,
+            // offer to re-run with the override.
+            if let Some(risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
+                return handle_screening_denial(
+                    config, &source, agent, bundle, no_tier_banner, force, risk,
+                )
+                .await;
+            }
+            return Err(err);
+        }
+    };
+
+    if let Some(screening) = &report.screening
+        && !screening.is_clean()
+    {
+        eprint!("{}", screening.render());
+    }
+
+    record_install_receipt(config, &source, &report);
+    print_install_success(&report);
+    print_install_location_note(&location);
+    Ok(())
+}
+
+/// Handle a screening denial: print the report + staged hash. Under `block`
+/// (no override possible) abort. Under `confirm`, on an interactive TTY prompt
+/// y/N against the displayed hash and, if accepted, re-run the install with a
+/// content-bound override; otherwise instruct a `--accept-risk` rerun.
+async fn handle_screening_denial(
+    config: &crate::config::Config,
+    source: &str,
+    agent: Option<String>,
+    bundle: Option<String>,
+    no_tier_banner: bool,
+    force: bool,
+    risk: &RiskAcceptanceRequired,
+) -> Result<()> {
+    eprint!("{}", risk.report.render());
+    eprintln!(
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-skills-screen-staged-hash",
+            &[("hash", &risk.staged_hash)]
+        )
+    );
+
+    if risk.blocked {
+        anyhow::bail!("{}", get_required_cli_string("cli-skills-screen-blocked"));
+    }
+
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !interactive {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-screen-accept-hint",
+                &[("hash", &risk.staged_hash)]
+            )
+        );
+    }
+
+    let proceed = dialoguer::Confirm::new()
+        .with_prompt(get_required_cli_string("cli-skills-screen-confirm-prompt"))
+        .default(false)
+        .interact()?;
+    if !proceed {
+        anyhow::bail!("{}", get_required_cli_string("cli-skills-screen-declined"));
+    }
+
+    // Re-run with the content-bound override. The install re-stages and
+    // re-hashes; if the source now serves different bytes the hash differs and
+    // this stale override is rejected.
+    let workspace_dir = &config.data_dir;
+    let location = resolve_install_location(config, agent.as_deref(), bundle.as_deref())?;
+    let skills_path = location.dir().to_path_buf();
+    let gate = screening_gate_for(config, source, Some(risk.staged_hash.clone()));
+    let mode = install_mode_for(config, source, force);
+    let report = match dispatch_install(
+        config,
+        source,
+        workspace_dir,
+        &skills_path,
+        no_tier_banner,
+        &gate,
+        &mode,
+        config.skills.allow_scripts,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(err) => {
+            // The override is content-bound. If the re-stage now hashes
+            // differently, the source served different bytes *between* the hash
+            // the user just approved and this install — the exact upstream-swap
+            // case the content-bound hash exists to catch. Surface the new
+            // report and hash (never silently install the swapped content, and
+            // never leave the user with a bare error) so they can review and
+            // re-approve the new hash rather than pasting it sight-unseen.
+            if let Some(new_risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
+                eprintln!(
+                    "{}",
+                    get_required_cli_string("cli-skills-screen-content-changed")
+                );
+                eprint!("{}", new_risk.report.render());
+                eprintln!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-screen-staged-hash",
+                        &[("hash", &new_risk.staged_hash)]
+                    )
+                );
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-screen-accept-hint",
+                        &[("hash", &new_risk.staged_hash)]
+                    )
+                );
+            }
+            return Err(err);
+        }
+    };
+
+    record_install_receipt(config, source, &report);
+    print_install_success(&report);
+    print_install_location_note(&location);
+    Ok(())
+}
+
+/// Print the standard install-success lines from a completed install report.
+fn print_install_success(report: &SkillInstallReport) {
+    let status = console::style("✓").green().bold().to_string();
+    let installed_path = report.dir.display().to_string();
+    let files_scanned = report.files_scanned.to_string();
+    println!(
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-skills-install-installed-audited",
+            &[
+                ("status", &status),
+                ("path", &installed_path),
+                ("files", &files_scanned)
+            ]
+        )
+    );
+    println!(
+        "{}",
+        get_required_cli_string("cli-skills-install-security-audit-completed")
+    );
+}
+
+/// Assemble and persist an install receipt. A write failure is a warning, not
+/// a rollback — the skill is already installed.
+fn record_install_receipt(
+    config: &crate::config::Config,
+    source: &str,
+    report: &SkillInstallReport,
+) {
+    let install_root = config.install_root_dir();
+    let name = match report.dir.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+    let tier_at_install = resolve_tier_label(config, source, &name);
+    let receipt = zeroclaw_runtime::skills::receipt::SkillInstallReceipt {
+        schema_version: zeroclaw_runtime::skills::receipt::RECEIPT_SCHEMA_VERSION,
+        name: name.clone(),
+        source: SkillSourceRecord::from_source(&SkillSource::parse(source)),
+        immutable_resolution: report.resolution.clone(),
+        tree_hash: report.tree_hash.clone(),
+        tree_hash_scheme: zeroclaw_runtime::skills::receipt::TREE_HASH_SCHEME,
+        version: zeroclaw_runtime::skills::read_manifest_version(&report.dir),
+        tier_at_install,
+        screening_ruleset_version: 0,
+        screening_max_impact: None,
+        screening_counts: std::collections::BTreeMap::new(),
+        unscanned_count: 0,
+        audit_options: format!("allow_scripts={}", config.skills.allow_scripts),
+        installer_version: env!("CARGO_PKG_VERSION").to_string(),
+        installed_at: install_timestamp(),
+        accepted_hash: report.accepted_override.clone(),
+    }
+    .with_screening(report.screening.as_ref());
+
+    if let Err(err) = zeroclaw_runtime::skills::receipt::write_receipt(&install_root, &receipt) {
+        eprintln!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-skills-receipt-write-failed",
+                &[("name", &name), ("error", &err.to_string())]
+            )
+        );
+    }
+}
+
+/// Best-effort trust-tier label for the receipt. Registry sources resolve the
+/// live registry tier; other sources have no tier and record `"unknown"`.
+fn resolve_tier_label(config: &crate::config::Config, source: &str, skill_name: &str) -> String {
+    if is_registry_source(source) {
+        let registry_dir = config.data_dir.join("skills-registry");
+        let (tier, _version) = lookup_registry_skill_tier(&registry_dir, skill_name);
+        format!("{tier:?}").to_lowercase()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Current Unix timestamp in seconds for the receipt's `installed_at`.
+fn install_timestamp() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify installed skills against their receipts.
+fn handle_verify(config: &crate::config::Config, name: Option<String>) -> Result<()> {
+    use zeroclaw_runtime::skills::VerifyStatus;
+    let install_root = config.install_root_dir();
+    let skills_path = skills_dir(&config.data_dir);
+
+    let names: Vec<String> = match name {
+        Some(name) => {
+            reject_unsafe_skill_name(&name)?;
+            vec![name]
+        }
+        None => {
+            let Ok(entries) = std::fs::read_dir(&skills_path) else {
+                println!("{}", get_required_cli_string("cli-skills-none-installed"));
+                return Ok(());
+            };
+            entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        }
+    };
+
+    let mut any_modified = false;
+    for name in names {
+        let skill_dir = skills_path.join(&name);
+        if !skill_dir.is_dir() {
+            anyhow::bail!("Skill not found: {name}");
+        }
+        // A per-skill hashing failure (e.g. `compute_tree_hash` bailing on an
+        // injected symlink — itself a tamper signal) must count as Modified for
+        // this skill, not abort the whole sweep and hide every skill after it.
+        let status = match verify_skill(&install_root, &name, &skill_dir) {
+            Ok(status) => status,
+            Err(_) => VerifyStatus::Modified,
+        };
+        let (glyph, key) = match status {
+            VerifyStatus::Ok => (console::style("✓").green().bold(), "cli-skills-verify-ok"),
+            VerifyStatus::Modified => {
+                any_modified = true;
+                (
+                    console::style("✗").red().bold(),
+                    "cli-skills-verify-modified",
+                )
+            }
+            VerifyStatus::NoReceipt => (console::style("-").dim(), "cli-skills-verify-no-receipt"),
+        };
+        println!(
+            "  {} {}",
+            glyph,
+            get_required_cli_string_with_args(key, &[("name", &name)])
+        );
+    }
+
+    if any_modified {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string("cli-skills-verify-found-modified")
+        );
+    }
+    Ok(())
+}
+
+/// Screen a skill source without installing it. Remote sources are staged to a
+/// temporary directory, scanned, and discarded; local sources are scanned in
+/// place. The exit code matches what an install of the same source would do:
+/// nonzero when the source's install gate would refuse the report (a remote
+/// `confirm`/`block` install refuses a denial or an unscanned file), zero for a
+/// local (warn-only) source that an install would never block.
+async fn handle_screen(config: &crate::config::Config, source: String) -> Result<()> {
+    let report = if source_is_remote(&source) {
+        screen_remote_source(config, &source).await?
+    } else {
+        let path = PathBuf::from(&source);
+        if !path.exists() {
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-screen-source-missing",
+                    &[("source", &source)]
+                )
+            );
+        }
+        screen_skill_directory(&path)?
+    };
+
+    print!("{}", report.render());
+    // Exit code exactly matches whether an install of this source would refuse
+    // the report. Remote (confirm/block) refuses a denial or an unscanned file;
+    // local is warn-only and never refuses, so a local screen does not fail
+    // where a local install would succeed.
+    let gate = screening_gate_for(config, &source, None);
+    if gate.refuses(&report) {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string("cli-skills-screen-found-blocking")
+        );
+    }
+    Ok(())
+}
+
+/// Stage a remote source into a throwaway temp directory and screen it without
+/// installing. Reuses the real installers with a disabled gate, pointed at a
+/// temp skills dir, then screens the promoted copy.
+///
+/// Staging passes `allow_scripts = true` so the structural audit does not abort
+/// on a script-bearing skill — the whole point of `skills screen` is to inspect
+/// exactly that kind of content before installing, and nothing here is
+/// executed: the tree is promoted into a temp dir, screened, then discarded.
+async fn screen_remote_source(
+    config: &crate::config::Config,
+    source: &str,
+) -> Result<zeroclaw_runtime::skills::ScreeningReport> {
+    let tmp = tempfile::tempdir().context("failed to create temp dir for screening")?;
+    let skills_path = tmp.path().join("skills");
+    std::fs::create_dir_all(&skills_path)?;
+    // Promote into the throwaway temp `skills_path`, but resolve the registry
+    // cache against the real workspace (`config.data_dir`) so a registry source
+    // reuses the already-synced `skills-registry` clone instead of re-cloning
+    // the whole registry over the network on every `skills screen` (and failing
+    // offline). Staging/promote stay under `skills_path`, so the real skills
+    // directory is never touched.
+    let report = dispatch_install(
+        config,
+        source,
+        &config.data_dir,
+        &skills_path,
+        true,
+        &SkillScreeningGate::disabled(),
+        &InstallMode::fresh(),
+        true,
+    )
+    .await?;
+    screen_skill_directory(&report.dir).context("failed to screen staged skill")
+}
+
+/// Tell the user whether the freshly installed skill is in a runtime-loadable
+/// location (a bundle) or the global dir (installed but not auto-loaded).
+fn print_install_location_note(location: &SkillLocation) {
+    match location {
+        SkillLocation::Bundle { alias, .. } => println!(
+            "{}",
+            get_required_cli_string_with_args("cli-skills-install-into-bundle", &[("alias", alias)])
+        ),
+        SkillLocation::Global { .. } => println!(
+            "{}",
+            get_required_cli_string("cli-skills-install-global-note")
+        ),
+    }
+}
+
+#[cfg(test)]
+mod install_location_tests {
+    use super::*;
+    use crate::config::{AliasedAgentConfig, Config};
+    use zeroclaw_config::schema::SkillBundleConfig;
+
+    fn config_with_bundles(aliases: &[&str]) -> Config {
+        let mut c = Config::default();
+        for alias in aliases {
+            c.skill_bundles
+                .insert((*alias).to_string(), SkillBundleConfig::default());
+        }
+        c
+    }
+
+    fn agent_with_bundles(bundles: &[&str]) -> AliasedAgentConfig {
+        AliasedAgentConfig {
+            skill_bundles: bundles.iter().map(|s| (*s).to_string()).collect(),
+            ..AliasedAgentConfig::default()
+        }
+    }
+
+    /// The `skills install`/`audit` error strings route through Fluent. Assert
+    /// the new `cli-skills-*` keys resolve (not the `{key}` missing-marker) and
+    /// interpolate their `{$source}` argument, so a code/ftl key rename can't
+    /// silently degrade these user-facing errors to a literal key. Uses the
+    /// locale-independent argument value as the resolution signal.
+    #[test]
+    fn install_error_strings_resolve_through_fluent() {
+        use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+        let audit = get_required_cli_string("cli-skills-audit-failed");
+        assert!(
+            !audit.starts_with('{') && audit.contains("audit"),
+            "cli-skills-audit-failed did not resolve: {audit}"
+        );
+        for key in [
+            "cli-skills-install-git-failed",
+            "cli-skills-install-registry-failed",
+            "cli-skills-install-extra-registry-failed",
+            "cli-skills-install-local-failed",
+        ] {
+            let msg = get_required_cli_string_with_args(key, &[("source", "acme/widget")]);
+            assert!(
+                msg.contains("failed to install") && msg.contains("acme/widget"),
+                "{key} did not resolve/interpolate: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_bundle_wins() {
+        let c = config_with_bundles(&["official"]);
+        let loc = resolve_install_location(&c, None, Some("official")).unwrap();
+        assert!(matches!(loc, SkillLocation::Bundle { alias, .. } if alias == "official"));
+    }
+
+    #[test]
+    fn explicit_unknown_bundle_errors() {
+        let c = config_with_bundles(&["official"]);
+        assert!(resolve_install_location(&c, None, Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn unknown_agent_errors() {
+        let c = config_with_bundles(&["official"]);
+        assert!(resolve_install_location(&c, Some("nobody"), None).is_err());
+    }
+
+    #[test]
+    fn no_agent_no_bundle_falls_back_to_global() {
+        let c = config_with_bundles(&["official"]);
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        assert!(matches!(loc, SkillLocation::Global { .. }));
+    }
+
+    #[test]
+    fn default_agent_single_bundle_is_used() {
+        let mut c = config_with_bundles(&["team"]);
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["team"]));
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        assert!(matches!(loc, SkillLocation::Bundle { alias, .. } if alias == "team"));
+    }
+
+    #[test]
+    fn agent_with_multiple_bundles_requires_flag() {
+        let mut c = config_with_bundles(&["a", "b"]);
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["a", "b"]));
+        assert!(resolve_install_location(&c, None, None).is_err());
+    }
+
+    #[test]
+    fn explicit_agent_without_bundle_falls_back_to_global() {
+        let mut c = Config::default();
+        c.agents
+            .insert("worker".to_string(), agent_with_bundles(&[]));
+        let loc = resolve_install_location(&c, Some("worker"), None).unwrap();
+        assert!(matches!(loc, SkillLocation::Global { .. }));
+    }
+
+    fn write_skill(dir: &Path, name: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{name}\"\ndescription = \"boundary test skill\"\nversion = \"0.1.0\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Boundary test for #8334: a skill placed at the install destination that
+    /// `resolve_install_location` picks for the default agent is actually loaded
+    /// by the runtime loader, while a skill left in the old `data/skills/` dir
+    /// is NOT — proving install now lands somewhere agents read.
+    #[test]
+    fn default_install_destination_is_loaded_by_the_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let mut c = Config {
+            // install_root_dir() == config_path.parent() == root
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        c.skill_bundles
+            .insert("official".to_string(), SkillBundleConfig::default());
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["official"]));
+
+        // Where `skills install` (no flags) would write for the default agent.
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        let dest = match loc {
+            SkillLocation::Bundle { ref alias, ref dir } => {
+                assert_eq!(alias, "official");
+                dir.clone()
+            }
+            SkillLocation::Global { .. } => panic!("expected the agent's bundle, got global"),
+        };
+        write_skill(&dest, "loadable-skill");
+
+        // A skill left in the legacy global dir must NOT be loaded (the bug).
+        write_skill(&skills_dir(&c.data_dir), "orphaned-skill");
+
+        let loaded: Vec<String> = load_skills_for_agent_from_config(&c, "default")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            loaded.iter().any(|n| n == "loadable-skill"),
+            "install destination must be loaded by the runtime; got {loaded:?}"
+        );
+        assert!(
+            !loaded.iter().any(|n| n == "orphaned-skill"),
+            "data/skills must NOT be loaded by the runtime (this was #8334); got {loaded:?}"
+        );
+    }
+
+    /// End-to-end #8334 (requested in review): drive the *real* `skills install`
+    /// command handler with a local skill source, then assert the runtime loader
+    /// the agent boot/loop uses actually returns it — covering the full
+    /// install → read path, not just the resolved destination.
+    #[tokio::test]
+    async fn install_command_then_runtime_loads_the_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // A local skill source directory a user would `skills install`.
+        let source_parent = root.join("source");
+        write_skill(&source_parent, "e2e-skill");
+        let source = source_parent.join("e2e-skill");
+
+        let mut c = Config {
+            // install_root_dir() == config_path.parent() == root
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        c.skill_bundles
+            .insert("official".to_string(), SkillBundleConfig::default());
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["official"]));
+
+        // Run the actual bin handler — no flags, so it resolves to the default
+        // agent's single assigned bundle, exactly like `zeroclaw skills install`.
+        handle_command(
+            crate::SkillCommands::Install {
+                source: source.to_string_lossy().into_owned(),
+                agent: None,
+                bundle: None,
+                no_tier_banner: true,
+                accept_risk: None,
+                force: false,
+            },
+            &c,
+        )
+        .await
+        .expect("skills install should succeed for a local source");
+
+        // The runtime loader must now see what install just wrote.
+        let loaded: Vec<String> = load_skills_for_agent_from_config(&c, "default")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            loaded.iter().any(|n| n == "e2e-skill"),
+            "an installed skill must be loaded by the runtime; got {loaded:?}"
+        );
     }
 }

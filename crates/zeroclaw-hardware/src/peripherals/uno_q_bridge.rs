@@ -98,20 +98,20 @@ impl Tool for UnoQGpioReadTool {
                 if resp.starts_with("error:") {
                     Ok(ToolResult {
                         success: false,
-                        output: resp.clone(),
+                        output: resp.clone().into(),
                         error: Some(resp),
                     })
                 } else {
                     Ok(ToolResult {
                         success: true,
-                        output: resp,
+                        output: resp.into(),
                         error: None,
                     })
                 }
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: format!("Bridge error: {}", e),
+                output: format!("Bridge error: {}", e).into(),
                 error: Some(e.to_string()),
             }),
         }
@@ -174,7 +174,7 @@ impl Tool for UnoQGpioWriteTool {
                 if resp.starts_with("error:") {
                     Ok(ToolResult {
                         success: false,
-                        output: resp.clone(),
+                        output: resp.clone().into(),
                         error: Some(resp),
                     })
                 } else {
@@ -187,7 +187,7 @@ impl Tool for UnoQGpioWriteTool {
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: format!("Bridge error: {}", e),
+                output: format!("Bridge error: {}", e).into(),
                 error: Some(e.to_string()),
             }),
         }

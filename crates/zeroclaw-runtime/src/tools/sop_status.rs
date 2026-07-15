@@ -123,13 +123,13 @@ impl Tool for SopStatusTool {
                     self.append_gate_status(&mut output, include_gate_status);
                     Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     })
                 }
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("No run found with ID '{run_id}'."),
+                    output: format!("No run found with ID '{run_id}'.").into(),
                     error: None,
                 }),
             };
@@ -198,7 +198,7 @@ impl Tool for SopStatusTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -270,6 +270,7 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
                 output: "done".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,
@@ -424,6 +426,7 @@ mod tests {
                 output: "fail".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,

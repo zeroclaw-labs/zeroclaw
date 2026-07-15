@@ -727,6 +727,7 @@ mod tests {
             output: format!("Step {number}"),
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:01:00Z".into()),
+            tool_calls: Vec::new(),
         }
     }
 

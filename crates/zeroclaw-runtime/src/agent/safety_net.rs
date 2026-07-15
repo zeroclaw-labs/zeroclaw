@@ -37,7 +37,7 @@ fn mem_none() -> Arc<dyn Memory> {
     )
 }
 
-fn text_response(text: &str) -> ChatResponse {
+pub(super) fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
@@ -46,7 +46,7 @@ fn text_response(text: &str) -> ChatResponse {
     }
 }
 
-fn tool_call(id: &str, name: &str) -> ToolCall {
+pub(super) fn tool_call(id: &str, name: &str) -> ToolCall {
     ToolCall {
         id: id.into(),
         name: name.into(),
@@ -55,7 +55,7 @@ fn tool_call(id: &str, name: &str) -> ToolCall {
     }
 }
 
-fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
+pub(super) fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
@@ -73,12 +73,12 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
 }
 
 /// Returns scripted responses in order; "done" once the script is exhausted.
-struct ScriptedProvider {
+pub(super) struct ScriptedProvider {
     responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
 }
 
 impl ScriptedProvider {
-    fn new(responses: Vec<ChatResponse>) -> Self {
+    pub(super) fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: parking_lot::Mutex::new(responses.into()),
         }
@@ -125,9 +125,9 @@ impl ::zeroclaw_api::attribution::Attributable for ScriptedProvider {
 }
 
 /// Counts executions; succeeds with a fixed output.
-struct CountingTool {
-    name: &'static str,
-    calls: Arc<AtomicUsize>,
+pub(super) struct CountingTool {
+    pub(super) name: &'static str,
+    pub(super) calls: Arc<AtomicUsize>,
 }
 
 zeroclaw_api::tool_attribution!(CountingTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
@@ -147,7 +147,7 @@ impl Tool for CountingTool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(crate::tools::ToolResult {
             success: true,
-            output: format!("{}-out", self.name),
+            output: format!("{}-out", self.name).into(),
             error: None,
         })
     }
@@ -486,7 +486,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         image_cache: None,
         // Phase 1: stamp Internal/Trusted. Real per-transport
         // stamping is PR C (RFC #6971 §4).
-        ingress: IngressContext::internal(),
+        memory: None,
+        ingress: IngressContext::sub_turn(),
         agent_alias: None,
         turn_id: &turn_id,
     })
@@ -886,7 +887,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
-                ingress: IngressContext::internal(),
+                memory: None,
+                ingress: IngressContext::sub_turn(),
                 agent_alias: None,
                 turn_id: &turn_id,
             })

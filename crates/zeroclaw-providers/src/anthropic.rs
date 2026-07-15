@@ -158,7 +158,10 @@ enum NativeContentOut {
 struct NativeToolSpec {
     name: String,
     description: String,
-    input_schema: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema when no cleaning
+    /// is required — serialized transparently, deep-cloned only for schemas
+    /// the Anthropic cleaner actually rewrites (#8642).
+    input_schema: std::sync::Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -362,8 +365,9 @@ impl AnthropicModelProvider {
             .map(|tool| NativeToolSpec {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic(
-                    tool.parameters.clone(),
+                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_shared(
+                    &tool.parameters,
+                    zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
                 cache_control: None,
             })
@@ -893,9 +897,28 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        while let Ok(Some(line)) =
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(read) => read,
+        let mut saw_stop_reason = false;
+
+        loop {
+            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => break,
+                Ok(Err(err)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{err}"),
+                            })),
+                        "stream: SSE read error — aborting stream"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
+                        .await;
+                    return;
+                }
                 Err(_) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -914,8 +937,7 @@ impl AnthropicModelProvider {
                         .await;
                     return;
                 }
-            }
-        {
+            };
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;
@@ -1045,6 +1067,9 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
+                    if stop_reason != "none" {
+                        saw_stop_reason = true;
+                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -1121,18 +1146,7 @@ impl AnthropicModelProvider {
             }
         }
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(::serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                })),
-            "stream: SSE parser reached end of stream, emitting Final"
-        );
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
     }
 }
 
@@ -1365,18 +1379,16 @@ impl ModelProvider for AnthropicModelProvider {
                     );
                     None
                 })?;
-                Some(ToolSpec {
-                    name: name.to_string(),
-                    description: func
-                        .get("description")
+                Some(ToolSpec::new(
+                    name.to_string(),
+                    func.get("description")
                         .and_then(|d| d.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    parameters: func
-                        .get("parameters")
+                    func.get("parameters")
                         .cloned()
                         .unwrap_or(serde_json::json!({"type": "object"})),
-                })
+                ))
             })
             .collect();
 
@@ -1921,6 +1933,44 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
     }
 
     #[tokio::test]
+    async fn eof_before_message_stop_surfaces_error_not_final() {
+        // Live repro (trace aaf558a6): the SSE socket closed mid-response
+        // after tool-result submission; the parser fell through to Final and
+        // the turn ended as an empty "final response" with no explanation.
+        // EOF without message_stop (or a stop_reason) is a truncated
+        // response and must surface a retryable error.
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_final = false;
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(e) => last_err = Some(e),
+                Ok(_) => {}
+            }
+        }
+        assert!(!saw_final, "truncated stream must not emit Final");
+        let err = last_err.expect("truncated stream must emit a StreamError");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("truncated")),
+            "expected truncation error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_usage_omitted_when_provider_does_not_send_usage() {
         // Backward-compat: a stream that never emits a usage frame must not
         // synthesize a zero-valued Usage event. Consumers should treat
@@ -2377,7 +2427,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let tool = NativeToolSpec {
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
-            input_schema: schema,
+            input_schema: schema.into(),
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2391,7 +2441,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let tool = NativeToolSpec {
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
-            input_schema: schema,
+            input_schema: schema.into(),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2533,16 +2583,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_tools_adds_cache_to_last_tool() {
         let tools = vec![
-            ToolSpec {
-                name: "tool1".to_string(),
-                description: "First tool".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolSpec {
-                name: "tool2".to_string(),
-                description: "Second tool".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
+            ToolSpec::new("tool1", "First tool", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "tool2",
+                "Second tool",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -2554,11 +2600,11 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_single_tool_gets_cache() {
-        let tools = vec![ToolSpec {
-            name: "tool1".to_string(),
-            description: "Only tool".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "tool1",
+            "Only tool",
+            serde_json::json!({"type": "object"}),
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
@@ -2568,10 +2614,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_cleans_ref_from_input_schema() {
-        let tools = vec![ToolSpec {
-            name: "query".to_string(),
-            description: "Search with a ref".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "query",
+            "Search with a ref",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "filter": {
@@ -2587,7 +2633,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     }
                 }
             }),
-        }];
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
@@ -2601,10 +2647,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_cleans_definitions_from_input_schema() {
-        let tools = vec![ToolSpec {
-            name: "query".to_string(),
-            description: "Search with a definitions ref".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "query",
+            "Search with a definitions ref",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "filter": {
@@ -2620,7 +2666,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     }
                 }
             }),
-        }];
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;

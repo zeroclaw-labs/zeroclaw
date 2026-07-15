@@ -7,7 +7,7 @@ use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -39,10 +39,20 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
 /// - **Hybrid Merge**: weighted fusion of vector + keyword results
 /// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
+///
+/// Cloning is cheap and yields a handle to the SAME database connection and
+/// embedder (all shared state is behind `Arc`) — used to hand a background
+/// task (e.g. an auto-triggered reindex) its own handle.
+#[derive(Clone)]
 pub struct SqliteMemory {
     alias: String,
     conn: Arc<Mutex<Connection>>,
-    embedder: Arc<dyn EmbeddingProvider>,
+    // `Arc` so `#[derive(Clone)]` handles share ONE lock: a `swap_embedder`
+    // on any clone is observed by all others (the shared-embedder contract in
+    // the type doc). `RwLock` inside lets `config/set` hot-swap the embedder on
+    // a long-lived handle without a daemon restart (#8359). Reads snapshot the
+    // inner `Arc` and drop the guard before any `.await`.
+    embedder: Arc<RwLock<Arc<dyn EmbeddingProvider>>>,
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
@@ -89,7 +99,7 @@ impl SqliteMemory {
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            embedder: Arc::new(super::embeddings::NoopEmbedding),
+            embedder: Arc::new(RwLock::new(Arc::new(super::embeddings::NoopEmbedding))),
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
@@ -146,7 +156,7 @@ impl SqliteMemory {
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            embedder,
+            embedder: Arc::new(RwLock::new(embedder)),
             vector_weight,
             keyword_weight,
             cache_max,
@@ -301,7 +311,15 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Store-level metadata (e.g. the embedding identity that produced
+            -- the stored vectors). Sits beside schema_version, which is keyed
+            -- by component with an INTEGER version and can't carry strings.
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
         )
         .with_context(|| "SQLite init_schema failed: CREATE base schema")?;
 
@@ -534,9 +552,106 @@ impl SqliteMemory {
         &self.conn
     }
 
+    /// Read the embedding identity recorded in `memory_meta`, if any.
+    ///
+    /// Returns `None` when the store predates identity tracking (or any of
+    /// the three keys is missing/unparseable) — callers treat that as "adopt
+    /// the current identity" rather than a mismatch.
+    pub fn stored_embedding_identity(
+        &self,
+    ) -> anyhow::Result<Option<super::embeddings::EmbeddingIdentity>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM memory_meta WHERE key IN \
+             ('embedding_provider', 'embedding_model', 'embedding_dimensions')",
+        )?;
+        let mut provider = None;
+        let mut model = None;
+        let mut dimensions = None;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            match key.as_str() {
+                "embedding_provider" => provider = Some(value),
+                "embedding_model" => model = Some(value),
+                "embedding_dimensions" => dimensions = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+        Ok(match (provider, model, dimensions) {
+            (Some(provider), Some(model), Some(dimensions)) => {
+                Some(super::embeddings::EmbeddingIdentity {
+                    provider,
+                    model,
+                    dimensions,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Record `identity` in `memory_meta` without touching any vectors.
+    ///
+    /// Used to adopt the current identity on stores that predate identity
+    /// tracking, and after a match check confirms nothing changed.
+    pub fn record_embedding_identity(
+        &self,
+        identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        Self::write_identity_rows(&tx, identity)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Migrate the store to a new embedding identity: NULL every stored
+    /// vector, clear the (identity-agnostic, content-hash-keyed)
+    /// `embedding_cache`, and stamp the new identity — atomically.
+    ///
+    /// This is the cheap, lossless half of an identity migration: `content`
+    /// is retained on every row, so `reindex()` can re-embed from it later.
+    /// No embedding API calls are made here. Returns the number of rows
+    /// whose vector was invalidated.
+    pub fn invalidate_embeddings_for_identity_change(
+        &self,
+        new_identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let invalidated = tx.execute(
+            "UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL",
+            [],
+        )?;
+        tx.execute("DELETE FROM embedding_cache", [])?;
+        Self::write_identity_rows(&tx, new_identity)?;
+        tx.commit()?;
+        Ok(invalidated)
+    }
+
+    fn write_identity_rows(
+        conn: &Connection,
+        identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        let mut stmt =
+            conn.prepare("INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?1, ?2)")?;
+        stmt.execute(params!["embedding_provider", identity.provider])?;
+        stmt.execute(params!["embedding_model", identity.model])?;
+        stmt.execute(params![
+            "embedding_dimensions",
+            identity.dimensions.to_string()
+        ])?;
+        Ok(())
+    }
+
     /// Get embedding from cache, or compute + cache it
     pub async fn get_or_compute_embedding(&self, text: &str) -> anyhow::Result<Option<Vec<f32>>> {
-        if self.embedder.dimensions() == 0 {
+        // Snapshot the embedder once so a concurrent `refresh_embedder` swap
+        // can't split this call across two providers; the guard is dropped
+        // immediately, never held across the `.await` below.
+        let embedder = self.embedder.read().clone();
+        if embedder.dimensions() == 0 {
             return Ok(None); // Noop embedder
         }
 
@@ -568,7 +683,7 @@ impl SqliteMemory {
         }
 
         // Compute embedding (async I/O)
-        let embedding = self.embedder.embed_one(text).await?;
+        let embedding = embedder.embed_one(text).await?;
         let bytes = vector::vec_to_bytes(&embedding);
 
         // Store in cache + LRU eviction (offloaded to blocking thread)
@@ -814,12 +929,62 @@ impl SqliteMemory {
         })
         .await?
     }
+
+    /// Replace the live embedder in place. Shared by the runtime
+    /// `refresh_embedder` hook (after a `config/set` provider-profile change)
+    /// and tests that need to inject a fake embedder. Existing `Arc<dyn Memory>`
+    /// holders observe the new embedder on their next embed without rebuilding
+    /// the handle (#8359).
+    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *self.embedder.write() = embedder;
+        // `embedding_cache` is keyed by content hash only, so every cached
+        // vector belongs to the *previous* provider/model/dimensions. Drop the
+        // cache on swap so the next embed goes through the new embedder instead
+        // of returning a stale vector (#8359). Best-effort — a cache-clear
+        // failure must not block the swap.
+        if let Err(e) = self.conn.lock().execute("DELETE FROM embedding_cache", []) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "memory embedder refresh: failed to clear stale embedding cache"
+            );
+        }
+    }
+
+    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
+    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
+    /// took effect after a `config/set` provider-profile change (#8359).
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
+    }
 }
 
 #[async_trait]
 impl Memory for SqliteMemory {
     fn name(&self) -> &str {
         "sqlite"
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Rebuild from the freshly-resolved settings and swap in place. No
+        // provider state is duplicated into a separate cache — the endpoint/key
+        // come from the canonical config via the runtime resolver.
+        let embedder: Arc<dyn EmbeddingProvider> =
+            Arc::from(super::embeddings::create_embedding_provider(
+                model_provider,
+                api_key,
+                model,
+                dimensions,
+            ));
+        self.swap_embedder(embedder);
     }
 
     async fn store(
@@ -1522,7 +1687,7 @@ impl Memory for SqliteMemory {
         }
 
         // Step 2: Re-embed memories with NULL vectors, if embedder is configured
-        if self.embedder.dimensions() == 0 {
+        if self.embedder.read().dimensions() == 0 {
             return Ok(0);
         }
 
@@ -2711,6 +2876,141 @@ mod tests {
         assert_eq!(entry.content, "this content must be retained");
     }
 
+    // ── Embedder hot-swap (#8359) ────────────────────────────────
+
+    /// A working embedder double that returns a fixed-length vector (each
+    /// element = `fill`, so the source embedder is identifiable) and counts its
+    /// embed calls — makes a swap observable on the real read path, network-free.
+    struct StubEmbedding {
+        dims: usize,
+        fill: f32,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StubEmbedding {
+        fn new(dims: usize, fill: f32) -> Self {
+            Self {
+                dims,
+                fill,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for StubEmbedding {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![self.fill; self.dims]).collect())
+        }
+    }
+
+    /// Swapping the embedder on a live handle is observed by the real embed
+    /// path: a Noop handle yields no vector, and after the swap the same handle
+    /// produces one from the new embedder — no rebuild of the `SqliteMemory`.
+    #[tokio::test]
+    async fn refresh_embedder_takes_effect_on_live_handle() {
+        let (_tmp, mem) = temp_sqlite(); // constructed with NoopEmbedding (dims 0)
+
+        assert!(
+            mem.get_or_compute_embedding("hello")
+                .await
+                .unwrap()
+                .is_none(),
+            "Noop embedder must short-circuit to no vector"
+        );
+
+        mem.swap_embedder(Arc::new(StubEmbedding::new(4, 0.1)));
+
+        let embedding = mem
+            .get_or_compute_embedding("hello")
+            .await
+            .unwrap()
+            .expect("swapped-in embedder must now produce a vector");
+        assert_eq!(embedding.len(), 4, "vector must come from the new embedder");
+    }
+
+    /// After an embedder swap, the same content must re-embed through the NEW
+    /// provider rather than return the previous provider's cached vector — the
+    /// `embedding_cache` (keyed by content hash only) must be invalidated.
+    #[tokio::test]
+    async fn swap_embedder_invalidates_stale_embedding_cache() {
+        let tmp = TempDir::new().unwrap();
+        let first = Arc::new(StubEmbedding::new(4, 0.1));
+        let first_calls = Arc::clone(&first.calls);
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            first,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+
+        // Prime the cache with the first provider's vector.
+        let v1 = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(v1.unwrap(), vec![0.1_f32; 4]);
+        // Second call for identical content is served from cache (no new embed).
+        let _ = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(
+            first_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "identical content must hit the cache, not re-embed"
+        );
+
+        // Swap to a different provider (distinct fill so its output is unique).
+        let second = Arc::new(StubEmbedding::new(4, 0.9));
+        let second_calls = Arc::clone(&second.calls);
+        mem.swap_embedder(second);
+
+        // Same content again: must re-embed through the NEW provider, not return
+        // the stale cached 0.1 vector.
+        let v2 = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(
+            v2.unwrap(),
+            vec![0.9_f32; 4],
+            "post-swap embed must use the new provider, not the stale cache"
+        );
+        assert_eq!(
+            second_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cache must have been invalidated so the new provider is called"
+        );
+    }
+
+    /// The `Memory::refresh_embedder` hook rebuilds the embedder from freshly
+    /// resolved provider settings and installs it on the live handle (the shape
+    /// `config/set` uses after a provider-profile change).
+    #[test]
+    fn refresh_embedder_rebuilds_from_resolved_settings() {
+        let (_tmp, mem) = temp_sqlite(); // NoopEmbedding, dims 0
+        assert_eq!(mem.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &mem,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "refresh_embedder must install the resolved provider's embedder"
+        );
+    }
+
     // ── With-embedder constructor test ───────────────────────────
 
     #[test]
@@ -2750,6 +3050,133 @@ mod tests {
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── Embedding identity primitives (issue #7948) ──────────────
+
+    /// Embedder that returns a fixed vector, so store() persists real
+    /// (non-NULL) embeddings and populates the embedding cache.
+    struct FixedEmbedding(usize);
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FixedEmbedding {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn dimensions(&self) -> usize {
+            self.0
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.5f32; self.0]).collect())
+        }
+    }
+
+    fn identity(
+        provider: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> super::super::embeddings::EmbeddingIdentity {
+        super::super::embeddings::EmbeddingIdentity {
+            provider: provider.into(),
+            model: model.into(),
+            dimensions,
+        }
+    }
+
+    fn count_scalar(mem: &SqliteMemory, sql: &str) -> i64 {
+        let conn = mem.connection().lock();
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn embedding_identity_roundtrip() {
+        let (_tmp, mem) = temp_sqlite();
+        // A fresh store (and any store predating identity tracking) has none.
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+
+        let id = identity("openai", "text-embedding-3-small", 1536);
+        mem.record_embedding_identity(&id).unwrap();
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(id));
+    }
+
+    #[test]
+    fn embedding_identity_partial_rows_read_as_absent() {
+        let (_tmp, mem) = temp_sqlite();
+        {
+            let conn = mem.connection().lock();
+            conn.execute(
+                "INSERT INTO memory_meta (key, value) VALUES ('embedding_model', 'orphan')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalidate_nulls_vectors_clears_cache_and_stamps_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FixedEmbedding(4)),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        mem.record_embedding_identity(&identity("openai", "old-model", 4))
+            .unwrap();
+
+        mem.store("a", "alpha content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "beta content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            2
+        );
+        assert_eq!(
+            count_scalar(&mem, "SELECT COUNT(*) FROM embedding_cache"),
+            2
+        );
+
+        let new_id = identity("openai", "new-model", 4);
+        let invalidated = mem
+            .invalidate_embeddings_for_identity_change(&new_id)
+            .unwrap();
+
+        assert_eq!(invalidated, 2);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            0
+        );
+        assert_eq!(
+            count_scalar(&mem, "SELECT COUNT(*) FROM embedding_cache"),
+            0
+        );
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(new_id));
+
+        // Content is retained, so the existing reindex path re-embeds losslessly.
+        let reembedded = mem.reindex().await.unwrap();
+        assert_eq!(reembedded, 2);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            2
+        );
     }
 
     // ── Recall limit test ────────────────────────────────────────

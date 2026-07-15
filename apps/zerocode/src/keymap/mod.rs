@@ -17,6 +17,13 @@ pub use chord::Chord;
 
 use crossterm::event::KeyEvent;
 
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    GlobalAction::Help
+        .resolved()
+        .iter()
+        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+}
+
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
 /// resolved chords without knowing the concrete enum.
@@ -79,6 +86,16 @@ mod tests {
     }
 
     #[test]
+    fn global_help_resolves_from_question_mark_and_f1() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
+        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
+    }
+
+    #[test]
     fn input_bar_enter_is_submit() {
         let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
@@ -134,6 +151,7 @@ mod tests {
         check(ConfigTabAction::TAG, ConfigTabAction::bindings());
         check(DoctorTabAction::TAG, DoctorTabAction::bindings());
         check(QuickstartTabAction::TAG, QuickstartTabAction::bindings());
+        check(SopTabAction::TAG, SopTabAction::bindings());
         check(InputBarAction::TAG, InputBarAction::bindings());
         check(ModalAction::TAG, ModalAction::bindings());
         check(CaptureAction::TAG, CaptureAction::bindings());
@@ -189,6 +207,13 @@ mod tests {
                     .map(|(c, _)| c)
                     .collect(),
             ),
+            (
+                "sop",
+                SopTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
         ];
         for (gc, ga) in &global {
             for (label, chords) in panes {
@@ -228,6 +253,7 @@ mod tests {
         check::<DashboardTabAction>();
         check::<ConfigTabAction>();
         check::<QuickstartTabAction>();
+        check::<SopTabAction>();
         check::<InputBarAction>();
         check::<FileExplorerAction>();
     }

@@ -63,7 +63,9 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) parameters: Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
 
@@ -89,6 +91,7 @@ struct ResponsesResponse {
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
+    pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
     pub(crate) tool_calls: HashMap<String, PendingToolCall>,
@@ -256,7 +259,7 @@ pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesT
                 kind: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: std::sync::Arc::clone(&tool.parameters),
                 strict: false,
             })
             .collect(),
@@ -829,6 +832,7 @@ pub(crate) fn process_responses_stream_event(
             }
         }
         Some("response.completed" | "response.done") => {
+            state.saw_completion = true;
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -866,6 +870,9 @@ pub(crate) fn process_sse_chunk(
     let joined = data_lines.join("\n");
     let trimmed = joined.trim();
     if trimmed.is_empty() || trimmed == "[DONE]" {
+        if trimmed == "[DONE]" {
+            state.saw_completion = true;
+        }
         return Ok(Vec::new());
     }
 
@@ -877,6 +884,9 @@ pub(crate) fn process_sse_chunk(
     for line in data_lines {
         let line = line.trim();
         if line.is_empty() || line == "[DONE]" {
+            if line == "[DONE]" {
+                state.saw_completion = true;
+            }
             continue;
         }
         let event = serde_json::from_str::<Value>(line).map_err(|err| {
@@ -1219,7 +1229,7 @@ impl OpenAiCodexModelProvider {
                         "openai_codex: auth profile present but no usable access token"
                     );
                     anyhow::Error::msg(
-                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --provider openai-codex` to sign in again.",
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --model-provider openai-codex` to sign in again.",
                     )
                 } else {
                     ::zeroclaw_log::record!(
@@ -1233,7 +1243,7 @@ impl OpenAiCodexModelProvider {
                         "openai_codex: no auth profile found"
                     );
                     anyhow::Error::msg(
-                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --provider openai-codex` to sign in.",
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --model-provider openai-codex` to sign in.",
                     )
                 }
             })?)
@@ -1251,7 +1261,7 @@ impl OpenAiCodexModelProvider {
                     "openai_codex: account_id not found in profile/token"
                 );
                 anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --model-provider openai-codex` again.",
                 )
             })?)
         };
@@ -1762,7 +1772,7 @@ mod tests {
             kind: "function".to_string(),
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
             strict: false,
         }
     }
@@ -2085,6 +2095,35 @@ data: [DONE]
     }
 
     #[test]
+    fn process_sse_chunk_marks_completion_on_response_completed() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"hi\"}}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_done_sentinel() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk("data: [DONE]", &mut state).unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_leaves_completion_unset_on_text_delta() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(!state.saw_completion);
+    }
+
+    #[test]
     fn parse_sse_turn_falls_back_to_completed_response() {
         let payload = r#"data: {"type":"response.completed","response":{"output_text":"Done"}}
 data: [DONE]
@@ -2387,10 +2426,10 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
@@ -2398,7 +2437,7 @@ data: [DONE]
                 },
                 "required": ["action"]
             }),
-        }];
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");

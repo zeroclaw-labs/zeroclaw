@@ -95,6 +95,7 @@ pub use detection::{DetectionConfidence, DetectionMatch, sanitize_excerpt};
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
+use zeroclaw_config::schema::LeakDetectionConfig;
 
 /// Scrub credential leaks from arbitrary text before it crosses into a log
 /// record or any other sink. Routes through the global [`LeakDetector`] so
@@ -102,6 +103,14 @@ pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 /// per-callsite regexes. Clean input is returned unchanged.
 pub fn scrub(text: &str) -> String {
     match LeakDetector::new().scan(text) {
+        LeakResult::Clean => text.to_string(),
+        LeakResult::Detected { redacted, .. } => redacted,
+    }
+}
+
+/// Scrub credential leaks using the configured leak-detection policy.
+pub fn scrub_with_config(text: &str, config: &LeakDetectionConfig) -> String {
+    match LeakDetector::with_config(config).scan(text) {
         LeakResult::Clean => text.to_string(),
         LeakResult::Detected { redacted, .. } => redacted,
     }

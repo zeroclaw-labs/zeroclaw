@@ -21,7 +21,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 
 | Risk label | Typical paths | Minimum depth | Required evidence |
 |---|---|---|---|
-| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent local validation, no behavior ambiguity |
+| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
 | `risk:medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
 | `risk:high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
 
@@ -48,13 +48,17 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 ### Fast-lane checklist (every PR)
 
 - Scope boundary is explicit and believable.
-- Validation commands are present and the results are coherent.
+- Behavior changes are checked against the controlling contract: architecture docs, source-of-truth modules, trait boundaries, existing tests, public API shape, source comments, or explicit maintainer decisions.
+- PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
+- Validation evidence names the checks being relied on and why they cover the changed behavior.
+- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.
 - Compatibility and migration impact is clear.
+- MSRV, pinned toolchain, or other version-floor changes are called out as compatibility-impacting: the PR explains who must upgrade, CI and installer baselines agree, and release notes name the new floor when the change can affect source-build users.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
-- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Extension examples](../developing/extension-examples.md)).
+- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Architecture overview](../architecture/overview.md#core-traits)).
 
 ### Deep-review checklist (high-risk only)
 
@@ -63,6 +67,9 @@ For `risk:high` PRs, verify a concrete example in each category. One concrete in
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
 - **Contract stability**: CLI, config, or API compatibility preserved or migration documented.
+- **Diff shape**: large or new-integration PRs are coherent, merge-justified now, not easily split, and not mostly duplicated machinery.
+- **Generated artifacts**: generated files that affect policy, schema, routes, migrations, lockfiles, release artifacts, capabilities, packages, runtime behavior, or reviewer evidence are reviewed like source.
+- **Toolchain compatibility**: MSRV or pinned-toolchain changes are intentional, aligned across CI/Docker/install surfaces, and documented for downstream/source-build users.
 - **Observability**: failures diagnosable without leaking secrets.
 - **Rollback safety**: revert path and blast radius clear.
 
@@ -92,6 +99,7 @@ Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk
 | `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
 | `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and routing evidence using the contributor-visible sources in the [Project board contract](./pr-workflow.md#issue-routing-evidence). Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active. |
+| `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Use only when the live label exists; do not substitute `roadmap` or `type:roadmap`. This is a finder/routing marker, not stale protection by itself. |
 | `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
 | `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
 

@@ -4083,16 +4083,16 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "run shell".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" }
                 }
             }),
-        }];
+        )];
         let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &messages,
@@ -4131,11 +4131,11 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "run shell".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell",
+            serde_json::json!({"type": "object"}),
+        )];
         let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &messages,
