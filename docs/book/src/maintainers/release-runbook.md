@@ -8,7 +8,7 @@
 > If anything in here feels heavyweight, that is intentional friction, we do
 > not yet have the automation discipline to remove it safely.
 
-Last verified against the `0.8.0-beta` cycle.
+Last verified against the `v0.8.2` release cycle.
 
 ---
 
@@ -67,7 +67,18 @@ feature lists from the canonical install spec (`Cargo.toml` plus
 never hand-edit a generated region. This script also refreshes the Nix git
 dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
 
-Then refresh the docs translation catalogues and pin them to the matching tag:
+### Refresh and pin translations
+
+After `bump-version.sh` sets the release version, refresh the docs translation
+catalogues and pin them to the matching tag. If the catalogues were prepared
+separately, inspect coverage and validate them before cutting the tag:
+
+```sh
+cargo mdbook stats
+cargo mdbook check
+```
+
+Then run the release wrapper:
 
 <div class="os-tabs-src">
 
@@ -87,8 +98,14 @@ pinned to that tag. It initialises the submodule if it is not already checked
 out. Run it after `bump-version.sh` so the `Cargo.toml` version it reads is the
 release version. The configured provider alias is required explicitly so the
 release does not depend on a hardcoded backend; pass `--config-dir` when needed.
-Use `--no-translate` when the catalogues are already current, or pass an explicit
-version before `--model-provider` to override the `Cargo.toml` default.
+The alias selected by `--model-provider` resolves from
+`providers.models.<kind>.<alias>`. Use `--no-translate` when the catalogues are
+already current, or pass an explicit version before `--model-provider` to
+override the `Cargo.toml` default, for example:
+
+```sh
+./scripts/release/refresh-translations.sh 0.8.2 --model-provider anthropic.release
+```
 
 Commit everything together:
 
@@ -105,8 +122,8 @@ gate in CI fails the PR if a generated surface is out of sync with the spec, so
 a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit
 and validates catalogue format and msgid parity, so a bad pin cannot land
-either. See [Docs & Translations](../maintainers/docs-and-translations.md) for
-catalogue refresh details.
+either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext)
+for translation pipeline details.
 
 **Confirm the merge landed correctly:**
 

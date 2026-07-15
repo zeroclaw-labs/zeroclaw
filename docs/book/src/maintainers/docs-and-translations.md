@@ -196,21 +196,10 @@ Per release, `scripts/release/refresh-translations.sh` tags the submodule as `v{
 
 ## Release translation workflow
 
-During a release, after `./scripts/release/bump-version.sh` has set the version in `Cargo.toml`, refresh the catalogues and cut the matching submodule tag. This is one command: it reads the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and stages the main-repo gitlink pinned to that tag. No `git -C` by hand, no version typed into git commands. It initialises the submodule if needed.
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-./scripts/release/refresh-translations.sh --model-provider anthropic.release
-```
-
-</div>
-
-Run it after `bump-version.sh` so the version it reads is the release version. Pass the configured provider alias explicitly with `--model-provider`; use `--config-dir` when that alias is stored outside the default config directory. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` only when the catalogues are already current and separately checked; that flag skips both sync and `cargo mdbook check`. Pass an explicit version (`./scripts/release/refresh-translations.sh 0.8.2 --model-provider anthropic.release`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
-
-The model used is the alias selected by `--model-provider`, resolved from `providers.models.<kind>.<alias>`.
+The release-time refresh, validation, tagging, push, and gitlink-pin procedure
+is part of [Step 2 in the Release Runbook](release-runbook.md#refresh-and-pin-translations).
+This page documents the translation system; use the runbook as the operational
+source of truth when preparing a release.
 
 ## Model quality notes
 
