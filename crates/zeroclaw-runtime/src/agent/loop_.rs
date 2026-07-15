@@ -908,6 +908,12 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
+/// `agent_alias`, when the caller has resolved one, is threaded onto the
+/// inner `ToolLoop` so lifecycle observer events (llm_request, llm_response,
+/// tool_call_start, tool_call) carry the full `(channel, agent_alias,
+/// turn_id)` correlation triple that observer consumers (Prometheus, OTel,
+/// the gateway `/api/events` stream) rely on for per-agent attribution.
+/// `None` opts out for callers without a resolved alias (tests, benches).
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
@@ -934,6 +940,7 @@ pub async fn agent_turn(
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
+    agent_alias: Option<&str>,
 ) -> Result<String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
     run_tool_call_loop(ToolLoop {
@@ -984,7 +991,7 @@ pub async fn agent_turn(
         // per-transport stamping is PR C (RFC #6971 §4).
         memory,
         ingress: IngressContext::from_origin(origin),
-        agent_alias: None,
+        agent_alias,
         turn_id: &turn_id,
     })
     .await
@@ -3422,6 +3429,7 @@ pub async fn process_message(
                             ..Default::default()
                         },
                     }),
+                    Some(agent_alias),
                 ),
             )
             .await
@@ -11536,6 +11544,7 @@ This is an example, not an invocation."#;
                 None,  // channel
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11606,6 +11615,7 @@ This is an example, not an invocation."#;
                 None,  // channel
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11737,6 +11747,7 @@ This is an example, not an invocation."#;
                 None,
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("agent_turn should complete");
@@ -11817,6 +11828,7 @@ This is an example, not an invocation."#;
                 None,
                 TurnOrigin::SubTurn,
                 None,
+                None, // agent_alias: not under test here
             )
             .await
             .expect("agent_turn should complete");
@@ -15546,6 +15558,65 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    #[tokio::test]
+    async fn agent_turn_propagates_resolved_agent_alias_to_observer_events() {
+        // Regression guard: process_message resolves agent_alias but
+        // agent_turn hardcoded `agent_alias: None` in the ToolLoop it built,
+        // so every lifecycle event on this path violated the
+        // (channel, agent_alias, turn_id) contract that
+        // assert_all_events_share_turn_id enforces.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = agent_turn(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            0,
+            0,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+        )
+        .await
+        .expect("agent_turn should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+        let events = capturing.events.lock();
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
     }
 
     /// `read_capped_line` returns a full line and [`CappedLine::Line`]
