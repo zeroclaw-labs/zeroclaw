@@ -84,9 +84,9 @@ wire_api = "responses"
 vision = false
 ```
 
-**Compatibility note:** When `vision` is unset, OpenAI-compatible families report their family default (usually `true`), while the OpenAI Responses API defaults to `false` as a safety measure. This means existing Responses aliases will reject image inputs until the operator explicitly sets `vision = true`. This is an intentional opt-in behaviour: adding `vision = true` to the alias entry restores image support for that model.
+**After upgrade:** if you have existing Responses aliases that process images without an explicit `vision` field, those aliases will start rejecting images at the capability gate. This is intentional: the Responses path defaults `vision = false` when unset as a safety measure. Adding `vision = true` to the alias entry restores image support for that model.
 
-The `vision` field is available on every family slot (it lives on the shared `ModelProviderConfig` base). Currently it is processed by the OpenAI Responses and OpenAI-compatible construction paths; [#7100](https://github.com/zeroclaw-labs/zeroclaw/issues/7100) tracks extending it to all provider paths.
+The `vision` field is available on every family slot (it lives on the shared `ModelProviderConfig` base). It is currently processed by the OpenAI Responses and OpenAI-compatible construction paths; setting `vision` on unsupported families is silently ignored. [#7100](https://github.com/zeroclaw-labs/zeroclaw/issues/7100) tracks extending it to all provider paths.
 
 ## Per-family knobs: worked examples
 
