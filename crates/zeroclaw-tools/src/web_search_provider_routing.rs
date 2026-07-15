@@ -8,30 +8,25 @@ pub enum WebSearchProviderRoute {
     Bocha,
 }
 
-/// Structured search status: distinguishes provider failure classes from a
-/// genuine empty result and from each other.
+/// Provider HTTP-failure status surfaced to the agent via the error message's
+/// `search_status=` tag. Only the classes `classify_http_status` actually
+/// produces appear here — no speculative variants (wire-or-remove).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStatus {
-    Ok,
     Blocked,
     Unavailable,
     ClientError,
-    Timeout,
-    Empty,
-    ParseError,
 }
 
 impl SearchStatus {
-    /// Stable lowercase wire string for log attrs and error-message tags.
+    /// Stable lowercase tag embedded in the agent-visible error message
+    /// (`search_status=<tag>`). This is an error-text tag, not a structured
+    /// wire or log-attr contract — the runtime forwards the error as opaque text.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Ok => "ok",
             Self::Blocked => "blocked",
             Self::Unavailable => "unavailable",
             Self::ClientError => "client_error",
-            Self::Timeout => "timeout",
-            Self::Empty => "empty",
-            Self::ParseError => "parse_error",
         }
     }
 }
@@ -211,15 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn search_status_as_str_returns_stable_wire_strings() {
-        // Log attrs and error-message tags depend on these exact lowercase
-        // strings — drifting one silently breaks agent routing heuristics.
-        assert_eq!(SearchStatus::Ok.as_str(), "ok");
+    fn search_status_as_str_returns_stable_tags() {
+        // The agent-visible error tag depends on these exact lowercase strings.
         assert_eq!(SearchStatus::Blocked.as_str(), "blocked");
         assert_eq!(SearchStatus::Unavailable.as_str(), "unavailable");
         assert_eq!(SearchStatus::ClientError.as_str(), "client_error");
-        assert_eq!(SearchStatus::Timeout.as_str(), "timeout");
-        assert_eq!(SearchStatus::Empty.as_str(), "empty");
-        assert_eq!(SearchStatus::ParseError.as_str(), "parse_error");
     }
 }

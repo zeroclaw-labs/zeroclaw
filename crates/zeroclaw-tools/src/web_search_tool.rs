@@ -1020,15 +1020,23 @@ fn duckduckgo_block_message(
     }
 }
 
-/// Classify a non-2xx HTTP status into a structured search status. Called only
-/// on the failure path (`!status.is_success()`); 2xx never reaches here.
+/// Classify a non-2xx HTTP status into a search status. Called only on the
+/// failure path (`!status.is_success()`); 2xx never reaches here.
+///
+/// 403 maps to `ClientError`, not `Blocked`: an API provider's 403 means
+/// authenticated-but-not-permitted (per Brave/Tavily docs) or a disabled/quota
+/// key — not an automated-search block. DuckDuckGo's confirmed CAPTCHA 403 is
+/// intercepted earlier by `duckduckgo_block_message`, so a 403 reaching here is
+/// always an API-provider permission failure. 451 (legal block) is the one
+/// status that unambiguously means "blocked" across providers.
 fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
     match status.as_u16() {
-        403 | 451 => SearchStatus::Blocked, // active block / legal block
-        402 | 404 | 410 | 429 => SearchStatus::Unavailable, // quota / not-found / rate-limit
+        451 => SearchStatus::Blocked,                             // legal block (unambiguous)
+        403 => SearchStatus::ClientError,                         // API provider 403 = permission (DDG 403 handled upstream)
+        408 | 402 | 404 | 410 | 429 => SearchStatus::Unavailable,  // transient / provider-side
         400 | 401 => SearchStatus::ClientError,
         500..=599 => SearchStatus::Unavailable,
-        _ => SearchStatus::ClientError, // other non-success → request-side
+        _ => SearchStatus::ClientError,                           // other 4xx → request-side
     }
 }
 
@@ -1044,15 +1052,9 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
     let search_status = classify_http_status(status);
     let hint = match search_status {
         SearchStatus::Blocked | SearchStatus::Unavailable => {
-            "Try a different provider (SearXNG, Brave, or Tavily)."
+            "Provider may be transiently unavailable or blocking the request; retry, or try a different provider (SearXNG, Brave, or Tavily)."
         }
-        SearchStatus::ClientError => "Check the query and API key for this provider.",
-        // classify_http_status only returns failure classes (Blocked / Unavailable /
-        // ClientError); the remaining variants are unreachable on this path.
-        SearchStatus::Ok
-        | SearchStatus::Timeout
-        | SearchStatus::Empty
-        | SearchStatus::ParseError => "Try a different provider.",
+        SearchStatus::ClientError => "Check the query, API key, quota, and permissions for this provider.",
     };
     anyhow::Error::msg(format!(
         "{provider} search failed (search_status={}, http={status}). {hint}",
@@ -1254,37 +1256,33 @@ mod tests {
     }
 
     #[test]
-    fn http_search_failure_classifies_forbidden_as_blocked_with_provider_hint() {
-        // 403 is the canonical signal of active provider blocking; 451 is the
-        // legal-block variant. Both must surface a precise `search_status=blocked`
-        // tag and direct the agent at a different provider.
-        for status in [
-            reqwest::StatusCode::FORBIDDEN,
+    fn http_search_failure_classifies_legal_block_as_blocked() {
+        // 451 (legal block) is the one status that unambiguously means "blocked"
+        // across providers. It must surface search_status=blocked and the
+        // "different provider" hint. (403 is covered by the client_error case —
+        // an API provider's 403 is a permission failure, not a block.)
+        let err = http_search_failure(
+            "brave",
             reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-        ] {
-            let err = http_search_failure("brave", status);
-            let msg = format!("{err}");
-            assert!(
-                msg.contains("search_status=blocked"),
-                "{status} must tag search_status=blocked, got: {msg}"
-            );
-            assert!(
-                msg.contains(&format!("http={}", status.as_u16())),
-                "message must include the HTTP status code, got: {msg}"
-            );
-            assert!(
-                msg.contains("different provider"),
-                "blocked status must suggest switching providers, got: {msg}"
-            );
-        }
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search_status=blocked"),
+            "451 must tag search_status=blocked, got: {msg}"
+        );
+        assert!(msg.contains("http=451"));
+        assert!(
+            msg.contains("different provider"),
+            "blocked status must suggest switching providers, got: {msg}"
+        );
     }
 
     #[test]
     fn http_search_failure_classifies_provider_side_failures_as_unavailable() {
-        // 5xx outages, 429 rate limiting, 402 quota, and 404 endpoint problems
-        // are all provider-side in the sense that switching provider is the
-        // actionable remedy; each must tag `search_status=unavailable` and
-        // surface the "different provider" hint.
+        // 5xx outages, 429 rate limiting, 402 quota, 404/410 endpoint problems,
+        // and 408 timeout are all transient/provider-side in the sense that
+        // retrying or switching provider is the actionable remedy; each must tag
+        // `search_status=unavailable` and surface the "different provider" hint.
         for status in [
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             reqwest::StatusCode::BAD_GATEWAY,
@@ -1292,6 +1290,7 @@ mod tests {
             reqwest::StatusCode::PAYMENT_REQUIRED,
             reqwest::StatusCode::NOT_FOUND,
             reqwest::StatusCode::GONE,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
         ] {
             let err = http_search_failure("searxng", status);
             let msg = format!("{err}");
@@ -1312,11 +1311,14 @@ mod tests {
 
     #[test]
     fn http_search_failure_classifies_client_errors_as_client_error() {
-        // 400/401 are request/credential problems; switching provider may
-        // NOT help, so the hint must direct at query/key, not "different provider".
+        // 400/401 are request/credential problems, and 403 is an API provider
+        // permission failure (DuckDuckGo's confirmed-block 403 is intercepted
+        // upstream by duckduckgo_block_message). Switching provider may NOT help,
+        // so the hint must direct at key/quota/permissions, not "different provider".
         for status in [
             reqwest::StatusCode::BAD_REQUEST,
             reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
         ] {
             let err = http_search_failure("tavily", status);
             let msg = format!("{err}");
@@ -1329,8 +1331,8 @@ mod tests {
                 "message must include the HTTP status code, got: {msg}"
             );
             assert!(
-                msg.contains("Check the query and API key"),
-                "client_error hint must direct at query/key, got: {msg}"
+                msg.contains("Check the query, API key, quota, and permissions"),
+                "client_error hint must direct at query/key/quota/permissions, got: {msg}"
             );
             assert!(
                 !msg.contains("different provider"),
