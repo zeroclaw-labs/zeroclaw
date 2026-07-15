@@ -85,6 +85,10 @@ impl SopCapability for LlmGenerateCapability {
         }
     }
 
+    fn requires_authored_input(&self) -> bool {
+        true
+    }
+
     fn execute(&self, _ctx: CapabilityContext, input: Value) -> Result<CapabilityResult> {
         let Some(adapter) = self.adapter.as_ref() else {
             return Ok(CapabilityResult::failure(
@@ -263,6 +267,71 @@ mod tests {
         assert!(!out.success);
         assert!(out.error.unwrap().contains("instruction"));
         assert!(adapter.calls.lock().unwrap().is_empty(), "no model call");
+    }
+
+    #[test]
+    fn registry_rejects_payload_instruction_without_authored_config() {
+        use crate::sop::capability::SopCapabilityRegistry;
+        use crate::sop::types::{SopStep, SopStepKind};
+
+        let adapter = Arc::new(RecordingLlm {
+            calls: Mutex::new(Vec::new()),
+            result: Ok("x".into()),
+        });
+        let mut registry = SopCapabilityRegistry::with_builtins();
+        registry.register(LlmGenerateCapability::new(Some(adapter.clone())));
+        let step = SopStep {
+            kind: SopStepKind::Capability,
+            capability: Some("llm.generate".into()),
+            ..SopStep::default()
+        };
+
+        let error = registry
+            .execute_step(
+                ctx(),
+                &step,
+                json!({"instruction": "follow the trigger payload"}),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires authored `with`"));
+        assert!(adapter.calls.lock().unwrap().is_empty(), "no model call");
+    }
+
+    #[test]
+    fn registry_overwrites_authored_input_with_piped_payload() {
+        use crate::sop::capability::SopCapabilityRegistry;
+        use crate::sop::types::{SopStep, SopStepKind};
+
+        let adapter = Arc::new(RecordingLlm {
+            calls: Mutex::new(Vec::new()),
+            result: Ok("x".into()),
+        });
+        let mut registry = SopCapabilityRegistry::with_builtins();
+        registry.register(LlmGenerateCapability::new(Some(adapter.clone())));
+        let step = SopStep {
+            kind: SopStepKind::Capability,
+            capability: Some("llm.generate".into()),
+            capability_input: Some(json!({
+                "instruction": "Write a safe summary.",
+                "input": {"stale": "authored data must not replace the event"}
+            })),
+            ..SopStep::default()
+        };
+
+        registry
+            .execute_step(
+                ctx(),
+                &step,
+                json!({"instruction": "payload instruction", "body": "event body"}),
+            )
+            .unwrap();
+
+        let (_, prompt) = &adapter.calls.lock().unwrap()[0];
+        assert!(prompt.starts_with("Write a safe summary."));
+        assert!(prompt.contains("payload instruction"));
+        assert!(prompt.contains("event body"));
+        assert!(!prompt.contains("authored data must not replace the event"));
     }
 
     #[test]
