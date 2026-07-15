@@ -85,16 +85,12 @@ impl SkillSourceRecord {
 }
 
 /// Strip credentials and query/fragment from a git URL for storage. Parseable
-/// URLs go through the full `Url` sanitizer; SCP-like remotes
-/// (`git@host:path`) have any `user:pass@` userinfo removed by hand.
+/// URLs go through the shared [`super::sanitized_display_url`] sanitizer (single
+/// source of truth for URL redaction); SCP-like remotes (`git@host:path`) have
+/// any `user:pass@` userinfo removed by hand.
 fn sanitize_git_url(url: &str) -> String {
     if let Ok(parsed) = reqwest::Url::parse(url) {
-        let mut clean = parsed;
-        let _ = clean.set_username("");
-        let _ = clean.set_password(None);
-        clean.set_query(None);
-        clean.set_fragment(None);
-        return clean.to_string();
+        return super::sanitized_display_url(&parsed);
     }
     // SCP-like: [user[:pass]@]host:path — drop any password in the userinfo.
     if let Some((userinfo, rest)) = url.split_once('@')
@@ -217,7 +213,11 @@ pub fn verify_skill(install_root: &Path, name: &str, skill_dir: &Path) -> Result
 /// symlinks, so one present here was injected after the audit and must not be
 /// hashed as if absent.
 pub fn compute_tree_hash(dir: &Path) -> Result<String> {
-    let mut records: Vec<(String, bool, Vec<u8>)> = Vec::new();
+    // Only the per-file `(rel, is_executable, content_len, inner_sha256)` is
+    // retained — the inner digest is computed as each file is read, so peak
+    // memory is one file rather than the whole tree. The bytes fed to the outer
+    // hash are identical to hashing full contents at the end.
+    let mut records: Vec<(String, bool, u64, [u8; 32])> = Vec::new();
     for path in collect_paths_depth_first(dir)? {
         let metadata = std::fs::symlink_metadata(&path)
             .with_context(|| format!("failed to read metadata for {}", path.display()))?;
@@ -233,19 +233,19 @@ pub fn compute_tree_hash(dir: &Path) -> Result<String> {
         let rel = rel_path_string(dir, &path);
         let content =
             std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        records.push((rel, is_executable(&metadata), content));
+        let inner: [u8; 32] = Sha256::digest(&content).into();
+        records.push((rel, is_executable(&metadata), content.len() as u64, inner));
     }
     // Deterministic order independent of directory-walk order.
     records.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut outer = Sha256::new();
-    for (rel, exec, content) in &records {
+    for (rel, exec, content_len, inner) in &records {
         let rel_bytes = rel.as_bytes();
         outer.update((rel_bytes.len() as u64).to_le_bytes());
         outer.update(rel_bytes);
         outer.update([u8::from(*exec)]);
-        outer.update((content.len() as u64).to_le_bytes());
-        let inner = Sha256::digest(content);
+        outer.update(content_len.to_le_bytes());
         outer.update(inner);
     }
     Ok(hex::encode(outer.finalize()))

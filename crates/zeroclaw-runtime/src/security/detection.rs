@@ -95,16 +95,52 @@ pub fn is_zero_width(ch: char) -> bool {
     )
 }
 
+/// Unicode variation selectors (U+FE00–U+FE0F) and the variation-selector
+/// supplement (U+E0100–U+E01EF). A single selector after a base glyph is
+/// legitimate (emoji presentation, ideographic variation sequences); a *run* of
+/// them is a documented byte-smuggling channel (one selector per hidden byte).
+pub fn is_variation_selector(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{FE00}'..='\u{FE0F}'        // variation selectors
+            | '\u{E0100}'..='\u{E01EF}' // variation selectors supplement
+    )
+}
+
+/// Unicode Default_Ignorable_Code_Point set — code points that render to nothing
+/// (zero-width joiners, bidi/format controls, selectors, fillers, tags, …). Such
+/// a character cannot be the *visible base* of a variation sequence, so screening
+/// uses this to reject an invisible carrier an attacker pairs with a variation
+/// selector to smuggle bytes through otherwise-innocent prose.
+pub fn is_default_ignorable(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'                      // SOFT HYPHEN
+            | '\u{034F}'                // COMBINING GRAPHEME JOINER
+            | '\u{061C}'                // ARABIC LETTER MARK
+            | '\u{115F}'..='\u{1160}'   // HANGUL CHOSEONG/JUNGSEONG FILLER
+            | '\u{17B4}'..='\u{17B5}'   // KHMER VOWEL INHERENT AQ/AA
+            | '\u{180B}'..='\u{180F}'   // MONGOLIAN FVS 1-3, MVS, 180F
+            | '\u{200B}'..='\u{200F}'   // ZWSP/ZWNJ/ZWJ, LRM/RLM, ALM
+            | '\u{202A}'..='\u{202E}'   // bidi embeddings/overrides
+            | '\u{2060}'..='\u{206F}'   // WJ, invisible operators, deprecated format
+            | '\u{3164}'                // HANGUL FILLER
+            | '\u{FE00}'..='\u{FE0F}'   // variation selectors
+            | '\u{FEFF}'                // ZWNBSP / BOM
+            | '\u{FFA0}'                // HALFWIDTH HANGUL FILLER
+            | '\u{FFF0}'..='\u{FFF8}'   // reserved default-ignorable
+            | '\u{1BCA0}'..='\u{1BCA3}' // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}' // musical symbol beams/ties
+            | '\u{E0000}'..='\u{E0FFF}' // tags + variation-selector supplement
+    )
+}
+
 /// Unicode TAG characters (U+E0000–U+E007F) and variation selectors — invisible
 /// glyphs that can carry a smuggled instruction channel into a rendered report
 /// or a persisted receipt. Stripped from excerpts as defense-in-depth [R3].
 pub fn is_tag_or_selector(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{E0000}'..='\u{E007F}'      // Unicode TAG block
-            | '\u{FE00}'..='\u{FE0F}'  // variation selectors
-            | '\u{E0100}'..='\u{E01EF}' // variation selectors supplement
-    )
+    matches!(ch, '\u{E0000}'..='\u{E007F}') // Unicode TAG block
+        || is_variation_selector(ch)
 }
 
 #[cfg(test)]

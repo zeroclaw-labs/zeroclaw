@@ -149,9 +149,9 @@ For a worked example that turns a built-in tool into a reusable operator workflo
 
 ## Install screening
 
-Beyond the structural audit (script safety, below), remote installs are screened for content-level risk before the skill is promoted into your workspace: prompt-injection prose, embedded credential material, remote-execution patterns (such as `curl … | sh`), and encoding smuggling (malformed Unicode TAG runs, zero-width joiners, bidirectional controls). Screening is a **screening signal**, not a guarantee: static analysis cannot catch a payload constructed to evade it, and files it cannot read as text (binary, oversized, non-UTF-8, nested archives) are listed as unscanned rather than silently passed.
+Beyond the structural audit (script safety, below), remote installs are screened for content-level risk before the skill is promoted into your workspace: prompt-injection prose, embedded credential material, remote-execution patterns (such as `curl … | sh`), and encoding smuggling (malformed Unicode TAG runs, variation-selector byte channels, zero-width joiners, bidirectional controls). Screening is a **screening signal**, not a guarantee: static analysis cannot catch a payload constructed to evade it, and files it cannot read as text (binary, oversized, non-UTF-8, nested archives) are listed as unscanned rather than silently passed.
 
-Screening is configured under `[skills.install_screening]`. `remote_action` (`off` | `warn` | `confirm` | `block`, default `confirm`) governs ClawHub/Git/registry installs; `local_action` (`off` | `warn`, default `warn`) governs local-path installs and never blocks your own iteration loop. Under `confirm`, a denial-impact finding (a malformed Unicode TAG run or a high-confidence embedded credential) stops the install and prints the report plus a **staged content hash**. To proceed you accept that exact content — on an interactive terminal by confirming the prompt, or non-interactively by re-running with `--accept-risk=<hash>`. The acceptance is content-bound: the re-run re-fetches and re-hashes, so if the source now serves different bytes the stale acceptance is rejected. Under `block`, a denial cannot be overridden.
+Screening is configured under `[skills.install_screening]`. `remote_action` (`off` | `warn` | `confirm` | `block`, default `confirm`) governs ClawHub/Git/registry installs; `local_action` (`off` | `warn`, default `warn`) governs local-path installs and never blocks your own iteration loop. Under `confirm`, a denial-impact finding (a malformed Unicode TAG run or a high-confidence embedded credential) or an unscanned file (binary, oversized, non-UTF-8, or a nested archive — a blind spot a payload could hide in) stops the install and prints the report plus a **staged content hash**. To proceed you accept that exact content — on an interactive terminal by confirming the prompt, or non-interactively by re-running with `--accept-risk=<hash>`. The acceptance is content-bound: the re-run re-fetches and re-hashes, so if the source now serves different bytes the stale acceptance is rejected. Under `block`, a denial cannot be overridden.
 
 Screen a source without installing it:
 
@@ -165,7 +165,7 @@ zeroclaw skills screen clawhub:release-check
 
 </div>
 
-`zeroclaw skills screen` stages the source, prints the full report (including any unscanned files), and exits non-zero if any denial-impact signal is present.
+`zeroclaw skills screen` stages the source, prints the full report (including any unscanned files), and exits non-zero on anything the default (`confirm`) install gate would refuse to install silently — a denial-impact finding **or** an unscanned file — so it can be used as a CI preflight that agrees with `skills install`.
 
 ## Install receipts and verification
 

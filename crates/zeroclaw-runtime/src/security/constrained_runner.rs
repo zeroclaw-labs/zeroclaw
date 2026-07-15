@@ -21,9 +21,17 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::security::traits::Sandbox;
+
+/// How long `run` waits for the output drainers to deliver their captured text
+/// after the child (and, on Unix, its whole process group) has been reaped.
+/// Post-kill the pipes close and the drainers report near-instantly; the grace
+/// only bounds the pathological case where a stream never reaches EOF, so `run`
+/// returns instead of blocking forever.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Default wall-clock budget for a single constrained command.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -35,6 +43,11 @@ pub const DEFAULT_OUTPUT_CAP_BYTES: usize = 256 * 1024;
 /// this list is stripped so inherited daemon secrets never reach a child.
 /// `HOME` is only forwarded when the caller intentionally sets it (see
 /// [`ConstrainedRunner::with_home`]).
+///
+/// The temp-dir vars are on the list because a scrubbed child still needs a
+/// writable scratch location: without `TMPDIR`/`TEMP`/`TMP` a `mktemp` or `%TEMP%`
+/// in a skill's `TEST.sh` resolves to an unwritable fallback and the test
+/// fails for reasons unrelated to the skill. They name locations, not secrets.
 const ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "LANG",
@@ -42,11 +55,18 @@ const ENV_ALLOWLIST: &[&str] = &[
     "LC_CTYPE",
     "TZ",
     "TERM",
+    // Writable scratch location for the child (Unix).
+    "TMPDIR",
     // Windows needs these to locate the shell and system libraries.
     "SYSTEMROOT",
     "COMSPEC",
     "PATHEXT",
     "WINDIR",
+    // Writable scratch location for the child (Windows); USERPROFILE is the
+    // documented GetTempPath fallback when TEMP/TMP are unset.
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
 ];
 
 /// Outcome of a constrained command execution.
@@ -83,6 +103,14 @@ pub struct ConstrainedRunner {
     output_cap_bytes: usize,
     home: Option<PathBuf>,
     sandbox: Option<Arc<dyn Sandbox>>,
+    /// Raw (unquoted-by-std) arguments applied verbatim via `CommandExt::raw_arg`
+    /// on Windows, so `cmd.exe`'s own quoting rules survive rather than std's
+    /// MSVC-style escaping (which `cmd.exe` misparses).
+    #[cfg(windows)]
+    windows_raw_args: Vec<std::ffi::OsString>,
+    /// Set `CREATE_NO_WINDOW` on Windows so no console flashes for the child.
+    #[cfg(windows)]
+    windows_no_window: bool,
 }
 
 impl ConstrainedRunner {
@@ -96,12 +124,31 @@ impl ConstrainedRunner {
             output_cap_bytes: DEFAULT_OUTPUT_CAP_BYTES,
             home: None,
             sandbox: None,
+            #[cfg(windows)]
+            windows_raw_args: Vec::new(),
+            #[cfg(windows)]
+            windows_no_window: false,
         }
     }
 
     /// Append a single argument.
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    /// Append a raw Windows argument, applied verbatim via `raw_arg` (no std
+    /// re-quoting). Used to preserve the `cmd /C "<command>"` quoting contract.
+    #[cfg(windows)]
+    pub fn windows_raw_arg(mut self, arg: impl Into<std::ffi::OsString>) -> Self {
+        self.windows_raw_args.push(arg.into());
+        self
+    }
+
+    /// Suppress the console window for the Windows child (`CREATE_NO_WINDOW`).
+    #[cfg(windows)]
+    pub fn windows_no_window(mut self) -> Self {
+        self.windows_no_window = true;
         self
     }
 
@@ -151,6 +198,27 @@ impl ConstrainedRunner {
     fn build_command(&self) -> std::io::Result<Command> {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            /// `CREATE_NO_WINDOW` — no console is created for the child.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            for raw in &self.windows_raw_args {
+                cmd.raw_arg(raw);
+            }
+            if self.windows_no_window {
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+        }
+        // Run the child as the leader of its own process group so the timeout
+        // path can signal the whole group, not just the direct child — a
+        // command that backgrounds a grandchild would otherwise keep the
+        // stdout/stderr pipes open and stall capture past the budget.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         cmd.env_clear();
         for key in ENV_ALLOWLIST {
             if let Some(value) = std::env::var_os(key) {
@@ -179,42 +247,61 @@ impl ConstrainedRunner {
     /// runs*, so a command that emits more than the OS pipe buffer (~64 KiB)
     /// cannot deadlock waiting for a reader — each drainer keeps consuming to
     /// EOF, retaining only up to the output cap and discarding the rest. The
-    /// main thread polls for the wall-clock deadline and kills the child if it
-    /// is exceeded.
+    /// main thread polls for the wall-clock deadline.
+    ///
+    /// When the child finishes (or the deadline fires), the *whole process
+    /// group* is signalled on Unix — not just the direct child — so a
+    /// backgrounded grandchild that inherited the pipes is reaped and the
+    /// drainers reach EOF. Collection is then bounded by [`DRAIN_GRACE`], so a
+    /// stream that still never closes makes `run` return with truncated output
+    /// instead of blocking past the budget forever.
     pub fn run(&self) -> std::io::Result<ConstrainedOutput> {
         let mut child = self.build_command()?.spawn()?;
+        let pid = child.id();
 
         let cap = self.output_cap_bytes;
-        let stdout_drainer = child.stdout.take().map(|s| drain_capped_async(s, cap));
-        let stderr_drainer = child.stderr.take().map(|s| drain_capped_async(s, cap));
+        let stdout_rx = child.stdout.take().map(|s| drain_capped_async(s, cap));
+        let stderr_rx = child.stderr.take().map(|s| drain_capped_async(s, cap));
 
         let deadline = Instant::now() + self.timeout;
         let mut timed_out = false;
         loop {
-            match child.try_wait()? {
-                Some(_) => break,
-                None => {
+            match poll_child_exited(&mut child, pid) {
+                // Exited on its own. On Unix the child is detected *without*
+                // being reaped (see `poll_child_exited`), so its pid — and thus
+                // its process-group id — stays reserved until the sweep below.
+                Ok(true) => break,
+                Ok(false) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
                         timed_out = true;
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
+                Err(err) => {
+                    // Reap before surfacing the error so we never leak a
+                    // running child (and its group) or detached drainers.
+                    kill_process_group(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
             }
         }
 
-        let exit_code = child.try_wait()?.and_then(|status| status.code());
+        // Whether the child exited on its own or hit the deadline, terminate it
+        // and sweep its process group *before* the final reap. Killing the child
+        // directly is what enforces the timeout on non-Unix (where the
+        // process-group sweep is a no-op); the group sweep reaps any Unix
+        // backgrounded members so the inherited pipes close and the drainers
+        // reach EOF. Doing both before `wait()` keeps the pid reserved for the
+        // sweep, so a recycled process-group id can never be signalled.
+        kill_process_group(pid);
+        let _ = child.kill();
+        let exit_code = child.wait().ok().and_then(|status| status.code());
 
-        // Killing the child closes its stdout/stderr write ends, so the
-        // drainer threads reach EOF and join promptly.
-        let (stdout, stdout_truncated) = stdout_drainer
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        let (stderr, stderr_truncated) = stderr_drainer
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
+        let (stdout, stdout_truncated) = recv_drain(stdout_rx);
+        let (stderr, stderr_truncated) = recv_drain(stderr_rx);
 
         Ok(ConstrainedOutput {
             exit_code,
@@ -226,14 +313,95 @@ impl ConstrainedRunner {
     }
 }
 
+/// Whether the child with `pid` has exited, checked *without* reaping it.
+///
+/// On Unix this uses `waitid(..., WNOWAIT)`: the exited child is left as a
+/// still-waitable zombie so its pid — and therefore its process-group id — stays
+/// reserved until the caller sweeps the group and reaps explicitly. That closes
+/// the window in which a reaped-then-signalled pgid could alias a process group
+/// the kernel has since recycled. On non-Unix there is no process-group
+/// signalling (and thus no such race), so a plain reaping `try_wait` is used.
+#[cfg(unix)]
+pub(crate) fn poll_child_exited(_child: &mut std::process::Child, pid: u32) -> std::io::Result<bool> {
+    let id = pid as libc::id_t;
+    loop {
+        // Zeroing the struct lets us distinguish "no child ready" (`si_pid`
+        // stays 0 under WNOHANG) from "exited" (`si_pid` set to the child).
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, zeroed `siginfo_t`; `waitid` only writes to
+        // it. WNOWAIT leaves the child reapable; WNOHANG makes the call
+        // non-blocking. No memory-safety preconditions.
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if ret == 0 {
+            // SAFETY: reading a scalar field of the populated siginfo.
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn poll_child_exited(child: &mut std::process::Child, _pid: u32) -> std::io::Result<bool> {
+    Ok(child.try_wait()?.is_some())
+}
+
+/// Signal the process group led by `pid` (SIGKILL) so backgrounded
+/// descendants that inherited the child's pipes are reaped. No-op on non-Unix,
+/// where the child is killed directly by the caller. Errors (e.g. the group is
+/// already gone) are ignored. The caller must not have reaped `pid` yet, so the
+/// group id cannot have been recycled onto an unrelated group.
+pub(crate) fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        if let Ok(pgid) = i32::try_from(pid) {
+            // SAFETY: kill(2) with a negative pid targets the process group;
+            // it has no memory-safety preconditions and a bad pgid just fails.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Collect a drainer's captured text, bounded by [`DRAIN_GRACE`]. Returns
+/// `(text, truncated)`; a stream that fails to deliver within the grace is
+/// reported as empty-and-truncated so `run` cannot block indefinitely.
+fn recv_drain(rx: Option<Receiver<(String, bool)>>) -> (String, bool) {
+    match rx {
+        Some(rx) => rx
+            .recv_timeout(DRAIN_GRACE)
+            .unwrap_or_else(|_| (String::new(), true)),
+        None => (String::new(), false),
+    }
+}
+
 /// Spawn a thread that drains `stream` to EOF, keeping at most `cap` bytes and
 /// counting the rest so we can flag truncation without buffering it. Draining
-/// past the cap is what prevents the child from blocking on a full pipe.
-/// Returns `(text, truncated)`.
+/// past the cap is what prevents the child from blocking on a full pipe. The
+/// final `(text, truncated)` is delivered over the returned channel; the
+/// caller reads it with a bounded timeout so a stream that never closes cannot
+/// stall `run`. The thread detaches if that happens and exits when the pipe
+/// eventually closes.
 fn drain_capped_async<R: Read + Send + 'static>(
     mut stream: R,
     cap: usize,
-) -> std::thread::JoinHandle<(String, bool)> {
+) -> Receiver<(String, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut kept: Vec<u8> = Vec::new();
         let mut truncated = false;
@@ -257,8 +425,9 @@ fn drain_capped_async<R: Read + Send + 'static>(
                 Err(_) => break,
             }
         }
-        (String::from_utf8_lossy(&kept).into_owned(), truncated)
-    })
+        let _ = tx.send((String::from_utf8_lossy(&kept).into_owned(), truncated));
+    });
+    rx
 }
 
 /// Print a one-line warning that functional tests are running without OS-level
@@ -363,6 +532,30 @@ mod tests {
         let want = tmp.path().canonicalize().unwrap();
         let got = PathBuf::from(reported).canonicalize().unwrap();
         assert_eq!(got, want);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backgrounded_grandchild_does_not_hang_run() {
+        // The shell exits immediately, but it backgrounds a `sleep` that
+        // inherits the stdout/stderr pipes. Before the process-group kill,
+        // joining the drainers would block for the sleep's full lifetime.
+        // `run` must return promptly with the parent's output captured.
+        let started = Instant::now();
+        let out = ConstrainedRunner::new("sh")
+            .args(["-c", "sleep 30 & echo started"])
+            .timeout(Duration::from_secs(60))
+            .run()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "run must not block on a backgrounded grandchild holding the pipe"
+        );
+        assert!(
+            out.combined().contains("started"),
+            "parent output must still be captured: {:?}",
+            out.combined()
+        );
     }
 
     #[test]

@@ -14,6 +14,12 @@ const TEST_FILE_NAME: &str = "TEST.sh";
 /// commands had no timeout and inherited the daemon environment.
 const TEST_CASE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Per-stream capture cap for a `TEST.sh` command. Generous (the legacy path
+/// captured unbounded output) but still bounded so a runaway command cannot
+/// exhaust memory; when a stream hits the cap the failure output says so, so a
+/// pattern that appears past the cap does not fail silently.
+const TEST_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
+
 /// Result of running all tests for a single skill.
 #[derive(Debug, Clone)]
 pub struct SkillTestResult {
@@ -135,10 +141,22 @@ fn run_test_case(
     };
     let combined = if output.timed_out {
         format!(
-            "{}{}\n[command exceeded the {}s test timeout and was killed]",
+            "{}{}\n{}",
             output.stdout,
             output.stderr,
-            TEST_CASE_TIMEOUT.as_secs()
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-test-timeout",
+                &[("seconds", &TEST_CASE_TIMEOUT.as_secs().to_string())],
+            )
+        )
+    } else if output.output_truncated {
+        format!(
+            "{}\n{}",
+            output.combined(),
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-test-output-truncated",
+                &[("bytes", &TEST_OUTPUT_CAP_BYTES.to_string())],
+            )
         )
     } else {
         output.combined()
@@ -173,17 +191,26 @@ fn run_test_case(
 /// Build the constrained runner for one `TEST.sh` command: `sh -c <cmd>`
 /// (`cmd /C` on Windows), confined to `skill_dir`, env-scrubbed, timed, and
 /// output-capped, wrapped by the active `sandbox` backend.
+///
+/// On Windows the command is passed via `raw_arg` (not `.args`), so `cmd.exe`
+/// receives the `/C "<command>"` form verbatim under its own quoting rules —
+/// std's MSVC-style escaping mangles commands containing quotes — and
+/// `CREATE_NO_WINDOW` keeps a console from flashing (#7083 quoting contract).
 #[cfg(windows)]
 fn build_test_runner(
     command: &str,
     skill_dir: &Path,
     sandbox: &Arc<dyn Sandbox>,
 ) -> ConstrainedRunner {
-    ConstrainedRunner::new("cmd")
-        .args(["/C", command])
+    let runner = ConstrainedRunner::new("cmd")
+        .windows_raw_arg("/C")
+        .windows_raw_arg(zeroclaw_config::platform::native::windows_cmd_shell_raw_arg(command))
+        .windows_no_window()
         .workdir(skill_dir)
         .timeout(TEST_CASE_TIMEOUT)
-        .sandbox(sandbox.clone())
+        .output_cap_bytes(TEST_OUTPUT_CAP_BYTES)
+        .sandbox(sandbox.clone());
+    with_inherited_home(runner)
 }
 
 #[cfg(not(windows))]
@@ -192,12 +219,25 @@ fn build_test_runner(
     skill_dir: &Path,
     sandbox: &Arc<dyn Sandbox>,
 ) -> ConstrainedRunner {
-    ConstrainedRunner::new("sh")
+    let runner = ConstrainedRunner::new("sh")
         .arg("-c")
         .arg(command)
         .workdir(skill_dir)
         .timeout(TEST_CASE_TIMEOUT)
-        .sandbox(sandbox.clone())
+        .output_cap_bytes(TEST_OUTPUT_CAP_BYTES)
+        .sandbox(sandbox.clone());
+    with_inherited_home(runner)
+}
+
+/// Forward the daemon's `HOME` to the scrubbed child so a `TEST.sh` case that
+/// resolves `~` or reads user config works, without re-exposing the rest of the
+/// inherited environment. `HOME` is a path, not a secret; the runner's
+/// allowlist keeps everything else stripped.
+fn with_inherited_home(runner: ConstrainedRunner) -> ConstrainedRunner {
+    match std::env::var_os("HOME") {
+        Some(home) => runner.with_home(home),
+        None => runner,
+    }
 }
 
 /// Test a single skill by parsing and running its TEST.sh under the active

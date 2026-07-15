@@ -180,6 +180,14 @@ pub async fn handle_command(
             }
 
             std::fs::remove_dir_all(&skill_path)?;
+            // Remove the install receipt too, so a later skill reusing this
+            // name is not classified by the removed skill's provenance (a
+            // scaffolded local `foo` would otherwise be refused from testing,
+            // or reported modified by `verify`, on the stale remote receipt).
+            let _ = std::fs::remove_file(zeroclaw_runtime::skills::receipt::receipt_path(
+                &config.install_root_dir(),
+                &name,
+            ));
             println!(
                 "  {} Skill '{}' removed.",
                 console::style("✓").green().bold(),
@@ -246,9 +254,16 @@ fn skill_is_remote_origin(config: &crate::config::Config, skill_name: &str) -> b
 fn handle_test(config: &crate::config::Config, name: Option<String>, verbose: bool) -> Result<()> {
     let workspace_dir = &config.data_dir;
     let results = if let Some(ref skill_name) = name {
-        let source_path = PathBuf::from(skill_name);
-        let (target, is_installed) = if source_path.exists() {
-            (source_path, false)
+        // A bare name (no path separators) always addresses the *installed*
+        // skill of that name, so the remote-origin refusal below cannot be
+        // sidestepped by running from inside the skills directory (where a
+        // cwd-relative `foo` would otherwise resolve to a local path and skip
+        // the gate). Only an explicit path-like argument is treated as a local
+        // directory a developer is iterating on.
+        let looks_like_path =
+            skill_name.contains('/') || skill_name.contains('\\') || skill_name.starts_with('.');
+        let (target, is_installed) = if looks_like_path {
+            (PathBuf::from(skill_name), false)
         } else {
             (skills_dir(workspace_dir).join(skill_name), true)
         };
@@ -315,6 +330,26 @@ fn handle_test(config: &crate::config::Config, name: Option<String>, verbose: bo
     Ok(())
 }
 
+/// Whether an install spec is remote provenance. Delegates to
+/// [`SkillSource::is_remote`] — the single classification authority — so the
+/// gate class can never disagree with the installer the dispatch picks (a new
+/// remote source kind added there is remote here automatically, rather than
+/// silently falling through to the warn-only local gate).
+fn source_is_remote(source: &str) -> bool {
+    zeroclaw_runtime::skills::SkillSource::parse(source).is_remote()
+}
+
+/// Reject a skill name that could act as a path component and escape the skills
+/// directory (or the receipts directory). Mirrors the guard the `remove`
+/// command enforces, so `verify`/`test` cannot be pointed outside the skills
+/// tree via `../` or an absolute-looking name.
+fn reject_unsafe_skill_name(name: &str) -> Result<()> {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: {name}");
+    }
+    Ok(())
+}
+
 /// Build the screening gate for an install spec: remote sources use
 /// `[skills.install_screening].remote_action` (carrying any `--accept-risk`
 /// override), local sources use `local_action`.
@@ -324,11 +359,7 @@ fn screening_gate_for(
     accept_risk: Option<String>,
 ) -> SkillScreeningGate {
     let cfg = &config.skills.install_screening;
-    let is_remote = is_clawhub_source(source)
-        || is_git_source(source)
-        || is_registry_source(source)
-        || is_extra_registry_source(source);
-    if is_remote {
+    if source_is_remote(source) {
         SkillScreeningGate::for_remote(cfg.remote_action, accept_risk)
     } else {
         SkillScreeningGate::for_local(cfg.local_action)
@@ -346,8 +377,8 @@ async fn dispatch_install(
     no_tier_banner: bool,
     gate: &SkillScreeningGate,
     mode: &InstallMode,
+    allow_scripts: bool,
 ) -> Result<SkillInstallReport> {
-    let allow_scripts = config.skills.allow_scripts;
     if is_clawhub_source(source) {
         install_clawhub_skill_source(source, skills_path, allow_scripts, gate, mode)
             .await
@@ -407,19 +438,11 @@ async fn dispatch_install(
 fn install_dir_name(source: &str) -> Option<String> {
     match SkillSource::parse(source) {
         SkillSource::ClawHub { .. } => clawhub_skill_dir_name(source).ok(),
+        // Resolve the git destination name through the same runtime helper the
+        // installer uses (`git_clone_dir_name`), so the receipt lookup and the
+        // actual install directory can never disagree.
         SkillSource::Git { .. } => {
-            let trimmed = source.trim_end_matches('/');
-            let path_part = if trimmed.contains("://") {
-                trimmed
-            } else {
-                trimmed.split_once(':').map_or(trimmed, |(_, p)| p)
-            };
-            let base = path_part
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(".git");
-            (!base.is_empty()).then(|| base.to_string())
+            zeroclaw_runtime::skills::git_clone_dir_name(source).ok()
         }
         SkillSource::Registry { skill, .. } => Some(skill),
         SkillSource::Local { path } => path
@@ -476,6 +499,7 @@ async fn handle_install(
         no_tier_banner,
         &gate,
         &mode,
+        config.skills.allow_scripts,
     )
     .await;
 
@@ -553,7 +577,7 @@ async fn handle_screening_denial(
     let skills_path = skills_dir(workspace_dir);
     let gate = screening_gate_for(config, source, Some(risk.staged_hash.clone()));
     let mode = install_mode_for(config, source, force);
-    let report = dispatch_install(
+    let report = match dispatch_install(
         config,
         source,
         workspace_dir,
@@ -561,8 +585,43 @@ async fn handle_screening_denial(
         no_tier_banner,
         &gate,
         &mode,
+        config.skills.allow_scripts,
     )
-    .await?;
+    .await
+    {
+        Ok(report) => report,
+        Err(err) => {
+            // The override is content-bound. If the re-stage now hashes
+            // differently, the source served different bytes *between* the hash
+            // the user just approved and this install — the exact upstream-swap
+            // case the content-bound hash exists to catch. Surface the new
+            // report and hash (never silently install the swapped content, and
+            // never leave the user with a bare error) so they can review and
+            // re-approve the new hash rather than pasting it sight-unseen.
+            if let Some(new_risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
+                eprintln!(
+                    "{}",
+                    get_required_cli_string("cli-skills-screen-content-changed")
+                );
+                eprint!("{}", new_risk.report.render());
+                eprintln!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-screen-staged-hash",
+                        &[("hash", &new_risk.staged_hash)]
+                    )
+                );
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-screen-accept-hint",
+                        &[("hash", &new_risk.staged_hash)]
+                    )
+                );
+            }
+            return Err(err);
+        }
+    };
 
     record_install_receipt(config, source, &report);
     print_install_success(&report);
@@ -611,7 +670,7 @@ fn record_install_receipt(
         immutable_resolution: report.resolution.clone(),
         tree_hash: report.tree_hash.clone(),
         tree_hash_scheme: zeroclaw_runtime::skills::receipt::TREE_HASH_SCHEME,
-        version: read_installed_skill_version(&report.dir),
+        version: zeroclaw_runtime::skills::read_manifest_version(&report.dir),
         tier_at_install,
         screening_ruleset_version: 0,
         screening_max_impact: None,
@@ -647,22 +706,6 @@ fn resolve_tier_label(config: &crate::config::Config, source: &str, skill_name: 
     }
 }
 
-/// Read the installed skill's version from its manifest, if present.
-fn read_installed_skill_version(dir: &std::path::Path) -> Option<String> {
-    for manifest in ["SKILL.toml", "manifest.toml"] {
-        if let Ok(content) = std::fs::read_to_string(dir.join(manifest))
-            && let Ok(value) = toml::from_str::<toml::Value>(&content)
-            && let Some(version) = value
-                .get("skill")
-                .and_then(|s| s.get("version"))
-                .and_then(|v| v.as_str())
-        {
-            return Some(version.to_string());
-        }
-    }
-    None
-}
-
 /// Current Unix timestamp in seconds for the receipt's `installed_at`.
 fn install_timestamp() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -679,7 +722,10 @@ fn handle_verify(config: &crate::config::Config, name: Option<String>) -> Result
     let skills_path = skills_dir(&config.data_dir);
 
     let names: Vec<String> = match name {
-        Some(name) => vec![name],
+        Some(name) => {
+            reject_unsafe_skill_name(&name)?;
+            vec![name]
+        }
         None => {
             let Ok(entries) = std::fs::read_dir(&skills_path) else {
                 println!("{}", get_required_cli_string("cli-skills-none-installed"));
@@ -699,7 +745,13 @@ fn handle_verify(config: &crate::config::Config, name: Option<String>) -> Result
         if !skill_dir.is_dir() {
             anyhow::bail!("Skill not found: {name}");
         }
-        let status = verify_skill(&install_root, &name, &skill_dir)?;
+        // A per-skill hashing failure (e.g. `compute_tree_hash` bailing on an
+        // injected symlink — itself a tamper signal) must count as Modified for
+        // this skill, not abort the whole sweep and hide every skill after it.
+        let status = match verify_skill(&install_root, &name, &skill_dir) {
+            Ok(status) => status,
+            Err(_) => VerifyStatus::Modified,
+        };
         let (glyph, key) = match status {
             VerifyStatus::Ok => (console::style("✓").green().bold(), "cli-skills-verify-ok"),
             VerifyStatus::Modified => {
@@ -729,27 +781,37 @@ fn handle_verify(config: &crate::config::Config, name: Option<String>) -> Result
 
 /// Screen a skill source without installing it. Remote sources are staged to a
 /// temporary directory, scanned, and discarded; local sources are scanned in
-/// place. Exits nonzero iff any `Denial` finding is present.
+/// place. The exit code matches what an install of the same source would do:
+/// nonzero when the source's install gate would refuse the report (a remote
+/// `confirm`/`block` install refuses a denial or an unscanned file), zero for a
+/// local (warn-only) source that an install would never block.
 async fn handle_screen(config: &crate::config::Config, source: String) -> Result<()> {
-    let report = if is_clawhub_source(&source)
-        || is_git_source(&source)
-        || is_registry_source(&source)
-        || is_extra_registry_source(&source)
-    {
+    let report = if source_is_remote(&source) {
         screen_remote_source(config, &source).await?
     } else {
         let path = PathBuf::from(&source);
         if !path.exists() {
-            anyhow::bail!("Source path does not exist: {source}");
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-screen-source-missing",
+                    &[("source", &source)]
+                )
+            );
         }
         screen_skill_directory(&path)?
     };
 
     print!("{}", report.render());
-    if report.has_denial() {
+    // Exit code exactly matches whether an install of this source would refuse
+    // the report. Remote (confirm/block) refuses a denial or an unscanned file;
+    // local is warn-only and never refuses, so a local screen does not fail
+    // where a local install would succeed.
+    let gate = screening_gate_for(config, &source, None);
+    if gate.refuses(&report) {
         anyhow::bail!(
             "{}",
-            get_required_cli_string("cli-skills-screen-found-denial")
+            get_required_cli_string("cli-skills-screen-found-blocking")
         );
     }
     Ok(())
@@ -758,6 +820,11 @@ async fn handle_screen(config: &crate::config::Config, source: String) -> Result
 /// Stage a remote source into a throwaway temp directory and screen it without
 /// installing. Reuses the real installers with a disabled gate, pointed at a
 /// temp skills dir, then screens the promoted copy.
+///
+/// Staging passes `allow_scripts = true` so the structural audit does not abort
+/// on a script-bearing skill — the whole point of `skills screen` is to inspect
+/// exactly that kind of content before installing, and nothing here is
+/// executed: the tree is promoted into a temp dir, screened, then discarded.
 async fn screen_remote_source(
     config: &crate::config::Config,
     source: &str,
@@ -765,14 +832,21 @@ async fn screen_remote_source(
     let tmp = tempfile::tempdir().context("failed to create temp dir for screening")?;
     let skills_path = tmp.path().join("skills");
     std::fs::create_dir_all(&skills_path)?;
+    // Promote into the throwaway temp `skills_path`, but resolve the registry
+    // cache against the real workspace (`config.data_dir`) so a registry source
+    // reuses the already-synced `skills-registry` clone instead of re-cloning
+    // the whole registry over the network on every `skills screen` (and failing
+    // offline). Staging/promote stay under `skills_path`, so the real skills
+    // directory is never touched.
     let report = dispatch_install(
         config,
         source,
-        tmp.path(),
+        &config.data_dir,
         &skills_path,
         true,
         &SkillScreeningGate::disabled(),
         &InstallMode::fresh(),
+        true,
     )
     .await?;
     screen_skill_directory(&report.dir).context("failed to screen staged skill")

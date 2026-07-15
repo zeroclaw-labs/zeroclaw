@@ -49,6 +49,8 @@ pub use service::{
 };
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
+use crate::security::constrained_runner::{kill_process_group, poll_child_exited};
+
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
@@ -1914,6 +1916,15 @@ pub enum SkillSource {
 }
 
 impl SkillSource {
+    /// True for any non-local provenance (ClawHub / git / registry). The
+    /// screening layer uses this to pick the remote gate vs. the warn-only
+    /// local gate, so it must live on the classification authority itself — a
+    /// caller re-deriving remoteness from the raw spec risks routing a new
+    /// remote variant through the weaker local gate.
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, SkillSource::Local { .. })
+    }
+
     /// Classify an install spec. This is the single classification authority:
     /// the `is_*_source` predicates below are projections of this parse, not
     /// parallel string checks. Anything that matches no remote form is a
@@ -2182,8 +2193,13 @@ impl InstallLock {
             // just created (two peers rename different inodes; the loser's
             // rename hits NotFound). The unconditional `remove_file` this
             // replaces could otherwise clobber a peer's fresh lock. [A#1]
+            // Distinct `.reclaimed-lock-` prefix (NOT `.lock-`): the stale sweep
+            // skips every `.lock-*` (those are managed by acquire), so a reclaim
+            // leftover must live outside that namespace to be sweepable — and a
+            // distinct prefix also cannot alias a live lock for a skill whose
+            // name happens to contain `.reclaim-`.
             let reclaim_target = staging_root.join(format!(
-                ".lock-{name}.reclaim-{:016x}",
+                ".reclaimed-lock-{name}-{:016x}",
                 rand::random::<u64>()
             ));
             if std::fs::rename(&path, &reclaim_target).is_ok() {
@@ -2254,6 +2270,11 @@ fn sweep_stale_staging(staging_root: &Path, stale_bound: Duration) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Live lock files (`.lock-<skill>`) are reclaimed by `InstallLock::acquire`,
+        // not swept. A reclaim leftover uses the distinct `.reclaimed-lock-` prefix
+        // (orphaned when a crash interrupts the rename→unlink of a stale-lock
+        // reclaim) and is swept like any other stale staging leftover, so the
+        // skip is limited to the `.lock-` namespace acquire owns.
         if entry.file_name().to_string_lossy().starts_with(".lock-") {
             continue;
         }
@@ -2358,10 +2379,22 @@ fn begin_skill_install(
     // the destination is an error, not a follow.
     match std::fs::symlink_metadata(&dest) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            anyhow::bail!("Destination skill path is a symlink: {}", dest.display());
+            anyhow::bail!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-destination-symlink",
+                    &[("path", &dest.display().to_string())],
+                )
+            );
         }
         Ok(_) if !force => {
-            anyhow::bail!("Destination skill already exists: {}", dest.display());
+            anyhow::bail!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-destination-exists",
+                    &[("path", &dest.display().to_string())],
+                )
+            );
         }
         _ => {}
     }
@@ -2410,10 +2443,22 @@ fn finish_skill_install(
             )
         }),
         Ok(meta) if meta.file_type().is_symlink() => {
-            anyhow::bail!("Destination skill path is a symlink: {}", dest.display())
+            anyhow::bail!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-destination-symlink",
+                    &[("path", &dest.display().to_string())],
+                )
+            )
         }
         Ok(_) if !force => {
-            anyhow::bail!("Destination skill already exists: {}", dest.display())
+            anyhow::bail!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-destination-exists",
+                    &[("path", &dest.display().to_string())],
+                )
+            )
         }
         // Journaled swap: move the current skill aside, then promote the new
         // one. A crash between the two renames leaves the old content in the
@@ -2732,7 +2777,11 @@ fn apply_update_review(
             ],
         )
     );
-    if gate.enforces_override() && gate.matched_override(new_hash).is_none() {
+    // Under `block` the content swap can never be overridden — mirror
+    // `SkillScreeningGate::evaluate`, which ignores `accept_hash` in block mode.
+    // Under `confirm` a content-bound override that matches the freshly staged
+    // hash is accepted.
+    if gate.enforces_override() && (gate.is_block() || gate.matched_override(new_hash).is_none()) {
         return Err(screening::RiskAcceptanceRequired {
             report: screening.cloned().unwrap_or_default(),
             staged_hash: new_hash.to_string(),
@@ -2789,8 +2838,21 @@ fn file_hashes(dir: &Path) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
-/// Best-effort read of a skill's declared version from its manifest.
-fn read_manifest_version(dir: &Path) -> Option<String> {
+/// Best-effort read of a skill's declared version.
+///
+/// Skills are scaffolded as `SKILL.md` with a `version:` frontmatter field, so
+/// that is the primary source (ClawHub only writes a fallback `SKILL.toml` when
+/// `SKILL.md` is absent). Falls back to the `[skill].version` key in
+/// `SKILL.toml` / `manifest.toml`. Single source of truth for both the receipt
+/// writer and the update-review comparison, so an md-only skill's version bump
+/// is not misread as a content swap.
+pub fn read_manifest_version(dir: &Path) -> Option<String> {
+    if let Ok(content) = std::fs::read_to_string(dir.join("SKILL.md"))
+        && let Ok(doc) = SkillDocument::parse(&content)
+        && let Some(version) = doc.frontmatter.version
+    {
+        return Some(version);
+    }
     for manifest in ["SKILL.toml", "manifest.toml"] {
         if let Ok(content) = std::fs::read_to_string(dir.join(manifest))
             && let Ok(value) = toml::from_str::<toml::Value>(&content)
@@ -2843,7 +2905,7 @@ pub fn install_local_skill_source(
 /// and the final destination before the clone runs. Names that could act as
 /// path components (`.`/`..`), hide from the skills walk, or collide with
 /// staging bookkeeping (leading `.`) are rejected.
-fn git_clone_dir_name(source: &str) -> Result<String> {
+pub fn git_clone_dir_name(source: &str) -> Result<String> {
     let trimmed = source.trim_end_matches('/');
     // SCP-like remotes (git@host:owner/repo.git) keep only the path half.
     let path_part = if !trimmed.contains("://") {
@@ -2857,7 +2919,13 @@ fn git_clone_dir_name(source: &str) -> Result<String> {
         .unwrap_or_default()
         .trim_end_matches(".git");
     if base.is_empty() || base.starts_with('.') || base.contains('\\') {
-        anyhow::bail!("could not derive a skill directory name from git source: {source}");
+        anyhow::bail!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-git-name-underivable",
+                &[("source", source)],
+            )
+        );
     }
     Ok(base.to_string())
 }
@@ -2924,28 +2992,43 @@ fn git_host_looks_like_option(source: &str) -> bool {
 }
 
 /// Spawn `cmd`, enforcing a hard wall-clock timeout. On timeout the child is
-/// killed and a localized error naming `source` is returned. `label` names
-/// the operation in non-timeout failure messages.
+/// killed and `timeout_message` (already localized by the caller, which knows
+/// whether this is a clone or a pull) is returned. `label` names the operation
+/// in non-timeout failure messages. Process-group termination is shared with
+/// [`ConstrainedRunner`](crate::security::constrained_runner) so both runners
+/// reap lingering group members the same way.
 fn run_command_with_timeout(
     cmd: &mut std::process::Command,
     timeout: Duration,
-    source: &str,
+    timeout_message: &str,
     label: &str,
 ) -> Result<()> {
+    // Run git as its own process-group leader so lingering helpers (a git
+    // credential/remote helper, or a persistent `ssh` connection mux) can be
+    // reaped as a group — otherwise a survivor holding the inherited stderr
+    // pipe would stall stderr collection past the budget.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .spawn()
         .with_context(|| format!("failed to run {label}"))?;
+    let pid = child.id();
 
-    // Drain stderr on a dedicated thread. A remote can stream more than one
-    // pipe buffer (~64 KiB) of git sideband/progress text to stderr; reading
-    // it only after exit would let the child block on a full pipe and stall
-    // for the whole timeout. Cap the retained text so a hostile remote can't
-    // balloon memory. [R4]
+    // Drain stderr on a dedicated thread, delivering the capped text over a
+    // channel. A remote can stream more than one pipe buffer (~64 KiB) of git
+    // sideband/progress text to stderr; reading it only after exit would let
+    // the child block on a full pipe. Collection is read with a bounded
+    // timeout so a helper that keeps the pipe open cannot hang the wait. [R4]
     const STDERR_CAP: usize = 64 * 1024;
-    let stderr_reader = child.stderr.take().map(|mut pipe| {
+    const STDERR_GRACE: Duration = Duration::from_secs(5);
+    let mut stderr_rx = child.stderr.take().map(|mut pipe| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let mut chunk = [0_u8; 8192];
@@ -2962,43 +3045,46 @@ fn run_command_with_timeout(
                     Err(_) => break,
                 }
             }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        rx
     });
-    let collect_stderr = move || {
-        stderr_reader
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default()
-    };
 
     let started = std::time::Instant::now();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stderr = collect_stderr();
-                if status.success() {
+        // Non-reaping exit check: on Unix the child is detected without being
+        // reaped, so its pid (== pgid) stays reserved through the group sweep
+        // below — a reaped-then-signalled pgid could otherwise alias a recycled
+        // group.
+        match poll_child_exited(&mut child, pid) {
+            Ok(true) => {
+                // Sweep the whole group *before* reaping so a lingering
+                // transport helper (a git credential/remote helper, or a
+                // persistent `ssh` mux) is reaped and releases the inherited
+                // stderr pipe. Safe because `pid` is not yet reaped.
+                kill_process_group(pid);
+                let _ = child.kill();
+                let status = child.wait().ok();
+                if status.is_some_and(|s| s.success()) {
                     return Ok(());
                 }
+                let stderr = stderr_rx
+                    .take()
+                    .and_then(|rx| rx.recv_timeout(STDERR_GRACE).ok())
+                    .unwrap_or_default();
                 anyhow::bail!("{label} failed: {stderr}");
             }
-            Ok(None) => {
+            Ok(false) => {
                 if started.elapsed() >= timeout {
+                    kill_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!(
-                        "{}",
-                        crate::i18n::get_required_cli_string_with_args(
-                            "cli-skills-git-clone-timeout",
-                            &[
-                                ("source", source),
-                                ("seconds", &timeout.as_secs().to_string()),
-                            ],
-                        )
-                    );
+                    anyhow::bail!("{timeout_message}");
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
+                kill_process_group(pid);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(err).with_context(|| format!("failed to wait for {label}"));
@@ -3071,10 +3157,17 @@ pub fn install_git_skill_source(
             ])
             .arg(&clone_target)
             .env("GIT_TERMINAL_PROMPT", "0");
+        let clone_timeout = Duration::from_secs(GIT_CLONE_TIMEOUT_SECS);
         run_command_with_timeout(
             &mut clone_cmd,
-            Duration::from_secs(GIT_CLONE_TIMEOUT_SECS),
-            source,
+            clone_timeout,
+            &crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-git-clone-timeout",
+                &[
+                    ("source", source),
+                    ("seconds", &clone_timeout.as_secs().to_string()),
+                ],
+            ),
             "git clone",
         )?;
 
@@ -3300,9 +3393,8 @@ fn extract_validated_skill_zip<R: Read + Seek>(
 
 /// Render a URL with credentials and query string stripped: userinfo may
 /// carry tokens, query strings may carry signed parameters. Every log line,
-/// banner, and (once task-2A lands) receipt that shows a fetched URL must go
-/// through this.
-fn sanitized_display_url(url: &Url) -> String {
+/// banner, and receipt that shows a fetched URL must go through this.
+pub(crate) fn sanitized_display_url(url: &Url) -> String {
     let mut clean = url.clone();
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
@@ -3466,16 +3558,37 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
         })?;
     }
 
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", repo_url])
+    // Same transport hardening as a direct git skill install: reject
+    // no-integrity/option-injection remotes, disable the ext/remote-helper
+    // command-execution transports, never prompt on a TTY, terminate option
+    // parsing with `--`, and enforce a hard wall-clock budget. [R4]
+    validate_git_transport(repo_url).context("failed to clone skills registry")?;
+    let mut clone_cmd = Command::new("git");
+    clone_cmd
+        .args([
+            "-c",
+            "protocol.ext.allow=never",
+            "clone",
+            "--depth",
+            "1",
+            "--",
+            repo_url,
+        ])
         .arg(registry_dir)
-        .output()
-        .context("failed to run git clone for skills registry")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to clone skills registry: {stderr}");
-    }
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let registry_clone_timeout = Duration::from_secs(GIT_CLONE_TIMEOUT_SECS);
+    run_command_with_timeout(
+        &mut clone_cmd,
+        registry_clone_timeout,
+        // Credential-safe: the registry URL may embed userinfo, so the timeout
+        // message names the operation, not the URL.
+        &crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-git-registry-clone-timeout",
+            &[("seconds", &registry_clone_timeout.as_secs().to_string())],
+        ),
+        "git clone for skills registry",
+    )
+    .context("failed to clone skills registry")?;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -3494,32 +3607,40 @@ fn pull_skills_registry(registry_dir: &Path) -> bool {
         return true;
     }
 
-    let output = Command::new("git")
+    // Disable the ext/remote-helper command-execution transports even on the
+    // update path (a malicious registry could configure one), never prompt on
+    // a TTY, and bound the pull with the same wall-clock budget as the clone so
+    // a hung remote cannot stall installs indefinitely. [R4]
+    let mut pull_cmd = Command::new("git");
+    pull_cmd
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
         .arg("-C")
         .arg(registry_dir)
         .args(["pull", "--ff-only"])
-        .output();
+        .env("GIT_TERMINAL_PROMPT", "0");
 
-    match output {
-        Ok(result) if result.status.success() => true,
-        Ok(result) => {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"stderr": stderr})),
-                "failed to pull skills registry updates: "
-            );
-            false
-        }
+    let pull_timeout = Duration::from_secs(GIT_CLONE_TIMEOUT_SECS);
+    match run_command_with_timeout(
+        &mut pull_cmd,
+        pull_timeout,
+        &crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-git-pull-timeout",
+            &[("seconds", &pull_timeout.as_secs().to_string())],
+        ),
+        "git pull for skills registry",
+    ) {
+        Ok(()) => true,
         Err(err) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "failed to run git pull for skills registry"
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "skills.registry.pull_failed",
+                        "error": format!("{err:#}"),
+                    })),
+                "failed to pull skills registry updates"
             );
             false
         }
@@ -4861,7 +4982,7 @@ mod install_transaction_tests {
         let err = run_command_with_timeout(
             &mut cmd,
             Duration::from_millis(200),
-            "https://slow.example/repo.git",
+            "clone of 'https://slow.example/repo.git' exceeded the budget",
             "git clone",
         )
         .expect_err("command exceeding the budget must be killed");
@@ -4869,6 +4990,7 @@ mod install_transaction_tests {
             started.elapsed() < Duration::from_secs(10),
             "timeout must not wait for the child to finish"
         );
+        // On timeout the caller-supplied message is returned verbatim.
         assert!(err.to_string().contains("exceeded"), "got: {err}");
     }
 
@@ -4876,7 +4998,9 @@ mod install_transaction_tests {
     fn command_timeout_passes_through_success_and_failure() {
         let mut ok = std::process::Command::new("git");
         ok.arg("--version");
-        if run_command_with_timeout(&mut ok, Duration::from_secs(30), "src", "git clone").is_err() {
+        if run_command_with_timeout(&mut ok, Duration::from_secs(30), "timeout", "git clone")
+            .is_err()
+        {
             eprintln!("skipping: git not available");
             return;
         }
@@ -4884,7 +5008,7 @@ mod install_transaction_tests {
         {
             let mut fail = std::process::Command::new("false");
             let err =
-                run_command_with_timeout(&mut fail, Duration::from_secs(30), "src", "git clone")
+                run_command_with_timeout(&mut fail, Duration::from_secs(30), "timeout", "git clone")
                     .expect_err("non-zero exit must be an error");
             assert!(err.to_string().contains("git clone failed"), "got: {err}");
         }
@@ -5289,6 +5413,93 @@ mod install_transaction_tests {
     }
 
     #[test]
+    fn content_swap_under_block_ignores_matching_override() {
+        // Regression: under `block`, a content swap must be refused even when a
+        // `--accept-risk` hash matches the freshly staged tree — mirroring the
+        // primary screening gate, which ignores overrides in block mode.
+        let (tmp, skills, _) = setup();
+        let v1 = write_versioned_skill(tmp.path(), "up", "0.1.0", "# v1\nold\n");
+        install_versioned(
+            &skills,
+            &v1,
+            &SkillScreeningGate::disabled(),
+            &InstallMode::fresh(),
+        )
+        .unwrap();
+
+        let src2 = tmp.path().join("src2");
+        let v2 = write_versioned_skill(&src2, "up", "0.1.0", "# v1\nswapped\n");
+        let new_hash = receipt::compute_tree_hash(&v2).unwrap();
+        let review = UpdateReview {
+            prior_version: Some("0.1.0".to_string()),
+            prior_tree_hash: receipt::compute_tree_hash(&v1).unwrap(),
+        };
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, Some(new_hash));
+        let err = install_versioned(&skills, &v2, &gate, &InstallMode::forced(Some(review)))
+            .expect_err("block must not honor an override on a content swap");
+        assert!(
+            err.downcast_ref::<screening::RiskAcceptanceRequired>()
+                .is_some_and(|r| r.blocked),
+            "expected a blocked RiskAcceptanceRequired: {err:?}"
+        );
+        assert!(
+            fs::read_to_string(skills.join("up").join("SKILL.md"))
+                .unwrap()
+                .contains("old"),
+            "the block gate must leave the prior content in place"
+        );
+    }
+
+    #[test]
+    fn orphaned_reclaim_lock_is_swept_but_live_lock_is_not() {
+        // Regression: a `.reclaimed-lock-<name>-<hex>` leftover (crash between
+        // the stale-lock rename and its unlink) is invisible to acquire and must
+        // be swept, while a live `.lock-<name>` is left for acquire to reclaim.
+        let (_tmp, skills, _) = setup();
+        let staging = skill_staging_root(&skills).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+
+        // A live lock, including one for a skill whose name contains ".reclaim-",
+        // must never be swept — only acquire reclaims `.lock-*`.
+        let live_lock = staging.join(".lock-active");
+        fs::write(&live_lock, b"").unwrap();
+        backdate(&live_lock, SKILL_STAGING_STALE_SECS + 60);
+        let live_lock_tricky = staging.join(".lock-foo.reclaim-bar");
+        fs::write(&live_lock_tricky, b"").unwrap();
+        backdate(&live_lock_tricky, SKILL_STAGING_STALE_SECS + 60);
+        // An orphaned reclaim leftover — a `.reclaimed-lock-<name>-<hex>` file
+        // (crash between the stale-lock rename and its unlink) — MUST be swept.
+        let orphan = staging.join(".reclaimed-lock-active-00000000deadbeef");
+        fs::write(&orphan, b"").unwrap();
+        backdate(&orphan, SKILL_STAGING_STALE_SECS + 60);
+
+        sweep_stale_staging(&staging, Duration::from_secs(SKILL_STAGING_STALE_SECS));
+
+        assert!(live_lock.exists(), "a live lock file must not be swept");
+        assert!(
+            live_lock_tricky.exists(),
+            "a live lock for a skill named with '.reclaim-' must not be swept"
+        );
+        assert!(!orphan.exists(), "an orphaned reclaim leftover must be swept");
+    }
+
+    #[test]
+    fn read_manifest_version_prefers_skill_md_frontmatter() {
+        // Regression: skills scaffolded as SKILL.md carry the version in
+        // frontmatter; the update review must read it (not only SKILL.toml) so a
+        // version bump is not misclassified as a content swap.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("s");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: s\ndescription: d\nversion: 2.3.4\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(read_manifest_version(&dir).as_deref(), Some("2.3.4"));
+    }
+
+    #[test]
     fn journaled_swap_restores_old_content_on_promote_failure() {
         // If the promote step fails after the old content is trashed, the old
         // content is restored so the update is non-destructive.
@@ -5396,6 +5607,43 @@ mod screening_gate_tests {
     }
 
     #[test]
+    fn confirm_unscanned_file_requires_acceptance() {
+        // An oversized non-md/toml file passes the structural audit (which only
+        // size-caps markdown/toml) but cannot be screened, so it must demand a
+        // content-bound override under confirm rather than installing behind a
+        // non-blocking warning — otherwise it is a screening-evasion channel.
+        let (tmp, skills) = setup();
+        let dir = tmp.path().join("blob-skill");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "# Skill\nClean.\n").unwrap();
+        fs::write(
+            dir.join("payload.txt"),
+            vec![b'a'; (audit::MAX_TEXT_FILE_BYTES as usize) + 1],
+        )
+        .unwrap();
+        let gate = SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None);
+
+        let err = install_local_skill_source(
+            dir.to_str().unwrap(),
+            &skills,
+            false,
+            &gate,
+            &InstallMode::fresh(),
+        )
+        .expect_err("an unscannable file must require acceptance under confirm");
+        let risk = err
+            .downcast_ref::<RiskAcceptanceRequired>()
+            .expect("must surface RiskAcceptanceRequired");
+        assert!(!risk.blocked);
+        assert!(
+            !risk.report.has_denial(),
+            "no denial finding, only unscanned"
+        );
+        assert!(risk.report.requires_acceptance());
+        assert!(!skills.join("blob-skill").exists());
+    }
+
+    #[test]
     fn confirm_denial_with_matching_hash_installs() {
         let (tmp, skills) = setup();
         let source = write_denial_skill(tmp.path(), "denial-skill");
@@ -5476,6 +5724,29 @@ mod screening_gate_tests {
             report.screening.is_some_and(|r| r.has_denial()),
             "the denial is still reported, just not enforced"
         );
+    }
+
+    #[test]
+    fn gate_refuses_matches_install_blocking_by_policy() {
+        // `skills screen` sets its exit code from `refuses`; it must equal what
+        // an install of the same source would block on. A report with an
+        // unscanned file requires acceptance.
+        let mut report = ScreeningReport::default();
+        report.unscanned.push(screening::UnscannedFile {
+            file: "icon.png".to_string(),
+            reason: screening::UnscannedReason::NonUtf8,
+        });
+        assert!(report.requires_acceptance());
+
+        // Remote confirm/block refuse it; local warn and off never do.
+        assert!(SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None).refuses(&report));
+        assert!(SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, None).refuses(&report));
+        assert!(!SkillScreeningGate::for_local(SkillScreenLocalAction::Warn).refuses(&report));
+        assert!(!SkillScreeningGate::for_remote(SkillScreenRemoteAction::Off, None).refuses(&report));
+
+        // A genuinely clean report is refused by no policy.
+        let clean = ScreeningReport::default();
+        assert!(!SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, None).refuses(&clean));
     }
 
     #[test]
