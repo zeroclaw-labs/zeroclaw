@@ -467,6 +467,11 @@ pub enum EscalationViolation {
     /// allowlists: parent ⊆ child, so the child can ADD entries but
     /// never DROP them.
     ForbiddenPathDroppedByChild { path: String },
+    /// Child drops (or narrows) a deny_write entry the parent enforces.
+    /// Same opposite-direction subset semantics as forbidden_paths:
+    /// parent ⊆ child, so the child can ADD write-deny entries but
+    /// never DROP them.
+    DenyWriteDroppedByChild { path: PathBuf },
     /// Child raises `shell_env_passthrough` to leak env vars the
     /// parent declined to forward.
     ShellEnvPassthroughExpanded { variable: String },
@@ -519,6 +524,10 @@ impl std::fmt::Display for EscalationViolation {
             Self::ForbiddenPathDroppedByChild { path } => write!(
                 f,
                 "subagent drops forbidden_paths entry {path:?} that the parent enforces"
+            ),
+            Self::DenyWriteDroppedByChild { path } => write!(
+                f,
+                "subagent drops deny_write entry {path:?} that the parent enforces"
             ),
             Self::ShellEnvPassthroughExpanded { variable } => write!(
                 f,
@@ -2108,6 +2117,24 @@ impl SecurityPolicy {
         false
     }
 
+    /// Repoint this policy at a new workspace, rebasing resolved
+    /// `deny_write` guardrails so workspace-relative entries (`.env`,
+    /// `.git/hooks/`, …) follow the effective workspace instead of the
+    /// one they were resolved against at construction time. Entries that
+    /// do not sit under the old workspace (absolute operator-supplied
+    /// denials) are left untouched. Any code that reassigns
+    /// `workspace_dir` on a constructed policy must go through here
+    /// rather than assigning the field directly, or the guardrail list
+    /// stays scoped to the stale workspace.
+    pub fn rebase_workspace(&mut self, new_workspace: PathBuf) {
+        let old_workspace = std::mem::replace(&mut self.workspace_dir, new_workspace);
+        for denied in &mut self.deny_write {
+            if let Ok(suffix) = denied.strip_prefix(&old_workspace) {
+                *denied = self.workspace_dir.join(suffix);
+            }
+        }
+    }
+
     /// Directories whose `config.toml`-family files are protected from
     /// agent self-modification. Includes the real config directory (the
     /// parent of `config_path`, i.e. the install root) and, for
@@ -2386,6 +2413,23 @@ impl SecurityPolicy {
             if !self.forbidden_paths.iter().any(|c| c == parent_forbidden) {
                 return Err(EscalationViolation::ForbiddenPathDroppedByChild {
                     path: parent_forbidden.clone(),
+                });
+            }
+        }
+
+        // deny_write runs the same OPPOSITE direction as forbidden_paths:
+        // every parent write-deny must remain covered by the child. A child
+        // entry covers a parent entry when the parent path sits at or under
+        // the child path (denial is prefix-based), so the child may broaden
+        // a denial but never drop or narrow one.
+        for parent_denied in &parent.deny_write {
+            if !self
+                .deny_write
+                .iter()
+                .any(|c| path_contains(c, parent_denied))
+            {
+                return Err(EscalationViolation::DenyWriteDroppedByChild {
+                    path: parent_denied.clone(),
                 });
             }
         }
@@ -5483,6 +5527,68 @@ mod tests {
     }
 
     #[test]
+    fn ensure_no_escalation_rejects_dropped_deny_write_entry() {
+        let parent = SecurityPolicy {
+            deny_write: vec![
+                PathBuf::from("/workspace/.env"),
+                PathBuf::from("/workspace/.git/hooks"),
+            ],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            deny_write: vec![PathBuf::from("/workspace/.git/hooks")],
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child dropping a parent's deny_write entry must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::DenyWriteDroppedByChild { ref path }
+            if path == &PathBuf::from("/workspace/.env")
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_broadened_deny_write_entry() {
+        // Child replaces the parent's narrower .git/hooks denial with a
+        // broader .git denial — this covers the parent's entry, so it must
+        // be accepted as a legitimate broadening, not a drop.
+        let parent = SecurityPolicy {
+            deny_write: vec![PathBuf::from("/workspace/.git/hooks")],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            deny_write: vec![PathBuf::from("/workspace/.git")],
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_narrowed_deny_write_entry() {
+        // Child narrows the parent's broad .git denial down to only
+        // .git/hooks — the parent's .git/config is no longer covered, so
+        // this must be rejected as a drop.
+        let parent = SecurityPolicy {
+            deny_write: vec![PathBuf::from("/workspace/.git")],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            deny_write: vec![PathBuf::from("/workspace/.git/hooks")],
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child narrowing a parent's deny_write entry must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::DenyWriteDroppedByChild { ref path }
+            if path == &PathBuf::from("/workspace/.git")
+        ));
+    }
+
+    #[test]
     fn ensure_no_escalation_rejects_expanded_shell_env_passthrough() {
         let parent = SecurityPolicy {
             shell_env_passthrough: vec!["PATH".into()],
@@ -5711,6 +5817,43 @@ mod tests {
         assert!(
             !policy.is_resolved_path_allowed(&workspace.join(".env")),
             "mandatory deny-write guardrail (.env) must be enforced by the app-layer path guard"
+        );
+    }
+
+    #[test]
+    fn rebase_workspace_follows_relative_deny_write_entries_to_new_workspace() {
+        let target_ws = Path::new("/target_ws");
+        let profile = crate::schema::RiskProfileConfig::default();
+        let mut policy = SecurityPolicy::from_risk_profile(&profile, target_ws);
+
+        // Sanity: before rebasing, the guardrail is scoped to target_ws.
+        assert!(!policy.is_resolved_path_allowed(&target_ws.join(".env")));
+
+        policy.rebase_workspace(PathBuf::from("/caller_ws"));
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/caller_ws/.env")),
+            "relative deny_write entries must follow the rebased workspace"
+        );
+        assert!(
+            policy.deny_write.iter().all(|p| !p.starts_with(target_ws)),
+            "no resolved deny_write entry should still point at the stale workspace, got: {:?}",
+            policy.deny_write
+        );
+    }
+
+    #[test]
+    fn rebase_workspace_leaves_absolute_deny_write_entries_unchanged() {
+        let target_ws = Path::new("/target_ws");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_write = vec!["/etc/secrets".to_string()];
+        let mut policy = SecurityPolicy::from_risk_profile(&profile, target_ws);
+
+        policy.rebase_workspace(PathBuf::from("/caller_ws"));
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/etc/secrets")),
+            "absolute operator-supplied deny_write entries must be unaffected by rebasing"
         );
     }
 

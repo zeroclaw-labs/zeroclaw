@@ -1420,7 +1420,7 @@ impl Agent {
             // search tools are locked out of the agent's workspace the
             // moment the session cwd differs.
             if let Some(cwd) = session_cwd {
-                policy.workspace_dir = cwd.to_path_buf();
+                policy.rebase_workspace(cwd.to_path_buf());
                 policy.allowed_roots.push(agent_workspace.clone());
             }
             policy

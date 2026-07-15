@@ -523,7 +523,7 @@ impl DelegateTool {
             target_policy.tracker = self.security.tracker.clone();
 
             if self.security.risk_profile_name == target_policy.risk_profile_name {
-                target_policy.workspace_dir = self.security.workspace_dir.clone();
+                target_policy.rebase_workspace(self.security.workspace_dir.clone());
             }
         }
 
@@ -7153,6 +7153,55 @@ mod tests {
         assert_eq!(
             target_policy.workspace_dir, target_config_workspace,
             "independent delegate target must keep its own configured workspace"
+        );
+    }
+
+    /// Regression: a bounded same-profile delegate's resolved policy has its
+    /// `workspace_dir` overwritten to the caller's workspace, but its
+    /// `deny_write` guardrails (`.env`, `.git/hooks/`, etc.) were resolved
+    /// against the target's own workspace during `SecurityPolicy::for_agent`.
+    /// Without rebasing those entries alongside the workspace, the guardrail
+    /// stays scoped to a workspace the bounded delegate never touches, and
+    /// the caller's actual workspace gets none of the write-deny protection.
+    #[tokio::test]
+    async fn bounded_same_profile_delegate_rebases_deny_write_guardrails_to_caller_workspace() {
+        let config = config_with_two_agents("caller", 5, "target", 5);
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_workspace = caller_policy.workspace_dir.clone();
+        let target_workspace = config.agent_workspace_dir("target");
+        assert_ne!(
+            caller_workspace, target_workspace,
+            "test precondition: caller and target must have distinct per-agent workspaces"
+        );
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("bounded same-profile target resolves");
+        assert_eq!(target_policy.workspace_dir, caller_workspace);
+
+        assert!(
+            !target_policy.is_resolved_path_allowed(&caller_workspace.join(".env")),
+            "mandatory deny-write guardrail must protect .env under the effective \
+             (caller) workspace the bounded delegate actually runs in"
+        );
+        assert!(
+            target_policy
+                .deny_write
+                .iter()
+                .all(|p| !p.starts_with(&target_workspace)),
+            "no resolved deny_write entry should still point at the stale target \
+             workspace after rebasing, got: {:?}",
+            target_policy.deny_write
         );
     }
 
