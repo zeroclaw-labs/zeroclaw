@@ -3,12 +3,21 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
 use crate::helpers::domain_guard;
+
+/// Fluent lookup key for the `image_gen` tool's `description()` string.
+/// Mirrors `TOOL_DESCRIPTION_KEY` in `file_download.rs:13`.
+const TOOL_DESCRIPTION_KEY: &str = "tool-image-gen";
+/// Cached localized description; initialized once on first `description()` call
+/// so the `&'static str` return type is satisfied without re-running the
+/// Fluent lookup on every invocation. Mirrors `TOOL_DESCRIPTION` in
+/// `file_download.rs:14`.
+static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Resolve the output filename stem (no extension) for a generated image.
 ///
@@ -138,6 +147,18 @@ impl ImageGenTool {
         })
     }
 
+    /// Resolve a tool-localized Fluent key to its current-locale string.
+    /// Mirrors `file_download.rs:99-101`.
+    fn tool_msg(key: &str) -> String {
+        crate::i18n::get_required_tool_string(key)
+    }
+
+    /// Resolve a tool-localized Fluent key with named arguments (Fluent
+    /// external args, e.g. `{ $host }`). Mirrors `file_download.rs:103-105`.
+    fn tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
+        crate::i18n::get_required_tool_string_with_args(key, args)
+    }
+
     /// Validate the URL of an image to be downloaded from a (server-supplied)
     /// fal.ai response. Mirrors `http_request::validate_url_policy` but for
     /// the image-download stage: no `allowed_domains` (we trust fal.ai's
@@ -149,28 +170,32 @@ impl ImageGenTool {
     fn validate_image_url(&self, raw_url: &str) -> anyhow::Result<String> {
         let url = raw_url.trim();
         if url.is_empty() {
-            anyhow::bail!("image URL cannot be empty");
+            anyhow::bail!(Self::tool_msg("tool-image-gen-error-url-empty"));
         }
         if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("image URL cannot contain whitespace");
+            anyhow::bail!(Self::tool_msg("tool-image-gen-error-url-whitespace"));
         }
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            anyhow::bail!("Only http:// and https:// image URLs are allowed");
+            anyhow::bail!(Self::tool_msg("tool-image-gen-error-url-scheme"));
         }
 
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| anyhow::Error::msg(format!("Invalid image URL format: {e}")))?;
+        let parsed = reqwest::Url::parse(url).map_err(|e| {
+            anyhow::Error::msg(Self::tool_msg_with_args(
+                "tool-image-gen-error-url-parse",
+                &[("err", &e.to_string())],
+            ))
+        })?;
 
         // Reject userinfo-bearing URLs at parse time — the same shape used
         // by the http_request SSRF gate (`http_request.rs` extract_host).
         // A `user:pass@host` form is never legitimate for an image CDN.
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            anyhow::bail!("image URL userinfo is not allowed");
+            anyhow::bail!(Self::tool_msg("tool-image-gen-error-url-userinfo"));
         }
 
         let host = parsed
             .host_str()
-            .ok_or_else(|| anyhow::Error::msg("image URL has no host"))?
+            .ok_or_else(|| anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-url-no-host")))?
             .to_string();
 
         // Cloud-metadata IP literals (169.254.169.254, fd00:ec2::254, etc.)
@@ -179,7 +204,10 @@ impl ImageGenTool {
             .parse::<IpAddr>()
             .is_ok_and(domain_guard::is_cloud_metadata_ip)
         {
-            anyhow::bail!("Blocked cloud metadata host: {host}");
+            anyhow::bail!(Self::tool_msg_with_args(
+                "tool-image-gen-error-url-metadata-host",
+                &[("host", &host)],
+            ));
         }
 
         let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
@@ -197,10 +225,10 @@ impl ImageGenTool {
                     .with_attrs(::serde_json::json!({"tool": "image_gen", "host": host})),
                 "image_gen: rejecting private/local image host"
             );
-            anyhow::bail!(
-                "Blocked local/private image host: {host}. \
-                 To allow, add it (or \"*\") to image_gen.allowed_private_hosts in config.toml"
-            );
+            anyhow::bail!(Self::tool_msg_with_args(
+                "tool-image-gen-error-url-private-host",
+                &[("host", &host)],
+            ));
         }
 
         // Warn loudly when an explicit carve-out lifts the SSRF gate — same
@@ -237,22 +265,31 @@ impl ImageGenTool {
         &self,
         validated_url: &str,
     ) -> anyhow::Result<(String, Vec<std::net::SocketAddr>)> {
-        let parsed = reqwest::Url::parse(validated_url)
-            .map_err(|e| anyhow::Error::msg(format!("Invalid image URL: {e}")))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::Error::msg("Image URL has no host"))?;
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| anyhow::Error::msg("Image URL has no known port"))?;
+        let parsed = reqwest::Url::parse(validated_url).map_err(|e| {
+            anyhow::Error::msg(Self::tool_msg_with_args(
+                "tool-image-gen-error-resolved-url-parse",
+                &[("err", &e.to_string())],
+            ))
+        })?;
+        let host = parsed.host_str().ok_or_else(|| {
+            anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-host"))
+        })?;
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-port"))
+        })?;
 
         let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
             .await
-            .context("Failed to resolve image download host")?
+            .context(Self::tool_msg(
+                "tool-image-gen-error-resolved-url-resolve-failed",
+            ))?
             .collect();
 
         if addrs.is_empty() {
-            anyhow::bail!("Failed to resolve image download host '{host}'");
+            anyhow::bail!(Self::tool_msg_with_args(
+                "tool-image-gen-error-resolved-url-resolve-empty",
+                &[("host", host)],
+            ));
         }
 
         let ips: Vec<std::net::IpAddr> = addrs.iter().map(|sa| sa.ip()).collect();
@@ -267,6 +304,77 @@ impl ImageGenTool {
         }?;
 
         Ok((host.to_string(), addrs))
+    }
+
+    /// Build the image-download client: bind the validated address set to
+    /// the connection via `resolve_to_addrs`, and re-validate each redirect
+    /// target with the synchronous host-string gate.
+    ///
+    /// `resolve_to_addrs` keys by domain name (lower-cased), NOT the full
+    /// URL — passing `https://cdn.example/image.png` would never match the
+    /// request hostname `cdn.example` and the validated address set would
+    /// be silently ignored at connect time, reopening the DNS-rebinding
+    /// window. `resolved_host` must therefore be the bare hostname from
+    /// `validate_image_url_resolved`. Mirrors http_request's reference
+    /// impl at http_request.rs:363.
+    ///
+    /// Redirect resolved-IP validation is explicitly deferred: the reqwest
+    /// redirect callback runs synchronously inside the async runtime, and
+    /// nesting `Handle::block_on` there risks a panic. Redirect targets
+    /// are still gated by the synchronous host-string check; cross-host
+    /// DNS rebinding on redirect hops remains a documented residual risk.
+    fn build_download_client(
+        &self,
+        resolved_host: &str,
+        validated_addrs: &[std::net::SocketAddr],
+    ) -> anyhow::Result<reqwest::Client> {
+        // The closure captures a clone of `self.allowed_private_hosts` so
+        // the per-redirect check uses the exact operator-configured
+        // allowlist (no re-parse, no IO).
+        let allowed_private_hosts = self.allowed_private_hosts.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error(std::io::Error::other(Self::tool_msg_with_args(
+                    "tool-image-gen-error-redirect-limit",
+                    &[("max", "10")],
+                )));
+            }
+            // Host-string gate (sync). The helper's anyhow::Error Display
+            // is the localized Fluent string verbatim; pass it through
+            // unwrapped so the operator sees the translator's message.
+            // `PermissionDenied` is preserved so any caller that
+            // classifies the error by kind still works.
+            if let Err(err) =
+                validate_redirect_image_url(attempt.url().as_str(), &allowed_private_hosts)
+            {
+                return attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    err.to_string(),
+                ));
+            }
+            attempt.follow()
+        });
+
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(redirect_policy)
+            // The pinning above is only meaningful if THIS process dials
+            // the validated addresses. reqwest honors proxy env vars by
+            // default, and a proxy resolves and connects on our behalf —
+            // the override would never apply and the proxy's DNS view
+            // (which may include internal hosts) decides the destination,
+            // reopening the rebinding window. Disable proxies so the
+            // connection is always dialed directly to the validated set.
+            .no_proxy()
+            .resolve_to_addrs(resolved_host, validated_addrs)
+            .build()
+            .map_err(|e| {
+                anyhow::Error::msg(Self::tool_msg_with_args(
+                    "tool-image-gen-error-client-build",
+                    &[("err", &e.to_string())],
+                ))
+            })
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -439,51 +547,12 @@ impl ImageGenTool {
             .validate_image_url_resolved(&validated_image_url)
             .await?;
 
-        // ── Build image-download client with per-redirect SSRF gate ─
-        // The closure captures a clone of `self.allowed_private_hosts` so
-        // the per-redirect check uses the exact operator-configured
-        // allowlist (no re-parse, no IO).
-        //
-        // Redirect resolved-IP validation is explicitly deferred: the
-        // reqwest redirect callback runs synchronously inside the async
-        // runtime, and nesting `Handle::block_on` there risks a panic.
-        // Redirect targets are still gated by the synchronous host-string
-        // check below; cross-host DNS rebinding remains deferred.
-        let allowed_private_hosts = self.allowed_private_hosts.clone();
-        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 10 {
-                return attempt.error(std::io::Error::other(
-                    "Too many image-URL redirects (max 10)",
-                ));
-            }
-            // Host-string gate (sync).
-            if let Err(err) =
-                validate_redirect_image_url(attempt.url().as_str(), &allowed_private_hosts)
-            {
-                return attempt.error(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("Blocked image-URL redirect target: {err}"),
-                ));
-            }
-            attempt.follow()
-        });
-
-        // Bind the validated address set into the reqwest client keyed by
-        // the parsed hostname (NOT the full URL). reqwest's
-        // `resolve_to_addrs` lower-cases the lookup key, so passing the
-        // full URL (e.g. `https://cdn.example/image.png`) would never
-        // match the request hostname (`cdn.example`) and the validated
-        // address set would be silently ignored. Mirrors http_request's
-        // reference impl at http_request.rs:363.
-        let download_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .redirect(redirect_policy)
-            .resolve_to_addrs(&resolved_host, &validated_addrs)
-            .build()
-            .map_err(|e| {
-                anyhow::Error::msg(format!("Failed to build secure image download client: {e}"))
-            })?;
+        // ── Build image-download client ────────────────────────────
+        // Binds the validated address set keyed by the parsed hostname
+        // (NOT the full URL) and re-validates each redirect target with
+        // the synchronous host-string gate — closes the redirect-to-
+        // internal gap that `Policy::default()` would leave open.
+        let download_client = self.build_download_client(&resolved_host, &validated_addrs)?;
 
         // ── Download image ─────────────────────────────────────────
         let img_resp = download_client
@@ -547,31 +616,50 @@ fn validate_redirect_image_url(
 ) -> anyhow::Result<()> {
     let url = raw_url.trim();
     if url.is_empty() {
-        anyhow::bail!("redirect image URL cannot be empty");
+        anyhow::bail!(crate::i18n::get_required_tool_string(
+            "tool-image-gen-error-redirect-url-empty"
+        ));
     }
     if url.chars().any(char::is_whitespace) {
-        anyhow::bail!("redirect image URL cannot contain whitespace");
+        anyhow::bail!(crate::i18n::get_required_tool_string(
+            "tool-image-gen-error-redirect-url-whitespace"
+        ));
     }
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        anyhow::bail!("Only http:// and https:// redirect URLs are allowed");
+        anyhow::bail!(crate::i18n::get_required_tool_string(
+            "tool-image-gen-error-redirect-url-scheme"
+        ));
     }
 
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| anyhow::Error::msg(format!("Invalid redirect image URL format: {e}")))?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+            "tool-image-gen-error-redirect-url-parse",
+            &[("err", &e.to_string())],
+        ))
+    })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        anyhow::bail!("redirect image URL userinfo is not allowed");
+        anyhow::bail!(crate::i18n::get_required_tool_string(
+            "tool-image-gen-error-redirect-url-userinfo"
+        ));
     }
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| anyhow::Error::msg("redirect image URL has no host"))?
+        .ok_or_else(|| {
+            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                "tool-image-gen-error-redirect-url-no-host",
+            ))
+        })?
         .to_string();
 
     if host
         .parse::<IpAddr>()
         .is_ok_and(domain_guard::is_cloud_metadata_ip)
     {
-        anyhow::bail!("Blocked redirect to cloud metadata host: {host}");
+        anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+            "tool-image-gen-error-redirect-url-metadata-host",
+            &[("host", &host)],
+        ));
     }
 
     let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
@@ -579,10 +667,10 @@ fn validate_redirect_image_url(
         && domain_guard::host_matches_allowlist(&host, allowed_private_hosts);
 
     if host_is_private_or_local && !private_match {
-        anyhow::bail!(
-            "Blocked redirect to local/private host: {host}. \
-             To allow, add it (or \"*\") to image_gen.allowed_private_hosts in config.toml"
-        );
+        anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+            "tool-image-gen-error-redirect-url-private-host",
+            &[("host", &host)],
+        ));
     }
 
     Ok(())
@@ -595,8 +683,7 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an image from a text prompt using fal.ai (Flux models). \
-         Saves the result to the workspace images directory and returns the file path."
+        TOOL_DESCRIPTION.get_or_init(|| crate::i18n::get_required_tool_string(TOOL_DESCRIPTION_KEY))
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -606,20 +693,20 @@ impl Tool for ImageGenTool {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Text prompt describing the image to generate."
+                    "description": Self::tool_msg("tool-image-gen-param-prompt")
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Output filename without extension (default: 'generated_image'). Saved as PNG in workspace/images/."
+                    "description": Self::tool_msg("tool-image-gen-param-filename")
                 },
                 "size": {
                     "type": "string",
                     "enum": ["square_hd", "landscape_4_3", "portrait_4_3", "landscape_16_9", "portrait_16_9"],
-                    "description": "Image aspect ratio / size preset (default: 'square_hd')."
+                    "description": Self::tool_msg("tool-image-gen-param-size")
                 },
                 "model": {
                     "type": "string",
-                    "description": "fal.ai model identifier (default: 'fal-ai/flux/schnell')."
+                    "description": Self::tool_msg("tool-image-gen-param-model")
                 }
             }
         })
@@ -1148,20 +1235,13 @@ mod tests {
 
     /// Deterministic seam test: `validate_image_url_resolved` returns
     /// the parsed hostname alongside the validated addresses, and the
-    /// download client passes the tuple's `.0` (hostname, not URL) to
+    /// download path passes the tuple's `.0` (hostname, not URL) to
     /// `reqwest::Client::resolve_to_addrs`. Together these two
     /// contracts guarantee that reqwest's lookup key matches the
     /// request hostname and the validated address set is selected at
     /// connect time, so a second unbound DNS lookup cannot bypass the
-    /// SSRF gate.
-    ///
-    /// The reviewer asked for a transport-level regression against a
-    /// controlled resolver or local listener. The build environment
-    /// here has a DNS-intercepting proxy that returns a captive-portal
-    /// "DNS resolution failed" body for unknown hostnames, masking the
-    /// reqwest lookup behavior, so an env-independent seam test is
-    /// used instead. The seam is the (validator return, caller call)
-    /// join point, pin-able from pure Rust without network fixtures.
+    /// SSRF gate. The transport-level behavior of the override itself
+    /// is pinned by the listener-backed tests below.
     #[test]
     fn resolve_to_addrs_seam_uses_hostname_not_url() {
         let url = "http://localhost:8080/test.png";
@@ -1176,6 +1256,112 @@ mod tests {
             "host must be the bare hostname (no scheme, no port, no path) — \
              reqwest::Client::resolve_to_addrs keys by hostname, and a full \
              URL or a host:port string would never match the request hostname"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Transport-level tests: the download client's address pinning.
+    //
+    // These drive the same client construction the download path uses
+    // (`ImageGenTool::build_download_client`) against a local listener.
+    // The synthetic `.invalid` hostname (RFC 2606) cannot resolve via
+    // ordinary DNS, so a request can only reach the listener when the
+    // validated address override is present and keyed by the request
+    // hostname. If the override is dropped or mis-keyed in the builder,
+    // the connection never lands on the listener and the tests fail.
+    // The assertions are on the listener's hit count, so the outcome
+    // does not depend on how the environment resolves (or fails to
+    // resolve) the synthetic hostname.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// With the validated address override keyed by the request hostname,
+    /// the connection lands on the validated `SocketAddr`: the synthetic
+    /// hostname is unresolvable and the URL carries no port, so the
+    /// override is the only path to the listener.
+    #[tokio::test]
+    async fn resolve_to_addrs_pins_connection_to_validated_socket_addr() {
+        use std::net::SocketAddr;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_private_hosts(vec![]);
+        let validated_addrs = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let client = tool
+            .build_download_client("image-gen-resolve-test.invalid", &validated_addrs)
+            .expect("production client build must succeed");
+
+        // No port in the URL: dialing must be driven entirely by the
+        // validated address set, not by URL components or DNS.
+        let resp = client
+            .get("http://image-gen-resolve-test.invalid/img.png")
+            .send()
+            .await
+            .expect(
+                "the validated address override must make the \
+                 unresolvable hostname reachable",
+            );
+        assert!(
+            resp.status().is_success(),
+            "expected 200 from the local listener, got {}",
+            resp.status()
+        );
+
+        let received = server.received_requests().await.expect("received_requests");
+        assert_eq!(received.len(), 1, "expected exactly one listener hit");
+    }
+
+    /// Control: the same production builder, but with the override keyed
+    /// by a hostname that does NOT match the request URL — the mis-keyed
+    /// regression class. The listener must see no request: the request
+    /// hostname has no validated address set bound to it, so reaching
+    /// `127.0.0.1:port` through this client is impossible regardless of
+    /// how the environment resolves the synthetic name.
+    #[tokio::test]
+    async fn resolve_to_addrs_miskeyed_override_cannot_reach_listener() {
+        use std::net::SocketAddr;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_private_hosts(vec![]);
+        let validated_addrs = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let client = tool
+            .build_download_client("some-other-host.invalid", &validated_addrs)
+            .expect("production client build must succeed");
+
+        // The outcome of the send itself is environment-dependent (the
+        // hostname may fail DNS or hit a captive portal); the authoritative
+        // check is the listener's hit count.
+        let _ = client
+            .get("http://image-gen-resolve-test.invalid/img.png")
+            .send()
+            .await;
+
+        let received = server.received_requests().await.expect("received_requests");
+        assert_eq!(
+            received.len(),
+            0,
+            "a mis-keyed override must not pin the connection: the request \
+             hostname has no validated address set, so the listener must be \
+             unreachable; got {received_len} hit(s)",
+            received_len = received.len(),
         );
     }
 }
