@@ -7368,7 +7368,6 @@ fn build_channel_by_id(
                 .with_streaming(
                     tg.stream_mode,
                     tg.draft_update_interval_ms,
-                    tg.multi_message_delay_ms,
                 )
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
@@ -8515,7 +8514,6 @@ fn collect_configured_channels(
                     .with_streaming(
                         tg.stream_mode,
                         tg.draft_update_interval_ms,
-                        tg.multi_message_delay_ms,
                     )
                     .with_transcription(config.transcription.clone())
                     .with_agent_transcription_provider(agent_transcription_provider.clone())
@@ -16165,6 +16163,21 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
                 "fake-token".into(),
@@ -16172,7 +16185,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750, 0)
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
         );

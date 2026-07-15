@@ -600,7 +600,6 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
-    multi_message_delay_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
@@ -700,7 +699,6 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
-            multi_message_delay_ms: DEFAULT_MULTI_MESSAGE_DELAY_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -775,7 +773,6 @@ impl TelegramChannel {
         mut self,
         stream_mode: StreamMode,
         draft_update_interval_ms: u64,
-        multi_message_delay_ms: u64,
     ) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = if draft_update_interval_ms == 0 {
@@ -783,8 +780,22 @@ impl TelegramChannel {
         } else {
             draft_update_interval_ms
         };
-        self.multi_message_delay_ms = multi_message_delay_ms;
         self
+    }
+
+    /// Canonical source: `[channels.telegram.<alias>].multi_message_delay_ms`.
+    fn resolve_multi_message_delay_ms(&self) -> u64 {
+        self.persist
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&self.alias)
+                    .map(|tg| tg.multi_message_delay_ms)
+            })
+            .unwrap_or(DEFAULT_MULTI_MESSAGE_DELAY_MS)
     }
 
     fn new_multi_message_draft_id() -> String {
@@ -809,7 +820,7 @@ impl TelegramChannel {
     /// successful send, pacing consecutive multi-message posts without a
     /// trailing delay after the final one.
     async fn pace_multi_message_send(&self, last_sent_at: Option<std::time::Instant>) {
-        let delay = Duration::from_millis(self.multi_message_delay_ms);
+        let delay = Duration::from_millis(self.resolve_multi_message_delay_ms());
         if delay.is_zero() {
             return;
         }
@@ -3534,7 +3545,7 @@ impl Channel for TelegramChannel {
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
-        self.multi_message_delay_ms
+        self.resolve_multi_message_delay_ms()
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -4573,6 +4584,57 @@ Ensure only one `zeroclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use zeroclaw_config::schema::{Config, TelegramConfig};
+
+    fn telegram_alias_config(alias: &str, multi_message_delay_ms: u64) -> Arc<RwLock<Config>> {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms,
+                ..TelegramConfig::default()
+            },
+        );
+        Arc::new(RwLock::new(config))
+    }
+
+    fn multi_message_test_channel(alias: &str, multi_message_delay_ms: u64) -> TelegramChannel {
+        TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence(telegram_alias_config(alias, multi_message_delay_ms))
+        .with_streaming(StreamMode::MultiMessage, 750)
+    }
+
+    #[test]
+    fn multi_message_delay_resolves_live_from_canonical_config() {
+        let alias = "telegram_test_alias";
+        let config = telegram_alias_config(alias, 500);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750)
+        .with_persistence(Arc::clone(&config));
+
+        assert_eq!(ch.multi_message_delay_ms(), 500);
+        config
+            .write()
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .multi_message_delay_ms = 0;
+        assert_eq!(ch.multi_message_delay_ms(), 0);
+    }
 
     #[test]
     fn scrub_masks_poll_error_url() {
@@ -4912,7 +4974,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 750, 800);
+        .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
     }
@@ -4927,7 +4989,7 @@ mod tests {
         );
         assert!(!ch.supports_multi_message_streaming());
 
-        let multi = ch.with_streaming(StreamMode::MultiMessage, 750, 500);
+        let multi = multi_message_test_channel("telegram_test_alias", 500);
         assert!(multi.supports_multi_message_streaming());
         assert_eq!(multi.multi_message_delay_ms(), 500);
     }
@@ -4983,13 +5045,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_draft_multi_message_returns_unique_synthetic_id() {
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 800);
+        let ch = multi_message_test_channel("telegram_test_alias", 800);
 
         let id = ch
             .send_draft(&SendMessage::new("hello", "123"))
@@ -5006,13 +5062,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_draft_multi_message_synthetic_clears_only_matching_draft() {
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 800);
+        let ch = multi_message_test_channel("telegram_test_alias", 800);
 
         let draft_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}cancel-me");
         let other_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}keep-me");
@@ -5060,13 +5110,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5107,13 +5151,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5174,13 +5212,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5219,13 +5251,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5270,13 +5296,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri())
         .with_approval_timeout_secs(0);
 
@@ -5327,15 +5347,9 @@ mod tests {
             .await;
 
         let delay_ms: u64 = 200;
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, delay_ms)
-        .with_api_base(mock_server.uri())
-        .with_approval_timeout_secs(0);
+        let ch = multi_message_test_channel("telegram_test_alias", delay_ms)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0);
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5415,13 +5429,7 @@ mod tests {
         // Recipient "123" is voice-capable, so a non-suppressed finalize WOULD
         // queue TTS — that is what makes the suppress assertion meaningful.
         let make_channel = || {
-            TelegramChannel::new(
-                "fake-token".into(),
-                "telegram_test_alias",
-                Arc::new(|| vec!["*".into()]),
-                false,
-            )
-            .with_streaming(StreamMode::MultiMessage, 750, 0)
+            multi_message_test_channel("telegram_test_alias", 0)
             .with_api_base(mock_server.uri())
             .with_voice_peer_resolver(Arc::new(|| vec!["123".to_string()]))
             .with_tts(&config)
@@ -5510,13 +5518,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5565,13 +5567,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5609,13 +5605,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5665,13 +5655,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = TelegramChannel::new(
-            "fake-token".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            false,
-        )
-        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        let ch = multi_message_test_channel("telegram_test_alias", 0)
         .with_api_base(mock_server.uri());
 
         let draft_id = ch
@@ -5705,7 +5689,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_streaming(StreamMode::Partial, 0, 800);
+        .with_streaming(StreamMode::Partial, 0);
 
         assert_eq!(
             ch.draft_update_interval_ms,
@@ -5738,7 +5722,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 60_000, 800);
+        .with_streaming(StreamMode::Partial, 60_000);
         ch.last_draft_edit
             .lock()
             .insert("123".to_string(), std::time::Instant::now());
@@ -5756,7 +5740,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 0, 800);
+        .with_streaming(StreamMode::Partial, 0);
         let long_emoji_text = "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 20);
 
         // Invalid message_id returns early after building display_text.
@@ -5776,7 +5760,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 0, 800);
+        .with_streaming(StreamMode::Partial, 0);
         let long_text = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 64);
 
         // For oversized text + invalid draft message_id, finalize_draft should
