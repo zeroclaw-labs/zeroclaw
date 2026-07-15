@@ -451,15 +451,15 @@ pub async fn record_tool_loop_cost_usage(
     // Exact id matching keeps provider-qualified self-hosted ids — absent from
     // the public catalog — at $0, so only billed cloud models get a non-zero
     // rate here.
-    if input_rate == 0.0 && output_rate == 0.0 {
-        if let Some((cat_in, cat_out, cat_cached)) =
+    if input_rate == 0.0
+        && output_rate == 0.0
+        && let Some((cat_in, cat_out, cat_cached)) =
             crate::agent::pricing_catalog::global_pricing_rates(model)
-        {
-            input_rate = cat_in;
-            output_rate = cat_out;
-            if cached_rate == 0.0 {
-                cached_rate = cat_cached;
-            }
+    {
+        input_rate = cat_in;
+        output_rate = cat_out;
+        if cached_rate == 0.0 {
+            cached_rate = cat_cached;
         }
     }
 
