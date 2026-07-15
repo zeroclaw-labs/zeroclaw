@@ -538,7 +538,7 @@ pub async fn record_tool_loop_cost_usage(
                 Some(task_id)
             } else {
                 let agent_alias = ctx.agent_alias.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("goal accounting attribution is missing agent identity")
+                    anyhow::Error::msg("goal accounting attribution is missing agent identity")
                 })?;
                 Some(
                     active_goal_task_id_for_context(
@@ -548,7 +548,7 @@ pub async fn record_tool_loop_cost_usage(
                     )
                     .await?
                     .ok_or_else(|| {
-                        anyhow::anyhow!("goal accounting attribution has no active task")
+                        anyhow::Error::msg("goal accounting attribution has no active task")
                     })?,
                 )
             }
@@ -561,9 +561,9 @@ pub async fn record_tool_loop_cost_usage(
             attributed_task_id,
         ) {
             if goal_attributed {
-                return Err(anyhow::anyhow!(
+                return Err(anyhow::Error::msg(format!(
                     "persist goal-attributed cost usage: {error}"
-                ));
+                )));
             }
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
         }
@@ -613,12 +613,14 @@ async fn active_goal_task_id_for_context(
     principal_id: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let control_plane = crate::control_plane::control_plane()
-        .ok_or_else(|| anyhow::anyhow!("goal accounting control plane unavailable"))?;
+        .ok_or_else(|| anyhow::Error::msg("goal accounting control plane unavailable"))?;
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(agent_alias, originator_route, principal_id)
         .await
-        .map_err(|error| anyhow::anyhow!("resolve goal accounting attribution: {error}"))
+        .map_err(|error| {
+            anyhow::Error::msg(format!("resolve goal accounting attribution: {error}"))
+        })
 }
 
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
