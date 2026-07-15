@@ -406,7 +406,7 @@ pub async fn handle_sop_decide(
     );
     let _guard = span.enter();
 
-    let mut resumed_action: Option<zeroclaw_runtime::sop::types::SopRunAction> = None;
+    let mut resolved_outcome = None;
     let mut pending_quorum = false;
     {
         let mut guard = match engine.lock() {
@@ -442,8 +442,8 @@ pub async fn handle_sop_decide(
                 .into_response();
         }
         match guard.resolve_via_broker(&run_id, decision, principal) {
-            Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
-                resumed_action = Some(*action);
+            Ok(outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))) => {
+                resolved_outcome = Some(outcome);
             }
             Ok(BrokerOutcome::Resolved(
                 ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved | ResolveOutcome::Revised,
@@ -512,13 +512,13 @@ pub async fn handle_sop_decide(
         };
     }
 
-    if let Some(action) = resumed_action {
-        let config = state.config.read().clone();
-        zeroclaw_runtime::sop::spawn_headless_run_driver(
-            config,
+    if let Some(outcome) = resolved_outcome {
+        let config = state.config.read();
+        zeroclaw_runtime::sop::drive_resumed_broker_action(
+            &config,
             std::sync::Arc::clone(engine),
             state.sop_audit.clone(),
-            action,
+            &outcome,
         );
     }
 

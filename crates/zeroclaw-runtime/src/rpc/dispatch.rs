@@ -4226,6 +4226,14 @@ impl RpcDispatcher {
             }
         }
 
+        let config = self.ctx.config.read();
+        crate::sop::drive_resumed_broker_action(
+            &config,
+            Arc::clone(&engine),
+            self.ctx.sop_audit.clone(),
+            &outcome,
+        );
+
         let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
@@ -5577,6 +5585,105 @@ mod tests {
                 "second RPC decision must resolve through the broker ledger path: {events:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sops_decide_drives_resumed_execute_step() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().expect("temporary SOP directory");
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+        let sop = Sop {
+            name: "rpc-resumed-execute".to_string(),
+            description: "RPC resume driver regression".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute after approval".to_string(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-resumed-execute",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-gated SOP");
+            let SopRunAction::WaitApproval { run_id, .. } = action else {
+                panic!("supervised Execute step must park for approval: {action:?}");
+            };
+            run_id
+        };
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-resumed-execute",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect("RPC approval must accept the parked run");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .expect("engine lock")
+                    .get_run(&run_id)
+                    .map(|run| run.status);
+                if status == Some(SopRunStatus::Failed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC approval must schedule the resumed ExecuteStep");
     }
 
     #[tokio::test]

@@ -6602,6 +6602,7 @@ fn text_gate_reply_matches_approval_route(
 async fn dispatch_channel_sop_gate(
     router: &AgentRouter,
     msg: &zeroclaw_api::channel::ChannelMessage,
+    config: &zeroclaw_config::schema::Config,
     gate_prompt_channels: &[Arc<dyn Channel>],
     gate_channel_route_keys: &[String],
 ) -> bool {
@@ -6819,6 +6820,12 @@ async fn dispatch_channel_sop_gate(
     };
     match outcome {
         Ok(outcome) => {
+            zeroclaw_runtime::sop::drive_resumed_broker_action(
+                config,
+                Arc::clone(engine),
+                router.sop_audit.clone(),
+                &outcome,
+            );
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7008,6 +7015,7 @@ async fn run_message_dispatch_loop(
         if dispatch_channel_sop_gate(
             &router,
             &msg,
+            ctx.prompt_config.as_ref(),
             &gate_prompt_channels,
             &gate_channel_route_keys,
         )
@@ -26843,7 +26851,8 @@ Done."#;
     ) -> bool {
         let route_keys = vec![channel_key_for_message(msg)];
         let gate_prompt_channels = gate_channel.into_iter().collect::<Vec<_>>();
-        dispatch_channel_sop_gate(router, msg, &gate_prompt_channels, &route_keys).await
+        let config = zeroclaw_config::schema::Config::default();
+        dispatch_channel_sop_gate(router, msg, &config, &gate_prompt_channels, &route_keys).await
     }
 
     async fn dispatch_test_channel_sop_gate_with_route_keys(
@@ -26852,7 +26861,8 @@ Done."#;
         route_keys: &[&str],
     ) -> bool {
         let route_keys: Vec<String> = route_keys.iter().map(|key| (*key).to_string()).collect();
-        dispatch_channel_sop_gate(router, msg, &[], &route_keys).await
+        let config = zeroclaw_config::schema::Config::default();
+        dispatch_channel_sop_gate(router, msg, &config, &[], &route_keys).await
     }
 
     #[tokio::test]
@@ -27116,6 +27126,41 @@ Done."#;
     }
 
     #[tokio::test]
+    async fn channel_gate_approval_drives_resumed_execute_step() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+        let config = zeroclaw_config::schema::Config::default();
+
+        assert!(
+            dispatch_channel_sop_gate(&router, &msg, &config, &[], &["discord.ops".to_string()],)
+                .await,
+            "the channel approval must resolve the parked gate"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_run_status(&engine, &run_id)
+                    == Some(zeroclaw_runtime::sop::types::SopRunStatus::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("channel approval must schedule the resumed ExecuteStep");
+    }
+
+    #[tokio::test]
     async fn sop_gate_resolution_finalizes_request_and_escalation_channels() {
         let (router, engine, run_id) = parked_channel_gate_router_with_routes(
             Some("prod"),
@@ -27140,6 +27185,7 @@ Done."#;
             dispatch_channel_sop_gate(
                 &router,
                 &msg,
+                &zeroclaw_config::schema::Config::default(),
                 &prompt_channels,
                 &["discord.oncall".to_string()],
             )
