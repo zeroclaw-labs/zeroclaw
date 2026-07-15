@@ -20,6 +20,9 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "ti
 anyhow = "1.0"
 base64 = "0.22"
 
+[dev-dependencies]
+tauri-utils = { version = "2.0", features = ["build-2"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSRunningApplication"] }
