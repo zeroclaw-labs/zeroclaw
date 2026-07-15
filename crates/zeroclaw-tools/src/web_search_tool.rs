@@ -1031,12 +1031,12 @@ fn duckduckgo_block_message(
 /// status that unambiguously means "blocked" across providers.
 fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
     match status.as_u16() {
-        451 => SearchStatus::Blocked,                             // legal block (unambiguous)
-        403 => SearchStatus::ClientError,                         // API provider 403 = permission (DDG 403 handled upstream)
-        408 | 402 | 404 | 410 | 429 => SearchStatus::Unavailable,  // transient / provider-side
+        451 => SearchStatus::Blocked,     // legal block (unambiguous)
+        403 => SearchStatus::ClientError, // API provider 403 = permission (DDG 403 handled upstream)
+        408 | 402 | 404 | 410 | 429 => SearchStatus::Unavailable, // transient / provider-side
         400 | 401 => SearchStatus::ClientError,
         500..=599 => SearchStatus::Unavailable,
-        _ => SearchStatus::ClientError,                           // other 4xx → request-side
+        _ => SearchStatus::ClientError, // other 4xx → request-side
     }
 }
 
@@ -1054,7 +1054,9 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
         SearchStatus::Blocked | SearchStatus::Unavailable => {
             "Provider may be transiently unavailable or blocking the request; retry, or try a different provider (SearXNG, Brave, or Tavily)."
         }
-        SearchStatus::ClientError => "Check the query, API key, quota, and permissions for this provider.",
+        SearchStatus::ClientError => {
+            "Check the query, API key, quota, and permissions for this provider."
+        }
     };
     anyhow::Error::msg(format!(
         "{provider} search failed (search_status={}, http={status}). {hint}",
@@ -1261,10 +1263,7 @@ mod tests {
         // across providers. It must surface search_status=blocked and the
         // "different provider" hint. (403 is covered by the client_error case —
         // an API provider's 403 is a permission failure, not a block.)
-        let err = http_search_failure(
-            "brave",
-            reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-        );
+        let err = http_search_failure("brave", reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         let msg = format!("{err}");
         assert!(
             msg.contains("search_status=blocked"),
