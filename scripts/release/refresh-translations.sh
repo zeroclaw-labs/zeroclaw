@@ -100,6 +100,19 @@ if [[ ! -d "$SUBMODULE_PATH/.git" && ! -f "$SUBMODULE_PATH/.git" ]]; then
   git -C "$REPO_ROOT" submodule update --init docs/book/po
 fi
 
+git -C "$SUBMODULE_PATH" fetch --quiet origin main
+remote_main="$(git -C "$SUBMODULE_PATH" rev-parse refs/remotes/origin/main)"
+submodule_head="$(git -C "$SUBMODULE_PATH" rev-parse HEAD)"
+if [[ -n "$(git -C "$SUBMODULE_PATH" status --porcelain)" ]]; then
+  if [[ "$submodule_head" != "$remote_main" ]]; then
+    echo "error: prepared catalogues are not based on current origin/main" >&2
+    echo "       update or rebase docs/book/po before running the release wrapper." >&2
+    exit 1
+  fi
+else
+  git -C "$SUBMODULE_PATH" checkout --quiet --detach "$remote_main"
+fi
+
 if git -C "$SUBMODULE_PATH" rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
   echo "error: tag ${TAG} already exists in the submodule; nothing to cut." >&2
   echo "       bump the version or delete the stale tag before re-running." >&2
@@ -135,7 +148,7 @@ fi
 if [[ -n "$(git -C "$SUBMODULE_PATH" status --porcelain)" ]]; then
   git -C "$SUBMODULE_PATH" add -A
   git -C "$SUBMODULE_PATH" commit -m "chore: refresh catalogues for ${TAG}"
-  git -C "$SUBMODULE_PATH" push origin main
+  git -C "$SUBMODULE_PATH" push origin HEAD:main
 else
   echo "  catalogues unchanged; tagging the current submodule HEAD"
 fi

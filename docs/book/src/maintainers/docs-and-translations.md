@@ -192,7 +192,7 @@ The translated `.po` catalogues are not in this repo's main tree. They live in t
 
 The Rust crate dev loop never needs the submodule. Only docs builds and the docs-deploy / release jobs require it; those checkouts pass `submodules: recursive`. Everything else stays submodule-free.
 
-Per release, `scripts/release/refresh-translations.sh` tags the submodule as `v{version}`, checks out that tag, and stages the main-repository gitlink. `bump-version.sh` deliberately leaves translation pinning to that helper. `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
+Per release, `scripts/release/refresh-translations.sh` publishes changed catalogues to the submodule's `main` branch, tags that commit as `v{version}`, checks out the tag, and stages the main-repository gitlink. `bump-version.sh` deliberately leaves translation pinning to that helper. `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
 
 ## Release translation workflow
 
