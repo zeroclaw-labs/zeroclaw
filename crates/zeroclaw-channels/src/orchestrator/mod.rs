@@ -6493,11 +6493,13 @@ impl AgentRouter {
         }
         if let Some(alias) = msg.channel_alias.as_deref().filter(|s| !s.is_empty()) {
             let composite = format!("{}.{alias}", msg.channel);
-            if let Some(agent) = self.owner_by_channel_key.get(&composite)
-                && let Some(ctx) = self.by_agent.get(agent)
-            {
-                return Some(Arc::clone(ctx));
-            }
+            // An explicit alias identifies a distinct configured channel. It
+            // must not fall back to another alias's bare platform owner.
+            return self
+                .owner_by_channel_key
+                .get(&composite)
+                .and_then(|agent| self.by_agent.get(agent))
+                .cloned();
         }
         if let Some(agent) = self.owner_by_channel_key.get(&msg.channel)
             && let Some(ctx) = self.by_agent.get(agent)
@@ -8309,7 +8311,8 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
             .is_some_and(|(channel_type, _)| channel_type == message_base)
 }
 
-/// Active `<type>.<alias>` channel references from enabled agents.
+/// Active `<type>.<alias>` channel references from enabled agents and SOP
+/// approval routes.
 ///
 /// An empty set means no enabled agent declared channel bindings, so
 /// collection falls back to legacy behavior and accepts all enabled channels.
@@ -8324,14 +8327,20 @@ struct ActiveChannelAliases {
     /// NOT fire; otherwise disabled owners would still bring their bound
     /// channels online.
     all_known_bindings: HashSet<String>,
+    /// `<type>.<alias>` named by an approval request or escalation route.
+    /// These channels are live to deliver and receive SOP gate replies, but
+    /// they remain absent from the agent ownership map for ordinary traffic.
+    approval_route_bindings: HashSet<String>,
 }
 
 impl ActiveChannelAliases {
-    /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings anywhere and legacy "accept all enabled channels"
-    /// mode applies.
+    /// Returns true when `channel_ref` is agent-bound, named by an approval
+    /// route, or when no explicit agent bindings exist and legacy "accept all
+    /// enabled channels" mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+        self.all_known_bindings.is_empty()
+            || self.enabled_bindings.contains(channel_ref)
+            || self.approval_route_bindings.contains(channel_ref)
     }
 
     /// True when bindings exist somewhere in the config but every owner is
@@ -8343,12 +8352,44 @@ impl ActiveChannelAliases {
     /// Build an `ActiveChannelAliases` from a config snapshot.
     ///
     /// Single source of truth for the "is this channel reference currently
-    /// active under the agent binding state?" decision. Used by
+    /// active under the agent binding and SOP approval-route state?" decision. Used by
     /// `collect_configured_channels` (Discord/Telegram/Mattermost/etc.) and
     /// by the Nostr startup / health-check paths so the #8013 invariant
     /// ("a disabled agent must not bring its bound channel online") is
-    /// enforced uniformly across the orchestrator.
+    /// enforced uniformly across the orchestrator. An explicit SOP approval
+    /// route is separately sufficient to keep its delivery channel live.
     fn compute(config: &Config) -> Self {
+        let configured_channel_aliases = config.channels_by_alias();
+        let approval_route_bindings = config
+            .sop
+            .approval
+            .policies
+            .values()
+            .flat_map(|policy| {
+                [
+                    policy.request_route.as_deref(),
+                    policy.escalation_route.as_deref(),
+                ]
+            })
+            .filter_map(|route| {
+                route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
+            })
+            .flat_map(|(channel_key, _)| {
+                if channel_key.contains('.') {
+                    return vec![channel_key.to_string()];
+                }
+
+                let enabled_aliases: Vec<_> = configured_channel_aliases
+                    .iter()
+                    .filter(|channel| channel.enabled && channel.channel_type == channel_key)
+                    .collect();
+                match enabled_aliases.as_slice() {
+                    [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
+                    _ => vec![channel_key.to_string()],
+                }
+            })
+            .collect();
+
         Self {
             enabled_bindings: config
                 .agents
@@ -8361,6 +8402,7 @@ impl ActiveChannelAliases {
                 .values()
                 .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
                 .collect(),
+            approval_route_bindings,
         }
     }
 }
@@ -23064,6 +23106,125 @@ This is an example JSON object for profile settings."#;
             discord_channels[0].alias.as_deref(),
             Some("a"),
             "only the enabled owner's channel should be active"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn approval_route_collects_unowned_channel_without_agent_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.sop.approval.policies.insert(
+            "prod".to_string(),
+            zeroclaw_config::schema::ApprovalPolicyConfig {
+                request_route: Some("discord.ops:room-1".to_string()),
+                escalation_route: Some("discord.ops:room-2".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(
+            channel_map.contains_key("discord.ops"),
+            "the approval route's configured channel must be live for adapter delivery"
+        );
+
+        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
+        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        assert!(
+            !owners.contains_key("discord.ops"),
+            "approval-route liveness must not create an agent owner"
+        );
+
+        let worker_ctx = router_test_ctx();
+        let router = AgentRouter::multi(
+            HashMap::from([("worker".to_string(), worker_ctx)]),
+            owners,
+            None,
+            None,
+        );
+        assert!(
+            router
+                .resolve(&channel_message("discord", Some("ops")))
+                .is_none(),
+            "ordinary traffic on the approval-only alias must not reach the worker"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn bare_approval_route_collects_the_sole_enabled_alias() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: false,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.sop.approval.policies.insert(
+            "prod".to_string(),
+            zeroclaw_config::schema::ApprovalPolicyConfig {
+                request_route: Some("discord:room-1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(channel_map.contains_key("discord.ops"));
+        assert!(
+            channel_map.contains_key("discord"),
+            "the route adapter can resolve the bare singleton key"
+        );
+        assert!(
+            !channel_map.contains_key("discord.worker"),
+            "a disabled channel must not be revived just because a sibling route is active"
         );
     }
 
