@@ -5110,8 +5110,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5151,8 +5151,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5212,8 +5212,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5251,8 +5251,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5297,8 +5297,8 @@ mod tests {
             .await;
 
         let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri())
-        .with_approval_timeout_secs(0);
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0);
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5430,9 +5430,9 @@ mod tests {
         // queue TTS — that is what makes the suppress assertion meaningful.
         let make_channel = || {
             multi_message_test_channel("telegram_test_alias", 0)
-            .with_api_base(mock_server.uri())
-            .with_voice_peer_resolver(Arc::new(|| vec!["123".to_string()]))
-            .with_tts(&config)
+                .with_api_base(mock_server.uri())
+                .with_voice_peer_resolver(Arc::new(|| vec!["123".to_string()]))
+                .with_tts(&config)
         };
         let long_text = "Сбросьте питание контроллера и проверьте терминаторы шины Profibus DP на обоих концах.";
         assert!(long_text.len() > 40, "voice path requires substantive text");
@@ -5518,8 +5518,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5567,8 +5567,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5605,8 +5605,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
@@ -5655,8 +5655,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let ch = multi_message_test_channel("telegram_test_alias", 0)
-        .with_api_base(mock_server.uri());
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
 
         let draft_id = ch
             .send_draft(&SendMessage::new("...", "123"))
