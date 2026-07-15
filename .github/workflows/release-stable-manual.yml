@@ -829,6 +829,37 @@ jobs:
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
             -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
 
+  deploy-docs:
+    name: Deploy Versioned Docs
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # workflow_dispatch of docs-deploy.yml
+      contents: read
+    steps:
+      # The release tag (needs.validate.outputs.tag) is created by the publish
+      # job via `gh release create` using GITHUB_TOKEN. GitHub does NOT fire
+      # another workflow run from a GITHUB_TOKEN-created tag push
+      # (https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow),
+      # so docs-deploy.yml's `tags: [v*]` trigger never sees this tag. Dispatch
+      # it explicitly instead — workflow_dispatch IS the documented exception
+      # that runs even when invoked with GITHUB_TOKEN. docs-deploy checks out the
+      # tag input internally and builds /<tag>/ on gh-pages. The subsequent
+      # `master` docs deploy (from the merged version-bump push) then publishes
+      # the stable-pointer flip once /<tag>/ exists.
+      - name: Dispatch docs-deploy for the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching docs-deploy.yml for ${TAG} (ref master)..."
+          gh workflow run docs-deploy.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f tag="$TAG"
+
   docker:
     name: Push Docker Image
     needs: [validate, build]
