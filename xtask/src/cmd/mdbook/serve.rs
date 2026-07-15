@@ -1,4 +1,4 @@
-use crate::cmd::mdbook::refs::{build_api, build_refs};
+use crate::cmd::mdbook::refs::build_api;
 use crate::util::*;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -31,10 +31,6 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
         );
     }
 
-    let ref_dir = ref_dir(&root);
-    if !ref_dir.join("cli.md").exists() || !ref_dir.join("config.md").exists() {
-        build_refs(&root)?;
-    }
     if !root.join("target/doc").exists() {
         build_api(&root)?;
     }

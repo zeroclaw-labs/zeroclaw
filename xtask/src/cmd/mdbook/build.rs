@@ -13,7 +13,6 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
-    build_refs(&root)?;
     build_api(&root)?;
     build_locales(&root, tag)?;
     crate::cmd::mdbook::linkcheck::check_internal_links(&root, tag.unwrap_or(DEFAULT_TAG))?;
@@ -66,6 +65,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
 /// rendering. Keep all entrypoints on this helper so a warm working tree cannot
 /// hide a missing generator from clean-checkout builds.
 pub fn prepare_generated_book_inputs(root: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
+    build_refs(root)?;
     inject_lang_switcher_locales(&book_dir(root), entries)?;
     crate::cmd::mdbook::themes::run(root)?;
     crate::cmd::mdbook::keymap::run(root)?;
