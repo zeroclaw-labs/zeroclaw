@@ -64,27 +64,47 @@ pub(crate) struct GatePromptInput {
     pub(crate) prefill: Option<String>,
 }
 
-static GATE_PROMPTS: LazyLock<Mutex<HashMap<String, (Instant, GatePromptRecord)>>> =
+static GATE_PROMPTS: LazyLock<Mutex<HashMap<String, Vec<(Instant, GatePromptRecord)>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Record a sent gate prompt under its reference (replacing any previous entry
-/// for the same reference). Sweeps expired entries so the registry stays
-/// bounded by live-gate volume, not daemon uptime.
+/// Record a sent gate prompt under its reference. A gate can be presented more
+/// than once (request, escalation, or restart recovery), and every live prompt
+/// must be finalized when that gate resolves. Sweeps expired entries so the
+/// registry stays bounded by live-gate volume, not daemon uptime.
 pub(crate) fn record(reference: &str, record: GatePromptRecord) {
     let mut map = GATE_PROMPTS.lock().expect("gate prompt registry poisoned");
-    map.retain(|_, (at, _)| at.elapsed() < SWEEP_AFTER);
-    map.insert(reference.to_string(), (Instant::now(), record));
+    map.values_mut()
+        .for_each(|records| records.retain(|(at, _)| at.elapsed() < SWEEP_AFTER));
+    map.retain(|_, records| !records.is_empty());
+    map.entry(reference.to_string())
+        .or_default()
+        .push((Instant::now(), record));
 }
 
-/// Remove and return the prompt recorded under `reference`. The caller PATCHes
-/// the message; on a transient failure it should `record` the entry back so a
-/// later terminal event can retry.
-pub(crate) fn take(reference: &str) -> Option<GatePromptRecord> {
-    GATE_PROMPTS
-        .lock()
-        .expect("gate prompt registry poisoned")
-        .remove(reference)
-        .map(|(_, r)| r)
+/// Remove all prompts for `reference` that were sent by `channel_alias`. The
+/// caller PATCHes every returned message; on a transient failure it re-records
+/// the failed and unattempted entries so a later terminal event can retry.
+pub(crate) fn take_for_alias(reference: &str, channel_alias: &str) -> Vec<GatePromptRecord> {
+    let mut map = GATE_PROMPTS.lock().expect("gate prompt registry poisoned");
+    let Some(records) = map.remove(reference) else {
+        return Vec::new();
+    };
+    let mut matching = Vec::new();
+    let mut retained = Vec::new();
+    for (at, record) in records {
+        if at.elapsed() >= SWEEP_AFTER {
+            continue;
+        }
+        if record.channel_alias == channel_alias {
+            matching.push(record);
+        } else {
+            retained.push((at, record));
+        }
+    }
+    if !retained.is_empty() {
+        map.insert(reference.to_string(), retained);
+    }
+    matching
 }
 
 /// The input spec of `choice_id` on the prompt recorded under `reference`,
@@ -94,7 +114,12 @@ pub(crate) fn input_for(reference: &str, choice_id: &str) -> Option<GatePromptIn
         .lock()
         .expect("gate prompt registry poisoned")
         .get(reference)
-        .and_then(|(_, r)| r.inputs.iter().find(|i| i.choice_id == choice_id))
+        .and_then(|records| {
+            records
+                .iter()
+                .rev()
+                .find_map(|(_, record)| record.inputs.iter().find(|i| i.choice_id == choice_id))
+        })
         .cloned()
 }
 
@@ -123,21 +148,27 @@ mod tests {
         let reference = "run-registry-take";
         record(reference, rec("A"));
         // Any caller (a different channel instance) sees it…
-        let got = take(reference).expect("recorded entry is visible process-wide");
+        let mut got = take_for_alias(reference, "primary");
+        let got = got.pop().expect("recorded entry is visible process-wide");
         assert_eq!(got.title, "A");
         assert_eq!(got.channel_alias, "primary");
         // …and take consumed it.
-        assert!(take(reference).is_none());
+        assert!(take_for_alias(reference, "primary").is_empty());
     }
 
     #[test]
     fn reinsert_after_failed_finalize_allows_retry() {
         let reference = "run-registry-retry";
         record(reference, rec("A"));
-        let got = take(reference).expect("first take");
+        let got = take_for_alias(reference, "primary")
+            .pop()
+            .expect("first take");
         // Simulate a failed PATCH: put it back, a later event retries.
         record(reference, got);
-        assert!(take(reference).is_some(), "re-inserted entry is retryable");
+        assert!(
+            !take_for_alias(reference, "primary").is_empty(),
+            "re-inserted entry is retryable"
+        );
     }
 
     #[test]
@@ -148,8 +179,27 @@ mod tests {
         assert_eq!(input.prefill.as_deref(), Some("draft"));
         assert!(input_for(reference, "revise").is_none(), "unknown choice");
         assert!(
-            take(reference).is_some(),
+            !take_for_alias(reference, "primary").is_empty(),
             "input_for must not consume the record"
         );
+    }
+
+    #[test]
+    fn records_every_prompt_for_a_gate_and_partitions_by_sending_alias() {
+        let reference = "run-registry-fanout";
+        record(reference, rec("Initial request"));
+        let mut escalation = rec("Escalation");
+        escalation.channel_alias = "escalation".into();
+        escalation.channel_id = "c2".into();
+        escalation.message_id = "m2".into();
+        escalation.inputs.clear();
+        record(reference, escalation);
+
+        let primary = take_for_alias(reference, "primary");
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].title, "Initial request");
+        let escalation = take_for_alias(reference, "escalation");
+        assert_eq!(escalation.len(), 1);
+        assert_eq!(escalation[0].title, "Escalation");
     }
 }

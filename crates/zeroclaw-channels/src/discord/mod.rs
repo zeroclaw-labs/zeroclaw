@@ -4405,49 +4405,55 @@ impl Channel for DiscordChannel {
         // the same alias (separate channel maps). The registry records the
         // sending alias but not credentials; the matching live channel instance
         // owns the current bot token used for PATCH.
-        let Some(record) = gate_prompts::take(reference) else {
-            return Ok(false);
-        };
-        if record.channel_alias != self.alias {
-            gate_prompts::record(reference, record);
+        let mut records = gate_prompts::take_for_alias(reference, &self.alias);
+        if records.is_empty() {
             return Ok(false);
         }
-        // Keep the approval CONTEXT in place and append the outcome under it —
-        // a resolved prompt should still show what was approved, not erase it.
-        // PATCH with an EXPLICIT empty components array: omitting the key would
-        // leave the buttons in place on Discord's side.
-        let description = match &record.resolved_description {
-            Some(base) => format!("{base}\n\n{outcome}"),
-            None => outcome.to_string(),
-        };
-        let body = serde_json::json!({
-            "embeds": [{"title": record.title, "description": description}],
-            "components": [],
-        });
-        let url = format!(
-            "https://discord.com/api/v10/channels/{}/messages/{}",
-            record.channel_id, record.message_id
-        );
-        let resp = self
-            .http_client()
-            .patch(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await;
-        // Transient failure: put the record back so a later terminal event (a
-        // stale click's "window has passed") can retry the edit.
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => {
+
+        while let Some(record) = records.pop() {
+            // Keep the approval CONTEXT in place and append the outcome under it —
+            // a resolved prompt should still show what was approved, not erase it.
+            // PATCH with an EXPLICIT empty components array: omitting the key would
+            // leave the buttons in place on Discord's side.
+            let description = match &record.resolved_description {
+                Some(base) => format!("{base}\n\n{outcome}"),
+                None => outcome.to_string(),
+            };
+            let body = serde_json::json!({
+                "embeds": [{"title": record.title, "description": description}],
+                "components": [],
+            });
+            let url = format!(
+                "https://discord.com/api/v10/channels/{}/messages/{}",
+                record.channel_id, record.message_id
+            );
+            let resp = self
+                .http_client()
+                .patch(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .json(&body)
+                .send()
+                .await;
+            // Transient failure: put the failed and unattempted records back so a
+            // later terminal event (a stale click's "window has passed") retries.
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    gate_prompts::record(reference, record);
+                    for remaining in records {
+                        gate_prompts::record(reference, remaining);
+                    }
+                    return Err(e.into());
+                }
+            };
+            if !resp.status().is_success() {
+                let status = resp.status();
                 gate_prompts::record(reference, record);
-                return Err(e.into());
+                for remaining in records {
+                    gate_prompts::record(reference, remaining);
+                }
+                anyhow::bail!("Discord gate-prompt finalize failed ({status})");
             }
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            gate_prompts::record(reference, record);
-            anyhow::bail!("Discord gate-prompt finalize failed ({status})");
         }
         Ok(true)
     }

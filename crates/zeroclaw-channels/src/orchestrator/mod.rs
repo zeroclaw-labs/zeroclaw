@@ -6530,6 +6530,36 @@ fn channel_key_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
     }
 }
 
+fn unique_channel_handles(
+    channels_by_name: &HashMap<String, Arc<dyn Channel>>,
+) -> Vec<Arc<dyn Channel>> {
+    let mut unique = Vec::new();
+    for channel in channels_by_name.values() {
+        if !unique.iter().any(|existing| Arc::ptr_eq(existing, channel)) {
+            unique.push(Arc::clone(channel));
+        }
+    }
+    unique
+}
+
+async fn finalize_gate_prompts(channels: &[Arc<dyn Channel>], reference: &str, outcome: &str) {
+    for channel in channels {
+        if let Err(e) = channel.finalize_gate_prompt(reference, outcome).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "reference": reference,
+                        "channel": channel.name(),
+                        "error": e.to_string(),
+                    })),
+                "gate-prompt finalize failed (decision unaffected)"
+            );
+        }
+    }
+}
+
 fn text_gate_reply_matches_approval_route(
     engine: &zeroclaw_runtime::sop::SopEngine,
     run_id: &str,
@@ -6572,7 +6602,7 @@ fn text_gate_reply_matches_approval_route(
 async fn dispatch_channel_sop_gate(
     router: &AgentRouter,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    gate_channel: Option<Arc<dyn Channel>>,
+    gate_prompt_channels: &[Arc<dyn Channel>],
     gate_channel_route_keys: &[String],
 ) -> bool {
     const MARKER_PREFIX: &str = "sop.gate:";
@@ -6704,15 +6734,13 @@ async fn dispatch_channel_sop_gate(
             ),
             "channel SOP-gate answer targeted a superseded prompt revision"
         );
-        if let Some(channel) = gate_channel {
-            let _ = channel
-                .finalize_gate_prompt(
-                    &reference,
-                    "\u{1f501} This prompt was superseded by a newer draft \u{2014} \
-                     answer the latest prompt instead.",
-                )
-                .await;
-        }
+        finalize_gate_prompts(
+            gate_prompt_channels,
+            &reference,
+            "\u{1f501} This prompt was superseded by a newer draft \u{2014} \
+             answer the latest prompt instead.",
+        )
+        .await;
         // Consumed for both forms: it named a real parked gate, just an old
         // presentation of it — never a message for the agent.
         return true;
@@ -6732,15 +6760,13 @@ async fn dispatch_channel_sop_gate(
                 );
                 // Name the state correctly on the prompt itself: this gate's
                 // approval window has passed.
-                if let Some(channel) = gate_channel {
-                    let _ = channel
-                        .finalize_gate_prompt(
-                            &reference,
-                            "\u{23f0} The approval window for this gate has passed \
-                             (the run already resolved or finished).",
-                        )
-                        .await;
-                }
+                finalize_gate_prompts(
+                    gate_prompt_channels,
+                    &reference,
+                    "\u{23f0} The approval window for this gate has passed \
+                     (the run already resolved or finished).",
+                )
+                .await;
                 true
             }
             Form::Text => false,
@@ -6843,21 +6869,8 @@ async fn dispatch_channel_sop_gate(
             } else {
                 format!("{run_id}#{ref_rev}")
             };
-            if let (Some(text), Some(channel)) = (final_text, gate_channel)
-                && let Err(e) = channel
-                    .finalize_gate_prompt(&finalize_reference, &text)
-                    .await
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "run_id": run_id,
-                            "error": e.to_string(),
-                        })),
-                    "gate-prompt finalize failed (decision unaffected)"
-                );
+            if let Some(text) = final_text {
+                finalize_gate_prompts(gate_prompt_channels, &finalize_reference, &text).await;
             }
         }
         Err(e) => {
@@ -6991,7 +7004,15 @@ async fn run_message_dispatch_loop(
                 keys
             })
             .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
-        if dispatch_channel_sop_gate(&router, &msg, gate_channel, &gate_channel_route_keys).await {
+        let gate_prompt_channels = unique_channel_handles(&ctx.channels_by_name);
+        if dispatch_channel_sop_gate(
+            &router,
+            &msg,
+            &gate_prompt_channels,
+            &gate_channel_route_keys,
+        )
+        .await
+        {
             continue;
         }
         if dispatch_channel_sop_event(&router, &msg).await {
@@ -13621,6 +13642,7 @@ api_key = "anthropic-key"
         stop_typing_calls: AtomicUsize,
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
+        finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[derive(Default)]
@@ -13969,6 +13991,18 @@ api_key = "anthropic-key"
                 emoji.to_string(),
             ));
             Ok(())
+        }
+
+        async fn finalize_gate_prompt(
+            &self,
+            reference: &str,
+            outcome: &str,
+        ) -> anyhow::Result<bool> {
+            self.finalized_gate_prompts
+                .lock()
+                .await
+                .push((reference.to_string(), outcome.to_string()));
+            Ok(true)
         }
     }
 
@@ -26808,7 +26842,8 @@ Done."#;
         gate_channel: Option<Arc<dyn Channel>>,
     ) -> bool {
         let route_keys = vec![channel_key_for_message(msg)];
-        dispatch_channel_sop_gate(router, msg, gate_channel, &route_keys).await
+        let gate_prompt_channels = gate_channel.into_iter().collect::<Vec<_>>();
+        dispatch_channel_sop_gate(router, msg, &gate_prompt_channels, &route_keys).await
     }
 
     async fn dispatch_test_channel_sop_gate_with_route_keys(
@@ -26817,7 +26852,7 @@ Done."#;
         route_keys: &[&str],
     ) -> bool {
         let route_keys: Vec<String> = route_keys.iter().map(|key| (*key).to_string()).collect();
-        dispatch_channel_sop_gate(router, msg, None, &route_keys).await
+        dispatch_channel_sop_gate(router, msg, &[], &route_keys).await
     }
 
     #[tokio::test]
@@ -27078,6 +27113,51 @@ Done."#;
             active_run_status(&engine, &run_id),
             Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
         );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_resolution_finalizes_request_and_escalation_channels() {
+        let (router, engine, run_id) = parked_channel_gate_router_with_routes(
+            Some("prod"),
+            Some("discord.ops:room-1"),
+            Some("discord.oncall:room-2"),
+        );
+        let request_channel = Arc::new(RecordingChannel::default());
+        let escalation_channel = Arc::new(RecordingChannel::default());
+        let prompt_channels: Vec<Arc<dyn Channel>> =
+            vec![request_channel.clone(), escalation_channel.clone()];
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("oncall".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-2".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-2", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_channel_sop_gate(
+                &router,
+                &msg,
+                &prompt_channels,
+                &["discord.oncall".to_string()],
+            )
+            .await,
+            "an approval on the escalation route should resolve the gate"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
+        for finalized in [
+            request_channel.finalized_gate_prompts.lock().await,
+            escalation_channel.finalized_gate_prompts.lock().await,
+        ] {
+            assert_eq!(finalized.len(), 1, "every active route channel finalizes");
+            assert_eq!(finalized[0].0, run_id);
+            assert!(finalized[0].1.contains("Approved"));
+        }
     }
 
     #[tokio::test]
