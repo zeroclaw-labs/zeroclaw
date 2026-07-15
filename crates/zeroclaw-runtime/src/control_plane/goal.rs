@@ -625,7 +625,11 @@ pub struct GoalAdmissionContext {
     pub originator_route: Option<String>,
     /// Authenticated principal that originated the command, when available.
     pub principal_id: Option<String>,
-    /// Exact goal task bound by trusted controller plumbing, when available.
+    /// Exact durable goal task bound to this trusted controller turn.
+    ///
+    /// This is transient admission evidence, not another lifecycle source of
+    /// truth. The canonical task record remains in the goal store; callers use
+    /// this binding only to avoid attributing a concurrent replacement goal.
     pub goal_task_id: Option<String>,
     /// Minimal durable channel context needed to resume after restart.
     ///
