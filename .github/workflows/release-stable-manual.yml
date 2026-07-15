@@ -461,7 +461,6 @@ jobs:
           shopt -u nullglob
           if [ "${#dmg_candidates[@]}" -ne 1 ]; then
             echo "::error::Expected exactly one final macOS DMG in $dmg_dir; found ${#dmg_candidates[@]}."
-            printf '  %s\n' "${dmg_candidates[@]}"
             exit 1
           fi
           mv "${dmg_candidates[0]}" "$MACOS_DMG_PATH"
