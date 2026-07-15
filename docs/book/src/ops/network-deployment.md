@@ -188,7 +188,7 @@ Telegram Bot API's `getUpdates` is single-poller per bot token. You cannot run t
 If you see this:
 
 1. `ps aux | grep zeroclaw` and confirm only one daemon is running
-2. Check you don't have `cargo run --bin zeroclaw -- channel start telegram` from a dev session hanging around
+2. Check you don't have `cargo run --bin zeroclaw -- channel start` from a dev session hanging around
 3. If stale, reset Telegram's poll session:
 
    <div class="os-tabs-src">
