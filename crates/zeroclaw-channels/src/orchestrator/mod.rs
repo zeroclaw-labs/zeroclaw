@@ -6672,9 +6672,11 @@ async fn dispatch_channel_sop_gate(
     // replies must carry the full run id minted in the prompt. For the TEXT form
     // a non-match means "not a gate answer" — fall through to the agent; a marker
     // non-match is consumed (stale buttons after the run ended). A matched run
-    // whose CURRENT revision differs from the reference's is superseded, but text
-    // replies must first prove they came through a policy route that can present
-    // fallback instructions.
+    // whose CURRENT revision differs from the reference's is superseded only
+    // after that replacement park is durable. While persistence retries, the
+    // prior prompt stays visible and is not finalized as stale. Text replies
+    // must first prove they came through a policy route that can present fallback
+    // instructions.
     let resolved = {
         let Ok(guard) = engine.lock() else {
             return matches!(form, Form::Marker);
@@ -6686,7 +6688,7 @@ async fn dispatch_channel_sop_gate(
                     | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint
             )
         });
-        let matched: Vec<(String, u32, bool)> = candidates
+        let matched: Vec<(String, u32, bool, bool)> = candidates
             .by_ref()
             .filter(|r| r.run_id == ref_run)
             .map(|r| {
@@ -6697,7 +6699,8 @@ async fn dispatch_channel_sop_gate(
                         &channel_route_keys,
                         &msg.reply_target,
                     );
-                (r.run_id.clone(), r.revision, text_admissible)
+                let superseded = guard.is_gate_reference_superseded(&r.run_id, ref_rev);
+                (r.run_id.clone(), r.revision, text_admissible, superseded)
             })
             .collect();
         match matched.as_slice() {
@@ -6705,7 +6708,7 @@ async fn dispatch_channel_sop_gate(
             _ => None,
         }
     };
-    if let Some((run_id, _, false)) = &resolved {
+    if let Some((run_id, _, false, _)) = &resolved {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -6720,9 +6723,7 @@ async fn dispatch_channel_sop_gate(
         );
         return false;
     }
-    if let Some((run_id, current_rev, _)) = &resolved
-        && *current_rev != ref_rev
-    {
+    if let Some((run_id, current_rev, _, true)) = &resolved {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -6746,7 +6747,7 @@ async fn dispatch_channel_sop_gate(
         // presentation of it — never a message for the agent.
         return true;
     }
-    let resolved_run_id = resolved.map(|(run_id, _, _)| run_id);
+    let resolved_run_id = resolved.map(|(run_id, _, _, _)| run_id);
     let Some(run_id) = resolved_run_id else {
         return match form {
             Form::Marker => {
@@ -6986,43 +6987,60 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Gate answers (button-click markers / `approve <ref>` text replies)
+        // resolve a PARKED run and must never start one, so they are consumed
+        // BEFORE agent ownership lookup. A configured approval route may be
+        // intentionally unowned by an agent; it can present gate prompts but
+        // must never receive ordinary agent traffic. All live contexts share
+        // this global channel registry and prompt config.
+        let gate_ctx = router
+            .single_ctx
+            .as_ref()
+            .cloned()
+            .or_else(|| router.by_agent.values().next().cloned());
+        if let Some(gate_ctx) = gate_ctx {
+            let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
+            let gate_channel_route_keys = gate_channel
+                .as_ref()
+                .map(|target| {
+                    let mut keys: Vec<String> = gate_ctx
+                        .channels_by_name
+                        .iter()
+                        .filter_map(|(key, channel)| {
+                            Arc::ptr_eq(channel, target).then(|| key.clone())
+                        })
+                        .collect();
+                    let inbound_key = channel_key_for_message(&msg);
+                    if !keys.iter().any(|key| key == &inbound_key) {
+                        keys.push(inbound_key);
+                    }
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                })
+                .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
+            let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
+            if dispatch_channel_sop_gate(
+                &router,
+                &msg,
+                gate_ctx.prompt_config.as_ref(),
+                &gate_prompt_channels,
+                &gate_channel_route_keys,
+            )
+            .await
+            {
+                continue;
+            }
+        }
+
         let Some(ctx) = router.resolve(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
-        // Gate answers (button-click markers / `approve <ref>` text replies)
-        // resolve a PARKED run and must never start one, so they are consumed
-        // BEFORE SOP-event ingress and before any agent dispatch.
-        let gate_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-        let gate_channel_route_keys = gate_channel
-            .as_ref()
-            .map(|target| {
-                let mut keys: Vec<String> = ctx
-                    .channels_by_name
-                    .iter()
-                    .filter_map(|(key, channel)| Arc::ptr_eq(channel, target).then(|| key.clone()))
-                    .collect();
-                let inbound_key = channel_key_for_message(&msg);
-                if !keys.iter().any(|key| key == &inbound_key) {
-                    keys.push(inbound_key);
-                }
-                keys.sort();
-                keys.dedup();
-                keys
-            })
-            .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
-        let gate_prompt_channels = unique_channel_handles(&ctx.channels_by_name);
-        if dispatch_channel_sop_gate(
-            &router,
-            &msg,
-            ctx.prompt_config.as_ref(),
-            &gate_prompt_channels,
-            &gate_channel_route_keys,
-        )
-        .await
-        {
-            continue;
-        }
+
+        // Gate answers were already considered against the global approval
+        // channel registry above. The remaining path only dispatches events and
+        // ordinary messages to an agent-owned runtime.
         if dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
@@ -27158,6 +27176,53 @@ Done."#;
         })
         .await
         .expect("channel approval must schedule the resumed ExecuteStep");
+    }
+
+    #[tokio::test]
+    async fn approval_only_channel_gate_reply_bypasses_agent_ownership() {
+        let (mut router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("test-channel:room-1"));
+        let gate_channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let gate_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            gate_channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        router.by_agent = Arc::new(HashMap::from([("worker".to_string(), gate_ctx)]));
+
+        let msg = ChannelMessage {
+            channel: "test-channel".to_string(),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "test-channel", 0)
+        };
+        assert!(
+            router.resolve(&msg).is_none(),
+            "the configured approval route must not need an agent owner"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(msg).await.expect("queue gate reply");
+        drop(tx);
+        run_message_dispatch_loop(rx, router, 1).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_run_status(&engine, &run_id)
+                    == Some(zeroclaw_runtime::sop::types::SopRunStatus::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the approval-only channel reply must drive the resumed action");
     }
 
     #[tokio::test]

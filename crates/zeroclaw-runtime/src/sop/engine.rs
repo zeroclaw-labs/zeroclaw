@@ -667,6 +667,16 @@ impl SopEngine {
         self.claims_pending_persist.contains(run_id)
     }
 
+    /// A prompt becomes stale only after a replacement presentation is durable.
+    /// A re-draft can update the in-memory revision before its parked snapshot
+    /// saves; finalizing the old prompt in that window would leave operators
+    /// without a durable replacement after a crash.
+    pub fn is_gate_reference_superseded(&self, run_id: &str, reference_revision: u32) -> bool {
+        self.active_runs.get(run_id).is_some_and(|run| {
+            run.revision != reference_revision && !self.is_park_persist_pending(run_id)
+        })
+    }
+
     /// Admit a run through the store CAS claim before it becomes locally active.
     /// The durable store is the concurrency source of truth; `active_runs` is the
     /// execution cache/status surface.
@@ -10774,6 +10784,10 @@ type = "manual"
             engine.is_park_persist_pending(&run_id),
             "the revised gate must remain fail-closed for its durable retry"
         );
+        assert!(
+            !engine.is_gate_reference_superseded(&run_id, 0),
+            "the original prompt must stay current until the revised snapshot is durable"
+        );
         assert_eq!(
             store.claim_counts("cp-revise-save-fail").unwrap(),
             (1, 1),
@@ -10785,6 +10799,10 @@ type = "manual"
         assert!(
             !engine.is_park_persist_pending(&run_id),
             "a successful maintenance retry completes the revised park"
+        );
+        assert!(
+            engine.is_gate_reference_superseded(&run_id, 0),
+            "the original prompt becomes stale only after the revised snapshot is durable"
         );
         assert_eq!(
             store.claim_counts("cp-revise-save-fail").unwrap(),
