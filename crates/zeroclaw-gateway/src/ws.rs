@@ -1035,6 +1035,11 @@ async fn process_chat_message(
         let cfg = state.config.read();
         cfg.effective_max_context_tokens(&turn_alias) as u64
     };
+    // Resolve model's actual context window for display (provider context_window).
+    let model_context_window = {
+        let cfg = state.config.read();
+        cfg.effective_model_context_window(&turn_alias) as u64
+    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -1511,6 +1516,7 @@ async fn process_chat_message(
                 "model": turn_model,
                 "provider": provider_label,
                 "max_context_tokens": max_context_tokens,
+                "model_context_window": model_context_window,
                 "last_input_tokens": last_input_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;

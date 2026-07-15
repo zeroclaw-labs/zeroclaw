@@ -251,6 +251,7 @@ pub enum SessionUpdate {
         session_id: String,
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
+        model_context_window: Option<u64>,
     },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
@@ -323,6 +324,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+            model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,

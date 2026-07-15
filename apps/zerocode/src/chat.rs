@@ -5757,6 +5757,7 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                model_context_window,
                 ..
             } => {
                 // Replace-on-arrival: ContextUsage reports the *current* prompt
@@ -5767,7 +5768,11 @@ impl ChatState {
                 if input_tokens.is_some() {
                     self.context_input_tokens = input_tokens;
                 }
-                if max_context_tokens.is_some() {
+                // Use model_context_window for display (actual model window),
+                // fall back to max_context_tokens (trim budget) if not provided.
+                if model_context_window.is_some() {
+                    self.context_max_tokens = model_context_window;
+                } else if max_context_tokens.is_some() {
                     self.context_max_tokens = max_context_tokens;
                 }
             }

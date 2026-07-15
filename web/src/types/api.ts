@@ -272,6 +272,7 @@ export interface WsMessage {
   timeout_secs?: number;
   // Context window info (present on "done" frames). See #7311.
   max_context_tokens?: number;
+  model_context_window?: number;
   input_tokens?: number;
   output_tokens?: number;
   last_input_tokens?: number;
