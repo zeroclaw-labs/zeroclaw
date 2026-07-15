@@ -1217,41 +1217,159 @@ async fn connect_heartbeat_mcp_registry(
     }
 }
 
-/// Decide whether to replace the current heartbeat MCP registry with a
-/// freshly-constructed one.
+/// Additively reconcile the heartbeat worker's MCP registry.
 ///
-/// The replacement is allowed only when every server connected in `current`
-/// is also connected in `fresh` (fresh is a superset by server name).  This
-/// prevents silently dropping healthy connections when a transient error
-/// causes `fresh` to be missing some servers that were previously healthy.
+/// The previous count-only / superset-only logic had two failure
+/// modes that surfaced under partial outage (one granted server
+/// healthy, another flaky):
 ///
-/// Returns `fresh` when it is safe to use, `None` when the caller should
-/// keep using `current`.
-fn reconcile_heartbeat_mcp_registry(
+///   * When `current == fresh` by name, the prior code replaced
+///     `current` with `fresh` on every tick, churning a healthy
+///     stdio connection while the missing peer stayed down.
+///   * When `fresh` had a different shape from `current` (e.g.
+///     current = {A}, fresh = {B}), the prior code discarded
+///     `fresh` entirely and waited for one future attempt that
+///     happened to return both {A, B} — a stall when A's endpoint
+///     could not accept a duplicate connection.
+///
+/// This function implements an additive merge:
+///
+///   1. Identify the **healthy** slice of `current` (drop any whose
+///      transport is reported dead by `health_check_all`).
+///   2. Identify the **fresh-new** slice of `fresh` — servers whose
+///      name is not already covered by a healthy current server.
+///   3. Build a new registry from `healthy_current + fresh_new`,
+///      cheaply Arc-cloning each surviving `McpServer` so its live
+///      transport is reused — no disconnect, no respawn.
+///   4. If the merged set is exactly the healthy-current set
+///      (identity-preserving comparison via `McpServer::ptr_eq`),
+///      return `None` so the caller does NOT swap `current`'s Arc
+///      pointer — preserving the no-churn steady state.
+///
+/// Returns `Some(merged_registry)` when the caller should replace
+/// `current` with a new Arc, `None` when `current` should stay
+/// unchanged.
+async fn reconcile_heartbeat_mcp_registry(
     current: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
     fresh: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
 ) -> Option<std::sync::Arc<crate::tools::McpRegistry>> {
-    let Some(current_reg) = current else {
-        // No current registry — use fresh (if any)
+    let Some(current_arc) = current else {
+        // No current registry — use fresh (if any). This is the boot
+        // case where `shared` was `None`.
         return fresh.map(std::sync::Arc::clone);
     };
-    let Some(fresh_reg) = fresh else {
-        // No fresh registry — keep current
+    let Some(fresh_arc) = fresh else {
+        // No fresh registry — keep current. Mirrors the prior
+        // fail-open contract: a failed connect_all must not silently
+        // drop a live registry.
         return None;
     };
 
-    // Identity-aware comparison: only replace when fresh contains every
-    // server that current has.  This is the monotonicity guarantee that
-    // Finding #2 requires.
-    let current_names: std::collections::HashSet<_> =
-        current_reg.server_names().into_iter().collect();
-    let fresh_names: std::collections::HashSet<_> = fresh_reg.server_names().into_iter().collect();
+    // Step 1: split current into healthy (kept) and dead (dropped /
+    // replaced by fresh). `health_check_all` is read-only, so it
+    // works against the shared Arc without `Arc::get_mut`.
+    let dead: std::collections::HashSet<String> =
+        current_arc.health_check_all().into_iter().collect();
+    let current_handles = current_arc.server_handles();
+    let healthy_handles: Vec<(String, crate::tools::McpServer)> = current_handles
+        .into_iter()
+        .filter(|(name, _)| !dead.contains(name))
+        .collect();
+    let healthy_names: std::collections::HashSet<String> =
+        healthy_handles.iter().map(|(n, _)| n.clone()).collect();
 
-    if fresh_names.is_superset(&current_names) {
-        Some(std::sync::Arc::clone(fresh_reg))
-    } else {
-        None
+    // Step 2: identify the slice of `fresh` that is NOT already
+    // covered by a healthy current server — those are the recovered
+    // servers we want to admit additively. We keep a sorted-by-name
+    // copy of all fresh handles for the merged-equals-fresh check
+    // in step 5 (avoids recomputing `server_handles()` again).
+    let fresh_handles: Vec<(String, crate::tools::McpServer)> = fresh_arc.server_handles();
+    let fresh_new: Vec<(String, crate::tools::McpServer)> = fresh_handles
+        .iter()
+        .filter(|(name, _)| !healthy_names.contains(name))
+        .map(|(n, s)| (n.clone(), s.clone()))
+        .collect();
+
+    // Step 3: merged set, sorted by name for determinism.
+    let mut merged: Vec<(String, crate::tools::McpServer)> = healthy_handles;
+    merged.extend(fresh_new);
+    merged.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Step 4: identity-stable no-churn check. If the merged set is
+    // exactly the healthy-current set (same names AND same `McpServer`
+    // Arc identity for each name), then the merged registry would be
+    // functionally identical to `current` and there is nothing to
+    // do — return `None` so the caller keeps the existing Arc.
+    if merged.is_empty() {
+        // No healthy current and no fresh-new — `current` may still
+        // hold dead handles, but `fresh` did not bring a recovery.
+        // Keep current (it might be the boot empty registry that
+        // the test hook installed; the next tick will try again).
+        return None;
     }
+    let current_after_drop = current_arc.server_handles();
+    // A merged entry is "the same" as a current entry iff they share
+    // the name AND the underlying McpServer transport. When the
+    // healthy-current handle for name N is exactly the same McpServer
+    // we ended up with in `merged` for name N (which is the case
+    // whenever `fresh_new` didn't carry the same name), no churn.
+    let mut current_by_name: std::collections::HashMap<String, crate::tools::McpServer> =
+        current_after_drop
+            .into_iter()
+            .filter(|(name, _)| !dead.contains(name))
+            .collect();
+    let mut churn = false;
+    for (name, server) in &merged {
+        match current_by_name.remove(name) {
+            Some(existing) if existing.ptr_eq(server) => {
+                // Same handle — preserved connection. No churn on
+                // this entry.
+            }
+            Some(_) | None => {
+                // Either the entry came from `fresh_new` (a brand-new
+                // server we just admitted), or the healthy current
+                // server's identity drifted away (uncommon — same
+                // name but a different handle, which only happens
+                // when `fresh` rebuilt the connection). Either way,
+                // a new registry allocation is required.
+                churn = true;
+            }
+        }
+    }
+    if !churn && current_by_name.is_empty() {
+        // Every merged name matched a healthy current handle
+        // identity, and no healthy current handle was left over
+        // unmatched. The merged set is identical to the healthy
+        // current set — no churn, no replacement.
+        return None;
+    }
+
+    // Step 5: when the merged set is exactly `fresh`'s server set
+    // (same names, same `McpServer` Arc identity for each name),
+    // there is nothing for the daemon to rebuild — reuse `fresh`'s
+    // Arc directly. This avoids a redundant `McpRegistry::from_servers`
+    // allocation AND preserves the caller's "the recovery Arc IS
+    // the fresh Arc" expectation: tick 1 of the recovery sequence
+    // must hand the worker the same Arc pointer the hook returned.
+    // (Both `merged` and `fresh_handles` are sorted by name, so the
+    // zip is name-aligned.)
+    if merged.len() == fresh_handles.len() {
+        let all_match = merged
+            .iter()
+            .zip(fresh_handles.iter())
+            .all(|((mn, ms), (fn_, fs))| mn == fn_ && ms.ptr_eq(fs));
+        if all_match {
+            return Some(std::sync::Arc::clone(fresh_arc));
+        }
+    }
+
+    // Step 6: build the new registry from the merged handles.
+    // `from_servers` rebuilds the tool_index from each handle's
+    // advertised capabilities — empty for stub servers in tests,
+    // non-empty for real stdio children.
+    let servers: Vec<crate::tools::McpServer> = merged.into_iter().map(|(_, s)| s).collect();
+    let new_registry = crate::tools::McpRegistry::from_servers(servers).await;
+    Some(std::sync::Arc::new(new_registry))
 }
 
 /// Reconnect and reconcile the daemon-level MCP registry.
@@ -1271,8 +1389,9 @@ async fn retry_heartbeat_mcp_registry(
     // - Dead servers (after startup) are detected and replaced
     // - New servers (that came up later) are picked up
     // - Healthy servers are preserved via identity-aware reconciliation
-    // (Finding #1: reconnect after stdio child exits, Finding #2:
-    //  identity-aware replacement, not count-based).
+    //   (live `McpServer` Arc identity is reused; no churn on the
+    //   healthy side when only a peer server's discovery result
+    //   changed shape).
     let granted = config.mcp_servers_for_agent(agent_alias);
     let granted_count = granted.len();
     let current_count = shared.as_ref().map_or(0, |r| r.server_count());
@@ -1309,7 +1428,9 @@ async fn retry_heartbeat_mcp_registry(
         // Identity-aware replacement — only swap when `fresh` is a
         // superset of `current` by server name, never silently dropping
         // a healthy one.
-        if let Some(replaced) = reconcile_heartbeat_mcp_registry(shared.as_ref(), fresh.as_ref()) {
+        if let Some(replaced) =
+            reconcile_heartbeat_mcp_registry(shared.as_ref(), fresh.as_ref()).await
+        {
             *shared = Some(replaced);
         }
     }
@@ -3929,119 +4050,240 @@ mod tests {
         (config, agent_alias)
     }
 
+    /// Build a stub `McpServer` handle with the given name for use in
+    /// regression tests that exercise identity / ptr_eq /
+    /// server_count assertions. The handle has a no-op transport;
+    /// any actual tool call on the resulting handle panics, so this
+    /// helper is only safe in tests that read state, never make
+    /// tool calls. Two calls with the same name return two distinct
+    /// handles (different Arc allocations) — to assert identity is
+    /// preserved across a recovery, both sides of the comparison
+    /// must hold the SAME `McpServer` clone, which `for_test_with_server_handles`
+    /// + cloning an existing handle achieves.
+    fn make_test_server_handle(name: &str) -> crate::tools::McpServer {
+        crate::tools::McpRegistry::for_test_make_stub_server(name)
+    }
+
     // ── reconcile_heartbeat_mcp_registry unit tests ──────────────────────
 
-    /// Verify that `reconcile_heartbeat_mcp_registry` never replaces the
-    /// current registry when the fresh registry's connected-server set is
-    /// NOT a superset of the current set (Finding #2).
-    /// Equal-count swap — different servers, must NOT replace.
-    #[test]
-    fn reconcile_heartbeat_mcp_registry_ignores_equal_count_swap() {
+    /// Additive merge: current = {A}, fresh = {B}. Even though fresh
+    /// does NOT include A, the recovered B must be admitted into the
+    /// merged registry while A's live handle is preserved (Arc
+    /// identity check). This is the case the previous superset-only
+    /// logic stalled on: a granted-but-flaky peer whose discovery
+    /// never produced the full set in a single connect_all.
+    #[tokio::test]
+    async fn reconcile_heartbeat_mcp_registry_merges_when_fresh_is_disjoint_subset() {
+        let a_handle = make_test_server_handle("server-a");
+        let b_handle = make_test_server_handle("server-b");
         let current = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![(
+                "server-a".to_string(),
+                a_handle.clone(),
+            )]),
         ));
         let fresh = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-b"]),
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![(
+                "server-b".to_string(),
+                b_handle.clone(),
+            )]),
         ));
 
-        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
-        assert!(
-            result.is_none(),
-            "must NOT replace when fresh has a different server than current"
-        );
-        // Current registry must be preserved.
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref())
+            .await
+            .expect("reconcile must produce a merged registry");
+        let merged = result.server_handles();
+        let merged_names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(
-            current.as_ref().unwrap().server_names(),
-            vec!["server-a"],
-            "current registry must be preserved"
+            merged_names,
+            vec!["server-a".to_string(), "server-b".to_string()],
+            "merged registry must contain both server-a (preserved from current) \
+             and server-b (admitted from fresh)"
+        );
+        let (_, a_merged) = merged.iter().find(|(n, _)| n == "server-a").unwrap();
+        let (_, b_merged) = merged.iter().find(|(n, _)| n == "server-b").unwrap();
+        assert!(
+            a_handle.ptr_eq(a_merged),
+            "merged A handle must be the SAME Arc as the original current A handle \
+             (live stdio connection preserved, not respawned)"
+        );
+        assert!(
+            b_handle.ptr_eq(b_merged),
+            "merged B handle must be the SAME Arc as the fresh B handle"
         );
     }
 
-    /// Partial overlap — current has {A, B}, fresh has {B, C}.
-    /// Fresh is not a superset of current (A is missing from fresh).
-    #[test]
-    fn reconcile_heartbeat_mcp_registry_partial_overlap() {
+    /// Additive merge: current = {A, B}, fresh = {B, C}. The healthy
+    /// current B is preserved; C is admitted; A (not in fresh) is
+    /// dropped because `health_check_all` reports it dead. Wait —
+    /// for test stubs health_check_all reports no dead, so A is
+    /// healthy. The additive merge keeps A AND adds C. This is the
+    /// shape of a "config drift" recovery where a server was renamed
+    /// out of fresh and a new server came up in its place.
+    #[tokio::test]
+    async fn reconcile_heartbeat_mcp_registry_preserves_healthy_drops_drift_adds_recovered() {
+        let a_handle = make_test_server_handle("server-a");
+        let b_handle = make_test_server_handle("server-b");
+        let c_handle = make_test_server_handle("server-c");
         let current = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![
+                ("server-a".to_string(), a_handle.clone()),
+                ("server-b".to_string(), b_handle.clone()),
+            ]),
         ));
         let fresh = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-b", "server-c"]),
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![
+                ("server-b".to_string(), b_handle.clone()),
+                ("server-c".to_string(), c_handle.clone()),
+            ]),
         ));
 
-        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref())
+            .await
+            .expect("reconcile must produce a merged registry");
+        let merged = result.server_handles();
+        let merged_names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(
+            merged_names,
+            vec![
+                "server-a".to_string(),
+                "server-b".to_string(),
+                "server-c".to_string()
+            ],
+            "merged registry must contain A (kept from current — fresh omitted it \
+             but A is healthy), B (preserved live handle from current), and C (admitted \
+             from fresh)"
+        );
+        let (_, a_merged) = merged.iter().find(|(n, _)| n == "server-a").unwrap();
+        let (_, b_merged) = merged.iter().find(|(n, _)| n == "server-b").unwrap();
+        let (_, c_merged) = merged.iter().find(|(n, _)| n == "server-c").unwrap();
+        assert!(
+            a_handle.ptr_eq(a_merged),
+            "A's live handle must be preserved even though fresh omitted A"
+        );
+        assert!(
+            b_handle.ptr_eq(b_merged),
+            "B's live handle must be preserved (matched identity in fresh)"
+        );
+        assert!(c_handle.ptr_eq(c_merged), "C's handle must come from fresh");
+    }
+
+    /// Additive merge: current = {A}, fresh = {A, B}. A is preserved
+    /// (matched identity); B is admitted; no churn on A.
+    #[tokio::test]
+    async fn reconcile_heartbeat_mcp_registry_preserves_matched_admits_new() {
+        let a_handle = make_test_server_handle("server-a");
+        let b_handle = make_test_server_handle("server-b");
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![(
+                "server-a".to_string(),
+                a_handle.clone(),
+            )]),
+        ));
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![
+                ("server-a".to_string(), a_handle.clone()),
+                ("server-b".to_string(), b_handle.clone()),
+            ]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref())
+            .await
+            .expect("reconcile must produce a merged registry");
+        let merged = result.server_handles();
+        let merged_names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(
+            merged_names,
+            vec!["server-a".to_string(), "server-b".to_string()],
+            "merged registry must contain A (preserved) and B (admitted)"
+        );
+        let (_, a_merged) = merged.iter().find(|(n, _)| n == "server-a").unwrap();
+        let (_, b_merged) = merged.iter().find(|(n, _)| n == "server-b").unwrap();
+        assert!(
+            a_handle.ptr_eq(a_merged),
+            "A's live handle must be preserved (matched identity in fresh)"
+        );
+        assert!(b_handle.ptr_eq(b_merged), "B's handle must come from fresh");
+    }
+
+    /// No-churn steady state: current = fresh by name AND identity.
+    /// The merge yields the same set; the caller must NOT replace
+    /// `current`'s Arc. This is the "every healthy handle survives"
+    /// contract that protects stdio children from per-tick churn.
+    #[tokio::test]
+    async fn reconcile_heartbeat_mcp_registry_no_churn_when_identities_match() {
+        let a_handle = make_test_server_handle("server-a");
+        let b_handle = make_test_server_handle("server-b");
+        let current = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![
+                ("server-a".to_string(), a_handle.clone()),
+                ("server-b".to_string(), b_handle.clone()),
+            ]),
+        ));
+        let fresh = Some(std::sync::Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![
+                ("server-a".to_string(), a_handle.clone()),
+                ("server-b".to_string(), b_handle.clone()),
+            ]),
+        ));
+
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref()).await;
         assert!(
             result.is_none(),
-            "must NOT replace when fresh is missing a server that current has"
+            "must return None (no churn) when merged set equals healthy current \
+             by name and Arc identity; got Some"
         );
-    }
-
-    /// Fresh is a strict superset — should replace.
-    #[test]
-    fn reconcile_heartbeat_mcp_registry_replaces_when_superset() {
-        let current = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
-        ));
-        let fresh = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
-        ));
-
-        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
-        assert!(
-            result.is_some(),
-            "must replace when fresh is a superset of current"
-        );
-        let names = result.unwrap().server_names();
-        assert!(
-            names.contains(&"server-a".to_string()) && names.contains(&"server-b".to_string()),
-            "replaced registry must contain both server-a and server-b; got {names:?}",
-        );
-    }
-
-    /// Fresh has exactly the same servers — should replace (superset is reflexive).
-    #[test]
-    fn reconcile_heartbeat_mcp_registry_replaces_when_equal_set() {
-        let current = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
-        ));
-        let fresh = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a", "server-b"]),
-        ));
-
-        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), fresh.as_ref());
-        assert!(result.is_some(), "must replace when server sets are equal");
     }
 
     /// No current registry — use fresh if available.
-    #[test]
-    fn reconcile_heartbeat_mcp_registry_none_current_uses_fresh() {
+    #[tokio::test]
+    async fn reconcile_heartbeat_mcp_registry_none_current_uses_fresh() {
+        let a_handle = make_test_server_handle("server-a");
         let fresh = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![(
+                "server-a".to_string(),
+                a_handle.clone(),
+            )]),
         ));
 
-        let result = reconcile_heartbeat_mcp_registry(None, fresh.as_ref());
+        let result = reconcile_heartbeat_mcp_registry(None, fresh.as_ref()).await;
         assert!(result.is_some(), "must use fresh when there is no current");
     }
 
     /// No fresh registry — keep current.
-    #[test]
-    fn reconcile_heartbeat_mcp_registry_none_fresh_keeps_current() {
+    #[tokio::test]
+    async fn reconcile_heartbeat_mcp_registry_none_fresh_keeps_current() {
+        let a_handle = make_test_server_handle("server-a");
         let current = Some(std::sync::Arc::new(
-            crate::tools::McpRegistry::for_test_with_server_names(vec!["server-a"]),
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![(
+                "server-a".to_string(),
+                a_handle.clone(),
+            )]),
         ));
 
-        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), None);
+        let result = reconcile_heartbeat_mcp_registry(current.as_ref(), None).await;
         assert!(result.is_none(), "must keep current when there is no fresh");
     }
 
-    // ── Finding #1: health check & reconnection for a stdio child that dies ─
+    // ── Health check & reconnection for a stdio child that dies ────────
 
     /// Regression test: when a stdio MCP child exits after a successful
     /// connection, the heartbeat worker's retry gate must detect the dead
-    /// transport via `health_check_all` and reconnect on the next tick.
+    /// transport and reconnect on the next tick.
     ///
-    /// The test does NOT call `run_heartbeat_worker` directly — instead it
-    /// exercises the health-check + reconnect path that the real worker
-    /// uses each tick.
+    /// The test invokes `retry_heartbeat_mcp_registry` directly — the
+    /// same production helper the heartbeat worker calls on every
+    /// tick — rather than reimplementing the health-check /
+    /// kill_dead_connections / reconnect / reconcile sequence inline.
+    /// That way a future regression that removes the health-check or
+    /// reconnect branch from the production helper will fail this
+    /// test (not silently let the dead child leak across ticks).
+    ///
+    /// Unix-only: the fixture writes a Bash script, chmods it via
+    /// `PermissionsExt`, and invokes `kill`. The test is gated under
+    /// `#[cfg(unix)]` so the repository's Windows `cargo test
+    /// --no-run` target for `zeroclaw-runtime` stays green.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn heartbeat_worker_reconnects_after_stdio_child_exits() {
         use std::os::unix::fs::PermissionsExt;
@@ -4131,53 +4373,41 @@ done
         // Give the kernel a moment to reap.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // ── 5. Simulate heartbeat tick: detect dead + reconnect ─────────
-        //    a. health_check_all detects the dead child
-        if let Some(arc) = &mut shared_mcp_registry
-            && let Some(reg) = std::sync::Arc::get_mut(arc)
-        {
-            let dead = reg.health_check_all();
-            assert!(
-                dead.contains(&"reconnect-test".to_string()),
-                "health_check_all must detect the dead server; got {dead:?}"
-            );
-
-            //    b. remove the dead connection
-            let killed = reg.kill_dead_connections().await;
-            assert_eq!(killed, vec!["reconnect-test"]);
-        }
-
-        //    c. reconnect (fresh connect_all spawns a new child)
-        let fresh = connect_heartbeat_mcp_registry(&config, &agent_alias)
+        // ── 5. Simulate one heartbeat tick via the production helper ────
+        //    The helper must (a) detect the dead child via
+        //    `health_check_all`, (b) call `kill_dead_connections`,
+        //    (c) reconnect via `connect_heartbeat_mcp_registry`, and
+        //    (d) replace `shared_mcp_registry` with a healthy one.
+        //    If any of those steps is removed from the helper in the
+        //    future, this test fails.
+        retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
             .await
-            .expect("reconnect must succeed");
-
-        //    d. reconcile — empty current is a subset of any fresh set
-        if let Some(replaced) =
-            reconcile_heartbeat_mcp_registry(shared_mcp_registry.as_ref(), fresh.as_ref())
-        {
-            shared_mcp_registry = Some(replaced);
-        }
+            .expect("retry_heartbeat_mcp_registry succeeds");
 
         // ── 6. Verify the reconnected registry is alive ─────────────────
         assert!(
             shared_mcp_registry.is_some(),
             "registry must be Some after reconnection"
         );
-        if let Some(arc) = &mut shared_mcp_registry
-            && let Some(reg) = std::sync::Arc::get_mut(arc)
-        {
-            let dead = reg.health_check_all();
-            assert!(
-                dead.is_empty(),
-                "reconnected server must be alive; health_check_all returned {dead:?}"
-            );
-            assert_eq!(
-                reg.server_count(),
-                1,
-                "must have exactly one connected server"
-            );
-        }
+        let registry = shared_mcp_registry.as_ref().unwrap();
+        assert_eq!(
+            registry.server_names(),
+            vec!["reconnect-test"],
+            "registry must contain the granted server after reconnect"
+        );
+        // Health check is read-only against the shared Arc, so we do
+        // not need `Arc::get_mut`. The reconnected child must report
+        // alive (`health_check_all` returns empty).
+        let dead = registry.health_check_all();
+        assert!(
+            dead.is_empty(),
+            "reconnected server must be alive; health_check_all returned {dead:?}"
+        );
+        assert_eq!(
+            registry.server_count(),
+            1,
+            "must have exactly one connected server"
+        );
     }
 
     // ── #5903 (a): steady-state pin — once complete, no churn.
@@ -4563,6 +4793,268 @@ done
             ),
             "the worker's stored Arc must be the complete registry; \
              recovery succeeded but did not replace the stored Arc"
+        );
+
+        // `_hook_guard` drops here, releasing the serialising lock
+        // and clearing the global hook for the next test.
+    }
+
+    // ── Partial recovery: A stays healthy across failed B retries, then
+    //    B is admitted without replacing A.
+    //
+    //    Grants:    {A, B}
+    //    Sequence:
+    //      tick 0 (boot):              hook returns {}            → empty registry
+    //      tick 1 (retry, B still down): hook returns {A}         → A is admitted
+    //      tick 2 (retry, B still down): hook returns {A} (same A handle)
+    //                                                            → A MUST stay
+    //                                                              identical
+    //                                                              (no churn)
+    //      tick 3 (retry, B came up):   hook returns {A, B} (same A handle, fresh B)
+    //                                                            → A MUST stay
+    //                                                              identical;
+    //                                                              B is admitted
+    //                                                              in the SAME
+    //                                                              tick (without
+    //                                                              replacing A).
+    //
+    //    The old count-only / superset-only logic would either churn A
+    //    every tick (when fresh == {A}) or stall forever (when fresh
+    //    == {A, B} but current's A handle would be replaced, requiring
+    //    both to reconnect simultaneously). The additive merge keeps
+    //    A's `McpServer` Arc identity stable across every tick and
+    //    admits B in one tick without dropping A.
+    #[tokio::test]
+    async fn heartbeat_worker_preserves_healthy_a_admits_recovered_b_additively() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+
+        // Build the test config with TWO granted MCP servers (A and B).
+        let mut config = test_config(&tmp);
+        config.mcp.enabled = true;
+        config
+            .mcp
+            .servers
+            .push(zeroclaw_config::schema::McpServerConfig {
+                name: "server-a".to_string(),
+                ..zeroclaw_config::schema::McpServerConfig::default()
+            });
+        config
+            .mcp
+            .servers
+            .push(zeroclaw_config::schema::McpServerConfig {
+                name: "server-b".to_string(),
+                ..zeroclaw_config::schema::McpServerConfig::default()
+            });
+        config.mcp_bundles.insert(
+            "ab-bundle".to_string(),
+            zeroclaw_config::schema::McpBundleConfig {
+                servers: vec!["server-a".to_string(), "server-b".to_string()],
+                exclude: vec![],
+            },
+        );
+        let agent_alias = "ops".to_string();
+        config.agents.insert(
+            agent_alias.clone(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                mcp_bundles: vec!["ab-bundle".to_string()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        // Pre-build the four registries the hook will return:
+        //   empty:      {}            — boot + B-down tick 0
+        //   a_only:     {A_handle_a}  — B-down ticks 1..=2 (handle shared)
+        //   ab_first:   {A_handle_a, B_handle_b}  — B-came-up tick 3 (A reused)
+        //
+        // The single `A_handle_a` Arc is the key — it MUST survive
+        // across every tick. If the daemon's reconciliation replaces
+        // A's handle (e.g. by re-running `connect_all` and getting a
+        // fresh stub) at any tick, this test fails.
+        let empty_handle = Arc::new(crate::tools::McpRegistry::for_test_with_server_count(0));
+        let a_handle = make_test_server_handle("server-a");
+        let b_handle = make_test_server_handle("server-b");
+        let a_only_registry = Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
+            vec![("server-a".to_string(), a_handle.clone())],
+        ));
+        let ab_registry = Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
+            vec![
+                ("server-a".to_string(), a_handle.clone()),
+                ("server-b".to_string(), b_handle.clone()),
+            ],
+        ));
+
+        let empty_for_hook = Arc::clone(&empty_handle);
+        let a_only_for_hook = Arc::clone(&a_only_registry);
+        let ab_for_hook = Arc::clone(&ab_registry);
+
+        // Sequence: 0=empty (boot), 1=a_only, 2=a_only, 3=ab.
+        // The hook pops from this sequence; any extra calls (which
+        // must NOT happen) would panic the test, surfacing the bug.
+        let sequence: Arc<std::sync::Mutex<Vec<Arc<crate::tools::McpRegistry>>>> =
+            Arc::new(std::sync::Mutex::new(vec![
+                Arc::clone(&empty_for_hook),
+                Arc::clone(&a_only_for_hook),
+                Arc::clone(&a_only_for_hook),
+                Arc::clone(&ab_for_hook),
+            ]));
+        let construct_count = Arc::new(AtomicUsize::new(0));
+        let construct_count_for_hook = Arc::clone(&construct_count);
+        let sequence_for_hook = Arc::clone(&sequence);
+        let _hook_guard =
+            set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+                construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                let mut seq = sequence_for_hook
+                    .lock()
+                    .expect("sequence mutex not poisoned");
+                if seq.is_empty() {
+                    panic!(
+                        "hook fired more times than expected — \
+                         the retry helper is over-calling connect_heartbeat_mcp_registry \
+                         after recovery completed"
+                    );
+                }
+                seq.remove(0)
+            }));
+
+        // Boot — hook call #0 returns the empty registry.
+        let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
+            connect_heartbeat_mcp_registry(&config, &agent_alias)
+                .await
+                .expect("connect_heartbeat_mcp_registry succeeds");
+        assert!(shared_mcp_registry.is_some(), "hook returns Some");
+        assert_eq!(
+            shared_mcp_registry.as_ref().map(|r| r.server_count()),
+            Some(0),
+            "boot hook returns the empty registry"
+        );
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            1,
+            "boot constructs exactly once"
+        );
+
+        // Tick 1 — retry hook call #1 returns {A_handle_a}. The retry
+        // helper must (a) observe current is incomplete (granted=2,
+        // current=0), (b) build a fresh {A_handle_a} registry, and
+        // (c) merge it into shared_mcp_registry.
+        retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
+            .await
+            .expect("retry_heartbeat_mcp_registry succeeds (tick 1)");
+        assert_eq!(
+            shared_mcp_registry.as_ref().map(|r| r.server_count()),
+            Some(1),
+            "tick 1: A must be admitted (B still down)"
+        );
+        let tick1_handles = shared_mcp_registry.as_ref().unwrap().server_handles();
+        let (_, tick1_a) = tick1_handles
+            .iter()
+            .find(|(n, _)| n == "server-a")
+            .expect("tick 1: registry must contain server-a");
+        assert!(
+            a_handle.ptr_eq(tick1_a),
+            "tick 1: A's handle MUST be the same Arc as the hook's A handle"
+        );
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            2,
+            "hook fired exactly 2 times after tick 1"
+        );
+
+        // Tick 2 — retry hook call #2 returns {A_handle_a} again (B
+        // still down). The retry helper must NOT churn A's handle.
+        // Under the OLD count-only / superset-only logic, this tick
+        // would replace the registry because {A} ⊇ {A} (reflexive
+        // superset), disconnecting and respawning A's stdio child.
+        // Under the NEW additive logic, the merge produces a registry
+        // whose A handle is identical to the current one — no churn.
+        // `ptr_eq` already compares the underlying `Arc<Mutex<…>>`
+        // identity, which is exactly the property we want to assert.
+        retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
+            .await
+            .expect("retry_heartbeat_mcp_registry succeeds (tick 2)");
+        assert_eq!(
+            shared_mcp_registry.as_ref().map(|r| r.server_count()),
+            Some(1),
+            "tick 2: registry must still have exactly 1 server (A); B still down"
+        );
+        let tick2_handles = shared_mcp_registry.as_ref().unwrap().server_handles();
+        let (_, tick2_a) = tick2_handles
+            .iter()
+            .find(|(n, _)| n == "server-a")
+            .expect("tick 2: registry must contain server-a");
+        assert!(
+            a_handle.ptr_eq(tick2_a),
+            "tick 2: A's handle MUST be the SAME Arc as tick 1's — no churn"
+        );
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            3,
+            "hook fired exactly 3 times after tick 2"
+        );
+
+        // Tick 3 — retry hook call #3 returns {A_handle_a, B_handle_b}
+        // (B came up). The retry helper must admit B additively while
+        // keeping A's handle identical. Under the OLD logic this would
+        // either replace the registry (because fresh ⊇ current) or
+        // discard fresh entirely (if shape differed). The new logic
+        // merges: A's live handle is Arc-cloned into the new registry,
+        // B's freshly-discovered handle is appended.
+        retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
+            .await
+            .expect("retry_heartbeat_mcp_registry succeeds (tick 3)");
+        let tick3 = shared_mcp_registry.as_ref().expect("non-None after tick 3");
+        assert_eq!(
+            tick3.server_count(),
+            2,
+            "tick 3: registry must contain both A and B after B came up"
+        );
+        let tick3_handles = tick3.server_handles();
+        let (_, tick3_a) = tick3_handles
+            .iter()
+            .find(|(n, _)| n == "server-a")
+            .expect("tick 3: registry must contain server-a");
+        let (_, tick3_b) = tick3_handles
+            .iter()
+            .find(|(n, _)| n == "server-b")
+            .expect("tick 3: registry must contain server-b");
+        assert!(
+            a_handle.ptr_eq(tick3_a),
+            "tick 3: A's handle MUST be the SAME Arc as before — B was admitted \
+             additively WITHOUT replacing A's live connection"
+        );
+        assert!(
+            b_handle.ptr_eq(tick3_b),
+            "tick 3: B's handle MUST be the Arc from fresh"
+        );
+
+        // Tick 4 — registry is now complete (A + B). The retry helper
+        // must NOT call the hook again (would mean churn).
+        retry_heartbeat_mcp_registry(&mut shared_mcp_registry, &config, &agent_alias)
+            .await
+            .expect("retry_heartbeat_mcp_registry succeeds (tick 4)");
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            4,
+            "hook fired exactly 4 times total — 1 boot + 3 retry ticks; \
+             tick 4 did not re-fire the hook because the registry is complete"
+        );
+        let tick4 = shared_mcp_registry.as_ref().expect("non-None after tick 4");
+        assert_eq!(
+            tick4.server_count(),
+            2,
+            "tick 4: registry must still have both servers (no churn)"
+        );
+        let tick4_handles = tick4.server_handles();
+        let (_, tick4_a) = tick4_handles
+            .iter()
+            .find(|(n, _)| n == "server-a")
+            .expect("tick 4: registry must contain server-a");
+        assert!(
+            a_handle.ptr_eq(tick4_a),
+            "tick 4: A's handle STILL the same Arc (steady state)"
         );
 
         // `_hook_guard` drops here, releasing the serialising lock

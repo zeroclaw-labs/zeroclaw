@@ -286,9 +286,20 @@ impl McpServer {
         self.inner.lock().await.config.name.clone()
     }
 
-    /// Get the server's config for reconnection.
-    pub fn server_config(&self) -> McpServerConfig {
-        self.inner.blocking_lock().config.clone()
+    /// Identity comparison on the underlying transport handle. Two
+    /// `McpServer` values share the same connection iff `ptr_eq`
+    /// returns `true` — i.e. their inner `Arc<Mutex<McpServerInner>>`
+    /// points to the same allocation. Cheap Arc-level comparison, no
+    /// async, no lock.
+    ///
+    /// Used by the daemon's reconciliation layer to verify that a
+    /// "preserved" healthy server's live connection survives a
+    /// recovery tick without being silently disconnected and
+    /// reconnected (the previous count-only / superset-only logic
+    /// would drop and reconnect healthy stdio children every time
+    /// a peer server's discovery result changed shape).
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Call a tool on this server. Returns the raw JSON result.
@@ -765,6 +776,138 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+        }
+    }
+
+    /// Snapshot the live `(server_name, McpServer)` pairs registered
+    /// in this registry. Returned pairs are sorted by `server_name`
+    /// for deterministic ordering across ticks. Each `McpServer` is
+    /// a cheap `Arc` clone of the registered handle — re-inserting it
+    /// into another `McpRegistry` shares the underlying transport
+    /// (no disconnect, no new stdio child).
+    ///
+    /// Used by the daemon heartbeat's additive reconciliation layer
+    /// to preserve a healthy live connection across recovery ticks
+    /// (#5903 follow-up): when `current` has a healthy server whose
+    /// identity still matches `fresh`, the daemon re-uses that
+    /// handle instead of forcing `connect_all` to spawn a duplicate
+    /// stdio child for the same endpoint.
+    pub fn server_handles(&self) -> Vec<(String, McpServer)> {
+        let mut out: Vec<(String, McpServer)> = self
+            .server_index
+            .iter()
+            .map(|(name, &idx)| (name.clone(), self.servers[idx].clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Build a new registry from a list of pre-existing `McpServer`
+    /// handles. The handles are cheaply Arc-cloned; transports
+    /// remain alive across the move. The internal `tool_index` and
+    /// `server_index` are rebuilt from each handle's advertised
+    /// capabilities (synchronous `tools()` call).
+    ///
+    /// Companion to [`Self::server_handles`]: callers wanting to
+    /// carry a healthy live connection into a fresh registry (the
+    /// additive recovery path) read the handle via `server_handles`
+    /// and rebuild via `from_servers`.
+    pub async fn from_servers(servers: Vec<McpServer>) -> Self {
+        let mut tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index: HashMap<String, usize> = HashMap::with_capacity(servers.len());
+        for (idx, server) in servers.iter().enumerate() {
+            let name = server.name().await;
+            let tools = server.tools().await;
+            for tool in &tools {
+                let prefixed = format!("{}__{}", name, tool.name);
+                tool_index.insert(prefixed, (idx, tool.name.clone()));
+            }
+            server_index.insert(name, idx);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Test-only: build a registry from pre-existing `(name, handle)`
+    /// pairs. Used by regression tests that need to assert the
+    /// daemon's reconciliation layer preserves a healthy server's
+    /// `McpServer` identity (cheap Arc pointer) across a recovery
+    /// tick. The handles are not re-validated — caller is responsible
+    /// for ensuring each `McpServer`'s `inner.config.name` matches the
+    /// paired name.
+    ///
+    /// Tool index is left empty: callers in regression tests
+    /// exercise identity / `server_count` / `server_names` only,
+    /// never tool lookup. Use [`Self::from_servers`] in production
+    /// paths where tool routing must remain valid.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_handles(handles: Vec<(String, McpServer)>) -> Self {
+        let mut servers: Vec<McpServer> = Vec::with_capacity(handles.len());
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index: HashMap<String, usize> = HashMap::with_capacity(handles.len());
+        for (idx, (name, server)) in handles.into_iter().enumerate() {
+            server_index.insert(name, idx);
+            servers.push(server);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Test-only: build a single stub `McpServer` handle with the
+    /// given `name`. The transport is a no-op (any actual call
+    /// panics in `unreachable!()`); only safe to use in regression
+    /// tests that exercise identity (`ptr_eq`) / `server_count` /
+    /// `server_names` / `health_check_all` and never make a real
+    /// tool call.
+    ///
+    /// Used to construct test registries where two registry builders
+    /// share a server handle — e.g. a healthy A handle that must
+    /// survive across a recovery tick into a freshly-merged registry.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_make_stub_server(name: &str) -> McpServer {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        struct NoopTransport;
+
+        #[async_trait]
+        impl McpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &mut self,
+                _request: &JsonRpcRequest,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_make_stub_server is only used for identity / \
+                     ptr_eq / server_count assertions — never for actual tool calls"
+                )
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: name.to_string(),
+                ..McpServerConfig::default()
+            },
+            transport: Box::new(NoopTransport),
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(0),
+            tools: Vec::new(),
+            capabilities: McpServerCapabilities::default(),
+        };
+        McpServer {
+            inner: std::sync::Arc::new(Mutex::new(inner)),
         }
     }
 
