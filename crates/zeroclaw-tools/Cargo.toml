@@ -42,9 +42,8 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 urlencoding = "2.1"
-uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+uuid = { version = "1.22", default-features = false, features = ["v4", "serde", "std"] }
 which = "8.0"
-
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false }
 mail-parser = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -52,9 +51,18 @@ rustls-pki-types = "1.14.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1.0.6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10", optional = true }
+core-graphics = { version = "0.25", features = ["elcapitan", "highsierra"], optional = true }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGEvent", "CGWindow"], optional = true }
+
 [features]
 default = []
 browser-native = ["dep:fantoccini"]
+computer-use = ["dep:core-foundation", "dep:core-graphics", "dep:objc2-core-graphics"]
 probe = ["dep:probe-rs"]
 
 [dev-dependencies]

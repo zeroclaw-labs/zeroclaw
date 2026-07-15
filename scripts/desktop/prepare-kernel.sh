@@ -72,8 +72,15 @@ build_kernel() {
     echo "$ZEROCLAW_KERNEL_PATH"
     return
   fi
-  echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple" >&2
-  (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple")
+  local build_args=(--profile "$PROFILE" --bin zeroclaw)
+  # The native backend is macOS-only today. Bundle it into Apple desktop
+  # kernels without advertising an unsupported tool in Linux/Windows builds.
+  [[ "$triple" == *-apple-darwin ]] && build_args+=(--features computer-use)
+  build_args+=(--target "$triple")
+  printf 'prepare-kernel: cargo build' >&2
+  printf ' %q' "${build_args[@]}" >&2
+  printf '\n' >&2
+  (cd "$REPO_ROOT" && cargo build "${build_args[@]}")
   local dir="release"
   [[ "$PROFILE" != "release" ]] && dir="$PROFILE"
   echo "$REPO_ROOT/target/$triple/$dir/zeroclaw$exe"

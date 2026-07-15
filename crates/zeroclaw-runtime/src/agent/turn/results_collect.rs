@@ -138,10 +138,9 @@ pub(crate) fn collect_tool_results(
                 }
             }
         }
-        // Provenance-gated: search/listing tools (content_search, glob_search)
-        // must not have incidental image paths promoted to routable [IMAGE:...]
-        // markers, or they falsely trigger vision routing on a text-only
-        // provider. Image-producing/fetching tools keep canonicalization.
+        // Provenance-gated: search/listing and untrusted UI tools must not have
+        // incidental or attacker-controlled image paths promoted to routable
+        // [IMAGE:...] markers. Explicit producer markers survive unchanged.
         // See PR #7345.
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
@@ -252,6 +251,7 @@ mod tests {
     fn outcome(output: &str, success: bool) -> ToolExecutionOutcome {
         ToolExecutionOutcome {
             output: output.to_string(),
+            audit_output: None,
             success,
             error_reason: if success {
                 None

@@ -2995,6 +2995,32 @@ impl Tool for ToolArcRef {
         self.inner.param_domains()
     }
 
+    fn confirmation_requirement(
+        &self,
+        args: &serde_json::Value,
+    ) -> ::zeroclaw_api::tool::ConfirmationRequirement {
+        self.inner.confirmation_requirement(args)
+    }
+
+    fn effective_confirmation_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
+        self.inner.effective_confirmation_arguments(args)
+    }
+
+    fn output_sensitivity(
+        &self,
+        args: &serde_json::Value,
+    ) -> ::zeroclaw_api::tool::ToolOutputSensitivity {
+        self.inner.output_sensitivity(args)
+    }
+
+    fn audit_output(
+        &self,
+        args: &serde_json::Value,
+        result: &ToolResult,
+    ) -> Option<serde_json::Value> {
+        self.inner.audit_output(args, result)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }

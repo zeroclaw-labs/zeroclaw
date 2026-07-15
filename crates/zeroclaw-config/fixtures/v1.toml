@@ -542,6 +542,14 @@ timeout_ms = 15000
 allow_remote_endpoint = false
 window_allowlist = []
 
+[computer_use]
+enabled = false
+application_access = "allowlist"
+confirmation_mode = "fresh"
+timeout_ms = 15000
+allowed_applications = []
+max_text_chars = 80
+
 [browser_delegate]
 enabled = false
 cli_binary = "claude"

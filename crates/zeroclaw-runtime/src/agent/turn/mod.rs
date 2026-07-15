@@ -111,7 +111,7 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
+    should_execute_tools_in_parallel_with_registry,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
@@ -965,23 +965,33 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            fresh_confirmation_guard,
         } = prepare_tool_calls(
             &ctx,
             &tool_calls,
+            tools_registry,
+            activated_tools,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
         )
         .await?;
+
+        // Decide from the post-hook prepared calls so an action-sensitive
+        // fresh-confirmation requirement cannot be rewritten into a parallel
+        // dispatch after this check.
+        let allow_parallel_execution = parallel_tools
+            && should_execute_tools_in_parallel_with_registry(
+                &executable_calls,
+                approval,
+                tools_registry,
+                activated_tools,
+            );
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
@@ -1023,6 +1033,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 }
             })
             .await;
+        // Release only after the approved call future has completed or been
+        // cancelled; another Fresh prompt may then begin from current state.
+        let fresh_execution_was_in_flight = fresh_confirmation_guard.is_some();
+        drop(fresh_confirmation_guard);
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -1032,6 +1046,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         };
 
         let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
+        let interrupted_result_key = if fresh_execution_was_in_flight {
+            "turn-fresh-tool-interrupted-outcome-unknown"
+        } else {
+            "turn-tool-interrupted-before-result"
+        };
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
@@ -1065,9 +1084,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         call.name.clone(),
                         call.tool_call_id.clone(),
                         crate::agent::tool_execution::ToolExecutionOutcome {
-                            output: crate::i18n::get_required_cli_string(
-                                "turn-tool-interrupted-before-result",
-                            ),
+                            output: crate::i18n::get_required_cli_string(interrupted_result_key),
+                            audit_output: None,
                             success: false,
                             error_reason: None,
                             duration: std::time::Duration::ZERO,
@@ -1090,9 +1108,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     }
                     let call_id = events::resolve_tool_call_id(call);
                     let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
-                        output: crate::i18n::get_required_cli_string(
-                            "turn-tool-interrupted-before-result",
-                        ),
+                        output: crate::i18n::get_required_cli_string(interrupted_result_key),
+                        audit_output: None,
                         success: false,
                         error_reason: None,
                         duration: std::time::Duration::ZERO,

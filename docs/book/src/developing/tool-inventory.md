@@ -63,6 +63,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 | `file_upload`, `file_upload_bundle`, `file_download` | Config-gated data movement. | Keep gated; these are policy-sensitive data movement tools and need an explicit replacement before externalization. |
 | `backup`, `data_management` | Local-state mutation surface. | Consider a clearer feature/config boundary because both mutate local state outside ordinary file edit flows. |
 | `screenshot`, `image_info`, `canvas` | Visual/UI tool surface. | Keep for now; classify with the visual/UI tool surface once plugin and dashboard boundaries settle. |
+| `computer_use` | Build- and config-gated native desktop driver. | Keep first-party while fresh-confirmation, accessibility semantics, platform permissions, and image routing remain ZeroClaw-owned. |
 | `llm_task` | Provider-dependent subtask execution. | Keep until provider-scoped subtask execution has a separate contract from delegation. |
 | `security_ops` | Config-gated security operations. | Keep gated; security operations need first-party policy visibility until a plugin can advertise equivalent permissions, receipts, and rollback. |
 | `verifiable_intent` | Config-gated trust policy. | Keep gated; intent issuance and verification affect trust policy and should stay first-party until the credential boundary is stable. |

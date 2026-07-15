@@ -51,6 +51,7 @@ Conditionally registered:
 | Hardware probes | `--features hardware`: GPIO, I2C, SPI reads/writes |
 | `sop_*` tools | Registered when `sop.sops_dir` is configured: run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
+| `computer_use` | Built with `--features computer-use` and `[computer_use].enabled = true`; see [Computer use](./computer-use.md) |
 
 ## Extension protocols
 
