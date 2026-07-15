@@ -8,6 +8,7 @@ use heapless::{String, Vec};
 use log::info;
 use zeroclaw_fw_protocol::{Command, copy_id, write_err, write_ok};
 
+// Pre-escaped because `write_ok` embeds this value as a JSON string without escaping.
 const CAPABILITIES_RESULT: &str =
     r#"{\"gpio\":[0,1,2,3,4,5,12,13,14,15,16,17,18,19],\"led_pin\":2}"#;
 
