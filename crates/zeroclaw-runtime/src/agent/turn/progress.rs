@@ -83,7 +83,9 @@ fn render_argument_value(value: &Value) -> Option<String> {
 }
 
 fn scrub_and_collapse_display(value: &str) -> String {
-    scrub_credentials(value)
+    // Progress is a chat-visible sink. Catch standalone credential prefixes
+    // with the canonical detector before preserving key/value context below.
+    scrub_credentials(&crate::security::scrub(value))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -126,5 +128,21 @@ mod tests {
         );
         assert!(line.contains("[REDACTED]"));
         assert!(!line.contains("abcd1234efgh5678"));
+    }
+
+    #[test]
+    fn progress_scrubs_standalone_credentials() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let start = render_tool_start_progress("shell", &json!({"command": token}));
+        let completion = render_tool_completion_progress(
+            "shell",
+            &json!({"command": "echo"}),
+            1,
+            false,
+            Some(token),
+        );
+
+        assert!(!start.contains(token));
+        assert!(!completion.contains(token));
     }
 }
