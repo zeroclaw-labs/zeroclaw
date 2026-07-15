@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 /// root; `~` is expanded to the user home directory with a `directories::UserDirs`
 /// fallback for environments where `HOME` is unset.
 ///
-/// This lives in `zeroclaw-config` (not `zeroclaw-runtime`) so both the OS sandbox
-/// backends (`zeroclaw-runtime::security::detect::create_sandbox`) and the app-layer
-/// path guard (`SecurityPolicy::from_profiles`, same crate) consume the identical
-/// resolved policy — two enforcement layers reading two different resolutions of the
-/// same config was the dual-policy-surface gap flagged in the #7821 review.
+/// This lives in `zeroclaw-config` (not `zeroclaw-runtime`) so both the call site that
+/// passes a resolved policy to `zeroclaw-runtime::security::detect::create_sandbox`
+/// (which does not yet forward it to individual OS sandbox backends) and the app-layer
+/// path guard (`SecurityPolicy::from_profiles`, same crate) derive from the identical
+/// resolution — two enforcement layers reading two different resolutions of the same
+/// config would otherwise be a dual-policy-surface gap.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SandboxPolicy {
     pub deny_read: Vec<PathBuf>,
@@ -170,9 +171,9 @@ pub fn allow_write_is_at_default(
 /// - If `allow_write` is at its schema default (order-independent) and top-level
 ///   `allowed_roots` is non-empty, `allowed_roots` is MERGED onto the default write roots
 ///   (the top-level `allowed_roots` field historically granted extra write access on top of
-///   the default workspace/temp roots, not a replacement of them — see Audacity88 review on
-///   #7821: replace semantics silently revoke default write access and read narrower than
-///   the compatibility story the schema promises). If `allow_write` was explicitly
+///   the default workspace/temp roots, not a replacement of them — replace semantics would
+///   silently revoke default write access and read narrower than the compatibility story
+///   the schema promises). If `allow_write` was explicitly
 ///   customised, `allowed_roots` is NOT merged in — the explicit value takes precedence.
 fn resolve_allow_write(
     sp: &SandboxPolicyConfig,
@@ -318,8 +319,8 @@ mod tests {
 
     #[test]
     fn allowed_roots_compat_merges_onto_default_write_roots_not_replaces() {
-        // Regression for Audacity88 #7821 review: allowed_roots must be merged onto the
-        // default write roots (workspace + /tmp), not replace them outright.
+        // allowed_roots must be merged onto the default write roots
+        // (workspace + /tmp), not replace them outright.
         let profile = RiskProfileConfig {
             workspace_only: false,
             allowed_roots: vec!["/extra".to_string()],

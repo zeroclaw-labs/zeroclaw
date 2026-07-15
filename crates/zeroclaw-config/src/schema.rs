@@ -11170,14 +11170,20 @@ pub struct SandboxPolicyConfig {
     pub allow_write: Vec<String>,
     /// Write exceptions within `allow_write` regions. Takes precedence over `allow_write`.
     pub deny_write: Vec<String>,
-    /// Network domains the sandbox may reach via proxy. Empty list = no network.
-    /// Wildcard prefix supported: `*.github.com`.
+    /// Network domains the sandbox may reach via proxy. Accepted and carried into
+    /// the resolved policy, but **not yet enforced**: no OS sandbox backend consumes
+    /// it yet (`create_sandbox()` does not forward the resolved policy to individual
+    /// backends until backend wiring lands). Once enforced, the intended semantics
+    /// are: empty list = no network, wildcard prefix supported (`*.github.com`).
     pub allowed_domains: Vec<String>,
-    /// Domains explicitly blocked. Checked before `allowed_domains`.
+    /// Domains explicitly blocked; intended to be checked before `allowed_domains`
+    /// once enforced. Same inert status as `allowed_domains` — see that field's doc.
     pub denied_domains: Vec<String>,
     /// Unix socket paths the sandbox may access (macOS only; ignored on Linux).
+    /// Same inert status as `allowed_domains` — accepted but not yet enforced.
     pub allow_unix_sockets: Vec<String>,
     /// Raw extra bwrap flags appended last (Bubblewrap backend only, escape hatch).
+    /// Same inert status as `allowed_domains` — accepted but not yet enforced.
     pub bubblewrap_args: Vec<String>,
     /// When `true`, the default `deny_write` guardrail list (shell configs, git hooks,
     /// `.env`, `.mcp.json`, etc.) is merged into the resolved policy by the runtime

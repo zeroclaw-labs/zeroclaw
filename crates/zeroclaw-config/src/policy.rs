@@ -235,10 +235,12 @@ pub struct SecurityPolicy {
     /// `RiskProfileConfig.sandbox_policy` (operator-supplied `deny_write` plus, when
     /// `mandatory_deny_write_enabled` is true, the default guardrail list — shell
     /// configs, git hooks, `.env`, `.mcp.json`, etc.) via
-    /// [`crate::sandbox_policy::SandboxPolicy::from_risk_profile`], the same resolver the
-    /// OS sandbox backends consume. Checked in [`Self::is_resolved_path_allowed`] before
-    /// any allow-grant, mirroring the "deny_write overrides allow_write" contract
-    /// documented on `SandboxPolicyConfig`.
+    /// [`crate::sandbox_policy::SandboxPolicy::from_risk_profile`], the same resolver
+    /// whose output is passed to `zeroclaw-runtime::security::detect::create_sandbox`
+    /// (that call does not yet forward the resolved policy to individual OS sandbox
+    /// backends). Checked in [`Self::is_resolved_path_allowed`] before any allow-grant,
+    /// mirroring the "deny_write overrides allow_write" contract documented on
+    /// `SandboxPolicyConfig`.
     pub deny_write: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
@@ -2509,14 +2511,14 @@ impl SecurityPolicy {
         let runtime_default = crate::schema::RuntimeProfileConfig::default();
         let runtime = runtime_profile.unwrap_or(&runtime_default);
 
-        // Canonical `sandbox_policy` resolution — the same resolver the OS sandbox
-        // backends consume (`zeroclaw-runtime::security::detect::create_sandbox`).
-        // Reusing it here closes the dual-policy-surface gap flagged in the #7821
-        // review: previously `sandbox_policy.deny_read`/`allow_read`/`allow_write`/
-        // `deny_write` were accepted by the schema but never read by this app-layer
-        // path guard, so an operator could set `sandbox_policy.deny_read =
-        // ["~/.ssh"]` and get no enforcement at all when no OS sandbox backend was
-        // active (NoopSandbox, or platforms without Bubblewrap/Landlock/Seatbelt).
+        // Canonical `sandbox_policy` resolution — the same resolver whose output is
+        // passed to `zeroclaw-runtime::security::detect::create_sandbox`. Reusing it
+        // here keeps a single source of truth: without this, `sandbox_policy.deny_read`/
+        // `allow_read`/`allow_write`/`deny_write` would be accepted by the schema but
+        // never read by this app-layer path guard, so an operator could set
+        // `sandbox_policy.deny_read = ["~/.ssh"]` and get no enforcement at all when no
+        // OS sandbox backend was active (NoopSandbox, or platforms without
+        // Bubblewrap/Landlock/Seatbelt).
         let resolved_sandbox =
             crate::sandbox_policy::SandboxPolicy::from_risk_profile(risk_profile, workspace_dir);
 
@@ -5700,9 +5702,9 @@ mod tests {
 
     #[test]
     fn sandbox_policy_deny_read_only_blocks_resolved_path_without_old_style_fields() {
-        // Exact scenario from Audacity88's #7821 review: an operator sets ONLY
-        // sandbox_policy.deny_read, with no old-style forbidden_paths/allowed_roots.
-        // Before the from_profiles migration this was accepted by the schema but
+        // An operator sets ONLY sandbox_policy.deny_read, with no old-style
+        // forbidden_paths/allowed_roots. Before the from_profiles migration this
+        // was accepted by the schema but
         // silently unenforced by the app-layer path guard (PathGuardedTool), since
         // is_resolved_path_readable only ever consulted forbidden_paths.
         let mut profile = crate::schema::RiskProfileConfig {
