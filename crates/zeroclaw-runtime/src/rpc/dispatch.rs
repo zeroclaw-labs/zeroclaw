@@ -4580,11 +4580,17 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             text: delta.clone(),
         },
-        TurnEvent::ToolCall { id, name, args } => SessionUpdateEvent::ToolCall {
+        TurnEvent::ToolCall {
+            id,
+            name,
+            args,
+            presentation,
+        } => SessionUpdateEvent::ToolCall {
             session_id: session_id.to_string(),
             tool_call_id: id.clone(),
             name: name.clone(),
             raw_input: args.clone(),
+            presentation: *presentation,
         },
         TurnEvent::ToolResult { id, name, output } => SessionUpdateEvent::ToolResult {
             session_id: session_id.to_string(),
@@ -4595,12 +4601,14 @@ fn notification_for_turn_event(
         TurnEvent::ApprovalRequest {
             request_id,
             tool_name,
+            presentation,
             arguments_summary,
             timeout_secs,
         } => SessionUpdateEvent::ApprovalRequest {
             session_id: session_id.to_string(),
             request_id: request_id.clone(),
             tool_name: tool_name.clone(),
+            presentation: *presentation,
             arguments_summary: arguments_summary.clone(),
             timeout_secs: *timeout_secs,
         },
@@ -5661,6 +5669,7 @@ mod tests {
             id: "tc_1".into(),
             name: "bash".into(),
             args: json!({"cmd": "ls"}),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);
@@ -5827,6 +5836,7 @@ mod tests {
         let event = TurnEvent::ApprovalRequest {
             request_id: "ar_1".into(),
             tool_name: "bash".into(),
+            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
             arguments_summary: "rm -rf /".into(),
             timeout_secs: 30,
         };

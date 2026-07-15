@@ -180,6 +180,7 @@ pub(crate) async fn consume_provider_streaming_response(
                             id,
                             name,
                             args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
+                            presentation: zeroclaw_api::tool::ToolPresentation::Generic,
                         })
                         .await;
                 }

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
+use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
@@ -66,6 +67,10 @@ impl Tool for McpToolWrapper {
             parameters: Arc::clone(&self.input_schema),
             output: None,
             param_domains: std::collections::BTreeMap::new(),
+            presentation: Some(zeroclaw_api::tool::default_tool_presentation(
+                self.role(),
+                &self.input_schema,
+            )),
         }
     }
 

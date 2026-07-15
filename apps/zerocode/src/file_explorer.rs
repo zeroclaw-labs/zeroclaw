@@ -1,7 +1,7 @@
 //! Reusable file explorer modal widget with multi-file selection.
 //!
 //! Browses the local filesystem where the TUI is running. Designed to
-//! be invoked from any pane (Chat, ACP, etc.).
+//! be invoked from the Code pane.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::keymap::{self, FileExplorerAction, FileExplorerSearchAction};
 use crate::theme;
 
 // ── Types ────────────────────────────────────────────────────────
@@ -252,7 +253,6 @@ impl FileExplorerState {
         let visible = self.visible_entries();
         let vis_len = visible.len();
 
-        use crate::keymap::FileExplorerAction;
         let action = FileExplorerAction::from_chord(&key);
         match action {
             Some(FileExplorerAction::Cancel) => ExplorerAction::Cancel,
@@ -388,7 +388,6 @@ impl FileExplorerState {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> ExplorerAction {
-        use crate::keymap::FileExplorerSearchAction;
         let action = FileExplorerSearchAction::from_chord(&key);
         match action {
             Some(FileExplorerSearchAction::Cancel) => {
@@ -583,20 +582,56 @@ impl FileExplorerState {
             footer_spans.push(Span::styled(&self.search_query, theme::body_style()));
             footer_spans.push(Span::styled("\u{2588}", theme::body_style()));
         } else if self.dir_picker {
-            footer_spans.push(Span::styled(
-                " j/k=move  l/h=in/out dir  c=choose dir  Enter=open  /=search  .=hidden  Esc=cancel",
-                theme::dim_style(),
-            ));
+            footer_spans.push(Span::styled(dir_picker_footer_hint(), theme::dim_style()));
         } else {
-            footer_spans.push(Span::styled(
-                " j/k=move  l/h=in/out dir  Space=select  Enter=confirm  /=search  .=hidden  Esc=cancel",
-                theme::dim_style(),
-            ));
+            footer_spans.push(Span::styled(file_picker_footer_hint(), theme::dim_style()));
         }
 
         let footer = Paragraph::new(Line::from(footer_spans)).style(theme::fill_style());
         f.render_widget(footer, chunks[1]);
     }
+}
+
+fn explorer_keys(action: FileExplorerAction) -> String {
+    keymap::action_key_labels(action).join("/")
+}
+
+fn dir_picker_footer_hint() -> String {
+    format!(
+        " {}=move  {}/{}=in/out dir  {}=choose dir  {}=open  {}=search  {}=hidden  {}=cancel",
+        [
+            keymap::action_key_labels(FileExplorerAction::Up),
+            keymap::action_key_labels(FileExplorerAction::Down),
+        ]
+        .concat()
+        .join("/"),
+        explorer_keys(FileExplorerAction::EnterDir),
+        explorer_keys(FileExplorerAction::LeaveDir),
+        explorer_keys(FileExplorerAction::ConfirmDir),
+        explorer_keys(FileExplorerAction::Activate),
+        explorer_keys(FileExplorerAction::BeginSearch),
+        explorer_keys(FileExplorerAction::ToggleHidden),
+        explorer_keys(FileExplorerAction::Cancel),
+    )
+}
+
+fn file_picker_footer_hint() -> String {
+    format!(
+        " {}=move  {}/{}=in/out dir  {}=select  {}=confirm  {}=search  {}=hidden  {}=cancel",
+        [
+            keymap::action_key_labels(FileExplorerAction::Up),
+            keymap::action_key_labels(FileExplorerAction::Down),
+        ]
+        .concat()
+        .join("/"),
+        explorer_keys(FileExplorerAction::EnterDir),
+        explorer_keys(FileExplorerAction::LeaveDir),
+        explorer_keys(FileExplorerAction::ToggleSelect),
+        explorer_keys(FileExplorerAction::Activate),
+        explorer_keys(FileExplorerAction::BeginSearch),
+        explorer_keys(FileExplorerAction::ToggleHidden),
+        explorer_keys(FileExplorerAction::Cancel),
+    )
 }
 
 impl crate::widgets::HelpContext for FileExplorerState {

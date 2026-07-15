@@ -13806,6 +13806,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
+ "shlex",
  "similar",
  "tempfile",
  "tokio",

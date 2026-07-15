@@ -17,12 +17,11 @@ use std::time::Duration;
 
 use clap::Parser;
 
-mod acp;
 mod app;
 mod attachment;
-mod chat;
 mod client;
 mod clipboard;
+mod code;
 mod color_depth;
 mod config;
 mod config_manager;
@@ -39,10 +38,10 @@ mod keymap;
 mod logs;
 mod mouse;
 mod quickstart_pane;
-mod sop_pane;
 mod theme;
-mod todo_tracker;
+mod transcript;
 mod turn_status;
+mod ui_render_spec;
 mod widgets;
 mod wire;
 mod zerocode_pane;
@@ -72,7 +71,7 @@ struct Cli {
     #[arg(long)]
     config_dir: Option<PathBuf>,
 
-    /// Start in chat mode with this agent alias.
+    /// Start in Code mode with this agent alias.
     /// If omitted, opens the config manager.
     #[arg(long, short = 'a')]
     agent: Option<String>,
@@ -371,7 +370,7 @@ async fn run_until_exit(
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
-    // the user into Chat once the daemon is back up.
+    // the user into Code once the daemon is back up.
     let reconnect_state: app::SharedReconnectState =
         Arc::new(std::sync::Mutex::new(app::CrossReconnectState::default()));
 
@@ -531,7 +530,7 @@ mod confirm_insecure_tls_tests {
     //!    [`abort_arm_of_confirm_match_must_not_call_persist`] enforces
     //!    the structural invariant that the `Abort` arm of the production
     //!    match in `run()` does not invoke `persist_wss_route_ack`.
-    //! 3. "Mode transition tests cover the quickstart/chat handoff" is
+    //! 3. "Mode transition tests cover the Quickstart/Code handoff" is
     //!    covered by the existing `connection_tests::flag_connect_*` /
     //!    `config_uri_*` / `skip_verify_*` tests; this issue does not
     //!    change `resolve_wss_target`'s contract.

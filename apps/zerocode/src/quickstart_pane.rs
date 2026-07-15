@@ -21,7 +21,6 @@ use std::sync::Arc;
 /// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
 const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
-const MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT: usize = 5;
 
 /// Upper bound on rendered secret-mask bullets. A pasted API key can be
 /// 100+ chars; one bullet per character wraps the masked value across
@@ -110,18 +109,6 @@ impl Selector {
         }
     }
 
-    fn from_step(step: QuickstartStep) -> Option<Self> {
-        match step {
-            QuickstartStep::ModelProvider => Some(Selector::ModelProvider),
-            QuickstartStep::RiskProfile => Some(Selector::RiskProfile),
-            QuickstartStep::RuntimeProfile => Some(Selector::RuntimeProfile),
-            QuickstartStep::Memory => Some(Selector::Memory),
-            QuickstartStep::Channels => Some(Selector::Channels),
-            QuickstartStep::PeerGroups => Some(Selector::PeerGroups),
-            QuickstartStep::Agent => Some(Selector::Agent),
-        }
-    }
-
     /// Localised title for the selector that owns a validation step, so
     /// a field error can name where the problem lives (e.g.
     /// `Model provider / alias: …`) instead of only a count.
@@ -165,60 +152,11 @@ fn retain_filled_selector_errors(
         .collect()
 }
 
-fn first_incomplete_required_selector(form: &FormState) -> Option<Selector> {
-    Selector::ALL.iter().copied().find(|sel| {
-        !matches!(
-            sel,
-            Selector::Submit | Selector::Channels | Selector::PeerGroups
-        ) && !form.is_satisfied(*sel)
-    })
-}
-
-fn incomplete_submit_error(form: &FormState) -> Option<QuickstartError> {
-    let sel = first_incomplete_required_selector(form)?;
-    let message_key = match sel {
-        Selector::ModelProvider => "zc-quickstart-missing-model-provider",
-        Selector::RiskProfile => "zc-quickstart-missing-risk-profile",
-        Selector::RuntimeProfile => "zc-quickstart-missing-runtime-profile",
-        Selector::Memory => "zc-quickstart-missing-memory",
-        Selector::Agent => "zc-quickstart-missing-agent",
-        Selector::Channels | Selector::PeerGroups | Selector::Submit => return None,
-    };
-    Some(QuickstartError {
-        step: sel.step(),
-        field: String::new(),
-        message: crate::i18n::t(message_key),
-    })
-}
-
-fn errors_include_selector(errors: &[QuickstartError], sel: Selector) -> bool {
-    let step = sel.step();
-    errors.iter().any(|e| e.step == step)
-}
-
-fn next_selector_index_after(sel: Selector, form: &FormState) -> Option<usize> {
-    let current = Selector::ALL.iter().position(|s| *s == sel)?;
-    let next = (current + 1).min(Selector::ALL.len().saturating_sub(1));
-
+fn next_selector_index_after(sel: Selector) -> Option<usize> {
     Selector::ALL
         .iter()
-        .enumerate()
-        .skip(next)
-        .find_map(|(idx, candidate)| {
-            if selector_needs_attention(*candidate, form) {
-                Some(idx)
-            } else {
-                None
-            }
-        })
-        .or(Some(next))
-}
-
-fn selector_needs_attention(sel: Selector, form: &FormState) -> bool {
-    match sel {
-        Selector::Submit => form.all_selectors_satisfied(),
-        _ => !form.is_satisfied(sel),
-    }
+        .position(|s| *s == sel)
+        .map(|idx| (idx + 1).min(Selector::ALL.len().saturating_sub(1)))
 }
 
 fn apply_model_catalog_result(form: &mut FieldFormModal, models: Option<Vec<String>>) {
@@ -242,9 +180,7 @@ fn opt(value: &str, label: impl Into<String>, help: impl Into<String>) -> Picker
         value: value.to_string(),
         label: label.into(),
         help: help.into(),
-        kind: PickerOptionKind::Choice {
-            use_existing: false,
-        },
+        use_existing: false,
     }
 }
 
@@ -253,50 +189,20 @@ fn existing_opt(alias: String) -> PickerOption {
         label: format!("Use existing: {alias}"),
         value: alias,
         help: crate::i18n::t("zc-quickstart-reuse-alias-help"),
-        kind: PickerOptionKind::Choice { use_existing: true },
+        use_existing: true,
     }
 }
 
-fn existing_provider_opt(alias: String) -> PickerOption {
-    PickerOption {
-        label: alias.clone(),
-        value: alias,
-        help: crate::i18n::t("zc-quickstart-reuse-alias-help"),
-        kind: PickerOptionKind::Choice { use_existing: true },
-    }
-}
-
-fn header_opt(label: impl Into<String>) -> PickerOption {
-    PickerOption {
-        value: String::new(),
-        label: label.into(),
-        help: String::new(),
-        kind: PickerOptionKind::Header,
-    }
-}
-
-fn existing_provider_toggle_opt(hidden_count: usize, expanded: bool) -> PickerOption {
-    let label = if expanded {
-        format!(
-            "  {}",
-            crate::i18n::t("zc-quickstart-existing-providers-show-fewer")
-        )
-    } else {
-        let count = hidden_count.to_string();
-        format!(
-            "  {}",
-            crate::i18n::t_args(
-                "zc-quickstart-existing-providers-show-more",
-                &[("count", count.as_str())],
-            )
-        )
-    };
-    PickerOption {
-        value: String::new(),
-        label,
-        help: String::new(),
-        kind: PickerOptionKind::ExistingProviderToggle { expanded },
-    }
+#[cfg(test)]
+fn current_provider_picker_cursor(options: &[PickerOption], form: &FormState) -> usize {
+    let existing = format!("{}.{}", form.provider_type, form.provider_alias);
+    options
+        .iter()
+        .position(|option| match form.provider_mode {
+            SelectorMode::Existing => option.use_existing && option.value == existing,
+            SelectorMode::Fresh => !option.use_existing && option.value == form.provider_type,
+        })
+        .unwrap_or(0)
 }
 
 fn in_rect(col: u16, row: u16, r: Rect) -> bool {
@@ -316,12 +222,12 @@ fn queue_apply_handoff(
         return None;
     };
     if daemon_restarted {
-        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect(
+        guard.pending_quickstart_code = Some(crate::app::PendingQuickstartCode::AfterReconnect(
             alias.clone(),
         ));
         Some(alias)
     } else {
-        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::Immediate(alias));
+        guard.pending_quickstart_code = Some(crate::app::PendingQuickstartCode::Immediate(alias));
         None
     }
 }
@@ -431,7 +337,12 @@ fn memory_options() -> Vec<PickerOption> {
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{kind:?}").to_lowercase());
-            opt(&wire, wire.clone(), String::new())
+            PickerOption {
+                value: wire.clone(),
+                label: wire,
+                help: String::new(),
+                use_existing: false,
+            }
         })
         .collect()
 }
@@ -456,65 +367,9 @@ fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<Picker
             } else {
                 crate::i18n::t("zc-quickstart-provider-cloud")
             },
-            kind: PickerOptionKind::Choice {
-                use_existing: false,
-            },
+            use_existing: false,
         })
         .collect()
-}
-
-fn ordered_existing_provider_refs(existing: &[String]) -> Vec<String> {
-    let mut refs: Vec<String> = existing.to_vec();
-    refs.sort_by(|a, b| {
-        let rank = |value: &str| {
-            if value == "openrouter.default" {
-                0
-            } else if value.ends_with(".default") {
-                1
-            } else {
-                2
-            }
-        };
-        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-    });
-    refs
-}
-
-fn model_provider_picker_options(
-    snapshot: Option<&QuickstartStateResult>,
-    existing_expanded: bool,
-) -> Vec<PickerOption> {
-    let Some(snap) = snapshot else {
-        return Vec::new();
-    };
-
-    let mut options = Vec::new();
-    let existing = ordered_existing_provider_refs(&snap.model_providers);
-    if !existing.is_empty() {
-        options.push(header_opt(crate::i18n::t(
-            "zc-quickstart-existing-providers-heading",
-        )));
-        let visible_count = if existing_expanded {
-            existing.len()
-        } else {
-            existing.len().min(MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT)
-        };
-        for alias in existing.iter().take(visible_count) {
-            options.push(existing_provider_opt(alias.clone()));
-        }
-        if existing.len() > MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT {
-            options.push(existing_provider_toggle_opt(
-                existing.len() - MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT,
-                existing_expanded,
-            ));
-        }
-    }
-
-    options.push(header_opt(crate::i18n::t(
-        "zc-quickstart-new-provider-heading",
-    )));
-    options.extend(provider_type_options(snapshot));
-    options
 }
 
 fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
@@ -530,9 +385,7 @@ fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerO
             value: t.kind.clone(),
             label: t.display_name.clone(),
             help: format!("Configure a new {} channel.", t.display_name),
-            kind: PickerOptionKind::Choice {
-                use_existing: false,
-            },
+            use_existing: false,
         })
         .collect()
 }
@@ -652,10 +505,6 @@ impl FormState {
                 )
             })
             .all(|s| self.is_satisfied(*s))
-    }
-
-    fn selector_is_complete(&self, sel: Selector, errors: &[QuickstartError]) -> bool {
-        self.is_satisfied(sel) && !errors_include_selector(errors, sel)
     }
 
     fn summary(&self, sel: Selector) -> String {
@@ -886,21 +735,6 @@ struct FileEditorState {
     cursor_col: usize,
 }
 
-fn personality_file_needs_template(agent: &AgentModal, filename: &str) -> bool {
-    agent
-        .files
-        .get(filename)
-        .map(|content| content.trim().is_empty())
-        .unwrap_or(true)
-}
-
-fn advance_agent_modal_after_file(agent: &mut AgentModal) {
-    let row_count = agent.filenames.len() + 2;
-    if agent.cursor + 1 < row_count {
-        agent.cursor += 1;
-    }
-}
-
 impl FileEditorState {
     fn new(filename: String, content: String) -> Self {
         let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
@@ -1027,13 +861,6 @@ fn byte_index_at_char(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PickerOptionKind {
-    Choice { use_existing: bool },
-    Header,
-    ExistingProviderToggle { expanded: bool },
-}
-
 #[derive(Clone)]
 struct PickerOption {
     /// Wire-side value written back into [`FormState`].
@@ -1042,31 +869,17 @@ struct PickerOption {
     label: String,
     /// One-line help / blurb.
     help: String,
-    kind: PickerOptionKind,
-}
-
-impl PickerOption {
-    fn is_selectable(&self) -> bool {
-        !matches!(self.kind, PickerOptionKind::Header)
-    }
-
-    fn use_existing(&self) -> bool {
-        matches!(self.kind, PickerOptionKind::Choice { use_existing: true })
-    }
-
-    fn existing_provider_toggle_expanded(&self) -> Option<bool> {
-        match self.kind {
-            PickerOptionKind::ExistingProviderToggle { expanded } => Some(expanded),
-            _ => None,
-        }
-    }
+    /// `true` when this option points at an already-configured alias
+    /// (`SelectorChoice::Existing`). `false` for fresh presets / type
+    /// rows that build a `SelectorChoice::Fresh`.
+    use_existing: bool,
 }
 
 pub struct QuickstartPane {
     rpc: Arc<RpcClient>,
     /// Shared state that survives the daemon-reload reconnect. Used
     /// by Stage 2 to hand the new agent's alias to the next
-    /// `app::run` iteration so the user lands directly in Chat.
+    /// `app::run` iteration so the user lands directly in Code.
     reconnect_state: crate::app::SharedReconnectState,
     form: FormState,
     list_state: ListState,
@@ -1217,8 +1030,6 @@ impl QuickstartPane {
                     if matches!(sel, Selector::Submit) {
                         if self.can_create() {
                             self.submit().await;
-                        } else {
-                            self.report_incomplete_submit();
                         }
                     } else {
                         self.open_modal_for(sel);
@@ -1229,8 +1040,6 @@ impl QuickstartPane {
             Some(QuickstartTabAction::Create) => {
                 if self.can_create() {
                     self.submit().await;
-                } else {
-                    self.report_incomplete_submit();
                 }
                 false
             }
@@ -1309,9 +1118,6 @@ impl QuickstartPane {
                         .enumerate()
                         .find(|(_, r)| in_rect(col, row, **r))
                     {
-                        if !self.modal_row_is_selectable(idx) {
-                            return;
-                        }
                         self.set_modal_cursor(idx);
                         // Synthesise the same Enter behaviour the
                         // keyboard takes.
@@ -1349,8 +1155,6 @@ impl QuickstartPane {
                         if matches!(sel, Selector::Submit) {
                             if self.can_create() {
                                 self.submit().await;
-                            } else {
-                                self.report_incomplete_submit();
                             }
                         } else {
                             self.open_modal_for(sel);
@@ -1409,7 +1213,7 @@ impl QuickstartPane {
         };
         match modal {
             Modal::Picker(p) => {
-                if p.options.get(idx).is_some_and(PickerOption::is_selectable) {
+                if idx < p.options.len() {
                     p.cursor = idx;
                 }
             }
@@ -1439,14 +1243,6 @@ impl QuickstartPane {
         }
     }
 
-    fn modal_row_is_selectable(&self, idx: usize) -> bool {
-        match self.active_modal.as_ref() {
-            Some(Modal::Picker(p)) => p.options.get(idx).is_some_and(PickerOption::is_selectable),
-            Some(Modal::TextInput(_)) | None => false,
-            _ => true,
-        }
-    }
-
     fn move_selection(&mut self, delta: i32) {
         let len = Selector::ALL.len() as i32;
         let current = self.list_state.selected().unwrap_or(0) as i32;
@@ -1455,31 +1251,8 @@ impl QuickstartPane {
     }
 
     fn advance_after_completed(&mut self, sel: Selector) {
-        if let Some(next) = next_selector_index_after(sel, &self.form) {
+        if let Some(next) = next_selector_index_after(sel) {
             self.list_state.select(Some(next));
-        }
-    }
-
-    fn keep_selector_selected(&mut self, sel: Selector) {
-        if let Some(idx) = Selector::ALL.iter().position(|candidate| *candidate == sel) {
-            self.list_state.select(Some(idx));
-        }
-    }
-
-    fn advance_after_validated(&mut self, sel: Selector) {
-        if errors_include_selector(&self.last_errors, sel) {
-            self.keep_selector_selected(sel);
-        } else {
-            self.advance_after_completed(sel);
-        }
-    }
-
-    fn report_incomplete_submit(&mut self) {
-        if let Some(error) = incomplete_submit_error(&self.form) {
-            if let Some(sel) = Selector::from_step(error.step) {
-                self.keep_selector_selected(sel);
-            }
-            self.last_errors = vec![error];
         }
     }
 
@@ -1511,13 +1284,18 @@ impl QuickstartPane {
                 }));
             }
             Selector::ModelProvider => {
-                let options = model_provider_picker_options(self.state_snapshot.as_ref(), false);
-                let cursor = current_provider_picker_cursor(&options, &self.form);
+                let mut options: Vec<PickerOption> =
+                    provider_type_options(self.state_snapshot.as_ref());
+                if let Some(snap) = &self.state_snapshot {
+                    for alias in &snap.model_providers {
+                        options.push(existing_opt(alias.clone()));
+                    }
+                }
                 self.active_modal = Some(Modal::Picker(PickerModal {
                     selector: sel,
                     purpose: PickerPurpose::ProviderType,
                     options,
-                    cursor,
+                    cursor: 0,
                 }));
             }
             Selector::Channels => {
@@ -1600,37 +1378,15 @@ impl QuickstartPane {
                 Some(QuickstartModalAction::Cancel) => {
                     self.active_modal = None;
                 }
-                Some(QuickstartModalAction::Up) => {
-                    if let Some(next) = adjacent_selectable_option_index(&p.options, p.cursor, -1) {
-                        p.cursor = next;
-                    }
+                Some(QuickstartModalAction::Up) if p.cursor > 0 => {
+                    p.cursor -= 1;
                 }
-                Some(QuickstartModalAction::Down) => {
-                    if let Some(next) = adjacent_selectable_option_index(&p.options, p.cursor, 1) {
-                        p.cursor = next;
-                    }
+                Some(QuickstartModalAction::Down) if p.cursor + 1 < p.options.len() => {
+                    p.cursor += 1;
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    if let Some(expanded) = p.options[p.cursor].existing_provider_toggle_expanded()
-                    {
-                        p.options =
-                            model_provider_picker_options(self.state_snapshot.as_ref(), !expanded);
-                        p.cursor = p
-                            .options
-                            .iter()
-                            .position(|option| {
-                                option.existing_provider_toggle_expanded() == Some(!expanded)
-                            })
-                            .unwrap_or_else(|| {
-                                nearest_selectable_option_index(&p.options, p.cursor)
-                            });
-                        return;
-                    }
-                    if !p.options[p.cursor].is_selectable() {
-                        return;
-                    }
                     let chosen = p.options[p.cursor].value.clone();
-                    let use_existing = p.options[p.cursor].use_existing();
+                    let use_existing = p.options[p.cursor].use_existing;
                     let selector = p.selector;
                     let purpose = p.purpose;
                     match (purpose, use_existing) {
@@ -1638,13 +1394,13 @@ impl QuickstartPane {
                             self.apply_picker_choice(selector, chosen, use_existing);
                             self.active_modal = None;
                             self.revalidate().await;
-                            self.advance_after_validated(selector);
+                            self.advance_after_completed(selector);
                         }
                         (PickerPurpose::ProviderType, true) => {
                             self.adopt_existing_provider(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
-                            self.advance_after_validated(selector);
+                            self.advance_after_completed(selector);
                         }
                         (PickerPurpose::ProviderType, false) => {
                             self.active_modal = None;
@@ -1659,7 +1415,7 @@ impl QuickstartPane {
                             self.adopt_existing_channel(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
-                            self.advance_after_validated(selector);
+                            self.advance_after_completed(selector);
                         }
                         (PickerPurpose::ChannelType, false) => {
                             self.active_modal = None;
@@ -1775,11 +1531,9 @@ impl QuickstartPane {
                             Some(Modal::ChannelList(ChannelListModal { cursor: 0 }));
                     } else {
                         self.active_modal = None;
+                        self.advance_after_completed(selector);
                     }
                     self.revalidate().await;
-                    if !from_channel {
-                        self.advance_after_validated(selector);
-                    }
                 }
                 Some(QuickstartModalAction::Left) => {
                     let variants = f
@@ -1876,8 +1630,7 @@ impl QuickstartPane {
                             }));
                         } else if cl.cursor == drafts + 1 {
                             self.active_modal = None;
-                            self.revalidate().await;
-                            self.advance_after_validated(Selector::Channels);
+                            self.advance_after_completed(Selector::Channels);
                         }
                     }
                     _ => {}
@@ -1916,8 +1669,7 @@ impl QuickstartPane {
                             }
                         } else if pl.cursor == drafts + 1 {
                             self.active_modal = None;
-                            self.revalidate().await;
-                            self.advance_after_validated(Selector::PeerGroups);
+                            self.advance_after_completed(Selector::PeerGroups);
                         }
                     }
                     _ => {}
@@ -1964,30 +1716,7 @@ impl QuickstartPane {
                         self.commit_agent_modal();
                         self.active_modal = None;
                         self.revalidate().await;
-                        self.advance_after_validated(Selector::Agent);
-                    }
-                    Some(QuickstartModalAction::Confirm) if on_file => {
-                        let filename = a.filenames[a.cursor - 1].clone();
-                        if !personality_file_needs_template(a, &filename) {
-                            advance_agent_modal_after_file(a);
-                            return;
-                        }
-                        let agent_name = a.name.trim().to_string();
-                        let templated = self
-                            .fetch_personality_template(&filename, Some(agent_name.as_str()))
-                            .await;
-                        match templated {
-                            Some(content) => {
-                                if let Some(Modal::Agent(a)) = self.active_modal.as_mut() {
-                                    a.files.insert(filename, content);
-                                    advance_agent_modal_after_file(a);
-                                }
-                                self.last_errors.clear();
-                            }
-                            None => {
-                                self.last_errors = vec![missing_template_error(&filename)];
-                            }
-                        }
+                        self.advance_after_completed(Selector::Agent);
                     }
                     Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down)
                         if a.cursor + 1 < row_count =>
@@ -2133,7 +1862,12 @@ impl QuickstartPane {
         refs.sort();
         refs.dedup();
         refs.into_iter()
-            .map(|r| opt(&r, r.clone(), String::new()))
+            .map(|r| PickerOption {
+                label: r.clone(),
+                value: r,
+                help: String::new(),
+                use_existing: false,
+            })
             .collect()
     }
 
@@ -2183,8 +1917,7 @@ impl QuickstartPane {
         // frozen modal while the catalog RPC runs. The row builder also
         // handles bool toggles, enum defaults, and the synthetic model
         // provider alias row.
-        let mut rows = build_field_form_rows(section, fields, None);
-        restore_field_form_rows_from_form(section, &type_key, &mut rows, &self.form);
+        let rows = build_field_form_rows(section, fields, None);
         let model_catalog_state = if is_model_provider {
             ModelCatalogState::Pending
         } else {
@@ -2292,18 +2025,6 @@ impl QuickstartPane {
                     message: format!("Required field `{k}` is empty"),
                 })
                 .collect();
-            return false;
-        }
-        if let Some(error) = model_provider_alias_duplicate_error(self.state_snapshot.as_ref(), f) {
-            let alias_idx = f
-                .fields
-                .iter()
-                .position(|row| row.descriptor.key == "alias")
-                .unwrap_or(0);
-            self.last_errors = vec![error];
-            if let Some(Modal::FieldForm(form)) = self.active_modal.as_mut() {
-                form.cursor = alias_idx;
-            }
             return false;
         }
         match f.selector {
@@ -2417,7 +2138,7 @@ impl QuickstartPane {
     }
 
     fn can_create(&self) -> bool {
-        self.form.all_selectors_satisfied() && self.last_errors.is_empty() && !self.busy
+        self.form.all_selectors_satisfied() && !self.busy
     }
 
     async fn submit(&mut self) {
@@ -2446,9 +2167,16 @@ impl QuickstartPane {
     }
 
     fn handle_apply_success(&mut self, agent: AppliedAgent, daemon_restarted: bool) {
-        // A real daemon reload must survive the old connection closing:
-        // use the immediate handoff only when the daemon reports that no
-        // reconnect is needed.
+        // Arm the Stage-2 hand-off **before** any daemon reload can kick
+        // in. When reload is signalled the socket dies shortly after
+        // this returns, the TUI waits during the disconnect, and the
+        // next `app::run` pane rebuild consumes the pending reconnect
+        // Code handoff.
+        //
+        // Test/standalone daemons can report `daemon_restarted = false`.
+        // In that case no disconnect is coming, so freezing Quickstart
+        // behind `applied_alias` strands the user. Queue an immediate
+        // connected-client handoff instead.
         self.applied_alias =
             queue_apply_handoff(&self.reconnect_state, agent.alias, daemon_restarted);
         self.last_errors.clear();
@@ -2466,7 +2194,7 @@ impl QuickstartPane {
         let items: Vec<ListItem> = Selector::ALL
             .iter()
             .map(|sel| {
-                let satisfied = self.form.selector_is_complete(*sel, &self.last_errors);
+                let satisfied = self.form.is_satisfied(*sel);
                 let glyph_style = if satisfied {
                     Style::default()
                         .fg(Color::Green)
@@ -2513,10 +2241,6 @@ impl QuickstartPane {
         } else if let Some(alias) = &self.applied_alias {
             crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
         } else if let Some(first) = self.last_errors.first() {
-            // Name the first actionable field error so the user knows
-            // which field is invalid, instead of only a count. The
-            // daemon's message often already carries the specifics
-            // (e.g. "alias openai.default already exists").
             let where_ = Selector::title_for_step(first.step);
             let field_part = if first.field.is_empty() {
                 String::new()
@@ -2546,12 +2270,14 @@ impl QuickstartPane {
         } else {
             crate::i18n::t_args("zc-quickstart-status-hint", &[("chord", "c")])
         };
-        let style = if self.applied_alias.is_some() || can_create {
+        let style = if self.applied_alias.is_some() {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else if !self.last_errors.is_empty() {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else if can_create {
+            theme::accent_style()
         } else {
             theme::dim_style()
         };
@@ -2612,180 +2338,6 @@ fn apply_model_catalog_to_rows(rows: &mut [FieldFormRow], model_catalog: Option<
             row.descriptor.enum_variants = Some(models.to_vec());
             if !models.contains(&row.buf) {
                 row.buf = models[0].clone();
-            }
-        }
-    }
-}
-
-fn first_selectable_option_index(options: &[PickerOption]) -> usize {
-    options
-        .iter()
-        .position(PickerOption::is_selectable)
-        .unwrap_or(0)
-}
-
-fn nearest_selectable_option_index(options: &[PickerOption], preferred: usize) -> usize {
-    if options
-        .get(preferred)
-        .is_some_and(PickerOption::is_selectable)
-    {
-        return preferred;
-    }
-    options
-        .iter()
-        .enumerate()
-        .skip(preferred.saturating_add(1))
-        .find(|(_, option)| option.is_selectable())
-        .map(|(idx, _)| idx)
-        .or_else(|| {
-            options
-                .iter()
-                .enumerate()
-                .take(preferred)
-                .rev()
-                .find(|(_, option)| option.is_selectable())
-                .map(|(idx, _)| idx)
-        })
-        .unwrap_or(0)
-}
-
-fn adjacent_selectable_option_index(
-    options: &[PickerOption],
-    current: usize,
-    delta: i32,
-) -> Option<usize> {
-    if delta < 0 {
-        options
-            .iter()
-            .enumerate()
-            .take(current)
-            .rev()
-            .find(|(_, option)| option.is_selectable())
-            .map(|(idx, _)| idx)
-    } else {
-        options
-            .iter()
-            .enumerate()
-            .skip(current.saturating_add(1))
-            .find(|(_, option)| option.is_selectable())
-            .map(|(idx, _)| idx)
-    }
-}
-
-fn wrapped_selectable_option_index(options: &[PickerOption], current: usize, delta: i32) -> usize {
-    if options.is_empty() {
-        return 0;
-    }
-    let mut next = current.min(options.len().saturating_sub(1));
-    for _ in 0..options.len() {
-        next = (next as i32 + delta).rem_euclid(options.len() as i32) as usize;
-        if options[next].is_selectable() {
-            return next;
-        }
-    }
-    current.min(options.len().saturating_sub(1))
-}
-
-fn current_provider_picker_cursor(options: &[PickerOption], form: &FormState) -> usize {
-    if form.provider_type.is_empty() {
-        return first_selectable_option_index(options);
-    }
-
-    let target = if form.provider_mode == SelectorMode::Existing && !form.provider_alias.is_empty()
-    {
-        format!("{}.{}", form.provider_type, form.provider_alias)
-    } else {
-        form.provider_type.clone()
-    };
-
-    options
-        .iter()
-        .position(|o| o.value == target && o.is_selectable())
-        .unwrap_or_else(|| first_selectable_option_index(options))
-}
-
-fn model_provider_alias_value(form: &FieldFormModal) -> String {
-    form.fields
-        .iter()
-        .find(|row| row.descriptor.key == "alias")
-        .map(|row| row.buf.trim().to_string())
-        .filter(|alias| !alias.is_empty())
-        .unwrap_or_else(|| form.alias.clone())
-}
-
-fn model_provider_alias_duplicate_error(
-    snapshot: Option<&QuickstartStateResult>,
-    form: &FieldFormModal,
-) -> Option<QuickstartError> {
-    if form.selector != Selector::ModelProvider {
-        return None;
-    }
-    let alias = model_provider_alias_value(form);
-    if alias.trim().is_empty() {
-        return None;
-    }
-    let dotted = format!("{}.{}", form.type_key, alias.trim());
-    let exists = snapshot?
-        .model_providers
-        .iter()
-        .any(|existing| existing == &dotted);
-    if !exists {
-        return None;
-    }
-    Some(QuickstartError {
-        step: QuickstartStep::ModelProvider,
-        field: "alias".into(),
-        message: crate::i18n::t_args(
-            "zc-quickstart-provider-alias-exists",
-            &[("alias", dotted.as_str())],
-        ),
-    })
-}
-
-fn current_field_form_duplicate_error(
-    snapshot: Option<&QuickstartStateResult>,
-    form: &FieldFormModal,
-) -> Option<QuickstartError> {
-    let row = form.fields.get(form.cursor)?;
-    if row.descriptor.key != "alias" {
-        return None;
-    }
-    model_provider_alias_duplicate_error(snapshot, form)
-}
-
-fn current_field_form_row_is_model_provider_alias(form: &FieldFormModal) -> bool {
-    form.selector == Selector::ModelProvider
-        && form
-            .fields
-            .get(form.cursor)
-            .is_some_and(|row| row.descriptor.key == "alias")
-}
-
-fn restore_field_form_rows_from_form(
-    section: QuickstartFieldSection,
-    type_key: &str,
-    rows: &mut [FieldFormRow],
-    form: &FormState,
-) {
-    if !matches!(section, QuickstartFieldSection::ModelProvider)
-        || form.provider_type != type_key
-        || form.provider_mode != SelectorMode::Fresh
-    {
-        return;
-    }
-
-    for row in rows {
-        match row.descriptor.key.as_str() {
-            "alias" if !form.provider_alias.is_empty() => {
-                row.buf = form.provider_alias.clone();
-            }
-            "model" if !form.model.is_empty() => {
-                row.buf = form.model.clone();
-            }
-            key => {
-                if let Some(value) = form.provider_fields.get(key) {
-                    row.buf = value.clone();
-                }
             }
         }
     }
@@ -2864,6 +2416,46 @@ fn field_row_variants(row: &FieldFormRow) -> Option<&[String]> {
         return Some(variants);
     }
     None
+}
+
+fn wrapped_selectable_option_index(options: &[PickerOption], cursor: usize, delta: i32) -> usize {
+    if options.is_empty() {
+        return cursor;
+    }
+    (cursor as i32 + delta).rem_euclid(options.len() as i32) as usize
+}
+
+fn current_field_form_row_is_model_provider_alias(form: &FieldFormModal) -> bool {
+    matches!(form.selector, Selector::ModelProvider)
+        && form
+            .fields
+            .get(form.cursor)
+            .is_some_and(|row| row.descriptor.key == "alias")
+}
+
+fn current_field_form_duplicate_error(
+    snapshot: Option<&QuickstartStateResult>,
+    form: &FieldFormModal,
+) -> Option<QuickstartError> {
+    if !current_field_form_row_is_model_provider_alias(form) {
+        return None;
+    }
+    let row = form.fields.get(form.cursor)?;
+    let alias = row.buf.trim();
+    if alias.is_empty() {
+        return None;
+    }
+    let full_ref = format!("{}.{}", form.type_key, alias);
+    snapshot
+        .is_some_and(|state| state.model_providers.iter().any(|item| item == &full_ref))
+        .then(|| QuickstartError {
+            step: QuickstartStep::ModelProvider,
+            field: "alias".to_string(),
+            message: crate::i18n::t_args(
+                "zc-quickstart-error-alias-exists",
+                &[("alias", &full_ref)],
+            ),
+        })
 }
 
 fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
@@ -3549,126 +3141,6 @@ mod tests {
         f
     }
 
-    fn model_provider_snapshot(existing: Vec<&str>) -> QuickstartStateResult {
-        QuickstartStateResult {
-            quickstart_completed: false,
-            agents: Vec::new(),
-            risk_profiles: Vec::new(),
-            runtime_profiles: Vec::new(),
-            model_providers: existing.into_iter().map(str::to_string).collect(),
-            channels: Vec::new(),
-            unassigned_channels: Vec::new(),
-            storage: Vec::new(),
-            model_provider_types: vec![
-                crate::client::QuickstartTypeOption {
-                    kind: "openrouter".into(),
-                    display_name: "OpenRouter".into(),
-                    local: false,
-                },
-                crate::client::QuickstartTypeOption {
-                    kind: "anthropic".into(),
-                    display_name: "Anthropic".into(),
-                    local: false,
-                },
-                crate::client::QuickstartTypeOption {
-                    kind: "ollama".into(),
-                    display_name: "Ollama".into(),
-                    local: true,
-                },
-            ],
-            channel_types: Vec::new(),
-            risk_presets: Vec::new(),
-            runtime_presets: Vec::new(),
-            memory_kinds: Vec::new(),
-            personality_files: Vec::new(),
-        }
-    }
-
-    fn selectable_labels(options: &[PickerOption]) -> Vec<&str> {
-        options
-            .iter()
-            .filter(|option| option.is_selectable())
-            .map(|option| option.label.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn model_provider_picker_groups_existing_first_without_hiding_new_provider() {
-        let snap = model_provider_snapshot(vec!["openrouter.default", "openai.gpt5"]);
-
-        let options = model_provider_picker_options(Some(&snap), false);
-        let labels = selectable_labels(&options);
-
-        assert_eq!(labels[0], "openrouter.default");
-        assert_eq!(labels[1], "openai.gpt5");
-        assert!(
-            labels.contains(&"OpenRouter"),
-            "create-new provider rows must remain visible"
-        );
-    }
-
-    #[test]
-    fn model_provider_picker_collapses_existing_provider_overflow() {
-        let snap = model_provider_snapshot(vec![
-            "openrouter.default",
-            "openai.gpt5",
-            "anthropic.sonnet",
-            "anthropic.haiku",
-            "ollama.local",
-            "groq.default",
-            "xai.grok",
-        ]);
-
-        let collapsed = model_provider_picker_options(Some(&snap), false);
-        let collapsed_labels = selectable_labels(&collapsed);
-        assert!(collapsed_labels.contains(&"  [+ Show 2 more existing providers]"));
-        assert!(!collapsed_labels.contains(&"xai.grok"));
-
-        let expanded = model_provider_picker_options(Some(&snap), true);
-        let expanded_labels = selectable_labels(&expanded);
-        assert!(expanded_labels.contains(&"xai.grok"));
-        assert!(expanded_labels.contains(&"  [- Show fewer existing providers]"));
-        assert!(expanded_labels.contains(&"OpenRouter"));
-    }
-
-    #[test]
-    fn model_provider_alias_duplicate_is_caught_from_snapshot() {
-        let snap = model_provider_snapshot(vec!["openrouter.default"]);
-        let mut form = FieldFormModal {
-            selector: Selector::ModelProvider,
-            type_key: "openrouter".into(),
-            alias: "default".into(),
-            model_catalog_state: ModelCatalogState::NotApplicable,
-            model_catalog_attempts: 0,
-            fields: vec![model_provider_alias_row()],
-            cursor: 0,
-        };
-        form.fields[0].buf = "default".into();
-
-        let error = model_provider_alias_duplicate_error(Some(&snap), &form).expect("duplicate");
-
-        assert_eq!(error.step, QuickstartStep::ModelProvider);
-        assert_eq!(error.field, "alias");
-        assert!(error.message.contains("openrouter.default"));
-    }
-
-    #[test]
-    fn model_provider_alias_duplicate_check_allows_new_aliases() {
-        let snap = model_provider_snapshot(vec!["openrouter.default"]);
-        let mut form = FieldFormModal {
-            selector: Selector::ModelProvider,
-            type_key: "openrouter".into(),
-            alias: "default".into(),
-            model_catalog_state: ModelCatalogState::NotApplicable,
-            model_catalog_attempts: 0,
-            fields: vec![model_provider_alias_row()],
-            cursor: 0,
-        };
-        form.fields[0].buf = "work".into();
-
-        assert!(model_provider_alias_duplicate_error(Some(&snap), &form).is_none());
-    }
-
     #[test]
     fn submit_is_excluded_from_completeness() {
         // Regression: can_create walked Selector::ALL including Submit,
@@ -3690,20 +3162,6 @@ mod tests {
         let mut f = complete_form();
         f.agent_name.clear();
         assert!(!f.all_selectors_satisfied());
-    }
-
-    #[test]
-    fn incomplete_submit_reports_first_missing_required_selector() {
-        let mut f = complete_form();
-        f.channels.clear();
-        f.peer_groups.clear();
-        f.agent_name.clear();
-
-        let error = incomplete_submit_error(&f).expect("missing required selector");
-
-        assert_eq!(error.step, QuickstartStep::Agent);
-        assert_eq!(error.field, String::new());
-        assert!(error.message.contains("Name the agent"));
     }
 
     #[test]
@@ -3730,13 +3188,13 @@ mod tests {
 
         f.channels.push(ChannelDraft {
             channel_type: "telegram".into(),
-            alias: "chat".into(),
+            alias: "code".into(),
             token: None,
             mode: SelectorMode::Fresh,
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {
             name: "crew".into(),
-            channel: "telegram.chat".into(),
+            channel: "telegram.code".into(),
             external_peers: vec!["123".into()],
             ignore: Vec::new(),
         });
@@ -3747,7 +3205,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_handoff_waits_for_reconnect_when_reload_was_signalled() {
+    fn apply_handoff_starts_code_and_preserves_reconnect_when_reload_was_signalled() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(
             crate::app::CrossReconnectState::default(),
         ));
@@ -3757,15 +3215,15 @@ mod tests {
 
         assert_eq!(applied_alias.as_deref(), Some("agent-a"));
         assert_eq!(
-            guard.pending_quickstart_chat,
-            Some(crate::app::PendingQuickstartChat::AfterReconnect(
+            guard.pending_quickstart_code,
+            Some(crate::app::PendingQuickstartCode::AfterReconnect(
                 "agent-a".into()
             ))
         );
     }
 
     #[test]
-    fn apply_handoff_starts_chat_immediately_without_reload_signal() {
+    fn apply_handoff_starts_code_immediately_without_reload_signal() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(
             crate::app::CrossReconnectState::default(),
         ));
@@ -3775,11 +3233,51 @@ mod tests {
 
         assert!(applied_alias.is_none());
         assert_eq!(
-            guard.pending_quickstart_chat,
-            Some(crate::app::PendingQuickstartChat::Immediate(
+            guard.pending_quickstart_code,
+            Some(crate::app::PendingQuickstartCode::Immediate(
                 "agent-a".into()
             ))
         );
+    }
+
+    #[test]
+    fn duplicate_model_provider_alias_error_uses_i18n() {
+        let snapshot = QuickstartStateResult {
+            quickstart_completed: false,
+            agents: Vec::new(),
+            risk_profiles: Vec::new(),
+            runtime_profiles: Vec::new(),
+            model_providers: vec!["openai.default".to_string()],
+            channels: Vec::new(),
+            unassigned_channels: Vec::new(),
+            storage: Vec::new(),
+            model_provider_types: Vec::new(),
+            channel_types: Vec::new(),
+            risk_presets: Vec::new(),
+            runtime_presets: Vec::new(),
+            memory_kinds: Vec::new(),
+            personality_files: Vec::new(),
+        };
+        let form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openai".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::NotApplicable,
+            model_catalog_attempts: 0,
+            fields: vec![model_provider_alias_row()],
+            cursor: 0,
+        };
+
+        let error = current_field_form_duplicate_error(Some(&snapshot), &form).unwrap();
+
+        assert_eq!(
+            error.message,
+            crate::i18n::t_args(
+                "zc-quickstart-error-alias-exists",
+                &[("alias", "openai.default")]
+            )
+        );
+        assert_ne!(error.message, "alias openai.default already exists");
     }
 
     #[test]
@@ -3927,12 +3425,17 @@ mod tests {
         );
 
         let mut rows = build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None);
-        restore_field_form_rows_from_form(
-            QuickstartFieldSection::ModelProvider,
-            "openai",
-            &mut rows,
-            &form,
-        );
+        for row in &mut rows {
+            match row.descriptor.key.as_str() {
+                "alias" => row.buf = form.provider_alias.clone(),
+                "model" => row.buf = form.model.clone(),
+                key => {
+                    if let Some(value) = form.provider_fields.get(key) {
+                        row.buf = value.clone();
+                    }
+                }
+            }
+        }
 
         assert_eq!(rows[0].descriptor.key, "alias");
         assert_eq!(rows[0].buf, "work");
@@ -4085,52 +3588,17 @@ mod tests {
 
     #[test]
     fn completed_selector_advances_to_next_row() {
-        let form = FormState::default_form();
-        assert_eq!(
-            next_selector_index_after(Selector::ModelProvider, &form),
-            Some(1)
-        );
+        assert_eq!(next_selector_index_after(Selector::ModelProvider), Some(1));
         assert_eq!(Selector::ALL[1], Selector::RiskProfile);
         let submit_index = Selector::ALL.len() - 1;
         assert_eq!(
-            next_selector_index_after(Selector::Agent, &complete_form()),
+            next_selector_index_after(Selector::Agent),
             Some(submit_index)
         );
         assert_eq!(Selector::ALL[submit_index], Selector::Submit);
         assert_eq!(
-            next_selector_index_after(Selector::Submit, &complete_form()),
+            next_selector_index_after(Selector::Submit),
             Some(submit_index)
-        );
-    }
-
-    #[test]
-    fn completed_selector_visits_optional_rows() {
-        let mut form = complete_form();
-        form.channels.clear();
-        form.peer_groups.clear();
-
-        assert_eq!(
-            next_selector_index_after(Selector::ModelProvider, &form).map(|idx| Selector::ALL[idx]),
-            Some(Selector::Channels)
-        );
-        assert_eq!(
-            next_selector_index_after(Selector::Channels, &form).map(|idx| Selector::ALL[idx]),
-            Some(Selector::PeerGroups)
-        );
-        assert_eq!(
-            next_selector_index_after(Selector::PeerGroups, &form).map(|idx| Selector::ALL[idx]),
-            Some(Selector::Submit)
-        );
-    }
-
-    #[test]
-    fn completed_selector_keeps_first_unfilled_required_row() {
-        let mut form = complete_form();
-        form.risk.clear();
-
-        assert_eq!(
-            next_selector_index_after(Selector::ModelProvider, &form).map(|idx| Selector::ALL[idx]),
-            Some(Selector::RiskProfile)
         );
     }
 
@@ -4188,43 +3656,6 @@ mod tests {
         assert!(err.message.contains("MEMORY.md"));
     }
 
-    fn test_agent_modal() -> AgentModal {
-        AgentModal {
-            cursor: 1,
-            name: "scout".into(),
-            files: std::collections::BTreeMap::new(),
-            filenames: vec!["MEMORY.md".into(), "SKILL.md".into()],
-            editor: None,
-        }
-    }
-
-    #[test]
-    fn agent_file_enter_loads_template_when_unset() {
-        let agent = test_agent_modal();
-
-        assert!(personality_file_needs_template(&agent, "MEMORY.md"));
-    }
-
-    #[test]
-    fn agent_file_enter_advances_when_content_already_set() {
-        let mut agent = test_agent_modal();
-        agent.files.insert("MEMORY.md".into(), "custom".into());
-
-        assert!(!personality_file_needs_template(&agent, "MEMORY.md"));
-        advance_agent_modal_after_file(&mut agent);
-        assert_eq!(agent.cursor, 2);
-    }
-
-    #[test]
-    fn last_agent_file_enter_advances_to_save_row() {
-        let mut agent = test_agent_modal();
-        agent.cursor = 2;
-        agent.files.insert("SKILL.md".into(), "custom".into());
-
-        advance_agent_modal_after_file(&mut agent);
-        assert_eq!(agent.cursor, 3);
-    }
-
     fn err(step: QuickstartStep) -> QuickstartError {
         QuickstartError {
             step,
@@ -4265,20 +3696,6 @@ mod tests {
 
         let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::ModelProvider)]);
         assert_eq!(kept.len(), 1, "filled-selector errors must be retained");
-    }
-
-    #[test]
-    fn selector_with_validation_error_does_not_render_complete() {
-        let mut f = FormState::default_form();
-        f.provider_type = "anthropic".into();
-        f.provider_alias = "default".into();
-        f.model = "claude-3-5-haiku-20241022".into();
-        assert!(f.is_satisfied(Selector::ModelProvider));
-
-        let errors = vec![err(QuickstartStep::ModelProvider)];
-
-        assert!(!f.selector_is_complete(Selector::ModelProvider, &errors));
-        assert!(errors_include_selector(&errors, Selector::ModelProvider));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{fmt, str::FromStr};
 use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
+use crate::tool::ToolPresentation;
 
 /// Reserved `ChannelMessage.subject` prefix that the git/forge channel uses
 /// to label SOP-ingress events for human-readable logs and reply threading.
@@ -59,10 +60,16 @@ impl ChannelSopTopic {
 
 // ── Channel approval types ──────────────────────────────────────
 
+fn default_tool_presentation() -> ToolPresentation {
+    ToolPresentation::Generic
+}
+
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {
     pub tool_name: String,
+    #[serde(default = "default_tool_presentation")]
+    pub presentation: ToolPresentation,
     pub arguments_summary: String,
     /// Raw tool arguments for channels (e.g. ACP) that can render structured
     /// diffs instead of a plain summary string.

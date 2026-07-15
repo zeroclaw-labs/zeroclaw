@@ -3,23 +3,35 @@ use std::sync::Arc;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
-use crate::chat;
 use crate::client::RpcClient;
+use crate::config::UiProfile;
+use crate::transcript;
 
-/// ACP pane — displayed as "Code" in the UI; internal name kept for historical reasons.
-pub(crate) struct Acp {
-    inner: chat::Chat,
+pub(crate) struct Code {
+    inner: transcript::Transcript,
 }
 
-impl Acp {
-    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+impl Code {
+    pub(crate) fn new(rpc: Arc<RpcClient>, ui_profile: UiProfile) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: transcript::Transcript::new(rpc, transcript::PaneKind::Code, ui_profile),
         }
     }
 
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
         self.inner.init().await
+    }
+
+    pub(crate) fn set_ui_profile(&mut self, profile: UiProfile) {
+        self.inner.set_ui_profile(profile);
+    }
+
+    pub(crate) fn set_adaptive_sidebar_visible(&mut self, visible: bool) {
+        self.inner.set_adaptive_sidebar_visible(visible);
+    }
+
+    pub(crate) fn take_ui_command(&mut self) -> Option<transcript::TranscriptUiCommand> {
+        self.inner.take_ui_command()
     }
 
     pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
@@ -42,6 +54,10 @@ impl Acp {
         self.inner.refresh_if_inactive().await;
     }
 
+    pub(crate) async fn focus_agent(&mut self, alias: &str) {
+        self.inner.focus_agent(alias).await;
+    }
+
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.inner.draw(frame, area);
     }
@@ -58,16 +74,16 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        self.inner.wants_quit_chord()
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }
 
     pub(crate) fn in_browse_mode(&self) -> bool {
         self.inner.in_browse_mode()
-    }
-
-    pub(crate) fn wants_quit_chord(&self) -> bool {
-        self.inner.wants_quit_chord()
     }
 
     pub(crate) fn exit_browse_mode(&mut self) {
@@ -89,9 +105,17 @@ impl Acp {
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
     }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
+    }
+
+    pub(crate) fn set_info_notice(&mut self, msg: String) {
+        self.inner.set_info_notice(msg);
+    }
 }
 
-impl crate::widgets::HelpContext for Acp {
+impl crate::widgets::HelpContext for Code {
     fn help_context(&self) -> crate::widgets::HelpNode {
         self.inner.help_context()
     }

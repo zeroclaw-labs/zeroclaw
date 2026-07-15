@@ -113,6 +113,7 @@ impl Channel for WsApprovalChannel {
         let event = TurnEvent::ApprovalRequest {
             request_id: request_id.clone(),
             tool_name: request.tool_name.clone(),
+            presentation: request.presentation,
             arguments_summary: request.arguments_summary.clone(),
             timeout_secs: self.timeout.as_secs(),
         };

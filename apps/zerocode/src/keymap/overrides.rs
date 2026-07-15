@@ -79,7 +79,7 @@ mod tests {
             got.get("refresh").unwrap(),
             &vec![Chord::key(KeyCode::F(5))]
         );
-        assert!(lookup("chat").is_none());
+        assert!(lookup("code").is_none());
         reset();
         assert!(lookup("dashboard").is_none());
     }

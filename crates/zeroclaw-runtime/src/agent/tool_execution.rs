@@ -13,6 +13,7 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::tool::{ToolPresentation, default_tool_presentation};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -38,7 +39,16 @@ fn maybe_plan_event(
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+    tools
+        .iter()
+        .find(|tool| tool.name() == name)
+        .map(|tool| tool.as_ref())
+}
+
+pub fn presentation_for_tool(tools: &[Box<dyn Tool>], name: &str) -> ToolPresentation {
+    find_tool(tools, name)
+        .map(|tool| default_tool_presentation(tool.role(), &tool.parameters_schema()))
+        .unwrap_or(ToolPresentation::Generic)
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +267,7 @@ pub(crate) async fn execute_one_tool(
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
                 args: call_arguments.clone(),
+                presentation: presentation_for_tool(dispatch.tools_registry, tool.name()),
             })
             .await;
     }

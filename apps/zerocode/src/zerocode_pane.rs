@@ -21,25 +21,36 @@ use crate::config::WssSection;
 use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
 
-/// Which sub-pane of the zerocode tab is focused.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Focus {
-    Theme,
-    AgentTheme,
-    Presets,
-    Bindings,
-    Locale,
-    Connection,
+macro_rules! focus_sections {
+    ($($variant:ident => $fluent:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Focus {
+            $($variant),+
+        }
+
+        impl Focus {
+            fn variants() -> &'static [Self] {
+                &[$(Self::$variant),+]
+            }
+
+            fn fluent_key(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $fluent),+
+                }
+            }
+        }
+    };
 }
 
-const FOCI: [Focus; 6] = [
-    Focus::Theme,
-    Focus::AgentTheme,
-    Focus::Presets,
-    Focus::Bindings,
-    Focus::Locale,
-    Focus::Connection,
-];
+focus_sections! {
+    Theme => "zc-zerocode-tab-theme",
+    AgentTheme => "zc-zerocode-tab-agent-theme",
+    Ui => "zc-zerocode-tab-ui",
+    Presets => "zc-zerocode-tab-presets",
+    Bindings => "zc-zerocode-tab-bindings",
+    Locale => "zc-zerocode-tab-locale",
+    Connection => "zc-zerocode-tab-connection",
+}
 
 /// Which side of the split holds the live cursor. `Sections` is the left list
 /// of section names; `Detail` is the right pane for the highlighted section. The
@@ -51,41 +62,60 @@ enum PaneCursor {
     Detail,
 }
 
-impl Focus {
-    fn fluent_key(self) -> &'static str {
-        match self {
-            Self::Theme => "zc-zerocode-tab-theme",
-            Self::AgentTheme => "zc-zerocode-tab-agent-theme",
-            Self::Presets => "zc-zerocode-tab-presets",
-            Self::Bindings => "zc-zerocode-tab-bindings",
-            Self::Locale => "zc-zerocode-tab-locale",
-            Self::Connection => "zc-zerocode-tab-connection",
+macro_rules! ui_fields {
+    ($($variant:ident => $fluent:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum UiField {
+            $($variant),+
         }
-    }
+
+        impl UiField {
+            fn variants() -> &'static [Self] {
+                &[$(Self::$variant),+]
+            }
+
+            fn fluent_key(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $fluent),+
+                }
+            }
+        }
+    };
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConnField {
-    Uri,
-    SkipVerify,
-    SkipVerifyRoutes,
+ui_fields! {
+    Profile => "zc-zerocode-ui-profile",
+    AdaptiveSidebar => "zc-zerocode-ui-adaptive-sidebar",
 }
 
-const CONN_FIELDS: [ConnField; 3] = [
-    ConnField::Uri,
-    ConnField::SkipVerify,
-    ConnField::SkipVerifyRoutes,
-];
+macro_rules! conn_fields {
+    ($($variant:ident => $fluent:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ConnField {
+            $($variant),+
+        }
+
+        impl ConnField {
+            fn variants() -> &'static [Self] {
+                &[$(Self::$variant),+]
+            }
+
+            fn fluent_key(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $fluent),+
+                }
+            }
+        }
+    };
+}
+
+conn_fields! {
+    Uri => "zc-zerocode-conn-uri",
+    SkipVerify => "zc-zerocode-conn-skip-verify",
+    SkipVerifyRoutes => "zc-zerocode-conn-skip-verify-routes",
+}
 
 impl ConnField {
-    fn fluent_key(self) -> &'static str {
-        match self {
-            Self::Uri => "zc-zerocode-conn-uri",
-            Self::SkipVerify => "zc-zerocode-conn-skip-verify",
-            Self::SkipVerifyRoutes => "zc-zerocode-conn-skip-verify-routes",
-        }
-    }
-
     fn leaf_path(self) -> &'static str {
         match self {
             Self::Uri => "uri",
@@ -128,7 +158,7 @@ pub(crate) struct ZerocodePane {
     theme_target_agent: Option<String>,
     // Agent theme overrides
     /// Configured agent aliases from the daemon (agents/status), fed by
-    /// config_manager — the same registry the Code/Chat agent pickers walk.
+    /// config_manager — the same registry the Code agent picker walks.
     agents: Vec<String>,
     agent_cursor: usize,
     /// alias -> override theme name, loaded from the local config.
@@ -165,6 +195,8 @@ pub(crate) struct ZerocodePane {
     focus_area: Rect,
     content_area: Rect,
     double_click: crate::mouse::DoubleClickTracker,
+    ui: config::UiSection,
+    ui_cursor: usize,
     conn: WssSection,
     conn_cursor: usize,
     conn_edit: Option<ConnEdit>,
@@ -186,17 +218,15 @@ impl ZerocodePane {
             .iter()
             .position(|n| theme::theme_by_name(n).map(|t| t.title) == Some(active.title))
             .unwrap_or(0);
-        let agent_overrides: HashMap<String, String> = config::ensure_and_load(config_dir)
-            .ok()
-            .map(|c| {
-                c.agent_override_aliases()
-                    .filter_map(|a| {
-                        c.agent_override_name(a)
-                            .map(|n| (a.to_string(), n.to_string()))
-                    })
-                    .collect()
+        let local_config = config::ensure_and_load(config_dir).unwrap_or_default();
+        let agent_overrides: HashMap<String, String> = local_config
+            .agent_override_aliases()
+            .filter_map(|alias| {
+                local_config
+                    .agent_override_name(alias)
+                    .map(|name| (alias.to_string(), name.to_string()))
             })
-            .unwrap_or_default();
+            .collect();
         let mut pane = Self {
             config_dir: config_dir.to_path_buf(),
             focus: Focus::Theme,
@@ -217,9 +247,7 @@ impl ZerocodePane {
             capture: None,
             locales: Vec::new(),
             locale_cursor: 0,
-            active_locale: config::ensure_and_load(config_dir)
-                .ok()
-                .and_then(|c| c.resolve_locale()),
+            active_locale: local_config.resolve_locale(),
             pending_fetch: None,
             status: None,
             list_error: None,
@@ -227,10 +255,9 @@ impl ZerocodePane {
             focus_area: Rect::default(),
             content_area: Rect::default(),
             double_click: crate::mouse::DoubleClickTracker::new(),
-            conn: config::ensure_and_load(config_dir)
-                .ok()
-                .map(|c| c.connection.wss)
-                .unwrap_or_default(),
+            ui: local_config.ui,
+            ui_cursor: 0,
+            conn: local_config.connection.wss,
             conn_cursor: 0,
             conn_edit: None,
         };
@@ -272,6 +299,7 @@ impl ZerocodePane {
             // surface; the agent picker returns once the assignment ends.
             Focus::AgentTheme if self.assigning_theme() => self.draw_theme(frame, cols[1]),
             Focus::AgentTheme => self.draw_agent_theme(frame, cols[1]),
+            Focus::Ui => self.draw_ui(frame, cols[1]),
             Focus::Presets => self.draw_presets(frame, cols[1]),
             Focus::Bindings => self.draw_bindings(frame, cols[1]),
             Focus::Locale => self.draw_locale(frame, cols[1]),
@@ -304,7 +332,7 @@ impl ZerocodePane {
     }
 
     fn draw_focus_list(&self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = FOCI
+        let items: Vec<ListItem> = Focus::variants()
             .iter()
             .map(|f| {
                 ListItem::new(Line::from(Span::styled(
@@ -314,7 +342,7 @@ impl ZerocodePane {
             })
             .collect();
         let mut state = ListState::default();
-        state.select(FOCI.iter().position(|f| *f == self.focus));
+        state.select(Focus::variants().iter().position(|f| *f == self.focus));
         // The section list is the active surface when the cursor lives in it;
         // a dimmed "you are here" highlight when the cursor has stepped into the
         // detail.
@@ -463,6 +491,52 @@ impl ZerocodePane {
                 theme::dim_style(),
             ))),
             rows[1],
+        );
+    }
+
+    fn localized_bool(value: bool) -> String {
+        crate::i18n::t(if value {
+            "zc-zerocode-bool-true"
+        } else {
+            "zc-zerocode-bool-false"
+        })
+    }
+
+    fn save_failed(error: &dyn std::fmt::Display) -> String {
+        let error = error.to_string();
+        crate::i18n::t_args("zc-zerocode-save-failed", &[("error", &error)])
+    }
+
+    fn ui_field_value(&self, field: UiField) -> String {
+        match field {
+            UiField::Profile => crate::i18n::t(self.ui.profile.fluent_key()),
+            UiField::AdaptiveSidebar => Self::localized_bool(self.ui.show_adaptive_sidebar),
+        }
+    }
+
+    fn draw_ui(&self, frame: &mut Frame, area: Rect) {
+        let fields = UiField::variants();
+        let items: Vec<ListItem> = fields
+            .iter()
+            .map(|field| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<24}", crate::i18n::t(field.fluent_key())),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(self.ui_field_value(*field), theme::body_style()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(fields.last().map(|_| self.ui_cursor.min(fields.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&crate::i18n::t("zc-zerocode-ui-title")))
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
+            area,
+            &mut state,
         );
     }
 
@@ -616,12 +690,7 @@ impl ZerocodePane {
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| crate::i18n::t("zc-zerocode-conn-unset")),
-            ConnField::SkipVerify => if self.conn.tls.skip_verify {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            ConnField::SkipVerify => Self::localized_bool(self.conn.tls.skip_verify),
             ConnField::SkipVerifyRoutes => {
                 if self.conn.tls.skip_verify_routes.is_empty() {
                     crate::i18n::t("zc-zerocode-conn-no-routes")
@@ -672,7 +741,8 @@ impl ZerocodePane {
             return;
         }
 
-        let items: Vec<ListItem> = CONN_FIELDS
+        let fields = ConnField::variants();
+        let items: Vec<ListItem> = fields
             .iter()
             .map(|f| {
                 ListItem::new(Line::from(vec![
@@ -685,7 +755,11 @@ impl ZerocodePane {
             })
             .collect();
         let mut state = ListState::default();
-        state.select(Some(self.conn_cursor.min(CONN_FIELDS.len() - 1)));
+        state.select(
+            fields
+                .last()
+                .map(|_| self.conn_cursor.min(fields.len() - 1)),
+        );
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&crate::i18n::t(
@@ -1025,9 +1099,10 @@ impl ZerocodePane {
         if self.focus == Focus::AgentTheme {
             self.theme_target_agent = None;
         }
-        let i = FOCI.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
-        let n = FOCI.len() as isize;
-        self.focus = FOCI[(((i + delta) % n + n) % n) as usize];
+        let sections = Focus::variants();
+        let i = sections.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
+        let n = sections.len() as isize;
+        self.focus = sections[(((i + delta) % n + n) % n) as usize];
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -1038,10 +1113,11 @@ impl ZerocodePane {
             match self.focus {
                 Focus::Theme => self.themes.len(),
                 Focus::AgentTheme => self.agents.len(),
+                Focus::Ui => UiField::variants().len(),
                 Focus::Presets => self.presets.len(),
                 Focus::Bindings => self.rows.len(),
                 Focus::Locale => self.locales.len() + 1,
-                Focus::Connection => CONN_FIELDS.len(),
+                Focus::Connection => ConnField::variants().len(),
             }
         };
         if len == 0 {
@@ -1053,6 +1129,7 @@ impl ZerocodePane {
             match self.focus {
                 Focus::Theme => self.theme_list_cursor_mut(),
                 Focus::AgentTheme => &mut self.agent_cursor,
+                Focus::Ui => &mut self.ui_cursor,
                 Focus::Presets => &mut self.preset_cursor,
                 Focus::Bindings => &mut self.binding_cursor,
                 Focus::Locale => &mut self.locale_cursor,
@@ -1071,6 +1148,7 @@ impl ZerocodePane {
             // agent's override.
             Focus::AgentTheme if self.assigning_theme() => self.apply_theme(),
             Focus::AgentTheme => self.begin_agent_assign(),
+            Focus::Ui => self.activate_ui(),
             Focus::Presets => self.apply_preset(),
             Focus::Bindings => {
                 if !self.rows.is_empty() {
@@ -1085,8 +1163,61 @@ impl ZerocodePane {
         }
     }
 
+    fn activate_ui(&mut self) {
+        let Some(field) = UiField::variants().get(self.ui_cursor).copied() else {
+            return;
+        };
+        match field {
+            UiField::Profile => self.cycle_ui_profile(),
+            UiField::AdaptiveSidebar => self.toggle_adaptive_sidebar(),
+        }
+    }
+
+    fn cycle_ui_profile(&mut self) {
+        let profiles = config::UiProfile::variants();
+        if profiles.is_empty() {
+            return;
+        }
+        let current = profiles
+            .iter()
+            .position(|profile| *profile == self.ui.profile)
+            .unwrap_or(0);
+        let Some(next) = profiles.get((current + 1) % profiles.len()).copied() else {
+            return;
+        };
+        match config::persist_ui_profile(&self.config_dir, next) {
+            Ok(()) => {
+                self.ui.profile = next;
+                self.status = Some(crate::i18n::t_args(
+                    "zc-zerocode-ui-profile-set",
+                    &[("profile", &crate::i18n::t(next.fluent_key()))],
+                ));
+            }
+            Err(error) => self.status = Some(Self::save_failed(&error)),
+        }
+    }
+
+    fn toggle_adaptive_sidebar(&mut self) {
+        let next = !self.ui.show_adaptive_sidebar;
+        match config::persist_show_adaptive_sidebar(&self.config_dir, next) {
+            Ok(()) => {
+                self.ui.show_adaptive_sidebar = next;
+                self.status = Some(crate::i18n::t("zc-zerocode-ui-sidebar-saved"));
+            }
+            Err(error) => self.status = Some(Self::save_failed(&error)),
+        }
+    }
+
+    pub(crate) fn ui_config(&self) -> config::UiSection {
+        self.ui.clone()
+    }
+
+    pub(crate) fn set_ui_config(&mut self, ui: config::UiSection) {
+        self.ui = ui;
+    }
+
     fn activate_connection(&mut self) {
-        let Some(field) = CONN_FIELDS.get(self.conn_cursor).copied() else {
+        let Some(field) = ConnField::variants().get(self.conn_cursor).copied() else {
             return;
         };
         if field == ConnField::SkipVerify {
@@ -1118,7 +1249,7 @@ impl ZerocodePane {
         };
         match config::persist_connection_field(&self.config_dir, field.leaf_path(), value) {
             Ok(()) => self.status = Some(crate::i18n::t("zc-zerocode-conn-saved")),
-            Err(e) => self.status = Some(format!("save failed: {e}")),
+            Err(e) => self.status = Some(Self::save_failed(&e)),
         }
     }
 
@@ -1202,8 +1333,8 @@ impl ZerocodePane {
                 Ok(()) => {
                     self.agent_overrides.insert(alias.clone(), name.clone());
                     // Live-apply, exactly like the global theme: update the
-                    // process-global override registry so the Code/Chat pane
-                    // picks it up on the next frame without an app restart.
+                    // process-global override registry so Code picks it up on
+                    // the next frame without an app restart.
                     if let Some(t) = theme::theme_by_name(&name) {
                         theme::set_agent_override(&alias, t);
                     }
@@ -1381,6 +1512,12 @@ impl ZerocodePane {
                     crate::i18n::t("zc-zerocode-help-clear-agent-theme"),
                 ));
             }
+            Focus::Ui => {
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-toggle-ui"),
+                ));
+            }
             Focus::Presets => {
                 entries.push(E::new(
                     keys(A::Enter),
@@ -1436,13 +1573,16 @@ impl ZerocodePane {
                 // Focus column click selects the section and parks the cursor on
                 // the left list.
                 if mouse::in_rect(mouse.column, mouse.row, self.focus_area) {
+                    let sections = Focus::variants();
                     if let Some(idx) =
-                        mouse::list_click_index(mouse.row, self.focus_area, 0, FOCI.len())
+                        mouse::list_click_index(mouse.row, self.focus_area, 0, sections.len())
                     {
                         // A section click ends any pending assignment so focus,
                         // the detail surface, and the cursor stay consistent.
                         self.theme_target_agent = None;
-                        self.focus = FOCI[idx.min(FOCI.len() - 1)];
+                        if let Some(focus) = sections.get(idx).copied() {
+                            self.focus = focus;
+                        }
                         self.cursor = PaneCursor::Sections;
                     }
                     return;
@@ -1493,10 +1633,11 @@ impl ZerocodePane {
         match self.focus {
             Focus::Theme => self.themes.len(),
             Focus::AgentTheme => self.agents.len(),
+            Focus::Ui => UiField::variants().len(),
             Focus::Presets => self.presets.len(),
             Focus::Bindings => self.rows.len(),
             Focus::Locale => self.locales.len() + 1,
-            Focus::Connection => CONN_FIELDS.len(),
+            Focus::Connection => ConnField::variants().len(),
         }
     }
 
@@ -1513,6 +1654,7 @@ impl ZerocodePane {
         match self.focus {
             Focus::Theme => *self.theme_list_cursor_mut() = idx,
             Focus::AgentTheme => self.agent_cursor = idx,
+            Focus::Ui => self.ui_cursor = idx,
             Focus::Presets => self.preset_cursor = idx,
             Focus::Bindings => self.binding_cursor = idx,
             Focus::Locale => self.locale_cursor = idx,
@@ -1574,13 +1716,13 @@ fn theme_swatch_roles(name: &str) -> Option<[ratatui::style::Color; SWATCH_ROLE_
 /// per `(tag, variant)`, chords grouped.
 fn collect_binding_rows() -> Vec<BindingRow> {
     use crate::keymap::{
-        ChatTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+        CodeTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
         GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction,
     };
 
     let mut rows = Vec::new();
     rows_from::<GlobalAction>(&mut rows);
-    rows_from::<ChatTabAction>(&mut rows);
+    rows_from::<CodeTabAction>(&mut rows);
     rows_from::<LogsTabAction>(&mut rows);
     rows_from::<DashboardTabAction>(&mut rows);
     rows_from::<ConfigTabAction>(&mut rows);
@@ -1607,12 +1749,12 @@ fn rows_from<A: crate::keymap::RebindableActions>(out: &mut Vec<BindingRow>) {
 /// by walking the enums for a matching action key.
 fn default_chords_for(action_key: &str) -> Vec<Chord> {
     use crate::keymap::{
-        ChatTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+        CodeTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
         GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction,
     };
     let mut found = None;
     defaults_in::<GlobalAction>(action_key, &mut found);
-    defaults_in::<ChatTabAction>(action_key, &mut found);
+    defaults_in::<CodeTabAction>(action_key, &mut found);
     defaults_in::<LogsTabAction>(action_key, &mut found);
     defaults_in::<DashboardTabAction>(action_key, &mut found);
     defaults_in::<ConfigTabAction>(action_key, &mut found);

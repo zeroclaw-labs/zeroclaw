@@ -805,12 +805,14 @@ async fn handle_socket(
                     zeroclaw_api::agent::TurnEvent::ApprovalRequest {
                         request_id,
                         tool_name,
+                        presentation,
                         arguments_summary,
                         timeout_secs,
                     } => serde_json::json!({
                         "type": "approval_request",
                         "request_id": request_id,
                         "tool": tool_name,
+                        "presentation": presentation,
                         "arguments_summary": arguments_summary,
                         "timeout_secs": timeout_secs,
                     }),
@@ -1241,6 +1243,7 @@ async fn process_chat_message(
                     if let TurnEvent::ApprovalRequest {
                         request_id,
                         tool_name,
+                        presentation,
                         arguments_summary,
                         timeout_secs,
                     } = event {
@@ -1248,6 +1251,7 @@ async fn process_chat_message(
                             "type": "approval_request",
                             "request_id": request_id,
                             "tool": tool_name,
+                            "presentation": presentation,
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         });
@@ -1284,8 +1288,13 @@ async fn process_chat_message(
                         TurnEvent::Thinking { delta } => {
                             serde_json::json!({ "type": "thinking", "content": delta })
                         }
-                        TurnEvent::ToolCall { id, name, args } => {
-                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                        TurnEvent::ToolCall {
+                            id,
+                            name,
+                            args,
+                            presentation,
+                        } => {
+                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args, "presentation": presentation })
                         }
                         TurnEvent::ToolResult { id, name, output } => {
                             serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
@@ -1293,12 +1302,14 @@ async fn process_chat_message(
                         TurnEvent::ApprovalRequest {
                             request_id,
                             tool_name,
+                            presentation,
                             arguments_summary,
                             timeout_secs,
                         } => serde_json::json!({
                             "type": "approval_request",
                             "request_id": request_id,
                             "tool": tool_name,
+                            "presentation": presentation,
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         }),

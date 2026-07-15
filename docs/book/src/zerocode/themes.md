@@ -1,8 +1,8 @@
 # Themes & terminal colors
 
 zerocode ships a set of named color themes, lets each agent carry its own theme
-in the Code and Chat panes, and adapts its color output to what the terminal
-can render.
+in the Code pane and optional Chat pane, and adapts its color output to what the
+terminal can render.
 
 All theme settings live in zerocode's own config, independent of
 which daemon zerocode connects to.
@@ -38,12 +38,12 @@ platform.
 > does not have, a typo, or a config written by a newer build, zerocode falls
 > back to the `terminal` theme rather than refusing to start.
 
-## Per-agent themes (Code & Chat panes)
+## Per-agent themes
 
-A theme can follow the agent. When the **Code** or **Chat** pane is focused on
-an agent that has an override, that agent's theme replaces the base theme while
-the pane is shown; other panes keep the base theme. This makes it easy to tell
-at a glance which agent you are working with.
+A theme can follow the agent. When the **Code** pane, or optional **Chat** pane,
+is focused on an agent that has an override, that agent's theme replaces the
+base theme while the pane is shown; other panes keep the base theme. This makes
+it easy to tell at a glance which agent you are working with.
 
 Configure overrides under `[theme.agent_override.<alias>]`:
 
@@ -57,8 +57,8 @@ none). The footer shows the keys.
   `Theme → <agent>`); pick a theme and it is assigned to that agent.
 - `d` clears the highlighted agent's override.
 
-Assignments and clears apply **live**: the Code/Chat pane re-themes on the
-next frame without restarting zerocode, and are persisted to zerocode's
+Assignments and clears apply **live**: the Code pane and optional Chat pane
+re-theme on the next frame without restarting zerocode, and are persisted to zerocode's
 config. An override naming an unknown theme falls back to the
 `terminal` theme, same as the global setting.
 

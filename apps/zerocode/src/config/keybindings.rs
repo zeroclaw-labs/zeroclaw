@@ -14,7 +14,7 @@ use anyhow::{Result, bail};
 use crossterm::event::KeyCode;
 
 use crate::keymap::{
-    ChatTabAction, Chord, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+    Chord, CodeTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
     GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction, RebindableActions,
     overrides::OverrideTable,
 };
@@ -35,7 +35,7 @@ pub struct KeyPreset {
 fn all_defaults() -> HashMap<String, Vec<Chord>> {
     let mut map = HashMap::new();
     fill_defaults::<GlobalAction>(&mut map);
-    fill_defaults::<ChatTabAction>(&mut map);
+    fill_defaults::<CodeTabAction>(&mut map);
     fill_defaults::<LogsTabAction>(&mut map);
     fill_defaults::<DashboardTabAction>(&mut map);
     fill_defaults::<ConfigTabAction>(&mut map);
@@ -247,11 +247,13 @@ pub fn build_override_table(rows: HashMap<String, Vec<Chord>>) -> Result<Overrid
     let mut seen: HashMap<String, HashMap<Chord, String>> = HashMap::new();
 
     for (action_key, chords) in rows {
-        let (tag, variant) = action_key.split_once('.').ok_or_else(|| {
+        let (raw_tag, variant) = action_key.split_once('.').ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "keybinding key '{action_key}' missing '.<variant>'"
             ))
         })?;
+        let tag = canonical_tag(raw_tag);
+        let canonical_action_key = format!("{tag}.{variant}");
 
         for (i, a) in chords.iter().enumerate() {
             if chords[i + 1..].contains(a) {
@@ -262,11 +264,11 @@ pub fn build_override_table(rows: HashMap<String, Vec<Chord>>) -> Result<Overrid
         for c in &chords {
             if let Some(other) = tag_seen.get(c) {
                 bail!(
-                    "chord '{}' bound to both '{action_key}' and '{other}'",
+                    "chord '{}' bound to both '{canonical_action_key}' and '{other}'",
                     c.wire()
                 );
             }
-            tag_seen.insert(c.clone(), action_key.clone());
+            tag_seen.insert(c.clone(), canonical_action_key.clone());
         }
 
         table
@@ -275,6 +277,15 @@ pub fn build_override_table(rows: HashMap<String, Vec<Chord>>) -> Result<Overrid
             .insert(variant.to_string(), chords);
     }
     Ok(table)
+}
+
+fn canonical_tag(tag: &str) -> &str {
+    const LEGACY_CODE_TAG: &str = "chat";
+    if tag == LEGACY_CODE_TAG {
+        CodeTabAction::TAG
+    } else {
+        tag
+    }
 }
 
 #[cfg(test)]
@@ -339,9 +350,18 @@ mod tests {
         // building must accept reserved chords; rejection is the capture
         // modal's job (tested via keymap::reserved_reason).
         let mut rows = HashMap::new();
-        rows.insert("chat.scroll_up".to_string(), vec![Chord::key(KeyCode::Esc)]);
+        rows.insert("code.scroll_up".to_string(), vec![Chord::key(KeyCode::Esc)]);
         assert!(build_override_table(rows).is_ok());
         assert!(crate::keymap::reserved_reason(&Chord::key(KeyCode::Esc)).is_some());
+    }
+
+    #[test]
+    fn legacy_code_tag_is_canonicalized() {
+        let mut rows = HashMap::new();
+        rows.insert("chat.scroll_up".to_string(), vec![Chord::key(KeyCode::Esc)]);
+        let table = build_override_table(rows).expect("legacy tag accepted");
+        assert!(table.contains_key(CodeTabAction::TAG));
+        assert!(!table.contains_key("chat"));
     }
 
     #[test]

@@ -400,6 +400,7 @@ mod cost_usd_regression_tests {
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let ctx = TurnCtx {
             observer: &crate::observability::NoopObserver,
+            tools_registry: &[],
             provider_name: provider,
             model,
             temperature: None,

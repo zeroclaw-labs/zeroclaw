@@ -902,6 +902,7 @@ mod tests {
             parameters: std::sync::Arc::new(params),
             output,
             param_domains: Default::default(),
+            presentation: None,
         }
     }
 

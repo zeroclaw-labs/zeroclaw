@@ -5,7 +5,7 @@
 //! title shows a verb + animated dots so the user can see the agent is
 //! still alive even when no chunks are streaming.
 //!
-//! State transitions (driven from `ChatState`):
+//! State transitions (driven from `TranscriptState`):
 //!   * user sends         → `Working`            (request out, nothing back yet)
 //!   * AgentThoughtChunk  → `Thinking`           (reasoning tokens streaming)
 //!   * AgentMessageChunk  → `Responding`         (reply text streaming)

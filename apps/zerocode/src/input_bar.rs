@@ -1,8 +1,7 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
 //!
-//! Embedded by both Chat and ACP panes — each pane owns its own
-//! `InputBarState` instance with independent state.
+//! Embedded by the Code pane, which owns its own `InputBarState` instance.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -31,20 +30,33 @@ use crate::turn_status::TurnStatus;
 
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
+const MAX_PROMPT_HISTORY: usize = 100;
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
+pub(crate) const SLASH_COMMAND_CLEAR_QUEUE: &str = "/clear-queue";
+pub(crate) const SLASH_COMMAND_PROFILE: &str = "/profile";
+pub(crate) const SLASH_COMMAND_SIDEBAR: &str = "/sidebar";
+pub(crate) const SLASH_COMMAND_TOGGLE_THINKING: &str = "/toggle-thinking";
+
+macro_rules! slash_commands {
+    ($($command:expr),+ $(,)?) => {
+        const SLASH_COMMANDS: &[&str] = &[$($command),+];
+    };
+}
+
+slash_commands! {
     "/attach",
     "/attachments",
-    "/clear-queue",
+    SLASH_COMMAND_CLEAR_QUEUE,
     "/detach",
     "/model",
     "/model-provider",
     "/new",
     "/new-session",
+    SLASH_COMMAND_PROFILE,
     "/restart-session",
-    "/toggle-thinking",
-];
+    SLASH_COMMAND_SIDEBAR,
+    SLASH_COMMAND_TOGGLE_THINKING,
+}
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -77,6 +89,8 @@ pub(crate) enum InputBarAction {
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
     ToggleThinking,
+    ToggleSidebar,
+    CycleProfile,
     /// User chose a model directly (`/model <name>`) — parent applies it via
     /// `session/configure`.
     SetModel(String),
@@ -86,6 +100,12 @@ pub(crate) enum InputBarAction {
     /// User typed `/model` with no argument — parent opens the model picker
     /// modal over the cached model catalog.
     OpenModelPicker,
+    /// User requested editing the prompt draft in `$VISUAL` / `$EDITOR`.
+    OpenExternalEditor,
+    /// User stored the current prompt draft without sending it.
+    StashedDraft(String),
+    /// User restored the latest stashed prompt draft.
+    RestoredDraft(String),
     /// User typed `/model-provider` with no argument — parent opens the
     /// two-stage model_provider picker modal.
     OpenModelProviderPicker,
@@ -104,6 +124,8 @@ enum SlashCommand<'a> {
     /// rather than silently clearing the whole queue.
     ClearQueue(Option<usize>),
     ToggleThinking,
+    ToggleSidebar,
+    CycleProfile,
     /// `/model <name>` — switch model directly.
     Model(&'a str),
     /// `/model` (no arg) — open the model picker modal.
@@ -126,17 +148,24 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::Detach(idx.trim().parse().ok())
     } else if trimmed == "/detach" {
         SlashCommand::Detach(None)
-    } else if let Some(arg) = trimmed.strip_prefix("/clear-queue ") {
+    } else if let Some(arg) = trimmed
+        .strip_prefix(SLASH_COMMAND_CLEAR_QUEUE)
+        .and_then(|arg| arg.strip_prefix(' '))
+    {
         // Malformed index -> Some(0): an invalid index, never a clear-all, so a
         // typo cannot wipe the whole queue. Only the bare form clears all.
         SlashCommand::ClearQueue(Some(arg.trim().parse().unwrap_or(0)))
-    } else if trimmed == "/clear-queue" {
+    } else if trimmed == SLASH_COMMAND_CLEAR_QUEUE {
         SlashCommand::ClearQueue(None)
     } else if trimmed == "/attachments" {
         SlashCommand::ListAttachments
     } else if trimmed == "/restart-session" || trimmed == "/new-session" || trimmed == "/new" {
         SlashCommand::RestartSession
-    } else if trimmed == "/toggle-thinking" {
+    } else if trimmed == SLASH_COMMAND_PROFILE {
+        SlashCommand::CycleProfile
+    } else if trimmed == SLASH_COMMAND_SIDEBAR {
+        SlashCommand::ToggleSidebar
+    } else if trimmed == SLASH_COMMAND_TOGGLE_THINKING {
         SlashCommand::ToggleThinking
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
         let name = name.trim();
@@ -489,7 +518,7 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
 
 // ── State ────────────────────────────────────────────────────────
 
-/// Input bar state. Each pane (Chat, ACP) owns its own instance.
+/// Input bar state owned by the Code pane.
 #[derive(Debug)]
 pub(crate) struct InputBarState {
     input: String,
@@ -536,6 +565,16 @@ pub(crate) struct InputBarState {
     model_catalog_provider: Option<String>,
     /// Cached model_provider names for `/model-provider <partial>` autocomplete.
     provider_catalog: Vec<String>,
+    prompt_history: Vec<String>,
+    draft_stash: Vec<StashedDraft>,
+    history_cursor: Option<usize>,
+    history_draft: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StashedDraft {
+    text: String,
+    attachments: Vec<PendingAttachment>,
 }
 
 /// What the autocomplete popup is currently offering, so Tab-completion knows
@@ -548,6 +587,15 @@ enum AutocompleteTarget {
     ModelArg,
     /// Completing the `/model-provider <arg>` value (replaces only the argument).
     ModelProviderArg,
+}
+
+fn cleanup_clipboard_temp(path: &PathBuf) {
+    if path.exists() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) => eprintln!("clipboard temp cleanup failed: {error}"),
+        }
+    }
 }
 
 impl InputBarState {
@@ -570,6 +618,10 @@ impl InputBarState {
             model_catalog: Vec::new(),
             model_catalog_provider: None,
             provider_catalog: Vec::new(),
+            prompt_history: Vec::new(),
+            draft_stash: Vec::new(),
+            history_cursor: None,
+            history_draft: None,
         }
     }
 
@@ -623,6 +675,7 @@ impl InputBarState {
             self.input.replace_range(start..end, "");
             self.cursor = start;
             self.selection_anchor = None;
+            self.reset_history_cursor();
             Some(deleted)
         } else {
             None
@@ -702,6 +755,114 @@ impl InputBarState {
         }
     }
 
+    pub fn editor_buffer(&self) -> &str {
+        &self.input
+    }
+
+    pub fn replace_editor_buffer(&mut self, text: String) {
+        self.load_for_edit(text, self.pending_attachments.clone());
+    }
+
+    #[cfg(test)]
+    pub fn prompt_history_len(&self) -> usize {
+        self.prompt_history.len()
+    }
+
+    #[cfg(test)]
+    pub fn history_cursor(&self) -> Option<usize> {
+        self.history_cursor
+    }
+
+    #[cfg(test)]
+    pub fn draft_stash_len(&self) -> usize {
+        self.draft_stash.len()
+    }
+
+    fn stash_current_draft(&mut self) -> Option<String> {
+        let draft = self.input.trim().to_string();
+        if draft.is_empty() && self.pending_attachments.is_empty() {
+            return None;
+        }
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        self.release_clipboard_temp_ownership(&attachments);
+        let stashed = StashedDraft {
+            text: self.input.clone(),
+            attachments,
+        };
+        self.draft_stash.push(stashed);
+        self.clear_input();
+        Some(draft)
+    }
+
+    fn restore_latest_draft(&mut self) -> Option<String> {
+        if !self.input.is_empty() || !self.pending_attachments.is_empty() {
+            return None;
+        }
+        let draft = self.draft_stash.pop()?;
+        let text = draft.text.clone();
+        self.load_for_edit(draft.text, draft.attachments);
+        Some(text)
+    }
+
+    fn remember_prompt(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .prompt_history
+            .last()
+            .is_some_and(|entry| entry == text)
+        {
+            return;
+        }
+        self.prompt_history.push(text.to_string());
+        if self.prompt_history.len() > MAX_PROMPT_HISTORY {
+            self.prompt_history.remove(0);
+        }
+    }
+
+    fn reset_history_cursor(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    fn recall_history_prev(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        if self.history_cursor.is_none() {
+            self.history_draft = Some(self.input.clone());
+        }
+        let next = self
+            .history_cursor
+            .map(|cursor| cursor.saturating_sub(1))
+            .unwrap_or_else(|| self.prompt_history.len().saturating_sub(1));
+        self.load_history_entry(next);
+        true
+    }
+
+    fn recall_history_next(&mut self) -> bool {
+        let Some(cursor) = self.history_cursor else {
+            return false;
+        };
+        if cursor + 1 < self.prompt_history.len() {
+            self.load_history_entry(cursor + 1);
+        } else {
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.replace_input(draft, self.pending_attachments.clone());
+            self.history_cursor = None;
+        }
+        true
+    }
+
+    fn load_history_entry(&mut self, cursor: usize) {
+        if let Some(entry) = self.prompt_history.get(cursor).cloned() {
+            self.replace_input(entry, self.pending_attachments.clone());
+            self.history_cursor = Some(cursor);
+        }
+    }
+
     /// Replace the input's catalog cache for argument autocomplete. Called by
     /// the app layer after an async `catalog_models` / model_provider fetch.
     pub fn set_model_catalog(&mut self, model_provider: String, models: Vec<String>) {
@@ -753,6 +914,7 @@ impl InputBarState {
             }
         }
         self.cursor = self.input.len();
+        self.reset_history_cursor();
     }
 
     /// Enter pressed while the autocomplete popup is open: accept the
@@ -785,6 +947,7 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.reset_history_cursor();
         self.update_autocomplete();
     }
 
@@ -803,6 +966,7 @@ impl InputBarState {
             let prev_start = self.cursor - prev_grapheme.len();
             self.input.replace_range(prev_start..self.cursor, "");
             self.cursor = prev_start;
+            self.reset_history_cursor();
             self.update_autocomplete();
         }
     }
@@ -874,6 +1038,24 @@ impl InputBarState {
         true
     }
 
+    fn cursor_on_first_visual_row(&self) -> bool {
+        let width = self.last_inner_width;
+        if width == 0 {
+            return true;
+        }
+        let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
+        row == 0
+    }
+
+    fn cursor_on_last_visual_row(&self) -> bool {
+        let width = self.last_inner_width;
+        if width == 0 {
+            return true;
+        }
+        let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
+        row + 1 >= wrapped_line_count(&self.input, width)
+    }
+
     /// Extract the input text and reset the cursor.
     pub fn take_input(&mut self) -> String {
         self.cursor = 0;
@@ -888,6 +1070,7 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.reset_history_cursor();
         self.update_autocomplete();
     }
 
@@ -898,6 +1081,11 @@ impl InputBarState {
     }
 
     pub fn load_for_edit(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        self.replace_input(text, attachments);
+        self.reset_history_cursor();
+    }
+
+    fn replace_input(&mut self, text: String, attachments: Vec<PendingAttachment>) {
         self.input = text;
         self.cursor = self.input.len();
         self.scroll_offset = 0;
@@ -921,12 +1109,16 @@ impl InputBarState {
 
     pub fn take_attachments(&mut self) -> Vec<PendingAttachment> {
         let taken = std::mem::take(&mut self.pending_attachments);
-        for att in &taken {
-            if att.source == crate::attachment::AttachmentSource::Clipboard {
-                self.clipboard_temps.retain(|p| p != &att.path);
+        self.release_clipboard_temp_ownership(&taken);
+        taken
+    }
+
+    fn release_clipboard_temp_ownership(&mut self, attachments: &[PendingAttachment]) {
+        for attachment in attachments {
+            if attachment.source == crate::attachment::AttachmentSource::Clipboard {
+                self.clipboard_temps.retain(|path| path != &attachment.path);
             }
         }
-        taken
     }
 
     // ── Lifecycle ────────────────────────────────────────────
@@ -940,6 +1132,10 @@ impl InputBarState {
         self.file_explorer = None;
         self.clear_selection();
         self.dismiss_autocomplete();
+        self.reset_history_cursor();
+        self.prompt_history.clear();
+        self.cleanup_stashed_draft_temps();
+        self.draft_stash.clear();
         self.cleanup_temps();
     }
 
@@ -951,12 +1147,23 @@ impl InputBarState {
         self.scroll_offset = 0;
         self.clear_selection();
         self.dismiss_autocomplete();
+        self.reset_history_cursor();
     }
 
     /// Remove clipboard temp files (called after turn completes).
     pub fn cleanup_temps(&mut self) {
         for path in self.clipboard_temps.drain(..) {
-            let _ = std::fs::remove_file(path);
+            cleanup_clipboard_temp(&path);
+        }
+    }
+
+    fn cleanup_stashed_draft_temps(&self) {
+        for draft in &self.draft_stash {
+            for attachment in &draft.attachments {
+                if attachment.source == crate::attachment::AttachmentSource::Clipboard {
+                    cleanup_clipboard_temp(&attachment.path);
+                }
+            }
         }
     }
 
@@ -1057,11 +1264,18 @@ impl InputBarState {
                 return self.handle_inject();
             }
             Some(IbWidgetAction::HistoryPrev) => {
-                self.move_cursor_up();
+                if !self.cursor_on_first_visual_row() || !self.recall_history_prev() {
+                    self.move_cursor_up();
+                }
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::HistoryNext) => {
-                self.move_cursor_down();
+                if self.history_cursor.is_none()
+                    || !self.cursor_on_last_visual_row()
+                    || !self.recall_history_next()
+                {
+                    self.move_cursor_down();
+                }
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::OpenFileBrowser) => {
@@ -1114,6 +1328,21 @@ impl InputBarState {
             }
             Some(IbWidgetAction::ClearInput) => {
                 self.clear_input();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::OpenExternalEditor) => {
+                return InputBarAction::OpenExternalEditor;
+            }
+            Some(IbWidgetAction::StashDraft) => {
+                if let Some(draft) = self.stash_current_draft() {
+                    return InputBarAction::StashedDraft(draft);
+                }
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::RestoreDraft) => {
+                if let Some(draft) = self.restore_latest_draft() {
+                    return InputBarAction::RestoredDraft(draft);
+                }
                 return InputBarAction::Consumed;
             }
             _ => {}
@@ -1173,12 +1402,18 @@ impl InputBarState {
         }
 
         // Input bar interactions.
-        if !mouse::in_rect(mouse.column, mouse.row, self.last_input_area) {
+        let input_content_area = Rect::new(
+            self.last_input_area.x,
+            self.last_input_area.y.saturating_add(1),
+            self.last_input_area.width,
+            self.last_input_area.height.saturating_sub(1),
+        );
+        if !mouse::in_rect(mouse.column, mouse.row, input_content_area) {
             return false;
         }
 
-        let inner_x = mouse.column.saturating_sub(self.last_input_area.x + 1);
-        let inner_y = mouse.row.saturating_sub(self.last_input_area.y + 1);
+        let inner_x = mouse.column.saturating_sub(input_content_area.x);
+        let inner_y = mouse.row.saturating_sub(input_content_area.y);
         let width = self.last_inner_width;
 
         match mouse.kind {
@@ -1308,6 +1543,8 @@ impl InputBarState {
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+                SlashCommand::ToggleSidebar => InputBarAction::ToggleSidebar,
+                SlashCommand::CycleProfile => InputBarAction::CycleProfile,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -1315,6 +1552,8 @@ impl InputBarState {
                 }
                 SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
                 SlashCommand::NotACommand => {
+                    self.remember_prompt(&msg);
+                    self.reset_history_cursor();
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
                         text: Some(msg),
@@ -1338,6 +1577,8 @@ impl InputBarState {
         let msg = self.take_input();
         if !msg.is_empty() {
             if matches!(parse_slash_command(&msg), SlashCommand::NotACommand) {
+                self.remember_prompt(&msg);
+                self.reset_history_cursor();
                 let attachments = self.take_attachments();
                 InputBarAction::Inject {
                     text: Some(msg),
@@ -1362,13 +1603,36 @@ impl InputBarState {
         match clipboard::read_clipboard_image() {
             Some((bytes, mime)) => {
                 let ext = mime.rsplit('/').next().unwrap_or("png");
-                let tmp_path = clipboard::clipboard_temp_path(ext);
-                if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                let mut tmp_file = match clipboard::clipboard_temp_file(ext) {
+                    Ok(tmp_file) => tmp_file,
+                    Err(error) => {
+                        return InputBarAction::StatusMessage(crate::i18n::t_args(
+                            "zc-input-clipboard-error",
+                            &[("error", &error.to_string())],
+                        ));
+                    }
+                };
+                if let Err(error) = std::io::Write::write_all(&mut tmp_file, &bytes) {
                     return InputBarAction::StatusMessage(crate::i18n::t_args(
                         "zc-input-clipboard-error",
-                        &[("error", &e.to_string())],
+                        &[("error", &error.to_string())],
                     ));
                 }
+                if let Err(error) = std::io::Write::flush(&mut tmp_file) {
+                    return InputBarAction::StatusMessage(crate::i18n::t_args(
+                        "zc-input-clipboard-error",
+                        &[("error", &error.to_string())],
+                    ));
+                }
+                let (_file, tmp_path) = match tmp_file.keep() {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        return InputBarAction::StatusMessage(crate::i18n::t_args(
+                            "zc-input-clipboard-error",
+                            &[("error", &error.error.to_string())],
+                        ));
+                    }
+                };
                 match PendingAttachment::from_path(tmp_path.to_str().unwrap_or("")) {
                     Ok(mut att) => {
                         att.source = crate::attachment::AttachmentSource::Clipboard;
@@ -1380,11 +1644,13 @@ impl InputBarState {
                             &[("label", &label)],
                         ))
                     }
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp_path);
+                    Err(error) => {
+                        if let Err(cleanup_error) = std::fs::remove_file(&tmp_path) {
+                            eprintln!("clipboard temp cleanup failed: {cleanup_error}");
+                        }
                         InputBarAction::StatusMessage(crate::i18n::t_args(
                             "zc-input-clipboard-error",
-                            &[("error", &e.to_string())],
+                            &[("error", &error.to_string())],
                         ))
                     }
                 }
@@ -1498,7 +1764,7 @@ impl InputBarState {
         let has_attachments = !self.pending_attachments.is_empty();
 
         // Compute dynamic input height.
-        let inner_width = area.width.saturating_sub(2);
+        let inner_width = area.width;
         self.last_inner_width = inner_width;
         let content_rows = if self.input.is_empty() {
             1
@@ -1506,7 +1772,7 @@ impl InputBarState {
             wrapped_line_count(&self.input, inner_width)
         };
         let visible_rows = content_rows.min(MAX_INPUT_ROWS);
-        let input_height = visible_rows + 2; // +2 for top/bottom border
+        let input_height = visible_rows + 1;
 
         // Clamp scroll to the valid range unconditionally so the paragraph
         // offset and the overflow arrows always reflect the same true state,
@@ -1553,10 +1819,9 @@ impl InputBarState {
         let label_owned = turn_status.label(turn_started_at);
         let label: &str = &label_owned;
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP)
             .border_style(theme::dim_style())
-            .title(Span::styled(label, theme::title_style()))
-            .title_bottom(Span::styled("?=help", theme::dim_style()));
+            .title(Span::styled(label, theme::title_style()));
 
         if self.input.is_empty() && !turn_in_flight {
             // A paused queue takes the empty input line as ghost text in the
@@ -1568,7 +1833,16 @@ impl InputBarState {
                 (String::new(), theme::dim_style())
             } else {
                 (
-                    crate::i18n::t("zc-input-placeholder-chat"),
+                    crate::i18n::t_args(
+                        "zc-input-placeholder-code-rich",
+                        &[(
+                            "chord",
+                            &crate::keymap::action_key_labels(
+                                crate::keymap::InputBarAction::OpenExternalEditor,
+                            )
+                            .join("/"),
+                        )],
+                    ),
                     theme::dim_style(),
                 )
             };
@@ -1601,7 +1875,7 @@ impl InputBarState {
             }
 
             let screen_row = cursor_row - self.scroll_offset;
-            let cx = input_area.x + 1 + cursor_col;
+            let cx = input_area.x + cursor_col;
             let cy = input_area.y + 1 + screen_row;
             f.set_cursor_position((cx, cy));
         }
@@ -1647,7 +1921,7 @@ impl InputBarState {
             + 4; // padding
 
         let popup_y = self.last_input_area.y.saturating_sub(popup_height);
-        let popup_x = self.last_input_area.x + 1;
+        let popup_x = self.last_input_area.x;
 
         let popup_rect = Rect::new(
             popup_x,
@@ -1856,6 +2130,73 @@ mod tests {
     }
 
     #[test]
+    fn compact_input_renders_text_below_top_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello");
+        let area = Rect::new(0, 0, 40, 6);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    true,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+            })
+            .expect("draw input bar");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("hello"), "input text missing: {rendered}");
+        assert!(
+            !rendered.contains("?=help"),
+            "bottom title overlaps compact input: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_ignores_input_top_border() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello");
+        bar.last_input_area = Rect::new(10, 5, 20, 2);
+        bar.last_inner_width = 20;
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(!bar.handle_mouse(click));
+        assert_eq!(bar.cursor(), 5);
+    }
+
+    #[test]
+    fn mouse_click_content_maps_to_text_cell() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello");
+        bar.last_input_area = Rect::new(10, 5, 20, 2);
+        bar.last_inner_width = 20;
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(bar.handle_mouse(click));
+        assert_eq!(bar.cursor(), 2);
+    }
+
+    #[test]
     fn cursor_movement() {
         let mut bar = InputBarState::new();
         bar.insert_text("abc");
@@ -1895,6 +2236,8 @@ mod tests {
         assert_eq!(bar.cursor(), 0);
         assert!(bar.pending_attachments().is_empty());
         assert!(!bar.has_file_explorer());
+        assert_eq!(bar.prompt_history_len(), 0);
+        assert_eq!(bar.draft_stash_len(), 0);
     }
 
     #[test]
@@ -1924,13 +2267,7 @@ mod tests {
     fn loading_for_edit_retakes_clipboard_temp_ownership() {
         let mut bar = InputBarState::new();
         let tmp = std::env::temp_dir().join("zc_test_clip_retake.png");
-        let att = PendingAttachment {
-            path: tmp.clone(),
-            mime_type: "image/png".into(),
-            filename: "clip.png".into(),
-            size_bytes: 1,
-            source: crate::attachment::AttachmentSource::Clipboard,
-        };
+        let att = test_clipboard_attachment(tmp.clone());
         bar.load_for_edit("edit".into(), vec![att]);
         assert!(bar.clipboard_temps().contains(&tmp));
     }
@@ -2024,6 +2361,14 @@ mod tests {
         assert!(matches!(
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
+        ));
+        assert!(matches!(
+            parse_slash_command("/sidebar"),
+            SlashCommand::ToggleSidebar
+        ));
+        assert!(matches!(
+            parse_slash_command("/profile"),
+            SlashCommand::CycleProfile
         ));
         assert!(matches!(
             parse_slash_command("hello"),
@@ -2123,6 +2468,190 @@ mod tests {
         bar.autocomplete_target = AutocompleteTarget::ModelArg;
         bar.apply_autocomplete_choice("claude-opus-4");
         assert_eq!(bar.input(), "/model claude-opus-4");
+    }
+
+    #[test]
+    fn prompt_history_recalls_submitted_prompts() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("first prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+        bar.insert_text("second prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+
+        assert!(bar.recall_history_prev());
+        assert_eq!(bar.input(), "second prompt");
+        assert_eq!(bar.history_cursor(), Some(1));
+        assert!(bar.recall_history_prev());
+        assert_eq!(bar.input(), "first prompt");
+        assert_eq!(bar.history_cursor(), Some(0));
+        assert!(bar.recall_history_next());
+        assert_eq!(bar.input(), "second prompt");
+        assert!(bar.recall_history_next());
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.history_cursor(), None);
+    }
+
+    #[test]
+    fn draft_stash_round_trips_without_sending() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("save for later");
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(
+            matches!(stashed, InputBarAction::StashedDraft(ref text) if text == "save for later")
+        );
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.draft_stash_len(), 1);
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(
+            matches!(restored, InputBarAction::RestoredDraft(ref text) if text == "save for later")
+        );
+        assert_eq!(bar.input(), "save for later");
+        assert_eq!(bar.draft_stash_len(), 0);
+    }
+
+    #[test]
+    fn draft_stash_round_trips_attachments() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("send file");
+        bar.add_attachment(test_attachment("a.txt"));
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
+        assert!(bar.pending_attachments().is_empty());
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "a.txt");
+    }
+
+    #[test]
+    fn draft_restore_does_not_overwrite_active_text() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("save for later");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+        bar.insert_text("active draft");
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+
+        assert!(matches!(restored, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "active draft");
+        assert_eq!(bar.draft_stash_len(), 1);
+    }
+
+    #[test]
+    fn draft_stash_preserves_attachment_only_draft() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("a.txt"));
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+
+        assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
+        assert!(bar.pending_attachments().is_empty());
+        assert_eq!(bar.draft_stash_len(), 1);
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
+        assert_eq!(bar.pending_attachments()[0].filename, "a.txt");
+    }
+
+    #[test]
+    fn draft_stash_preserves_clipboard_temp_ownership() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_stash.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.insert_text("send file");
+        bar.add_attachment(test_clipboard_attachment(tmp.clone()));
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
+        assert!(bar.clipboard_temps().is_empty());
+        bar.cleanup_temps();
+        assert!(tmp.exists(), "stashed clipboard temp must survive cleanup");
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert!(bar.clipboard_temps().contains(&tmp));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn reset_clears_prompt_history_and_stash() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("sent prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+        bar.insert_text("stash prompt");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+
+        bar.reset();
+
+        assert_eq!(bar.prompt_history_len(), 0);
+        assert_eq!(bar.draft_stash_len(), 0);
+    }
+
+    #[test]
+    fn reset_removes_stashed_clipboard_temps() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_reset_stash.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.insert_text("stash prompt");
+        bar.add_attachment(test_clipboard_attachment(tmp.clone()));
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+
+        bar.reset();
+
+        assert_eq!(bar.draft_stash_len(), 0);
+        assert!(!tmp.exists(), "reset must clean stashed clipboard temp");
+    }
+
+    #[test]
+    fn history_edit_exits_recall_mode() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("sent prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+
+        assert!(bar.recall_history_prev());
+        bar.push_input_char('!');
+        assert_eq!(bar.history_cursor(), None);
+        assert!(!bar.recall_history_next());
+        assert_eq!(bar.input(), "sent prompt!");
+    }
+
+    #[test]
+    fn history_up_preserves_multiline_navigation() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("old prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+        bar.insert_text("line one\nline two");
+        bar.last_inner_width = 80;
+        bar.cursor = bar.input.len();
+
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Up));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "line one\nline two");
+        assert_eq!(bar.history_cursor(), None);
+        assert!(bar.cursor < bar.input.len());
+    }
+
+    #[test]
+    fn external_editor_action_comes_from_keymap() {
+        let mut bar = InputBarState::new();
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT));
+        assert!(matches!(action, InputBarAction::OpenExternalEditor));
     }
 
     #[test]
@@ -2412,6 +2941,26 @@ mod tests {
         }
     }
 
+    fn test_attachment(filename: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: PathBuf::from(format!("/tmp/{filename}")),
+            mime_type: "text/plain".into(),
+            filename: filename.into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        }
+    }
+
+    fn test_clipboard_attachment(path: PathBuf) -> PendingAttachment {
+        PendingAttachment {
+            path,
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        }
+    }
+
     // ── Auto-complete tests ──────────────────────────────────
 
     #[test]
@@ -2497,6 +3046,22 @@ mod tests {
         assert!(matches!(action, InputBarAction::ToggleThinking));
         // Input should be cleared after submission.
         assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_sidebar_returns_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/sidebar");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::ToggleSidebar));
+    }
+
+    #[test]
+    fn slash_profile_returns_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/profile");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::CycleProfile));
     }
 
     #[test]

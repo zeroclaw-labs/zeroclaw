@@ -4,6 +4,7 @@ use super::events::DraftEvent;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
+use crate::tools::Tool;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
@@ -23,6 +24,7 @@ use zeroclaw_config::schema::PacingConfig;
 /// are NOT carried here — only the values steps actually read off `ctx`.
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
+    pub(crate) tools_registry: &'a [Box<dyn Tool>],
     pub(crate) provider_name: &'a str,
     pub(crate) model: &'a str,
     pub(crate) temperature: Option<f64>,

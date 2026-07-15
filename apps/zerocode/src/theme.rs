@@ -1,6 +1,6 @@
 //! ZeroClaw TUI colour palette and style helpers.
 //!
-//! Shared between the onboarding UI (lib target) and the main chat TUI (binary
+//! Shared between the onboarding UI (lib target) and the main code TUI (binary
 //! target). Not every helper is used by both targets.
 #![allow(dead_code)]
 
@@ -72,8 +72,8 @@ static ACTIVE_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
 
 /// Per-agent theme overrides, keyed by agent alias. A process-global registry
 /// mirroring `ACTIVE`: the Config pane writes here on assign/clear (live, no
-/// restart), and the app loop reads it each frame to tint the Code/Chat pane
-/// for the focused agent. Lazily created so the static stays const-initialised.
+/// restart), and the app loop reads it each frame to tint Code for the focused
+/// agent. Lazily created so the static stays const-initialised.
 static AGENT_OVERRIDES: RwLock<Option<std::collections::HashMap<String, Theme>>> =
     RwLock::new(None);
 
@@ -294,14 +294,14 @@ pub(crate) fn input_style() -> Style {
     Style::default().fg(active().body)
 }
 
-/// "You:" label in the chat conversation.
+/// "You:" label in the code transcript.
 pub(crate) fn user_label_style() -> Style {
     Style::default()
         .fg(active().heading)
         .add_modifier(Modifier::BOLD)
 }
 
-/// "Agent:" label in the chat conversation.
+/// "Agent:" label in the code transcript.
 pub(crate) fn agent_label_style() -> Style {
     Style::default()
         .fg(active().title)
@@ -318,6 +318,47 @@ pub(crate) fn tool_label_style() -> Style {
     Style::default()
         .fg(active().tool)
         .add_modifier(Modifier::BOLD)
+}
+
+fn distinct_role_color(theme: Theme, preferred: Color, used: &[Color]) -> Color {
+    if !used.contains(&preferred) {
+        return preferred;
+    }
+    [
+        theme.title,
+        theme.heading,
+        theme.accent,
+        theme.warn,
+        theme.tool,
+        theme.body,
+        theme.dim,
+        theme.selection_bg,
+    ]
+    .into_iter()
+    .find(|color| !used.contains(color))
+    .unwrap_or(preferred)
+}
+
+fn rail_colors_for(theme: Theme) -> (Color, Color, Color) {
+    let user = distinct_role_color(theme, theme.heading, &[]);
+    let agent = distinct_role_color(theme, theme.accent, &[user]);
+    let tool = distinct_role_color(theme, theme.tool, &[user, agent]);
+    (user, agent, tool)
+}
+
+pub(crate) fn user_rail_style() -> Style {
+    let (user, _, _) = rail_colors_for(active());
+    Style::default().fg(user)
+}
+
+pub(crate) fn agent_rail_style() -> Style {
+    let (_, agent, _) = rail_colors_for(active());
+    Style::default().fg(agent)
+}
+
+pub(crate) fn tool_rail_style() -> Style {
+    let (_, _, tool) = rail_colors_for(active());
+    Style::default().fg(tool)
 }
 
 /// Inline code spans in markdown.
@@ -442,7 +483,7 @@ pub(crate) fn list_highlight_style() -> Style {
 /// drift back to the terminal default.
 pub(crate) fn panel_block(title: &str) -> ratatui::widgets::Block<'static> {
     let mut block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
+        .borders(ratatui::widgets::Borders::TOP)
         .border_style(dim_style());
     if !title.is_empty() {
         block = block.title(ratatui::text::Span::styled(
@@ -580,5 +621,15 @@ mod tests {
             default_theme(),
             theme_by_name(DEFAULT_THEME_NAME).expect("default registered")
         );
+    }
+
+    #[test]
+    fn generated_themes_have_distinct_rail_roles() {
+        for (name, theme) in GENERATED_THEMES {
+            let (user, agent, tool) = rail_colors_for(*theme);
+            assert_ne!(user, agent, "{name} user/agent rail");
+            assert_ne!(user, tool, "{name} user/tool rail");
+            assert_ne!(agent, tool, "{name} agent/tool rail");
+        }
     }
 }

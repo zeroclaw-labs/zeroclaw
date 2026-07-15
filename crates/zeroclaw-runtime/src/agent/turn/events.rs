@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::tool::ToolPresentation;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -82,12 +83,14 @@ pub(crate) async fn emit_tool_call_pending(
     event_tx: &Sender<TurnEvent>,
     id: &str,
     call: &ParsedToolCall,
+    presentation: ToolPresentation,
 ) {
     let _ = event_tx
         .send(TurnEvent::ToolCall {
             id: id.to_string(),
             name: call.name.clone(),
             args: call.arguments.clone(),
+            presentation,
         })
         .await;
 }
@@ -117,9 +120,10 @@ pub(crate) async fn emit_tool_call_pair(
     event_tx: &Sender<TurnEvent>,
     call: &ParsedToolCall,
     outcome: &ToolExecutionOutcome,
+    presentation: ToolPresentation,
 ) {
     let call_id = resolve_tool_call_id(call);
-    emit_tool_call_pending(event_tx, &call_id, call).await;
+    emit_tool_call_pending(event_tx, &call_id, call, presentation).await;
     emit_tool_result(event_tx, &call_id, &call.name, outcome).await;
 }
 
@@ -148,6 +152,10 @@ mod tests {
         }
     }
 
+    fn default_presentation() -> ToolPresentation {
+        ToolPresentation::Generic
+    }
+
     fn ok_outcome() -> ToolExecutionOutcome {
         ToolExecutionOutcome {
             output: "out".into(),
@@ -164,8 +172,20 @@ mod tests {
     #[tokio::test]
     async fn idless_calls_get_distinct_synthesized_pair_ids() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
-        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(None),
+            &ok_outcome(),
+            default_presentation(),
+        )
+        .await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(None),
+            &ok_outcome(),
+            default_presentation(),
+        )
+        .await;
         drop(tx);
 
         let mut ids = Vec::new();
@@ -192,7 +212,13 @@ mod tests {
     #[tokio::test]
     async fn existing_ids_pass_through() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(Some("native-7")), &ok_outcome()).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(Some("native-7")),
+            &ok_outcome(),
+            default_presentation(),
+        )
+        .await;
         drop(tx);
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -212,7 +238,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let call = parsed_call(None);
         let id = resolve_tool_call_id(&call);
-        emit_tool_call_pending(&tx, &id, &call).await;
+        emit_tool_call_pending(&tx, &id, &call, default_presentation()).await;
         emit_tool_result(&tx, &id, &call.name, &ok_outcome()).await;
         drop(tx);
 
@@ -246,7 +272,13 @@ mod tests {
             output_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(Some("c1")),
+            &outcome,
+            default_presentation(),
+        )
+        .await;
         drop(tx);
         let mut saw_result = false;
         while let Some(ev) = rx.recv().await {

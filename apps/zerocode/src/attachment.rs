@@ -4,7 +4,7 @@
 //! values for the `session/prompt` RPC call. Transport-aware: sends
 //! `path` over Unix sockets, `data_b64` over WSS.
 //!
-//! Shared between Chat and ACP panes.
+//! Shared by the Code pane's local and WSS transport paths.
 
 use std::path::PathBuf;
 
@@ -122,8 +122,11 @@ pub(crate) fn build_attachments_json(
 /// attachments reference user files and are left untouched.
 pub(crate) fn cleanup_attachment_temps(attachments: &[PendingAttachment]) {
     for att in attachments {
-        if att.source == AttachmentSource::Clipboard {
-            let _ = std::fs::remove_file(&att.path);
+        if att.source == AttachmentSource::Clipboard && att.path.exists() {
+            match std::fs::remove_file(&att.path) {
+                Ok(()) => {}
+                Err(error) => eprintln!("attachment temp cleanup failed: {error}"),
+            }
         }
     }
 }

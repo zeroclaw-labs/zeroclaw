@@ -42,8 +42,8 @@ impl ChordSpec {
 pub(crate) struct ThemeSection {
     #[serde(default = "default_theme")]
     pub name: String,
-    /// Per-agent theme overrides keyed by agent alias. When the Code or Chat
-    /// pane is focused on an agent listed here, that agent's theme replaces
+    /// Per-agent theme overrides keyed by agent alias. When Code is focused on
+    /// an agent listed here, that agent's theme replaces
     /// the base `name` while the pane is active. Sparse: agents not listed use
     /// the base theme.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -64,6 +64,107 @@ impl Default for ThemeSection {
             agent_override: HashMap::new(),
         }
     }
+}
+
+macro_rules! ui_profiles {
+    ($($variant:ident => ($wire:literal, $fluent:literal)),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub(crate) enum UiProfile {
+            #[default]
+            $($variant),+
+        }
+
+        impl UiProfile {
+            pub(crate) fn variants() -> &'static [Self] {
+                &[$(Self::$variant),+]
+            }
+
+            pub(crate) fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+
+            pub(crate) fn fluent_key(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $fluent),+
+                }
+            }
+
+            fn parse(raw: &str) -> Option<Self> {
+                Self::variants()
+                    .iter()
+                    .copied()
+                    .find(|profile| profile.as_str() == raw)
+            }
+        }
+    };
+}
+
+ui_profiles! {
+    Minimal => ("minimal", "zc-zerocode-ui-profile-minimal"),
+    Rich => ("rich", "zc-zerocode-ui-profile-rich"),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct UiSection {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub show_chat_pane: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_adaptive_sidebar: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_ui_profile_or_default",
+        skip_serializing_if = "is_default_ui_profile"
+    )]
+    pub profile: UiProfile,
+}
+
+impl Default for UiSection {
+    fn default() -> Self {
+        Self {
+            show_chat_pane: false,
+            show_adaptive_sidebar: true,
+            profile: UiProfile::default(),
+        }
+    }
+}
+
+impl UiSection {
+    fn is_empty(&self) -> bool {
+        !self.show_chat_pane && self.show_adaptive_sidebar && self.profile == UiProfile::default()
+    }
+}
+
+fn is_default_ui_profile(profile: &UiProfile) -> bool {
+    *profile == UiProfile::default()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn deserialize_ui_profile_or_default<'de, D>(deserializer: D) -> Result<UiProfile, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = match String::deserialize(deserializer) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("zerocode: invalid [ui].profile ({e}); using minimal");
+            return Ok(UiProfile::default());
+        }
+    };
+    if let Some(profile) = UiProfile::parse(&raw) {
+        return Ok(profile);
+    }
+    eprintln!("zerocode: unknown [ui].profile '{raw}'; using minimal");
+    Ok(UiProfile::default())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -122,6 +223,8 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
+    #[serde(default, skip_serializing_if = "UiSection::is_empty")]
+    pub ui: UiSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -134,6 +237,7 @@ impl Default for ZerocodeConfig {
             locale: default_locale(),
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
+            ui: UiSection::default(),
             keybindings: HashMap::new(),
         }
     }
@@ -264,6 +368,15 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
+    if let Some(v) = doc.get("ui") {
+        match v.clone().try_into::<UiSection>() {
+            Ok(section) => config.ui = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [ui] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
     if let Some(v) = doc.get("keybindings") {
         match v.clone().try_into::<HashMap<String, ChordSpec>>() {
             Ok(rows) => config.keybindings = rows,
@@ -356,6 +469,26 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
         cur = section_mut(cur, key)?;
     }
     Ok(cur)
+}
+
+pub(crate) fn persist_ui_profile(config_dir: &Path, profile: UiProfile) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "ui")?.insert(
+        "profile".to_string(),
+        toml::Value::String(profile.as_str().to_string()),
+    );
+    write_document(&path, &doc)
+}
+
+pub(crate) fn persist_show_adaptive_sidebar(config_dir: &Path, enabled: bool) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "ui")?.insert(
+        "show_adaptive_sidebar".to_string(),
+        toml::Value::Boolean(enabled),
+    );
+    write_document(&path, &doc)
 }
 
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
@@ -519,6 +652,45 @@ mod tests {
             body.contains("locale = \"en\""),
             "default config must surface the locale prop on disk; got:\n{body}"
         );
+    }
+
+    #[test]
+    fn invalid_ui_profile_falls_back_to_minimal() {
+        let c: ZerocodeConfig = toml::from_str("[ui]\nprofile = \"unknown\"\n").unwrap();
+        assert_eq!(c.ui.profile, UiProfile::Minimal);
+    }
+
+    #[test]
+    fn ui_profile_round_trips_when_configured() {
+        let c: ZerocodeConfig = toml::from_str("[ui]\nprofile = \"rich\"\n").unwrap();
+        assert_eq!(c.ui.profile, UiProfile::Rich);
+        let body = toml::to_string_pretty(&c).unwrap();
+        assert!(body.contains("profile = \"rich\""), "{body}");
+    }
+
+    #[test]
+    fn ui_profile_variants_are_the_config_registry() {
+        assert!(UiProfile::variants().contains(&UiProfile::Minimal));
+        assert!(UiProfile::variants().contains(&UiProfile::Rich));
+        for profile in UiProfile::variants() {
+            assert_eq!(UiProfile::parse(profile.as_str()), Some(*profile));
+        }
+    }
+
+    #[test]
+    fn persist_ui_settings_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[ui]\nshow_chat_pane = true\n",
+        );
+        persist_ui_profile(dir.path(), UiProfile::Rich).unwrap();
+        persist_show_adaptive_sidebar(dir.path(), false).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert!(cfg.ui.show_chat_pane);
+        assert_eq!(cfg.ui.profile, UiProfile::Rich);
+        assert!(!cfg.ui.show_adaptive_sidebar);
     }
 
     #[test]
