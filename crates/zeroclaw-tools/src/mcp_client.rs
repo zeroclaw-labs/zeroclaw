@@ -281,11 +281,6 @@ impl McpServer {
             .unwrap_or(true) // assume healthy if lock is contended
     }
 
-    /// Get the server's config name.
-    pub async fn server_name(&self) -> String {
-        self.inner.lock().await.config.name.clone()
-    }
-
     /// Identity comparison on the underlying transport handle. Two
     /// `McpServer` values share the same connection iff `ptr_eq`
     /// returns `true` — i.e. their inner `Arc<Mutex<McpServerInner>>`
@@ -295,9 +290,8 @@ impl McpServer {
     /// Used by the daemon's reconciliation layer to verify that a
     /// "preserved" healthy server's live connection survives a
     /// recovery tick without being silently disconnected and
-    /// reconnected (the previous count-only / superset-only logic
-    /// would drop and reconnect healthy stdio children every time
-    /// a peer server's discovery result changed shape).
+    /// respawned (the additive merge contract: a healthy handle
+    /// covers its name and is reused verbatim via `Arc::clone`).
     pub fn ptr_eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.inner, &other.inner)
     }

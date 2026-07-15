@@ -1219,32 +1219,25 @@ async fn connect_heartbeat_mcp_registry(
 
 /// Additively reconcile the heartbeat worker's MCP registry.
 ///
-/// The previous count-only / superset-only logic had two failure
-/// modes that surfaced under partial outage (one granted server
-/// healthy, another flaky):
+/// The heartbeat worker's lifetime invariant (#5903) is that a healthy
+/// live `McpServer` connection must NEVER be silently disconnected and
+/// respawned just because a peer's discovery result changed shape. This
+/// function preserves that invariant under all of:
 ///
-///   * When `current == fresh` by name, the prior code replaced
-///     `current` with `fresh` on every tick, churning a healthy
-///     stdio connection while the missing peer stayed down.
-///   * When `fresh` had a different shape from `current` (e.g.
-///     current = {A}, fresh = {B}), the prior code discarded
-///     `fresh` entirely and waited for one future attempt that
-///     happened to return both {A, B} — a stall when A's endpoint
-///     could not accept a duplicate connection.
+///   * steady state (both registries match by name + `McpServer` Arc
+///     identity — return `None`, no churn);
+///   * partial outage (one granted server healthy, another flaky —
+///     keep the healthy handle, admit the freshly-discovered peer
+///     additively);
+///   * dead transport (a server whose child exited after startup —
+///     drop it from `current` while keeping the rest, admit anything
+///     `fresh` brought back);
 ///
-/// This function implements an additive merge:
-///
-///   1. Identify the **healthy** slice of `current` (drop any whose
-///      transport is reported dead by `health_check_all`).
-///   2. Identify the **fresh-new** slice of `fresh` — servers whose
-///      name is not already covered by a healthy current server.
-///   3. Build a new registry from `healthy_current + fresh_new`,
-///      cheaply Arc-cloning each surviving `McpServer` so its live
-///      transport is reused — no disconnect, no respawn.
-///   4. If the merged set is exactly the healthy-current set
-///      (identity-preserving comparison via `McpServer::ptr_eq`),
-///      return `None` so the caller does NOT swap `current`'s Arc
-///      pointer — preserving the no-churn steady state.
+/// while never silently dropping the live registry when both current
+/// and fresh are present. The additive merge rebuilds the registry
+/// from `healthy_current + fresh_new`, Arc-cloning each surviving
+/// `McpServer` so its live transport is reused — no disconnect, no
+/// respawn.
 ///
 /// Returns `Some(merged_registry)` when the caller should replace
 /// `current` with a new Arc, `None` when `current` should stay
@@ -1259,9 +1252,8 @@ async fn reconcile_heartbeat_mcp_registry(
         return fresh.map(std::sync::Arc::clone);
     };
     let Some(fresh_arc) = fresh else {
-        // No fresh registry — keep current. Mirrors the prior
-        // fail-open contract: a failed connect_all must not silently
-        // drop a live registry.
+        // No fresh registry — keep current. A failed `connect_all`
+        // must not silently drop a live registry (fail-open).
         return None;
     };
 
@@ -1425,9 +1417,11 @@ async fn retry_heartbeat_mcp_registry(
             let _dead = reg.kill_dead_connections().await;
         }
         let fresh = connect_heartbeat_mcp_registry(config, agent_alias).await?;
-        // Identity-aware replacement — only swap when `fresh` is a
-        // superset of `current` by server name, never silently dropping
-        // a healthy one.
+        // Let the additive reconciler decide whether the live registry
+        // needs to be replaced; it returns `None` when the healthy
+        // current handles are sufficient (preserves the #5903
+        // no-churn steady state) and `Some(merged)` when `fresh` adds
+        // a recovered server or replaces a dead one.
         if let Some(replaced) =
             reconcile_heartbeat_mcp_registry(shared.as_ref(), fresh.as_ref()).await
         {
@@ -3390,10 +3384,7 @@ mod tests {
     //    heartbeat tick — the daemon heartbeat worker owns one
     //    `Arc<McpRegistry>` for its entire lifetime, and every tick's
     //    `agent::run` call receives that same Arc via
-    //    `AgentRunOverrides::mcp_registry`. The prior fix only
-    //    keep-aliased a per-run Arc and was rejected because the
-    //    *construction itself* still happened per tick — leaving
-    //    a stdio MCP child orphaned every tick.
+    //    `AgentRunOverrides::mcp_registry`.
     //
     //    Regression test simulates N "tick boundaries" through the
     //    actual reuse path (`connect_heartbeat_mcp_registry` +
@@ -3405,10 +3396,9 @@ mod tests {
     //          overrides is the SAME Arc on every tick
     //          (std::ptr::eq on `Arc::as_ptr`).
     //
-    //    The counter test is non-vacuous: with the old code path
-    //    (no daemon-level cache), the construction counter would
-    //    have been N (one per tick) and the Arc pointers would have
-    //    differed on every tick.
+    //    The counter test is non-vacuous: without the daemon-level
+    //    cache, the construction counter would be N (one per tick)
+    //    and the Arc pointers would differ on every tick.
     #[tokio::test]
     async fn heartbeat_mcp_registry_constructed_once_across_n_ticks() {
         use std::sync::Arc;
@@ -3421,10 +3411,11 @@ mod tests {
         // Install a counter hook: every invocation increments and
         // returns the SAME shared Arc<McpRegistry>. A counter that
         // monotonically increases across calls is the regression
-        // signal — the old path would call this once per tick.
-        // The returned RAII guard must outlive every assertion
-        // below; if it drops while another test starts, that other
-        // test could clobber or reset the hook before we observe it.
+        // signal — a per-tick construction path would call this
+        // once per tick. The returned RAII guard must outlive every
+        // assertion below; if it drops while another test starts,
+        // that other test could clobber or reset the hook before we
+        // observe it.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
             crate::tools::McpRegistry::connect_all(&[])
@@ -3517,9 +3508,9 @@ mod tests {
         );
 
         // Drop the worker-level handle — this is the daemon's
-        // shutdown boundary. The previously-spilled stdio child
-        // (none, here, since we used an empty fixture) would be
-        // reaped cleanly by `kill_on_drop(true)`.
+        // shutdown boundary. Any live stdio child would be reaped
+        // cleanly by `kill_on_drop(true)`; the empty fixture used
+        // here has none.
         drop(shared);
 
         // The hook guard drops here, clearing the global hook and
@@ -3828,10 +3819,9 @@ mod tests {
     // counter must stay at 1 regardless of how many ticks we run.
     //
     // Non-vacuous: a test that just calls `McpRegistry::call_tool()`
-    // N times (the prior rejected PR's test) would NOT have caught
-    // the bug, because `call_tool` reuses the existing child. The
-    // regression signal is the construction/connect counter, not
-    // the call counter.
+    // N times would NOT have caught the bug, because `call_tool`
+    // reuses the existing child. The regression signal is the
+    // construction/connect counter, not the call counter.
     #[tokio::test]
     async fn heartbeat_worker_reuses_shared_mcp_registry_across_n_ticks() {
         use std::sync::Arc;
@@ -4069,9 +4059,9 @@ mod tests {
     /// Additive merge: current = {A}, fresh = {B}. Even though fresh
     /// does NOT include A, the recovered B must be admitted into the
     /// merged registry while A's live handle is preserved (Arc
-    /// identity check). This is the case the previous superset-only
-    /// logic stalled on: a granted-but-flaky peer whose discovery
-    /// never produced the full set in a single connect_all.
+    /// identity check). This is the "granted-but-flaky peer whose
+    /// discovery never produced the full set in a single connect_all"
+    /// invariant the additive merge protects.
     #[tokio::test]
     async fn reconcile_heartbeat_mcp_registry_merges_when_fresh_is_disjoint_subset() {
         let a_handle = make_test_server_handle("server-a");
@@ -4800,30 +4790,23 @@ done
     }
 
     // ── Partial recovery: A stays healthy across failed B retries, then
-    //    B is admitted without replacing A.
+    //    B is admitted without replacing A. The #5903 lifetime
+    //    invariant requires that A's `McpServer` Arc identity is
+    //    stable across every tick and that B is admitted in a single
+    //    tick — without replacing A or forcing both to reconnect.
     //
     //    Grants:    {A, B}
     //    Sequence:
-    //      tick 0 (boot):              hook returns {}            → empty registry
-    //      tick 1 (retry, B still down): hook returns {A}         → A is admitted
-    //      tick 2 (retry, B still down): hook returns {A} (same A handle)
-    //                                                            → A MUST stay
-    //                                                              identical
-    //                                                              (no churn)
-    //      tick 3 (retry, B came up):   hook returns {A, B} (same A handle, fresh B)
-    //                                                            → A MUST stay
-    //                                                              identical;
-    //                                                              B is admitted
-    //                                                              in the SAME
-    //                                                              tick (without
-    //                                                              replacing A).
-    //
-    //    The old count-only / superset-only logic would either churn A
-    //    every tick (when fresh == {A}) or stall forever (when fresh
-    //    == {A, B} but current's A handle would be replaced, requiring
-    //    both to reconnect simultaneously). The additive merge keeps
-    //    A's `McpServer` Arc identity stable across every tick and
-    //    admits B in one tick without dropping A.
+    //      tick 0 (boot):                hook returns {}           → empty registry
+    //      tick 1 (retry, B still down): hook returns {A}          → A admitted
+    //      tick 2 (retry, B still down): hook returns {A} (same handle)
+    //                                                          → A stays identical
+    //                                                            (no churn)
+    //      tick 3 (retry, B came up):    hook returns {A, B}
+    //                                 (same A handle, fresh B) → A stays identical,
+    //                                                            B admitted in the
+    //                                                            SAME tick (without
+    //                                                            replacing A).
     #[tokio::test]
     async fn heartbeat_worker_preserves_healthy_a_admits_recovered_b_additively() {
         use std::sync::Arc;
