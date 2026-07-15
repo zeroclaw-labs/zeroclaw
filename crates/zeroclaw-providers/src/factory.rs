@@ -2448,4 +2448,97 @@ mod tests {
             "OpenAI-compatible provider should keep its family-default vision=true when opts.vision = None"
         );
     }
+
+    #[test]
+    fn vision_flows_from_config_entry_through_runtime_options_to_factory() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let entry = ModelProviderConfig {
+            wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+            vision: Some(true),
+            ..Default::default()
+        };
+        let opts =
+            crate::model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+        assert_eq!(
+            opts.vision,
+            Some(true),
+            "entry.vision = Some(true) must resolve to opts.vision = Some(true)"
+        );
+        let provider = OpenAIModelProviderConfig { base: entry }
+            .create_provider("vision-resp-true", Some("sk-key"), None, &opts)
+            .unwrap();
+        assert!(
+            provider.capabilities().vision,
+            "Responses provider built from resolved opts must report vision=true"
+        );
+
+        let entry = ModelProviderConfig {
+            wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+            vision: Some(false),
+            ..Default::default()
+        };
+        let opts =
+            crate::model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+        assert_eq!(opts.vision, Some(false));
+        let provider = OpenAIModelProviderConfig { base: entry }
+            .create_provider("vision-resp-false", Some("sk-key"), None, &opts)
+            .unwrap();
+        assert!(!provider.capabilities().vision);
+
+        let entry = ModelProviderConfig {
+            wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+            ..Default::default()
+        };
+        let opts =
+            crate::model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+        assert_eq!(
+            opts.vision, None,
+            "entry without vision field must resolve to opts.vision = None"
+        );
+        let provider = OpenAIModelProviderConfig { base: entry }
+            .create_provider("vision-resp-default", Some("sk-key"), None, &opts)
+            .unwrap();
+        assert!(
+            !provider.capabilities().vision,
+            "Responses provider with opts.vision=None must default to vision=false"
+        );
+
+        let entry = ModelProviderConfig {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let opts =
+            crate::model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+        assert_eq!(opts.vision, Some(false));
+        let provider = entry
+            .create_provider(
+                "compat-override",
+                Some("sk-key"),
+                Some("https://api.example.test/v1"),
+                &opts,
+            )
+            .unwrap();
+        assert!(
+            !provider.capabilities().vision,
+            "Compat provider should report vision=false when config entry sets vision=false"
+        );
+
+        let entry = ModelProviderConfig::default();
+        let opts =
+            crate::model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+        assert_eq!(opts.vision, None);
+        let provider = entry
+            .create_provider(
+                "compat-default",
+                Some("sk-key"),
+                Some("https://api.example.test/v1"),
+                &opts,
+            )
+            .unwrap();
+        assert!(
+            provider.capabilities().vision,
+            "Compat provider with opts.vision=None must keep family-default vision=true"
+        );
+    }
 }

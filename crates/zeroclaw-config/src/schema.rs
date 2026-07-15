@@ -916,8 +916,12 @@ pub struct ModelProviderConfig {
     /// Whether this model supports vision (image) inputs.
     /// When set, overrides the provider-family default capability.
     /// Use this when a provider serves models with mixed vision support
-    /// (e.g., an OpenAI-compatible family where only some models are multimodal).
-    /// Leave unset to use the provider-family default.
+    /// (e.g., an OpenAI-compatible family where only some models are
+    /// multimodal). Leave unset to use the provider-family default.
+    ///
+    /// Currently applied to OpenAI Responses and OpenAI-compatible
+    /// families. Other families preserve their hardcoded capability.
+    /// #7100 tracks extending the override to all provider paths.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,

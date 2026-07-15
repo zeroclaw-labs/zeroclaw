@@ -19,7 +19,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
-- `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `wire_api`, `native_tools`, `vision`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -65,6 +65,28 @@ When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama
 {{#env-var container}}
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
+
+## Per-model vision support
+
+Providers that serve models with mixed vision support (some multimodal, some text-only) accept a `vision` override on the alias entry:
+
+```toml
+# Responses provider for a vision-capable model
+[providers.models.openai.gpt4o]
+model = "gpt-4o"
+wire_api = "responses"
+vision = true
+
+# Responses provider for a text-only model
+[providers.models.openai.gpt4o_mini]
+model = "gpt-4o-mini"
+wire_api = "responses"
+vision = false
+```
+
+**Compatibility note:** When `vision` is unset, OpenAI-compatible families report their family default (usually `true`), while the OpenAI Responses API defaults to `false` as a safety measure. This means existing Responses aliases will reject image inputs until the operator explicitly sets `vision = true`. This is an intentional opt-in behaviour: adding `vision = true` to the alias entry restores image support for that model.
+
+The `vision` field is available on every family slot (it lives on the shared `ModelProviderConfig` base). Currently it is processed by the OpenAI Responses and OpenAI-compatible construction paths; [#7100](https://github.com/zeroclaw-labs/zeroclaw/issues/7100) tracks extending it to all provider paths.
 
 ## Per-family knobs: worked examples
 
