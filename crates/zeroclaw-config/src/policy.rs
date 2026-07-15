@@ -630,6 +630,32 @@ fn is_null_device(path: &Path) -> bool {
     }
 }
 
+/// Canonicalize `path`, tolerating the case where `path` itself (or its
+/// tail components) does not exist yet — e.g. a `deny_write` guardrail
+/// target like `.env` being written for the first time. Plain
+/// `Path::canonicalize` fails outright on a missing path, which would
+/// silently fall back to the uncanonicalized form and defeat the
+/// guardrail on any workspace reachable through a symlink (notably
+/// macOS, where `/tmp` is a symlink to `/private/tmp`). Walks up to the
+/// nearest existing ancestor, canonicalizes that, and rejoins the
+/// missing suffix.
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    let mut missing_suffix = PathBuf::new();
+    let mut ancestor = path;
+    loop {
+        if let Ok(canonical_ancestor) = ancestor.canonicalize() {
+            return canonical_ancestor.join(missing_suffix);
+        }
+        match (ancestor.parent(), ancestor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing_suffix = Path::new(name).join(missing_suffix);
+                ancestor = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn rootless_path(path: &Path) -> Option<PathBuf> {
     let mut relative = PathBuf::new();
 
@@ -2028,7 +2054,7 @@ impl SecurityPolicy {
         // first so a guardrail path stays write-protected even inside an otherwise
         // writable workspace or allowed root.
         for denied in &self.deny_write {
-            let canonical = denied.canonicalize().unwrap_or_else(|_| denied.clone());
+            let canonical = canonicalize_best_effort(denied);
             if resolved.starts_with(&canonical) {
                 return false;
             }

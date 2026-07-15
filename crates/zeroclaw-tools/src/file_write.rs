@@ -198,6 +198,17 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
+        if !self.security.is_resolved_path_allowed(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_target),
+                ),
+            });
+        }
+
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
@@ -836,5 +847,69 @@ mod tests {
         assert!(!outside_file.exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    fn deny_write_guardrail_tool(workspace: std::path::PathBuf) -> FileWriteTool {
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, &workspace));
+        FileWriteTool::new(security)
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_mandatory_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_deny_write_env");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".env", "content": "SECRET=1"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "write to .env must be denied");
+        assert!(!dir.join(".env").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_sibling_of_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_deny_write_sibling");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "notes.txt", "content": "fine"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "sibling file must remain writable: {:?}",
+            result.error
+        );
+        assert!(dir.join("notes.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_nested_git_config_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_deny_write_git_config");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir.join(".git")).await.unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".git/config", "content": "[core]"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "write to .git/config must be denied");
+        assert!(!dir.join(".git/config").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
