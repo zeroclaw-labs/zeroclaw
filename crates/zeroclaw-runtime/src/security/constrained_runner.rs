@@ -322,7 +322,10 @@ impl ConstrainedRunner {
 /// the kernel has since recycled. On non-Unix there is no process-group
 /// signalling (and thus no such race), so a plain reaping `try_wait` is used.
 #[cfg(unix)]
-pub(crate) fn poll_child_exited(_child: &mut std::process::Child, pid: u32) -> std::io::Result<bool> {
+pub(crate) fn poll_child_exited(
+    _child: &mut std::process::Child,
+    pid: u32,
+) -> std::io::Result<bool> {
     let id = pid as libc::id_t;
     loop {
         // Zeroing the struct lets us distinguish "no child ready" (`si_pid`
@@ -352,7 +355,10 @@ pub(crate) fn poll_child_exited(_child: &mut std::process::Child, pid: u32) -> s
 }
 
 #[cfg(not(unix))]
-pub(crate) fn poll_child_exited(child: &mut std::process::Child, _pid: u32) -> std::io::Result<bool> {
+pub(crate) fn poll_child_exited(
+    child: &mut std::process::Child,
+    _pid: u32,
+) -> std::io::Result<bool> {
     Ok(child.try_wait()?.is_some())
 }
 

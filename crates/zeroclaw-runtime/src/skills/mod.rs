@@ -5224,9 +5224,13 @@ mod install_transaction_tests {
         #[cfg(unix)]
         {
             let mut fail = std::process::Command::new("false");
-            let err =
-                run_command_with_timeout(&mut fail, Duration::from_secs(30), "timeout", "git clone")
-                    .expect_err("non-zero exit must be an error");
+            let err = run_command_with_timeout(
+                &mut fail,
+                Duration::from_secs(30),
+                "timeout",
+                "git clone",
+            )
+            .expect_err("non-zero exit must be an error");
             assert!(err.to_string().contains("git clone failed"), "got: {err}");
         }
     }
@@ -5697,7 +5701,10 @@ mod install_transaction_tests {
             live_lock_tricky.exists(),
             "a live lock for a skill named with '.reclaim-' must not be swept"
         );
-        assert!(!orphan.exists(), "an orphaned reclaim leftover must be swept");
+        assert!(
+            !orphan.exists(),
+            "an orphaned reclaim leftover must be swept"
+        );
     }
 
     #[test]
@@ -5956,14 +5963,22 @@ mod screening_gate_tests {
         assert!(report.requires_acceptance());
 
         // Remote confirm/block refuse it; local warn and off never do.
-        assert!(SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None).refuses(&report));
-        assert!(SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, None).refuses(&report));
+        assert!(
+            SkillScreeningGate::for_remote(SkillScreenRemoteAction::Confirm, None).refuses(&report)
+        );
+        assert!(
+            SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, None).refuses(&report)
+        );
         assert!(!SkillScreeningGate::for_local(SkillScreenLocalAction::Warn).refuses(&report));
-        assert!(!SkillScreeningGate::for_remote(SkillScreenRemoteAction::Off, None).refuses(&report));
+        assert!(
+            !SkillScreeningGate::for_remote(SkillScreenRemoteAction::Off, None).refuses(&report)
+        );
 
         // A genuinely clean report is refused by no policy.
         let clean = ScreeningReport::default();
-        assert!(!SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, None).refuses(&clean));
+        assert!(
+            !SkillScreeningGate::for_remote(SkillScreenRemoteAction::Block, None).refuses(&clean)
+        );
     }
 
     #[test]

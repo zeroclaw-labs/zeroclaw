@@ -1565,9 +1565,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             .expect("generic api key must be detected");
         assert_eq!(generic.confidence, DetectionConfidence::Medium);
 
-        let aws = detector.detect(
-            "aws_secret_access_key=abcdefghijklmnopqrstuvwxyz0123456789ABCD",
-        );
+        let aws = detector.detect("aws_secret_access_key=abcdefghijklmnopqrstuvwxyz0123456789ABCD");
         let secret = aws
             .iter()
             .find(|m| m.label == "AWS Secret Access Key")

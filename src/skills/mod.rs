@@ -236,8 +236,16 @@ pub async fn handle_command(
             accept_risk,
             force,
         } => {
-            handle_install(config, source, agent, bundle, no_tier_banner, accept_risk, force)
-                .await
+            handle_install(
+                config,
+                source,
+                agent,
+                bundle,
+                no_tier_banner,
+                accept_risk,
+                force,
+            )
+            .await
         }
         crate::SkillCommands::Screen { source } => handle_screen(config, source).await,
         crate::SkillCommands::Verify { name } => handle_verify(config, name),
@@ -1245,13 +1253,14 @@ async fn dispatch_install(
             .await
             .with_context(|| format!("failed to install skill from ClawHub: {source}"))
     } else if is_git_source(source) {
-        install_git_skill_source(source, skills_path, allow_scripts, gate, mode)
-            .with_context(|| {
+        install_git_skill_source(source, skills_path, allow_scripts, gate, mode).with_context(
+            || {
                 get_required_cli_string_with_args(
                     "cli-skills-install-git-failed",
                     &[("source", source)],
                 )
-            })
+            },
+        )
     } else if is_registry_source(source) {
         println!(
             "{}",
@@ -1304,13 +1313,14 @@ async fn dispatch_install(
             )
         })
     } else {
-        install_local_skill_source(source, skills_path, allow_scripts, gate, mode)
-            .with_context(|| {
+        install_local_skill_source(source, skills_path, allow_scripts, gate, mode).with_context(
+            || {
                 get_required_cli_string_with_args(
                     "cli-skills-install-local-failed",
                     &[("source", source)],
                 )
-            })
+            },
+        )
     }
 }
 
@@ -1322,9 +1332,7 @@ fn install_dir_name(source: &str) -> Option<String> {
         // Resolve the git destination name through the same runtime helper the
         // installer uses (`git_clone_dir_name`), so the receipt lookup and the
         // actual install directory can never disagree.
-        SkillSource::Git { .. } => {
-            zeroclaw_runtime::skills::git_clone_dir_name(source).ok()
-        }
+        SkillSource::Git { .. } => zeroclaw_runtime::skills::git_clone_dir_name(source).ok(),
         SkillSource::Registry { skill, .. } => Some(skill),
         // Canonicalize before taking the basename: the installer canonicalizes
         // a local source, so a symlinked source (`./link` → `realdir/`) installs
@@ -1413,7 +1421,13 @@ async fn handle_install(
             // offer to re-run with the override.
             if let Some(risk) = err.downcast_ref::<RiskAcceptanceRequired>() {
                 return handle_screening_denial(
-                    config, &source, agent, bundle, no_tier_banner, force, risk,
+                    config,
+                    &source,
+                    agent,
+                    bundle,
+                    no_tier_banner,
+                    force,
+                    risk,
                 )
                 .await;
             }
@@ -1822,7 +1836,10 @@ fn print_install_location_note(location: &SkillLocation) {
     match location {
         SkillLocation::Bundle { alias, .. } => println!(
             "{}",
-            get_required_cli_string_with_args("cli-skills-install-into-bundle", &[("alias", alias)])
+            get_required_cli_string_with_args(
+                "cli-skills-install-into-bundle",
+                &[("alias", alias)]
+            )
         ),
         SkillLocation::Global { .. } => println!(
             "{}",
@@ -2053,7 +2070,8 @@ mod install_location_tests {
 
         let install_root = c.install_root_dir();
         let bundle_dir =
-            zeroclaw_config::skill_bundles::resolve_directory(&c, &install_root, "official").unwrap();
+            zeroclaw_config::skill_bundles::resolve_directory(&c, &install_root, "official")
+                .unwrap();
         write_skill(&bundle_dir, "in-bundle");
         write_skill(&skills_dir(&c.data_dir), "in-global");
 
@@ -2075,7 +2093,10 @@ mod install_location_tests {
     fn receipt_key_is_location_qualified_and_traversal_safe() {
         // Same name in different locations → distinct receipt keys, so their
         // receipts no longer collide on one name-keyed file.
-        assert_ne!(receipt_key("bundle:a", "foo"), receipt_key("bundle:b", "foo"));
+        assert_ne!(
+            receipt_key("bundle:a", "foo"),
+            receipt_key("bundle:b", "foo")
+        );
         assert_ne!(receipt_key("bundle:a", "foo"), receipt_key("global", "foo"));
         assert_eq!(receipt_key("bundle:a", "foo"), "bundle-a/foo");
         assert_eq!(receipt_key("global", "foo"), "global/foo");
@@ -2084,8 +2105,14 @@ mod install_location_tests {
         // lossy sanitizer would collapse (`.` vs `-`, spaces) stay distinct, so
         // a remote skill's receipt cannot be overwritten by a co-located local
         // one (which would defeat the remote-test gate).
-        assert_ne!(receipt_key("global", "foo.bar"), receipt_key("global", "foo-bar"));
-        assert_ne!(receipt_key("bundle:a.b", "x"), receipt_key("bundle:a-b", "x"));
+        assert_ne!(
+            receipt_key("global", "foo.bar"),
+            receipt_key("global", "foo-bar")
+        );
+        assert_ne!(
+            receipt_key("bundle:a.b", "x"),
+            receipt_key("bundle:a-b", "x")
+        );
         assert_ne!(receipt_key("global", "a b"), receipt_key("global", "a-b"));
 
         // The install-time label (from a SkillLocation, used by

@@ -1239,7 +1239,12 @@ mod tests {
         // (U+FE00–U+FE0F), one selector per ASCII carrier, must also be caught —
         // each selector hangs off an ASCII letter, which is not a plausible base.
         let mut body = String::new();
-        for (carrier, cp) in [('a', 0xFE06_u32), ('b', 0xFE08), ('c', 0xFE06), ('d', 0xFE09)] {
+        for (carrier, cp) in [
+            ('a', 0xFE06_u32),
+            ('b', 0xFE08),
+            ('c', 0xFE06),
+            ('d', 0xFE09),
+        ] {
             body.push(carrier);
             body.push(char::from_u32(cp).unwrap());
         }
