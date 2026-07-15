@@ -104,6 +104,66 @@ jobs:
           cosign sign --yes \
             "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
 
+  # The nominated relay (zerorelay) ships as its OWN distroless image from
+  # apps/zerorelay/Dockerfile (it holds no keys and is deployed independently of
+  # any daemon). It is not part of the install-spec tag matrix above, so it gets a
+  # dedicated job: a version-pinned tag on a release and a floating `latest`.
+  publish-relay:
+    name: Build & push zerorelay
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for keyless cosign OIDC signing of container images
+    outputs:
+      image: ${{ steps.tags.outputs.image }}
+      pinned: ${{ steps.tags.outputs.pinned }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute relay image tags
+        id: tags
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            pinned="${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay:${GITHUB_REF_NAME}"
+          else
+            pinned="${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay:sha-${GITHUB_SHA::12}"
+          fi
+          {
+            echo "image=${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay"
+            echo "pinned=${pinned}"
+            echo "floating=${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay:latest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the relay image
+        id: build-push
+        uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
+        with:
+          context: .
+          file: apps/zerorelay/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.pinned }}
+            ${{ steps.tags.outputs.floating }}
+
+      - name: Sign relay container image (keyless / Rekor)
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            "${{ steps.tags.outputs.image }}@${DIGEST}"
+
   scan:
     name: Scan ${{ matrix.stem }}
     if: github.repository == 'zeroclaw-labs/zeroclaw'
@@ -144,6 +204,38 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  scan-relay:
+    name: Scan zerorelay
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    needs: [publish-relay]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Scan relay pinned tag with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-dirs: /usr/share/zoneinfo
+          image-ref: ${{ needs.publish-relay.outputs.pinned }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      - name: Upload relay Trivy SARIF artifact
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-results-zerorelay
+          path: trivy-results.sarif
+          if-no-files-found: error
+          retention-days: 14
+
   upload-sarif:
     name: Upload SARIF ${{ matrix.stem }}
     if: github.repository == 'zeroclaw-labs/zeroclaw'
@@ -164,6 +256,26 @@ jobs:
           name: trivy-results-${{ matrix.stem }}
 
       - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        with:
+          sarif_file: trivy-results.sarif
+
+  upload-relay-sarif:
+    name: Upload SARIF zerorelay
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    needs: [scan-relay]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download relay Trivy SARIF artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: trivy-results-zerorelay
+
+      - name: Upload relay Trivy SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
         with:
           sarif_file: trivy-results.sarif

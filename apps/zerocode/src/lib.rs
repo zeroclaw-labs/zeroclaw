@@ -11,13 +11,16 @@
 // reasoning.
 #![allow(clippy::disallowed_methods)]
 
+mod client_crypto;
 mod color_depth;
+mod relay_proto;
 mod theme;
 mod todo_tracker;
 mod widgets;
 
 pub mod client;
 pub mod config;
+pub mod enroll;
 pub mod jsonrpc;
 pub mod keymap;
 pub mod wire;

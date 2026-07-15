@@ -2969,6 +2969,518 @@ enum SecurityCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Issue a client certificate from the daemon's mTLS CA for connecting over WSS.
+    ///
+    /// Reads the per-daemon CA at `<data_dir>/tls/ca.{crt,key}` (auto-generated on
+    /// first run when `[wss]` is enabled) and writes a `clientAuth` certificate +
+    /// key that zerocode (or any client) can present to the mutually-authenticated
+    /// WSS plane.
+    IssueClientCert {
+        /// Subject/device identity stamped into the certificate (CN).
+        #[arg(long, default_value = "zerocode")]
+        name: String,
+
+        /// Directory to write the certificate / key. Defaults to `<data_dir>/tls`.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+
+        /// Overwrite an existing certificate/key for this name.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Revoke an issued client certificate so the daemon refuses it at the next
+    /// WSS handshake (threat A5). The revoke is written to the issued-cert ledger,
+    /// which materializes `<data_dir>/tls/revoked` for the verifier - no daemon
+    /// restart needed. Identify the cert by `--fingerprint` (its SHA-256 hex) or
+    /// `--device` (revokes every active cert that device holds).
+    RevokeClientCert {
+        /// SHA-256 fingerprint (hex) of the certificate to revoke.
+        #[arg(long, conflicts_with = "device", required_unless_present = "device")]
+        fingerprint: Option<String>,
+
+        /// Device id whose active certificates should ALL be revoked.
+        #[arg(
+            long,
+            conflicts_with = "fingerprint",
+            required_unless_present = "fingerprint"
+        )]
+        device: Option<String>,
+    },
+
+    /// List the still-active client certificates issued by this daemon's CA
+    /// (device id, fingerprint, validity) by reading the issued-cert ledger.
+    ListClientCerts {
+        /// Emit machine-readable JSON instead of a text table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ask the running daemon to mint another enrollment pairing code.
+    ///
+    /// This adds another browser/zerocode device without restarting the daemon.
+    /// It is a local operator command: the request is exchanged through the
+    /// daemon's data dir, not through the public enrollment route.
+    EnrollPaircode {
+        /// Mint a new one-time enrollment code.
+        #[arg(long)]
+        new: bool,
+
+        /// Seconds to wait for the running daemon to answer.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+
+    /// Request an on-demand relay node-id rotation. The running daemon mints a
+    /// fresh id, registers it alongside the old one for a grace window, then
+    /// retires the old id; the new id reaches clients in-band on their next
+    /// certificate renewal. Only applies when `[relay].node_id` is auto-minted.
+    RelayRotateNodeId,
+}
+
+/// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
+/// CA private-key at-rest protection sourced from the environment (decision:
+/// opt-in passphrase, 0600 floor; threat A4). `ZEROCLAW_CA_PASSPHRASE` (or a file
+/// referenced by `ZEROCLAW_CA_PASSPHRASE_FILE`) enables scrypt + XChaCha20-Poly1305
+/// encryption of the CA key at rest; unset keeps the plaintext-0600 default so
+/// zero-config and headless bring-up are unaffected. The daemon sources it
+/// identically at CA generation (the WSS path) and at every CA read (enrollment
+/// + this CLI), so the on-disk form always matches.
+#[cfg(feature = "agent-runtime")]
+fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
+    zeroclaw_tls::CaKeyProtection::from_env()
+}
+
+/// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
+///
+/// The WSS plane is always mTLS. `enabled` controls only whether the configured
+/// CA replaces the daemon-generated CA; certificate pins apply in either mode.
+#[cfg(feature = "agent-runtime")]
+fn resolve_wss_client_auth(
+    client_auth: Option<&zeroclaw_config::schema::WssClientAuthConfig>,
+) -> Result<(Option<String>, Vec<String>)> {
+    if let Some(config) = client_auth
+        && !config.ca_cert_path.is_empty()
+        && !config.enabled
+    {
+        anyhow::bail!(
+            "[wss.client_auth].ca_cert_path is set but [wss.client_auth].enabled is false. \
+             Set enabled = true to use your CA, or clear ca_cert_path to auto-generate one."
+        );
+    }
+
+    let pinned = client_auth
+        .map(|config| config.pinned_certs.clone())
+        .unwrap_or_default();
+    let byo_ca = client_auth
+        .filter(|config| config.enabled && !config.ca_cert_path.is_empty())
+        .map(|config| config.ca_cert_path.clone());
+    Ok((byo_ca, pinned))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> {
+    if wss_cfg.sans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    sans.extend(
+        wss_cfg
+            .sans
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+    );
+    sans
+}
+
+#[cfg(all(test, feature = "agent-runtime"))]
+mod wss_client_auth_tests {
+    use super::*;
+
+    #[test]
+    fn auto_ca_honors_configured_client_certificate_pins() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            pinned_certs: vec!["a".repeat(64)],
+            ..Default::default()
+        };
+
+        let (byo_ca, pinned) = resolve_wss_client_auth(Some(&auth)).expect("valid auto-CA policy");
+        assert!(byo_ca.is_none(), "the daemon CA remains selected");
+        assert_eq!(
+            pinned, auth.pinned_certs,
+            "pins must reach the mTLS acceptor"
+        );
+    }
+
+    #[test]
+    fn disabled_byo_ca_is_rejected_before_listener_startup() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            ca_cert_path: "/etc/zeroclaw/client-ca.pem".into(),
+            ..Default::default()
+        };
+
+        let err =
+            resolve_wss_client_auth(Some(&auth)).expect_err("disabled BYO CA must fail closed");
+        assert!(err.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn wss_server_sans_adds_local_and_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["relay.example.test".into(), " ".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            wss_server_sans(&cfg),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "relay.example.test".to_string(),
+            ]
+        );
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn issue_wss_client_cert(
+    config: &Config,
+    name: &str,
+    out_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    let tls_dir = config.data_dir.join("tls");
+    let ca_cert = tls_dir.join("ca.crt");
+    let ca_key = tls_dir.join("ca.key");
+    if !ca_cert.exists() || !ca_key.exists() {
+        anyhow::bail!(
+            "no daemon mTLS CA found at {}. Start the daemon once with [wss] enabled to \
+             auto-generate it, or configure a bring-your-own CA.",
+            tls_dir.display()
+        );
+    }
+
+    // Per-device file names so issuing certs for multiple devices does not clobber.
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let has_out_dir = out_dir.is_some();
+    let dest = out_dir.unwrap_or(tls_dir);
+    let cert_path = dest.join(format!("client-{slug}.crt"));
+    let key_path = dest.join(format!("client-{slug}.key"));
+    let cert_tmp_path = dest.join(format!(".client-{slug}.crt.tmp"));
+    let key_tmp_path = dest.join(format!(".client-{slug}.key.tmp"));
+    if !force && (cert_path.exists() || key_path.exists()) {
+        anyhow::bail!(
+            "{} already exists. Pass --force to overwrite, or --out-dir / --name for a new one.",
+            key_path.display()
+        );
+    }
+
+    let ca_cert_pem = std::fs::read_to_string(&ca_cert)?;
+    // Read the CA key honoring any at-rest passphrase, so an encrypted CA still
+    // signs from the CLI (the key never leaves this process).
+    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(&ca_key, &ca_key_protection_from_env())?;
+    let issued = zeroclaw_tls::issue_client_cert(&ca_cert_pem, &ca_key_pem, name)?;
+
+    // Directory 0700, private key written 0600 atomically (no world-readable window).
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
+    std::fs::write(&cert_tmp_path, issued.cert_pem.as_bytes())
+        .with_context(|| format!("write staged certificate {}", cert_tmp_path.display()))?;
+    if let Err(e) = zeroclaw_tls::certgen::write_private_pem(&key_tmp_path, &issued.key_pem) {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        return Err(e)
+            .with_context(|| format!("write staged private key {}", key_tmp_path.display()));
+    }
+
+    // Record the issuance in the daemon-owned ledger so this cert is revocable and
+    // appears in the canonical "who holds which cert" record (actor = operator).
+    let ledger_result = (|| -> Result<()> {
+        use zeroclaw_runtime::security::cert_ledger::{
+            CertLedger, CertStatus, IssuanceActor, LedgerEntry,
+        };
+        let der = rustls_pemfile::certs(&mut issued.cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("parse staged issued certificate")?;
+        let fingerprint = zeroclaw_tls::cert_sha256_fingerprint(
+            der.first()
+                .context("issued client certificate PEM is empty")?
+                .as_ref(),
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ledger = CertLedger::open(&config.data_dir, None)?;
+        ledger.record_issued(
+            &LedgerEntry {
+                device_id: name.to_string(),
+                fingerprint,
+                not_before: now - 300,
+                not_after: now + 30 * 86_400,
+                status: CertStatus::Active,
+                token_hash: String::new(),
+                actor: IssuanceActor::Operator.label(),
+                issued_at: now,
+            },
+            false,
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = ledger_result {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        let _ = std::fs::remove_file(&key_tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&key_tmp_path, &key_path)
+        .with_context(|| format!("publish private key {}", key_path.display()))?;
+    if let Err(e) = std::fs::rename(&cert_tmp_path, &cert_path)
+        .with_context(|| format!("publish certificate {}", cert_path.display()))
+    {
+        let _ = std::fs::remove_file(&key_path);
+        return Err(e);
+    }
+
+    // When issuing into a separate out-dir, also lay it out as a drop-in client
+    // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
+    // exactly these names under its <config-dir>/tls, so a client that copies this
+    // directory needs no --tls-* flags at all.
+    if has_out_dir {
+        let _ = std::fs::copy(&ca_cert, dest.join("ca.crt"));
+        let _ = std::fs::write(dest.join("client.crt"), issued.cert_pem.as_bytes());
+        let _ = zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem);
+    }
+
+    let cert_path_display = cert_path.display().to_string();
+    let key_path_display = key_path.display().to_string();
+    let ca_cert_display = ca_cert.display().to_string();
+    println!(
+        "{}",
+        ta("cli-mtls-issued-client-cert", &[("name", name)], "issued")
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-cert-path",
+            &[("path", &cert_path_display)],
+            "cert"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-key-path",
+            &[("path", &key_path_display)],
+            "key"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-ca-path",
+            &[("path", &ca_cert_display)],
+            "CA"
+        )
+    );
+
+    let relay = &config.relay;
+    // node_id is auto-minted when unset, so resolve the real one (persisted) for
+    // the guidance rather than requiring the operator to have pinned it.
+    let relay_ready = relay.enabled && !relay.url.is_empty();
+    let relay_node = if relay_ready {
+        zeroclaw_runtime::relay::ensure_node_id(&config.data_dir, &relay.node_id)
+            .unwrap_or_else(|_| relay.node_id.clone())
+    } else {
+        relay.node_id.clone()
+    };
+    if has_out_dir {
+        println!();
+        println!("{}", t("cli-mtls-dropin-line-1", "drop-in TLS dir"));
+        println!("{}", t("cli-mtls-dropin-line-2", "client key"));
+        println!("{}", t("cli-mtls-dropin-line-3", "automatic TLS material"));
+    }
+    println!();
+    if relay_ready {
+        // The relay tunnels to the daemon's loopback listener, so the client does
+        // not name a host: --connect defaults to wss://127.0.0.1 in relay mode.
+        // The OUTER hop to the relay needs the relay's OWN ca (--relay-ca), which
+        // is a different trust root from the daemon CA (--tls-ca-cert).
+        let mut relay_flags = String::new();
+        if !relay.relay_host.is_empty() {
+            let _ = write!(relay_flags, " --relay-host {}", relay.relay_host);
+        }
+        if relay.relay_insecure {
+            relay_flags.push_str(" --relay-insecure");
+        } else if !relay.relay_ca_path.is_empty() {
+            let _ = write!(relay_flags, " --relay-ca {}", relay.relay_ca_path);
+        } else {
+            relay_flags.push_str(" --relay-ca <relay-ca.crt>");
+        }
+        println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
+        if has_out_dir {
+            println!(
+                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
+                relay.url, relay_node, relay_flags
+            );
+        } else {
+            println!(
+                "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                relay.url,
+                relay_node,
+                relay_flags,
+                ca_cert.display(),
+                cert_path.display(),
+                key_path.display()
+            );
+        }
+        println!("{}", t("cli-mtls-relay-ca-note-1", "relay CA note"));
+        println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
+    } else {
+        println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
+        println!(
+            "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+            ca_cert.display(),
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Revoke an issued client certificate (or every active cert a device holds) in
+/// the daemon ledger, which materializes `<data_dir>/tls/revoked` so the WSS
+/// verifier refuses it at the next handshake (threat A5). The operator-driven
+/// counterpart to `issue-client-cert`.
+#[cfg(feature = "agent-runtime")]
+fn revoke_wss_client_cert(
+    config: &Config,
+    fingerprint: Option<String>,
+    device: Option<String>,
+) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    // `operator` matches the issuance actor `issue-client-cert` records.
+    const ACTOR: &str = "operator";
+    let ledger = CertLedger::open(&config.data_dir, None)?;
+    let changed = if let Some(fp) = fingerprint {
+        let fp = fp.trim().to_ascii_lowercase();
+        if ledger.mark_revoked(&fp, ACTOR)? {
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoked-certificate",
+                    &[("fingerprint", &fp)],
+                    "revoked"
+                )
+            );
+            true
+        } else {
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoke-no-active-fingerprint",
+                    &[("fingerprint", &fp)],
+                    "not found"
+                )
+            );
+            false
+        }
+    } else if let Some(device_id) = device {
+        let n = ledger.revoke_device(&device_id, ACTOR)?;
+        let n_s = n.to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-device-certs",
+                &[("count", &n_s), ("device", &device_id)],
+                "revoked"
+            )
+        );
+        n > 0
+    } else {
+        // clap requires exactly one of --fingerprint / --device; defensive only.
+        anyhow::bail!("provide --fingerprint <hex> or --device <id>");
+    };
+    if changed {
+        let revoked_path =
+            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&config.data_dir)
+                .display()
+                .to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-list-updated",
+                &[("path", &revoked_path)],
+                "updated"
+            )
+        );
+    }
+    Ok(())
+}
+
+/// List the still-active client certificates this daemon's CA has issued, read
+/// from the issued-cert ledger. Read-only operator visibility into who holds a
+/// live certificate.
+#[cfg(feature = "agent-runtime")]
+fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    let ledger = CertLedger::open(&config.data_dir, None)?;
+    let active = ledger.list_active()?;
+    if json {
+        let rows: Vec<serde_json::Value> = active
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "device_id": e.device_id,
+                    "fingerprint": e.fingerprint,
+                    "not_before": e.not_before,
+                    "not_after": e.not_after,
+                    "issued_at": e.issued_at,
+                    "actor": e.actor,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if active.is_empty() {
+        println!("{}", t("cli-mtls-list-no-active-certs", "no active certs"));
+        return Ok(());
+    }
+    let active_len = active.len().to_string();
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-list-active-header",
+            &[("count", &active_len)],
+            "active certs"
+        )
+    );
+    for e in &active {
+        println!(
+            "  {}  device={}  not_after={}  actor={}",
+            e.fingerprint, e.device_id, e.not_after, e.actor
+        );
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -4331,15 +4843,90 @@ async fn main() -> Result<()> {
 
                 registry.register_wss(Box::new(|ctx, cancel, client_count| {
                     Box::pin(async move {
-                        let wss_cfg = ctx.config.read().wss.clone();
+                        let (wss_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (cfg.wss.clone(), cfg.data_dir.clone())
+                        };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
                             cancel.cancelled().await;
                             return Ok(());
                         }
+                        // The remote WSS plane is ALWAYS mutually authenticated; there
+                        // is no server-only / plaintext fallback. In auto-CA mode the
+                        // same generated CA verifies client certificates, and any
+                        // configured pin allowlist remains enforced.
+                        let (byo_ca, pinned) =
+                            resolve_wss_client_auth(wss_cfg.client_auth.as_ref())?;
+                        // Bring-your-own mTLS when an operator CA is configured;
+                        // otherwise auto-generate a per-daemon CA + server certificate
+                        // under the data dir (secure by default, zero config).
+                        let (cert_path, key_path, ca_cert_path) = match byo_ca {
+                            Some(ca_cert_path) => {
+                                if wss_cfg.cert_path.is_empty() || wss_cfg.key_path.is_empty() {
+                                    anyhow::bail!(
+                                        "[wss.client_auth].ca_cert_path is set (bring-your-own mTLS) \
+                                         but [wss].cert_path/key_path are not. Provide the server \
+                                         certificate and key, or clear ca_cert_path to auto-generate \
+                                         the CA and server certificate."
+                                    );
+                                }
+                                (wss_cfg.cert_path.clone(), wss_cfg.key_path.clone(), ca_cert_path)
+                            }
+                            None => {
+                                // Generate (or reuse) the per-daemon CA + server
+                                // cert. The CA key is encrypted at rest when a
+                                // passphrase is configured (same source the
+                                // enrollment + CLI read paths use), else 0600.
+                                // [wss].sans adds the hostnames/IPs a remote client
+                                // uses to reach the daemon to the server cert. The
+                                // enrollment endpoint uses the same resolver so both
+                                // TLS surfaces present matching daemon identities.
+                                let server_sans = wss_server_sans(&wss_cfg);
+                                let mats = zeroclaw_tls::ensure_server_materials_protected(
+                                    &data_dir.join("tls"),
+                                    &server_sans,
+                                    &ca_key_protection_from_env(),
+                                )?;
+                                (
+                                    mats.server_cert_path.to_string_lossy().into_owned(),
+                                    mats.server_key_path.to_string_lossy().into_owned(),
+                                    mats.ca_cert_path.to_string_lossy().into_owned(),
+                                )
+                            }
+                        };
+                        // Connect-time revocation refusal (A5): default to the
+                        // ledger-materialized list under <data_dir>/tls/revoked
+                        // (the daemon rewrites it on every revoke), overridable by
+                        // [wss.client_auth].crl_path.
+                        let default_crl_path =
+                            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&data_dir);
+                        let configured_crl_path = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .map(|c| c.crl_path.clone())
+                            .filter(|p| !p.is_empty());
+                        let crl_path = configured_crl_path.clone().unwrap_or_else(|| {
+                            default_crl_path.to_string_lossy().into_owned()
+                        });
+                        if configured_crl_path.is_none() {
+                            let ledger =
+                                zeroclaw_runtime::security::cert_ledger::CertLedger::open(
+                                    &data_dir, None,
+                                )
+                                .context(
+                                    "open cert ledger before starting WSS revocation checks",
+                                )?;
+                            ledger.materialize_revocations().context(
+                                "materialize cert revocations before starting WSS listener",
+                            )?;
+                        }
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                            &wss_cfg.cert_path,
-                            &wss_cfg.key_path,
+                            &cert_path,
+                            &key_path,
+                            &ca_cert_path,
+                            &pinned,
+                            &crl_path,
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
@@ -4351,6 +4938,294 @@ async fn main() -> Result<()> {
                             bind_addr,
                         )
                         .await
+                    })
+                }));
+
+                // Relay bridge: keep an outbound connection to a nominated relay
+                // so clients behind NAT can reach this daemon through it. The
+                // relay forwards to the local WSS listener (loopback), where the
+                // inner mTLS terminates; it never decrypts anything.
+                registry.register_relay(Box::new(|ctx, cancel, _client_count| {
+                    Box::pin(async move {
+                        let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.relay.clone(),
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
+                        if !relay_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but [wss] is not. The relay forwards clients to \
+                                 the local WSS listener, so enable [wss] (it provides the mutually \
+                                 authenticated plane the relay tunnels).",
+                            ));
+                        }
+                        if relay_cfg.url.is_empty() {
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but relay.url is required.",
+                            ));
+                        }
+                        // Persistent Ed25519 identity the relay binds the node-id to.
+                        let signing_key_pkcs8 =
+                            zeroclaw_runtime::relay::ensure_signing_key(&data_dir)?;
+                        // node_id is an unguessable 128-bit capability: auto-minted +
+                        // persisted unless the operator pinned one in [relay].node_id.
+                        let node_id = zeroclaw_runtime::relay::ensure_node_id(
+                            &data_dir,
+                            &relay_cfg.node_id,
+                        )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "node_id": node_id,
+                                "relay": relay_cfg.url,
+                            })),
+                            "relay bridge: node_id (give clients this as --relay-node)"
+                        );
+                        // Default the relay's expected cert name to its host:port host.
+                        let relay_host = if relay_cfg.relay_host.is_empty() {
+                            relay_cfg
+                                .url
+                                .rsplit_once(':')
+                                .map(|(h, _)| h.to_string())
+                                .unwrap_or_else(|| relay_cfg.url.clone())
+                        } else {
+                            relay_cfg.relay_host.clone()
+                        };
+                        // Rotation is permitted only for an auto-minted id (a
+                        // pinned [relay].node_id is fixed).
+                        let rotation_allowed = relay_cfg.node_id.trim().is_empty();
+                        let node_id_rotation_days = relay_cfg.node_id_rotation_days;
+                        let bridge_cfg = zeroclaw_runtime::relay::RelayBridgeConfig {
+                            relay_addr: relay_cfg.url,
+                            relay_host,
+                            node_id,
+                            relay_token: Some(relay_cfg.token).filter(|t| !t.is_empty()),
+                            local_wss_addr: format!("127.0.0.1:{}", wss_cfg.port),
+                            local_enroll_addr: enroll_cfg
+                                .enabled
+                                .then(|| format!("127.0.0.1:{}", enroll_cfg.port)),
+                            signing_key_pkcs8,
+                            relay_ca_path: Some(relay_cfg.relay_ca_path)
+                                .filter(|p| !p.is_empty()),
+                            relay_insecure: relay_cfg.relay_insecure,
+                            relay_tofu: relay_cfg.tofu,
+                            outer_client_cert: Some(relay_cfg.outer_client_cert)
+                                .filter(|p| !p.is_empty()),
+                            outer_client_key: Some(relay_cfg.outer_client_key)
+                                .filter(|p| !p.is_empty()),
+                            max_conns: 256,
+                            // Bridge-side OPEN-flood cap (A6): fast-reject beyond
+                            // ~20 new conns/sec (burst 60) so an OPEN flood cannot
+                            // force unbounded loopback mTLS handshakes.
+                            open_burst: 60,
+                            open_rate_per_sec: 20.0,
+                            data_dir: data_dir.clone(),
+                            node_id_rotation_days,
+                            rotation_allowed,
+                        };
+                        zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
+                    })
+                }));
+
+                // Certificate enrollment endpoint: the bootstrap surface a
+                // certless client reaches for its FIRST cert (server-auth TLS +
+                // one-time pairing code, CSR-only). The daemon owns the CA, so
+                // this works with no gateway. It is NOT the mTLS RPC plane.
+                registry.register_enroll(Box::new(|ctx, cancel, _client_count| {
+                    Box::pin(async move {
+                        let (enroll_cfg, wss_cfg, relay_cfg, audit_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.enroll.clone(),
+                                cfg.wss.clone(),
+                                cfg.relay.clone(),
+                                cfg.security.audit.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
+                        if !enroll_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[enroll] is enabled but [wss] is not. Enrollment issues client \
+                                 certificates for the mutually authenticated WSS plane; enable [wss].",
+                            ));
+                        }
+                        // Issuance needs the daemon CA *private key*. Two
+                        // bring-your-own forms exist:
+                        //   1. BYO-CA with key (in-band): the operator drops
+                        //      ca.crt + ca.key into <data_dir>/tls; the issuer
+                        //      loads and signs against them (handled below by
+                        //      ensure_server_materials_protected's load path).
+                        //   2. BYO-CA without key (external CA): the WSS verifier
+                        //      trusts an external CA cert whose key the daemon does
+                        //      not hold. It cannot sign - fail closed: do not open
+                        //      the endpoint (provision client certs out of band).
+                        let byo_ca = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .filter(|c| c.enabled)
+                            .map(|c| !c.ca_cert_path.is_empty())
+                            .unwrap_or(false);
+                        if byo_ca {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                ),
+                                "enrollment endpoint disabled: a bring-your-own CA has no signing \
+                                 key; provision client certs out of band"
+                            );
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        // Per-daemon CA + server cert. Loaded when the operator has
+                        // provisioned their own ca.{crt,key} (BYO-CA with key),
+                        // otherwise auto-generated (secure by default). Same
+                        // passphrase source as the WSS gen + CLI read paths, so the
+                        // on-disk CA-key form always matches.
+                        let tls_dir = data_dir.join("tls");
+                        let ca_provided =
+                            tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
+                        let protection = ca_key_protection_from_env();
+                        let server_sans = wss_server_sans(&wss_cfg);
+                        let mats = zeroclaw_tls::ensure_server_materials_protected(
+                            &tls_dir,
+                            &server_sans,
+                            &protection,
+                        )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            ),
+                            if ca_provided {
+                                "enrollment signing against an operator-provided CA \
+                                 (<data_dir>/tls/ca.*)"
+                            } else {
+                                "enrollment signing against the auto-generated per-daemon CA"
+                            }
+                        );
+                        let ca_cert_pem = std::fs::read_to_string(&mats.ca_cert_path)?;
+                        let ca_key_pem =
+                            zeroclaw_tls::load_ca_key_pem(&mats.ca_key_path, &protection)?;
+                        let ca_fingerprint = {
+                            let ders =
+                                zeroclaw_tls::load_certs(&mats.ca_cert_path.to_string_lossy())?;
+                            zeroclaw_tls::cert_sha256_fingerprint(ders[0].as_ref())
+                        };
+
+                        // Server-authentication-only TLS (no client cert; this is
+                        // the bootstrap surface, explicitly not the mTLS plane).
+                        let acceptor =
+                            zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+                                cert_path: mats.server_cert_path.to_string_lossy().into_owned(),
+                                key_path: mats.server_key_path.to_string_lossy().into_owned(),
+                                client_auth: None,
+                            })?;
+
+                        // Relay coordinates handed to the enrolled client (shared
+                        // with the renew path). The pin (relay LEAF sha256) is
+                        // sourced from the relay bridge's pin store when present.
+                        let relay_profile =
+                            zeroclaw_runtime::enroll::relay_profile(&data_dir, &relay_cfg);
+
+                        // One-time pairing code gates enrollment. Print it AND the
+                        // CA-bound short-auth-string so the operator reads both to
+                        // the client out of band (no blind trust-on-first-use).
+                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                            true,
+                            &[],
+                        ));
+                        if let Some(code) = pairing.pairing_code() {
+                            let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
+                            let enroll_bind = enroll_cfg.bind.to_string();
+                            let enroll_port = enroll_cfg.port.to_string();
+                            println!();
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-enroll-endpoint-ready",
+                                    &[("bind", &enroll_bind), ("port", &enroll_port)],
+                                    "enrollment ready"
+                                )
+                            );
+                            println!(
+                                "{}",
+                                t("cli-enroll-confirm-sas-line-1", "confirm SAS")
+                            );
+                            println!("{}", t("cli-enroll-confirm-sas-line-2", "match SAS"));
+                            println!(
+                                "{}",
+                                ta("cli-enroll-pairing-code", &[("code", &code)], "code")
+                            );
+                            println!("{}", ta("cli-enroll-sas", &[("sas", &sas)], "SAS"));
+                            println!();
+                        }
+
+                        // Reserved migration knob. Code-less enrollment needs a
+                        // separate client trust anchor before certs can be cached.
+                        let allow_unpaired_until = {
+                            let s = enroll_cfg.allow_unpaired_enrollment.trim();
+                            if !s.is_empty() {
+                                anyhow::bail!(
+                                    "[enroll].allow_unpaired_enrollment is reserved for a future \
+                                     no-code enrollment flow and is not supported in this release. \
+                                     Clear it and use the printed pairing code."
+                                );
+                            }
+                            None
+                        };
+
+                        let audit = std::sync::Arc::new(
+                            zeroclaw_runtime::security::audit::AuditLogger::new(
+                                audit_cfg,
+                                data_dir.clone(),
+                            )
+                            .context("initialize certificate audit logger for enrollment endpoint")?,
+                        );
+                        let ledger = std::sync::Arc::new(
+                            zeroclaw_runtime::security::cert_ledger::CertLedger::open(
+                                &data_dir,
+                                Some(audit),
+                            )?,
+                        );
+
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", enroll_cfg.bind, enroll_cfg.port).parse()?;
+                        let server = std::sync::Arc::new(zeroclaw_runtime::enroll::EnrollServer {
+                            bind_addr,
+                            acceptor,
+                            ca_cert_pem,
+                            ca_key_pem,
+                            ledger,
+                            pairing,
+                            static_client_pins_configured: wss_cfg
+                                .client_auth
+                                .as_ref()
+                                .map(|auth| !auth.pinned_certs.is_empty())
+                                .unwrap_or(false),
+                            allow_unpaired_until,
+                            relay_profile,
+                            paircode_admin_data_dir: Some(data_dir.clone()),
+                        });
+                        zeroclaw_runtime::enroll::serve(server, cancel).await
                     })
                 }));
 
@@ -4844,17 +5719,65 @@ async fn main() -> Result<()> {
         }
 
         #[cfg(feature = "agent-runtime")]
-        Commands::Security {
-            security_command: SecurityCommands::Status { agent, json },
-        } => {
-            let report = security_status::build_report(&config, &agent)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                security_status::print_report(&report);
+        Commands::Security { security_command } => match security_command {
+            SecurityCommands::Status { agent, json } => {
+                let report = security_status::build_report(&config, &agent)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    security_status::print_report(&report);
+                }
+                Ok(())
             }
-            Ok(())
-        }
+            SecurityCommands::IssueClientCert {
+                name,
+                out_dir,
+                force,
+            } => issue_wss_client_cert(&config, &name, out_dir, force),
+            SecurityCommands::RevokeClientCert {
+                fingerprint,
+                device,
+            } => revoke_wss_client_cert(&config, fingerprint, device),
+            SecurityCommands::ListClientCerts { json } => list_wss_client_certs(&config, json),
+            SecurityCommands::EnrollPaircode { new, timeout_secs } => {
+                if !new {
+                    anyhow::bail!("pass --new to mint a fresh enrollment pairing code");
+                }
+                let generated = zeroclaw_runtime::enroll::request_new_paircode(
+                    &config.data_dir,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
+                .await?;
+                println!(
+                    "{}",
+                    ta(
+                        "cli-enroll-pairing-code",
+                        &[("code", &generated.pairing_code)],
+                        "pairing code"
+                    )
+                );
+                println!(
+                    "{}",
+                    ta("cli-enroll-sas", &[("sas", &generated.sas)], "SAS")
+                );
+                Ok(())
+            }
+            SecurityCommands::RelayRotateNodeId => {
+                if !config.relay.node_id.trim().is_empty() {
+                    anyhow::bail!(
+                        "[relay].node_id is pinned, so the node-id is fixed and not rotatable. \
+                         Clear it to auto-mint (and enable rotation)."
+                    );
+                }
+                zeroclaw_runtime::relay::request_node_id_rotation(&config.data_dir)?;
+                println!(
+                    "Requested a relay node-id rotation. A running daemon will rotate within ~{}s; \
+                     the new id reaches clients in-band on their next certificate renewal.",
+                    15
+                );
+                Ok(())
+            }
+        },
 
         Commands::Estop {
             estop_command,
@@ -8381,6 +9304,141 @@ mod tests {
             }
             other => panic!("expected security status command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_cleans_staged_material_when_ledger_record_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let tls_dir = config.data_dir.join("tls");
+        zeroclaw_tls::ensure_server_materials(&tls_dir, &[]).expect("daemon TLS materials");
+        std::fs::create_dir(tls_dir.join("ledger.db")).expect("poison ledger path");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ledger"), "got: {err}");
+        assert!(!out.path().join("client-dev_under_test.crt").exists());
+        assert!(!out.path().join("client-dev_under_test.key").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+    }
+
+    /// Operator revocation through the `revoke-client-cert` handler writes the
+    /// fingerprint into `<data_dir>/tls/revoked` - the exact file the WSS
+    /// verifier reads - so a revoked cert is refused at the next handshake (A5).
+    /// Guards the production trigger for revocation (the path the ledger revoke
+    /// API exposes but nothing operator-facing reached before this command).
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_client_cert_handler_materializes_the_revoked_file() {
+        use zeroclaw_runtime::security::cert_ledger::{
+            CertLedger, CertStatus, IssuanceActor, LedgerEntry, revoked_list_path,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let fp = "ab".repeat(32); // 64-hex fingerprint
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev_under_test".to_string(),
+                        fingerprint: fp.clone(),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: IssuanceActor::Operator.label(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .expect("record issued");
+        }
+
+        // The operator command revokes by fingerprint.
+        revoke_wss_client_cert(&config, Some(fp.clone()), None).expect("revoke");
+
+        // The verifier's input file now lists the fingerprint, and the ledger
+        // reflects the revocation.
+        let revoked = std::fs::read_to_string(revoked_list_path(&config.data_dir))
+            .expect("read revoked file");
+        assert!(
+            revoked.lines().any(|l| l == fp),
+            "revoked file must list the revoked fingerprint, got: {revoked:?}"
+        );
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        assert_eq!(
+            ledger.status_of(&fp).expect("status"),
+            Some(CertStatus::Revoked)
+        );
+    }
+
+    /// `revoke-client-cert` requires exactly one of --fingerprint / --device,
+    /// and `list-client-certs` parses.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_and_list_client_cert_cli_parsing() {
+        // Neither selector -> rejected.
+        assert!(Cli::try_parse_from(["zeroclaw", "security", "revoke-client-cert"]).is_err());
+        // Both selectors -> rejected (mutually exclusive).
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "security",
+                "revoke-client-cert",
+                "--fingerprint",
+                "ab",
+                "--device",
+                "d",
+            ])
+            .is_err()
+        );
+        // Exactly one selector -> parses.
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "security",
+            "revoke-client-cert",
+            "--fingerprint",
+            "abcd",
+        ])
+        .expect("single selector parses");
+        match cli.command {
+            Commands::Security {
+                security_command:
+                    SecurityCommands::RevokeClientCert {
+                        fingerprint,
+                        device,
+                    },
+            } => {
+                assert_eq!(fingerprint.as_deref(), Some("abcd"));
+                assert!(device.is_none());
+            }
+            other => panic!("expected revoke-client-cert, got {other:?}"),
+        }
+        // list-client-certs parses with --json.
+        let cli = Cli::try_parse_from(["zeroclaw", "security", "list-client-certs", "--json"])
+            .expect("list parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Security {
+                security_command: SecurityCommands::ListClientCerts { json: true }
+            }
+        ));
     }
 
     /// `--rotate` parses and is mutually exclusive with `--new` and

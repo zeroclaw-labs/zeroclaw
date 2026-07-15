@@ -159,31 +159,21 @@ impl RpcTransport for WssTransport {
 
 // ── TLS acceptor ─────────────────────────────────────────────────
 
-/// Build a `TlsAcceptor` from PEM-encoded cert and key files.
-pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    use rustls::ServerConfig;
-    use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let cert_file =
-        File::open(cert_path).with_context(|| format!("opening TLS cert: {cert_path}"))?;
-    let key_file = File::open(key_path).with_context(|| format!("opening TLS key: {key_path}"))?;
-
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing TLS certificates")?;
-
-    let key = private_key(&mut BufReader::new(key_file))
-        .context("parsing TLS private key")?
-        .context("no private key found in key file")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building TLS server config")?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
+/// Build a [`TlsAcceptor`] for the remote WSS RPC plane.
+///
+/// The remote plane is ALWAYS mutually authenticated and TLS 1.3 only: every
+/// client certificate is verified against `ca_cert_path` (optionally pinned to
+/// `pinned_certs`). There is deliberately no server-only / no-client-auth path
+/// here (threat model A11); the secure-by-construction builder lives in
+/// [`zeroclaw_tls::build_mtls_acceptor`].
+pub fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: &str,
+    pinned_certs: &[String],
+    crl_path: &str,
+) -> Result<TlsAcceptor> {
+    zeroclaw_tls::build_mtls_acceptor(cert_path, key_path, ca_cert_path, pinned_certs, crl_path)
 }
 
 // ── Listener ─────────────────────────────────────────────────────
@@ -253,11 +243,19 @@ pub async fn run_wss_listener(
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
+                            // The WSS plane is always mutually authenticated, so a
+                            // client with no certificate (un-migrated) or a revoked
+                            // one fails here. Surface it actionably rather than as a
+                            // bare TLS error so the operator knows to enroll it.
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("WSS TLS handshake failed from {remote_addr}: {e}")
+                                &format!(
+                                    "WSS TLS handshake failed from {remote_addr}: {e}. The WSS plane \
+                                     requires a client certificate; an un-migrated client must enroll \
+                                     first (zerocode --enroll), and a revoked cert is refused."
+                                )
                             );
                             count.fetch_sub(1, Ordering::Relaxed);
                             return;
@@ -279,10 +277,22 @@ pub async fn run_wss_listener(
                         }
                     };
 
+                    // The client cert was verified against the CA during the
+                    // mTLS handshake; capture its SHA-256 fingerprint (the ledger
+                    // key) before the stream is consumed by the transport.
+                    let peer_cert_fp = ws_stream
+                        .get_ref()
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .map(|der| zeroclaw_tls::cert_sha256_fingerprint(der.as_ref()));
+
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
+                        .with_peer_cert_fingerprint(peer_cert_fp);
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {

@@ -530,6 +530,454 @@ pub struct RpcClient {
     transport: Transport,
 }
 
+/// Dial the daemon through a nominated relay instead of connecting directly.
+#[derive(Debug, Clone)]
+pub struct RelayDial {
+    /// Relay address (`host:port`) to connect to.
+    pub relay_addr: String,
+    /// Server name presented for the relay's outer TLS certificate (its SAN).
+    /// Defaults to the host portion of `relay_addr` when unset.
+    pub relay_host: String,
+    /// Node-id of the target daemon to request from the relay.
+    pub node_id: String,
+    /// PEM CA to trust for the relay's outer certificate. When set, this wins
+    /// over remembered pins and TOFU; when unset (and not insecure) the built-in
+    /// public webpki roots are used.
+    pub relay_ca_path: Option<String>,
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    pub relay_insecure: bool,
+    /// Expected relay OUTER-leaf SHA-256 pin (`--relay-pin` or the enrollment-
+    /// delivered `relay_cert_pin`). Used only when no `relay_ca_path` is set.
+    pub relay_pin: Option<String>,
+    /// Opt-in trust-on-first-use for the relay's outer leaf: accept the first cert
+    /// and persist its pin to `pin_store` so later runs pin it. Ignored when a
+    /// relay CA or pin is configured.
+    pub relay_tofu: bool,
+    /// Where to persist a TOFU-observed pin (`<config_dir>/relay/relay_pin`).
+    pub pin_store: Option<std::path::PathBuf>,
+    /// Outer-mTLS variant: PEM cert/key presented to the relay on the OUTER layer
+    /// (when the relay sets `outer_client_auth`). Separate from the inner mTLS.
+    pub outer_client_cert: Option<String>,
+    pub outer_client_key: Option<String>,
+}
+
+/// TLS verification + mutual-TLS client identity for a WSS connection.
+#[derive(Debug, Clone, Default)]
+pub struct ClientTls {
+    /// Disable server certificate verification (self-signed dev only).
+    pub skip_verify: bool,
+    /// PEM CA certificate to verify the daemon against (mutual TLS). When unset
+    /// and not skipping, the system / webpki roots are used.
+    pub ca_cert_path: Option<String>,
+    /// PEM client certificate to present to the daemon (mutual TLS).
+    pub client_cert_path: Option<String>,
+    /// PEM private key for `client_cert_path`.
+    pub client_key_path: Option<String>,
+}
+
+impl ClientTls {
+    /// True when no custom TLS material is configured (plain default path). Any
+    /// lone field (including a stray `client_key_path`) forces the custom path so
+    /// the cert+key must-come-together validation in `wss_tls_config` runs.
+    pub fn is_default(&self) -> bool {
+        !self.skip_verify
+            && self.ca_cert_path.is_none()
+            && self.client_cert_path.is_none()
+            && self.client_key_path.is_none()
+    }
+}
+
+/// Verifier that accepts every server certificate without checking. Used only on
+/// the explicit `skip_verify` path (insecure; self-signed dev only).
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Persist a TOFU-observed relay outer-leaf pin (sha256 hex) to `path` at `0600`,
+/// creating parent dirs. Best-effort: a write failure just means we TOFU again
+/// next run (the connection already succeeded).
+pub(crate) fn persist_relay_pin(path: &std::path::Path, pin: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = f.write_all(pin.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, pin.as_bytes());
+    }
+}
+
+/// Outer TLS to the relay with a trust-on-first-use verifier purely to OBSERVE
+/// its leaf certificate fingerprint (it is not yet trusted/pinned), so the
+/// operator can confirm it interactively before it is remembered. Returns the
+/// SHA-256 pin the relay would be pinned to. The outer TLS is a metadata boundary;
+/// the inner mutual TLS to the daemon is unaffected (A2).
+pub async fn probe_relay_cert_pin(relay_addr: &str, relay_host: &str) -> Result<String> {
+    let tcp = tokio::net::TcpStream::connect(relay_addr)
+        .await
+        .with_context(|| format!("connecting to relay {relay_addr}"))?;
+    let verifier = Arc::new(crate::client_crypto::RelayPinVerifier::tofu());
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(verifier.clone())
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let server_name = rustls::pki_types::ServerName::try_from(relay_host.to_string())
+        .with_context(|| format!("relay host '{relay_host}' as a TLS server name"))?;
+    let _tls = connector
+        .connect(server_name, tcp)
+        .await
+        .with_context(|| format!("relay outer TLS handshake to {relay_addr}"))?;
+    verifier
+        .observed_pin()
+        .context("the relay presented no certificate to pin")
+}
+
+/// Load PEM certificates from a file into DER.
+fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let pem = std::fs::read(path).with_context(|| format!("reading certificate file {path}"))?;
+    rustls_pemfile::certs(&mut &pem[..])
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing PEM certificates from {path}"))
+}
+
+/// Load the daemon CA cached by enrollment. The enrollment SAS binds exactly one
+/// daemon trust anchor, so the connect path must not later broaden trust by
+/// accepting every PEM block in the cached file.
+fn load_single_daemon_ca_cert(path: &str) -> Result<rustls::pki_types::CertificateDer<'static>> {
+    let certs = load_pem_certs(path)?;
+    match certs.len() {
+        0 => anyhow::bail!("no daemon CA certificate found in {path}"),
+        1 => Ok(certs.into_iter().next().expect("checked exactly one cert")),
+        n => anyhow::bail!(
+            "cached daemon CA file {path} must contain exactly one daemon CA certificate, got {n}"
+        ),
+    }
+}
+
+/// Load a PEM private key from a file into DER.
+fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let pem = std::fs::read(path).with_context(|| format!("reading key file {path}"))?;
+    rustls_pemfile::private_key(&mut &pem[..])
+        .with_context(|| format!("parsing private key from {path}"))?
+        .ok_or_else(|| anyhow::Error::msg(format!("no private key found in {path}")))
+}
+
+/// Open a tunnel to the daemon through a nominated relay.
+///
+/// Establishes the OUTER TLS + WebSocket session to the relay, requests the
+/// target `node_id`, and on `Opened` returns an in-memory byte stream over which
+/// the caller runs the INNER WSS + mTLS. A pump task bridges that byte stream
+/// to/from the relay's binary `DATA` frames; the relay only ever forwards the
+/// (still-encrypted) inner bytes and never sees plaintext.
+#[derive(Debug, Clone, Copy)]
+enum RelayRoute {
+    Wss,
+    Enrollment,
+}
+
+impl RelayRoute {
+    fn open_control(self, node_id: String) -> crate::relay_proto::Control {
+        match self {
+            Self::Wss => crate::relay_proto::Control::Connect { node_id },
+            Self::Enrollment => crate::relay_proto::Control::Enroll { node_id },
+        }
+    }
+
+    fn send_context(self) -> &'static str {
+        match self {
+            Self::Wss => "sending relay Connect",
+            Self::Enrollment => "sending relay Enroll",
+        }
+    }
+}
+
+fn relay_outer_connector(
+    relay: &RelayDial,
+) -> Result<(
+    Option<tokio_tungstenite::Connector>,
+    Option<Arc<crate::client_crypto::RelayPinVerifier>>,
+)> {
+    // Outer TLS connector verifying the relay's OWN certificate (distinct from the
+    // inner mTLS to the daemon). Precedence: insecure (dev) > configured CA > a
+    // leaf pin (explicit, enrollment-delivered, or remembered) > opt-in TOFU >
+    // the public roots (`None`). The outer TLS is a metadata boundary, not the
+    // RPC boundary (A2).
+    let builder = || {
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+    };
+    // Apply the outer-mTLS client cert (when configured) to a server-verified
+    // builder and wrap it as a connector. The inner mTLS is separate.
+    let finish = |verified: rustls::ConfigBuilder<
+        rustls::ClientConfig,
+        rustls::client::WantsClientCert,
+    >|
+     -> Result<tokio_tungstenite::Connector> {
+        let cfg = match (&relay.outer_client_cert, &relay.outer_client_key) {
+            (Some(c), Some(k)) => {
+                let chain = load_pem_certs(c)?;
+                let key = load_pem_key(k)?;
+                verified
+                    .with_client_auth_cert(chain, key)
+                    .context("loading the relay outer client cert/key")?
+            }
+            _ => verified.with_no_client_auth(),
+        };
+        Ok(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
+    };
+    let mut tofu_verifier: Option<Arc<crate::client_crypto::RelayPinVerifier>> = None;
+    let outer = if relay.relay_insecure {
+        Some(finish(
+            builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify)),
+        )?)
+    } else if let Some(ca) = &relay.relay_ca_path {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_pem_certs(ca)? {
+            roots.add(cert).context("adding relay CA to root store")?;
+        }
+        Some(finish(builder().with_root_certificates(roots))?)
+    } else if let Some(pin) = relay.relay_pin.as_deref().filter(|p| !p.is_empty()) {
+        let v = Arc::new(crate::client_crypto::RelayPinVerifier::pinned(
+            pin.to_string(),
+        ));
+        Some(finish(
+            builder().dangerous().with_custom_certificate_verifier(v),
+        )?)
+    } else if relay.relay_tofu {
+        let v = Arc::new(crate::client_crypto::RelayPinVerifier::tofu());
+        tofu_verifier = Some(v.clone());
+        Some(finish(
+            builder().dangerous().with_custom_certificate_verifier(v),
+        )?)
+    } else if relay.outer_client_cert.is_some() {
+        // Public-CA relay that also requires an outer client cert: build an
+        // explicit public-roots connector (the plain default below cannot carry a
+        // client cert).
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Some(finish(builder().with_root_certificates(roots))?)
+    } else {
+        None
+    };
+    Ok((outer, tofu_verifier))
+}
+
+async fn dial_through_relay(
+    relay: &RelayDial,
+    route: RelayRoute,
+) -> Result<tokio::io::DuplexStream> {
+    use crate::relay_proto::{
+        ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
+        encode_data,
+    };
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
+        .await
+        .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
+
+    let (outer, tofu_verifier) = relay_outer_connector(relay)?;
+
+    let relay_uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("wss://{}/", relay.relay_host)
+            .parse()
+            .context("building relay ws uri")?;
+    let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(relay_uri)
+        .with_sub_protocol(SUBPROTOCOL);
+    let (relay_ws, _resp) =
+        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, outer)
+            .await
+            .with_context(|| format!("relay outer WSS to {}", relay.relay_addr))?;
+
+    // Persist a TOFU-observed relay pin so later runs pin this leaf instead of
+    // re-trusting (opt-in path only).
+    if let Some(v) = &tofu_verifier
+        && let (Some(observed), Some(store)) = (v.observed_pin(), &relay.pin_store)
+    {
+        persist_relay_pin(store, &observed);
+    }
+
+    let (mut sink, mut stream) = relay_ws.split();
+
+    sink.send(Message::text(
+        route.open_control(relay.node_id.clone()).to_json(),
+    ))
+    .await
+    .context(route.send_context())?;
+
+    // Wait for the relay to pair us with the daemon (answer pings while waiting).
+    let conn_id = loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                Ok(Control::Opened { conn_id }) => break conn_id,
+                Ok(Control::Error { code, msg }) => {
+                    anyhow::bail!("relay refused the route: {code}: {msg}")
+                }
+                _ => {}
+            },
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sink.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(anyhow::Error::new(e).context("relay reply")),
+            None => anyhow::bail!("relay closed before opening the route"),
+        }
+    };
+
+    // Bridge the relay's DATA frames <-> an in-memory byte stream the inner mTLS
+    // runs over. What the inner TLS writes to `client_io` is read here and shipped
+    // as DATA; inbound DATA payloads are written back for the inner TLS to read.
+    let (client_io, mut relay_io) = tokio::io::duplex(128 * 1024);
+    tokio::spawn(async move {
+        // Per-conn credit flow control. `send_window` gates how much we ship to
+        // the relay before the daemon acks (so we never pin more than one window
+        // of unsent inner bytes); `recv_drained` counts daemon->client bytes we
+        // have handed to the inner stream so we can replenish the daemon's window.
+        let mut send_window = ConnWindow::new(INITIAL_WINDOW);
+        let mut recv_drained: u32 = 0;
+        // Grant the daemon our receive window up front.
+        let _ = sink
+            .send(Message::text(
+                Control::Window {
+                    conn_id,
+                    credit: INITIAL_WINDOW,
+                }
+                .to_json(),
+            ))
+            .await;
+
+        let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
+        loop {
+            tokio::select! {
+                // When the send window is exhausted, stop reading the inner stream
+                // (back-pressure to the inner TLS) until a DataAck replenishes it.
+                n = relay_io.read(&mut buf), if !send_window.is_blocked() => match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // `n <= MAX_DATA_PAYLOAD` (buffer size) so this is already a
+                        // single bounded chunk; the relay rejects anything larger.
+                        send_window.debit(n);
+                        if sink
+                            .send(Message::binary(encode_data(conn_id, &buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                msg = stream.next() => match msg {
+                    Some(Ok(Message::Binary(b))) => {
+                        if let Some((_, payload)) = decode_data(&b) {
+                            if relay_io.write_all(payload).await.is_err() {
+                                break;
+                            }
+                            recv_drained = recv_drained.saturating_add(payload.len() as u32);
+                            // Replenish the daemon's window once we have drained
+                            // about half of it, amortizing the ack frames.
+                            if recv_drained >= INITIAL_WINDOW / 2 {
+                                let _ = sink
+                                    .send(Message::text(
+                                        Control::DataAck {
+                                            conn_id,
+                                            consumed: recv_drained,
+                                        }
+                                        .to_json(),
+                                    ))
+                                    .await;
+                                recv_drained = 0;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                        Ok(Control::Close { .. }) => break,
+                        Ok(Control::Window { credit, .. }) => send_window.set(credit),
+                        Ok(Control::DataAck { consumed, .. }) => send_window.ack(consumed),
+                        _ => {}
+                    },
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sink.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+        let _ = relay_io.shutdown().await;
+        let _ = sink.close().await;
+    });
+
+    Ok(client_io)
+}
+
+/// Open the daemon's narrow enrollment endpoint through the nominated relay.
+/// The returned byte stream is still plaintext only to the caller; the caller
+/// must run the enrollment TLS client over it before sending pairing material.
+pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream> {
+    dial_through_relay(relay, RelayRoute::Enrollment).await
+}
+
 impl RpcClient {
     /// Connect to the daemon's local IPC endpoint and complete the
     /// `initialize` handshake.
@@ -670,29 +1118,73 @@ impl RpcClient {
     /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
-    /// When `tls_skip_verify` is true, certificate verification is
-    /// disabled — required for self-signed certs on remote hosts.
-    pub async fn connect_wss(
+    /// `tls` controls TLS verification and mutual-TLS client identity. When the
+    /// daemon's remote WSS plane requires mutual TLS, set `ca_cert_path` (the
+    /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
+    /// certificate to present). `skip_verify` disables server verification
+    /// (self-signed dev only).
+    pub async fn connect_wss_direct(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
-        tls_skip_verify: bool,
+        tls: &ClientTls,
     ) -> Result<Self> {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
-
-        let connector = if tls_skip_verify {
-            Some(tokio_tungstenite::Connector::Rustls(
-                Self::insecure_tls_config(),
-            ))
-        } else {
+        // The built-in (webpki-roots) connector only for the plain default (no
+        // client cert, no custom CA, no skip-verify); any custom TLS material
+        // requires our own rustls ClientConfig.
+        let connector = if tls.is_default() {
             None
+        } else {
+            Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
+                tls,
+            )?))
         };
-
         let (ws_stream, _response) =
             tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
                 .await
                 .with_context(|| format!("WSS connect to {url}"))?;
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
+    }
+
+    /// Connect to the daemon through a nominated relay.
+    ///
+    /// Establishes the OUTER TLS + WS to the relay, requests the target node-id,
+    /// then runs the SAME inner WSS + mTLS (against `inner_url`) over the tunnelled
+    /// byte stream. The relay only ever forwards ciphertext DATA frames and never
+    /// sees plaintext. `inner_url`'s server name is the daemon's loopback SAN.
+    pub async fn connect_wss_via_relay(
+        inner_url: &str,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+        tls: &ClientTls,
+        relay: &RelayDial,
+    ) -> Result<Self> {
+        let client_io = dial_through_relay(relay, RelayRoute::Wss).await?;
+        let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
+        let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
+            inner_url,
+            client_io,
+            None,
+            Some(connector),
+        )
+        .await
+        .with_context(|| format!("WSS-over-relay to {inner_url} via {}", relay.relay_addr))?;
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
+    }
+
+    /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
+    /// the `initialize` handshake. Generic over the underlying transport so it
+    /// serves both the direct (`TcpStream`) and relayed (`DuplexStream`) paths.
+    async fn spawn_ws_session<S>(
+        ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+    ) -> Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
 
         let (mut sink, mut stream) = ws_stream.split();
 
@@ -816,63 +1308,55 @@ impl RpcClient {
         })
     }
 
-    /// Build a rustls `ClientConfig` that accepts any server certificate.
-    fn insecure_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
+    /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
+    /// certificate for mutual TLS when one is configured.
+    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
-        /// Verifier that accepts every certificate without checking.
-        #[derive(Debug)]
-        struct NoVerify;
-
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &rustls::pki_types::CertificateDer<'_>,
-                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-                _server_name: &rustls::pki_types::ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
-
-        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
-        .expect("ring provider supports the default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
+        .expect("ring provider supports the default protocol versions");
 
-        Arc::new(config)
+        // Server verification.
+        let verified = if tls.skip_verify {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+        } else if let Some(ca_path) = &tls.ca_cert_path {
+            let daemon_ca = load_single_daemon_ca_cert(ca_path)?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(daemon_ca)
+                .context("adding daemon CA to the client root store")?;
+            builder.with_root_certificates(roots)
+        } else {
+            anyhow::bail!(
+                "WSS client certificate requires either tls.ca_cert_path (the daemon CA to trust) \
+                 or tls.skip_verify"
+            );
+        };
+
+        // Mutual-TLS client identity.
+        let config = match (&tls.client_cert_path, &tls.client_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let chain = load_pem_certs(cert_path)?;
+                let key = load_pem_key(key_path)?;
+                verified
+                    .with_client_auth_cert(chain, key)
+                    .context("loading client certificate / key for mutual TLS")?
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "WSS mutual TLS requires both tls.client_cert_path and tls.client_key_path"
+                );
+            }
+            (None, None) => verified.with_no_client_auth(),
+        };
+
+        Ok(Arc::new(config))
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
@@ -3602,9 +4086,100 @@ mod tls_tests {
     use super::*;
 
     #[test]
-    fn insecure_tls_config_builds_without_panic() {
-        let cfg = RpcClient::insecure_tls_config();
+    fn skip_verify_tls_config_builds_without_panic() {
+        let tls = ClientTls {
+            skip_verify: true,
+            ..Default::default()
+        };
+        let cfg = RpcClient::wss_tls_config(&tls).expect("skip-verify config builds");
         assert!(Arc::strong_count(&cfg) >= 1);
+    }
+
+    #[test]
+    fn client_cert_requires_ca_or_skip() {
+        // A client cert with neither a CA nor skip_verify is a clear error, not
+        // a silent fall-through to system roots.
+        let tls = ClientTls {
+            client_cert_path: Some("/x/cert.pem".into()),
+            client_key_path: Some("/x/key.pem".into()),
+            ..Default::default()
+        };
+        assert!(RpcClient::wss_tls_config(&tls).is_err());
+    }
+
+    #[test]
+    fn skip_verify_does_not_drop_the_client_cert() {
+        // Critic gap #8: `skip_verify` relaxes SERVER verification only. It must
+        // never silently drop the presented client certificate, or a relay/MITM
+        // could downgrade an mTLS client to an anonymous one. Build a config with
+        // skip_verify AND a real client cert+key and assert the resolver still
+        // carries certs. (`has_certs` is a trait-object method on the resolver, so
+        // no trait import is needed here.)
+        let (_, ca_crt, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let (csr_pem, key_pem) =
+            crate::client_crypto::generate_client_csr("dev_skipverify").unwrap();
+        let leaf =
+            crate::client_crypto::test_pki::sign_csr(&ca_crt, &ca_key, "dev_skipverify", &csr_pem);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, leaf.as_bytes()).unwrap();
+        std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+        let tls = ClientTls {
+            skip_verify: true,
+            client_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            client_key_path: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let cfg = RpcClient::wss_tls_config(&tls).expect("skip-verify + client cert builds");
+        assert!(
+            cfg.client_auth_cert_resolver.has_certs(),
+            "skip_verify must not drop the presented client certificate"
+        );
+    }
+
+    #[test]
+    fn cached_daemon_ca_requires_single_certificate() {
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let (extra_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, format!("{daemon_ca}\n{extra_ca}")).unwrap();
+
+        let tls = ClientTls {
+            ca_cert_path: Some(ca_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = RpcClient::wss_tls_config(&tls).unwrap_err().to_string();
+        assert!(
+            err.contains("exactly one daemon CA certificate"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_ca_path_takes_precedence_over_pins_and_tofu() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_ca = dir.path().join("relay-ca.pem");
+        let relay = RelayDial {
+            relay_addr: "127.0.0.1:443".into(),
+            relay_host: "localhost".into(),
+            node_id: "node".into(),
+            relay_ca_path: Some(missing_ca.to_string_lossy().into_owned()),
+            relay_insecure: false,
+            relay_pin: Some("00".into()),
+            relay_tofu: true,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        };
+
+        assert!(
+            relay_outer_connector(&relay).is_err(),
+            "configured relay CA must be loaded before stored pins or TOFU can be used"
+        );
     }
 }
 

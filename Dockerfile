@@ -94,6 +94,9 @@ COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # below. Its real build.rs reads web/src/contexts/themes.json and would panic in
 # this pre-fetch stage, so it is stubbed exactly like apps/tauri.
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+# apps/zerorelay: workspace member with lib+bin targets; not shipped in the
+# server image, but Cargo must be able to load its manifest during pre-fetch.
+COPY apps/zerorelay/Cargo.toml apps/zerorelay/Cargo.toml
 # tools/fill-translations and xtask are dev/build tools; copy manifests only so
 # Cargo can resolve the workspace, then stub their entry points so the
 # dependency pre-fetch step succeeds without building them into the image.
@@ -103,7 +106,7 @@ COPY xtask/Cargo.toml xtask/Cargo.toml
 # `src/bin/zeroclaw-acp-bridge.rs` is required because the `acp-bridge` feature
 # is in the root crate's default set; cargo selects the bin target during the
 # pre-fetch build even with only the workspace lib stubbed.
-RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
@@ -112,6 +115,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > apps/tauri/build.rs \
     && echo "fn main() {}" > apps/zerocode/src/main.rs \
     && echo "fn main() {}" > apps/zerocode/build.rs \
+    && echo "fn main() {}" > apps/zerorelay/src/main.rs \
+    && echo "" > apps/zerorelay/src/lib.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "" > xtask/src/lib.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \

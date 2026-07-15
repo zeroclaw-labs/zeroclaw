@@ -60,6 +60,45 @@ pub struct PairingGuard {
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
 }
 
+/// A successfully matched pairing code whose final token is not yet committed.
+///
+/// Dropping an uncommitted reservation restores the one-time code so validation
+/// or durable-write failures do not burn the operator's displayed code.
+#[derive(Debug)]
+pub struct PairingReservation {
+    guard: PairingGuard,
+    code: String,
+    token: String,
+    committed: bool,
+}
+
+impl PairingReservation {
+    /// SHA-256 hash of the token that will be committed on success.
+    pub fn token_hash(&self) -> String {
+        hash_token(&self.token)
+    }
+
+    /// Commit the reservation, consuming the one-time code and storing the token.
+    pub fn commit(mut self) -> String {
+        let token = self.token.clone();
+        self.guard.paired_tokens.lock().insert(hash_token(&token));
+        self.committed = true;
+        token
+    }
+}
+
+impl Drop for PairingReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut slot = self.guard.pairing_code.lock();
+        if slot.is_none() {
+            *slot = Some(self.code.clone());
+        }
+    }
+}
+
 impl PairingGuard {
     /// Create a new pairing guard.
     ///
@@ -105,7 +144,11 @@ impl PairingGuard {
         self.require_pairing
     }
 
-    fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
+    fn reserve_pair_blocking(
+        &self,
+        code: &str,
+        client_id: &str,
+    ) -> Result<Option<PairingReservation>, u64> {
         let client_id = normalize_client_key(client_id);
         let now = Instant::now();
 
@@ -143,14 +186,18 @@ impl PairingGuard {
                     let mut guard = self.failed_attempts.lock();
                     guard.0.remove(&client_id);
                 }
-                let token = generate_token();
-                let mut tokens = self.paired_tokens.lock();
-                tokens.insert(hash_token(&token));
+                let reservation = PairingReservation {
+                    guard: self.clone(),
+                    code: expected.clone(),
+                    token: generate_token(),
+                    committed: false,
+                };
 
-                // Consume the pairing code so it cannot be reused
+                // Reserve the pairing code so concurrent requests cannot both
+                // issue, but restore it on drop if issuance fails before commit.
                 *pairing_code = None;
 
-                return Ok(Some(token));
+                return Ok(Some(reservation));
             }
         }
 
@@ -189,6 +236,30 @@ impl PairingGuard {
         }
 
         Ok(None)
+    }
+
+    fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
+        Ok(self
+            .reserve_pair_blocking(code, client_id)?
+            .map(PairingReservation::commit))
+    }
+
+    /// Reserve the given code without committing it. The returned reservation
+    /// restores the code on drop unless `commit()` is called.
+    pub async fn reserve_pair(
+        &self,
+        code: &str,
+        client_id: &str,
+    ) -> Result<Option<PairingReservation>, u64> {
+        let this = self.clone();
+        let code = code.to_string();
+        let client_id = client_id.to_string();
+        let handle =
+            tokio::task::spawn_blocking(move || this.reserve_pair_blocking(&code, &client_id));
+
+        handle
+            .await
+            .expect("failed to spawn blocking task this should not happen")
     }
 
     /// Attempt to pair with the given code. Returns a bearer token on success.
@@ -455,6 +526,45 @@ mod tests {
         assert!(token.is_some());
         assert!(token.unwrap().starts_with("zc_"));
         assert!(guard.is_paired());
+    }
+
+    #[test]
+    async fn reservation_restores_code_until_committed() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        {
+            let reservation = guard
+                .reserve_pair(&code, "test_client")
+                .await
+                .unwrap()
+                .expect("code should reserve");
+            assert_eq!(reservation.token_hash().len(), 64);
+            assert!(
+                guard.pairing_code().is_none(),
+                "reserved code must not be concurrently reusable"
+            );
+        }
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "dropping an uncommitted reservation restores the one-time code"
+        );
+        assert!(!guard.is_paired());
+    }
+
+    #[test]
+    async fn committed_reservation_consumes_code_and_stores_token() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard
+            .reserve_pair(&code, "test_client")
+            .await
+            .unwrap()
+            .expect("code should reserve")
+            .commit();
+        assert!(token.starts_with("zc_"));
+        assert!(guard.pairing_code().is_none());
+        assert!(guard.is_authenticated(&token));
     }
 
     #[test]

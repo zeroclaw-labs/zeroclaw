@@ -322,11 +322,17 @@ jobs:
           else
             BUILD_CMD="cargo build"
           fi
-          $BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
-          # Build the zerocode TUI alongside the main binary so it ships in the
-          # release archive. Skipped on Android, which lacks the terminal deps.
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            $BUILD_CMD --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
+          else
+            $BUILD_CMD --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
+          fi
+          # Build the zerocode TUI and the zerorelay nominated relay alongside the
+          # main binary so they ship in the release archive. Skipped on Android,
+          # which lacks the terminal deps.
           if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
             $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}
+            $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}
           fi
 
       - name: Check binary size
@@ -341,10 +347,12 @@ jobs:
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           extra=""
-          if [ -f target/${{ matrix.target }}/release/zerocode ]; then
-            cp target/${{ matrix.target }}/release/zerocode staging/
-            extra="zerocode"
-          fi
+          for b in zerocode zerorelay; do
+            if [ -f target/${{ matrix.target }}/release/$b ]; then
+              cp target/${{ matrix.target }}/release/$b staging/
+              extra="$extra $b"
+            fi
+          done
           cp -r web/dist staging/web/dist
           cd staging
           tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
@@ -356,10 +364,12 @@ jobs:
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           extra=""
-          if [ -f target/${{ matrix.target }}/release/zerocode.exe ]; then
-            cp target/${{ matrix.target }}/release/zerocode.exe staging/
-            extra="zerocode.exe"
-          fi
+          for b in zerocode.exe zerorelay.exe; do
+            if [ -f target/${{ matrix.target }}/release/$b ]; then
+              cp target/${{ matrix.target }}/release/$b staging/
+              extra="$extra $b"
+            fi
+          done
           cp -r web/dist staging/web/dist
           cd staging
           7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist

@@ -28,6 +28,13 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    /// A client mTLS certificate was issued from the daemon CA (enrollment or
+    /// operator `issue-client-cert`). Recorded by the issued-cert ledger.
+    CertIssued,
+    /// A client certificate was renewed over an authenticated mTLS session.
+    CertRenewed,
+    /// A client certificate was revoked (status flipped in the ledger).
+    CertRevoked,
 }
 
 /// Actor information (who performed the action)

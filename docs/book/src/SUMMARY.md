@@ -20,6 +20,7 @@
   - [Config pane](./zerocode/config.md)
   - [Themes & terminal colours](./zerocode/themes.md)
   - [Remote setup (WSS)](./zerocode/remote.md)
+  - [Secure transport (end-to-end config)](./zerocode/secure-transport.md)
   - [Environment pass-through](./zerocode/environment.md)
 - [Installation](./setup/index.md)
   - [Linux](./setup/linux.md)

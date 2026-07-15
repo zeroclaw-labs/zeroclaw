@@ -1,0 +1,54 @@
+# zerorelay configuration. Pass with `zerorelay --config relay.toml`.
+#
+# Every value is optional; any CLI flag overrides the matching value here. The
+# [admission] section hot-reloads on SIGHUP (`kill -HUP <pid>`) so you can edit the
+# allow/deny lists without dropping live connections. The other sections take
+# effect at startup only.
+
+# Address to listen on for both daemon and client connections.
+bind = "0.0.0.0:8443"
+
+[tls]
+# The relay terminates an OUTER TLS + WebSocket session (it never decrypts the
+# inner mTLS). Leave cert/key unset to SELF-PROVISION a cert into `dir` on first
+# run (no openssl); set `sans` to the relay's public hostname(s)/IP(s).
+dir = "/data/tls"
+sans = ["relay.example.com"]
+# To bring your own (e.g. a public-CA cert for the relay's hostname) instead:
+# cert = "/etc/zerorelay/fullchain.pem"
+# key  = "/etc/zerorelay/privkey.pem"
+
+[admission]
+# Who may register a rendezvous. "open" admits any signed daemon that passes the
+# deny list; "allowlist" admits only daemons whose pubkey fingerprint is listed.
+# Keyed on the daemon registration pubkey FINGERPRINT (sha256 hex). Deny wins.
+mode = "open"
+allow = []
+deny = []
+# Optional shared-secret gate a daemon must present in its Hello.
+# relay_token = "change-me"
+# Outer-mTLS variant (additive admission on the OUTER TLS; the inner mTLS is
+# unaffected). "off" (default), "optional", or "required"; when on, outer_client_ca
+# verifies the peer's outer client cert. With route_by_client_cert, a client whose
+# outer cert CN names a node-id is routed to THAT node (else the Connect frame).
+# outer_client_auth = "off"
+# outer_client_ca = "/etc/zerorelay/outer-client-ca.pem"
+# route_by_client_cert = false
+
+[limits]
+# Cap on simultaneously-open client connections per node-id.
+max_conns_per_node = 256
+# Drop a client connection after this many seconds of inactivity (a connection
+# paused by flow control still counts as active).
+idle_timeout_secs = 300
+# Lease TTL (seconds) advertised to daemons at registration.
+lease_ttl_secs = 300
+# Abuse caps (A6). Per-source-IP connection-handshake rate: a burst allowance
+# plus a steady refill per second; excess connections from one IP are dropped
+# before the TLS handshake.
+accept_burst_per_ip = 30
+accept_rate_per_ip = 10.0
+# Per-node-id client-connect rate: excess Connects to one node-id are rejected
+# with `rate_limited`.
+connect_burst_per_node = 60
+connect_rate_per_node = 20.0

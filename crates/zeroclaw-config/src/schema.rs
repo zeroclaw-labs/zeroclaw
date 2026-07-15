@@ -319,6 +319,18 @@ pub struct Config {
     #[nested]
     pub wss: WssConfig,
 
+    /// Nominated-relay client for reaching this daemon through a relay (`[relay]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub relay: RelayConfig,
+
+    /// Certificate enrollment endpoint for certless clients (`[enroll]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub enroll: EnrollConfig,
+
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     #[nested]
@@ -6876,6 +6888,11 @@ pub struct GatewayClientAuthConfig {
     /// When non-empty, only client certs matching one of these fingerprints are accepted.
     #[serde(default)]
     pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line). A
+    /// client cert whose fingerprint is listed is refused at the handshake (A5);
+    /// the file is re-read when it changes. Empty disables the check.
+    #[serde(default)]
+    pub crl_path: String,
 }
 
 impl Default for GatewayClientAuthConfig {
@@ -6885,8 +6902,43 @@ impl Default for GatewayClientAuthConfig {
             ca_cert_path: String::new(),
             require_client_cert: default_true(),
             pinned_certs: Vec::new(),
+            crl_path: String::new(),
         }
     }
+}
+
+/// Client certificate authentication (mTLS) for the remote WSS transport
+/// (`[wss.client_auth]`).
+///
+/// This mirrors [`GatewayClientAuthConfig`]; the two are distinct structs only
+/// because the `Configurable` derive binds the section prefix into the type. The
+/// verification logic itself is single-sourced in the `zeroclaw-tls` crate.
+///
+/// Unlike the gateway's variant there is no `require_client_cert` knob: the
+/// remote WSS plane is *always* mutually authenticated (there is no
+/// server-only-TLS path), so a client certificate is unconditionally required.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "wss.client_auth"]
+pub struct WssClientAuthConfig {
+    /// Use the bring-your-own CA below. When false (default) the daemon
+    /// auto-generates its own CA. The WSS plane is always mutually authenticated
+    /// either way; this does NOT toggle whether a client certificate is required.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the PEM-encoded CA certificate used to verify client certificates.
+    #[serde(default)]
+    pub ca_cert_path: String,
+    /// Optional SHA-256 fingerprints for certificate pinning. When non-empty,
+    /// only client certs matching one of these fingerprints are accepted.
+    #[serde(default)]
+    pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line). A
+    /// client cert whose fingerprint is listed is refused at the handshake (A5);
+    /// the file is re-read when it changes. Empty (default) makes the daemon use
+    /// its ledger-materialized list at `<data_dir>/tls/revoked`.
+    #[serde(default)]
+    pub crl_path: String,
 }
 
 /// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).
@@ -6913,6 +6965,20 @@ pub struct WssConfig {
     /// Path to the PEM-encoded server private key file.
     #[serde(default)]
     pub key_path: String,
+    /// Extra Subject Alternative Names for the AUTO-GENERATED server certificate
+    /// (hostnames and/or IPs a remote client uses to reach this daemon, e.g.
+    /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
+    /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
+    /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// Ignored when you bring your own server certificate via `cert_path`.
+    #[serde(default)]
+    pub sans: Vec<String>,
+    /// Client certificate authentication (mutual TLS) for the remote WSS plane.
+    /// When the listener is enabled, the remote plane is always mutually
+    /// authenticated; this section supplies the CA and pinning policy.
+    #[serde(default)]
+    #[nested]
+    pub client_auth: Option<WssClientAuthConfig>,
 }
 
 impl Default for WssConfig {
@@ -6923,8 +6989,75 @@ impl Default for WssConfig {
             port: default_wss_port(),
             cert_path: String::new(),
             key_path: String::new(),
+            sans: Vec::new(),
+            client_auth: None,
         }
     }
+}
+
+/// Nominated-relay client (`[relay]`).
+///
+/// When enabled, the daemon keeps a persistent outbound connection to a relay
+/// and registers `node_id`, so clients behind NAT can reach it *through* the
+/// relay. The relay is a blind forwarder: the inner client<->daemon mTLS still
+/// terminates at the daemon's WSS listener and is never decrypted by the relay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "relay"]
+pub struct RelayConfig {
+    /// Enable the relay bridge (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay address to connect to, as `host:port`.
+    #[serde(default)]
+    pub url: String,
+    /// Opaque node-id this daemon registers under (clients dial this id). Leave
+    /// empty (recommended) to auto-mint and persist a random 128-bit capability at
+    /// `<data_dir>/relay/node_id`; set it only to pin a specific id. It must stay
+    /// unguessable and is decoupled from the cert - do NOT use a name or a cert
+    /// thumbprint (a guessable/derivable id lets attackers probe and flood you).
+    #[serde(default)]
+    pub node_id: String,
+    /// Relay account token presented at registration (admission credential).
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    pub token: String,
+    /// PEM CA to trust for the relay's OWN (outer) TLS certificate. When set,
+    /// this explicit CA takes precedence over remembered/TOFU relay pins. Empty
+    /// uses the built-in public roots unless a stored pin or `tofu` is active.
+    #[serde(default)]
+    pub relay_ca_path: String,
+    /// Server name to expect on the relay's outer certificate. Empty derives it
+    /// from the host portion of `url`.
+    #[serde(default)]
+    pub relay_host: String,
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    #[serde(default)]
+    pub relay_insecure: bool,
+    /// Trust-on-first-use for the relay's OUTER certificate (default false): accept
+    /// the first leaf seen and pin it at `<data_dir>/relay/relay_pin` thereafter
+    /// (the pin is also handed to enrolling clients). Opt-in; ignored once a pin is
+    /// stored or `relay_ca_path` is set. A configured relay CA also bypasses any
+    /// previously stored TOFU pin. The outer TLS is a metadata boundary, not the
+    /// RPC boundary (the inner mTLS is); see threat A2.
+    #[serde(default)]
+    pub tofu: bool,
+    /// PEM cert/key the daemon presents to the relay on the OUTER TLS layer
+    /// (outer-mTLS variant), required only when the relay sets
+    /// `outer_client_auth = required`. Empty presents no outer client cert. This is
+    /// separate from the inner mTLS client identity.
+    #[serde(default)]
+    pub outer_client_cert: String,
+    #[serde(default)]
+    pub outer_client_key: String,
+    /// Auto-rotate the auto-minted node-id every N days (default 0 = never).
+    /// Rotation mints a fresh id, registers it alongside the old one for a short
+    /// grace window (so in-flight clients keep working), then retires the old id;
+    /// the new id reaches clients in-band on their next certificate renewal. Only
+    /// applies when `node_id` is empty (an operator-pinned id is never rotated).
+    #[serde(default)]
+    pub node_id_rotation_days: u64,
 }
 
 fn default_wss_bind() -> String {
@@ -6933,6 +7066,48 @@ fn default_wss_bind() -> String {
 
 fn default_wss_port() -> u16 {
     9781
+}
+
+fn default_enroll_bind() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_enroll_port() -> u16 {
+    9782
+}
+
+/// Certificate enrollment endpoint (`[enroll]`).
+///
+/// The dedicated, narrowly scoped bootstrap surface a *certless* client reaches
+/// for its FIRST certificate. It is server-authenticated TLS (the daemon proves
+/// itself; the client confirms the CA via the pairing short-auth-string) plus a
+/// pairing-code gate. It accepts exactly one operation: submit a CSR, receive a
+/// signed cert + the CA chain + the relay profile. This is NOT a fallback on the
+/// always-mTLS RPC plane (that plane stays mutually authenticated with no
+/// weakenable path); it is a separate minimal endpoint with its own auth model.
+/// The daemon owns the CA, so this endpoint works with no gateway.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "enroll"]
+pub struct EnrollConfig {
+    /// Enable the enrollment endpoint (default: false). Requires `[wss]` enabled
+    /// (it hands out certs for that mutually authenticated plane) and a daemon CA
+    /// private key (auto-generated, or BYO with key); when the CA key is absent
+    /// the endpoint fails closed and certs must be provisioned out of band.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address the enrollment endpoint binds on.
+    #[serde(default = "default_enroll_bind")]
+    pub bind: String,
+    /// Port the enrollment endpoint listens on.
+    #[serde(default = "default_enroll_port")]
+    pub port: u16,
+    /// Reserved for a future migration flow. The first FOSS release rejects any
+    /// non-empty value because code-less enrollment needs an explicit client-side
+    /// trust anchor before certs can be cached. Leave empty to require the normal
+    /// pairing-code-gated path.
+    #[serde(default)]
+    pub allow_unpaired_enrollment: String,
 }
 
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
@@ -16982,6 +17157,8 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -23696,6 +23873,8 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -24407,6 +24586,8 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),

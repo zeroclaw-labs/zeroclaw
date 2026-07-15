@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -14,6 +14,9 @@ zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.2" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.2" }
 zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.2", default-features = false }
 zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.2" }
+zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.2" }
+zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.2" }
+zerorelay = { path = "apps/zerorelay", version = "0.8.2" }
 zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.2" }
 zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.2" }
 zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.2" }
@@ -87,6 +90,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
+zeroclaw-tls = { workspace = true }
 zeroclaw-eval = { workspace = true, optional = true }
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }

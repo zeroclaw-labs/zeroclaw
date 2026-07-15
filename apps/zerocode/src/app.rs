@@ -186,6 +186,7 @@ pub async fn run(
     config_dir: &std::path::Path,
     target: &crate::ConnectTarget,
     owns_ephemeral: bool,
+    initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     // Per-agent theme overrides live in a process-global registry (theme.rs),
@@ -210,6 +211,12 @@ pub async fn run(
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
+
+    // Which transport leg the live connection sits on, and when the direct path
+    // was last re-probed. While on the relay leg of a route that also has a
+    // direct address, the loop periodically retries direct and migrates back.
+    let mut active_leg = initial_leg;
+    let mut reprobe_last_attempt: Option<std::time::Instant> = None;
 
     // The live client handle. Reassigned in place on a successful
     // reconnect so every rebuilt pane talks to the recovered daemon.
@@ -287,6 +294,39 @@ pub async fn run(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
     )?;
+
+    // Adopt a freshly-connected client: rebuild every pane against it (a kept
+    // pane would still hold the dead client's notification receiver) while
+    // carrying the live sessions + agent aliases across the rebuild. Evaluates to
+    // `true` when the rebuild succeeded, `false` when the daemon flapped mid-init
+    // (the caller stays in its current state and retries). Shared by the
+    // disconnect-recovery path and the relay->direct re-probe migration.
+    macro_rules! adopt_client {
+        ($new_client:expr) => {{
+            rpc = Arc::new($new_client);
+            let resume_chat = (
+                chat_pane.current_session_id().map(String::from),
+                chat_pane.current_agent_alias().map(String::from),
+            );
+            let resume_acp = (
+                acp_pane.current_session_id().map(String::from),
+                acp_pane.current_agent_alias().map(String::from),
+            );
+            match build_panes!(resume_chat, resume_acp) {
+                Ok(panes) => {
+                    dashboard_pane = panes.0;
+                    config_app = panes.1;
+                    doctor_pane = panes.2;
+                    acp_pane = panes.3;
+                    chat_pane = panes.4;
+                    logs_pane = panes.5;
+                    quickstart = panes.6;
+                    true
+                }
+                Err(_) => false,
+            }
+        }};
+    }
 
     loop {
         // Draw
@@ -490,7 +530,9 @@ pub async fn run(
                     // our UID via HMAC signature verification.
                     let prev_id = rpc.tui_id().map(String::from);
                     let prev_sig = rpc.tui_sig().map(String::from);
-                    if let Ok(new_client) = target
+                    // The connect prefers the direct path and falls back to the
+                    // relay, so a reconnect lands on whichever leg is reachable.
+                    if let Ok((new_client, _leg)) = target
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
@@ -542,6 +584,36 @@ pub async fn run(
                         // daemon restart still recovers.
                         needs_intervention = true;
                     }
+                }
+            }
+        }
+
+        // Migrate back to the direct path once it becomes reachable again. Only
+        // runs while live on the relay leg of a route that also has a direct
+        // address; a successful probe adopts the direct client and rebuilds the
+        // panes against it. The probe is throttled and short-timeout, so the
+        // event loop keeps drawing between attempts.
+        if matches!(rpc.connection_state(), ConnectionState::Connected)
+            && active_leg == crate::ActiveLeg::WssRelay
+            && let crate::ConnectTarget::Wss(route) = target
+            && route.reprobe_secs > 0
+            && route.direct_url.is_some()
+        {
+            let now = std::time::Instant::now();
+            let due = reprobe_last_attempt
+                .map(|t| now.duration_since(t) >= Duration::from_secs(route.reprobe_secs))
+                .unwrap_or(true);
+            if due {
+                reprobe_last_attempt = Some(now);
+                let prev_id = rpc.tui_id().map(String::from);
+                let prev_sig = rpc.tui_sig().map(String::from);
+                if let Ok(direct) = route
+                    .connect_direct(prev_id.as_deref(), prev_sig.as_deref())
+                    .await
+                {
+                    active_leg = crate::ActiveLeg::WssDirect;
+                    let _ = adopt_client!(direct);
+                    continue;
                 }
             }
         }

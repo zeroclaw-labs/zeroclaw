@@ -84,11 +84,36 @@ pub(crate) struct WssSection {
     pub uri: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
+    /// Reach the daemon through a nominated relay at this `host:port` instead of
+    /// connecting to `uri` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Node-id of the target daemon to request from the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node: Option<String>,
+    /// How many times to try the direct address before falling back to the relay
+    /// (default 2). Only relevant when both a direct address and a relay exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_attempts: Option<u32>,
+    /// Per-attempt timeout, in seconds, for a direct connect before falling back
+    /// to the relay (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_timeout_secs: Option<u64>,
+    /// While connected through the relay, how often (seconds) to re-probe the
+    /// direct address and migrate back when it returns (default 30; 0 disables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_secs: Option<u64>,
 }
 
 impl WssSection {
     fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.tls.is_empty()
+        self.uri.is_none()
+            && self.tls.is_empty()
+            && self.relay_url.is_none()
+            && self.relay_node.is_none()
+            && self.direct_attempts.is_none()
+            && self.direct_timeout_secs.is_none()
+            && self.reprobe_secs.is_none()
     }
 }
 
@@ -98,6 +123,16 @@ pub(crate) struct WssTlsSection {
     pub skip_verify: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip_verify_routes: Vec<String>,
+    /// PEM CA certificate used to verify the daemon (mutual TLS). When set, the
+    /// server certificate is verified against this CA instead of the system roots.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_cert_path: String,
+    /// PEM client certificate presented to the daemon (mutual TLS).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_cert_path: String,
+    /// PEM client private key for `client_cert_path`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_key_path: String,
 }
 
 impl WssTlsSection {
@@ -106,7 +141,11 @@ impl WssTlsSection {
     }
 
     fn is_empty(&self) -> bool {
-        !self.skip_verify && self.skip_verify_routes.is_empty()
+        !self.skip_verify
+            && self.skip_verify_routes.is_empty()
+            && self.ca_cert_path.is_empty()
+            && self.client_cert_path.is_empty()
+            && self.client_key_path.is_empty()
     }
 }
 

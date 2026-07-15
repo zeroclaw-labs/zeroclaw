@@ -11,6 +11,7 @@ publish = false
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-tls.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
@@ -72,7 +73,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 toml = "1.0"
 toml_edit = "0.25"
-rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
