@@ -232,6 +232,20 @@ pub fn cert_sha256_fingerprint(cert_der: &[u8]) -> String {
     hex::encode(hash)
 }
 
+/// Compute the SHA-256 fingerprint of a PEM chain that must contain exactly one
+/// certificate. Enrollment SAS confirmation binds to one daemon CA, not a
+/// broader chain, so callers should fail closed on zero or multiple certs.
+pub fn single_cert_pem_sha256_fingerprint(ca_chain_pem: &str) -> Result<String> {
+    let certs = rustls_pemfile::certs(&mut ca_chain_pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid certificate PEM")?;
+    match certs.len() {
+        0 => anyhow::bail!("no certificate in PEM chain"),
+        1 => Ok(cert_sha256_fingerprint(certs[0].as_ref())),
+        n => anyhow::bail!("expected exactly one certificate in PEM chain, got {n}"),
+    }
+}
+
 /// Read a relay node-id from an OUTER client certificate's subject Common Name.
 ///
 /// Used only by the optional outer-mTLS relay variant: when an operator issues

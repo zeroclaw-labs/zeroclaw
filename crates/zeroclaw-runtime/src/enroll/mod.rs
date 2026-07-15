@@ -22,6 +22,7 @@
 //! web-framework dependency.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -32,6 +33,9 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::pairing::PairingGuard;
 
 use crate::security::cert_ledger::{CertLedger, CertStatus, IssuanceActor, LedgerEntry};
+
+mod paircode_admin;
+pub use paircode_admin::{GeneratedEnrollmentPaircode, request_new_paircode};
 
 /// Maximum bytes accepted for an enrollment request (headers + body). A CSR is a
 /// few KiB; this is a generous cap that still bounds a memory-exhaustion attempt.
@@ -136,6 +140,10 @@ pub struct EnrollServer {
     pub allow_unpaired_until: Option<chrono::DateTime<chrono::Utc>>,
     /// Relay coordinates to hand back, when the relay bridge is configured.
     pub relay_profile: RelayProfile,
+    /// Data dir used for local operator requests to mint additional pairing
+    /// codes. This is intentionally not exposed through the public enrollment
+    /// HTTP route because relay traffic reaches this listener over loopback.
+    pub paircode_admin_data_dir: Option<PathBuf>,
 }
 
 impl EnrollServer {
@@ -239,6 +247,9 @@ pub async fn serve_on(
             .with_attrs(::serde_json::json!({ "bind": server.bind_addr.to_string() })),
         "enrollment endpoint listening"
     );
+    if let Some(data_dir) = server.paircode_admin_data_dir.clone() {
+        paircode_admin::spawn_request_loop(server.clone(), data_dir, cancel.clone());
+    }
     let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
     loop {
         tokio::select! {
@@ -521,6 +532,7 @@ mod tests {
             static_client_pins_configured: false,
             allow_unpaired_until: deadline,
             relay_profile: RelayProfile::default(),
+            paircode_admin_data_dir: None,
         }
     }
 

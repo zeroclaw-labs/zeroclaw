@@ -31,6 +31,8 @@
 #   ZC_TESTBED_DIR    workspace dir         (default: ${TMPDIR:-/tmp}/zc-mtls-testbed)
 #   ZC_WSS_PORT       daemon WSS port       (default: 9799)
 #   ZC_RELAY_PORT     relay listen port     (default: 8459)
+#   ZC_RELAY_BIND     relay listen address  (default: 127.0.0.1)
+#   ZC_RELAY_PUBLIC_HOST browser/client host (default: 127.0.0.1)
 #   ZC_NODE_ID        relay node-id         (default: testbed-daemon)
 #   ZC_PROFILE        cargo profile         (release|debug, default: release)
 #   CARGO_TARGET_DIR  cargo output/cache dir (default: /opt/cargo-build)
@@ -79,6 +81,9 @@ TB="${ZC_TESTBED_DIR:-${TMPDIR:-/tmp}/zc-mtls-testbed}"
 WSS_PORT="${ZC_WSS_PORT:-9799}"
 RELAY_PORT="${ZC_RELAY_PORT:-8459}"
 ENROLL_PORT="${ZC_ENROLL_PORT:-9783}"
+RELAY_BIND="${ZC_RELAY_BIND:-127.0.0.1}"
+RELAY_DAEMON_HOST="${ZC_RELAY_DAEMON_HOST:-127.0.0.1}"
+RELAY_PUBLIC_HOST="${ZC_RELAY_PUBLIC_HOST:-$RELAY_DAEMON_HOST}"
 NODE_ID="${ZC_NODE_ID:-testbed-daemon}"
 PROFILE="${ZC_PROFILE:-release}"
 RELAY_TOKEN="testbed-token"
@@ -163,7 +168,7 @@ enabled = true
 url = "127.0.0.1:$RELAY_PORT"
 node_id = "$NODE_ID"
 token = "$RELAY_TOKEN"
-relay_host = "127.0.0.1"
+relay_host = "$RELAY_DAEMON_HOST"
 relay_ca_path = "$RELAY_TLS_DIR/ca.crt"
 
 # Enrollment endpoint: the bootstrap surface a certless client reaches for its
@@ -174,7 +179,7 @@ enabled = true
 bind = "127.0.0.1"
 port = $ENROLL_PORT
 TOML
-ok "wrote $TB/config.toml (wss :$WSS_PORT, relay :$RELAY_PORT, node '$NODE_ID')"
+ok "wrote $TB/config.toml (wss :$WSS_PORT, relay $RELAY_BIND:$RELAY_PORT, node '$NODE_ID')"
 
 CA="$TB/data/tls/ca.crt"
 # issue-client-cert into a drop-in client TLS dir: with --out-dir it also writes
@@ -187,10 +192,17 @@ CLIENT_KEY="$CLIENT_DIR/client.key"
 
 # --- 3. start the relay (open admission; it SELF-PROVISIONS its outer TLS) ----
 # No openssl: with no --tls-cert the relay generates its own CA + server cert
-# (SAN localhost/127.0.0.1) into --tls-dir, the same machinery the daemon uses.
-say "starting zerorelay on 127.0.0.1:$RELAY_PORT (open admission, self-provisioned TLS)"
-"$ZERORELAY" --bind "127.0.0.1:$RELAY_PORT" --registration-mode open \
+# (SAN localhost/127.0.0.1, plus ZC_RELAY_PUBLIC_HOST when set) into --tls-dir,
+# the same machinery the daemon uses.
+say "starting zerorelay on $RELAY_BIND:$RELAY_PORT (open admission, self-provisioned TLS)"
+RELAY_TLS_SAN_ARGS=()
+case "$RELAY_PUBLIC_HOST" in
+  ""|"127.0.0.1"|"localhost") ;;
+  *) RELAY_TLS_SAN_ARGS+=(--tls-san "$RELAY_PUBLIC_HOST") ;;
+esac
+"$ZERORELAY" --bind "$RELAY_BIND:$RELAY_PORT" --registration-mode open \
   --tls-dir "$RELAY_TLS_DIR" \
+  "${RELAY_TLS_SAN_ARGS[@]}" \
   > "$TB/relay.log" 2>&1 &
 RELAY_PID=$!
 for _ in $(seq 1 40); do
@@ -290,7 +302,7 @@ if [ "$BROWSER_MANUAL" = "1" ]; then
   ok "browser pairing code reserved for manual use"
 elif [ "$BROWSER_CHECK" = "1" ]; then
   say "self-check E: browser frontdoor enrollment and mTLS RPC tunnel"
-  ZC_BROWSER_E2E_URL="https://127.0.0.1:$RELAY_PORT/" \
+  ZC_BROWSER_E2E_URL="https://$RELAY_PUBLIC_HOST:$RELAY_PORT/" \
     ZC_BROWSER_E2E_NODE_ID="$NODE_ID" \
     ZC_BROWSER_E2E_PAIRING_CODE="$CODE" \
     ZC_BROWSER_E2E_PROFILE_DIR="$TB/browser-profile" \
@@ -365,9 +377,9 @@ cat <<EOF
  <config-dir>/tls and --connect defaulted to the daemon loopback:
    $ZEROCODE \\
      --config-dir $CLIENT_CONFIG_DIR \\
-     --relay 127.0.0.1:$RELAY_PORT \\
+     --relay $RELAY_PUBLIC_HOST:$RELAY_PORT \\
      --relay-node $NODE_ID \\
-     --relay-host 127.0.0.1 \\
+     --relay-host $RELAY_PUBLIC_HOST \\
      --relay-ca $RELAY_TLS_DIR/ca.crt \\
      --agent <your-agent-alias>
 
@@ -379,13 +391,13 @@ EOF
 if [ "$BROWSER_MANUAL" = "1" ]; then
 cat <<EOF
  BROWSER FRONTDOOR (pairing code is still unused):
-   URL:          https://127.0.0.1:$RELAY_PORT/
+   URL:          https://$RELAY_PUBLIC_HOST:$RELAY_PORT/
    Server ID:    $NODE_ID
    Pairing Code: $CODE
 
  Automated browser proof against this live testbed:
    node $REPO_ROOT/scripts/dev/browser-relay-frontdoor-e2e.mjs \\
-     --url https://127.0.0.1:$RELAY_PORT/ \\
+     --url https://$RELAY_PUBLIC_HOST:$RELAY_PORT/ \\
      --node-id $NODE_ID \\
      --pairing-code $CODE \\
      --browser /path/to/chromium

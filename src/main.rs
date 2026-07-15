@@ -3017,6 +3017,21 @@ enum SecurityCommands {
         json: bool,
     },
 
+    /// Ask the running daemon to mint another enrollment pairing code.
+    ///
+    /// This adds another browser/zerocode device without restarting the daemon.
+    /// It is a local operator command: the request is exchanged through the
+    /// daemon's data dir, not through the public enrollment route.
+    EnrollPaircode {
+        /// Mint a new one-time enrollment code.
+        #[arg(long)]
+        new: bool,
+
+        /// Seconds to wait for the running daemon to answer.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+
     /// Request an on-demand relay node-id rotation. The running daemon mints a
     /// fresh id, registers it alongside the old one for a grace window, then
     /// retires the old id; the new id reaches clients in-band on their next
@@ -5208,6 +5223,7 @@ async fn main() -> Result<()> {
                                 .unwrap_or(false),
                             allow_unpaired_until,
                             relay_profile,
+                            paircode_admin_data_dir: Some(data_dir.clone()),
                         });
                         zeroclaw_runtime::enroll::serve(server, cancel).await
                     })
@@ -5723,6 +5739,29 @@ async fn main() -> Result<()> {
                 device,
             } => revoke_wss_client_cert(&config, fingerprint, device),
             SecurityCommands::ListClientCerts { json } => list_wss_client_certs(&config, json),
+            SecurityCommands::EnrollPaircode { new, timeout_secs } => {
+                if !new {
+                    anyhow::bail!("pass --new to mint a fresh enrollment pairing code");
+                }
+                let generated = zeroclaw_runtime::enroll::request_new_paircode(
+                    &config.data_dir,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
+                .await?;
+                println!(
+                    "{}",
+                    ta(
+                        "cli-enroll-pairing-code",
+                        &[("code", &generated.pairing_code)],
+                        "pairing code"
+                    )
+                );
+                println!(
+                    "{}",
+                    ta("cli-enroll-sas", &[("sas", &generated.sas)], "SAS")
+                );
+                Ok(())
+            }
             SecurityCommands::RelayRotateNodeId => {
                 if !config.relay.node_id.trim().is_empty() {
                     anyhow::bail!(

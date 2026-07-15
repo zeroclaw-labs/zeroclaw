@@ -1,14 +1,19 @@
-use crate::frontdoor_assets::{APP_JS, INDEX_HTML, SERVICE_WORKER_JS, TUNNEL_WORKER_JS};
+use crate::frontdoor_assets::{
+    APP_JS, INDEX_HTML, SERVICE_WORKER_JS, TUNNEL_WORKER_JS, WEBUI_FETCH_BRIDGE_JS,
+};
 use crate::frontdoor_tls_assets::TLS_ENGINE_JS;
 use anyhow::{Context, Result};
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::time::{Duration, timeout};
 use tokio_tungstenite::WebSocketStream;
 use zeroclaw_relay_proto::SUBPROTOCOL;
 
 const MAX_HTTP_HEAD: usize = 16 * 1024;
+const HTTP_KEEP_ALIVE_IDLE: Duration = Duration::from_secs(5);
 
 pub(crate) enum Frontdoor<S> {
     WebSocket(Box<WebSocketStream<PrefixedIo<S>>>),
@@ -19,42 +24,58 @@ pub(crate) async fn accept_or_serve<S>(mut stream: S) -> Result<Frontdoor<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let head = read_http_head(&mut stream).await?;
-    if is_websocket_upgrade(&head) {
-        let io = PrefixedIo {
-            prefix: Cursor::new(head),
-            inner: stream,
-        };
-        let ws = tokio_tungstenite::accept_hdr_async(io, select_subprotocol)
-            .await
-            .context("relay websocket handshake")?;
-        return Ok(Frontdoor::WebSocket(Box::new(ws)));
-    }
+    let mut pending = Vec::with_capacity(1024);
+    let mut head = read_http_head(&mut stream, &mut pending).await?;
+    loop {
+        if is_websocket_upgrade(&head) {
+            let mut prefix = head;
+            prefix.extend_from_slice(&pending);
+            let io = PrefixedIo {
+                prefix: Cursor::new(prefix),
+                inner: stream,
+            };
+            let ws = tokio_tungstenite::accept_hdr_async(io, select_subprotocol)
+                .await
+                .context("relay websocket handshake")?;
+            return Ok(Frontdoor::WebSocket(Box::new(ws)));
+        }
 
-    let response = response_for(&head);
-    stream.write_all(&response).await?;
+        let response = response_for(&head);
+        stream.write_all(&response).await?;
+        if should_close_after_response(&head) {
+            break;
+        }
+        match timeout(
+            HTTP_KEEP_ALIVE_IDLE,
+            read_http_head(&mut stream, &mut pending),
+        )
+        .await
+        {
+            Ok(Ok(next)) => head = next,
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
     let _ = stream.shutdown().await;
     Ok(Frontdoor::ServedHttp)
 }
 
-async fn read_http_head<S>(stream: &mut S) -> Result<Vec<u8>>
+async fn read_http_head<S>(stream: &mut S, pending: &mut Vec<u8>) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
-    let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
+        if let Some(head) = take_http_head(pending) {
+            return Ok(head);
+        }
+        if pending.len() > MAX_HTTP_HEAD {
+            anyhow::bail!("request headers too large");
+        }
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
             anyhow::bail!("connection closed before request headers");
         }
-        head.extend_from_slice(&chunk[..n]);
-        if header_end(&head).is_some() {
-            return Ok(head);
-        }
-        if head.len() > MAX_HTTP_HEAD {
-            anyhow::bail!("request headers too large");
-        }
+        pending.extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -62,6 +83,12 @@ fn header_end(head: &[u8]) -> Option<usize> {
     head.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|i| i + 4)
+}
+
+fn take_http_head(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let end = header_end(pending)?;
+    let remaining = pending.split_off(end);
+    Some(std::mem::replace(pending, remaining))
 }
 
 fn is_websocket_upgrade(head: &[u8]) -> bool {
@@ -77,11 +104,29 @@ fn is_websocket_upgrade(head: &[u8]) -> bool {
         })
 }
 
+fn should_close_after_response(head: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.lines();
+    let request = lines.next().unwrap_or_default();
+    let mut connection_close = false;
+    let mut connection_keep_alive = false;
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if !lower.starts_with("connection:") {
+            continue;
+        }
+        connection_close |= lower.contains("close");
+        connection_keep_alive |= lower.contains("keep-alive");
+    }
+    connection_close || (request.ends_with(" HTTP/1.0") && !connection_keep_alive)
+}
+
 fn response_for(head: &[u8]) -> Vec<u8> {
     let path = request_path(head).unwrap_or("/");
     match path {
         "/" | "/index.html" => http_response("200 OK", "text/html; charset=utf-8", INDEX_HTML),
         "/app.js" => http_response("200 OK", "application/javascript; charset=utf-8", APP_JS),
+        "/webui" | "/webui/" => webui_index_response(),
         "/sw.js" => http_response(
             "200 OK",
             "application/javascript; charset=utf-8",
@@ -97,6 +142,13 @@ fn response_for(head: &[u8]) -> Vec<u8> {
             "application/javascript; charset=utf-8",
             TLS_ENGINE_JS,
         ),
+        path if path.starts_with("/webui/_app/") => {
+            webui_asset_response(path.trim_start_matches("/webui/_app/"), true)
+        }
+        path if path.starts_with("/_app/") => {
+            webui_asset_response(path.trim_start_matches("/_app/"), false)
+        }
+        path if path.starts_with("/webui/") => webui_index_response(),
         _ => http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
     }
 }
@@ -106,17 +158,109 @@ fn request_path(head: &[u8]) -> Option<&str> {
     let request = text.lines().next()?;
     let mut parts = request.split_whitespace();
     match (parts.next(), parts.next()) {
-        (Some("GET"), Some(path)) => Some(path),
+        (Some("GET" | "HEAD"), Some(path)) => Some(path.split_once('?').map_or(path, |(p, _)| p)),
         _ => None,
     }
 }
 
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+    http_bytes_response(status, content_type, "no-store", body.as_bytes())
+}
+
+fn http_bytes_response(
+    status: &str,
+    content_type: &str,
+    cache_control: &str,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: {cache_control}\r\nconnection: keep-alive\r\nkeep-alive: timeout=5\r\n\r\n",
         body.len()
     )
-    .into_bytes()
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn webui_index_response() -> Vec<u8> {
+    match std::fs::read_to_string(web_dist_dir().join("index.html")) {
+        Ok(html) => {
+            let script = format!(
+                r#"<script>window.__ZEROCLAW_BASE__="/webui";</script><script>{WEBUI_FETCH_BRIDGE_JS}</script>"#
+            );
+            let html = html
+                .replace("/_app/", "/webui/_app/")
+                .replace("<head>", &format!("<head>{script}"));
+            http_response("200 OK", "text/html; charset=utf-8", &html)
+        }
+        Err(_) => http_response(
+            "503 Service Unavailable",
+            "text/plain; charset=utf-8",
+            "ZeroClaw WebUI assets are not available; build web/dist first.\n",
+        ),
+    }
+}
+
+fn webui_asset_response(path: &str, rewrite_base: bool) -> Vec<u8> {
+    if path.contains("..") || path.starts_with('/') {
+        return http_response(
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            "invalid path\n",
+        );
+    }
+    match std::fs::read(web_dist_dir().join(path)) {
+        Ok(bytes) => {
+            let bytes = if rewrite_base && rewritable_webui_asset(path) {
+                match String::from_utf8(bytes) {
+                    Ok(text) => rewrite_webui_asset_base(&text).into_bytes(),
+                    Err(error) => error.into_bytes(),
+                }
+            } else {
+                bytes
+            };
+            let cache = if path.contains("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            http_bytes_response("200 OK", content_type_for(path), cache, &bytes)
+        }
+        Err(_) => http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
+    }
+}
+
+fn rewritable_webui_asset(path: &str) -> bool {
+    matches!(
+        path.rsplit_once('.').map(|(_, ext)| ext),
+        Some("css" | "html" | "js" | "json")
+    )
+}
+
+fn rewrite_webui_asset_base(text: &str) -> String {
+    text.replace("return`/_app/`+", "return`/webui/_app/`+")
+        .replace("return\"/_app/\"+", "return\"/webui/_app/\"+")
+        .replace("return'/_app/'+", "return'/webui/_app/'+")
+}
+
+fn web_dist_dir() -> PathBuf {
+    std::env::var_os("ZEROCLAW_WEB_DIST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist"))
+}
+
+fn content_type_for(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("xml") => "application/xml; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -201,6 +345,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pipelined_request_heads_are_split_without_dropping_overflow() {
+        let mut pending =
+            b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\nGET /sw.js HTTP/1.1\r\nHost: x\r\n\r\n"
+                .to_vec();
+        let first = take_http_head(&mut pending).expect("first request");
+        let second = take_http_head(&mut pending).expect("second request");
+        assert_eq!(first, b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(second, b"GET /sw.js HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn websocket_upgrade_is_detected() {
         let head = b"GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_websocket_upgrade(head));
@@ -213,9 +369,11 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains("ZeroClaw Relay"));
         assert!(text.contains("/app.js"));
+        assert!(text.contains("[hidden] { display: none !important; }"));
         assert!(text.contains("sas-panel"));
-        assert!(text.contains("chat-panel"));
-        assert!(text.contains("messages"));
+        assert!(text.contains("webui-panel"));
+        assert!(text.contains("body.webui-active"));
+        assert!(text.contains("webui-frame"));
     }
 
     #[test]
@@ -228,13 +386,104 @@ mod tests {
         assert!(text.contains("tls-engine-missing"));
         assert!(text.contains("zeroclaw-rpc-request"));
         assert!(text.contains("tunnel.postMessage(msg, transfers)"));
+        assert!(text.contains("window.addEventListener('message'"));
+        assert!(text.contains("showWebUi"));
+        assert!(text.contains("seedRelayWebUiAuth"));
+        assert!(text.contains("zeroclaw_relay_last_connection"));
+        assert!(text.contains("restoreSavedConnection"));
+        assert!(text.contains("resumeConnection"));
+        assert!(text.contains("resume-missing"));
+        assert!(text.contains("__ZEROCLAW_RELAY_APP_READY"));
+        assert!(text.contains("relayWebUiToken"));
+        assert!(text.contains("localStorage.setItem('zeroclaw_token'"));
+        assert!(text.contains("relay-mtls."));
+        assert!(!text.contains("relay-mtls:"));
+        assert!(text.contains("zeroclaw-rpc-notification"));
+        assert!(text.contains("Secure tunnel ready. Opening WebUI."));
+        assert!(text.contains("document.body.classList.add('webui-active')"));
+        assert!(text.contains("document.body.classList.remove('webui-active')"));
+        assert!(text.contains("webuiFrame.src = '/webui/'"));
         assert!(text.contains("confirmEnrollment"));
         assert!(text.contains("abortEnrollment"));
         assert!(text.contains("rpc-ready"));
+        assert!(!text.contains("chat-panel"));
+    }
+
+    #[test]
+    fn webui_route_serves_remote_dashboard() {
+        let resp = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"));
+        assert!(text.contains("<title>ZeroClaw</title>"));
+        assert!(text.contains(r#"window.__ZEROCLAW_BASE__="/webui""#));
+        assert!(text.contains("__ZEROCLAW_RELAY_FETCH_BRIDGE__"));
+        assert!(text.contains("window.fetch = async"));
+        assert!(text.contains("window.WebSocket = RelayWebSocket"));
+        assert!(text.contains("class RelayChatSocket"));
         assert!(text.contains("session/new"));
         assert!(text.contains("session/prompt"));
         assert!(text.contains("session/approve"));
-        assert!(text.contains("session/update"));
+        assert!(text.contains("zeroclaw-rpc-notification"));
+        assert!(text.contains("window.parent.postMessage(msg, location.origin"));
+        assert!(
+            text.contains("relay webui bridge currently supports read-only dashboard requests")
+        );
+        assert!(text.contains("/webui/_app/assets/"));
+        assert!(!text.contains("Relay service worker is not controlling this page"));
+    }
+
+    #[test]
+    fn webui_asset_route_serves_dashboard_assets() {
+        let index = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let text = String::from_utf8(index).unwrap();
+        let asset = text
+            .split("/webui/_app/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("dashboard index must reference a rewritten asset");
+        let request = format!("GET /webui/_app/{asset} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let resp = response_for(request.as_bytes());
+        assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let head_end = header_end(&resp).expect("response should include an HTTP header");
+        let headers = String::from_utf8(resp[..head_end].to_vec()).unwrap();
+        assert!(headers.contains("content-type: "));
+        assert!(headers.contains("content-length: "));
+    }
+
+    #[test]
+    fn head_webui_asset_route_uses_requested_path() {
+        let index = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let text = String::from_utf8(index).unwrap();
+        let asset = text
+            .split("/webui/_app/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("dashboard index must reference a rewritten asset");
+        let request = format!("HEAD /_app/{asset} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let resp = response_for(request.as_bytes());
+        let head_end = header_end(&resp).expect("response should include an HTTP header");
+        let headers = String::from_utf8(resp[..head_end].to_vec()).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(!headers.contains("content-type: text/html"));
+    }
+
+    #[test]
+    fn webui_javascript_assets_rewrite_absolute_app_base() {
+        let index = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let text = String::from_utf8(index).unwrap();
+        let asset = text
+            .split("src=\"/webui/_app/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("dashboard index must reference the rewritten entry script");
+        let request = format!("GET /webui/_app/{asset} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let resp = response_for(request.as_bytes());
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"));
+        assert!(text.contains("return`/webui/_app/`+"));
+        assert!(!text.contains("return`/_app/`+"));
+        assert!(text.contains("/_app/logo.png"));
+        assert!(!text.contains("/webui/_app/logo.png"));
     }
 
     #[test]
@@ -244,6 +493,15 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains("zeroclaw-relay-worker-ready"));
         assert!(text.contains("proxyRpc(event)"));
+        assert!(text.contains("proxyGatewayApi(event"));
+        assert!(text.contains("normalizedApiPath"));
+        assert!(text.contains("/api/events"));
+        assert!(text.contains("dashboardStatus"));
+        assert!(text.contains("publicHealth"));
+        assert!(text.contains("config/map-keys"));
+        assert!(text.contains("config/reload-status"));
+        assert!(text.contains("config/drift"));
+        assert!(text.contains("quickstart/state"));
         assert!(text.contains("new MessageChannel()"));
         assert!(text.contains("zeroclaw-rpc-request"));
         assert!(text.contains("Secure browser TLS enrollment is unavailable in this build"));
@@ -258,6 +516,10 @@ mod tests {
         let text = String::from_utf8(resp).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains("connectEnrollment"));
+        assert!(text.contains("resumeConnection"));
+        assert!(text.contains("loadCompletedEnrollment"));
+        assert!(text.contains("isCompletedEnrollment"));
+        assert!(text.contains("No saved browser certificate found"));
         assert!(text.contains("importScripts('/tls-engine.js')"));
         assert!(text.contains("ensureEnrollmentMaterial"));
         assert!(text.contains("createCertificationRequest"));
@@ -282,6 +544,11 @@ mod tests {
         assert!(text.contains("storeCompletedEnrollment"));
         assert!(text.contains("material = { ...material, relayUrl, nodeId, pairingCode }"));
         assert!(text.contains("connectRpcTunnel"));
+        assert!(text.contains("self.postMessage({ type: 'rpc-ready', nodeId })"));
+        assert!(text.contains("resolveRelayUrl"));
+        assert!(text.contains("profile.relayUrl || profile.relayProfile?.relay_url"));
+        assert!(text.contains("normalizeRelayWebSocketUrl"));
+        assert!(text.contains("new URL(relayUrl, self.location.origin)"));
         assert!(text.contains("singleCertificateFingerprintHex"));
         assert!(
             text.contains("enrollment response must contain exactly one daemon CA certificate")

@@ -249,6 +249,7 @@ async fn enrollment_post_round_trips_through_relay_route() {
         static_client_pins_configured: false,
         allow_unpaired_until: None,
         relay_profile: zeroclaw_runtime::enroll::RelayProfile::default(),
+        paircode_admin_data_dir: None,
     });
     let enroll_ledger = enroll_server.ledger.clone();
     let enroll_task = tokio::spawn(zeroclaw_runtime::enroll::serve_on(

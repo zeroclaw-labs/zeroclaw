@@ -7,7 +7,14 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
   <style>
     :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; display: grid; place-items: start center; padding: 32px 0; background: #f7f8fa; color: #17191c; }
+    [hidden] { display: none !important; }
     main { width: min(760px, calc(100vw - 32px)); display: grid; gap: 18px; }
+    main.webui-active { width: min(1180px, calc(100vw - 32px)); }
+    body.webui-active { display: block; padding: 0; background: #05070c; }
+    body.webui-active main { width: 100%; min-height: 100vh; gap: 0; }
+    body.webui-active h1, body.webui-active output, body.webui-active .webui-head { display: none; }
+    body.webui-active .webui { gap: 0; }
+    body.webui-active .webui iframe { min-height: 100vh; height: 100vh; border: 0; border-radius: 0; }
     h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: 0; }
     form { display: grid; gap: 12px; }
     label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
@@ -20,17 +27,14 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
     .sas { display: grid; gap: 10px; }
     .sas code { font: 700 24px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0; }
     .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .chat { display: grid; gap: 12px; }
-    .messages { min-height: 180px; max-height: 420px; overflow: auto; display: grid; align-content: start; gap: 10px; border: 1px solid #d9dde4; border-radius: 6px; padding: 12px; background: #fff; }
-    .msg { display: grid; gap: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.45; }
-    .role { font-size: 11px; font-weight: 800; letter-spacing: 0; text-transform: uppercase; color: #606a78; }
-    .approval { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .approval button { height: 34px; padding: 0 12px; }
+    .webui { display: grid; gap: 10px; }
+    .webui-head { display: flex; align-items: center; justify-content: space-between; color: #4d5663; font-size: 13px; font-weight: 700; }
+    .webui iframe { width: 100%; min-height: min(760px, calc(100vh - 170px)); border: 1px solid #d9dde4; border-radius: 6px; background: #fff; }
     output { min-height: 22px; font-size: 13px; color: #4d5663; }
     @media (prefers-color-scheme: dark) {
       body { background: #111316; color: #f3f5f7; }
-      input, textarea, .messages { background: #191d22; color: #f3f5f7; border-color: #343b45; }
-      .role { color: #b6beca; }
+      input, textarea, .webui iframe { background: #191d22; color: #f3f5f7; border-color: #343b45; }
+      .webui-head { color: #b6beca; }
       output { color: #b6beca; }
     }
   </style>
@@ -50,13 +54,12 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
         <button id="sas-abort" class="secondary" type="button">Abort</button>
       </div>
     </section>
-    <section id="chat-panel" class="chat" hidden>
-      <form id="chat">
-        <label>Agent <input id="agent-alias" autocomplete="off" spellcheck="false" value="default"></label>
-        <label>Message <textarea id="prompt" autocomplete="off" spellcheck="true" required></textarea></label>
-        <button id="send" type="submit">Send</button>
-      </form>
-      <div id="messages" class="messages" aria-live="polite"></div>
+    <section id="webui-panel" class="webui" hidden>
+      <div class="webui-head">
+        <span>Remote WebUI</span>
+        <span id="webui-state">Starting</span>
+      </div>
+      <iframe id="webui-frame" title="ZeroClaw WebUI" src="about:blank"></iframe>
     </section>
     <output id="status">Disconnected</output>
   </main>
@@ -66,26 +69,21 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
 "#;
 
 pub(crate) const APP_JS: &str = r#"const form = document.getElementById('pair');
+const main = document.querySelector('main');
 const status = document.getElementById('status');
 const button = document.getElementById('connect');
 const sasPanel = document.getElementById('sas-panel');
 const sasCode = document.getElementById('sas-code');
 const sasConfirm = document.getElementById('sas-confirm');
 const sasAbort = document.getElementById('sas-abort');
-const chatPanel = document.getElementById('chat-panel');
-const chatForm = document.getElementById('chat');
-const sendButton = document.getElementById('send');
-const promptInput = document.getElementById('prompt');
-const agentAliasInput = document.getElementById('agent-alias');
-const messages = document.getElementById('messages');
+const webuiPanel = document.getElementById('webui-panel');
+const webuiFrame = document.getElementById('webui-frame');
+const webuiState = document.getElementById('webui-state');
 const tunnel = new Worker('/tunnel-worker.js');
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-
-let rpcSeq = 1;
-let sessionId = null;
-let currentAssistant = null;
-let turnInFlight = false;
+const SAVED_CONNECTION_KEY = 'zeroclaw_relay_last_connection';
+let activeNodeId = '';
+let openingWebUi = null;
+let attemptedAutoResume = false;
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(async () => {
@@ -107,18 +105,27 @@ if ('serviceWorker' in navigator) {
     if (msg.type !== 'zeroclaw-rpc-request' || !event.ports?.length) {
       return;
     }
-    const transfers = [...event.ports];
-    if (msg.body instanceof ArrayBuffer) {
-      transfers.push(msg.body);
-    }
-    tunnel.postMessage(msg, transfers);
+    forwardToTunnel(msg, event.ports);
   });
 }
+
+window.addEventListener('message', (event) => {
+  if (event.origin !== location.origin) {
+    return;
+  }
+  const msg = event.data || {};
+  if (msg.type !== 'zeroclaw-rpc-request' || !event.ports?.length) {
+    return;
+  }
+  forwardToTunnel(msg, event.ports);
+});
 
 tunnel.addEventListener('message', (event) => {
   const msg = event.data || {};
   if (msg.type === 'connecting') {
     status.textContent = 'Preparing client key';
+  } else if (msg.type === 'resuming') {
+    status.textContent = `Restoring saved connection to ${msg.nodeId || 'the daemon'}.`;
   } else if (msg.type === 'enrollment-material-ready') {
     status.textContent = 'Client key and CSR ready. Opening enrollment route.';
   } else if (msg.type === 'route-open') {
@@ -132,19 +139,30 @@ tunnel.addEventListener('message', (event) => {
   } else if (msg.type === 'enrollment-complete') {
     sasPanel.hidden = true;
     status.textContent = `Enrolled as ${msg.deviceId || 'this browser'}.`;
+    rememberConnection(activeNodeId);
     button.disabled = false;
   } else if (msg.type === 'rpc-ready') {
-    status.textContent = 'Secure tunnel ready. Choose an agent and send a message.';
-    chatPanel.hidden = false;
-    sendButton.disabled = false;
+    if (msg.nodeId) {
+      activeNodeId = msg.nodeId;
+      rememberConnection(msg.nodeId);
+    }
+    status.textContent = 'Secure tunnel ready. Opening WebUI.';
+    showWebUi();
   } else if (msg.type === 'rpc-notification') {
-    handleRpcNotification(msg);
+    webuiFrame?.contentWindow?.postMessage({
+      type: 'zeroclaw-rpc-notification',
+      method: msg.method,
+      params: msg.params || null
+    }, location.origin);
   } else if (msg.type === 'rpc-closed') {
     status.textContent = msg.reason || 'Secure tunnel closed.';
-    sendButton.disabled = true;
+    if (webuiState) webuiState.textContent = 'Disconnected';
   } else if (msg.type === 'enrollment-aborted') {
     sasPanel.hidden = true;
     status.textContent = msg.reason || 'Enrollment aborted';
+    button.disabled = false;
+  } else if (msg.type === 'resume-missing') {
+    status.textContent = msg.reason || 'No saved browser certificate found. Pair once to connect.';
     button.disabled = false;
   } else if (msg.type === 'tls-engine-missing') {
     status.textContent = msg.reason || 'Secure browser enrollment is unavailable in this build.';
@@ -164,16 +182,12 @@ form.addEventListener('submit', (event) => {
   const pairingCode = document.getElementById('pairing-code').value.trim();
   if (!nodeId || !pairingCode) return;
 
+  activeNodeId = nodeId;
   button.disabled = true;
-  sendButton.disabled = true;
   sasPanel.hidden = true;
   sasConfirm.disabled = true;
   sasAbort.disabled = true;
-  chatPanel.hidden = true;
-  messages.replaceChildren();
-  sessionId = null;
-  currentAssistant = null;
-  turnInFlight = false;
+  resetWebUi();
   status.textContent = 'Preparing client key';
 
   tunnel.postMessage({
@@ -202,197 +216,113 @@ sasAbort.addEventListener('click', () => {
   tunnel.postMessage({ type: 'abortEnrollment' });
 });
 
-chatForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const prompt = promptInput.value.trim();
-  if (!prompt || turnInFlight) {
-    return;
-  }
-  promptInput.value = '';
-  appendMessage('You', prompt);
-  currentAssistant = null;
-  turnInFlight = true;
-  sendButton.disabled = true;
-  status.textContent = 'Sending prompt';
-  try {
-    const session = await ensureSession();
-    await rpcCall('session/prompt', {
-      session_id: session.session_id,
-      prompt,
-      attachments: []
+window.__ZEROCLAW_RELAY_APP_READY = true;
+restoreSavedConnection();
+
+function showWebUi() {
+  if (!openingWebUi) {
+    openingWebUi = openWebUi().finally(() => {
+      openingWebUi = null;
     });
-    status.textContent = 'Waiting for daemon';
-  } catch (error) {
-    turnInFlight = false;
-    sendButton.disabled = false;
-    status.textContent = error?.message || 'Prompt failed';
-    appendMessage('System', status.textContent);
   }
-});
-
-async function ensureSession() {
-  if (sessionId) {
-    return { session_id: sessionId };
-  }
-  const agent = agentAliasInput.value.trim() || 'default';
-  const result = await rpcCall('session/new', {
-    agent_alias: agent,
-    chat_mode: 'chat'
-  });
-  sessionId = result.session_id;
-  agentAliasInput.disabled = true;
-  appendMessage('System', `Session ready for agent ${result.agent_alias || agent}.`);
-  return result;
 }
 
-function rpcCall(method, params = null) {
-  return new Promise((resolve, reject) => {
-    const id = rpcSeq++;
-    const channel = new MessageChannel();
-    const timeout = setTimeout(() => {
-      channel.port1.close();
-      reject(new Error('browser RPC request timed out'));
-    }, 60000);
-    channel.port1.onmessage = (event) => {
-      clearTimeout(timeout);
-      channel.port1.close();
-      const msg = event.data || {};
-      if (!msg.ok) {
-        reject(new Error(msg.error || 'browser RPC request failed'));
-        return;
-      }
-      try {
-        const body = msg.body ? decoder.decode(toUint8(msg.body)) : '{}';
-        const parsed = JSON.parse(body || '{}');
-        if (parsed.error) {
-          reject(new Error(parsed.error.message || 'RPC error'));
-        } else {
-          resolve(parsed.result);
-        }
-      } catch (error) {
-        reject(error);
-      }
-    };
-    channel.port1.start();
+async function openWebUi() {
+  seedRelayWebUiAuth();
+  status.textContent = 'Secure tunnel ready. Opening WebUI.';
+  form.hidden = true;
+  sasPanel.hidden = true;
+  webuiPanel.hidden = false;
+  document.body.classList.add('webui-active');
+  main?.classList.add('webui-active');
+  if (webuiState) webuiState.textContent = 'Connected';
+  if (!webuiFrame.src || webuiFrame.src === 'about:blank') {
+    webuiFrame.src = '/webui/';
+  }
+}
 
-    const bytes = encoder.encode(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
-    const body = bytes.buffer;
-    tunnel.postMessage({
-      type: 'zeroclaw-rpc-request',
-      method: 'POST',
-      url: '/__zeroclaw/rpc',
-      headers: [['content-type', 'application/json']],
-      body
-    }, [channel.port2, body]);
+function resetWebUi() {
+  webuiPanel.hidden = true;
+  document.body.classList.remove('webui-active');
+  main?.classList.remove('webui-active');
+  if (webuiState) webuiState.textContent = 'Starting';
+  if (webuiFrame.src && webuiFrame.src !== 'about:blank') {
+    webuiFrame.src = 'about:blank';
+  }
+}
+
+function seedRelayWebUiAuth() {
+  try {
+    localStorage.setItem('zeroclaw_token', relayWebUiToken(activeNodeId || 'browser'));
+  } catch (_) {}
+}
+
+function restoreSavedConnection() {
+  if (attemptedAutoResume) {
+    return;
+  }
+  attemptedAutoResume = true;
+  const saved = readSavedConnection();
+  if (!saved?.nodeId) {
+    return;
+  }
+  activeNodeId = saved.nodeId;
+  const serverInput = document.getElementById('server-id');
+  if (serverInput && !serverInput.value) {
+    serverInput.value = saved.nodeId;
+  }
+  button.disabled = true;
+  sasPanel.hidden = true;
+  resetWebUi();
+  status.textContent = `Restoring saved connection to ${saved.nodeId}.`;
+  tunnel.postMessage({
+    type: 'resumeConnection',
+    nodeId: saved.nodeId,
+    relayUrl: `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/relay`
   });
 }
 
-function handleRpcNotification(msg) {
-  if (msg.method !== 'session/update') {
+function rememberConnection(nodeId) {
+  const cleanNodeId = String(nodeId || '').trim();
+  if (!cleanNodeId) {
     return;
   }
-  const params = msg.params || {};
-  if (sessionId && params.session_id && params.session_id !== sessionId) {
-    return;
-  }
-  if (params.type === 'agent_message_chunk') {
-    appendAssistantChunk(params.text || '');
-  } else if (params.type === 'agent_thought_chunk') {
-    appendMessage('Thought', params.text || '');
-  } else if (params.type === 'tool_call') {
-    appendMessage('Tool', `${params.name || 'tool'} called`);
-  } else if (params.type === 'tool_result') {
-    appendMessage('Tool', `${params.name || 'tool'} returned`);
-  } else if (params.type === 'approval_request') {
-    appendApproval(params);
-  } else if (params.type === 'turn_complete') {
-    if (!currentAssistant && params.content) {
-      appendMessage('ZeroClaw', params.content);
+  try {
+    localStorage.setItem(SAVED_CONNECTION_KEY, JSON.stringify({
+      nodeId: cleanNodeId,
+      savedAt: new Date().toISOString()
+    }));
+  } catch (_) {}
+}
+
+function readSavedConnection() {
+  try {
+    const raw = localStorage.getItem(SAVED_CONNECTION_KEY);
+    if (!raw) {
+      return null;
     }
-    currentAssistant = null;
-    turnInFlight = false;
-    sendButton.disabled = false;
-    status.textContent = params.outcome === 'completed'
-      ? 'Ready'
-      : `Turn ${params.outcome || 'finished'}`;
-  } else if (params.type === 'history_trimmed') {
-    appendMessage('System', params.reason || 'Conversation history was trimmed.');
+    const parsed = JSON.parse(raw);
+    const nodeId = String(parsed?.nodeId || '').trim();
+    return nodeId ? { nodeId } : null;
+  } catch (_) {
+    return null;
   }
 }
 
-function appendAssistantChunk(text) {
-  if (!currentAssistant) {
-    currentAssistant = appendMessage('ZeroClaw', '');
-  }
-  const body = currentAssistant.querySelector('.body');
-  body.textContent += text;
-  scrollMessages();
+function relayWebUiToken(nodeId) {
+  const clean = String(nodeId || 'browser')
+    .replace(/[^A-Za-z0-9!#$%&'*+\-.^_`|~]/g, '.')
+    .replace(/\.+/g, '.')
+    .replace(/^\.+|\.+$/g, '');
+  return `relay-mtls.${clean || 'browser'}`;
 }
 
-function appendApproval(params) {
-  const node = appendMessage(
-    'Approval',
-    `${params.tool_name || 'tool'}: ${params.arguments_summary || ''}`
-  );
-  const row = document.createElement('div');
-  row.className = 'approval';
-  const allow = document.createElement('button');
-  allow.type = 'button';
-  allow.textContent = 'Allow';
-  const deny = document.createElement('button');
-  deny.type = 'button';
-  deny.className = 'secondary';
-  deny.textContent = 'Deny';
-  row.append(allow, deny);
-  node.append(row);
-  const decide = async (decision) => {
-    allow.disabled = true;
-    deny.disabled = true;
-    try {
-      await rpcCall('session/approve', {
-        session_id: params.session_id,
-        request_id: params.request_id,
-        decision
-      });
-      appendMessage('System', `Approval ${decision}.`);
-    } catch (error) {
-      appendMessage('System', error?.message || 'Approval failed');
-    }
-  };
-  allow.addEventListener('click', () => decide('allow_once'));
-  deny.addEventListener('click', () => decide('reject'));
-}
-
-function appendMessage(role, text) {
-  const node = document.createElement('div');
-  node.className = 'msg';
-  const label = document.createElement('div');
-  label.className = 'role';
-  label.textContent = role;
-  const body = document.createElement('div');
-  body.className = 'body';
-  body.textContent = text;
-  node.append(label, body);
-  messages.append(node);
-  scrollMessages();
-  return node;
-}
-
-function scrollMessages() {
-  messages.scrollTop = messages.scrollHeight;
-}
-
-function toUint8(value) {
-  if (value instanceof Uint8Array) {
-    return value;
+function forwardToTunnel(msg, ports = []) {
+  const transfers = [...ports];
+  if (msg.body instanceof ArrayBuffer) {
+    transfers.push(msg.body);
   }
-  if (value instanceof ArrayBuffer) {
-    return new Uint8Array(value);
-  }
-  if (ArrayBuffer.isView(value)) {
-    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  }
-  return new Uint8Array(0);
+  tunnel.postMessage(msg, transfers);
 }
 "#;
 
@@ -403,6 +333,18 @@ pub(crate) const SERVICE_WORKER_JS: &str = r#"self.addEventListener('install', (
 const RPC_TIMEOUT_MS = 15000;
 const TLS_ENGINE_UNAVAILABLE =
   'Secure browser TLS enrollment is unavailable in this build.';
+const ZERO_COST = {
+  session_cost_usd: 0,
+  daily_cost_usd: 0,
+  monthly_cost_usd: 0,
+  total_tokens: 0,
+  request_count: 0,
+  by_model: {},
+  by_agent: {}
+};
+
+let rpcSeq = 1;
+let initializePromise = null;
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
@@ -410,16 +352,17 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
+  const apiPath = normalizedApiPath(url.pathname);
   if (url.pathname === '/__zeroclaw/tunnel/state') {
-    event.respondWith(new Response(JSON.stringify({
+    event.respondWith(jsonResponse({
       ready: true,
       enrollmentTls: true,
       mtlsEngine: true
-    }), {
-      headers: { 'content-type': 'application/json' }
     }));
   } else if (url.pathname === '/__zeroclaw/rpc') {
     event.respondWith(proxyRpc(event));
+  } else if (apiPath || url.pathname === '/health' || url.pathname === '/webui/health') {
+    event.respondWith(proxyGatewayApi(event, apiPath || '/health'));
   }
 });
 
@@ -427,12 +370,237 @@ self.addEventListener('message', (event) => {
   event.source?.postMessage({ type: 'zeroclaw-relay-worker-ready' });
 });
 
-async function proxyRpc(event) {
-  const client = event.clientId ? await self.clients.get(event.clientId) : null;
-  if (!client) {
-    return unavailable('no controlled browser client is available');
+function normalizedApiPath(pathname) {
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    return pathname;
   }
+  if (pathname === '/webui/api' || pathname.startsWith('/webui/api/')) {
+    return pathname.slice('/webui'.length);
+  }
+  return null;
+}
 
+async function proxyGatewayApi(event, apiPath) {
+  if (event.request.method !== 'GET') {
+    return jsonResponse({ error: 'relay webui bridge currently supports read-only dashboard requests' }, 405);
+  }
+  const url = new URL(event.request.url);
+  try {
+    await ensureInitialized();
+    switch (apiPath) {
+      case '/health':
+        return jsonResponse(await publicHealth());
+      case '/api/health':
+        return jsonResponse(await rpcCall('health'));
+      case '/api/status':
+        return jsonResponse(await dashboardStatus(url));
+      case '/api/events':
+        return emptyEventStream();
+      case '/api/tuis':
+        return jsonResponse(await rpcOr('tui/list', null, { tuis: [] }));
+      case '/api/cost':
+        return jsonResponse(await rpcOr('cost/query', costParams(url), ZERO_COST));
+      case '/api/sessions':
+        return jsonResponse(await rpcOr('session/list', {}, { sessions: [] }));
+      case '/api/channels':
+        return jsonResponse({ channels: [] });
+      case '/api/memory':
+        return jsonResponse(await memoryResponse(url));
+      case '/api/logs':
+        return jsonResponse(await rpcOr('logs/query', logsParams(url), { events: [], at_end: true, next_cursor: null, next_cursor_line_offset: null }));
+      case '/api/config/status':
+        return jsonResponse(await rpcOr('config/status', null, {
+          needs_quickstart: false,
+          reason: '',
+          has_partial_state: false,
+          missing: []
+        }));
+      case '/api/config/reload-status':
+        return jsonResponse(await configReloadStatus());
+      case '/api/config/drift':
+        return jsonResponse(await configDrift());
+      case '/api/config/sections':
+        return jsonResponse(await rpcOr('config/sections', null, { sections: [] }));
+      case '/api/config/map-keys':
+        return jsonResponse(await rpcCall('config/map-keys', { path: url.searchParams.get('path') || '' }));
+      case '/api/config/list':
+        return jsonResponse(await rpcCall('config/list', { prefix: url.searchParams.get('prefix') || null }));
+      case '/api/quickstart/state':
+        return jsonResponse(await rpcOr('quickstart/state', null, {
+          quickstart_completed: false,
+          agents: [],
+          risk_profiles: [],
+          runtime_profiles: [],
+          model_providers: [],
+          channels: [],
+          unassigned_channels: [],
+          storage: [],
+          model_provider_types: [],
+          channel_types: [],
+          risk_presets: [],
+          runtime_presets: [],
+          memory_kinds: [],
+          personality_files: []
+        }));
+      case '/api/cron':
+        return jsonResponse(await rpcOr('cron/list', null, { jobs: [] }));
+      case '/api/cli-tools':
+        return jsonResponse({ cli_tools: [] });
+      case '/api/tools':
+        return jsonResponse({ tools: [] });
+      default:
+        return jsonResponse({ error: 'relay webui bridge has no mapping for this route', path: apiPath }, 404);
+    }
+  } catch (error) {
+    return jsonResponse({ error: error?.message || TLS_ENGINE_UNAVAILABLE }, 503);
+  }
+}
+
+async function dashboardStatus(url) {
+  const [status, health] = await Promise.all([
+    rpcCall('status'),
+    rpcOr('health', null, {})
+  ]);
+  const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+  return {
+    version: status.server_version,
+    model_provider: null,
+    model: '',
+    temperature: 0,
+    uptime_seconds: Number(health.uptime_seconds || 0),
+    daemon_started_at: health.updated_at || new Date().toISOString(),
+    gateway_port: port,
+    locale: 'en',
+    memory_backend: '',
+    paired: true,
+    channels: {},
+    health,
+    process: health.process || {
+      rss_bytes: 0,
+      system_ram_total_bytes: 0,
+      cpu_percent: null,
+      num_cpus: 0
+    }
+  };
+}
+
+async function publicHealth() {
+  const health = await rpcOr('health', null, {});
+  return {
+    ...health,
+    require_pairing: false,
+    paired: true
+  };
+}
+
+async function configReloadStatus() {
+  const status = await rpcOr('config/reload-status', null, { pending_reload: false });
+  return {
+    pending_reload: Boolean(status?.pending_reload)
+  };
+}
+
+async function configDrift() {
+  const drift = await rpcOr('config/drift', null, { drifted: [] });
+  if (Array.isArray(drift?.drifted)) {
+    return { drifted: drift.drifted };
+  }
+  return { drifted: [] };
+}
+
+function costParams(url) {
+  return {
+    agent: url.searchParams.get('agent') || null,
+    from: url.searchParams.get('from') || null,
+    to: url.searchParams.get('to') || null
+  };
+}
+
+function logsParams(url) {
+  const limit = Number(url.searchParams.get('limit') || '50');
+  return {
+    since_ts: url.searchParams.get('since_ts') || null,
+    until_ts: url.searchParams.get('until_ts') || null,
+    until_id: url.searchParams.get('until_id') || null,
+    until_line_offset: optionalNumber(url.searchParams.get('until_line_offset')),
+    severity_min: optionalNumber(url.searchParams.get('severity_min')),
+    q: url.searchParams.get('q') || null,
+    category: url.searchParams.get('category') || null,
+    action: url.searchParams.get('action') || null,
+    outcome: url.searchParams.get('outcome') || null,
+    trace_id: url.searchParams.get('trace_id') || null,
+    hide_internal: url.searchParams.get('hide_internal') === 'true',
+    limit: Number.isFinite(limit) ? limit : 50
+  };
+}
+
+async function memoryResponse(url) {
+  const query = url.searchParams.get('query');
+  if (query) {
+    return rpcOr('memory/search', {
+      query,
+      limit: 100,
+      agent: url.searchParams.get('agent') || null
+    }, { entries: [], count: 0 });
+  }
+  return rpcOr('memory/list', {
+    category: url.searchParams.get('category') || null,
+    agent: url.searchParams.get('agent') || null
+  }, { entries: [], count: 0 });
+}
+
+function optionalNumber(value) {
+  if (value === null || value === '') {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function ensureInitialized() {
+  if (!initializePromise) {
+    initializePromise = rpcCall('initialize', {
+      protocol_version: 1,
+      clientCapabilities: { elicitation: {} }
+    }).catch((error) => {
+      initializePromise = null;
+      throw error;
+    });
+  }
+  return initializePromise;
+}
+
+async function rpcOr(method, params, fallback) {
+  try {
+    return await rpcCall(method, params);
+  } catch (_) {
+    return fallback;
+  }
+}
+
+async function rpcCall(method, params = null) {
+  const id = rpcSeq++;
+  const bytes = new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  const body = bytes.buffer;
+  const msg = await dispatchToRelayShell({
+    type: 'zeroclaw-rpc-request',
+    method: 'POST',
+    url: '/__zeroclaw/rpc',
+    headers: [['content-type', 'application/json']],
+    body
+  }, body);
+  if (!msg?.ok) {
+    throw new Error(msg?.error || 'browser tunnel request failed');
+  }
+  const text = msg.body ? new TextDecoder().decode(toUint8(msg.body)) : '{}';
+  const parsed = JSON.parse(text || '{}');
+  if (parsed.error) {
+    throw new Error(parsed.error.message || 'RPC error');
+  }
+  return parsed.result;
+}
+
+async function proxyRpc(event) {
   let body = null;
   try {
     body = await requestBody(event.request);
@@ -441,6 +609,22 @@ async function proxyRpc(event) {
   }
 
   const url = new URL(event.request.url);
+  const msg = await dispatchToRelayShell({
+    type: 'zeroclaw-rpc-request',
+    method: event.request.method,
+    url: `${url.pathname}${url.search}`,
+    headers: Array.from(event.request.headers.entries()),
+    body
+  }, body);
+  return responseFromRpcMessage(msg);
+}
+
+async function dispatchToRelayShell(msg, body) {
+  const client = await relayShellClient();
+  if (!client) {
+    throw new Error('relay pairing shell is not available');
+  }
+
   const channel = new MessageChannel();
   let timeout = null;
   const reply = new Promise((resolve) => {
@@ -460,13 +644,6 @@ async function proxyRpc(event) {
     channel.port1.start();
   });
 
-  const msg = {
-    type: 'zeroclaw-rpc-request',
-    method: event.request.method,
-    url: `${url.pathname}${url.search}`,
-    headers: Array.from(event.request.headers.entries()),
-    body
-  };
   const transfers = [channel.port2];
   if (body) {
     transfers.push(body);
@@ -478,10 +655,17 @@ async function proxyRpc(event) {
       clearTimeout(timeout);
     }
     channel.port1.close();
-    return unavailable('could not dispatch browser tunnel request');
+    throw new Error('could not dispatch browser tunnel request');
   }
+  return reply;
+}
 
-  return responseFromRpcMessage(await reply);
+async function relayShellClient() {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return clients.find((client) => {
+    const path = new URL(client.url).pathname;
+    return path === '/' || path === '/index.html';
+  }) || null;
 }
 
 function requestBody(request) {
@@ -502,12 +686,717 @@ function responseFromRpcMessage(msg) {
 }
 
 function unavailable(error, status = 503) {
-  return new Response(JSON.stringify({ error }), {
+  return jsonResponse({ error }, status);
+}
+
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), {
     status,
     headers: { 'content-type': 'application/json' }
   });
 }
+
+function emptyEventStream() {
+  return new Response(': relay bridge event stream ready\n\n', {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-store',
+      'connection': 'keep-alive'
+    }
+  });
+}
+
+function toUint8(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return new Uint8Array(0);
+}
 "#;
+
+pub(crate) const WEBUI_FETCH_BRIDGE_JS: &str = r#"(() => {
+  if (window.__ZEROCLAW_RELAY_FETCH_BRIDGE__) {
+    return;
+  }
+  window.__ZEROCLAW_RELAY_FETCH_BRIDGE__ = true;
+
+  const RPC_TIMEOUT_MS = 15000;
+  const ZERO_COST = {
+    session_cost_usd: 0,
+    daily_cost_usd: 0,
+    monthly_cost_usd: 0,
+    total_tokens: 0,
+    request_count: 0,
+    by_model: {},
+    by_agent: {}
+  };
+
+  const originalFetch = window.fetch.bind(window);
+  const NativeWebSocket = window.WebSocket;
+  const WS_CONNECTING = NativeWebSocket?.CONNECTING ?? 0;
+  const WS_OPEN = NativeWebSocket?.OPEN ?? 1;
+  const WS_CLOSING = NativeWebSocket?.CLOSING ?? 2;
+  const WS_CLOSED = NativeWebSocket?.CLOSED ?? 3;
+  const relayChatSockets = new Set();
+  let rpcSeq = 1;
+  let initializePromise = null;
+
+  window.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url, location.href);
+    const apiPath = normalizedApiPath(url.pathname);
+    if (!apiPath && url.pathname !== '/health' && url.pathname !== '/webui/health') {
+      return originalFetch(input, init);
+    }
+    if (request.method !== 'GET') {
+      return jsonResponse({ error: 'relay webui bridge currently supports read-only dashboard requests' }, 405);
+    }
+    try {
+      await ensureInitialized();
+      return await bridgeGatewayApi(apiPath || '/health', url);
+    } catch (error) {
+      return jsonResponse({ error: error?.message || 'Secure browser TLS enrollment is unavailable in this build.' }, 503);
+    }
+  };
+
+  if (NativeWebSocket) {
+    window.WebSocket = RelayWebSocket;
+    window.WebSocket.CONNECTING = WS_CONNECTING;
+    window.WebSocket.OPEN = WS_OPEN;
+    window.WebSocket.CLOSING = WS_CLOSING;
+    window.WebSocket.CLOSED = WS_CLOSED;
+  }
+
+  window.addEventListener('message', (event) => {
+    if (event.origin !== location.origin) {
+      return;
+    }
+    const msg = event.data || {};
+    if (msg.type !== 'zeroclaw-rpc-notification') {
+      return;
+    }
+    for (const socket of Array.from(relayChatSockets)) {
+      socket.handleNotification(msg.method, msg.params || null);
+    }
+  });
+
+  function RelayWebSocket(url, protocols) {
+    const parsed = new URL(url, location.href);
+    if (isRelayChatPath(parsed.pathname)) {
+      return new RelayChatSocket(parsed.toString(), protocols);
+    }
+    return new NativeWebSocket(url, protocols);
+  }
+
+  function isRelayChatPath(pathname) {
+    const base = String(window.__ZEROCLAW_BASE__ || '').replace(/\/$/, '');
+    return pathname === '/ws/chat'
+      || pathname === '/webui/ws/chat'
+      || Boolean(base && pathname === `${base}/ws/chat`);
+  }
+
+  class RelayChatSocket {
+    constructor(url, protocols) {
+      this.url = url;
+      this.protocol = selectProtocol(protocols);
+      this.extensions = '';
+      this.binaryType = 'blob';
+      this.bufferedAmount = 0;
+      this.readyState = WS_CONNECTING;
+      this.onopen = null;
+      this.onmessage = null;
+      this.onclose = null;
+      this.onerror = null;
+      this.events = new EventTarget();
+      this.closed = false;
+      this.sessionId = '';
+      this.agentAlias = 'default';
+      this.lastInputTokens = null;
+      this.maxContextTokens = null;
+      relayChatSockets.add(this);
+      queueMicrotask(() => this.connect());
+    }
+
+    addEventListener(type, listener, options) {
+      this.events.addEventListener(type, listener, options);
+    }
+
+    removeEventListener(type, listener, options) {
+      this.events.removeEventListener(type, listener, options);
+    }
+
+    dispatchEvent(event) {
+      return this.events.dispatchEvent(event);
+    }
+
+    send(data) {
+      if (this.readyState !== WS_OPEN) {
+        throw new Error('WebSocket is not connected');
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(String(data));
+      } catch (error) {
+        this.emitJson({
+          type: 'error',
+          code: 'INVALID_JSON',
+          message: error?.message || 'Invalid JSON'
+        });
+        return;
+      }
+
+      if (parsed.type === 'message') {
+        const prompt = String(parsed.content || '');
+        rpcCall('session/prompt', {
+          session_id: this.sessionId,
+          prompt
+        }).catch((error) => {
+          this.emitJson({
+            type: 'error',
+            code: 'PROMPT_FAILED',
+            message: error?.message || 'Prompt failed'
+          });
+        });
+      } else if (parsed.type === 'approval_response') {
+        rpcCall('session/approve', {
+          session_id: this.sessionId,
+          request_id: String(parsed.request_id || ''),
+          decision: normalizeApprovalDecision(parsed.decision),
+          replacement: parsed.replacement || null
+        }).catch((error) => {
+          this.emitJson({
+            type: 'error',
+            code: 'APPROVAL_FAILED',
+            message: error?.message || 'Approval failed'
+          });
+        });
+      } else if (parsed.type === 'connect') {
+        this.emitJson({ type: 'connected', message: 'Connection established' });
+      } else {
+        this.emitJson({
+          type: 'error',
+          code: 'UNKNOWN_MESSAGE_TYPE',
+          message: `Unknown message type: ${parsed.type || 'unknown'}`
+        });
+      }
+    }
+
+    close(code = 1000, reason = '') {
+      if (this.readyState === WS_CLOSED || this.readyState === WS_CLOSING) {
+        return;
+      }
+      this.closed = true;
+      this.readyState = WS_CLOSING;
+      relayChatSockets.delete(this);
+      const sessionId = this.sessionId;
+      const finish = () => {
+        this.readyState = WS_CLOSED;
+        this.emit(closeEvent(code, reason, true));
+      };
+      if (sessionId) {
+        rpcCall('session/close', { session_id: sessionId }).catch(() => {}).finally(finish);
+      } else {
+        finish();
+      }
+    }
+
+    async connect() {
+      const url = new URL(this.url, location.href);
+      this.sessionId = url.searchParams.get('session_id') || randomSessionId();
+      this.agentAlias = url.searchParams.get('agent') || 'default';
+      try {
+        const result = await rpcCall('session/new', {
+          agent_alias: this.agentAlias,
+          session_id: this.sessionId
+        });
+        if (this.closed) {
+          await rpcCall('session/close', { session_id: result?.session_id || this.sessionId }).catch(() => {});
+          return;
+        }
+        if (result?.session_id) {
+          this.sessionId = result.session_id;
+        }
+        this.readyState = WS_OPEN;
+        this.emit(new Event('open'));
+        this.emitJson({
+          type: 'session_start',
+          session_id: this.sessionId,
+          resumed: Number(result?.message_count || 0) > 0,
+          message_count: Number(result?.message_count || 0)
+        });
+        this.emitJson({ type: 'connected', message: 'Connection established' });
+      } catch (error) {
+        this.fail(error, 'CHAT_CONNECT_FAILED');
+      }
+    }
+
+    handleNotification(method, params) {
+      if (method !== 'session/update' || !params || params.session_id !== this.sessionId) {
+        return;
+      }
+      switch (params.type) {
+        case 'agent_message_chunk':
+          this.emitJson({ type: 'chunk', content: params.text || '' });
+          break;
+        case 'agent_thought_chunk':
+          this.emitJson({ type: 'thinking', content: params.text || '' });
+          break;
+        case 'tool_call':
+          this.emitJson({
+            type: 'tool_call',
+            id: params.tool_call_id || '',
+            name: params.name || '',
+            args: params.raw_input
+          });
+          break;
+        case 'tool_result':
+          this.emitJson({
+            type: 'tool_result',
+            id: params.tool_call_id || '',
+            name: params.name || '',
+            output: params.raw_output || ''
+          });
+          break;
+        case 'approval_request':
+          this.emitJson({
+            type: 'approval_request',
+            request_id: params.request_id || '',
+            tool: params.tool_name || '',
+            arguments_summary: params.arguments_summary || '',
+            timeout_secs: params.timeout_secs || 120
+          });
+          break;
+        case 'context_usage':
+          this.lastInputTokens = optionalNumber(params.input_tokens);
+          this.maxContextTokens = optionalNumber(params.max_context_tokens);
+          break;
+        case 'plan':
+          this.emitJson({ type: 'plan', entries: params.entries || [] });
+          break;
+        case 'history_trimmed':
+          this.emitJson({
+            type: 'history_trimmed',
+            dropped_messages: params.dropped_messages || 0,
+            kept_turns: params.kept_turns || 0,
+            reason: params.reason || ''
+          });
+          break;
+        case 'turn_complete':
+          this.handleTurnComplete(params);
+          break;
+        default:
+          break;
+      }
+    }
+
+    handleTurnComplete(params) {
+      const outcome = params.outcome || 'completed';
+      const content = params.content || '';
+      if (outcome === 'completed') {
+        this.emitJson({
+          type: 'done',
+          full_response: content,
+          input_tokens: this.lastInputTokens,
+          last_input_tokens: this.lastInputTokens,
+          max_context_tokens: this.maxContextTokens
+        });
+      } else if (outcome === 'cancelled') {
+        if (content.trim()) {
+          this.emitJson({
+            type: 'done',
+            full_response: content,
+            input_tokens: this.lastInputTokens,
+            last_input_tokens: this.lastInputTokens,
+            max_context_tokens: this.maxContextTokens
+          });
+        }
+        this.emitJson({ type: 'aborted' });
+      } else {
+        this.emitJson({
+          type: 'error',
+          code: 'TURN_FAILED',
+          message: content || 'Turn failed'
+        });
+      }
+    }
+
+    emitJson(value) {
+      if (this.readyState !== WS_OPEN) {
+        return;
+      }
+      this.emit(new MessageEvent('message', { data: JSON.stringify(value) }));
+    }
+
+    emit(event) {
+      const handler = this[`on${event.type}`];
+      if (typeof handler === 'function') {
+        try {
+          handler.call(this, event);
+        } catch (error) {
+          setTimeout(() => { throw error; }, 0);
+        }
+      }
+      this.events.dispatchEvent(event);
+    }
+
+    fail(error, code) {
+      if (this.readyState === WS_CLOSED) {
+        return;
+      }
+      relayChatSockets.delete(this);
+      this.emit(errorEvent(error));
+      if (this.readyState === WS_OPEN) {
+        this.emitJson({
+          type: 'error',
+          code,
+          message: error?.message || 'Relay chat bridge failed'
+        });
+      }
+      this.readyState = WS_CLOSED;
+      this.emit(closeEvent(1011, error?.message || 'Relay chat bridge failed', false));
+    }
+  }
+
+  function selectProtocol(protocols) {
+    if (Array.isArray(protocols)) {
+      return protocols[0] || '';
+    }
+    return protocols || '';
+  }
+
+  function randomSessionId() {
+    if (crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+    return `relay-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  function normalizeApprovalDecision(decision) {
+    switch (decision) {
+      case 'approve':
+        return 'allow_once';
+      case 'always':
+        return 'allow_always';
+      case 'deny':
+        return 'reject';
+      default:
+        return String(decision || '');
+    }
+  }
+
+  function closeEvent(code, reason, wasClean) {
+    if (typeof CloseEvent === 'function') {
+      return new CloseEvent('close', { code, reason, wasClean });
+    }
+    return new Event('close');
+  }
+
+  function errorEvent(error) {
+    if (typeof ErrorEvent === 'function') {
+      return new ErrorEvent('error', {
+        message: error?.message || 'Relay chat bridge failed',
+        error
+      });
+    }
+    return new Event('error');
+  }
+
+  function normalizedApiPath(pathname) {
+    if (pathname === '/api' || pathname.startsWith('/api/')) {
+      return pathname;
+    }
+    if (pathname === '/webui/api' || pathname.startsWith('/webui/api/')) {
+      return pathname.slice('/webui'.length);
+    }
+    return null;
+  }
+
+  async function bridgeGatewayApi(apiPath, url) {
+    switch (apiPath) {
+      case '/health':
+        return jsonResponse(await publicHealth());
+      case '/api/health':
+        return jsonResponse(await rpcCall('health'));
+      case '/api/status':
+        return jsonResponse(await dashboardStatus(url));
+      case '/api/events':
+        return emptyEventStream();
+      case '/api/tuis':
+        return jsonResponse(await rpcOr('tui/list', null, { tuis: [] }));
+      case '/api/cost':
+        return jsonResponse(await rpcOr('cost/query', costParams(url), ZERO_COST));
+      case '/api/sessions':
+        return jsonResponse(await rpcOr('session/list', {}, { sessions: [] }));
+      case '/api/channels':
+        return jsonResponse({ channels: [] });
+      case '/api/memory':
+        return jsonResponse(await memoryResponse(url));
+      case '/api/logs':
+        return jsonResponse(await rpcOr('logs/query', logsParams(url), {
+          events: [],
+          at_end: true,
+          next_cursor: null,
+          next_cursor_line_offset: null
+        }));
+      case '/api/config/status':
+        return jsonResponse(await rpcOr('config/status', null, {
+          needs_quickstart: false,
+          reason: '',
+          has_partial_state: false,
+          missing: []
+        }));
+      case '/api/config/reload-status':
+        return jsonResponse(await configReloadStatus());
+      case '/api/config/drift':
+        return jsonResponse(await configDrift());
+      case '/api/config/sections':
+        return jsonResponse(await rpcOr('config/sections', null, { sections: [] }));
+      case '/api/config/map-keys':
+        return jsonResponse(await rpcCall('config/map-keys', { path: url.searchParams.get('path') || '' }));
+      case '/api/config/list':
+        return jsonResponse(await rpcCall('config/list', { prefix: url.searchParams.get('prefix') || null }));
+      case '/api/quickstart/state':
+        return jsonResponse(await rpcOr('quickstart/state', null, {
+          quickstart_completed: false,
+          agents: [],
+          risk_profiles: [],
+          runtime_profiles: [],
+          model_providers: [],
+          channels: [],
+          unassigned_channels: [],
+          storage: [],
+          model_provider_types: [],
+          channel_types: [],
+          risk_presets: [],
+          runtime_presets: [],
+          memory_kinds: [],
+          personality_files: []
+        }));
+      case '/api/cron':
+        return jsonResponse(await rpcOr('cron/list', null, { jobs: [] }));
+      case '/api/cli-tools':
+        return jsonResponse({ cli_tools: [] });
+      case '/api/tools':
+        return jsonResponse({ tools: [] });
+      default:
+        return jsonResponse({ error: 'relay webui bridge has no mapping for this route', path: apiPath }, 404);
+    }
+  }
+
+  async function dashboardStatus(url) {
+    const [status, health] = await Promise.all([
+      rpcCall('status'),
+      rpcOr('health', null, {})
+    ]);
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    return {
+      version: status.server_version,
+      model_provider: null,
+      model: '',
+      temperature: 0,
+      uptime_seconds: Number(health.uptime_seconds || 0),
+      daemon_started_at: health.updated_at || new Date().toISOString(),
+      gateway_port: port,
+      locale: 'en',
+      memory_backend: '',
+      paired: true,
+      channels: {},
+      health,
+      process: health.process || {
+        rss_bytes: 0,
+        system_ram_total_bytes: 0,
+        cpu_percent: null,
+        num_cpus: 0
+      }
+    };
+  }
+
+  async function publicHealth() {
+    const health = await rpcOr('health', null, {});
+    return {
+      ...health,
+      require_pairing: false,
+      paired: true
+    };
+  }
+
+  async function configReloadStatus() {
+    const status = await rpcOr('config/reload-status', null, { pending_reload: false });
+    return {
+      pending_reload: Boolean(status?.pending_reload)
+    };
+  }
+
+  async function configDrift() {
+    const drift = await rpcOr('config/drift', null, { drifted: [] });
+    if (Array.isArray(drift?.drifted)) {
+      return { drifted: drift.drifted };
+    }
+    return { drifted: [] };
+  }
+
+  function costParams(url) {
+    return {
+      agent: url.searchParams.get('agent') || null,
+      from: url.searchParams.get('from') || null,
+      to: url.searchParams.get('to') || null
+    };
+  }
+
+  function logsParams(url) {
+    const limit = Number(url.searchParams.get('limit') || '50');
+    return {
+      since_ts: url.searchParams.get('since_ts') || null,
+      until_ts: url.searchParams.get('until_ts') || null,
+      until_id: url.searchParams.get('until_id') || null,
+      until_line_offset: optionalNumber(url.searchParams.get('until_line_offset')),
+      severity_min: optionalNumber(url.searchParams.get('severity_min')),
+      q: url.searchParams.get('q') || null,
+      category: url.searchParams.get('category') || null,
+      action: url.searchParams.get('action') || null,
+      outcome: url.searchParams.get('outcome') || null,
+      trace_id: url.searchParams.get('trace_id') || null,
+      hide_internal: url.searchParams.get('hide_internal') === 'true',
+      limit: Number.isFinite(limit) ? limit : 50
+    };
+  }
+
+  async function memoryResponse(url) {
+    const query = url.searchParams.get('query');
+    if (query) {
+      return rpcOr('memory/search', {
+        query,
+        limit: 100,
+        agent: url.searchParams.get('agent') || null
+      }, { entries: [], count: 0 });
+    }
+    return rpcOr('memory/list', {
+      category: url.searchParams.get('category') || null,
+      agent: url.searchParams.get('agent') || null
+    }, { entries: [], count: 0 });
+  }
+
+  function optionalNumber(value) {
+    if (value === null || value === '') {
+      return null;
+    }
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  async function ensureInitialized() {
+    if (!initializePromise) {
+      initializePromise = rpcCallRaw('initialize', {
+        protocol_version: 1,
+        clientCapabilities: { elicitation: {} }
+      }).catch((error) => {
+        initializePromise = null;
+        throw error;
+      });
+    }
+    return initializePromise;
+  }
+
+  async function rpcOr(method, params, fallback) {
+    try {
+      return await rpcCall(method, params);
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  async function rpcCall(method, params = null) {
+    await ensureInitialized();
+    return rpcCallRaw(method, params);
+  }
+
+  async function rpcCallRaw(method, params = null) {
+    const id = rpcSeq++;
+    const encoded = new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+    const body = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength);
+    const msg = await dispatchToRelayShell({
+      type: 'zeroclaw-rpc-request',
+      method: 'POST',
+      url: '/__zeroclaw/rpc',
+      headers: [['content-type', 'application/json']],
+      body
+    }, body);
+    if (!msg?.ok) {
+      throw new Error(msg?.error || 'browser tunnel request failed');
+    }
+    const text = msg.body ? new TextDecoder().decode(toUint8(msg.body)) : '{}';
+    const parsed = JSON.parse(text || '{}');
+    if (parsed.error) {
+      throw new Error(parsed.error.message || 'RPC error');
+    }
+    return parsed.result;
+  }
+
+  async function dispatchToRelayShell(msg, body) {
+    if (!window.parent || window.parent === window) {
+      throw new Error('relay pairing shell is not available');
+    }
+
+    const channel = new MessageChannel();
+    let timeout = null;
+    const reply = new Promise((resolve) => {
+      timeout = setTimeout(() => {
+        timeout = null;
+        channel.port1.close();
+        resolve({ ok: false, status: 504, error: 'browser tunnel request timed out' });
+      }, RPC_TIMEOUT_MS);
+      channel.port1.onmessage = (messageEvent) => {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+        channel.port1.close();
+        resolve(messageEvent.data || {});
+      };
+      channel.port1.start();
+    });
+
+    const transfers = [channel.port2];
+    if (body) {
+      transfers.push(body);
+    }
+    try {
+      window.parent.postMessage(msg, location.origin, transfers);
+    } catch (_) {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      channel.port1.close();
+      throw new Error('could not dispatch browser tunnel request');
+    }
+    return reply;
+  }
+
+  function jsonResponse(value, status = 200) {
+    return new Response(JSON.stringify(value), {
+      status,
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+
+  function emptyEventStream() {
+    return new Response(': relay bridge event stream ready\n\n', {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-store'
+      }
+    });
+  }
+
+  function toUint8(value) {
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return new Uint8Array(0);
+  }
+})();"#;
 
 pub(crate) const TUNNEL_WORKER_JS: &str = r#"const DB_NAME = 'zeroclaw-relay-enrollment';
 const DB_VERSION = 1;
@@ -532,6 +1421,8 @@ self.addEventListener('message', (event) => {
   const msg = event.data || {};
   if (msg.type === 'connectEnrollment') {
     connectEnrollment(msg.relayUrl, msg.nodeId, msg.pairingCode);
+  } else if (msg.type === 'resumeConnection') {
+    resumeConnection(msg.relayUrl, msg.nodeId);
   } else if (msg.type === 'confirmEnrollment') {
     confirmEnrollment();
   } else if (msg.type === 'abortEnrollment') {
@@ -550,6 +1441,7 @@ async function connectEnrollment(relayUrl, nodeId, pairingCode) {
   closeExisting();
   pendingEnrollment = null;
   pendingEnrollmentPost = null;
+  activeProfile = null;
   self.postMessage({ type: 'connecting' });
 
   let material;
@@ -570,6 +1462,49 @@ async function connectEnrollment(relayUrl, nodeId, pairingCode) {
   });
 
   openEnrollmentRoute(material);
+}
+
+async function resumeConnection(relayUrl, nodeId) {
+  if (!nodeId) {
+    self.postMessage({ type: 'resume-missing', reason: 'No saved relay connection is selected' });
+    return;
+  }
+
+  closeExisting();
+  pendingEnrollment = null;
+  pendingEnrollmentPost = null;
+  activeProfile = null;
+  self.postMessage({ type: 'resuming', nodeId });
+
+  let profile;
+  try {
+    profile = await loadCompletedEnrollment(nodeId);
+  } catch (error) {
+    self.postMessage({
+      type: 'resume-missing',
+      reason: error?.message || 'Could not read the saved browser certificate'
+    });
+    return;
+  }
+  if (!profile) {
+    self.postMessage({
+      type: 'resume-missing',
+      reason: `No saved browser certificate found for ${nodeId}. Pair once to connect.`
+    });
+    return;
+  }
+
+  activeProfile = {
+    ...profile,
+    relayUrl: relayUrl || profile.relayUrl,
+    nodeId: profile.nodeId || nodeId
+  };
+  connectRpcTunnel(activeProfile).catch((error) => {
+    self.postMessage({
+      type: 'route-error',
+      reason: error?.message || 'failed to restore saved relay connection'
+    });
+  });
 }
 
 function openEnrollmentRoute(material) {
@@ -919,8 +1854,8 @@ async function connectRpcTunnel(profile) {
   if (!self.ZeroClawEnrollmentTls?.connectRpc) {
     throw new Error('Secure browser RPC tunnel engine is unavailable in this build');
   }
-  const relayUrl = profile.relayProfile?.relay_url || profile.relayUrl;
-  const nodeId = profile.relayProfile?.node_id || profile.nodeId;
+  const relayUrl = resolveRelayUrl(profile);
+  const nodeId = resolveRelayNodeId(profile);
   if (!relayUrl || !nodeId) {
     throw new Error('Enrolled profile is missing relay coordinates');
   }
@@ -945,8 +1880,37 @@ async function connectRpcTunnel(profile) {
       self.postMessage({ type: 'rpc-closed', reason: 'Secure RPC tunnel closed' });
     }
   });
-  self.postMessage({ type: 'rpc-ready' });
+  self.postMessage({ type: 'rpc-ready', nodeId });
   return rpcClient;
+}
+
+function resolveRelayUrl(profile) {
+  const relayUrl = profile.relayUrl || profile.relayProfile?.relay_url;
+  if (!relayUrl) {
+    return '';
+  }
+  return normalizeRelayWebSocketUrl(relayUrl);
+}
+
+function resolveRelayNodeId(profile) {
+  return profile.nodeId || profile.relayProfile?.node_id || '';
+}
+
+function normalizeRelayWebSocketUrl(relayUrl) {
+  if (/^wss?:\/\//i.test(relayUrl)) {
+    return relayUrl;
+  }
+  const protocol = self.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (/^[^/]+:\d+$/.test(relayUrl)) {
+    return `${protocol}//${relayUrl}/relay`;
+  }
+  const url = new URL(relayUrl, self.location.origin);
+  if (url.protocol === 'http:') {
+    url.protocol = 'ws:';
+  } else if (url.protocol === 'https:') {
+    url.protocol = 'wss:';
+  }
+  return url.toString();
 }
 
 function parseRpcFetchBody(body) {
@@ -1180,6 +2144,30 @@ async function ensureEnrollmentMaterial(nodeId) {
   return material;
 }
 
+async function loadCompletedEnrollment(nodeId) {
+  if (!self.indexedDB) {
+    throw new Error('IndexedDB is not available');
+  }
+  const db = await openEnrollmentDb();
+  const stored = await readMaterial(db, `${MATERIAL_KEY_PREFIX}${nodeId}`);
+  if (!isCompletedEnrollment(stored)) {
+    return null;
+  }
+  return {
+    ...stored,
+    nodeId: stored.nodeId || nodeId
+  };
+}
+
+function isCompletedEnrollment(profile) {
+  return Boolean(
+    profile?.signingKey &&
+    profile?.certPem &&
+    profile?.caChainPem &&
+    (profile?.nodeId || profile?.relayProfile?.node_id)
+  );
+}
+
 function openEnrollmentDb() {
   if (dbPromise) {
     return dbPromise;
@@ -1347,6 +2335,14 @@ function pemEncode(label, bytes) {
 
 function closeExisting() {
   pendingEnrollmentPost = null;
+  rpcConnecting = null;
+  if (rpcClient) {
+    const old = rpcClient;
+    rpcClient = null;
+    try {
+      old.close?.();
+    } catch (_) {}
+  }
   if (route) {
     route.close('replaced');
     route = null;

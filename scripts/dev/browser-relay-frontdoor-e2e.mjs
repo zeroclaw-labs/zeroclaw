@@ -99,6 +99,7 @@ function findBrowser(explicit) {
     explicit,
     process.env.CHROME,
     process.env.CHROMIUM,
+    'chromium-headless-shell',
     'chromium-shell',
     'chromium',
     'chromium-browser',
@@ -156,16 +157,39 @@ async function main() {
     await preparePage(cdp);
     await navigate(cdp, opts.url, opts.timeoutMs);
     await ensureServiceWorker(cdp, opts.timeoutMs);
-    await submitPairing(cdp, opts.nodeId, opts.pairingCode);
-    const sas = await waitForSas(cdp, opts.timeoutMs);
+    await ensureRelayAppReady(cdp, opts.timeoutMs);
+    const submitted = await submitPairing(cdp, opts.nodeId, opts.pairingCode);
+    let sas = null;
+    try {
+      sas = await waitForSas(cdp, opts.timeoutMs);
+    } catch (error) {
+      error.message = `${error.message}\nSubmit state: ${JSON.stringify(submitted)}\nCDP diagnostics: ${JSON.stringify(cdp.diagnostics())}`;
+      throw error;
+    }
     await click(cdp, 'sas-confirm');
-    const ready = await waitForReady(cdp, opts.timeoutMs);
+    let ready = null;
+    try {
+      ready = await waitForReady(cdp, opts.timeoutMs);
+    } catch (error) {
+      error.message = `${error.message}\nCDP diagnostics: ${JSON.stringify(cdp.diagnostics())}`;
+      throw error;
+    }
+    await verifyRelayChatBridge(cdp, opts.timeoutMs);
+    let resumed = null;
+    try {
+      resumed = await reloadAndVerifyResume(cdp, opts.timeoutMs);
+    } catch (error) {
+      error.message = `${error.message}\nCDP diagnostics: ${JSON.stringify(cdp.diagnostics())}`;
+      throw error;
+    }
+    await verifyRelayChatBridge(cdp, opts.timeoutMs);
 
     console.log('browser relay frontdoor e2e ok');
     console.log(`  url: ${opts.url}`);
     console.log(`  node: ${opts.nodeId}`);
     console.log(`  sas: ${sas}`);
     console.log(`  status: ${ready.status}`);
+    console.log(`  resumed: ${resumed.status}`);
   } finally {
     if (cdp) {
       await cdp.send('Browser.close', {}, 2000).catch(() => {});
@@ -190,15 +214,14 @@ async function startBrowser(browser, profile, headed, timeoutMs) {
     '--disable-popup-blocking',
     '--disable-sync',
     '--disable-dev-shm-usage',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
     '--ignore-certificate-errors',
     '--allow-insecure-localhost',
     '--disable-features=DialMediaRouteProvider'
   ];
   if (!headed) {
     args.push('--headless=new');
-  }
-  if (typeof process.getuid === 'function' && process.getuid() === 0) {
-    args.push('--no-sandbox');
   }
   args.push('about:blank');
 
@@ -285,6 +308,7 @@ async function createTarget(port) {
 
 async function preparePage(cdp) {
   await cdp.send('Page.enable');
+  await cdp.send('Network.enable').catch(() => {});
   await cdp.send('Runtime.enable');
   await cdp.send('Log.enable').catch(() => {});
   await cdp.send('Security.enable').catch(() => {});
@@ -377,17 +401,36 @@ async function ensureServiceWorker(cdp, timeoutMs) {
   `, timeoutMs, 'service worker tunnel state');
 }
 
+async function ensureRelayAppReady(cdp, timeoutMs) {
+  await waitForEval(cdp, `
+    (() => ({
+      ok: window.__ZEROCLAW_RELAY_APP_READY === true,
+      ready: window.__ZEROCLAW_RELAY_APP_READY === true,
+      status: document.getElementById('status')?.textContent || '',
+      readyState: document.readyState
+    }))()
+  `, timeoutMs, 'relay app script ready');
+}
+
 async function submitPairing(cdp, nodeId, pairingCode) {
-  await cdp.evaluate(`
+  return cdp.evaluate(`
     (() => {
       const node = document.getElementById('server-id');
       const code = document.getElementById('pairing-code');
+      const form = document.getElementById('pair');
+      const status = document.getElementById('status');
+      const button = document.getElementById('connect');
       node.value = ${JSON.stringify(nodeId)};
       code.value = ${JSON.stringify(pairingCode)};
       node.dispatchEvent(new Event('input', { bubbles: true }));
       code.dispatchEvent(new Event('input', { bubbles: true }));
-      document.getElementById('pair').requestSubmit();
-      return true;
+      form.requestSubmit();
+      return {
+        ok: true,
+        status: status?.textContent || '',
+        buttonDisabled: button ? button.disabled : null,
+        formHidden: form ? form.hidden : null
+      };
     })()
   `);
 }
@@ -425,16 +468,125 @@ async function waitForReady(cdp, timeoutMs) {
   return waitForEval(cdp, `
     (() => {
       const status = document.getElementById('status')?.textContent || '';
-      const chat = document.getElementById('chat-panel');
-      const send = document.getElementById('send');
+      const form = document.getElementById('pair');
+      const panel = document.getElementById('webui-panel');
+      const frame = document.getElementById('webui-frame');
+      const doc = frame?.contentDocument || null;
+      const title = doc?.title || '';
+      const text = doc?.body?.innerText || '';
+      const loadError =
+        text.includes('Dashboard could not be loaded') ||
+        text.includes('dashboard.load_error') ||
+        text.includes('Something went wrong') ||
+        text.includes('Failed to fetch dynamically imported module');
+      const authPrompt =
+        text.includes('This gateway is already paired') ||
+        text.includes('6-digit code') ||
+        text.includes('Pairing codes can only be generated') ||
+        text.includes('Your pairing code');
       return {
-        ok: Boolean(chat && !chat.hidden && send && !send.disabled && status.includes('Secure tunnel ready')),
+        ok: Boolean(
+          form && form.hidden &&
+          panel && !panel.hidden &&
+          frame &&
+          frame.contentWindow?.location?.pathname === '/webui/' &&
+          title.includes('ZeroClaw') &&
+          text.includes('Dashboard') &&
+          !authPrompt &&
+          !loadError &&
+          status.includes('Secure tunnel ready')
+        ),
         status,
-        chatHidden: chat ? chat.hidden : null,
-        sendDisabled: send ? send.disabled : null
+        formHidden: form ? form.hidden : null,
+        panelHidden: panel ? panel.hidden : null,
+        framePath: frame?.contentWindow?.location?.pathname || '',
+        title,
+        text: text.slice(0, 500),
+        loadError,
+        authPrompt
       };
     })()
-  `, timeoutMs, 'secure tunnel ready');
+  `, timeoutMs, 'routed WebUI ready');
+}
+
+async function reloadAndVerifyResume(cdp, timeoutMs) {
+  const load = cdp.waitForEvent('Page.loadEventFired', () => true, timeoutMs).catch(() => null);
+  await cdp.send('Page.reload', { ignoreCache: true });
+  await load;
+  await ensureServiceWorker(cdp, timeoutMs);
+  await ensureRelayAppReady(cdp, timeoutMs);
+  return waitForReady(cdp, timeoutMs);
+}
+
+async function verifyRelayChatBridge(cdp, timeoutMs) {
+  const result = await cdp.evaluate(`
+    (async () => {
+      const frame = document.getElementById('webui-frame');
+      const win = frame?.contentWindow;
+      if (!win || win.location.pathname !== '/webui/') {
+        return { ok: false, reason: 'webui frame is not ready' };
+      }
+      const token = win.localStorage.getItem('zeroclaw_token') || '';
+      if (!token) {
+        return { ok: false, reason: 'missing relay WebUI token' };
+      }
+      if (token.includes(':')) {
+        return { ok: false, reason: 'relay WebUI token is not WebSocket-subprotocol safe', token };
+      }
+      const url = new URL('/webui/ws/chat', win.location.origin);
+      url.protocol = win.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      url.searchParams.set('token', token);
+      url.searchParams.set('session_id', 'relay-e2e-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now()));
+      url.searchParams.set('agent', 'default');
+      return await new Promise((resolve) => {
+        const messages = [];
+        let settled = false;
+        let socket = null;
+        const settle = (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try {
+            socket?.close();
+          } catch (_) {}
+          resolve(value);
+        };
+        const timer = setTimeout(() => {
+          settle({ ok: false, reason: 'chat bridge timed out', token, messages, readyState: socket?.readyState ?? null });
+        }, 30000);
+        try {
+          socket = new win.WebSocket(url.toString(), ['zeroclaw.v1', 'bearer.' + token]);
+        } catch (error) {
+          settle({ ok: false, reason: error?.message || 'chat WebSocket constructor failed', token, messages });
+          return;
+        }
+        socket.onmessage = (event) => {
+          let msg = null;
+          try {
+            msg = JSON.parse(event.data);
+          } catch (_) {
+            return;
+          }
+          messages.push(msg.type || '');
+          if (messages.includes('session_start') && messages.includes('connected')) {
+            settle({ ok: true, token, messages });
+          }
+        };
+        socket.onerror = () => {
+          settle({ ok: false, reason: 'chat bridge socket error', token, messages, readyState: socket?.readyState ?? null });
+        };
+        socket.onclose = (event) => {
+          if (!settled && !messages.includes('connected')) {
+            settle({ ok: false, reason: 'chat bridge closed before connected', token, messages, code: event.code, closeReason: event.reason });
+          }
+        };
+      });
+    })()
+  `, timeoutMs);
+  if (!result?.ok) {
+    throw new Error(`relay chat bridge check failed: ${JSON.stringify(result)}`);
+  }
+  return result;
 }
 
 async function waitForEval(cdp, expression, timeoutMs, label) {
@@ -460,6 +612,11 @@ class Cdp {
     this.pending = new Map();
     this.eventWaiters = [];
     this.lastException = null;
+    this.console = [];
+    this.logEntries = [];
+    this.networkFailures = [];
+    this.networkResponses = [];
+    this.requestUrls = new Map();
     ws.onMessage((text) => this.handleMessage(text));
     ws.onClose(() => {
       for (const pending of this.pending.values()) {
@@ -532,6 +689,16 @@ class Cdp {
     });
   }
 
+  diagnostics() {
+    return {
+      lastException: this.lastException,
+      console: this.console.slice(-20),
+      logEntries: this.logEntries.slice(-20),
+      networkFailures: this.networkFailures.slice(-20),
+      networkResponses: this.networkResponses.slice(-30)
+    };
+  }
+
   handleMessage(text) {
     let msg = null;
     try {
@@ -554,6 +721,60 @@ class Cdp {
     }
     if (msg.method === 'Runtime.exceptionThrown') {
       this.lastException = msg.params;
+    }
+    if (msg.method === 'Runtime.consoleAPICalled') {
+      this.console.push({
+        type: msg.params?.type,
+        args: (msg.params?.args || []).map((arg) => arg.value ?? arg.description ?? arg.type)
+      });
+    }
+    if (msg.method === 'Log.entryAdded') {
+      const entry = msg.params?.entry || {};
+      this.logEntries.push({
+        level: entry.level,
+        source: entry.source,
+        text: entry.text,
+        url: entry.url,
+        lineNumber: entry.lineNumber
+      });
+    }
+    if (msg.method === 'Network.loadingFailed') {
+      this.networkFailures.push({
+        requestId: msg.params?.requestId,
+        url: this.requestUrls.get(msg.params?.requestId) || null,
+        type: msg.params?.type,
+        errorText: msg.params?.errorText,
+        blockedReason: msg.params?.blockedReason,
+        corsErrorStatus: msg.params?.corsErrorStatus
+      });
+    }
+    if (msg.method === 'Network.requestWillBeSent') {
+      const requestId = msg.params?.requestId;
+      const url = msg.params?.request?.url;
+      if (requestId && url) {
+        this.requestUrls.set(requestId, url);
+      }
+    }
+    if (msg.method === 'Network.responseReceived') {
+      const response = msg.params?.response || {};
+      const url = response.url || '';
+      if (
+        url.includes('/webui/_app/') ||
+        url.includes('/_app/') ||
+        url.includes('/webui/api/') ||
+        url.includes('/api/') ||
+        url.endsWith('/health') ||
+        url.includes('/__zeroclaw/')
+      ) {
+        this.networkResponses.push({
+          requestId: msg.params?.requestId,
+          type: msg.params?.type,
+          url,
+          status: response.status,
+          mimeType: response.mimeType,
+          fromServiceWorker: response.fromServiceWorker === true
+        });
+      }
     }
     if (msg.method) {
       for (const waiter of [...this.eventWaiters]) {
