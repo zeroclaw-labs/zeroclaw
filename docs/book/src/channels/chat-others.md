@@ -27,8 +27,15 @@ Use case: paired-identity channels where sub-second replies are an AI-tell. Wire
 
    {{#secret-config channels.telegram.<alias>.bot_token}}
 
-3. **Start the bot**: send `/start` to it in a Telegram chat so it can begin
-   receiving messages.
+3. **Enable the channel and start the service**: set `enabled = true` on the
+   alias you configured. Telegram aliases default to disabled, and the
+   orchestrator skips any alias that is not active, so this is required before
+   inbound messages are accepted. If you run with explicit agent-channel
+   bindings, also attach `telegram.<alias>` to an enabled agent; with no
+   explicit binding the channel routes to the default agent. Then start or
+   restart the ZeroClaw daemon/service. Telegram uses long polling by default
+   and does not need a public URL. Once the service is running, send `/start`
+   to your bot in a Telegram chat so it can begin receiving messages.
 
 ### Who can talk to the agent
 
@@ -48,16 +55,34 @@ channel = "telegram"
 external_peers = ["*"]
 ```
 
+`channel = "telegram"` is a type-wide reference: paired with `["*"]` it opens
+**every** Telegram alias to anyone. To open just one configured bot, scope the
+group to a single alias with `channel = "telegram.<alias>"` instead. See
+[Peer Groups](./peer-groups.md) for the decision logic.
+
+> Streaming draft edits are supported but capped by Telegram's rate limit.
+> Tune `draft_update_interval_ms` if you see "Too Many Requests".
+
 ### Binding a Telegram identity
 
-Once the channel is configured, use `zeroclaw channel bind-telegram` to
-authorize a specific Telegram user. The identity can be:
+Use `zeroclaw channel bind-telegram <identity>` to authorize a specific
+Telegram user. Without `--alias` the identity is bound to the `default`
+alias (`channels.telegram.default`); pass `--alias <alias>` to target
+`channels.telegram.<alias>`:
 
-- A **numeric user ID** (e.g., `zeroclaw channel bind-telegram 111111111`)
-- An **@username** (e.g., `zeroclaw channel bind-telegram @alice`)
+```sh
+zeroclaw channel bind-telegram 111111111                       # default alias
+zeroclaw channel bind-telegram @zeroclaw_user --alias alerts   # channels.telegram.alerts
+```
 
-To find your Telegram user ID, send a message to [@userinfobot](https://t.me/userinfobot)
-or use a bot that echoes back your chat ID.
+The identity can be a **numeric user ID** or an **@username**. When you bind a
+non-default alias, the agent that runs on that alias requires a matching
+identity, otherwise an authorized sender keeps being asked for approval.
+
+To find your Telegram user ID, send any message to the bot — ZeroClaw
+replies to unauthorized senders with the exact `zeroclaw channel
+bind-telegram <identity>` command to run. You can also look up your
+ID through [@userinfobot](https://t.me/userinfobot).
 
 ## iMessage (macOS only)
 
