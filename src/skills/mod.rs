@@ -1326,10 +1326,18 @@ fn install_dir_name(source: &str) -> Option<String> {
             zeroclaw_runtime::skills::git_clone_dir_name(source).ok()
         }
         SkillSource::Registry { skill, .. } => Some(skill),
-        SkillSource::Local { path } => path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string),
+        // Canonicalize before taking the basename: the installer canonicalizes
+        // a local source, so a symlinked source (`./link` → `realdir/`) installs
+        // as `realdir`. Matching that here keeps the --force receipt lookup key
+        // aligned with the one the install writes. Falls back to the raw path if
+        // canonicalization fails (a missing source fails the install anyway).
+        SkillSource::Local { path } => {
+            let resolved = path.canonicalize().unwrap_or(path);
+            resolved
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        }
     }
 }
 
@@ -1622,10 +1630,12 @@ fn install_timestamp() -> u64 {
 }
 
 /// Verify installed skills against their receipts.
-/// True when the installed skill named `name` has a receipt recording a remote
-/// source (ClawHub / Git / registry). Used to refuse running its `TEST.sh`
-/// without an OS sandbox. Receipts are name-keyed, so this errs toward refusing
-/// when a name is shared across locations — the safe direction for a gate.
+/// True when the skill whose receipt is filed under `receipt_key` records a
+/// remote source (ClawHub / Git / registry). Used to refuse running its
+/// `TEST.sh` without an OS sandbox. The key is location-qualified, so this
+/// resolves the receipt of the specific installed copy; a missing receipt
+/// returns `false` (the skill is treated as local/unknown and allowed to run),
+/// so callers must pass the key for the exact skill being tested.
 fn skill_is_remote_origin(config: &crate::config::Config, receipt_key: &str) -> bool {
     zeroclaw_runtime::skills::receipt::read_receipt(&config.install_root_dir(), receipt_key)
         .is_some_and(|r| r.source.is_remote())
@@ -1834,19 +1844,30 @@ fn location_label(location: &SkillLocation) -> String {
 
 /// Location-qualified receipt key `<location>/<name>`, so same-named skills in
 /// different bundles (or bundle vs global) get distinct receipt files rather
-/// than colliding on one name-keyed file. Both segments are sanitized to
-/// `[A-Za-z0-9_-]`, so the key can never escape the receipts directory.
+/// than colliding on one name-keyed file. Each segment is percent-encoded (see
+/// the body) so the mapping is injective and the key can never escape the
+/// receipts directory.
 fn receipt_key(location_label: &str, name: &str) -> String {
+    // Injective, filesystem-safe encoding: keep `[A-Za-z0-9._-]` verbatim (so
+    // segments that differ only by `.` vs `-` stay distinct) and percent-encode
+    // every other byte, including path separators and `%`. Two distinct
+    // segments can never collide (percent-encoding is reversible), and because
+    // `/` and `\` are encoded the key contains exactly one separator (the one
+    // inserted below) and no `..` path component (the location prefix and the
+    // `.json` suffix keep both components off `.`/`..`).
     fn seg(s: &str) -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+                out.push(b as char);
+            } else {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+        out
     }
     let loc = match location_label.strip_prefix("bundle:") {
         Some(alias) => format!("bundle-{}", seg(alias)),
@@ -2059,6 +2080,14 @@ mod install_location_tests {
         assert_eq!(receipt_key("bundle:a", "foo"), "bundle-a/foo");
         assert_eq!(receipt_key("global", "foo"), "global/foo");
 
+        // The encoding is injective: names differing only by punctuation that a
+        // lossy sanitizer would collapse (`.` vs `-`, spaces) stay distinct, so
+        // a remote skill's receipt cannot be overwritten by a co-located local
+        // one (which would defeat the remote-test gate).
+        assert_ne!(receipt_key("global", "foo.bar"), receipt_key("global", "foo-bar"));
+        assert_ne!(receipt_key("bundle:a.b", "x"), receipt_key("bundle:a-b", "x"));
+        assert_ne!(receipt_key("global", "a b"), receipt_key("global", "a-b"));
+
         // The install-time label (from a SkillLocation, used by
         // record_install_receipt) matches the verify-time label (the string
         // `collect_skill_locations` emits), so a receipt written at install is
@@ -2069,10 +2098,18 @@ mod install_location_tests {
         };
         assert_eq!(location_label(&loc), "bundle:a");
 
-        // A hostile name/alias cannot escape the receipts directory.
+        // A hostile name/alias cannot escape the receipts directory: the key
+        // has exactly one separator and neither path component is `.`/`..` or
+        // empty (path separators inside a segment are percent-encoded).
         let k = receipt_key("bundle:../../etc", "../../pwn");
-        assert!(!k.contains(".."), "key must not contain '..': {k}");
-        assert_eq!(k.matches('/').count(), 1, "only the location separator: {k}");
+        let parts: Vec<&str> = k.split('/').collect();
+        assert_eq!(parts.len(), 2, "exactly one path separator: {k}");
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.is_empty() && *p != "." && *p != ".."),
+            "no traversable path component: {k}"
+        );
     }
 
     /// End-to-end #8334 (requested in review): drive the *real* `skills install`
