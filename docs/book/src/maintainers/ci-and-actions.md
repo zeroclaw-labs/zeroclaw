@@ -134,6 +134,7 @@ Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The `fmt`, `nix-e
 
 | Symptom | First thing to check |
 |---|---|
+| Any workflow dies at `startup_failure` (zero jobs) | An action or reusable-workflow ref is missing from the [allowlist](#allowed-actions). Fix the repo Actions settings, wait a few minutes for propagation, then dispatch a **fresh** run — never Re-run a startup failure, it can wedge in `queued` and hold the concurrency slot |
 | `CI Required Gate` red | Start with `fmt`, then `lint`, then `test`, then `build` |
 | Release `validate` failed | `Cargo.toml` version doesn't match the workflow input, or the tag already exists |
 | Release build leg failed | The specific target's job log. Android is `experimental` and runs with `continue-on-error` |
