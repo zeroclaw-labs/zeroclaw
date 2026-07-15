@@ -27,7 +27,6 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
-// tempfile is used so large system prompts never hit OS ARG_MAX via `-p`.
 
 /// Default `grok` binary name (resolved via `PATH`).
 const DEFAULT_GROK_CLI_BINARY: &str = "grok";
@@ -127,18 +126,24 @@ impl GrokCliModelProvider {
 
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
         // Write prompt to a temp file — ZeroClaw system prompts routinely
-        // exceed ARG_MAX when passed as a `-p` argv token.
-        let mut prompt_file = tempfile::NamedTempFile::new().map_err(|err| {
-            anyhow::Error::msg(format!("Failed to create temp prompt file for Grok CLI: {err}"))
-        })?;
-        use std::io::Write;
-        prompt_file.write_all(message.as_bytes()).map_err(|err| {
-            anyhow::Error::msg(format!("Failed to write Grok CLI prompt file: {err}"))
-        })?;
-        prompt_file.flush().map_err(|err| {
-            anyhow::Error::msg(format!("Failed to flush Grok CLI prompt file: {err}"))
-        })?;
-        let prompt_path = prompt_file.path().to_path_buf();
+        // exceed ARG_MAX when passed as a `-p` argv token. Use std only
+        // (no extra crate dep): unique path under the process temp dir.
+        let prompt_path = std::env::temp_dir().join(format!(
+            "zeroclaw-grok-prompt-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        tokio::fs::write(&prompt_path, message.as_bytes())
+            .await
+            .map_err(|err| {
+                anyhow::Error::msg(format!(
+                    "Failed to write Grok CLI prompt file {}: {err}",
+                    prompt_path.display()
+                ))
+            })?;
 
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(Self::build_cli_args(model, &prompt_path));
@@ -146,46 +151,37 @@ impl GrokCliModelProvider {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn().map_err(|err| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "binary": self.binary_path.display().to_string(),
-                        "phase": "spawn",
-                        "error": format!("{}", err),
-                    })),
-                "grok_cli: failed to spawn binary"
-            );
-            anyhow::Error::msg(format!(
-                "Failed to spawn Grok Build CLI binary at {}: {err}. \
-                 Ensure `grok` is installed and on PATH \
-                 (e.g. ~/.grok/bin), or set binary_path on the provider alias.",
-                self.binary_path.display()
-            ))
-        })?;
-
-        let output = timeout(GROK_CLI_REQUEST_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| {
+        let spawn_result = cmd.spawn();
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&prompt_path).await;
                 ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "binary": self.binary_path.display().to_string(),
-                            "timeout": format!("{:?}", GROK_CLI_REQUEST_TIMEOUT),
+                            "phase": "spawn",
+                            "error": format!("{}", err),
                         })),
-                    "grok_cli: request timed out"
+                    "grok_cli: failed to spawn binary"
                 );
-                anyhow::Error::msg(format!(
-                    "Grok Build CLI request timed out after {:?} (binary: {})",
-                    GROK_CLI_REQUEST_TIMEOUT,
+                return Err(anyhow::Error::msg(format!(
+                    "Failed to spawn Grok Build CLI binary at {}: {err}. \
+                     Ensure `grok` is installed and on PATH \
+                     (e.g. ~/.grok/bin), or set binary_path on the provider alias.",
                     self.binary_path.display()
-                ))
-            })?
-            .map_err(|err| {
+                )));
+            }
+        };
+
+        let wait_result = timeout(GROK_CLI_REQUEST_TIMEOUT, child.wait_with_output()).await;
+        let _ = tokio::fs::remove_file(&prompt_path).await;
+
+        let output = match wait_result {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -196,11 +192,28 @@ impl GrokCliModelProvider {
                         })),
                     "grok_cli: process wait failed"
                 );
-                anyhow::Error::msg(format!("Grok Build CLI process failed: {err}"))
-            })?;
-
-        // Keep prompt_file alive until the process exits (NamedTempFile drops unlink).
-        drop(prompt_file);
+                return Err(anyhow::Error::msg(format!(
+                    "Grok Build CLI process failed: {err}"
+                )));
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "binary": self.binary_path.display().to_string(),
+                            "timeout": format!("{:?}", GROK_CLI_REQUEST_TIMEOUT),
+                        })),
+                    "grok_cli: request timed out"
+                );
+                return Err(anyhow::Error::msg(format!(
+                    "Grok Build CLI request timed out after {:?} (binary: {})",
+                    GROK_CLI_REQUEST_TIMEOUT,
+                    self.binary_path.display()
+                )));
+            }
+        };
 
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
