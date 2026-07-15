@@ -79,35 +79,62 @@ const navGroups: NavGroup[] = [
 // the right shown on hover OR keyboard focus.
 //
 // The popover is rendered into `document.body` via `createPortal` so it
-// escapes the desktop `<nav>`'s `overflow-x-hidden` clipping context (the
-// `<nav>` is a scroll container with `overflow-y: auto` + `overflow-x:
-// hidden`, and any absolutely-positioned descendant that extends past its
-// right border — including this popover — is clipped by the nav). With the
-// portal, the popover is rendered outside the nav's DOM subtree and the
-// clipping no longer applies; `position: fixed` then pins it to viewport
-// coords computed from the NavLink's bounding rect, with `scroll` /
-// `resize` listeners re-anchoring it while it is visible.
+// lives outside the desktop `<nav>`'s DOM subtree (the `<nav>` is a scroll
+// container with `overflow-y: auto`; rendering the popover inside the
+// subtree would make it a positioned descendant of that scroll container,
+// which we don't want). With the portal, the popover is rendered into
+// the top-level body and `position: fixed` pins it to viewport coords
+// computed from the NavLink's bounding rect, with `scroll` / `resize`
+// listeners re-anchoring it while it is visible. The `<nav>`'s
+// `overflow-x: hidden` (round-1 band-aid for #8791) is removed in round-3
+// of this PR: the portal alone keeps the rail at `scrollWidth ===
+// clientWidth`, so the band-aid is no longer required.
 function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   const linkRef = useRef<HTMLAnchorElement>(null);
-  // Vertical center of the hovered / focused NavLink in viewport coords.
-  // `null` when the popover should not render.
+  // Tooltip anchor in viewport coords, derived from the DOM: `tooltipTop`
+  // is the vertical center of the NavLink (so the popover visually aligns
+  // with the icon) and `tooltipLeft` is the rail's right edge (the closest
+  // `<aside>`) plus the 8 px gap that round-1 established with `ml-2` —
+  // i.e. the popover sits flush against the rail. Both are `null` together
+  // when the popover should not render. Deriving both from the rect means
+  // the rail's `w-14` width is no longer hard-coded into the popover's
+  // horizontal position.
   const [tooltipTop, setTooltipTop] = useState<number | null>(null);
+  const [tooltipLeft, setTooltipLeft] = useState<number | null>(null);
 
   const showTooltip = () => {
-    const rect = linkRef.current?.getBoundingClientRect();
-    if (rect) setTooltipTop(rect.top + rect.height / 2);
+    const linkRect = linkRef.current?.getBoundingClientRect();
+    // Anchor the popover to the rail's right edge (the closest `<aside>`),
+    // not the link's right edge. Round-1 hard-coded `left: 64` because the
+    // rail is `w-14` (56 px) and the desired gap is 8 px; deriving from the
+    // rail's actual rect keeps the visual gap stable regardless of how the
+    // link is positioned within the rail (centered icon, full-width item,
+    // future layout changes, etc.) — i.e. the rail's `w-14` is no longer
+    // duplicated into the popover's horizontal position.
+    const railRect = linkRef.current?.closest('aside')?.getBoundingClientRect();
+    if (linkRect && railRect) {
+      setTooltipTop(linkRect.top + linkRect.height / 2);
+      setTooltipLeft(railRect.right + 8); // 8 px gap, matches the round-1 ml-2
+    }
   };
-  const hideTooltip = () => setTooltipTop(null);
+  const hideTooltip = () => {
+    setTooltipTop(null);
+    setTooltipLeft(null);
+  };
 
   // Re-anchor while the popover is visible so it tracks the NavLink across
   // viewport scrolls and resize events. Cleanup on unmount.
   useEffect(() => {
     if (tooltipTop === null) return;
     const update = () => {
-      const rect = linkRef.current?.getBoundingClientRect();
-      if (rect) setTooltipTop(rect.top + rect.height / 2);
+      const linkRect = linkRef.current?.getBoundingClientRect();
+      const railRect = linkRef.current?.closest('aside')?.getBoundingClientRect();
+      if (linkRect && railRect) {
+        setTooltipTop(linkRect.top + linkRect.height / 2);
+        setTooltipLeft(railRect.right + 8);
+      }
     };
     window.addEventListener('scroll', update, true);
     window.addEventListener('resize', update);
@@ -165,7 +192,7 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
             className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
             style={{
               top: tooltipTop,
-              left: 64, // rail width (56 px) + 8 px gap, matches the round-1 ml-2
+              left: tooltipLeft ?? 0, // set iff tooltipTop is set; see showTooltip
               transform: 'translateY(-50%)',
               background: 'var(--pc-bg-elevated)',
               color: 'var(--pc-text-primary)',
@@ -277,7 +304,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         aria-label={t('nav.aria.primary')}
       >
         <RailLogo />
-        <nav className="flex-1 overflow-y-auto overflow-x-hidden py-3 px-1.5" aria-label={t('nav.aria.primary')}>
+        <nav className="flex-1 overflow-y-auto py-3 px-1.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
