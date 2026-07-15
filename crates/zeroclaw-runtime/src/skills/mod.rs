@@ -5362,7 +5362,7 @@ mod install_transaction_tests {
             installed_at: 0,
             accepted_hash: None,
         };
-        receipt::write_receipt(&install_root, &receipt).unwrap();
+        receipt::write_receipt(&install_root, "clean-skill", &receipt).unwrap();
 
         assert_eq!(
             receipt::verify_skill(&install_root, "clean-skill", &report.dir).unwrap(),

@@ -151,27 +151,33 @@ pub fn receipts_dir(install_root: &Path) -> PathBuf {
     install_root.join("state").join("skill-receipts")
 }
 
-/// Path of a named skill's receipt.
-pub fn receipt_path(install_root: &Path, name: &str) -> PathBuf {
-    receipts_dir(install_root).join(format!("{name}.json"))
+/// Path of the receipt filed under `key`. The key is a location-qualified
+/// identifier chosen by the caller (a skill name is unique only within one
+/// install location, so the caller distinguishes bundle-vs-global copies), kept
+/// separate from the receipt's display `name`.
+pub fn receipt_path(install_root: &Path, key: &str) -> PathBuf {
+    receipts_dir(install_root).join(format!("{key}.json"))
 }
 
-/// Persist a receipt. A write failure is the caller's to treat as a warning,
-/// not a rollback (the skill is already installed).
-pub fn write_receipt(install_root: &Path, receipt: &SkillInstallReceipt) -> Result<()> {
-    let dir = receipts_dir(install_root);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create receipts dir {}", dir.display()))?;
-    let path = receipt_path(install_root, &receipt.name);
+/// Persist a receipt under `key`. A write failure is the caller's to treat as a
+/// warning, not a rollback (the skill is already installed).
+pub fn write_receipt(install_root: &Path, key: &str, receipt: &SkillInstallReceipt) -> Result<()> {
+    let path = receipt_path(install_root, key);
+    // The key may include a location sub-directory (`<loc>/<name>`), so create
+    // the immediate parent rather than only the receipts root.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create receipts dir {}", parent.display()))?;
+    }
     let json = serde_json::to_string_pretty(receipt).context("failed to serialize receipt")?;
     std::fs::write(&path, json)
         .with_context(|| format!("failed to write receipt {}", path.display()))?;
     Ok(())
 }
 
-/// Read a named skill's receipt, if present and parseable.
-pub fn read_receipt(install_root: &Path, name: &str) -> Option<SkillInstallReceipt> {
-    let path = receipt_path(install_root, name);
+/// Read the receipt filed under `key`, if present and parseable.
+pub fn read_receipt(install_root: &Path, key: &str) -> Option<SkillInstallReceipt> {
+    let path = receipt_path(install_root, key);
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -187,9 +193,9 @@ pub enum VerifyStatus {
     NoReceipt,
 }
 
-/// Verify an installed skill directory against its stored receipt.
-pub fn verify_skill(install_root: &Path, name: &str, skill_dir: &Path) -> Result<VerifyStatus> {
-    let Some(receipt) = read_receipt(install_root, name) else {
+/// Verify an installed skill directory against its receipt (filed under `key`).
+pub fn verify_skill(install_root: &Path, key: &str, skill_dir: &Path) -> Result<VerifyStatus> {
+    let Some(receipt) = read_receipt(install_root, key) else {
         return Ok(VerifyStatus::NoReceipt);
     };
     let current = compute_tree_hash(skill_dir)?;
@@ -448,7 +454,7 @@ mod tests {
             VerifyStatus::NoReceipt
         );
 
-        write_receipt(&install_root, &receipt).unwrap();
+        write_receipt(&install_root, "skill", &receipt).unwrap();
         let back = read_receipt(&install_root, "skill").unwrap();
         assert_eq!(back.tree_hash, tree_hash);
 
