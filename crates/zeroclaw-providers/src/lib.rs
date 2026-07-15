@@ -43,6 +43,7 @@ pub mod router;
 pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
+pub mod vision_override;
 
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 
@@ -640,6 +641,11 @@ pub struct ModelProviderRuntimeOptions {
     /// Enable or disable chain-of-thought thinking. Forwarded as
     /// `enable_thinking` in the request body. `None` lets the model decide.
     pub think: Option<bool>,
+    /// Override the provider's vision (image input) capability. `None` keeps
+    /// the provider family's built-in default; `Some(false)` marks a text-only
+    /// model served by a vision-capable family as non-vision. Mapped from
+    /// `ModelProviderConfig::vision`.
+    pub vision: Option<bool>,
     /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
@@ -666,6 +672,7 @@ impl Default for ModelProviderRuntimeOptions {
             native_tools: None,
             wire_api: None,
             think: None,
+            vision: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
         }
@@ -736,6 +743,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
+        vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
     }
@@ -807,6 +815,10 @@ pub fn options_for_provider_ref(
             let mut options = fallback.clone();
             options.provider_kind = None;
             options.provider_api_url = None;
+            // `vision` is provider-specific: a bare family ref must not inherit
+            // the fallback provider's capability flag. Clearing it falls back to
+            // the family default (or the choke point's own resolution).
+            options.vision = None;
             options
         }
     }
@@ -1180,6 +1192,24 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
+/// Apply the config `vision` capability override to a freshly-constructed
+/// provider. Called at every exit of `create_model_provider_inner`, the single
+/// construction choke point every subsystem funnels through, so the override
+/// lands once and `supports_vision()` stays consistent across the
+/// vision-routing gate, the channel media pipeline, and the model router
+/// without per-family or per-consumer re-derivation.
+fn apply_vision_override(
+    provider: Box<dyn ModelProvider>,
+    vision: Option<bool>,
+) -> Box<dyn ModelProvider> {
+    match vision {
+        Some(vision) => Box::new(vision_override::VisionOverrideProvider::new(
+            provider, vision,
+        )),
+        None => provider,
+    }
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1224,9 +1254,12 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
-            alias, options, api_key,
-        )?));
+        return Ok(apply_vision_override(
+            Box::new(openai_codex::OpenAiCodexModelProvider::new(
+                alias, options, api_key,
+            )?),
+            options.vision,
+        ));
     }
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream model_provider storage of the value
@@ -1289,13 +1322,17 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(factory::apply_compat_options(
-            factory::build_kimi_code_compat(alias, key, base_url),
-            options,
+        return Ok(apply_vision_override(
+            factory::apply_compat_options(
+                factory::build_kimi_code_compat(alias, key, base_url),
+                options,
+            ),
+            options.vision,
         ));
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
+        .map(|provider| apply_vision_override(provider, options.vision))
 }
 
 /// Wrap the primary model_provider in a retry/backoff harness, threading auth runtime options.
@@ -2435,6 +2472,74 @@ mod tests {
     fn factory_llamacpp() {
         assert!(create_model_provider("llamacpp", Some("key")).is_ok());
         assert!(create_model_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn vision_override_applies_once_at_construction_for_any_family() {
+        // llama.cpp and the generic custom endpoint both default to
+        // vision-capable. `vision = Some(false)` must mark the constructed
+        // provider non-vision regardless of family, and show up in BOTH
+        // `supports_vision()` and `capabilities().vision` so every consumer
+        // (routing gate, media pipeline, model router) agrees.
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            let off = ModelProviderRuntimeOptions {
+                vision: Some(false),
+                ..Default::default()
+            };
+            let provider =
+                create_model_provider_inner(None, name, "default", None, None, &off).unwrap();
+            assert!(
+                !provider.supports_vision(),
+                "{name}: vision=false should mark the provider non-vision"
+            );
+            assert!(
+                !provider.capabilities().vision,
+                "{name}: capabilities().vision must stay consistent with supports_vision()"
+            );
+
+            // `None` preserves the family default (vision-capable here).
+            let provider = create_model_provider_inner(
+                None,
+                name,
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                provider.supports_vision(),
+                "{name}: no override should keep the family default"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.vision, Some(false));
+    }
+
+    #[test]
+    fn options_for_bare_provider_ref_does_not_inherit_fallback_vision() {
+        use zeroclaw_config::schema::Config;
+        // A bare family ref (no alias) must not inherit the fallback provider's
+        // `vision` flag — otherwise a `-p llamacpp` override would carry the
+        // agent provider's capability. Falls back to the family default.
+        let fallback = ModelProviderRuntimeOptions {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let resolved = options_for_provider_ref(&Config::default(), "llamacpp", &fallback);
+        assert_eq!(resolved.vision, None);
     }
 
     #[test]

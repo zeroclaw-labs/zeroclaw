@@ -1202,6 +1202,25 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// Resolve the `vision` capability override for the *actual* provider being
+/// constructed. Unlike api_key/uri, vision never falls back to the agent's
+/// provider: a `--provider` override or a bare family ref must use its own
+/// provider's flag (or the family default when it has no dedicated alias
+/// entry), never inherit the agent alias's capability. This mirrors the
+/// alias-specific resolution that stops a `-p` override from leaking the
+/// agent's key.
+fn vision_override_for_provider(
+    config: &zeroclaw_config::schema::Config,
+    provider_name: &str,
+) -> Option<bool> {
+    let (family, alias) = provider_name.split_once('.')?;
+    config
+        .providers
+        .models
+        .find(family, alias)
+        .and_then(|entry| entry.vision)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1497,12 +1516,16 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options = match agent_provider_resolved.as_ref() {
+        let mut provider_runtime_options = match agent_provider_resolved.as_ref() {
             Some((ty, alias, _)) => {
                 zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
             }
             None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
         };
+        // `vision` is provider-specific and must track `provider_name` (which may
+        // be a `--provider` override distinct from the agent's provider), not the
+        // agent alias — same rationale as the api_key/uri resolution below.
+        provider_runtime_options.vision = vision_override_for_provider(&config, &provider_name);
 
         // Resolve api_key and uri from the actual provider being constructed.
         // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
@@ -3446,7 +3469,41 @@ mod tests {
         apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
+        vision_override_for_provider,
     };
+
+    #[test]
+    fn vision_override_for_provider_tracks_selected_provider_not_agent() {
+        use zeroclaw_config::schema::Config;
+        // Two aliases of the same family with opposite vision flags: a
+        // `--provider` override or model switch must resolve the SELECTED
+        // provider's flag, never inherit the agent alias's.
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.llamacpp.text_model]
+model = "qwen3-4b"
+vision = false
+[providers.models.llamacpp.vision_model]
+model = "qwen2.5-vl-7b"
+vision = true
+"#,
+        )
+        .expect("config parses");
+
+        assert_eq!(
+            vision_override_for_provider(&config, "llamacpp.text_model"),
+            Some(false)
+        );
+        assert_eq!(
+            vision_override_for_provider(&config, "llamacpp.vision_model"),
+            Some(true)
+        );
+        // A bare family ref inherits nothing (falls back to the family default).
+        assert_eq!(vision_override_for_provider(&config, "llamacpp"), None);
+        // An unknown alias resolves to nothing.
+        assert_eq!(vision_override_for_provider(&config, "llamacpp.nope"), None);
+    }
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
