@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::{Arc, OnceLock};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_memory::{Memory, MemoryCategory};
 
@@ -191,7 +191,7 @@ impl Tool for SharedMemoryStoreTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -202,7 +202,7 @@ impl Tool for SharedMemoryStoreTool {
         let Some(writable) = self.memory.as_shared_writable() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-not-available",
                     &[("tier", self.tier.tier_label())],
@@ -217,7 +217,7 @@ impl Tool for SharedMemoryStoreTool {
         if bank.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-no-bank",
                     &[("tier", self.tier.tier_label())],
@@ -235,12 +235,13 @@ impl Tool for SharedMemoryStoreTool {
                 output: Self::tool_msg_with_args(
                     "tool-shared-memory-store-success",
                     &[("tier", self.tier.tier_label()), ("key", key)],
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-shared-memory-store-error-failed",
                     &[("tier", self.tier.tier_label()), ("error", &e.to_string())],
