@@ -1416,19 +1416,16 @@ impl ModelProvider for AnthropicModelProvider {
                     );
                     None
                 })?;
-                Some(ToolSpec {
-                    name: name.to_string(),
-                    description: func
-                        .get("description")
+                Some(ToolSpec::new(
+                    name.to_string(),
+                    func.get("description")
                         .and_then(|d| d.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    parameters: std::sync::Arc::new(
-                        func.get("parameters")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({"type": "object"})),
-                    ),
-                })
+                    func.get("parameters")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({"type": "object"})),
+                ))
             })
             .collect();
 
@@ -2633,16 +2630,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_tools_adds_cache_to_last_tool() {
         let tools = vec![
-            ToolSpec {
-                name: "tool1".to_string(),
-                description: "First tool".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
-            ToolSpec {
-                name: "tool2".to_string(),
-                description: "Second tool".to_string(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new("tool1", "First tool", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "tool2",
+                "Second tool",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -2654,11 +2647,11 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_single_tool_gets_cache() {
-        let tools = vec![ToolSpec {
-            name: "tool1".to_string(),
-            description: "Only tool".to_string(),
-            parameters: serde_json::json!({"type": "object"}).into(),
-        }];
+        let tools = vec![ToolSpec::new(
+            "tool1",
+            "Only tool",
+            serde_json::json!({"type": "object"}),
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
@@ -2668,10 +2661,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_cleans_ref_from_input_schema() {
-        let tools = vec![ToolSpec {
-            name: "query".to_string(),
-            description: "Search with a ref".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "query",
+            "Search with a ref",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "filter": {
@@ -2686,9 +2679,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                         }
                     }
                 }
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
@@ -2702,10 +2694,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_cleans_definitions_from_input_schema() {
-        let tools = vec![ToolSpec {
-            name: "query".to_string(),
-            description: "Search with a definitions ref".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "query",
+            "Search with a definitions ref",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "filter": {
@@ -2720,9 +2712,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                         }
                     }
                 }
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;

@@ -333,7 +333,11 @@ These norms are documented in
 8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
 9. **Never merge.** Never push to contributor branches.
-10. **Never approve over another reviewer's active CHANGES_REQUESTED.**
-   Check the reviews API output before choosing a verdict flag.
+10. **Never approve while another reviewer's substantive concern remains unresolved.**
+   Check the reviews API output and current diff before choosing a verdict flag.
+   A `CHANGES_REQUESTED` state left on an older head is not automatically an
+   unresolved concern. Follow the protocol: verify the concern is resolved,
+   explain that reconciliation in the review body, and remember that your
+   approval does not clear the other review state for merge.
 11. **Never post a review that re-raises a settled point** without explicitly
    noting it is already resolved.

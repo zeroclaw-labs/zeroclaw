@@ -623,12 +623,31 @@ impl TelegramChannel {
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         mention_only: bool,
     ) -> Self {
+        let alias = alias.into();
         let has_peers = !peer_resolver().is_empty();
         let pairing = if has_peers {
             None
         } else {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
+                // Surface the one-time bind code through the structured log,
+                // not just stdout. A backgrounded daemon (launchd/systemd/
+                // GUI-spawned) discards stdout, so the println! alone leaves
+                // the operator with no way to retrieve the code. The log
+                // lands in runtime-trace.jsonl, the gateway log stream, and
+                // `zeroclaw service logs`. Tag it `Channel` (not the default
+                // `Internal`) so it survives the web Logs page's default
+                // hide-internal filter and is visible without unticking it.
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias.as_str(),
+                            "pairing_code": code.as_str(),
+                        })),
+                    "Telegram pairing required; one-time bind code issued"
+                );
                 println!("  🔐 Telegram pairing required. One-time bind code: {code}");
                 println!("     Send `{TELEGRAM_BIND_COMMAND} <code>` from your Telegram account.");
             }
@@ -637,7 +656,7 @@ impl TelegramChannel {
 
         Self {
             bot_token,
-            alias: alias.into(),
+            alias,
             peer_resolver,
             persist: None,
             pairing,
@@ -994,6 +1013,18 @@ impl TelegramChannel {
             .as_ref()
             .and_then(PairingGuard::pairing_code)
             .is_some()
+    }
+
+    /// Build the operator-facing `zeroclaw channel bind-telegram` command for
+    /// this channel's alias. The CLI defaults to the `default` alias, so only
+    /// non-default aliases need the explicit `--alias` flag — emitting it for
+    /// the default case would just be noise.
+    fn suggested_bind_command(alias: &str, identity: &str) -> String {
+        if alias == "default" {
+            format!("zeroclaw channel bind-telegram {identity}")
+        } else {
+            format!("zeroclaw channel bind-telegram {identity} --alias {alias}")
+        }
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -1699,19 +1730,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or_else(|| "YOUR_TELEGRAM_ID".to_string());
 
+        // Emit the bind command scoped to THIS channel's alias. The CLI
+        // handler defaults to the `default` alias, so an alias-less command
+        // would silently bind the wrong peer group for a non-default agent
+        // and the bot would keep demanding approval.
+        let bind_command = Self::suggested_bind_command(&self.alias, &suggested_identity);
+
         let _ = self
             .send(&SendMessage::new(
                 format!(
-                    "🔐 This bot requires operator approval.\n\nCopy this command to operator terminal:\n`zeroclaw channel bind-telegram {suggested_identity}`\n\nAfter operator runs it, send your message again."
+                    "🔐 This bot requires operator approval.\n\nCopy this command to the operator terminal:\n`{bind_command}`\n\nAfter the operator runs it, send your message again."
                 ),
                 &chat_id,
             ))
             .await;
 
-        if self.pairing_code_active() {
+        // Only offer the `/bind <code>` path while the channel is genuinely
+        // unpaired. Once peers exist (resolved live), the one-time code is
+        // moot and the hint just confuses an operator who already authorized
+        // someone — the "already assigned but still asks" complaint.
+        if self.pairing_code_active() && (self.peer_resolver)().is_empty() {
             let _ = self
                 .send(&SendMessage::new(
-                    "ℹ️ If operator provides a one-time pairing code, you can also run `/bind <code>`.",
+                    "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
                     &chat_id,
                 ))
                 .await;
@@ -4960,6 +5001,27 @@ mod tests {
     fn telegram_extract_bind_code_rejects_invalid_forms() {
         assert_eq!(TelegramChannel::extract_bind_code("/bind"), None);
         assert_eq!(TelegramChannel::extract_bind_code("/start"), None);
+    }
+
+    #[test]
+    fn suggested_bind_command_omits_alias_flag_for_default() {
+        // The CLI defaults to the `default` alias, so the short form must
+        // stay byte-identical for existing default-alias users.
+        assert_eq!(
+            TelegramChannel::suggested_bind_command("default", "123456789"),
+            "zeroclaw channel bind-telegram 123456789"
+        );
+    }
+
+    #[test]
+    fn suggested_bind_command_appends_alias_flag_for_non_default() {
+        // A non-default agent must get the `--alias` flag or the operator's
+        // copy-pasted command binds the wrong peer group and the bot keeps
+        // asking for approval.
+        assert_eq!(
+            TelegramChannel::suggested_bind_command("alerts", "123456789"),
+            "zeroclaw channel bind-telegram 123456789 --alias alerts"
+        );
     }
 
     #[test]
