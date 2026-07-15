@@ -2892,6 +2892,7 @@ impl DelegateTool {
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
+                        model_context_window: loop_runtime.model_context_window,
                         knobs: &LoopKnobs::default(),
                     },
                 ),

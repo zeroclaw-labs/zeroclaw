@@ -69,6 +69,9 @@ pub(crate) async fn try_recover_context_overflow(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     observer: &dyn Observer,
     context_token_budget: usize,
+    model_context_window: usize,
+    agent_alias: Option<&str>,
+    turn_id: &str,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
@@ -83,7 +86,22 @@ pub(crate) async fn try_recover_context_overflow(
         // forced below the current size. Never splits a tool_use/tool_result
         // pair, never silently shrinks a result. Whole turns or nothing.
         let tokens_now = estimate_history_tokens(history);
-        let budget = tokens_now.saturating_mul(2) / 3;
+        let window_ceiling = if model_context_window > 0 {
+            Some(model_context_window - model_context_window / 10)
+        } else {
+            None
+        };
+        let budget_ceiling = match (context_token_budget, window_ceiling) {
+            (b, Some(w)) if b > 0 => b.min(w),
+            (b, None) if b > 0 => b,
+            (_, Some(w)) => w,
+            (_, None) => 0,
+        };
+        let budget = if budget_ceiling > 0 && budget_ceiling < tokens_now {
+            budget_ceiling
+        } else {
+            tokens_now.saturating_mul(2) / 3
+        };
         let owned = std::mem::take(history);
         let result = trim_to_recent_turns(owned, budget);
         let trimmed = result.trimmed;
@@ -114,6 +132,8 @@ pub(crate) async fn try_recover_context_overflow(
                         "dropped_messages": dropped_messages,
                         "tokens_before": tokens_now,
                         "tokens_after": tokens_after,
+                        "agent_alias": agent_alias,
+                        "turn_id": turn_id,
                     })),
                 "Context recovery: dropped oldest whole turns, retrying"
             );
@@ -132,8 +152,8 @@ pub(crate) async fn try_recover_context_overflow(
                 kept_turns,
                 reason,
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
             });
             return true;
         }
@@ -202,8 +222,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+            0,
+            None,
+            "test",
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -247,8 +277,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            100,
+            0,
+            None,
+            "test",
+        )
+        .await;
 
         assert!(
             !recovered,
@@ -274,8 +314,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+            0,
+            None,
+            "test",
+        )
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -306,8 +356,18 @@ mod tests {
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            &observer,
+            budget,
+            0,
+            None,
+            "test",
+        )
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
@@ -370,5 +430,91 @@ mod tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for CapturingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    #[tokio::test]
+    async fn recovery_trims_to_model_window_ceiling_not_blind_two_thirds() {
+        let mut history = overflowing_history();
+        let tokens_now = estimate_history_tokens(&history);
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = NoopObserver;
+
+        let model_window = tokens_now / 3;
+        let ceiling = model_window - model_window / 10;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            &observer,
+            usize::MAX,
+            model_window,
+            None,
+            "test",
+        )
+        .await;
+
+        assert!(recovered, "an overflowing history must trim and recover");
+        let after = estimate_history_tokens(&history);
+        assert!(
+            after <= ceiling || after < tokens_now * 2 / 3,
+            "recovery must trim toward the window ceiling ({ceiling}), got {after} from {tokens_now}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_event_carries_agent_alias_and_turn_id() {
+        let mut history = overflowing_history();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = CapturingObserver::default();
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            &observer,
+            32_000,
+            0,
+            Some("exploration"),
+            "turn-xyz",
+        )
+        .await;
+
+        assert!(recovered);
+        let events = observer.events.lock();
+        let trimmed = events
+            .iter()
+            .find_map(|e| match e {
+                ObserverEvent::HistoryTrimmed {
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => Some((agent_alias.clone(), turn_id.clone())),
+                _ => None,
+            })
+            .expect("recovery must emit a HistoryTrimmed observer event");
+        assert_eq!(trimmed.0.as_deref(), Some("exploration"));
+        assert_eq!(trimmed.1.as_deref(), Some("turn-xyz"));
     }
 }
