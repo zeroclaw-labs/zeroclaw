@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
+pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
 pub mod model_pin;
@@ -1064,6 +1065,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "volcengine" | "ark" | "doubao-cn" => "doubao",
         // Gemini CLI is its own typed slot (subprocess runtime).
         "gemini-cli" => "gemini_cli",
+        // Grok Build CLI is its own typed slot (subprocess runtime).
+        "grok-cli" | "grokcli" => "grok_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -1913,6 +1916,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
+            ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("lmstudio", "LM Studio", true),
@@ -2998,6 +3002,11 @@ mod tests {
     fn factory_gemini_cli() {}
 
     #[test]
+    fn factory_grok_cli() {
+        assert!(create_model_provider("grok_cli", None).is_ok());
+    }
+
+    #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
     }
@@ -3368,6 +3377,7 @@ mod tests {
             "cohere",
             "copilot",
             "gemini_cli",
+            "grok_cli",
             "kilocli",
             "nvidia",
             "astrai",

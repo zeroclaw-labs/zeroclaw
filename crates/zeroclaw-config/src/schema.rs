@@ -2660,6 +2660,33 @@ pub struct GeminiCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Grok Build CLI (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GrokCliEndpoint {
+    #[default]
+    LocalSubprocess,
+}
+impl ModelEndpoint for GrokCliEndpoint {
+    fn uri(&self) -> &'static str {
+        // Subprocess — no remote endpoint. Sentinel for trait conformity.
+        "subprocess://grok-cli"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.grok_cli"]
+pub struct GrokCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+}
+
 // ── LMStudio (local default) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3291,6 +3318,7 @@ impl_default_family_endpoint! {
     BaichuanModelProviderConfig,
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
+    GrokCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,
     SglangModelProviderConfig,

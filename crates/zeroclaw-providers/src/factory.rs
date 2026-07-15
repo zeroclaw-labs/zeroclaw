@@ -383,6 +383,7 @@ use zeroclaw_config::schema::{
     DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
     FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
+    GrokCliModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
     KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
@@ -1368,6 +1369,25 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
                 .binary_path(self.binary_path.as_deref())
                 .build(),
         ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for GrokCliModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        _key: Option<&str>,
+        _api_url: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        Ok(Box::new(crate::grok_cli::GrokCliModelProvider::new(
+            alias,
+            self.binary_path.as_deref(),
+        )))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {

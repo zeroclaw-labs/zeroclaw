@@ -221,6 +221,7 @@ pub enum ModelProviderKind {
     Ollama,
     Gemini,
     GeminiCli,
+    GrokCli,
     GoogleAi,
     Mistral,
     Groq,

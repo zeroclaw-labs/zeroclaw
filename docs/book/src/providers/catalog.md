@@ -36,6 +36,11 @@ Google's Gemini API. Supports vision and pre-executed grounded search (see [Stre
 
 Shells out to the `gemini` CLI; uses the CLI's existing auth.
 
+### Grok Build CLI: slot `grok_cli`
+
+Shells out to the Grok Build CLI (`grok -p` headless); uses the CLI's own
+login / `XAI_API_KEY`. Optional `binary_path` when `grok` is not on `PATH`.
+
 ### Azure OpenAI: slot `azure`
 
 `resource`, `deployment`, and `api_version` live in this typed config, they are not read from environment variables.
