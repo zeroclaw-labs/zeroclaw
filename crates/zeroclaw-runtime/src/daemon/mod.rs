@@ -883,7 +883,9 @@ async fn await_startup_readiness(
 /// the `Ready` arm prints endpoint addresses — using the gateway's actual
 /// bound address reported through the readiness signal — so the "started"
 /// claim can never precede endpoint availability. The `Starting` arm
-/// announces no endpoints.
+/// announces no endpoints. Every line renders through the Fluent `cli-*`
+/// catalogue (`locales/*/cli.ftl`), the repository's source of truth for
+/// operator-facing CLI/daemon output.
 fn echo_daemon_started_to_terminal<W: std::io::Write>(
     config: &Config,
     host: &str,
@@ -891,9 +893,11 @@ fn echo_daemon_started_to_terminal<W: std::io::Write>(
     readiness: &StartupReadiness,
     mut out: W,
 ) -> std::io::Result<()> {
+    use crate::i18n::{
+        get_required_cli_string as cli_t, get_required_cli_string_with_args as cli_ta,
+    };
     match readiness {
         StartupReadiness::Ready { gateway_addr } => {
-            writeln!(out, "🧠 ZeroClaw daemon started")?;
             // Print the endpoint the listener actually bound (reported via
             // the readiness signal), falling back to the configured
             // host:port when no gateway is supervised in-process.
@@ -901,33 +905,42 @@ fn echo_daemon_started_to_terminal<W: std::io::Write>(
                 Some(addr) => format!("http://{addr}"),
                 None => format!("http://{host}:{port}"),
             };
-            writeln!(out, "   Gateway:  {gateway_url}")?;
+            let socket_path = crate::rpc::local::socket_path(config).display().to_string();
+            writeln!(out, "{}", cli_t("cli-daemon-started-title"))?;
             writeln!(
                 out,
-                "   Socket:   {}",
-                crate::rpc::local::socket_path(config).display()
+                "   {}",
+                cli_ta(
+                    "cli-daemon-started-gateway",
+                    &[("url", gateway_url.as_str())]
+                )
             )?;
             writeln!(
                 out,
-                "   Components: gateway, channels, heartbeat, scheduler"
+                "   {}",
+                cli_ta(
+                    "cli-daemon-started-socket",
+                    &[("path", socket_path.as_str())]
+                )
             )?;
+            writeln!(out, "   {}", cli_t("cli-daemon-started-components"))?;
             if config.gateway.require_pairing {
-                writeln!(
-                    out,
-                    "   Pairing:    enabled (code appears in gateway output above)"
-                )?;
+                writeln!(out, "   {}", cli_t("cli-daemon-started-pairing"))?;
             }
-            writeln!(out, "   Ctrl+C or SIGTERM to stop")?;
+            writeln!(out, "   {}", cli_t("cli-daemon-started-stop"))?;
         }
         StartupReadiness::Starting => {
-            writeln!(out, "🧠 ZeroClaw daemon starting…")?;
+            let seconds = STARTUP_READINESS_TIMEOUT.as_secs().to_string();
+            writeln!(out, "{}", cli_t("cli-daemon-starting-title"))?;
             writeln!(
                 out,
-                "   Endpoints not confirmed after {}s — the gateway/socket are still \
-                 binding or in supervisor retry. Watch the log for readiness.",
-                STARTUP_READINESS_TIMEOUT.as_secs()
+                "   {}",
+                cli_ta(
+                    "cli-daemon-starting-detail",
+                    &[("seconds", seconds.as_str())]
+                )
             )?;
-            writeln!(out, "   Ctrl+C or SIGTERM to stop")?;
+            writeln!(out, "   {}", cli_t("cli-daemon-started-stop"))?;
         }
     }
     Ok(())
@@ -2433,6 +2446,10 @@ mod tests {
 
     #[test]
     fn foreground_echo_lists_all_pre_7934_lines_when_pairing_enabled() {
+        // Pin the process locale so the locale-aware resolver renders the
+        // canonical English catalogue (first `init` wins; no other runtime
+        // test initializes a locale).
+        crate::i18n::init("en");
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.gateway.require_pairing = true;
@@ -2448,44 +2465,55 @@ mod tests {
         .expect("foreground echo writes succeed");
         let captured = String::from_utf8(buf).expect("echo output is utf-8");
 
+        // Assert the canonical English Fluent rendering of every line —
+        // expectations come from the catalogue, not a second handwritten
+        // message surface (#9000 round-2).
+        let en = crate::i18n::get_english_cli_string_with_args;
         assert!(
-            captured.contains("ZeroClaw daemon started"),
+            captured.contains(en("cli-daemon-started-title", &[]).as_str()),
             "missing banner line, got: {captured:?}"
         );
-        assert!(
-            captured.contains(&format!(
-                "http://{FOREGROUND_ECHO_HOST}:{FOREGROUND_ECHO_PORT}"
-            )),
-            "missing gateway URL line, got: {captured:?}"
-        );
-        assert!(
-            captured.contains("Socket:"),
-            "missing socket-prefix line, got: {captured:?}"
-        );
+        let gateway_url = format!("http://{FOREGROUND_ECHO_HOST}:{FOREGROUND_ECHO_PORT}");
         assert!(
             captured.contains(
-                &crate::rpc::local::socket_path(&config)
-                    .display()
-                    .to_string()
+                en(
+                    "cli-daemon-started-gateway",
+                    &[("url", gateway_url.as_str())]
+                )
+                .as_str()
             ),
-            "missing socket path in socket line, got: {captured:?}"
+            "missing gateway URL line, got: {captured:?}"
+        );
+        let socket_path = crate::rpc::local::socket_path(&config)
+            .display()
+            .to_string();
+        assert!(
+            captured.contains(
+                en(
+                    "cli-daemon-started-socket",
+                    &[("path", socket_path.as_str())]
+                )
+                .as_str()
+            ),
+            "missing socket path line, got: {captured:?}"
         );
         assert!(
-            captured.contains("Components:"),
+            captured.contains(en("cli-daemon-started-components", &[]).as_str()),
             "missing components line, got: {captured:?}"
         );
         assert!(
-            captured.contains("Pairing:") && captured.contains("enabled"),
+            captured.contains(en("cli-daemon-started-pairing", &[]).as_str()),
             "missing pairing line when require_pairing is true, got: {captured:?}"
         );
         assert!(
-            captured.contains("Ctrl+C or SIGTERM"),
+            captured.contains(en("cli-daemon-started-stop", &[]).as_str()),
             "missing stop-signal line, got: {captured:?}"
         );
     }
 
     #[test]
     fn foreground_echo_omits_pairing_line_when_pairing_disabled() {
+        crate::i18n::init("en");
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.gateway.require_pairing = false;
@@ -2501,19 +2529,21 @@ mod tests {
         .expect("foreground echo writes succeed");
         let captured = String::from_utf8(buf).expect("echo output is utf-8");
 
+        let en = crate::i18n::get_english_cli_string_with_args;
         assert!(
-            !captured.contains("Pairing:"),
+            !captured.contains(en("cli-daemon-started-pairing", &[]).as_str()),
             "pairing line must NOT appear when require_pairing is false, got: {captured:?}"
         );
         // The remaining informational lines still emit so the operator
         // gets gateway / socket / components / stop-signal context.
-        assert!(captured.contains("ZeroClaw daemon started"));
-        assert!(captured.contains("Components:"));
-        assert!(captured.contains("Ctrl+C or SIGTERM"));
+        assert!(captured.contains(en("cli-daemon-started-title", &[]).as_str()));
+        assert!(captured.contains(en("cli-daemon-started-components", &[]).as_str()));
+        assert!(captured.contains(en("cli-daemon-started-stop", &[]).as_str()));
     }
 
     #[test]
     fn foreground_echo_ready_prints_actual_bound_gateway_addr() {
+        crate::i18n::init("en");
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let bound: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
@@ -2534,8 +2564,12 @@ mod tests {
         // The banner announces the endpoint the listener actually bound —
         // reported through the readiness signal — not the configured
         // host:port (which is 0 here, i.e. ephemeral).
+        let expected = crate::i18n::get_english_cli_string_with_args(
+            "cli-daemon-started-gateway",
+            &[("url", "http://127.0.0.1:42617")],
+        );
         assert!(
-            captured.contains("http://127.0.0.1:42617"),
+            captured.contains(&expected),
             "banner must print the actual bound endpoint, got: {captured:?}"
         );
         assert!(
@@ -2546,6 +2580,7 @@ mod tests {
 
     #[test]
     fn foreground_echo_starting_announces_no_endpoints() {
+        crate::i18n::init("en");
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -2560,21 +2595,28 @@ mod tests {
         .expect("foreground echo writes succeed");
         let captured = String::from_utf8(buf).expect("echo output is utf-8");
 
+        let en = crate::i18n::get_english_cli_string_with_args;
         assert!(
-            captured.contains("starting"),
+            captured.contains(en("cli-daemon-starting-title", &[]).as_str()),
             "starting state must say starting, got: {captured:?}"
         );
         // Endpoint availability is not confirmed: the starting banner must
         // not announce the gateway/socket endpoints as ready (#9000).
         assert!(
-            !captured.contains("Gateway:"),
+            !captured.contains(
+                en(
+                    "cli-daemon-started-gateway",
+                    &[("url", "http://127.0.0.1:42617")]
+                )
+                .as_str()
+            ),
             "starting state must not announce the gateway endpoint, got: {captured:?}"
         );
         assert!(
             !captured.contains("Socket:"),
             "starting state must not announce the socket endpoint, got: {captured:?}"
         );
-        assert!(captured.contains("Ctrl+C or SIGTERM"));
+        assert!(captured.contains(en("cli-daemon-started-stop", &[]).as_str()));
     }
 
     #[tokio::test]
