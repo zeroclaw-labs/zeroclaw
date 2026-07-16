@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
@@ -315,12 +316,124 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
 /// Auxiliary calls do not need to *see* the media content; they only route
 /// or summarize, so the placeholder is sufficient. The main agent loop
 /// continues to call `prepare_messages_for_provider` for full normalization.
+/// The full media-marker kind vocabulary. `IMAGE` is first and is the only kind
+/// resolved into provider content parts; the rest are the "unhandled" kinds that
+/// [`strip_unhandled_media_markers`] removes when they carry a loadable
+/// reference. Both marker regexes below derive their kind alternation from this
+/// one list so the strip-all and strip-non-image paths cannot drift apart on
+/// which kinds exist. Mirrors `ATTACHMENT_KINDS` in
+/// `crates/zeroclaw-channels/src/util.rs` (the inbound channel grammar), which
+/// lives in a different crate and is intentionally kept separate.
+const MEDIA_MARKER_KINDS: &[&str] = &[
+    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "VOICE", "AUDIO",
+];
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
-            .unwrap()
+        regex::Regex::new(&format!(
+            r"(?i)\[(?:{}):[^\]]*\]",
+            MEDIA_MARKER_KINDS.join("|")
+        ))
+        .unwrap()
     });
     RE.replace_all(text, "[media attachment]").into_owned()
+}
+
+/// Non-image media markers the provider path does **not** resolve into content
+/// parts. `[IMAGE:...]` is deliberately excluded — it is fully handled (loaded
+/// from a path/data URI and inlined for vision, or degraded by the vision
+/// route). The rest are recognized by [`strip_media_markers`] but never turned
+/// into audio/video/file content by any provider, so a marker carrying a real
+/// filesystem path, URL, or data URI would otherwise reach the model as literal
+/// text and fail silently: the model is handed a path string and typically says
+/// it cannot hear/read the file or fabricates a description of it
+/// (zeroclaw-labs/zeroclaw#9089).
+static UNHANDLED_MEDIA_MARKER_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        // Every kind except IMAGE, which is resolved into content downstream.
+        let kinds = MEDIA_MARKER_KINDS
+            .iter()
+            .filter(|&&k| k != "IMAGE")
+            .copied()
+            .collect::<Vec<_>>()
+            .join("|");
+        regex::Regex::new(&format!(r"(?i)\[(?:{kinds}):([^\]]*)\]")).unwrap()
+    });
+
+/// Replace unhandled non-image media markers whose payload is a *loadable*
+/// reference (absolute path, `http(s)://` URL, or `data:` URI) with the same
+/// `[media attachment]` placeholder the degrade path uses, returning the
+/// rewritten text and the number of markers stripped.
+///
+/// Non-loadable payloads are left as literal text — placeholders (`[AUDIO:...]`),
+/// prose (`[VIDEO:<clip>]`), and the no-transcription note (`[Audio: attached]`)
+/// are harmless and must survive — mirroring how [`parse_image_markers`]
+/// preserves non-loadable `[IMAGE:...]` markers. Runs over the raw string so it
+/// also cleans a marker embedded in a native tool-result JSON blob
+/// (`{"content":"…[AUDIO:/clip.wav]…"}`): `[media attachment]` contains no
+/// JSON-special characters, so the surrounding object stays valid.
+fn strip_unhandled_media_markers(text: &str) -> (String, usize) {
+    let mut stripped = 0usize;
+    let out = UNHANDLED_MEDIA_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        let payload = collapse_wrapped_marker(&caps[1]);
+        if !payload.is_empty() && is_loadable_image_reference(&payload) {
+            stripped += 1;
+            "[media attachment]".to_string()
+        } else {
+            // Preserve placeholder/prose markers verbatim.
+            caps[0].to_string()
+        }
+    });
+    (out.into_owned(), stripped)
+}
+
+/// Strip unhandled non-image media markers (see [`strip_unhandled_media_markers`])
+/// across every message in `messages`, logging one degradation warning when any
+/// are removed. Returns the input borrowed when no candidate marker is present
+/// (the common, allocation-free path) or an owned rebuilt vector otherwise.
+///
+/// This is the shared seam so a raw filesystem path can never reach the model,
+/// whichever route the history takes to a provider:
+/// - the main iteration prep ([`prepare_messages_for_provider`], via
+///   `prepare_messages_inner`), and
+/// - one-shot queries that dispatch history directly without full prep (the
+///   max-iteration graceful summary and the other `run_model_query` callers),
+///
+/// closing the silent tool-result `[AUDIO:...]` passthrough on both (#9089).
+pub fn sanitize_unhandled_media_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|m| UNHANDLED_MEDIA_MARKER_RE.is_match(&m.content))
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut stripped = 0usize;
+    let rebuilt: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| {
+            let (content, n) = strip_unhandled_media_markers(&m.content);
+            stripped += n;
+            ChatMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    if stripped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "markers_stripped": stripped,
+                })),
+            "multimodal: stripped unhandled non-image media marker(s) (audio/video/document/file/voice/photo); the provider path does not resolve them to content, so a raw path/URL was replaced with a placeholder instead of being sent to the model as text"
+        );
+    }
+
+    Cow::Owned(rebuilt)
 }
 
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
@@ -506,6 +619,17 @@ async fn prepare_messages_inner(
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
 ) -> anyhow::Result<PreparedMessages> {
+    // #9089: strip non-image media markers the provider path cannot resolve
+    // into content parts (audio/video/document/file/voice/photo). Left in place,
+    // a marker carrying a real filesystem path or URL reaches the model as
+    // literal text and fails silently — the model is handed a path and typically
+    // hallucinates having read the file, which is worse than an explicit error.
+    // `[IMAGE:...]` markers are handled by the normalization below. The shared
+    // seam borrows the input untouched when no such marker is present, so the
+    // common (no-marker) hot path stays allocation-free.
+    let sanitized = sanitize_unhandled_media_markers(messages);
+    let messages: &[ChatMessage] = &sanitized;
+
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
@@ -1326,6 +1450,116 @@ mod tests {
             strip_media_markers(input),
             "Use [TODO:foo] and [NOTE:bar] but replace [media attachment]"
         );
+    }
+
+    // ── #9089: non-image media markers the provider path cannot resolve ──
+
+    #[test]
+    fn strip_unhandled_media_markers_replaces_loadable_audio_path() {
+        let (out, n) = strip_unhandled_media_markers("hear this [AUDIO:/tmp/clip.wav] now");
+        assert_eq!(out, "hear this [media attachment] now");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unhandled_media_markers_covers_all_non_image_kinds() {
+        let input = "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.wav]";
+        let (out, n) = strip_unhandled_media_markers(input);
+        assert_eq!(
+            out,
+            "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]"
+        );
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn strip_unhandled_media_markers_leaves_image_marker_untouched() {
+        // `[IMAGE:...]` is handled by `parse_image_markers`; the non-image
+        // stripper must never touch it (that would drop a resolvable image).
+        let (out, n) = strip_unhandled_media_markers("[IMAGE:/a.png] and [AUDIO:/b.wav]");
+        assert_eq!(out, "[IMAGE:/a.png] and [media attachment]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unhandled_media_markers_preserves_non_loadable_payloads() {
+        // Placeholders, prose, a bare filename, and the no-transcription
+        // `[Audio: attached]` note are harmless literal text — keep them.
+        for input in [
+            "[AUDIO:...]",
+            "[VIDEO:<clip>]",
+            "[Audio: attached]",
+            "[AUDIO:example.wav]",
+        ] {
+            let (out, n) = strip_unhandled_media_markers(input);
+            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
+            assert_eq!(
+                n, 0,
+                "non-loadable marker must not count as stripped: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_unhandled_media_markers_is_case_insensitive() {
+        let (out, n) = strip_unhandled_media_markers("[Audio:/tmp/clip.wav]");
+        assert_eq!(out, "[media attachment]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unhandled_media_markers_handles_data_uri_and_url() {
+        let (out, n) = strip_unhandled_media_markers(
+            "[VOICE:data:audio/ogg;base64,AAAA] and [VIDEO:https://x/y.mp4]",
+        );
+        assert_eq!(out, "[media attachment] and [media attachment]");
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_tool_result_audio_marker() {
+        // The reported repro (#9089): a tool result surfaces an audio path.
+        // With no images in history, prep must still strip the marker so the
+        // raw filesystem path never reaches the provider as literal text.
+        let history = vec![
+            ChatMessage::user("call the tool and tell me what you hear"),
+            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let tool_msg = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message survives prep");
+        assert!(
+            !tool_msg.content.contains("/tmp/clip.wav"),
+            "raw audio path must not reach the provider: {}",
+            tool_msg.content
+        );
+        assert!(tool_msg.content.contains("[media attachment]"));
+        assert!(!prepared.contains_images);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_audio_but_keeps_image_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:{}] and hear [AUDIO:/tmp/clip.wav]",
+            path.display()
+        ))];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let content = &prepared.messages[0].content;
+        assert!(
+            !content.contains("/tmp/clip.wav"),
+            "audio path must be stripped: {content}"
+        );
+        assert!(content.contains("[media attachment]"));
+        // The image marker is still normalized to a data URI alongside it.
+        assert!(prepared.contains_images, "image still inlined: {content}");
     }
 
     #[test]
