@@ -4,8 +4,12 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
+use zeroclaw_config::env_overrides::resolve_openai_stt_api_key;
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
-use zeroclaw_config::schema::{Config, TranscriptionConfig};
+use zeroclaw_config::schema::{
+    AssemblyAiSttConfig, Config, DeepgramSttConfig, GoogleSttConfig, LocalWhisperConfig,
+    OpenAiSttConfig, TranscriptionConfig,
+};
 
 /// Maximum upload size accepted by most Whisper-compatible APIs (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
@@ -214,25 +218,23 @@ impl OpenAiWhisperProvider {
         alias: &str,
         config: &zeroclaw_config::schema::OpenAiSttConfig,
     ) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-            .context(
-                "Missing OpenAI STT API key for [transcription.openai]. Set \
+        let api_key = resolve_openai_stt_api_key(config.api_key.as_deref()).context(
+            "Missing OpenAI STT API key for [transcription.openai]. Set \
                  `api_key` in config, or use the schema-mirror grammar \
                  `ZEROCLAW_transcription__openai__api_key=...`, or set \
                  `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` environment \
                  variable (both are picked up by Config::load as legacy \
                  env-var fallbacks).",
-            )?;
+        )?;
 
         Ok(Self {
             alias: alias.to_string(),
             api_key,
-            model: config.model.clone(),
+            model: if config.model.is_empty() {
+                "whisper-1".to_string()
+            } else {
+                config.model.clone()
+            },
         })
     }
 
@@ -241,23 +243,16 @@ impl OpenAiWhisperProvider {
         alias: &str,
         cfg: &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig,
     ) -> Result<Self> {
-        let api_key = cfg
-            .base
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "Missing API key for [providers.transcription.openai.{alias}]. Set \
+        let api_key = resolve_openai_stt_api_key(cfg.base.api_key.as_deref()).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "Missing API key for [providers.transcription.openai.{alias}]. Set \
                      `base.api_key` in config, or use the schema-mirror grammar \
                      `ZEROCLAW_providers__transcription__openai__{alias}__api_key=...`, \
                      or set `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` environment \
                      variable (both are picked up by Config::load as legacy \
                      env-var fallbacks)."
-                ))
-            })?;
+            ))
+        })?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -954,10 +949,15 @@ impl TranscriptionManager {
             transcription_providers.insert("groq".to_string(), Box::new(groq));
         }
 
-        if let Some(ref openai_cfg) = config.openai
-            && let Ok(p) = OpenAiWhisperProvider::from_config("openai", openai_cfg)
-        {
-            transcription_providers.insert("openai".to_string(), Box::new(p));
+        if let Some(ref openai_cfg) = config.openai {
+            if let Ok(p) = OpenAiWhisperProvider::from_config("openai", openai_cfg) {
+                transcription_providers.insert("openai".to_string(), Box::new(p));
+            }
+        } else {
+            let effective = OpenAiSttConfig::default();
+            if let Ok(p) = OpenAiWhisperProvider::from_config("openai", &effective) {
+                transcription_providers.insert("openai".to_string(), Box::new(p));
+            }
         }
 
         if let Some(ref deepgram_cfg) = config.deepgram

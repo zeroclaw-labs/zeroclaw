@@ -5642,7 +5642,7 @@ pub struct ToolFilterGroup {
 }
 
 /// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
 pub struct OpenAiSttConfig {
@@ -5655,6 +5655,15 @@ pub struct OpenAiSttConfig {
     /// Whisper model name (default: "whisper-1").
     #[serde(default = "default_openai_stt_model")]
     pub model: String,
+}
+
+impl Default for OpenAiSttConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        }
+    }
 }
 
 /// Deepgram STT model_provider configuration (`[transcription.deepgram]`).
