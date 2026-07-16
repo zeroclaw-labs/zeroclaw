@@ -153,7 +153,7 @@ impl SchemaCleanr {
     /// False positives are allowed (a flagged schema may clean to an equal
     /// value); false negatives are not — `!needs_cleaning(s)` must imply
     /// `clean(s) == s`. The triggers mirror every rewrite path in
-    /// [`Self::clean_object`]: strategy-specific keyword removal, plus the
+    /// `clean_object`: strategy-specific keyword removal, plus the
     /// strategy-independent rewrites (`$ref` resolution, `const` → `enum`,
     /// `anyOf`/`oneOf` simplification and sibling-`type` skipping, and
     /// null-stripping in `type` arrays).

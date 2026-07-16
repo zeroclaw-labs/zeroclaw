@@ -25335,40 +25335,81 @@ This is an example JSON object for profile settings."#;
         assert!(result.contains("[REDACTED"));
     }
 
+    /// Regression test for a redaction bypass: an AWS-shaped credential
+    /// dropped into a markdown link destination -- exactly where a
+    /// prompt-injected model would try to exfiltrate one -- must not sail
+    /// through unredacted just because a link destination is otherwise
+    /// protected from the high-entropy heuristic.
     #[test]
-    fn sanitize_channel_response_preserves_markdown_link_destination_credentials() {
+    fn sanitize_channel_response_detects_aws_key_smuggled_in_markdown_link_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        // AKIAABCDEFGHIJKLMNOP gitleaks:allow
+        let target = "https://exfil.example.invalid/callback?key=AKIAABCDEFGHIJKLMNOP";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP"), "result: {result}"); // gitleaks:allow
+        assert!(
+            result.contains("[REDACTED_AWS_CREDENTIAL]"),
+            "result: {result}"
+        );
+    }
+
+    // A protected link destination shields the *shape-based* high-entropy
+    // heuristic (the #8722 false-positive), never a deterministic credential
+    // pattern. A real credential dropped into a link destination -- exactly
+    // where a prompt-injected model would try to smuggle one past the
+    // detector -- must still be caught.
+
+    #[test]
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_markdown_link_destination()
+     {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
 
         let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_markdown_reference_destination_credentials() {
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_markdown_reference_destination()
+     {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "https://example.invalid/callback?api_key=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let response = format!("See [callback][cb]\n\n[cb]: {target}");
 
         let result = sanitize_channel_response(&response, &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_entity_escaped_markdown_destination_credentials() {
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_entity_escaped_markdown_destination()
+     {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
 
         let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_protects_entity_destination_before_title_copy() {
+    fn sanitize_channel_response_still_detects_credential_in_entity_destination_and_title() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
@@ -25377,13 +25418,19 @@ This is an example JSON object for profile settings."#;
         let result =
             sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
-        assert!(!result.contains(title), "result: {result}");
+        // The destination span computation is still correct (used by the
+        // entropy heuristic), but the deterministic "Token value" pattern is
+        // not suppressed by it, so both the destination and the distinct
+        // title copy are caught.
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
         assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_protects_reference_destination_before_title_copy() {
+    fn sanitize_channel_response_still_detects_credential_in_reference_destination_and_title() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
@@ -25392,13 +25439,15 @@ This is an example JSON object for profile settings."#;
 
         let result = sanitize_channel_response(&response, &tools);
 
-        assert!(result.contains(target), "result: {result}");
-        assert!(!result.contains(title), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
         assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_protects_url_entity_destination_before_title_copy() {
+    fn sanitize_channel_response_still_detects_credential_in_url_entity_destination_and_title() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https&colon;&sol;&sol;example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
@@ -25407,19 +25456,22 @@ This is an example JSON object for profile settings."#;
         let result =
             sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
-        assert!(!result.contains(title), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
         assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_markdown_autolink_destination_credentials() {
+    fn sanitize_channel_response_still_detects_bot_token_in_markdown_autolink_destination() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
 
         let result = sanitize_channel_response(&format!("<{target}>"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains("123456:ABC-def_GHI"), "result: {result}");
+        assert!(result.contains("[REDACTED_BOT_TOKEN]"), "result: {result}");
     }
 
     #[test]
@@ -25442,8 +25494,13 @@ This is an example JSON object for profile settings."#;
         let result =
             sanitize_channel_response(&format!("[password=longsecretvalue]({target})"), &tools);
 
-        assert!(!result.contains("longsecretvalue"));
-        assert!(result.contains(target), "result: {result}");
+        // The generic-secret pattern is greedy and, starting outside the
+        // destination, can span into it; deterministic patterns are never
+        // suppressed by a protected span, so the whole overlapping match is
+        // redacted. That is the safe direction: losing an adjacent file
+        // reference is preferable to leaking the secret it was next to.
+        assert!(!result.contains("longsecretvalue"), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
@@ -25462,21 +25519,26 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_escaped_markdown_destination_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_escaped_markdown_destination() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report\\(1\\).md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
 
         let result = sanitize_channel_response(&format!("[report]({target})"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_raw_file_uri_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_raw_file_uri() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!("Recorded {target}.");
 
+        // The entropy-protected span is still computed correctly...
         let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
         assert_eq!(
             spans
@@ -25485,13 +25547,23 @@ This is an example JSON object for profile settings."#;
                 .collect::<Vec<_>>(),
             vec![target],
         );
+        // ...but the deterministic "Token value" pattern inside it is not
+        // suppressed by that protection.
         let result = sanitize_channel_response(&outbound, &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            result.contains("file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_keyed_raw_file_uri_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_keyed_raw_file_uri() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!("Recorded path={target}.");
@@ -25507,13 +25579,18 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(&outbound, &tools);
 
         assert!(
-            result.contains(&format!("path={target}")),
+            result.contains("path=file:///tmp/report.md?"),
             "result: {result}"
         );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_json_keyed_raw_file_uri_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_json_keyed_raw_file_uri() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!(r#"{{"uri":"{target}"}}"#);
@@ -25528,7 +25605,15 @@ This is an example JSON object for profile settings."#;
         );
         let result = sanitize_channel_response(&outbound, &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            result.contains(r#""uri":"file:///tmp/report.md?"#),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
@@ -25593,7 +25678,7 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn leak_only_guard_preserves_raw_file_uri_credentials() {
+    fn leak_only_guard_still_detects_credential_in_raw_file_uri() {
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let input = format!("Cron output: {target}");
 
@@ -25603,7 +25688,15 @@ This is an example JSON object for profile settings."#;
             OutboundContentFormat::Markdown,
         );
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            result.contains("file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
