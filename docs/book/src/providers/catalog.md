@@ -63,7 +63,7 @@ chat-completions API** for that precheck (for example the HTTP/OAuth
 `model_provider`** (the full answer). CLI agent backends often emit planning
 prose instead of a single sentinel token; that prose can be delivered as the
 channel message (“staying silent” / “no Slack reply”). Empty
-`classifier_provider` reuses `model_provider` — fine for API models, not for
+`classifier_provider` reuses `model_provider`: fine for API models, not for
 CLI channel bots. ACP channels skip the classifier entirely.
 
 ```toml
@@ -125,7 +125,7 @@ permission rules over always-approve for channel agents.
 
 This is **Grok Build’s process sandbox** (Landlock / Seatbelt / seccomp on the
 `grok` subprocess). It is **not** ZeroClaw’s tool sandbox on
-`[risk_profiles.*.sandbox_*]` — that wraps ZeroClaw tools after native tool
+`[risk_profiles.*.sandbox_*]`: that wraps ZeroClaw tools after native tool
 calls. With `grok_cli`, most file/shell work happens **inside** Grok, so Grok’s
 `--sandbox` is the effective confinement for that work. See also
 [Sandboxing](../security/sandboxing.md) for ZeroClaw’s risk-profile sandbox.
