@@ -417,11 +417,15 @@ fn memory_options() -> Vec<PickerOption> {
     // here and forces the array above to grow alongside the schema.
     #[allow(clippy::no_effect_underscore_binding)]
     let _exhaustive = |k: MemoryKind| match k {
+        // Hindsight is omitted from the quickstart picker (like Qdrant): it
+        // needs an external endpoint + bearer token, so it is opt-in via
+        // `[memory.hindsight]` rather than a one-click onboarding choice.
         MemoryKind::Sqlite
         | MemoryKind::Markdown
         | MemoryKind::Postgres
         | MemoryKind::Qdrant
         | MemoryKind::Lucid
+        | MemoryKind::Hindsight
         | MemoryKind::None => (),
     };
     variants

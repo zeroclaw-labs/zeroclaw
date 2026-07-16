@@ -27,6 +27,7 @@ use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 use zeroclaw_tools::memory_recall::MemoryRecallTool;
 use zeroclaw_tools::memory_store::MemoryStoreTool;
+use zeroclaw_tools::shared_memory_store::SharedMemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
@@ -763,14 +764,35 @@ impl DelegateTool {
     fn memory_tools_for_target(
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
+        recall_default_limit: usize,
     ) -> Vec<Box<dyn Tool>> {
-        vec![
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-            Box::new(MemoryRecallTool::new(memory.clone())),
+            Box::new(MemoryRecallTool::with_default_limit(
+                memory.clone(),
+                recall_default_limit,
+            )),
             Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
             Box::new(MemoryExportTool::new(memory.clone())),
-            Box::new(MemoryPurgeTool::new(memory, security)),
-        ]
+            Box::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+        ];
+        // Mirror the primary assembly: expose the shared/system write tools on
+        // the delegate path too, but only when the target's backend supports
+        // the tier, so a delegated turn neither silently gains nor loses the
+        // capability. The same per-agent risk-profile gate still applies.
+        if SharedMemoryStoreTool::is_supported(&memory, false) {
+            tools.push(Box::new(SharedMemoryStoreTool::new_shared(
+                memory.clone(),
+                security.clone(),
+            )));
+        }
+        if SharedMemoryStoreTool::is_supported(&memory, true) {
+            tools.push(Box::new(SharedMemoryStoreTool::new_system(
+                memory.clone(),
+                security.clone(),
+            )));
+        }
+        tools
     }
 
     /// Build the full target-owned registry for an independent agentic child.
@@ -2770,10 +2792,24 @@ impl DelegateTool {
                 let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
                 {
                     match self.memory_for_target_agent(agent_name).await {
-                        Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
+                        Ok(Some(memory)) => {
+                            // Target's configured recall depth so a delegated
+                            // turn honors the same limit the target agent would
+                            // use directly (falls back to the historical default
+                            // when no root config is threaded).
+                            let recall_default_limit = self
+                                .root_config
+                                .as_deref()
+                                .map_or(5, |c| c.effective_memory_recall_tool_limit(agent_name));
+                            Self::memory_tools_for_target(
+                                memory,
+                                target_policy,
+                                recall_default_limit,
+                            )
                             .into_iter()
                             .map(|tool| (tool.name().to_string(), tool))
-                            .collect(),
+                            .collect()
+                        }
                         Ok(None) => HashMap::new(),
                         Err(e) => {
                             return Ok(ToolResult {

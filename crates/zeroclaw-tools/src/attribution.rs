@@ -72,6 +72,7 @@ use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+use crate::shared_memory_store::SharedMemoryStoreTool;
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
 use crate::weather_tool::WeatherTool;
@@ -122,6 +123,7 @@ tool_attribution!(MemoryForgetTool, ToolKind::Memory);
 tool_attribution!(MemoryPurgeTool, ToolKind::Memory);
 tool_attribution!(MemoryRecallTool, ToolKind::Memory);
 tool_attribution!(MemoryStoreTool, ToolKind::Memory);
+tool_attribution!(SharedMemoryStoreTool, ToolKind::Memory);
 tool_attribution!(Microsoft365Tool, ToolKind::Plugin);
 tool_attribution!(ModelRoutingConfigTool, ToolKind::Plugin);
 tool_attribution!(NotionTool, ToolKind::Plugin);
