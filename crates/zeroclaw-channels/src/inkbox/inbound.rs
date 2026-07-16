@@ -30,12 +30,9 @@ pub struct AppState {
     pub signing_key: String,
     /// ZeroClaw channel alias, stamped onto every inbound message.
     pub alias: String,
-    /// Realtime bridge config for calls; `None` uses Inkbox STT/TTS.
-    pub realtime: Option<super::realtime::RealtimeConfig>,
-    /// Inkbox client + identity handle, for the realtime bridge to resolve the
-    /// agent's own identity (so the model speaks as ZeroClaw with real contacts).
+    /// Inkbox client, for API round-trips the inbound handlers need.
     pub inkbox: std::sync::Arc<inkbox::Inkbox>,
-    /// Agent identity handle the realtime bridge resolves its own contact card from.
+    /// Agent identity handle this channel runs as.
     pub identity: String,
     /// Tunnel public host (e.g. `abc.inkbox.ai`), used to build the call-media
     /// WS URL we hand back from the incoming-call webhook with `?call_id=`.
@@ -56,14 +53,14 @@ pub(crate) fn router(state: AppState) -> Router {
 /// Incoming-call webhook. With the phone number set to
 /// `incoming_call_action="webhook"`, Inkbox calls this synchronously when a
 /// call arrives and uses our response to bridge the audio. We answer and hand
-/// back the call-media WS URL stamped with `?call_id=<id>` — the realtime
-/// bridge reads that id to resolve the caller's contact card.
+/// back the call-media WS URL stamped with `?call_id=<id>`, which the media
+/// handler binds against the signed call context on upgrade.
 ///
 /// Fails CLOSED at the trust boundary: Inkbox signs this webhook (the same V2
 /// `X-Inkbox-*` scheme `webhook` verifies), so an unsigned/forged request is
 /// rejected rather than answered — answering one would let an attacker drive a
-/// call leg and the (paid) realtime bridge. The `call_id` is validated as a
-/// UUID before it is trusted in the WS URL / contact resolution.
+/// call leg. The `call_id` is validated as a UUID before it is trusted in the
+/// WS URL.
 async fn incoming_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let mut header_map = HashMap::with_capacity(headers.len());
     for (k, v) in headers.iter() {

@@ -2580,15 +2580,7 @@ mod tests {
         );
         let rows = super::field_shape(super::FieldSection::Channel, "inkbox");
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
-        for expected in [
-            "api_key",
-            "identity",
-            "signing_key",
-            "base_url",
-            // Realtime calls: just the toggle + the OpenAI key.
-            "realtime_enabled",
-            "realtime_api_key",
-        ] {
+        for expected in ["api_key", "identity", "signing_key", "base_url"] {
             assert!(
                 keys.contains(&expected),
                 "`{expected}` must surface via its `#[quickstart]` annotation; got {keys:?}",

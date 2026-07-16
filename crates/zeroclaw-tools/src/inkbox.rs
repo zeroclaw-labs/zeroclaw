@@ -10,8 +10,7 @@
 //! [`InkboxCtx::run`]; the `AgentIdentity` facade is `!Send`, so it is resolved
 //! and used entirely inside that closure.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use inkbox::contacts::resources::contacts::{
@@ -21,7 +20,6 @@ use inkbox::contacts::types::{ContactEmail, ContactPhone};
 use inkbox::phone::resources::texts::TextRecipients;
 use inkbox::phone::types::CallOrigin;
 use inkbox::{AgentIdentity, Inkbox, InkboxError};
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -141,53 +139,6 @@ fn fail(msg: impl Into<String>) -> ToolResult {
         output: String::new().into(),
         error: Some(msg.into()),
     }
-}
-
-/// Outbound-call context (why we're calling + an optional opening line) handed
-/// from `inkbox_place_call` to the voice bridge. Both run in the same daemon
-/// process, so it's passed through an in-process registry keyed by a single-use
-/// token (round-tripped via the call WS URL as `?context_token=`) — no temp
-/// file. Mirrors the channel's `CALL_SINKS` / `CONSULT_SINKS` registries.
-#[derive(Clone, Default)]
-pub struct CallContext {
-    /// Why we're calling, surfaced to the realtime model.
-    pub purpose: Option<String>,
-    /// Opening line to say verbatim as the first turn, when set.
-    pub opening_message: Option<String>,
-    /// The number we dialed, so the bridge can resolve that party's contact
-    /// card (outbound legs carry no `call_id` to look the call record up by).
-    pub remote_number: Option<String>,
-}
-
-static CALL_CONTEXTS: OnceLock<Mutex<HashMap<String, CallContext>>> = OnceLock::new();
-
-fn call_contexts() -> &'static Mutex<HashMap<String, CallContext>> {
-    CALL_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Stash single-use outbound-call context, returning the token to append to the
-/// call WS URL as `context_token`. The voice bridge reclaims it via
-/// [`take_call_context`] when Inkbox connects the audio leg.
-fn stash_call_context(
-    purpose: Option<&str>,
-    opening: Option<&str>,
-    remote_number: Option<&str>,
-) -> String {
-    let token = uuid::Uuid::new_v4().to_string();
-    let ctx = CallContext {
-        purpose: purpose.map(str::to_string).filter(|s| !s.is_empty()),
-        opening_message: opening.map(str::to_string).filter(|s| !s.is_empty()),
-        remote_number: remote_number.map(str::to_string).filter(|s| !s.is_empty()),
-    };
-    call_contexts().lock().insert(token.clone(), ctx);
-    token
-}
-
-/// Take (and remove) the outbound-call context for `token`. Called by the
-/// channel's voice handler on WS connect. `None` if the token is unknown
-/// (already taken, or the daemon restarted between place-call and connect).
-pub fn take_call_context(token: &str) -> Option<CallContext> {
-    call_contexts().lock().remove(token)
 }
 
 // ── tools ────────────────────────────────────────────────────────────────
@@ -418,8 +369,6 @@ impl Tool for InkboxPlaceCall {
             "type": "object",
             "properties": {
                 "to_number": { "type": "string", "description": "Recipient E.164 number." },
-                "purpose": { "type": "string", "description": "Why you're calling — loaded into the live call so the agent opens with the right context." },
-                "opening_message": { "type": "string", "description": "Optional exact opening line to say first when the callee picks up." },
                 "client_websocket_url": { "type": "string", "description": "Optional explicit call-media WS URL; defaults to the agent's tunnel." }
             },
             "required": ["to_number"]
@@ -430,33 +379,16 @@ impl Tool for InkboxPlaceCall {
             return Ok(fail("`to_number` is required"));
         };
         let explicit_ws = str_arg(&args, "client_websocket_url");
-        let purpose = str_arg(&args, "purpose");
-        let opening = str_arg(&args, "opening_message");
         Ok(self
             .ctx
             .run(move |id| {
                 // Default the media leg to this identity's tunnel so the call
                 // bridges through the channel's `/phone/media/ws` handler.
-                let mut ws = explicit_ws.or_else(|| {
+                let ws = explicit_ws.or_else(|| {
                     id.tunnel()
                         .map(|t| t.public_host)
                         .map(|host| format!("wss://{host}/phone/media/ws"))
                 });
-                // Port call context to the realtime bridge via a single-use
-                // token the voice handler reads on connect. Always stash on
-                // outbound (even with no purpose/opening) so the bridge can
-                // resolve the dialed party's contact card.
-                if ws.is_some() {
-                    let token = stash_call_context(
-                        purpose.as_deref(),
-                        opening.as_deref(),
-                        Some(&to_number),
-                    );
-                    ws = ws.map(|u| {
-                        let sep = if u.contains('?') { '&' } else { '?' };
-                        format!("{u}{sep}context_token={token}")
-                    });
-                }
                 // Ride this identity's dedicated number; shared-iMessage-line
                 // origination is wired separately.
                 let call = id.place_call(&to_number, CallOrigin::DedicatedNumber, ws.as_deref())?;
@@ -1048,22 +980,5 @@ mod tests {
         ));
         assert!(text_recipients(&json!({ "to": "" })).is_none());
         assert!(text_recipients(&json!({})).is_none());
-    }
-
-    #[test]
-    fn call_context_round_trips_in_memory_and_is_single_use() {
-        let token = stash_call_context(Some("confirm order"), None, Some("+15551234567"));
-        let ctx = take_call_context(&token).expect("context present");
-        assert_eq!(ctx.purpose.as_deref(), Some("confirm order"));
-        assert_eq!(ctx.opening_message, None);
-        assert_eq!(ctx.remote_number.as_deref(), Some("+15551234567"));
-        // Single-use: a second take finds nothing.
-        assert!(take_call_context(&token).is_none());
-        // Empty strings are normalized to None.
-        let t2 = stash_call_context(Some(""), Some("hi"), Some(""));
-        let c2 = take_call_context(&t2).unwrap();
-        assert_eq!(c2.purpose, None);
-        assert_eq!(c2.opening_message.as_deref(), Some("hi"));
-        assert_eq!(c2.remote_number, None);
     }
 }

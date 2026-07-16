@@ -9,7 +9,7 @@ Inkbox identity and answers across every surface that identity exposes.
 |---|---|
 | Email | Receive and send email from the identity's mailbox |
 | SMS | Two-way texting from the identity's phone number |
-| Voice | Answer and place calls, optionally with OpenAI Realtime audio |
+| Voice | Answer and place calls, using Inkbox speech-to-text and text-to-speech |
 | iMessage | Reachable over Apple Messages through the Inkbox router |
 
 Unlike most channels, Inkbox needs no public host of your own: inbound webhooks
@@ -53,7 +53,6 @@ defaults pre-filled):
 | `identity` | yes | the agent handle this gateway runs as |
 | `signing_key` | no (secret) | webhook signing key (`whsec_...`) for inbound verification |
 | `base_url` | no | defaults to `https://inkbox.ai` |
-| `realtime_enabled`, `realtime_api_key` | no | turn on OpenAI Realtime calls and the OpenAI key (see below) |
 
 Creating the identity, provisioning a phone number, minting a signing key, and
 enabling iMessage happen in the Inkbox console, not the CLI.
@@ -92,13 +91,11 @@ budget that resets on a fresh inbound message, a delivered receipt, or after
 nothing sensible to resend, the agent replies `[SILENT]` and nothing is
 delivered to the recipient.
 
-## Realtime calls (optional)
+## Voice calls
 
-By default, voice calls use Inkbox speech-to-text and text-to-speech. Set
-`realtime_enabled = true` with a `realtime_api_key` to instead bridge raw call
-audio to the OpenAI Realtime API, so the model speaks and listens directly.
-`realtime_fallback` controls whether a Realtime connection failure falls back to
-Inkbox STT/TTS for that call.
+Voice calls use Inkbox speech-to-text and text-to-speech: each final caller
+utterance reaches the agent as an ordinary message, and the agent's reply is
+spoken back on the call. No external audio model is involved.
 
 ## Configuration surfaces
 
@@ -108,7 +105,7 @@ Inkbox STT/TTS for that call.
 
 {{#secret-config channels.inkbox.<alias>.api_key}}
 
-The same applies to `signing_key` and `realtime_api_key`.
+The same applies to `signing_key`.
 
 ## Start and check
 

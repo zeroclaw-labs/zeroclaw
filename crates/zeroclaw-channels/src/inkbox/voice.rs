@@ -12,9 +12,9 @@
 //! Each final caller transcript becomes a [`ChannelMessage`] tagged
 //! `reply_target = "call:<conn_id>"`. The agent's reply comes back through
 //! [`InkboxChannel::send`](super::InkboxChannel), which calls [`speak_to_call`]
-//! to push the text onto this socket as TTS. The raw-audio realtime mode
-//! (`x-use-inkbox-*: false`) is intentionally not implemented here; the default
-//! Inkbox STT/TTS path needs no external model.
+//! to push the text onto this socket as TTS. The raw-audio mode
+//! (`x-use-inkbox-*: false`) is intentionally not implemented; the Inkbox
+//! STT/TTS path needs no external model.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -34,8 +34,7 @@ use zeroclaw_api::channel::ChannelMessage;
 
 use super::inbound::AppState;
 
-/// Opening line spoken on pickup in the Inkbox-managed STT/TTS path (the
-/// realtime path builds its own identity-aware greeting).
+/// Opening line spoken on pickup.
 const STT_GREETING: &str = "Hi there, how can I help?";
 
 /// Per-process monotonic id for each live call leg. A local id (rather than the
@@ -85,10 +84,9 @@ fn accepted_call_ids() -> &'static Mutex<HashMap<String, Instant>> {
 /// Inkbox signs the media upgrade the same way it signs webhooks: the
 /// `X-Call-Context` header carries `{"call_id",...}` JSON and the
 /// `X-Inkbox-*` headers carry an HMAC over those bytes, keyed by the
-/// identity's signing key. This gate runs before the 101 (and before any
-/// OpenAI Realtime connection), so an unauthenticated socket can neither
-/// reach a bridge nor incur provider spend. Fails CLOSED, like the webhook
-/// handler.
+/// identity's signing key. This gate runs before the 101, so an
+/// unauthenticated socket never reaches the bridge or speaks a caller turn.
+/// Fails CLOSED, like the webhook handler.
 ///
 /// # Arguments
 /// * `headers` - the upgrade request's headers.
@@ -187,84 +185,16 @@ pub(crate) async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Authenticate before the upgrade, before any OpenAI connection, and
-    // before any frame is processed.
+    // Authenticate before the upgrade and before any frame is processed.
     let verified_call_id = match authenticate_upgrade(&headers, &params, &state.signing_key) {
         Ok(call_id) => call_id,
         Err(rejection) => return rejection.into_response(),
     };
-    // Realtime mode: ask Inkbox to send RAW audio (no STT/TTS) and bridge it to
-    // the OpenAI Realtime API. Falls back to Inkbox STT/TTS when not configured.
-    if let Some(rt) = state.realtime.clone() {
-        // Outbound calls carry a `context_token` written by `inkbox_place_call`;
-        // it resolves the purpose/opening to inject. Inbound calls have none.
-        let meta = super::realtime::load_call_meta(params.get("context_token").map(String::as_str));
-        // The signed call context names the call; the bridge uses its id to
-        // resolve the caller's contact + email. (Outbound legs get it from the
-        // signature too — the URL only carries the context token.)
-        let call_id = verified_call_id;
-        // Pre-flight the OpenAI connection so `realtime_fallback` can drop to
-        // Inkbox STT/TTS when the model is unreachable, instead of a dead call.
-        match super::realtime::connect_openai(&rt).await {
-            Ok(openai) => {
-                let tx = state.tx.clone();
-                let alias = state.alias.clone();
-                let client = state.inkbox.clone();
-                let identity = state.identity.clone();
-                let mut resp = ws
-                    .on_upgrade(move |socket| {
-                        super::realtime::run_realtime_bridge(
-                            socket,
-                            openai,
-                            tx,
-                            super::realtime::BridgeSetup {
-                                cfg: rt,
-                                meta,
-                                alias,
-                                client,
-                                identity,
-                                call_id,
-                            },
-                        )
-                    })
-                    .into_response();
-                let headers = resp.headers_mut();
-                headers.insert(
-                    HeaderName::from_static("x-use-inkbox-speech-to-text"),
-                    HeaderValue::from_static("false"),
-                );
-                headers.insert(
-                    HeaderName::from_static("x-use-inkbox-text-to-speech"),
-                    HeaderValue::from_static("false"),
-                );
-                return resp;
-            }
-            Err(e) if rt.fallback => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    format!(
-                        "[inkbox] realtime connect failed; falling back to Inkbox STT/TTS: {e}"
-                    ),
-                );
-                // fall through to the STT/TTS path below
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    format!("[inkbox] realtime connect failed and fallback disabled: {e}"),
-                );
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "realtime bridge unavailable",
-                )
-                    .into_response();
-            }
-        }
-    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        format!("[inkbox] call-media upgrade authenticated (call_id={verified_call_id})"),
+    );
 
     let mut resp = ws
         .on_upgrade(move |socket| bridge(socket, state))
@@ -493,7 +423,6 @@ mod tests {
             failure: std::sync::Arc::new(super::super::delivery_failure::FailureTracker::new("zc")),
             signing_key: KEY.to_string(),
             alias: "zc".to_string(),
-            realtime: None,
             inkbox: client,
             identity: "ident".to_string(),
             public_host: "example.test".to_string(),

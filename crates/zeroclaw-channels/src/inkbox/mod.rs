@@ -17,10 +17,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 mod delivery_failure;
 mod inbound;
-mod realtime;
 mod voice;
-
-pub use realtime::RealtimeConfig;
 
 /// Loopback host the tunnel forwards inbound traffic to. The SDK's
 /// `validate_forward_target` requires a literal loopback address.
@@ -41,12 +38,10 @@ pub(super) fn now_secs() -> u64 {
 /// `recipient` as `"<mode>:<id>"`; this classifies it (a bare string with no
 /// tag falls back to SMS so a hand-built target still routes). Pure + unit-tested.
 enum ReplyRoute<'a> {
-    /// Post-call reflection turns and other non-delivery targets.
+    /// Non-delivery targets.
     Noreply,
     /// Live STT/TTS call leg (`conn_id`).
     Call(&'a str),
-    /// In-call consult answer (`consult id`).
-    Consult(&'a str),
     Email(&'a str),
     Sms(&'a str),
     SmsTo(&'a str),
@@ -61,9 +56,6 @@ fn reply_route(target: &str) -> ReplyRoute<'_> {
     }
     if let Some(c) = target.strip_prefix("call:") {
         return ReplyRoute::Call(c);
-    }
-    if let Some(c) = target.strip_prefix("consult:") {
-        return ReplyRoute::Consult(c);
     }
     let (mode, id) = target.split_once(':').unwrap_or(("sms", target));
     match mode {
@@ -89,9 +81,6 @@ pub struct InkboxChannel {
     signing_key: String,
     /// ZeroClaw channel alias (the `<alias>` in `[channels.inkbox.<alias>]`).
     alias: String,
-    /// OpenAI Realtime bridge config for calls, when enabled + credentialed.
-    /// `None` falls back to Inkbox STT/TTS for voice.
-    realtime: Option<RealtimeConfig>,
     /// Delivery-failure retry loop: shared budget between the send path and
     /// the inbound webhook server, so both failure surfaces draw one cap.
     failure: Arc<delivery_failure::FailureTracker>,
@@ -106,7 +95,6 @@ impl InkboxChannel {
         identity: impl Into<String>,
         signing_key: impl Into<String>,
         alias: impl Into<String>,
-        realtime: Option<RealtimeConfig>,
     ) -> Self {
         let alias = alias.into();
         Self {
@@ -115,7 +103,6 @@ impl InkboxChannel {
             signing_key: signing_key.into(),
             failure: Arc::new(delivery_failure::FailureTracker::new(alias.clone())),
             alias,
-            realtime,
         }
     }
 }
@@ -207,8 +194,8 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
         )?;
         // Route inbound calls through the incoming-call webhook (not auto_accept)
         // so Inkbox hits `/incoming-call`, which answers with a call-media WS URL
-        // carrying `?call_id=`. That id is what lets the realtime bridge resolve
-        // the caller's contact card; auto_accept connects the WS without it.
+        // carrying `?call_id=` that the media handler binds against the signed
+        // call context; auto_accept connects the WS without it.
         let call_ws = format!("wss://{public_host}/phone/media/ws");
         let call_webhook = format!("https://{public_host}/incoming-call");
         inkbox
@@ -306,8 +293,7 @@ impl Channel for InkboxChannel {
 
         // Non-REST targets are handled before the blocking path: live-call audio
         // replies go to the open socket (a miss means the call already ended —
-        // drop quietly), consult answers go back to the realtime bridge, and
-        // post-call reflection turns (`noreply`) need no delivery.
+        // drop quietly), and `noreply` turns need no delivery.
         match reply_route(&message.recipient) {
             ReplyRoute::Noreply => return Ok(()),
             ReplyRoute::Call(conn_id) => {
@@ -318,10 +304,6 @@ impl Channel for InkboxChannel {
                         format!("[inkbox] reply for call {conn_id} dropped — leg already ended"),
                     );
                 }
-                return Ok(());
-            }
-            ReplyRoute::Consult(id) => {
-                realtime::deliver_consult(id, &message.content);
                 return Ok(());
             }
             // Delivery targets fall through to the blocking REST path below.
@@ -376,7 +358,7 @@ impl Channel for InkboxChannel {
                     anyhow::bail!("unknown Inkbox reply-target mode {mode:?}")
                 }
                 // Non-delivery targets were handled before the blocking hop.
-                ReplyRoute::Noreply | ReplyRoute::Call(_) | ReplyRoute::Consult(_) => {}
+                ReplyRoute::Noreply | ReplyRoute::Call(_) => {}
             }
             Ok(())
         })
@@ -437,8 +419,8 @@ impl Channel for InkboxChannel {
             host_rx.await.unwrap_or_default()
         };
         if public_host.is_empty() {
-            // Without it, the incoming-call answer URL is malformed and the
-            // realtime bridge can't resolve callers — surface the broken lookup.
+            // Without it, the incoming-call answer URL is malformed and calls
+            // can't route to the media bridge — surface the broken lookup.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -457,7 +439,6 @@ impl Channel for InkboxChannel {
             failure: self.failure.clone(),
             signing_key: self.signing_key.clone(),
             alias: self.alias.clone(),
-            realtime: self.realtime.clone(),
             inkbox: self.inkbox.clone(),
             identity: self.identity.clone(),
             public_host,
@@ -534,7 +515,7 @@ mod tests {
         let inkbox = std::thread::spawn(|| Inkbox::new("ApiKey_test").expect("client builds"))
             .join()
             .expect("client thread");
-        let channel = InkboxChannel::new(inkbox, "ident", "whsec_test", "zc", None);
+        let channel = InkboxChannel::new(inkbox, "ident", "whsec_test", "zc");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -566,10 +547,6 @@ mod tests {
     fn reply_route_classifies_every_target_shape() {
         assert!(matches!(reply_route("noreply"), ReplyRoute::Noreply));
         assert!(matches!(reply_route("call:c7"), ReplyRoute::Call("c7")));
-        assert!(matches!(
-            reply_route("consult:42"),
-            ReplyRoute::Consult("42")
-        ));
         assert!(matches!(
             reply_route("email:a@b.com"),
             ReplyRoute::Email("a@b.com")
