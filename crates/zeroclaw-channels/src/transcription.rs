@@ -1975,53 +1975,133 @@ mod tests {
         assert_eq!(provider.timeout_secs, 300);
     }
 
-    /// Production-path regression: a `Config` materialized via
-    /// `Config::init_defaults` keeps the parent `[transcription]` block
-    /// enabled when scaffolded `local_whisper` defaults are valid, and
-    /// no `dropped_config: transcription` event is emitted.
+    /// Production-boundary regression: the scaffolded `[transcription]`
+    /// section must survive the same write→load cycle the daemon performs,
+    /// without the resilient loader dropping it (`dropped_config:
+    /// transcription`).
     ///
-    /// This is the user-boundary the previous child-struct regression
-    /// could not exercise: it actually walks the production
-    /// config-init/default-materialization path and reloads the parent
-    /// `Config` to confirm the transcription section is preserved.
+    /// The test walks the production paths end to end, in the same order
+    /// the CLI and daemon hit them:
+    ///
+    /// 1. **Pre-existing config.toml** — `Config::load_or_init` has
+    ///    already created `config.toml` before any `zeroclaw config`
+    ///    subcommand runs, so every `save_dirty()` below takes the
+    ///    incremental existing-document path (`apply_dirty_path`), never
+    ///    the full-save fallback for a missing file.
+    /// 2. **Scaffold + persist** — `Config::init_defaults(Some(
+    ///    "transcription.local_whisper"))` is the exact call the
+    ///    `zeroclaw config init <section>` handler makes
+    ///    (`ConfigCommands::Init` in `src/main.rs`), persisted through
+    ///    the same `mark_dirty`/`save_dirty` path the handler uses.
+    /// 3. **Operator edits** — `set_prop_persistent` is the exact call
+    ///    the `zeroclaw config set <path> <value>` handler makes
+    ///    (`ConfigCommands::Set`): it sets the field and marks that path
+    ///    dirty, so `transcription.enabled` is persisted as its own dirty
+    ///    path rather than riding along on a full save.
+    /// 4. **Resilient load** — `migration::migrate_to_current_salvaged`
+    ///    is the exact call `Config::load_or_init` makes when the daemon
+    ///    boots; its returned `dropped` list is the source of the
+    ///    `dropped_config: <path>` WARN events (migration.rs), so
+    ///    asserting the list does not contain `transcription` asserts
+    ///    the absence of that named log event at its source.
     #[tokio::test]
     async fn local_whisper_config_init_preserves_transcription_section() {
-        // Step 1 — materialise a parent Config via Config::init_defaults.
-        let mut config = zeroclaw_config::schema::Config::default();
-        let _ = config.init_defaults(None);
-        // Simulate `zeroclaw config init transcription.local_whisper` —
-        // the scaffolded block uses `..LocalWhisperConfig::default()`.
-        config.transcription.local_whisper = Some(zeroclaw_config::schema::LocalWhisperConfig {
-            url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
-            bearer_token: Some("test-token".to_string()),
-            ..zeroclaw_config::schema::LocalWhisperConfig::default()
-        });
-        config.transcription.enabled = true;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
 
-        // Step 2 — round-trip the parent Config through TOML (simulating
-        // daemon boot that re-reads the persisted file).
-        let toml_str = toml::to_string(&config).expect("Config must serialize to TOML");
-        let reloaded: zeroclaw_config::schema::Config =
-            toml::from_str(&toml_str).expect("Config must deserialize from TOML");
-
-        // Step 3 — the transcription block survives the round-trip, the
-        // scaffolded local_whisper block has the expected non-zero
-        // defaults, and the provider accepts the reloaded config.
+        // Step 1 — the CLI entry state: config.toml already exists on
+        // disk (load_or_init created it), so save_dirty below runs the
+        // incremental existing-document machinery, not the full-save
+        // fallback for a missing file.
+        let initial = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        initial
+            .save()
+            .await
+            .expect("default config.toml must be created");
         assert!(
-            reloaded.transcription.enabled,
-            "transcription.enabled must survive the parent Config round-trip"
+            config_path.is_file(),
+            "config.toml must exist before the scaffold, mirroring load_or_init"
         );
-        let local = reloaded
+
+        // Step 2 — the real scaffold: no handcrafted struct assignment.
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let initialized = config.init_defaults(Some("transcription.local_whisper"));
+        assert!(
+            initialized.contains(&"transcription.local_whisper"),
+            "scaffold must report the section initialized, got: {initialized:?}"
+        );
+
+        // Persist through the production dirty/save path, mirroring the
+        // CLI handler (mark each initialized section dirty, then save).
+        for section in &initialized {
+            config.mark_dirty(section);
+        }
+        config
+            .save_dirty()
+            .await
+            .expect("save_dirty must persist the scaffolded section incrementally");
+
+        // Step 3 — the operator fills the scaffolded block and enables
+        // the parent section through the same persistent setter the
+        // `config set` handler uses (set field + mark that path dirty).
+        config
+            .set_prop_persistent("transcription.enabled", "true")
+            .expect("transcription.enabled must be settable");
+        config
+            .set_prop_persistent(
+                "transcription.local_whisper.url",
+                "http://127.0.0.1:9999/v1/transcribe",
+            )
+            .expect("transcription.local_whisper.url must be settable");
+        config
+            .set_prop_persistent("transcription.local_whisper.bearer_token", "test-token")
+            .expect("transcription.local_whisper.bearer_token must be settable");
+        config
+            .save_dirty()
+            .await
+            .expect("save_dirty must persist operator edits incrementally");
+
+        // Step 4 — the real resilient daemon load.
+        let contents =
+            std::fs::read_to_string(&config_path).expect("persisted config.toml must be readable");
+        let salvage = zeroclaw_config::migration::migrate_to_current_salvaged(&contents);
+
+        assert!(
+            !salvage.dropped.iter().any(|path| path == "transcription"),
+            "resilient load must not drop `transcription` (the dropped_config WARN), \
+             dropped: {:?}",
+            salvage.dropped
+        );
+        assert!(
+            salvage.dropped_security.is_empty(),
+            "no security-critical section must be degraded, dropped_security: {:?}",
+            salvage.dropped_security
+        );
+
+        // The section survives with operator intent and the scaffolded
+        // non-zero defaults, and the provider accepts it.
+        let loaded = salvage.config;
+        assert!(
+            loaded.transcription.enabled,
+            "transcription.enabled must survive the scaffold→persist→resilient-load cycle"
+        );
+        let local = loaded
             .transcription
             .local_whisper
             .as_ref()
-            .expect("transcription.local_whisper must survive the parent Config round-trip");
+            .expect("transcription.local_whisper must survive the resilient load");
         assert_eq!(local.max_audio_bytes, 25 * 1024 * 1024);
         assert_eq!(local.timeout_secs, 300);
         assert_eq!(local.url, "http://127.0.0.1:9999/v1/transcribe");
 
         let provider = LocalWhisperProvider::from_config("local_whisper", local)
-            .expect("reloaded local_whisper config must be loadable by from_config");
+            .expect("resilient-loaded local_whisper config must be loadable by from_config");
         assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
         assert_eq!(provider.timeout_secs, 300);
     }
