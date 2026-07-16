@@ -31,26 +31,22 @@ pub fn apply_timeout_action(
         // Audit-first: don't re-surface unless the escalation row is durably
         // recorded; on a store failure skip this run (it retries next tick).
         ApprovalTimeoutAction::Escalate => {
-            let entry = system_entry(engine, run_id, GateEventKind::Escalated);
-            if let Err(e) = engine.record_gate_event(entry) {
+            let event = system_entry(engine, run_id, GateEventKind::Escalated).into_event_record();
+            if let Err(e) = engine.restamp_waiting_with_gate_event(run_id, &event) {
                 log_audit_skip(run_id, "escalate", &e);
                 return None;
             }
-            engine.restamp_waiting(run_id);
             None
         }
         // Fail-safe terminal: cancel the run. Audit-first: do not cancel unless
         // the timeout row is durably recorded; on a store failure skip (retries).
         ApprovalTimeoutAction::Cancel => {
-            let entry = system_entry(engine, run_id, GateEventKind::TimedOut);
-            if let Err(e) = engine.record_gate_event(entry) {
-                log_audit_skip(run_id, "cancel", &e);
-                return None;
-            }
-            match engine.finish_run(
+            let event = system_entry(engine, run_id, GateEventKind::TimedOut).into_event_record();
+            match engine.finish_run_with_gate_event(
                 run_id,
                 SopRunStatus::Cancelled,
                 Some("approval timeout (fail-closed cancel)".to_string()),
+                &event,
             ) {
                 Ok(action) => Some(action),
                 Err(e) => {
