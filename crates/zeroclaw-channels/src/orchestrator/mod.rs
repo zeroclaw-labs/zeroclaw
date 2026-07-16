@@ -135,12 +135,12 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
-    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
-    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    LoopKnobs, ProgressEvent, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, apply_policy_tool_filter,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
+    eager_mcp_tool_allowed, get_model_switch_state, is_model_switch_requested,
+    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -5420,6 +5420,22 @@ async fn process_channel_message_body(
                 let mut accumulated = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
+                        StreamDelta::Lifecycle(event) => {
+                            if let Err(e) = channel
+                                .update_draft_lifecycle(&reply_target, &draft_id, event)
+                                .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Draft lifecycle update failed"
+                                );
+                            }
+                        }
                         StreamDelta::Status(text) => {
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
@@ -5464,6 +5480,17 @@ async fn process_channel_message_body(
     } else {
         None
     };
+
+    // Give draft-capable channels a stable lifecycle signal before model work
+    // begins. Channel implementations decide how to render or rate-limit it.
+    if let Some(tx) = delta_tx.as_ref() {
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
+            .await;
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Planning))
+            .await;
+    }
 
     // Skip typing only for Partial mode — the draft message itself provides
     // visual feedback. MultiMessage and Off both keep typing active.
@@ -5793,6 +5820,14 @@ async fn process_channel_message_body(
         (llm_result, fb)
     })
     .await;
+
+    if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
+        && let Some(tx) = delta_tx.as_ref()
+    {
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::FinalizingResponse))
+            .await;
+    }
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     ::zeroclaw_log::record!(
@@ -13398,6 +13433,8 @@ api_key = "anthropic-key"
         fallback_send_should_fail: bool,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
+        progress_messages: tokio::sync::Mutex<Vec<String>>,
+        lifecycle_events: tokio::sync::Mutex<Vec<ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -13408,6 +13445,8 @@ api_key = "anthropic-key"
                 fallback_send_should_fail,
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
+                progress_messages: tokio::sync::Mutex::new(Vec::new()),
+                lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
             }
         }
@@ -13642,6 +13681,26 @@ api_key = "anthropic-key"
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
             Ok(Some("draft-1".to_string()))
+        }
+
+        async fn update_draft_progress(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.progress_messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn update_draft_lifecycle(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            event: ProgressEvent,
+        ) -> anyhow::Result<()> {
+            self.lifecycle_events.lock().await.push(event);
+            Ok(())
         }
 
         async fn finalize_draft(
@@ -13954,6 +14013,38 @@ api_key = "anthropic-key"
                 "chat-42".to_string(),
                 "ok".to_string()
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_emits_stable_lifecycle_progress() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.lifecycle_events.lock().await.as_slice(),
+            [
+                ProgressEvent::Received,
+                ProgressEvent::Planning,
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::FinalizingResponse,
+            ]
         );
     }
 

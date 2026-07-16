@@ -1,6 +1,7 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
 use super::context::TurnCtx;
+use super::events::{ProgressEvent, send_progress};
 use super::outcome::is_tool_loop_cancelled;
 use crate::agent::history::estimate_history_tokens;
 use crate::agent::history_trim::trim_to_recent_turns;
@@ -67,10 +68,12 @@ pub(crate) async fn try_recover_context_overflow(
     e: &anyhow::Error,
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
     context_token_budget: usize,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
+        send_progress(on_delta, ProgressEvent::CompactingContext).await;
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
@@ -203,7 +206,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
+                .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -248,7 +252,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 100)
+                .await;
 
         assert!(
             !recovered,
@@ -275,7 +280,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
+                .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -307,7 +313,8 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+            try_recover_context_overflow(&mut history, &err, 1, None, None, &observer, budget)
+                .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

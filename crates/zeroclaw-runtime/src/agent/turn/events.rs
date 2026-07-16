@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -24,6 +25,16 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// Typed, non-sensitive agent lifecycle progress.
+    Lifecycle(ProgressEvent),
+}
+
+/// Send a typed lifecycle state through the draft stream without exposing tool
+/// names, arguments, prompts, provider output, or error details.
+pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Lifecycle(event)).await;
+    }
 }
 
 /// Backwards-compatible alias while callers are migrated.
@@ -139,6 +150,18 @@ pub(crate) async fn emit_posthoc_turn_chunk(event_tx: Option<&Sender<TurnEvent>>
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn progress_events_remain_typed_in_the_draft_stream() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        send_progress(Some(&tx), ProgressEvent::RunningTool).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::RunningTool))
+        ));
+    }
 
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {
         ParsedToolCall {

@@ -398,6 +398,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_progress_strings_exist_in_every_builtin_locale() {
+        let keys = [
+            "channel-runtime-progress-received",
+            "channel-runtime-progress-planning",
+            "channel-runtime-progress-waiting-on-model",
+            "channel-runtime-progress-running-tool",
+            "channel-runtime-progress-compacting-context",
+            "channel-runtime-progress-finalizing-response",
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in keys {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+    }
+
+    #[test]
     fn zh_cn_wechat_translations_preserve_machine_facing_tokens() {
         let zh_cn = include_str!("../locales/zh-CN/cli.ftl");
         let bind = format_ftl_message(

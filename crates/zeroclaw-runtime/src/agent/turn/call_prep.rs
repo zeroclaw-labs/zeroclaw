@@ -5,7 +5,7 @@
 use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
-use super::events::{StreamDelta, emit_tool_call_pair};
+use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -248,6 +248,7 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         // ── Progress: tool start ────────────────────────────
+        send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
         if let Some(tx) = ctx.on_delta {
             let hint = {
                 let raw = match tool_name.as_str() {
