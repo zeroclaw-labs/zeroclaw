@@ -48,21 +48,41 @@ workspace `.grok/` tree. Operators who want those flags on the CLI can set
 optional `extra_args` on the alias (appended after the built-in headless
 plumbing flags).
 
-#### Recommended workspace `.grok` settings
+#### Recommended pattern: default channel chatbot
 
-When `grok_cli` is used as a channel agent (Slack, Discord, …), Grok may shell
-out to `zeroclaw channel send` from skill text. That posts **outside** ZeroClaw's
-normal reply path (often top-level, without `thread_ts`) while ZeroClaw still
-delivers the final model text — **dual delivery**.
+Use a **dedicated provider alias** for the messaging agent (for example
+`agents.default`), and a separate alias for agents that need write/shell
+(dependabot, triage, …). Sandbox **selection** is via `extra_args` (project
+`.grok` cannot choose the active profile by itself); **permission** rules live
+in the agent workspace `.grok/config.toml`.
 
-Put a **project** config under the agent workspace (the path you set as
-`working_directory`), and keep the Bash denies **narrow** so unrelated commands
-that merely contain the words “channel send” are not blocked:
+```toml
+# Channel chatbot — read-only OS sandbox + workspace permissions
+[providers.models.grok_cli.default]
+model = "grok-4.5"
+binary_path = "/home/you/.grok/bin/grok"
+working_directory = "/path/to/agents/default/workspace"
+extra_args = ["--sandbox", "read-only"]
+
+# Ops / coding agents — no read-only sandbox (writes allowed)
+[providers.models.grok_cli.ops]
+model = "grok-4.5"
+binary_path = "/home/you/.grok/bin/grok"
+
+[agents.default]
+model_provider = "grok_cli.default"
+channels = ["slack.default"]   # example
+
+[agents.dependabot]
+model_provider = "grok_cli.ops"
+```
 
 ```toml
 # <agent-workspace>/.grok/config.toml
+# Narrow denies only (not a blanket "channel send" substring).
+# Blocks Grok shelling out to `zeroclaw channel send` (dual delivery with
+# ZeroClaw's normal thread reply path).
 [permission]
-# Block ZeroClaw CLI channel posts only (not a blanket "channel send" substring).
 deny = [
   "Bash(zeroclaw channel send:*)",   # plain: zeroclaw channel send …
   "Bash(zeroclaw *channel send*)",   # flags between binary and subcommand
@@ -71,21 +91,15 @@ deny = [
 ]
 ```
 
-Example alias:
+| Layer | Where | Purpose |
+| ----- | ----- | ------- |
+| OS sandbox | `extra_args = ["--sandbox", "read-only"]` | Read everywhere; write only `~/.grok` + tmp; child network blocked on Linux |
+| App permissions | `<workspace>/.grok/config.toml` `[permission]` | Deny `zeroclaw channel send` variants |
+| Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 
-```toml
-[providers.models.grok_cli.default]
-model = "grok-4.5"
-binary_path = "/home/you/.grok/bin/grok"
-working_directory = "/path/to/agents/default/workspace"
-# Optional opt-in CLI flags (empty by default):
-# extra_args = ["--max-turns", "20"]
-# extra_args = ["--always-approve"]  # powerful; prefer .grok [permission] when possible
-```
-
-ZeroClaw should remain the only path that posts channel replies (`thread_replies`
-and related channel config). Prefer workspace `.grok` permission rules over
-`--always-approve` in `extra_args` for channel agents.
+Optional further `extra_args` (empty by default), for example
+`["--max-turns", "20"]` or `["--always-approve"]`. Prefer workspace `.grok`
+permission rules over always-approve for channel agents.
 
 ### Azure OpenAI: slot `azure`
 
