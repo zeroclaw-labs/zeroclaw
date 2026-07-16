@@ -21,16 +21,6 @@ pub struct ToolIoCapture {
     pub truncated: bool,
 }
 
-impl ToolIoCapture {
-    fn empty() -> Self {
-        Self {
-            text: String::new(),
-            original_bytes: 0,
-            truncated: false,
-        }
-    }
-}
-
 /// Capture redacted tool input.
 ///
 /// `redacted` is the input string AFTER the runtime has scanned it for
@@ -129,13 +119,6 @@ fn truncate_to_cap(redacted: &str, cap: usize) -> ToolIoCapture {
         original_bytes,
         truncated: true,
     }
-}
-
-#[allow(dead_code)]
-fn empty_unused_marker() {
-    // Suppress unused-import false positives for `ToolIoCapture::empty`
-    // (kept around for future "explicit empty capture" call sites).
-    let _ = ToolIoCapture::empty();
 }
 
 #[cfg(test)]
