@@ -4154,7 +4154,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4169,6 +4169,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4228,14 +4229,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
-                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                registry.register_wss(Box::new(|ctx, cancel, client_count, _ready_tx| {
                     Box::pin(async move {
                         let wss_cfg = ctx.config.read().wss.clone();
                         if !wss_cfg.enabled {
@@ -7838,10 +7844,11 @@ async fn run_gateway_if_enabled(
     zeroclaw_runtime::restart::record_launch();
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
-    // manually" message, None for tui_registry (no TUI socket), and None
-    // for canvas_store so the gateway falls back to its own default.
+    // manually" message, None for tui_registry (no TUI socket), None
+    // for canvas_store so the gateway falls back to its own default, and
+    // None for ready_tx (no daemon startup echo consumes readiness here).
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade

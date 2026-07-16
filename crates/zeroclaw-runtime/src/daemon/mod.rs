@@ -345,6 +345,17 @@ pub async fn run(
     let channels_cancel = tokio_util::sync::CancellationToken::new();
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
+    // Readiness signals for the foreground startup echo (#9000): the echo
+    // may only print "started" after every endpoint it announces has
+    // reported its bind. The senders are wired into the supervised gateway
+    // and socket starters below (foreground runs only); the receivers are
+    // consumed by the echo when the endpoint is actually supervised.
+    let (gateway_ready_tx, gateway_ready_rx) =
+        tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+    let (socket_ready_tx, socket_ready_rx) = tokio::sync::watch::channel::<bool>(false);
+    let mut gateway_echo_rx = None;
+    let mut socket_echo_rx = None;
+
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
     let tui_registry =
@@ -360,6 +371,13 @@ pub async fn run(
         };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
+        // Foreground runs hand the starter a readiness sender so the echo
+        // learns the actual bound address (#9000); service runs get `None`
+        // and carry no extra wiring.
+        let gateway_ready = foreground.then(|| gateway_ready_tx.clone());
+        if foreground {
+            gateway_echo_rx = Some(gateway_ready_rx);
+        }
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -372,6 +390,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let ready = gateway_ready.clone();
                 async move {
                     start(
                         host,
@@ -380,6 +399,7 @@ pub async fn run(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        ready,
                     )
                     .await
                 }
@@ -590,6 +610,11 @@ pub async fn run(
         let socket_start = std::sync::Arc::new(socket_start);
         let socket_cancel = channels_cancel.clone();
         let count = socket_client_count.clone();
+        // Same readiness contract as the gateway starter (#9000).
+        let socket_ready = foreground.then(|| socket_ready_tx.clone());
+        if foreground {
+            socket_echo_rx = Some(socket_ready_rx);
+        }
         handles.push(spawn_component_supervisor(
             "socket",
             initial_backoff,
@@ -600,7 +625,8 @@ pub async fn run(
                 let start = socket_start.clone();
                 let cancel = socket_cancel.clone();
                 let count = count.clone();
-                async move { start(ctx, cancel, count).await }
+                let ready = socket_ready.clone();
+                async move { start(ctx, cancel, count, ready).await }
             },
         ));
     }
@@ -623,7 +649,9 @@ pub async fn run(
                 let start = wss_start.clone();
                 let cancel = wss_cancel.clone();
                 let count = count.clone();
-                async move { start(ctx, cancel, count).await }
+                // The startup banner announces only the gateway and local
+                // socket endpoints; WSS has no echo consumer (#9000).
+                async move { start(ctx, cancel, count, None).await }
             },
         ));
     }
@@ -705,11 +733,17 @@ pub async fn run(
 
     record_daemon_started(&config, &host, port);
     if foreground {
+        // Gate the banner on real endpoint readiness (#9000): the ready
+        // message must not precede endpoint availability, and a slow or
+        // retrying bind must surface as "starting", never as "started".
+        let readiness =
+            await_startup_readiness(gateway_echo_rx, socket_echo_rx, STARTUP_READINESS_TIMEOUT)
+                .await;
         let mut stderr = std::io::stderr().lock();
         // Stderr write failures at daemon startup are diagnostic-only;
         // dropping the `Result` keeps startup robust to closed pipes
         // (e.g. the operator who launched via `&` then quit the shell).
-        let _ = echo_daemon_started_to_terminal(&config, &host, port, &mut stderr);
+        let _ = echo_daemon_started_to_terminal(&config, &host, port, &readiness, &mut stderr);
     }
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
@@ -780,6 +814,60 @@ fn record_daemon_started(config: &Config, host: &str, port: u16) {
     );
 }
 
+/// Bounded wait for the endpoints the foreground banner announces (#9000).
+/// Local binds normally complete in well under a second; 15s bounds the
+/// wait so a supervisor retry loop cannot stall the echo — or block the
+/// daemon's shutdown-signal handling behind it — indefinitely.
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Outcome of [`await_startup_readiness`]: what the foreground banner is
+/// allowed to claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupReadiness {
+    /// Every supervised endpoint reported its bind. Carries the gateway's
+    /// actual bound address when the gateway is supervised in-process, so
+    /// the banner prints the real endpoint (not the configured guess —
+    /// which differs for an ephemeral configured port).
+    Ready {
+        gateway_addr: Option<std::net::SocketAddr>,
+    },
+    /// The bounded wait elapsed, or a sender dropped (component task died
+    /// before binding), before every supervised endpoint reported. The
+    /// banner must say "starting" and announce no endpoints: availability
+    /// is not confirmed.
+    Starting,
+}
+
+/// Wait until every supervised endpoint the banner announces has reported
+/// its bind, or `timeout` elapses. A `None` receiver means the endpoint is
+/// not supervised in this run — there is nothing to wait for.
+async fn await_startup_readiness(
+    gateway_ready: Option<tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>>,
+    socket_ready: Option<tokio::sync::watch::Receiver<bool>>,
+    timeout: Duration,
+) -> StartupReadiness {
+    let wait = async move {
+        let gateway_addr = match gateway_ready {
+            Some(mut rx) => {
+                // `wait_for` errors when the sender drops without a ready
+                // mark (the component task died before binding) — treat as
+                // not-ready so the caller reports the starting state.
+                let marked = rx.wait_for(|addr| addr.is_some()).await.ok()?;
+                *marked
+            }
+            None => None,
+        };
+        if let Some(mut rx) = socket_ready {
+            rx.wait_for(|ready| *ready).await.ok()?;
+        }
+        Some(gateway_addr)
+    };
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Some(gateway_addr)) => StartupReadiness::Ready { gateway_addr },
+        Ok(None) | Err(_) => StartupReadiness::Starting,
+    }
+}
+
 /// Foreground echo for the seven pre-#7934 informational lines that the
 /// structured `record_daemon_started` event hid behind the `--verbose`
 /// display gate. Kept as a separate helper so the structured call path
@@ -790,30 +878,58 @@ fn record_daemon_started(config: &Config, host: &str, port: u16) {
 /// — the only call site for production output. Restores the operator-facing
 /// feedback lost in the #7934 "route stdout diagnostics through logs"
 /// sweep (issue #9000).
+///
+/// Round-2: the banner's content is gated on [`StartupReadiness`]. Only
+/// the `Ready` arm prints endpoint addresses — using the gateway's actual
+/// bound address reported through the readiness signal — so the "started"
+/// claim can never precede endpoint availability. The `Starting` arm
+/// announces no endpoints.
 fn echo_daemon_started_to_terminal<W: std::io::Write>(
     config: &Config,
     host: &str,
     port: u16,
+    readiness: &StartupReadiness,
     mut out: W,
 ) -> std::io::Result<()> {
-    writeln!(out, "🧠 ZeroClaw daemon started")?;
-    writeln!(out, "   Gateway:  http://{host}:{port}")?;
-    writeln!(
-        out,
-        "   Socket:   {}",
-        crate::rpc::local::socket_path(config).display()
-    )?;
-    writeln!(
-        out,
-        "   Components: gateway, channels, heartbeat, scheduler"
-    )?;
-    if config.gateway.require_pairing {
-        writeln!(
-            out,
-            "   Pairing:    enabled (code appears in gateway output above)"
-        )?;
+    match readiness {
+        StartupReadiness::Ready { gateway_addr } => {
+            writeln!(out, "🧠 ZeroClaw daemon started")?;
+            // Print the endpoint the listener actually bound (reported via
+            // the readiness signal), falling back to the configured
+            // host:port when no gateway is supervised in-process.
+            let gateway_url = match gateway_addr {
+                Some(addr) => format!("http://{addr}"),
+                None => format!("http://{host}:{port}"),
+            };
+            writeln!(out, "   Gateway:  {gateway_url}")?;
+            writeln!(
+                out,
+                "   Socket:   {}",
+                crate::rpc::local::socket_path(config).display()
+            )?;
+            writeln!(
+                out,
+                "   Components: gateway, channels, heartbeat, scheduler"
+            )?;
+            if config.gateway.require_pairing {
+                writeln!(
+                    out,
+                    "   Pairing:    enabled (code appears in gateway output above)"
+                )?;
+            }
+            writeln!(out, "   Ctrl+C or SIGTERM to stop")?;
+        }
+        StartupReadiness::Starting => {
+            writeln!(out, "🧠 ZeroClaw daemon starting…")?;
+            writeln!(
+                out,
+                "   Endpoints not confirmed after {}s — the gateway/socket are still \
+                 binding or in supervisor retry. Watch the log for readiness.",
+                STARTUP_READINESS_TIMEOUT.as_secs()
+            )?;
+            writeln!(out, "   Ctrl+C or SIGTERM to stop")?;
+        }
     }
-    writeln!(out, "   Ctrl+C or SIGTERM to stop")?;
     Ok(())
 }
 
@@ -2326,6 +2442,7 @@ mod tests {
             &config,
             FOREGROUND_ECHO_HOST,
             FOREGROUND_ECHO_PORT,
+            &StartupReadiness::Ready { gateway_addr: None },
             &mut buf,
         )
         .expect("foreground echo writes succeed");
@@ -2378,6 +2495,7 @@ mod tests {
             &config,
             FOREGROUND_ECHO_HOST,
             FOREGROUND_ECHO_PORT,
+            &StartupReadiness::Ready { gateway_addr: None },
             &mut buf,
         )
         .expect("foreground echo writes succeed");
@@ -2392,6 +2510,153 @@ mod tests {
         assert!(captured.contains("ZeroClaw daemon started"));
         assert!(captured.contains("Components:"));
         assert!(captured.contains("Ctrl+C or SIGTERM"));
+    }
+
+    #[test]
+    fn foreground_echo_ready_prints_actual_bound_gateway_addr() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let bound: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        echo_daemon_started_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            &StartupReadiness::Ready {
+                gateway_addr: Some(bound),
+            },
+            &mut buf,
+        )
+        .expect("foreground echo writes succeed");
+        let captured = String::from_utf8(buf).expect("echo output is utf-8");
+
+        // The banner announces the endpoint the listener actually bound —
+        // reported through the readiness signal — not the configured
+        // host:port (which is 0 here, i.e. ephemeral).
+        assert!(
+            captured.contains("http://127.0.0.1:42617"),
+            "banner must print the actual bound endpoint, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("http://127.0.0.1:0\n"),
+            "configured ephemeral port must not be announced, got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn foreground_echo_starting_announces_no_endpoints() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let mut buf: Vec<u8> = Vec::new();
+        echo_daemon_started_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            42617,
+            &StartupReadiness::Starting,
+            &mut buf,
+        )
+        .expect("foreground echo writes succeed");
+        let captured = String::from_utf8(buf).expect("echo output is utf-8");
+
+        assert!(
+            captured.contains("starting"),
+            "starting state must say starting, got: {captured:?}"
+        );
+        // Endpoint availability is not confirmed: the starting banner must
+        // not announce the gateway/socket endpoints as ready (#9000).
+        assert!(
+            !captured.contains("Gateway:"),
+            "starting state must not announce the gateway endpoint, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("Socket:"),
+            "starting state must not announce the socket endpoint, got: {captured:?}"
+        );
+        assert!(captured.contains("Ctrl+C or SIGTERM"));
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_returns_only_after_both_endpoints_report() {
+        let (gateway_tx, gateway_rx) =
+            tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+        let (socket_tx, socket_rx) = tokio::sync::watch::channel::<bool>(false);
+        let bound: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+
+        // Socket reports after 40ms, gateway after another 40ms. The await
+        // must not complete before the slower endpoint reports, and must
+        // carry the gateway's actual bound address. The sleeps are
+        // sequential inside the spawned task, so the >= 80ms ordering holds
+        // regardless of when the task is scheduled.
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = socket_tx.send(true);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = gateway_tx.send(Some(bound));
+        });
+
+        let started = std::time::Instant::now();
+        let readiness =
+            await_startup_readiness(Some(gateway_rx), Some(socket_rx), Duration::from_secs(5))
+                .await;
+
+        assert_eq!(
+            readiness,
+            StartupReadiness::Ready {
+                gateway_addr: Some(bound)
+            },
+            "ready outcome must carry the gateway's actual bound address"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(80),
+            "the ready message must not precede endpoint availability (#9000)"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_times_out_to_starting_when_endpoint_never_reports() {
+        let (_gateway_tx, gateway_rx) =
+            tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+        let (_socket_tx, socket_rx) = tokio::sync::watch::channel::<bool>(false);
+
+        let readiness =
+            await_startup_readiness(Some(gateway_rx), Some(socket_rx), Duration::from_millis(50))
+                .await;
+
+        assert_eq!(
+            readiness,
+            StartupReadiness::Starting,
+            "an endpoint that never reports must yield the starting state, not ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_treats_dropped_sender_as_not_ready() {
+        let (gateway_tx, gateway_rx) =
+            tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+        // The component task died before binding: the sender drops without
+        // a ready mark. Must not wait the full timeout and must not report
+        // ready.
+        drop(gateway_tx);
+
+        let started = std::time::Instant::now();
+        let readiness =
+            await_startup_readiness(Some(gateway_rx), None, Duration::from_secs(30)).await;
+
+        assert_eq!(readiness, StartupReadiness::Starting);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a dropped sender must short-circuit, not burn the whole timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_with_no_supervised_endpoints_is_immediately_ready() {
+        // Neither gateway nor socket is supervised in-process (e.g. the
+        // embedded-daemon configuration): nothing to wait for.
+        let readiness = await_startup_readiness(None, None, Duration::from_secs(5)).await;
+        assert_eq!(readiness, StartupReadiness::Ready { gateway_addr: None });
     }
 
     #[tokio::test]
@@ -2958,7 +3223,7 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry| {
+            move |host, port, config, event_tx, reload_controls, tui_registry, ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -2968,6 +3233,9 @@ mod tests {
                         .expect("daemon should pass reload controls to gateway starter");
                     let has_reload_tx = !reload_tx.is_closed();
                     let has_tui_registry = tui_registry.is_some();
+                    // This run is foreground=false: the daemon must not wire
+                    // a startup-echo readiness sender into the starter.
+                    let has_ready_tx = ready_tx.is_some();
                     seen_tx
                         .send((
                             host,
@@ -2977,6 +3245,7 @@ mod tests {
                             has_gateway_shutdown_tx,
                             has_reload_tx,
                             has_tui_registry,
+                            has_ready_tx,
                         ))
                         .expect("record gateway starter inputs");
                     reload_tx.send(true).expect("send reload signal");
@@ -3009,6 +3278,7 @@ mod tests {
             has_gateway_shutdown_tx,
             has_reload_tx,
             has_tui_registry,
+            has_ready_tx,
         ) = seen_rx
             .try_recv()
             .expect("gateway starter should record its daemon inputs");
@@ -3019,6 +3289,70 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+        assert!(
+            !has_ready_tx,
+            "foreground=false runs must not wire a startup-echo readiness sender"
+        );
+    }
+
+    /// Round-2 wiring regression (#9000): a foreground `run()` must hand the
+    /// gateway starter a readiness sender, and the starter's ready mark is
+    /// what unblocks the startup echo. The stub reports its "bind" and then
+    /// triggers reload so the daemon returns; the test proves the daemon
+    /// reaches the reload wait (i.e. the echo completed after the ready
+    /// mark) instead of stalling behind an unreported endpoint.
+    #[tokio::test]
+    async fn foreground_run_wires_gateway_readiness_sender_and_echo_completes() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, ready_tx| {
+                let seen_tx = seen_tx.clone();
+                Box::pin(async move {
+                    let ready_tx =
+                        ready_tx.expect("foreground run must wire a readiness sender (#9000)");
+                    seen_tx.send(()).expect("record starter invocation");
+                    // Report the "bind" the echo is gated on, then trigger
+                    // reload so the daemon returns. The echo's readiness
+                    // wait is bounded at 15s; with the mark sent first, the
+                    // banner completes immediately.
+                    let bound: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+                    ready_tx
+                        .send(Some(bound))
+                        .expect("send gateway readiness mark");
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let exit = timeout(
+            Duration::from_secs(5),
+            run(
+                config,
+                "127.0.0.1".to_string(),
+                0,
+                registry,
+                false,
+                true, // foreground: the startup echo runs and waits for readiness
+            ),
+        )
+        .await
+        .expect("daemon must reach the reload wait once the echo's readiness gate opens")
+        .expect("daemon run should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        seen_rx
+            .try_recv()
+            .expect("gateway starter should have been invoked");
     }
 
     #[tokio::test]
@@ -3033,7 +3367,7 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg| {
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)
