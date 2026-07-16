@@ -16,7 +16,7 @@
 /crates/zeroclaw-runtime/**          @Audacity88
 /crates/zeroclaw-tools/**            @Audacity88
 /crates/zeroclaw-gateway/**          @Audacity88
-/crates/zeroclaw-config/**           @Audacity88 @singlerider
+/crates/zeroclaw-config/**           @Audacity88
 /crates/zeroclaw-memory/**           @Audacity88
 /crates/zeroclaw-tool-call-parser/** @Audacity88
 /src/agent/**                        @Audacity88
@@ -27,25 +27,15 @@
 /dev/**                              @Audacity88
 
 # ---------------------------------------------------------------------------
-# singlerider-primary areas (providers, API, infra, hardware, firmware, web)
+# Providers (Nillth specialist). Former singlerider-primary areas (API, infra,
+# hardware, firmware, web, dist, apps) intentionally revert to the default
+# fallback until successors are named.
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-providers/** @singlerider @Nillth
-/crates/zeroclaw-api/**       @singlerider
-/crates/zeroclaw-infra/**     @singlerider
-/crates/zeroclaw-hardware/**  @singlerider
-/crates/aardvark-sys/**       @singlerider
-/crates/robot-kit/**          @singlerider
-/crates/zeroclaw-macros/**    @singlerider
-/firmware/**                  @singlerider
-/src/providers/**             @singlerider @Nillth
-/src/hardware/**              @singlerider
-/web/**                       @singlerider
-/dist/**                      @singlerider
-/apps/**                      @singlerider
+/crates/zeroclaw-providers/** @Nillth
+/src/providers/**             @Nillth
 
-# Zerocode TUI: paired. Must come AFTER /apps/** (last match wins) or the
-# broad apps rule strips @Audacity88 from zerocode files.
-/apps/zerocode/**             @singlerider @Audacity88
+# Zerocode TUI
+/apps/zerocode/**             @Audacity88
 
 # ---------------------------------------------------------------------------
 # Legacy root crate and common source paths (shared maintainer triage)
@@ -72,7 +62,7 @@
 /src/trust/**             @WareWolf-MoonWall @Audacity88
 /src/tunnel/**            @WareWolf-MoonWall @Audacity88
 /src/verifiable_intent/** @WareWolf-MoonWall @Audacity88
-/src/config/**            @Audacity88 @singlerider
+/src/config/**            @Audacity88
 /src/cost/**              @Audacity88
 /src/cli_input.rs         @Audacity88
 /src/identity.rs          @Audacity88
@@ -104,10 +94,10 @@
 /CNAME                     @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
-# Channels (Audacity primary + singlerider specialist)
+# Channels (Audacity primary + Nillth specialist)
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-channels/** @Audacity88 @singlerider @Nillth
-/src/channels/**             @Audacity88 @singlerider @Nillth
+/crates/zeroclaw-channels/** @Audacity88 @Nillth
+/src/channels/**             @Audacity88 @Nillth
 
 # ---------------------------------------------------------------------------
 # Skills, plugins (per Jordan's suggested patch on PR #6537)
@@ -127,29 +117,15 @@
 /apps/tauri/** @JordanTheJet @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
-# Internationalization (singlerider specialist)
-# ---------------------------------------------------------------------------
-/locales.toml                       @singlerider
-/src/i18n.rs                        @singlerider
-/crates/zeroclaw-runtime/locales/** @singlerider
-/tools/fill-translations/**         @singlerider
-/TRANSLATIONS.md                    @singlerider
-
-# Explicit i18n files Audacity flagged on PR #6537. Would otherwise resolve
-# to their broader area without the i18n specialist on them.
-/crates/zeroclaw-runtime/src/i18n.rs @Audacity88 @singlerider
-/web/src/lib/i18n.ts                 @singlerider
-
-# ---------------------------------------------------------------------------
-# Other docs (Audacity-led + singlerider). Must come BEFORE architecture-doc
+# Other docs (Audacity-led). Must come BEFORE architecture-doc
 # overrides below so the narrower foundations/RFC rules can win.
 # ---------------------------------------------------------------------------
-/docs/** @Audacity88 @singlerider
+/docs/** @Audacity88
 
 # ---------------------------------------------------------------------------
 # Architecture docs (high-risk, paired)
 # ---------------------------------------------------------------------------
-/docs/book/src/foundations/** @Audacity88 @singlerider
+/docs/book/src/foundations/** @Audacity88
 
 # ---------------------------------------------------------------------------
 # Governance, release, CI (high-risk)
@@ -158,8 +134,8 @@
 # Review-routing control paths stay paired so no single owner can change
 # who reviews future changes.
 # ---------------------------------------------------------------------------
-/.github/**             @Audacity88 @singlerider
-/.github/CODEOWNERS     @Audacity88 @singlerider
+/.github/**             @Audacity88
+/.github/CODEOWNERS     @Audacity88
 /release-plz.toml       @Audacity88
 /scripts/**             @Audacity88
 /xtask/**               @Audacity88
@@ -177,14 +153,14 @@
 /taplo.toml             @Audacity88
 
 # ---------------------------------------------------------------------------
-# Security (high-risk, paired: Audacity + singlerider)
+# Security (high-risk; needs a second paired owner to replace singlerider)
 # ---------------------------------------------------------------------------
-/SECURITY.md                             @Audacity88 @singlerider
-/deny.toml                               @Audacity88 @singlerider
-/src/security/**                         @Audacity88 @singlerider
-/crates/zeroclaw-runtime/src/security/** @Audacity88 @singlerider
-/.github/codeql/**                       @Audacity88 @singlerider
-/.github/dependabot.yml                  @Audacity88 @singlerider
+/SECURITY.md                             @Audacity88
+/deny.toml                               @Audacity88
+/src/security/**                         @Audacity88
+/crates/zeroclaw-runtime/src/security/** @Audacity88
+/.github/codeql/**                       @Audacity88
+/.github/dependabot.yml                  @Audacity88
 
 # ---------------------------------------------------------------------------
 # Cargo manifests at any depth (legacy stewardship, Jordan)
@@ -195,9 +171,9 @@ Cargo.lock @JordanTheJet
 # ---------------------------------------------------------------------------
 # Root governance Markdown (paired)
 # ---------------------------------------------------------------------------
-/AGENTS.md          @Audacity88 @singlerider
-/CONTRIBUTING.md    @Audacity88 @singlerider
-/CODE_OF_CONDUCT.md @Audacity88 @singlerider
+/AGENTS.md          @Audacity88
+/CONTRIBUTING.md    @Audacity88
+/CODE_OF_CONDUCT.md @Audacity88
 
 # ---------------------------------------------------------------------------
 # Other top-level Markdown, license, notice files (legacy stewardship)
@@ -213,10 +189,10 @@ Cargo.lock @JordanTheJet
 # Specific overrides (must be last)
 # ---------------------------------------------------------------------------
 # Channels-crate Cargo.toml: legacy steward + channels owners
-/crates/zeroclaw-channels/Cargo.toml @Audacity88 @singlerider @JordanTheJet @Nillth
+/crates/zeroclaw-channels/Cargo.toml @Audacity88 @JordanTheJet @Nillth
 
 # Matrix backend
-/crates/zeroclaw-channels/src/matrix.rs @tidux @Audacity88 @singlerider
+/crates/zeroclaw-channels/src/matrix.rs @tidux @Audacity88
 
 # ACP server (per @tidux's request on PR #6537)
-/crates/zeroclaw-channels/src/orchestrator/acp_server.rs @tidux @Audacity88 @singlerider
+/crates/zeroclaw-channels/src/orchestrator/acp_server.rs @tidux @Audacity88
