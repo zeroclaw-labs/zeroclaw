@@ -202,7 +202,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # 90 min: the x86_64-apple-darwin leg needs ~45-50 min on GitHub's slower
+    # Intel macOS runners (v0.8.3 hit the old 40-min ceiling twice, killing the
+    # cache save each time and compounding the slowdown). Fast legs are
+    # unaffected; this is a ceiling, not an allocation.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -828,6 +832,45 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
             -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
+
+  deploy-docs:
+    name: Deploy Versioned Docs
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # workflow_dispatch of docs-deploy.yml
+      contents: read
+    steps:
+      # The release tag (needs.validate.outputs.tag) is created by the publish
+      # job via `gh release create` using GITHUB_TOKEN. GitHub does NOT fire
+      # another workflow run from a GITHUB_TOKEN-created tag push
+      # (https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow),
+      # so docs-deploy.yml's `tags: [v*]` trigger never sees this tag. Dispatch
+      # it explicitly instead: workflow_dispatch IS the documented exception
+      # that runs even when invoked with GITHUB_TOKEN. docs-deploy checks out the
+      # tag input internally and builds /<tag>/ on gh-pages.
+      #
+      # Ordering: the version-bump PR merges BEFORE Release Stable runs, so its
+      # `master` docs deploy normally runs first, while /<tag>/ does not yet
+      # exist; that master deploy therefore defers the stable-pointer flip by
+      # design (see docs-deploy.yml). This job then creates /<tag>/, and a LATER
+      # `master` deploy publishes the flip once /<tag>/ is live. This step only
+      # DISPATCHES the tag build; a green job here means the dispatch was
+      # accepted, not that the downstream docs run finished. To advance the
+      # stable pointer after /<tag>/ is live, re-run docs-deploy.yml with
+      # tag=master (see the release runbook, Step 7).
+      - name: Dispatch docs-deploy for the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching docs-deploy.yml for ${TAG} (ref master)..."
+          gh workflow run docs-deploy.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f tag="$TAG"
 
   docker:
     name: Push Docker Image
