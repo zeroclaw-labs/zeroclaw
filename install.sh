@@ -302,8 +302,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries ship the full distribution channel set (all channels, no heavyweight extras)."
-  info "For heavyweight extras excluded from the distribution set (e.g. whatsapp-web), build from source with --preset full."
+  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect

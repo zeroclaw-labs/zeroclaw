@@ -102,9 +102,12 @@ mod tests {
     }
 
     #[test]
-    fn dist_renders_all_channels() {
+    fn dist_renders_lean_release_channels() {
         let b = render_features(&root(), &Selection::Dist, "        ").unwrap();
-        assert!(b.contains("channel-discord") && !b.contains("hardware"));
+        assert!(b.contains("channel-matrix"));
+        assert!(b.contains("channel-lark"));
+        assert!(b.contains("whatsapp-web"));
+        assert!(!b.contains("channel-slack"));
     }
 
     #[test]
