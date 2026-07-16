@@ -38,8 +38,13 @@ Shells out to the `gemini` CLI; uses the CLI's existing auth.
 
 ### Grok Build CLI: slot `grok_cli`
 
-Shells out to the Grok Build CLI (`grok -p` headless); uses the CLI's own
-login / `XAI_API_KEY`. Optional `binary_path` when `grok` is not on `PATH`.
+Shells out to the Grok Build CLI (`grok --prompt-file` headless); uses the
+CLI's own login / `XAI_API_KEY`. Optional `binary_path` when `grok` is not on
+`PATH`. Optional `working_directory` sets the subprocess cwd so project
+`.grok/config.toml` permissions, skills, and agents resolve correctly.
+ZeroClaw does **not** pass tool/permission argv (`--always-approve`,
+`--disallowed-tools`, `--max-turns`, etc.); configure those in the workspace
+`.grok/` tree.
 
 ### Azure OpenAI: slot `azure`
 

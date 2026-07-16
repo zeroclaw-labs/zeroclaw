@@ -2685,6 +2685,12 @@ pub struct GrokCliModelProviderConfig {
     /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    /// Working directory for the `grok` subprocess. Project-scoped Grok
+    /// config (`.grok/config.toml` permissions, skills, agents) is resolved
+    /// relative to this path. Defaults to the daemon process cwd when unset.
+    /// ZeroClaw does not pass tool/permission flags on the CLI argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
 }
 
 // ── LMStudio (local default) ──

@@ -19,9 +19,12 @@
 //! - **Conversation history**: Only the system prompt (if present) and the last
 //!   user message are forwarded (same contract as `gemini_cli`).
 //! - **Native tool calls**: This provider does not emit ZeroClaw tool_calls.
-//!   The CLI is invoked as a **one-shot completion** (like `gemini_cli`): no
-//!   always-approve / multi-turn agent loop inside the subprocess. ZeroClaw's
-//!   own agent loop handles multi-step tool use via the text tool protocol.
+//! - **Permissions / tools**: ZeroClaw does **not** pass `--always-approve`,
+//!   `--permission-mode`, `--disallowed-tools`, or `--max-turns`. Tool
+//!   enablement and permission rules belong in Grok project config under the
+//!   subprocess working directory (typically the agent workspace):
+//!   `.grok/config.toml` (`[permission]`), plus `.grok/skills/`, etc.
+//!   See Grok user-guide `05-configuration.md` / `22-permissions-and-safety.md`.
 //! - **Temperature**: Only baseline values `0.7` and `1.0` are accepted.
 //!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
@@ -35,32 +38,48 @@ const DEFAULT_GROK_CLI_BINARY: &str = "grok";
 
 /// Model name used to signal "use the CLI / config default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
-/// Bound hung subprocesses. Matches the completion-oriented timeout used by
-/// `gemini_cli` (not the long agentic tool-loop budget).
-const GROK_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bound hung subprocesses. Tools may still run if the workspace `.grok`
+/// config allows them; keep a generous but finite budget.
+const GROK_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_GROK_CLI_STDERR_CHARS: usize = 512;
 const GROK_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
-/// ModelProvider that invokes Grok Build CLI headless as a one-shot completion.
+/// ModelProvider that invokes Grok Build CLI headless.
+///
+/// Permission and tool policy are owned by Grok (workspace `.grok/`), not by
+/// ZeroClaw argv.
 pub struct GrokCliModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     /// Path to the `grok` binary.
     binary_path: PathBuf,
+    /// Subprocess cwd so project `.grok/config.toml` resolves correctly.
+    working_directory: Option<PathBuf>,
 }
 
 impl GrokCliModelProvider {
-    /// Create a new provider. Pass `None` to use `"grok"` from `PATH`.
-    pub fn new(alias: &str, binary_path: Option<&str>) -> Self {
+    /// Create a new provider. Pass `None` for `binary_path` to use `"grok"`
+    /// from `PATH`. Optional `working_directory` sets the subprocess cwd
+    /// (Grok loads project `.grok/` relative to that path).
+    pub fn new(
+        alias: &str,
+        binary_path: Option<&str>,
+        working_directory: Option<&str>,
+    ) -> Self {
         let binary_path = binary_path
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_GROK_CLI_BINARY));
+        let working_directory = working_directory
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
         Self {
             alias: alias.to_string(),
             binary_path,
+            working_directory,
         }
     }
 
@@ -104,9 +123,8 @@ impl GrokCliModelProvider {
     /// Build argv after the binary. Prompt is always passed via
     /// `--prompt-file` so large system prompts never hit OS ARG_MAX.
     ///
-    /// Intentionally **not** agentic (aligned with `gemini_cli`): no
-    /// `--always-approve` / multi-turn tool loop. `--max-turns 1` keeps the
-    /// CLI to a single completion; ZeroClaw re-invokes for further turns.
+    /// Only headless plumbing flags — no permission / tool / max-turns policy.
+    /// Those are configured in the workspace `.grok/` tree (see module docs).
     fn build_cli_args(model: &str, prompt_file: &std::path::Path) -> Vec<String> {
         let mut args = vec![
             "--prompt-file".to_string(),
@@ -114,11 +132,6 @@ impl GrokCliModelProvider {
             "--output-format".to_string(),
             "plain".to_string(),
             "--no-auto-update".to_string(),
-            "--no-plan".to_string(),
-            "--no-subagents".to_string(),
-            // One model step inside the subprocess (not a 40-turn agent).
-            "--max-turns".to_string(),
-            "1".to_string(),
         ];
         if Self::should_forward_model(model) {
             args.push("-m".to_string());
@@ -150,6 +163,9 @@ impl GrokCliModelProvider {
 
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(Self::build_cli_args(model, &prompt_path));
+        if let Some(cwd) = self.working_directory.as_ref() {
+            cmd.current_dir(cwd);
+        }
         cmd.kill_on_drop(true);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -311,23 +327,30 @@ mod tests {
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = GrokCliModelProvider::new("test", Some("/home/user/.grok/bin/grok"));
+        let p = GrokCliModelProvider::new("test", Some("/home/user/.grok/bin/grok"), None);
         assert_eq!(
             p.binary_path,
             PathBuf::from("/home/user/.grok/bin/grok")
         );
+        assert!(p.working_directory.is_none());
     }
 
     #[test]
     fn new_defaults_to_grok() {
-        let p = GrokCliModelProvider::new("test", None);
+        let p = GrokCliModelProvider::new("test", None, None);
         assert_eq!(p.binary_path, PathBuf::from("grok"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = GrokCliModelProvider::new("test", Some("   "));
+        let p = GrokCliModelProvider::new("test", Some("   "), None);
         assert_eq!(p.binary_path, PathBuf::from("grok"));
+    }
+
+    #[test]
+    fn new_sets_working_directory() {
+        let p = GrokCliModelProvider::new("test", None, Some("/tmp/agent-ws"));
+        assert_eq!(p.working_directory, Some(PathBuf::from("/tmp/agent-ws")));
     }
 
     #[test]
@@ -361,22 +384,29 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_args_uses_prompt_file_and_completion_flags() {
+    fn build_cli_args_is_permission_agnostic_headless_plumbing() {
         let path = PathBuf::from("/tmp/prompt.md");
         let args = GrokCliModelProvider::build_cli_args(DEFAULT_MODEL_MARKER, &path);
         assert_eq!(args[0], "--prompt-file");
         assert_eq!(args[1], "/tmp/prompt.md");
         assert!(args.iter().any(|a| a == "--output-format"));
         assert!(args.iter().any(|a| a == "plain"));
-        // Completion-oriented (gemini_cli-like): no agentic auto-approve loop.
-        assert!(!args.iter().any(|a| a == "--always-approve"));
-        assert!(!args.iter().any(|a| a == "bypassPermissions"));
-        let max_idx = args
-            .iter()
-            .position(|a| a == "--max-turns")
-            .expect("--max-turns");
-        assert_eq!(args[max_idx + 1], "1");
-        assert!(args.iter().any(|a| a == "--no-subagents"));
+        // ZeroClaw must not inject permission / tool policy via argv.
+        for forbidden in [
+            "--always-approve",
+            "bypassPermissions",
+            "--permission-mode",
+            "--max-turns",
+            "--disallowed-tools",
+            "--tools",
+            "--no-subagents",
+            "--no-plan",
+        ] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "unexpected policy flag in argv: {forbidden}"
+            );
+        }
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a == "-p"));
     }
@@ -394,6 +424,7 @@ mod tests {
         let model_provider = GrokCliModelProvider {
             alias: "test".to_string(),
             binary_path: PathBuf::from("/nonexistent/path/to/grok"),
+            working_directory: None,
         };
         let result = model_provider.invoke_cli("hello", "default").await;
         assert!(result.is_err());

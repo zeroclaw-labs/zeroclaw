@@ -1387,6 +1387,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
         Ok(Box::new(crate::grok_cli::GrokCliModelProvider::new(
             alias,
             self.binary_path.as_deref(),
+            self.working_directory.as_deref(),
         )))
     }
 
