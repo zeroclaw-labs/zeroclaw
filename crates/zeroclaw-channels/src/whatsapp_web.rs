@@ -2008,6 +2008,12 @@ impl Channel for WhatsAppWebChannel {
             // `TokioRuntime`. `with_device_props` switched from three
             // positional Options to a `DevicePropsOverride` builder
             // (oxidezap/whatsapp-rust#586).
+            //
+            // Clone the backend Arc for the event handler so we can fall back to
+            // the persistent LID→phone mapping when the in-memory client cache
+            // misses (cold start before history sync; see #6350).
+            let backend_for_events = backend.clone();
+
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
@@ -2039,6 +2045,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     let allowed_groups_resolver = Arc::clone(&allowed_groups_resolver);
+                    let backend_for_events = backend_for_events.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per PR #613, so we match against `&*event` to get a
@@ -2050,17 +2057,50 @@ impl Channel for WhatsAppWebChannel {
                                 let sender = sender_jid.user().to_string();
                                 let chat = info.source.chat.to_string();
 
-                                // whatsapp-rust 0.6: `Client::get_phone_number_from_lid`
-                                // was replaced by the unified `get_lid_pn_entry`
-                                // (oxidezap/whatsapp-rust#487). The new helper
-                                // returns the full LID↔phone entry; we extract
-                                // the phone field on hit, swallow lookup errors
-                                // back to `None` (consistent with the legacy
-                                // semantics — best-effort enrichment).
+                                // Resolve LID → phone for the allowlist check.
+                                //
+                                // The in-memory client cache (#6354), surfaced in
+                                // whatsapp-rust 0.6 as the unified `get_lid_pn_entry`
+                                // (oxidezap/whatsapp-rust#487), is best-effort and is
+                                // empty on cold start before history sync, so an
+                                // inbound from a LID contact with an already-persisted
+                                // mapping was silently dropped (#6350). Fall back to
+                                // the durable mapping in `ProtocolStore` when the
+                                // cache returns None; treat store errors as a miss
+                                // (fail-closed) so a lookup failure can never admit a
+                                // LID sender the allowlist would otherwise reject.
                                 let mapped_phone = if sender_jid.is_lid() {
                                     match client.get_lid_pn_entry(&sender_jid).await {
                                         Ok(Some(entry)) => Some(entry.phone_number),
-                                        _ => None,
+                                        _ => {
+                                            use wacore::store::traits::ProtocolStore;
+                                            match ProtocolStore::get_lid_mapping(
+                                                &*backend_for_events,
+                                                sender_jid.user(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(entry)) => Some(entry.phone_number),
+                                                Ok(None) => None,
+                                                Err(err) => {
+                                                    ::zeroclaw_log::record!(
+                                                        WARN,
+                                                        ::zeroclaw_log::Event::new(
+                                                            module_path!(),
+                                                            ::zeroclaw_log::Action::Note,
+                                                        )
+                                                        .with_outcome(
+                                                            ::zeroclaw_log::EventOutcome::Failure,
+                                                        ),
+                                                        format!(
+                                                            "WhatsApp Web: persistent LID→phone lookup failed for {}: {err}",
+                                                            sender_jid.user()
+                                                        ),
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }
                                     }
                                 } else {
                                     None
@@ -2708,6 +2748,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+    #[cfg(feature = "whatsapp-web")]
+    use wacore_binary::jid::JidExt as _;
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
@@ -3245,6 +3287,134 @@ mod tests {
             Arc::new(Vec::new),
         );
         assert!(!ch.health_check().await);
+    }
+
+    // ── #6350: persistent LID→phone mapping unblocks the allowlist ──
+    //
+    // When wa-rs's in-memory LID cache misses (cold start before history
+    // sync, or before the contact's first usync), the message handler must
+    // fall back to the durable `ProtocolStore::get_lid_mapping` row to
+    // resolve the sender's phone. Without that fallback, the allowlist
+    // comparison runs on `+<LID-digits>` and silently drops inbound from
+    // any LID-based contact whose phone is in `allowed-numbers`.
+    //
+    // This test exercises the integration boundary: a persisted mapping is
+    // looked up via the trait method (same call shape as the handler), the
+    // resulting phone is fed through `sender_phone_candidates`, and the
+    // allowlist check matches the operator-configured phone entry.
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_web_persistent_lid_mapping_unblocks_allowlist() {
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap();
+
+        let entry = LidPnMappingEntry {
+            lid: "37207519834264".to_string(),
+            phone_number: "15551234567".to_string(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_100,
+            learning_source: "usync".to_string(),
+        };
+        ProtocolStore::put_lid_mapping(&store, &entry)
+            .await
+            .unwrap();
+
+        let sender = Jid::lid("37207519834264");
+
+        // Simulate the handler's lookup: cache miss (None), then store hit.
+        let mapped_phone = ProtocolStore::get_lid_mapping(&store, sender.user())
+            .await
+            .unwrap()
+            .expect("persisted mapping must be readable through the trait")
+            .phone_number;
+
+        let candidates =
+            WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some(&mapped_phone));
+
+        let allowlist = vec!["+15551234567".to_string()];
+        let matched = candidates
+            .iter()
+            .any(|c| WhatsAppWebChannel::is_number_allowed_for_list(&allowlist, c));
+        assert!(
+            matched,
+            "operator-configured phone +15551234567 must match a LID contact whose persistent mapping resolves to that phone; candidates={candidates:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_web_missing_persistent_mapping_leaves_allowlist_intact() {
+        // Sanity check: with neither cache nor store providing a mapping,
+        // the LID sender's `+<LID-digits>` candidate must still be the only
+        // one tested. This pins that the fallback doesn't fabricate phones.
+        use wacore::store::traits::ProtocolStore;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap();
+
+        let sender = Jid::lid("37207519834264");
+        let mapped_phone = ProtocolStore::get_lid_mapping(&store, sender.user())
+            .await
+            .unwrap()
+            .map(|e| e.phone_number);
+        assert!(mapped_phone.is_none(), "empty store must report no mapping");
+
+        let candidates =
+            WhatsAppWebChannel::sender_phone_candidates(&sender, None, mapped_phone.as_deref());
+        let allowlist = vec!["+15551234567".to_string()];
+        let matched = candidates
+            .iter()
+            .any(|c| WhatsAppWebChannel::is_number_allowed_for_list(&allowlist, c));
+        assert!(
+            !matched,
+            "without a mapping, a LID contact must not match a phone-form allowlist entry; candidates={candidates:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_web_persistent_mapping_to_wrong_phone_stays_rejected() {
+        // Bypass-adjacent case (#6350 triage): the store resolves the LID to
+        // phone A, but the allowlist contains only phone B. The fallback must
+        // *narrow* to the resolved phone, not broaden the allowlist to admit a
+        // different contact. This pins that a persisted-but-non-allowlisted
+        // mapping is still rejected at the gate.
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap();
+
+        let entry = LidPnMappingEntry {
+            lid: "37207519834264".to_string(),
+            phone_number: "15550001111".to_string(), // resolves to phone A
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_100,
+            learning_source: "usync".to_string(),
+        };
+        ProtocolStore::put_lid_mapping(&store, &entry)
+            .await
+            .unwrap();
+
+        let sender = Jid::lid("37207519834264");
+        let mapped_phone = ProtocolStore::get_lid_mapping(&store, sender.user())
+            .await
+            .unwrap()
+            .expect("persisted mapping must be readable through the trait")
+            .phone_number;
+
+        let candidates =
+            WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some(&mapped_phone));
+        let allowlist = vec!["+15551234567".to_string()]; // only phone B
+        let matched = candidates
+            .iter()
+            .any(|c| WhatsAppWebChannel::is_number_allowed_for_list(&allowlist, c));
+        assert!(
+            !matched,
+            "a LID whose persisted mapping resolves to a non-allowlisted phone must stay rejected; candidates={candidates:?}"
+        );
     }
 
     // ── Reconnect retry state machine tests (exercise production helpers) ──
