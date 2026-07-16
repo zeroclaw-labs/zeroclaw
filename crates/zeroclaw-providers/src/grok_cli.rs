@@ -345,10 +345,7 @@ mod tests {
     #[test]
     fn new_uses_explicit_binary_path() {
         let p = GrokCliModelProvider::new("test", Some("/home/user/.grok/bin/grok"), None, vec![]);
-        assert_eq!(
-            p.binary_path,
-            PathBuf::from("/home/user/.grok/bin/grok")
-        );
+        assert_eq!(p.binary_path, PathBuf::from("/home/user/.grok/bin/grok"));
         assert!(p.working_directory.is_none());
         assert!(p.extra_args.is_empty());
     }
@@ -379,7 +376,10 @@ mod tests {
             None,
             vec!["--max-turns".into(), "  ".into(), "20".into()],
         );
-        assert_eq!(p.extra_args, vec!["--max-turns".to_string(), "20".to_string()]);
+        assert_eq!(
+            p.extra_args,
+            vec!["--max-turns".to_string(), "20".to_string()]
+        );
     }
 
     #[test]
