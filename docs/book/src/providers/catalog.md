@@ -57,14 +57,14 @@ Use a **dedicated provider alias** for the messaging agent (for example
 in the agent workspace `.grok/config.toml`.
 
 ```toml
-# Channel chatbot — read-only OS sandbox + workspace permissions
+# Channel chatbot — strict OS sandbox + workspace permissions
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/default/workspace"
-extra_args = ["--sandbox", "read-only"]
+extra_args = ["--sandbox", "strict"]
 
-# Ops / coding agents — no read-only sandbox (writes allowed)
+# Ops / coding agents — no strict sandbox (writes / broader FS reads allowed)
 [providers.models.grok_cli.ops]
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
@@ -93,7 +93,7 @@ deny = [
 
 | Layer | Where | Purpose |
 | ----- | ----- | ------- |
-| OS sandbox | `extra_args = ["--sandbox", "read-only"]` | Read everywhere; write only `~/.grok` + tmp; child network blocked on Linux |
+| OS sandbox | `extra_args = ["--sandbox", "strict"]` | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
 | App permissions | `<workspace>/.grok/config.toml` `[permission]` | Deny `zeroclaw channel send` variants |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 
@@ -114,9 +114,9 @@ calls. With `grok_cli`, most file/shell work happens **inside** Grok, so Grok’
 
 | Mechanism | Scope | Example |
 | --------- | ----- | ------- |
-| `extra_args` on the provider alias | That alias’s spawns only | `extra_args = ["--sandbox", "read-only"]` |
-| Process env | Whole ZeroClaw daemon (every `grok` spawn) | `Environment=GROK_SANDBOX=read-only` in the unit |
-| User Grok config | Every local `grok` (CLI + ZeroClaw) | `[sandbox] profile = "read-only"` in `~/.grok/config.toml` |
+| `extra_args` on the provider alias | That alias’s spawns only | `extra_args = ["--sandbox", "strict"]` |
+| Process env | Whole ZeroClaw daemon (every `grok` spawn) | `Environment=GROK_SANDBOX=strict` in the unit |
+| User Grok config | Every local `grok` (CLI + ZeroClaw) | `[sandbox] profile = "strict"` in `~/.grok/config.toml` |
 
 Project `.grok/config.toml` can hold MCP / plugins / **`[permission]`**, but it
 does **not** select the active sandbox profile by itself. Profile **names** and
@@ -130,19 +130,22 @@ custom profile **bodies** can live in project
 | ------- | ------- | -------- | ----------------------------- | ----------- |
 | `off` (default) | unrestricted | unrestricted | unrestricted | Full access |
 | `workspace` | everywhere | CWD + `~/.grok` + tmp | allowed | Everyday coding |
-| `read-only` | everywhere | `~/.grok` + tmp only | blocked | Channel chatbots, review |
-| `strict` | CWD + system paths | CWD + `~/.grok` + tmp | blocked | Untrusted / tightest |
+| `read-only` | everywhere (includes home / `~/.ssh`) | `~/.grok` + tmp only | blocked | Review when broad reads are OK |
+| `strict` | CWD + system paths (not home / `~/.ssh`) | CWD + `~/.grok` + tmp | blocked | **Default channel chatbot (recommended)** |
 | `devbox` | everywhere | most of the tree | allowed | Disposable VMs |
 
 Child-network blocking applies to **shell children** on Linux only; in-process
-Grok tools (LLM, built-in web search) still need network.
+Grok tools (LLM, built-in web search) still need network. Prefer **`strict`**
+for messaging bots so home-directory secrets stay out of reach; use
+`read-only` only when the agent must read outside the workspace without
+writing project files.
 
 **Custom profile example** (define in workspace, select from ZeroClaw):
 
 ```toml
 # <agent-workspace>/.grok/sandbox.toml
 [profiles.channel-bot]
-extends = "read-only"
+extends = "strict"
 # Optional kernel deny paths (needs bubblewrap on Linux when non-empty):
 # deny = ["**/.env", "**/*.pem"]
 ```
@@ -155,7 +158,7 @@ extra_args = ["--sandbox", "channel-bot"]
 ```
 
 **Per-agent sandbox:** one daemon shares one environment, so use **separate
-provider aliases** with different `extra_args` (for example `read-only` on the
+provider aliases** with different `extra_args` (for example `strict` on the
 chatbot alias, no sandbox on an ops alias). Point each agent at the matching
 `model_provider`.
 
