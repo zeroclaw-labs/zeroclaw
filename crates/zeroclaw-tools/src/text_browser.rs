@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 use crate::helpers::domain_guard;
@@ -286,7 +286,7 @@ impl Tool for TextBrowserTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -294,7 +294,7 @@ impl Tool for TextBrowserTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -304,7 +304,7 @@ impl Tool for TextBrowserTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -317,7 +317,7 @@ impl Tool for TextBrowserTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -352,14 +352,14 @@ impl Tool for TextBrowserTool {
                     let text = self.truncate_response(&text);
                     Ok(ToolResult {
                         success: true,
-                        output: text,
+                        output: text.into(),
                         error: None,
                     })
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "{browser} exited with status {}: {}",
                             output.status,
@@ -370,12 +370,12 @@ impl Tool for TextBrowserTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to execute {browser}: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "{browser} timed out after {} seconds",
                     timeout.as_secs()

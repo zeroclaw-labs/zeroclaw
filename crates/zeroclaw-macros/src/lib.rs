@@ -58,6 +58,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
+/// - `#[multiline]` on a string field hints surfaces to render a multi-line
+///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
 /// # Generated methods
 ///
@@ -129,7 +131,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         credential_class,
         natural_key,
         tab,
-        group
+        group,
+        multiline
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -248,6 +251,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let is_multiline = has_attr(field, "multiline");
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
@@ -382,6 +386,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 credential_class: #credential_class_expr,
                                 tab: #tab_token,
                                 alias_source: None,
+                                multiline: false,
                             });
                         }
                     }
@@ -2273,6 +2278,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         credential_class: #credential_class_expr,
                         tab: #tab_token,
                         alias_source: #alias_source_expr,
+                        multiline: #is_multiline,
                     }
                 }
             });
@@ -2293,6 +2299,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #tab_token,
                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
                     #alias_source_expr,
+                    #is_multiline,
                 )
             });
         }
@@ -2560,6 +2567,244 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Derive `field_specs(&self) -> Vec<TriggerField>` for a trigger enum, so the
+/// authoring registry never hand-lists a source's fields. Field kind is
+/// inferred by convention from each variant's fields:
+///
+/// - a field named `condition` becomes an expression field;
+/// - a `Vec<T>` whose element type ends in `Kind` becomes a multi-select
+///   options field populated from `T::iter()`;
+/// - any other `Vec<_>` becomes a plain list field;
+/// - everything else becomes a text field.
+///
+/// A variant marked `#[trigger(config_derived)]` yields no fields: its options
+/// depend on live config and the registry supplies them separately. Add a
+/// variant and its field spec is generated automatically - there is no second
+/// place to edit.
+#[proc_macro_derive(TriggerFields, attributes(trigger))]
+pub fn derive_trigger_fields(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(&input, "TriggerFields can only be derived for enums")
+            .to_compile_error()
+            .into();
+    };
+
+    for variant in &data.variants {
+        if matches!(variant.fields, Fields::Unnamed(_)) {
+            return syn::Error::new_spanned(
+                variant,
+                "TriggerFields does not support tuple variants",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
+    let source_arms: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .map(|variant| {
+            let vident = &variant.ident;
+            let config_derived = variant
+                .attrs
+                .iter()
+                .any(|a| trigger_attr_has_flag(a, "config_derived"));
+            let field_exprs: Vec<proc_macro2::TokenStream> = if config_derived {
+                Vec::new()
+            } else {
+                match &variant.fields {
+                    Fields::Named(named) => {
+                        named.named.iter().filter_map(trigger_field_expr).collect()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            quote! { SopTriggerSource::#vident => vec![ #(#field_exprs),* ], }
+        })
+        .collect();
+
+    let display_arms: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .map(|variant| {
+            let vident = &variant.ident;
+            let is_unit = matches!(variant.fields, Fields::Unit);
+            let disp = parse_trigger_display(variant);
+
+            let mut binds: Vec<proc_macro2::TokenStream> = Vec::new();
+            for fname in disp.fields.iter().chain(disp.opt.iter()) {
+                let fident = syn::Ident::new(fname, proc_macro2::Span::call_site());
+                binds.push(quote! { #fident });
+            }
+            let pattern = if is_unit {
+                quote! { Self::#vident }
+            } else if binds.is_empty() {
+                quote! { Self::#vident { .. } }
+            } else {
+                quote! { Self::#vident { #(#binds),* , .. } }
+            };
+
+            let body = if disp.fields.is_empty() {
+                quote! { write!(f, "{source}") }
+            } else {
+                let field_idents: Vec<syn::Ident> = disp
+                    .fields
+                    .iter()
+                    .map(|n| syn::Ident::new(n, proc_macro2::Span::call_site()))
+                    .collect();
+                let joined = field_idents
+                    .iter()
+                    .map(|id| quote! { #id })
+                    .collect::<Vec<_>>();
+                let base = {
+                    let mut parts = Vec::new();
+                    for (i, id) in joined.iter().enumerate() {
+                        if i > 0 {
+                            parts.push(quote! { write!(f, "/")?; });
+                        }
+                        parts.push(quote! { write!(f, "{}", #id)?; });
+                    }
+                    parts
+                };
+                match &disp.opt {
+                    Some(opt) => {
+                        let opt_ident = syn::Ident::new(opt, proc_macro2::Span::call_site());
+                        quote! {
+                            write!(f, "{source}:")?;
+                            #(#base)*
+                            if let ::core::option::Option::Some(v) = #opt_ident {
+                                write!(f, "/{}", v)?;
+                            }
+                            Ok(())
+                        }
+                    }
+                    None => quote! {
+                        write!(f, "{source}:")?;
+                        #(#base)*
+                        Ok(())
+                    },
+                }
+            };
+
+            quote! { #pattern => { #body } }
+        })
+        .collect();
+
+    let expanded = quote! {
+        impl #name {
+            pub(crate) fn field_specs(&self) -> ::std::vec::Vec<crate::sop::trigger_registry::TriggerField> {
+                self.source().field_specs()
+            }
+        }
+
+        impl ::core::fmt::Display for #name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let source = self.source();
+                match self {
+                    #(#display_arms)*
+                }
+            }
+        }
+
+        impl crate::sop::types::SopTriggerSource {
+            /// Editable field specs for this trigger source, generated from the
+            /// `SopTrigger` variant's fields. The single source of truth the
+            /// authoring registry reads.
+            pub(crate) fn field_specs(self) -> ::std::vec::Vec<crate::sop::trigger_registry::TriggerField> {
+                use crate::sop::trigger_registry::TriggerField;
+                use crate::sop::types::SopTriggerSource;
+                #[allow(unused_imports)]
+                use ::strum::IntoEnumIterator;
+                match self {
+                    #(#source_arms)*
+                }
+            }
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+fn trigger_attr_has_flag(attr: &syn::Attribute, flag: &str) -> bool {
+    if !attr.path().is_ident("trigger") {
+        return false;
+    }
+    let mut found = false;
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident(flag) {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Parsed `#[trigger(display = "...", opt = "...")]` for one variant.
+struct TriggerDisplay {
+    /// Field names rendered as the `:`-suffix, joined by `/`. Empty means the
+    /// variant renders as the bare source with no suffix.
+    fields: Vec<String>,
+    /// Optional trailing field rendered as `/{field}` only when it is `Some`.
+    opt: Option<String>,
+}
+
+fn parse_trigger_display(variant: &syn::Variant) -> TriggerDisplay {
+    let mut display = TriggerDisplay {
+        fields: Vec::new(),
+        opt: None,
+    };
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("trigger") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("display") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                display.fields = lit.value().split('/').map(str::to_string).collect();
+            } else if meta.path.is_ident("opt") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                display.opt = Some(lit.value());
+            }
+            Ok(())
+        });
+    }
+    display
+}
+
+/// Build the `TriggerField` constructor call for one named field, or `None`
+/// for fields that carry no authoring input (currently none are dropped, but
+/// serde-skipped internal fields could be here).
+fn trigger_field_expr(field: &syn::Field) -> Option<proc_macro2::TokenStream> {
+    let ident = field.ident.as_ref()?;
+    let name = ident.to_string();
+    if name == "condition" {
+        return Some(quote! { TriggerField::expression(#name) });
+    }
+    if let Some(inner) = extract_vec_inner(&field.ty) {
+        if let syn::Type::Path(p) = inner
+            && p.path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident.to_string().ends_with("Kind"))
+        {
+            let elem = inner;
+            return Some(quote! {
+                TriggerField::options(
+                    #name,
+                    <#elem as ::strum::IntoEnumIterator>::iter()
+                        .map(|k| <&'static str>::from(k).to_string())
+                        .collect(),
+                )
+            });
+        }
+        return Some(quote! { TriggerField::list(#name) });
+    }
+    Some(quote! { TriggerField::text(#name) })
 }
 
 #[proc_macro_derive(ConfigEnum)]

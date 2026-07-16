@@ -1072,6 +1072,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                             error_reason: None,
                             duration: std::time::Duration::ZERO,
                             receipt: None,
+                            output_data: None,
                         },
                     ));
                 }
@@ -1096,6 +1097,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         error_reason: None,
                         duration: std::time::Duration::ZERO,
                         receipt: None,
+                        output_data: None,
                     };
                     events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
                 }
@@ -1370,56 +1372,61 @@ async fn drive_live_sop_actions(
                     );
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
-                    let step_output = Box::pin(run_tool_call_loop(ToolLoop {
-                        exec: ResolvedAgentExecution::resolve(
-                            ResolvedModelAccess {
-                                model_provider,
-                                provider_name,
-                                model,
-                                temperature,
-                            },
-                            ResolvedIo {
-                                tools_registry,
-                                observer,
-                                silent,
-                                approval,
-                                multimodal_config,
-                                hooks,
-                                activated_tools,
-                                model_switch_callback: model_switch_callback.clone(),
-                                receipt_generator,
-                            },
-                            ResolvedRuntimeKnobs {
-                                max_tool_iterations,
-                                excluded_tools: &sop_excluded_tools,
-                                dedup_exempt_tools,
-                                pacing,
-                                strict_tool_parsing,
-                                parallel_tools,
-                                max_tool_result_chars,
-                                context_token_budget,
-                                knobs,
-                            },
-                        ),
-                        history,
-                        channel_name,
-                        channel_reply_target,
-                        cancellation_token: cancellation_token.clone(),
-                        on_delta: on_delta.clone(),
-                        shared_budget: shared_budget.clone(),
-                        channel,
-                        collected_receipts,
-                        event_tx: event_tx.clone(),
-                        steering: None,
-                        new_messages_out: new_messages_out.as_deref_mut(),
-                        image_cache: image_cache.as_deref_mut(),
-                        memory: None,
-                        ingress: IngressContext::sub_turn(),
-                        agent_alias,
-                        turn_id: &nested_turn_id,
-                    }))
+                    let step_call_sink = crate::sop::executor::new_step_call_sink();
+                    let step_output = crate::sop::executor::scope_step_call_sink(
+                        step_call_sink.clone(),
+                        Box::pin(run_tool_call_loop(ToolLoop {
+                            exec: ResolvedAgentExecution::resolve(
+                                ResolvedModelAccess {
+                                    model_provider,
+                                    provider_name,
+                                    model,
+                                    temperature,
+                                },
+                                ResolvedIo {
+                                    tools_registry,
+                                    observer,
+                                    silent,
+                                    approval,
+                                    multimodal_config,
+                                    hooks,
+                                    activated_tools,
+                                    model_switch_callback: model_switch_callback.clone(),
+                                    receipt_generator,
+                                },
+                                ResolvedRuntimeKnobs {
+                                    max_tool_iterations,
+                                    excluded_tools: &sop_excluded_tools,
+                                    dedup_exempt_tools,
+                                    pacing,
+                                    strict_tool_parsing,
+                                    parallel_tools,
+                                    max_tool_result_chars,
+                                    context_token_budget,
+                                    knobs,
+                                },
+                            ),
+                            history,
+                            channel_name,
+                            channel_reply_target,
+                            cancellation_token: cancellation_token.clone(),
+                            on_delta: on_delta.clone(),
+                            shared_budget: shared_budget.clone(),
+                            channel,
+                            collected_receipts,
+                            event_tx: event_tx.clone(),
+                            steering: None,
+                            new_messages_out: new_messages_out.as_deref_mut(),
+                            image_cache: image_cache.as_deref_mut(),
+                            memory: None,
+                            ingress: IngressContext::sub_turn(),
+                            agent_alias,
+                            turn_id: &nested_turn_id,
+                        })),
+                    )
                     .await;
 
+                    let step_calls = crate::sop::executor::drain_step_calls(&step_call_sink);
                     let completed_at = crate::sop::engine::now_iso8601();
                     let step_result = match step_output {
                         Ok(output) => crate::sop::SopStepResult {
@@ -1428,6 +1435,7 @@ async fn drive_live_sop_actions(
                             output,
                             started_at,
                             completed_at: Some(completed_at),
+                            tool_calls: step_calls,
                         },
                         Err(e) => crate::sop::SopStepResult {
                             step_number: step.number,
@@ -1435,6 +1443,7 @@ async fn drive_live_sop_actions(
                             output: e.to_string(),
                             started_at,
                             completed_at: Some(completed_at),
+                            tool_calls: step_calls,
                         },
                     };
 
