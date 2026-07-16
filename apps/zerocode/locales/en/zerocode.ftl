@@ -5,6 +5,7 @@ zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
+zc-pane-sop = SOPs
 
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-reload = Reload daemon
@@ -248,6 +249,20 @@ zc-dashboard-section-by-agent = By Agent
 zc-dashboard-section-command = Command
 zc-dashboard-section-prompt = Prompt
 zc-dashboard-section-last-output = Last Output
+zc-dashboard-section-manual-run = Manual Run
+zc-dashboard-section-recent-runs = Recent Runs
+zc-dashboard-actions = Actions
+zc-dashboard-cron-action-hint = { $run } run now · { $refresh } refresh
+zc-dashboard-loading-runs = Loading runs…
+zc-dashboard-runs-error = Failed to load runs
+zc-dashboard-no-runs = No runs recorded yet
+zc-dashboard-run-succeeded = Run succeeded
+zc-dashboard-run-failed = Run failed
+zc-dashboard-run-running = Run started: { $id }
+zc-dashboard-run-already-running = Run already in progress: { $id }
+zc-dashboard-run-pending-status = running
+zc-dashboard-run-pending-window = starting now
+zc-dashboard-run-pending-output = Manual trigger in progress…
 
 
 zc-dashboard-yes = yes
@@ -266,6 +281,11 @@ zc-quickstart-selector-agent = Agent
 zc-quickstart-selector-submit = Submit
 
 zc-quickstart-reuse-alias-help = Reuse this alias instead of creating a new one.
+zc-quickstart-existing-providers-heading = Existing providers
+zc-quickstart-existing-providers-show-more = [+ Show { $count } more existing providers]
+zc-quickstart-existing-providers-show-fewer = [- Show fewer existing providers]
+zc-quickstart-new-provider-heading = Create new provider
+zc-quickstart-provider-alias-exists = Alias `{ $alias }` already exists. Pick another alias or use the existing provider.
 
 zc-quickstart-risk-locked-down = Locked Down
 zc-quickstart-risk-locked-down-desc = Tight defaults. Workspace-only fs, approval on med/high risk.
@@ -316,6 +336,11 @@ zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
 zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
 zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
+zc-quickstart-missing-model-provider = Choose a model provider before creating.
+zc-quickstart-missing-risk-profile = Choose a risk profile before creating.
+zc-quickstart-missing-runtime-profile = Choose a runtime profile before creating.
+zc-quickstart-missing-memory = Choose a memory backend before creating.
+zc-quickstart-missing-agent = Name the agent before creating.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel
@@ -335,6 +360,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-switch-error = Failed to switch session: { $error }
+zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 
@@ -382,6 +409,8 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
+zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
 zc-elicit-help-cancel = Cancel

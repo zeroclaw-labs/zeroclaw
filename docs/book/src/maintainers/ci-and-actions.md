@@ -22,6 +22,14 @@ Composite job with multiple matrix legs:
 
 `fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
+Fresh required CI is normally the shared evidence for the Cargo surfaces it actually runs. A local rerun of the same Cargo command on the same head, target, and feature set is duplicate confidence, not a stronger proof. Before asking for extra Cargo or Clippy, compare the changed surface with the current workflow files and the actual checks on the PR. Extra validation belongs where the required gate does not prove the thing under review:
+
+- a platform received compile checks but not tests;
+- a platform, crate, or path is outside the required lint job;
+- a desktop change did not trigger the desktop workflow;
+- a release target is outside the PR matrix and only covered by release/manual workflows;
+- stale, cancelled, skipped, or unavailable CI is not fresh evidence.
+
 ### Daily Advisory Scan (`daily-audit.yml`)
 
 Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tree. Opens an issue on findings. No action unless a vulnerability is reported.
@@ -37,6 +45,12 @@ Auto-applies path and scope labels based on changed files. It runs on PR open, r
 This workflow does not currently apply `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels. If a PR is missing a path/scope label, check whether the paths in `.github/labeler.yml` cover the changes.
 
 Dependabot has separate label configuration in `.github/dependabot.yml` for its own PRs. Cargo update PRs start with `dependencies`; GitHub Actions and Docker update PRs start with `ci` and `dependencies`.
+
+### Project Dashboard Planner (`project-dashboard-plan.yml`)
+
+Runs manually for a single issue number. It reads issue state and labels, then writes a report-only step summary proposing the existing Project Status value that best matches the issue.
+
+This workflow does not run automatically on issue events, write ProjectV2 fields, edit issues, add labels, post comments, or recalculate PR `risk:*`, `size:*`, or `type:*` labels. Live ProjectV2 mutation or automatic issue-event planning needs a separately approved field mapping, trigger policy, and project-scoped credential.
 
 ### Validate PR title (`pr-title.yml`)
 
