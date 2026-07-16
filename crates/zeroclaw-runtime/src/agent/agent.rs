@@ -2506,7 +2506,12 @@ impl Agent {
                             .provider_switch_config
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            .map(|config| crate::agent::turn::SopStepReassembly {
+                                config,
+                                // Top of the tree: baseline is the agent this
+                                // live-daemon turn runs as.
+                                baseline_alias: agent_alias_for_loop.as_deref(),
+                            }),
                     }),
                 ),
             )
@@ -2893,7 +2898,12 @@ impl Agent {
                                 .provider_switch_config
                                 .as_ref()
                                 .and_then(|c| c.config.as_deref())
-                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                                .map(|config| crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    // Top of the tree: baseline is the agent this
+                                    // live-daemon turn runs as.
+                                    baseline_alias: agent_alias_for_loop.as_deref(),
+                                }),
                         }),
                     ),
                 )

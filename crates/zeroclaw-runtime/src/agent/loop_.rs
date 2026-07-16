@@ -2076,6 +2076,9 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    // Top of the tree: the re-assembly baseline is
+                                    // the agent this turn runs as.
+                                    baseline_alias: Some(agent_alias),
                                 }),
                             }),
                         ),
@@ -2645,6 +2648,9 @@ pub async fn run(
                                     turn_id: &turn_id,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        // Top of the tree: the re-assembly baseline
+                                        // is the agent this turn runs as.
+                                        baseline_alias: Some(agent_alias),
                                     }),
                                 }),
                             ),
@@ -3515,7 +3521,12 @@ pub async fn process_message(
                         },
                     }),
                     Some(agent_alias),
-                    Some(SopStepReassembly { config: &config }),
+                    Some(SopStepReassembly {
+                        config: &config,
+                        // Top of the tree: the re-assembly baseline is the agent
+                        // this process-message turn runs as.
+                        baseline_alias: Some(agent_alias),
+                    }),
                 ),
             )
             .await

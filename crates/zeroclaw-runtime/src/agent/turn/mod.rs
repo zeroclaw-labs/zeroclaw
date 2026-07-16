@@ -1329,9 +1329,59 @@ fn sop_step_excluded_tools(
 /// context is assembled the way a fresh agent turn would be. `Copy` so the
 /// handle survives being re-read on every drained action and forwarded into
 /// each nested turn.
+///
+/// This handle is either `Some` on every frame of a recursion tree or `None` on
+/// every frame: it is introduced only at the top entry points and forwarded
+/// unchanged (config-wise) into each nested step, so a `None` here means no
+/// ancestor could have re-assembled and thus `baseline_alias == agent_alias`
+/// always holds. That invariant is what lets the re-assembly baseline ride
+/// inside this handle instead of a separate per-turn field.
 #[derive(Clone, Copy)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    /// The alias of the agent whose execution context the CURRENT loop is
+    /// actually running with — the re-assembly baseline. At a top-level entry
+    /// this equals `agent_alias`; once a cross-agent step re-assembles a
+    /// different agent in a parent frame, the nested loop carries THAT agent
+    /// here (see [`advance_nested_reassembly`]). It is deliberately distinct
+    /// from `agent_alias`, which stays pinned to the outer agent for
+    /// attribution (Observer/receipt/OTel) and must not be overloaded: at
+    /// depth >= 2 the two diverge, and the re-assembly gate must compare a
+    /// step's alias against the effective baseline, not the attribution alias,
+    /// or a step naming the outer agent from inside a re-assembled child would
+    /// skip re-assembly and inherit the child's broader scope (escalation).
+    pub baseline_alias: Option<&'a str>,
+}
+
+/// The re-assembly gate: a step needs its own agent context re-assembled when it
+/// names an agent different from the one the current loop is running as. The
+/// baseline is the EFFECTIVE alias (the re-assembly baseline), never the
+/// attribution `agent_alias`, which at depth >= 2 lags behind a re-assembled
+/// child. A step with no explicit agent inherits the current one and never
+/// re-assembles.
+fn step_needs_reassembly(baseline_alias: Option<&str>, step_alias: Option<&str>) -> bool {
+    matches!(step_alias, Some(s) if baseline_alias != Some(s))
+}
+
+/// Advance the re-assembly baseline for a nested step's sub-loop. When this step
+/// re-assembled a different agent's context (`reassembled`), that agent becomes
+/// the baseline its own nested sub-steps compare against, so a deeper step naming
+/// yet another agent (including the outer one) re-assembles correctly instead of
+/// inheriting this step agent's scope. When nothing was re-assembled the baseline
+/// carries through unchanged. The config handle is preserved so the whole subtree
+/// keeps the same re-assembly capability.
+fn advance_nested_reassembly<'a>(
+    current: Option<SopStepReassembly<'a>>,
+    step_alias: Option<&'a str>,
+    reassembled: bool,
+) -> Option<SopStepReassembly<'a>> {
+    match current {
+        Some(r) if reassembled => Some(SopStepReassembly {
+            config: r.config,
+            baseline_alias: step_alias,
+        }),
+        other => other,
+    }
 }
 
 /// A nested SOP step's owned per-agent execution surface, assembled for a step
@@ -1541,7 +1591,16 @@ async fn drive_live_sop_actions(
                     // re-assemble (and memoize) that agent's execution context;
                     // same-agent steps keep the parent context unchanged.
                     let step_alias = step.agent.as_deref();
-                    let needs_reassembly = matches!(step_alias, Some(s) if agent_alias != Some(s));
+                    // Compare against the EFFECTIVE re-assembly baseline (the agent
+                    // this loop is actually running as), not `agent_alias` (which
+                    // stays pinned to the outer agent for attribution). At depth
+                    // >= 2 a re-assembled child carries its step agent as the
+                    // baseline; comparing against `agent_alias` there would skip
+                    // re-assembling a step that names the outer agent and let it
+                    // inherit the child's broader scope. When there is no handle,
+                    // the tree never re-assembles, so baseline == `agent_alias`.
+                    let baseline_alias = sop_reassembly.map_or(agent_alias, |r| r.baseline_alias);
+                    let needs_reassembly = step_needs_reassembly(baseline_alias, step_alias);
                     let mut assembly_error: Option<anyhow::Error> = None;
                     if needs_reassembly {
                         let alias =
@@ -1564,9 +1623,12 @@ async fn drive_live_sop_actions(
                             }
                         } else {
                             // This construction path provides no per-agent re-assembly
-                            // handle, so a step delegating to a different agent would run
-                            // with the parent turn's broader context. Surface the gap
-                            // rather than under-enforce in silence (omission is not a grant).
+                            // handle (e.g. a bounded delegate sub-loop that carries a live
+                            // SOP tool). Running a cross-agent step here would inherit the
+                            // parent/delegate agent's broader tools/policy/MCP surface —
+                            // the exact escalation this whole seam exists to prevent. Fail
+                            // the step CLOSED, the same as an assembly error below, rather
+                            // than under-enforce in silence (omission is not a grant).
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -1575,10 +1637,16 @@ async fn drive_live_sop_actions(
                                 ),
                                 &format!(
                                     "SOP step delegates to agent '{alias}' but this run path \
-                                     provides no per-agent re-assembly; the step runs with the \
-                                     parent agent's context (per-agent isolation not applied)"
+                                     provides no per-agent re-assembly handle; refusing the step \
+                                     (fail-closed) rather than run it with the parent agent's \
+                                     context (per-agent isolation cannot be applied here)"
                                 )
                             );
+                            assembly_error = Some(anyhow::Error::msg(format!(
+                                "SOP step delegates to agent '{alias}' but this run path provides \
+                                 no per-agent re-assembly handle; refusing to run the step with \
+                                 the parent agent's context (per-agent isolation cannot be applied)"
+                            )));
                         }
                     }
 
@@ -1600,6 +1668,14 @@ async fn drive_live_sop_actions(
                         } else {
                             None
                         };
+                        // The baseline the step's own nested sub-steps compare
+                        // against: this step's agent once we re-assembled it
+                        // (`owned` is `Some`), otherwise the current baseline
+                        // unchanged. Threaded via `sop_reassembly` so a depth >= 2
+                        // sub-step re-resolves scope against the agent actually in
+                        // effect, not the outer attribution alias.
+                        let nested_sop_reassembly =
+                            advance_nested_reassembly(sop_reassembly, step_alias, owned.is_some());
                         let (
                             eff_model_provider,
                             eff_provider_name,
@@ -1682,9 +1758,12 @@ async fn drive_live_sop_actions(
                                 image_cache: image_cache.as_deref_mut(),
                                 memory: None,
                                 ingress: IngressContext::sub_turn(),
+                                // Attribution stays on the OUTER agent (Observer/
+                                // receipts/OTel); the re-assembly baseline rides in
+                                // `sop_reassembly` instead. See `advance_nested_reassembly`.
                                 agent_alias,
                                 turn_id: &nested_turn_id,
-                                sop_reassembly,
+                                sop_reassembly: nested_sop_reassembly,
                             })),
                         )
                         .await
@@ -1981,5 +2060,644 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+/// Live SOP nested-step re-assembly gate + fail-closed regressions.
+///
+/// Two privilege-scope properties of the live driver:
+///
+/// - **Depth >= 2 baseline (Defect 1).** The re-assembly gate compares a step's
+///   agent against the EFFECTIVE baseline (the agent this loop is actually
+///   running as), not the attribution `agent_alias`. After a cross-agent
+///   re-assembly the two diverge; a step naming the outer agent from inside a
+///   re-assembled child must re-assemble, not inherit the child's broader scope.
+/// - **No-handle fail-closed (Defect 2).** A driver path with no re-assembly
+///   handle (`sop_reassembly: None`, e.g. a bounded delegate sub-loop carrying a
+///   live SOP tool) must fail a cross-agent step CLOSED, never run it with the
+///   parent/delegate agent's tools.
+#[cfg(test)]
+mod sop_step_reassembly_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    // ── Defect 1: gate + baseline threading (pure, on the driver's own fns) ──
+
+    #[test]
+    fn gate_reassembles_only_on_agent_change() {
+        assert!(
+            !step_needs_reassembly(Some("a"), Some("a")),
+            "same agent must not re-assemble"
+        );
+        assert!(
+            step_needs_reassembly(Some("a"), Some("b")),
+            "a different agent must re-assemble"
+        );
+        assert!(
+            !step_needs_reassembly(Some("a"), None),
+            "a step with no explicit agent inherits the current one"
+        );
+        assert!(
+            step_needs_reassembly(None, Some("b")),
+            "an unnamed baseline still re-assembles a named step"
+        );
+        assert!(!step_needs_reassembly(None, None));
+    }
+
+    #[test]
+    fn nested_baseline_advances_only_when_reassembled() {
+        let config = zeroclaw_config::schema::Config::default();
+        let top = SopStepReassembly {
+            config: &config,
+            baseline_alias: Some("root-a"),
+        };
+        // Re-assembled a step naming "mid-b": the nested sub-loop's baseline
+        // becomes "mid-b", carrying the same config handle.
+        let nested = advance_nested_reassembly(Some(top), Some("mid-b"), true)
+            .expect("handle preserved through re-assembly");
+        assert_eq!(nested.baseline_alias, Some("mid-b"));
+        // Same-agent step (not re-assembled): baseline unchanged.
+        let same = advance_nested_reassembly(Some(top), Some("root-a"), false)
+            .expect("handle preserved when not re-assembling");
+        assert_eq!(same.baseline_alias, Some("root-a"));
+        // No handle stays no handle (a None-tree never re-assembles anywhere).
+        assert!(advance_nested_reassembly(None, Some("mid-b"), true).is_none());
+    }
+
+    /// The depth-2 regression: root `A` -> step names `B` -> `B` re-assembled ->
+    /// `B`'s nested step names root `A`. The `A`-named nested step MUST
+    /// re-assemble (run with `A`'s scope), not skip because attribution still
+    /// reads `A`. This composes the exact functions the live driver runs across
+    /// two frames. A literal end-to-end live drive is infeasible
+    /// (`assemble_owned_execution` binds a provider from config with no
+    /// scripted-provider seam for the nested loop), so this pins the decision +
+    /// threading the driver performs; the real-scope tie is asserted separately
+    /// in `reassembly_yields_the_named_agents_own_scope`.
+    #[test]
+    fn depth2_step_naming_outer_agent_reassembles_against_effective_baseline() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        // Frame 0 — root turn runs as agent "A"; the top handle's baseline is "A".
+        let root = SopStepReassembly {
+            config: &config,
+            baseline_alias: Some("A"),
+        };
+
+        // Depth-1 step names "B" (!= "A") -> re-assemble B.
+        assert!(step_needs_reassembly(root.baseline_alias, Some("B")));
+        let depth1 = advance_nested_reassembly(Some(root), Some("B"), /* reassembled */ true)
+            .expect("B re-assembled");
+        assert_eq!(
+            depth1.baseline_alias,
+            Some("B"),
+            "the nested sub-loop must run with B as its re-assembly baseline"
+        );
+
+        // Depth-2 step names the ROOT agent "A" from inside re-assembled B.
+        // FIXED: compared against the effective baseline "B", so "A" (!= "B")
+        // re-assembles and the step runs with A's own scope.
+        assert!(
+            step_needs_reassembly(depth1.baseline_alias, Some("A")),
+            "a depth-2 step naming the outer agent must re-assemble that agent's scope"
+        );
+
+        // Pre-fix escalation contrast: the driver used to thread the OUTER
+        // attribution alias unchanged as the nested baseline; comparing a step
+        // naming "A" against "A" skipped re-assembly, so the step ran with B's
+        // broader scope. Pin that this is exactly what the fix reverses.
+        let attribution_alias = Some("A");
+        assert!(
+            !step_needs_reassembly(attribution_alias, Some("A")),
+            "documents the closed escalation: comparing against attribution skips re-assembly"
+        );
+    }
+
+    fn tool_names(tools: &[Box<dyn crate::tools::Tool>]) -> Vec<String> {
+        tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Real-scope tie for Defect 1: re-assembling a step's named agent yields
+    /// THAT agent's own gated tool set, and distinct agents resolve distinct
+    /// scopes — so the depth-2 gate decision above is load-bearing (choosing to
+    /// re-assemble genuinely changes which tools the step can reach).
+    #[tokio::test]
+    async fn reassembly_yields_the_named_agents_own_scope() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-sop-depth2-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        // Two agents whose per-agent policy allowlists exactly one, DIFFERENT
+        // built-in each: their assembled scopes must not coincide.
+        config.risk_profiles.insert(
+            "reader".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "writer".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_write".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        for (alias, profile) in [("reader", "reader"), ("writer", "writer")] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: "ollama.p".into(),
+                    risk_profile: profile.into(),
+                    memory: AgentMemoryConfig {
+                        backend: MemoryBackendKind::Markdown,
+                    },
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None)
+            .await
+            .expect("reader assembles");
+        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None)
+            .await
+            .expect("writer assembles");
+        let reader_names = tool_names(&reader.tools_registry);
+        let writer_names = tool_names(&writer.tools_registry);
+
+        assert!(
+            reader_names.contains(&"file_read".to_string())
+                && !reader_names.contains(&"file_write".to_string()),
+            "reader gets only its own allowlisted tool: {reader_names:?}"
+        );
+        assert!(
+            writer_names.contains(&"file_write".to_string())
+                && !writer_names.contains(&"file_read".to_string()),
+            "writer gets only its own allowlisted tool: {writer_names:?}"
+        );
+        // The gate re-assembles when a step names the other agent, so a
+        // cross-agent step lands in the named agent's scope, not the baseline's.
+        assert!(step_needs_reassembly(Some("reader"), Some("writer")));
+    }
+
+    // ── Defect 2: no-handle cross-agent step fails closed ────────────────────
+
+    /// A provider that, if the nested loop ever ran, would drive the parent's
+    /// sensitive tool. Under the fix the fail-closed guard short-circuits before
+    /// the nested loop, so `chat` is never polled.
+    struct ShellCallingProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ShellCallingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ShellCallingProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ShellCallingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// The parent/delegate agent's sensitive tool; counts executions so the test
+    /// can prove a no-handle cross-agent step never reaches it.
+    struct ShellProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    ::zeroclaw_api::tool_attribution!(ShellProbe, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ShellProbe {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "shell"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "shell-out".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A provider that returns plain text (no tool call), so a nested step loop
+    /// completes in a single iteration without needing any assembled tools.
+    struct TextProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for TextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TextProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for TextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Build a single-step SOP whose step delegates to `step_agent`, start it in a
+    /// fresh engine, and return the shared engine handle plus the first
+    /// `ExecuteStep` action (already resolved to a cross-agent step).
+    fn start_single_cross_agent_step(
+        step_agent: &str,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopTrigger,
+            SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        let sop = Sop {
+            name: "cross-agent".to_string(),
+            description: "x".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "delegate".to_string(),
+                body: "run".to_string(),
+                agent: Some(step_agent.to_string()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-07-16T00:00:00Z".to_string(),
+        };
+        let action = engine.start_run("cross-agent", event).expect("run starts");
+        let run_id = match &action {
+            SopRunAction::ExecuteStep { run_id, step, .. } => {
+                assert_eq!(
+                    step.agent.as_deref(),
+                    Some(step_agent),
+                    "the step must resolve to a cross-agent delegation"
+                );
+                run_id.clone()
+            }
+            other => panic!("expected ExecuteStep, got {other:?}"),
+        };
+        (Arc::new(std::sync::Mutex::new(engine)), run_id, action)
+    }
+
+    /// Runs `drive_live_sop_actions` over a single queued cross-agent step with a
+    /// plain-text provider and the given `agent_alias` / `sop_reassembly`, then
+    /// returns the recorded status of step 1.
+    async fn drive_single_step_status(
+        engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+        action: crate::sop::types::SopRunAction,
+        agent_alias: Option<&str>,
+        sop_reassembly: Option<SopStepReassembly<'_>>,
+    ) -> crate::sop::types::SopStepStatus {
+        use crate::sop::executor::QueuedSopAction;
+
+        let provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let queued = QueuedSopAction {
+            engine: Arc::clone(&engine),
+            audit: None,
+            action,
+        };
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_live_sop_actions(
+            vec![queued],
+            &mut history,
+            &provider,
+            "mock",
+            "mock-model",
+            None,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            true,
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            5,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            30_000,
+            100_000,
+            None,
+            &LoopKnobs::default(),
+            "cli",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            agent_alias,
+            sop_reassembly,
+        )
+        .await
+        .expect("drive returns Ok");
+
+        let guard = engine.lock().expect("engine lock");
+        guard
+            .get_run(run_id)
+            .expect("run present after drive")
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .expect("step 1 result recorded")
+            .status
+    }
+
+    /// Driver-level guard for Defect 1's fix line: the re-assembly gate reads the
+    /// baseline from the `sop_reassembly` HANDLE (`|r| r.baseline_alias`), not the
+    /// attribution `agent_alias`. Set the handle's baseline == the step agent
+    /// ("stepper") while attribution reads a different agent ("outer").
+    ///
+    /// - FIXED: baseline "stepper" == step "stepper" -> no re-assembly -> the
+    ///   nested loop runs the plain-text provider -> step Completed.
+    /// - If the fix line reverts to `agent_alias`: baseline "outer" != "stepper"
+    ///   -> the gate tries to assemble "stepper" from the bare handle config
+    ///   (no such agent / risk profile) -> assembly error -> step Failed.
+    ///
+    /// The Completed-vs-Failed split makes this test fail if the driver stops
+    /// consulting the handle baseline. (The deeper two-frame threading revert is
+    /// not feasibly drivable — frame-1 re-assembly would bind a real provider for
+    /// the nested loop — so that half stays pinned by the pure composition test
+    /// above plus the wired call to `advance_nested_reassembly`.)
+    #[tokio::test]
+    async fn gate_reads_baseline_from_handle_not_attribution_alias() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly {
+            config: &config,
+            baseline_alias: Some("stepper"),
+        };
+        let status = drive_single_step_status(
+            Arc::clone(&engine),
+            &run_id,
+            action,
+            // Attribution reads a DIFFERENT agent than the handle baseline; the
+            // gate must consult the handle, not this.
+            Some("outer"),
+            Some(handle),
+        )
+        .await;
+        assert_eq!(
+            status,
+            crate::sop::types::SopStepStatus::Completed,
+            "the gate must read the baseline from the handle (== step agent -> no \
+             re-assembly -> the text step completes); a revert to the attribution \
+             alias would try to assemble a nonexistent agent and fail the step"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_handle_cross_agent_step_fails_closed_not_parent_scope() {
+        use crate::sop::executor::QueuedSopAction;
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopStepStatus,
+            SopTrigger, SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        // A single-step SOP whose step delegates to a DIFFERENT agent than the
+        // one running the (bounded-delegate-like) loop.
+        let sop = Sop {
+            name: "bounded-cross-agent".to_string(),
+            description: "x".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "delegate".to_string(),
+                body: "run".to_string(),
+                agent: Some("other-agent".to_string()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-07-16T00:00:00Z".to_string(),
+        };
+        let action = engine
+            .start_run("bounded-cross-agent", event)
+            .expect("run starts");
+        let run_id = match &action {
+            SopRunAction::ExecuteStep { run_id, step, .. } => {
+                assert_eq!(
+                    step.agent.as_deref(),
+                    Some("other-agent"),
+                    "the step must resolve to a cross-agent delegation"
+                );
+                run_id.clone()
+            }
+            other => panic!("expected ExecuteStep, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let shell_calls = Arc::new(AtomicUsize::new(0));
+        // Parent/delegate scope: a sensitive tool the cross-agent step must never
+        // reach.
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
+            calls: Arc::clone(&shell_calls),
+        })];
+        let provider = ShellCallingProvider;
+
+        let queued = QueuedSopAction {
+            engine: Arc::clone(&engine),
+            audit: None,
+            action,
+        };
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_live_sop_actions(
+            vec![queued],
+            &mut history,
+            &provider,
+            "mock",
+            "mock-model",
+            None,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            true,
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            5,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            30_000,
+            100_000,
+            None,
+            &LoopKnobs::default(),
+            "cli",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            // The bounded-delegate loop runs AS "delegate"; the step names a
+            // different agent, and this path carries NO re-assembly handle.
+            Some("delegate"),
+            None,
+        )
+        .await
+        .expect("drive returns Ok even when the step fails closed");
+
+        // Security property: the parent's sensitive tool never executed — the
+        // cross-agent step did not run with the parent/delegate scope.
+        assert_eq!(
+            shell_calls.load(Ordering::SeqCst),
+            0,
+            "a no-handle cross-agent step must not run with the parent agent's tools"
+        );
+
+        // And the step is recorded FAILED (fail-closed), not Completed.
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("run present after drive");
+        let step1 = run
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .expect("step 1 result recorded");
+        assert_eq!(
+            step1.status,
+            SopStepStatus::Failed,
+            "the no-handle cross-agent step must fail closed: {:?}",
+            step1.status
+        );
     }
 }

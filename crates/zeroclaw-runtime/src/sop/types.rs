@@ -790,9 +790,15 @@ pub enum SopRunAction {
     /// the step AS that effective agent: when it names a different agent than
     /// the one running the turn, the step's per-agent execution context — its
     /// gated tool registry, security/approval policy, and MCP scope — must be
-    /// re-assembled for that agent on EVERY driver path, not inherited from the
-    /// parent turn. Inheriting the parent's context would let a step run with a
-    /// broader tool/policy/MCP surface than its own agent is granted.
+    /// re-assembled for that agent, never inherited from the parent turn.
+    /// Inheriting the parent's context would let a step run with a broader
+    /// tool/policy/MCP surface than its own agent is granted. A driver path that
+    /// carries the re-assembly handle (the live runtime and channel-orchestrator
+    /// turn paths) re-assembles the step agent; a path that does NOT carry it
+    /// (e.g. a bounded delegate sub-loop) MUST fail the cross-agent step CLOSED
+    /// rather than run it with the parent's context. Either way the invariant
+    /// holds: a cross-agent step never executes with a broader scope than its
+    /// own agent — it is re-assembled or it is refused.
     ExecuteStep {
         run_id: String,
         step: SopStep,

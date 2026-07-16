@@ -5654,6 +5654,9 @@ async fn process_channel_message_body(
                 // this turn's.
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    // Top of the tree: the re-assembly baseline is the agent this
+                    // channel-daemon turn runs as.
+                    baseline_alias: Some(ctx.agent_alias.as_str()),
                 }),
             });
             // Scope this turn's routing handle so concurrent same-agent turns,
