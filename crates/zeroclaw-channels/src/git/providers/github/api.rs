@@ -24,6 +24,14 @@ use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 /// progress across ticks, and a truncation is logged.
 const MAX_PAGES_PER_POLL: usize = 20;
 
+/// Pin a raw forge-call path under the configured API base. The leading-slash
+/// trim keeps `format!` from producing `base//path`; because the path is always
+/// appended after `base/`, no absolute URL, protocol-relative `//host`, or
+/// `..` sequence in `path` can redirect the request to a different origin.
+fn forge_url(base: &str, path: &str) -> String {
+    format!("{}/{}", base, path.trim_start_matches('/'))
+}
+
 /// Extract the `rel="next"` URL from a GitHub `Link` header, if present.
 ///
 /// Example header value:
@@ -538,11 +546,37 @@ impl GithubApi {
         )
         .await
     }
+
+    /// Low-level authed call: build `{base}/{path}`, attach `token`, send, and
+    /// return the raw status + decoded JSON body (Null when empty). Non-2xx is
+    /// returned, not raised, so the caller inspects GitHub's error envelope.
+    pub async fn forge_call(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value), GitChannelError> {
+        let url = forge_url(&self.base, path);
+        let mut req = self.request(method, url, token);
+        if let Some(payload) = body {
+            req = req.json(payload);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        let value = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        };
+        Ok((status, value))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::next_page_url;
+    use super::{forge_url, next_page_url};
 
     fn headers(link: &str) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
@@ -569,5 +603,24 @@ mod tests {
         assert!(next_page_url(&h).is_none());
         // No Link header at all.
         assert!(next_page_url(&reqwest::header::HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn forge_url_pins_raw_path_to_configured_base() {
+        let base = "https://api.github.com";
+        assert_eq!(
+            forge_url(base, "repos/o/r/issues/1"),
+            "https://api.github.com/repos/o/r/issues/1"
+        );
+        assert_eq!(
+            forge_url(base, "/repos/o/r/issues/1"),
+            "https://api.github.com/repos/o/r/issues/1"
+        );
+        // An absolute URL in the path is appended, not honored as an origin.
+        assert!(forge_url(base, "https://evil.test/x").starts_with("https://api.github.com/"));
+        // A protocol-relative path stays under the base host.
+        assert!(forge_url(base, "//evil.test/x").starts_with("https://api.github.com/"));
+        // Traversal segments do not escape the base scheme+host in the string.
+        assert!(forge_url(base, "../../../evil.test").starts_with("https://api.github.com/"));
     }
 }

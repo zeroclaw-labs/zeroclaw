@@ -258,6 +258,13 @@ pub struct Config {
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
 
+    /// ZeroCode live task tracker (`[todotracker]`), the read-only
+    /// TodoWrite visual tracker in the Code pane.
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub todotracker: TodoTrackerConfig,
+
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
     /// Each entry is a named scheduled job synced into the database at
@@ -820,7 +827,7 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
-    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
+    /// When true, the client pulls credentials from ZeroClaw's stored `openai-codex` auth profile instead of the `api_key` field above. Import an existing Codex CLI login with `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json`, or run `zeroclaw auth login --model-provider openai-codex`. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "is_false")]
     #[credential_class = "external_auth_store"]
@@ -3321,6 +3328,7 @@ pub struct ResolvedRuntime {
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
     pub tool_receipts: ToolReceiptsConfig,
+    pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
 impl ResolvedRuntime {
@@ -3359,6 +3367,7 @@ impl Default for ResolvedRuntime {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
     }
 }
@@ -3596,6 +3605,14 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Per-agent reply-intent precheck controls. The classifier call reads
+    /// this block at message time; model/provider selection stays on
+    /// `classifier_provider` so there is only one routing source of truth.
+    #[tab(Channels)]
+    #[serde(default)]
+    #[nested]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
+
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
     /// the runtime profile's `context_compression.summary_provider`, else the
@@ -3687,6 +3704,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
@@ -4058,6 +4076,7 @@ impl Config {
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
+            prompt_injection_mode: self.effective_skills_prompt_mode(agent_alias),
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
@@ -4072,6 +4091,24 @@ impl Config {
         }
         out.resolved = resolved;
         Some(out)
+    }
+
+    /// Resolve the effective skills prompt-injection mode for an agent: the
+    /// agent's resolved runtime profile's `prompt_injection_mode` override when
+    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
+    /// no runtime profile (or an unknown alias) fall back to the global value.
+    ///
+    /// Keyed on the resolved runtime profile — the sanctioned surface for
+    /// per-agent runtime tunables (#6877) — so agent-inline knobs stay inert.
+    /// Centralizing the fallback here keeps the system-prompt builder and the
+    /// `read_skill` tool-registration gate in lockstep on one effective mode,
+    /// so a compact prompt is never paired with a missing `read_skill` tool
+    /// (or a full prompt with a spurious one).
+    #[must_use]
+    pub fn effective_skills_prompt_mode(&self, agent_alias: &str) -> SkillsPromptInjectionMode {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.prompt_injection_mode)
+            .unwrap_or(self.skills.prompt_injection_mode)
     }
 
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
@@ -5470,21 +5507,29 @@ pub enum ToolFilterGroupMode {
 
 /// A named group of MCP tool patterns with an activation mode.
 ///
-/// Each group lists glob patterns for MCP tool names (prefix `mcp_`) and an
-/// optional set of keywords that trigger inclusion in `dynamic` mode.
-/// Built-in (non-MCP) tools always pass through and are never affected by
-/// `tool_filter_groups`.
+/// Each group lists glob patterns for MCP tool names and an optional set of
+/// keywords that trigger inclusion in `dynamic` mode. MCP tools are named
+/// `<server>__<tool>` (double-underscore separator, e.g. `filesystem__read_file`).
+///
+/// Classification is by origin, not name shape: only tools that actually came
+/// from the MCP registry are subject to these groups. Built-in tools AND skill
+/// tools — which share the `<x>__<y>` naming convention (`{skill}__{tool}`) —
+/// always pass through and are never affected by `tool_filter_groups`.
+///
+/// Under `[mcp] deferred_loading = true`, `mode = "always"` entries are
+/// pre-activated at assembly time so matching tools are live from the first
+/// turn without a `tool_search` round-trip.
 ///
 /// # Example
 /// ```toml
-/// [[agent.tool_filter_groups]]
+/// [[runtime_profiles.default.tool_filter_groups]]
 /// mode = "always"
-/// tools = ["mcp_filesystem_*"]
+/// tools = ["filesystem__*"]
 /// keywords = []
 ///
-/// [[agent.tool_filter_groups]]
+/// [[runtime_profiles.default.tool_filter_groups]]
 /// mode = "dynamic"
-/// tools = ["mcp_browser_*"]
+/// tools = ["browser__*"]
 /// keywords = ["browse", "website", "url", "search"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5500,9 +5545,6 @@ pub struct ToolFilterGroup {
     /// Ignored when `mode = "always"`.
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// When true, also filter built-in tools (not just MCP tools).
-    #[serde(default)]
-    pub filter_builtins: bool,
 }
 
 /// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
@@ -7483,6 +7525,13 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
+    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
+    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_text_browser_timeout_secs() -> u64 {
@@ -7495,6 +7544,7 @@ impl Default for TextBrowserConfig {
             enabled: false,
             preferred_browser: None,
             timeout_secs: default_text_browser_timeout_secs(),
+            allowed_private_hosts: vec![],
         }
     }
 }
@@ -7557,7 +7607,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), or "jina" (requires API key)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), or "bocha" (Bocha AI, requires API key — Chinese-friendly, <https://open.bochaai.com>)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -7578,6 +7628,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub jina_api_key: Option<String>,
+    /// Bocha AI Web Search API key (required if search_provider is `"bocha"`). Obtain at <https://open.bochaai.com>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub bocha_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -7609,6 +7665,7 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             tavily_api_key: None,
             jina_api_key: None,
+            bocha_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -10270,12 +10327,15 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
+    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Automatically re-embed all memories in the background when a change of embedding provider/model/dimensions is detected at startup (after the stale vectors have been cleared). Costs one embedding API call per memory, so it's off by default — leave it off for large stores and run `zeroclaw memory reindex` explicitly instead.
+    #[serde(default)]
+    pub auto_reindex_on_identity_change: bool,
     /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
     #[secret]
     #[credential_class = "encrypted_secret"]
@@ -10550,6 +10610,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            auto_reindex_on_identity_change: false,
             embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
@@ -11422,6 +11483,14 @@ pub struct RuntimeProfileConfig {
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
     pub memory_recall_limit: Option<usize>,
+    /// How skills are injected into the system prompt for agents on this
+    /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
+    /// `compact` inlines only compact skill metadata and registers the
+    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// through [`Config::effective_skills_prompt_mode`], the single point both
+    /// the system-prompt builder and the `read_skill` tool-registration gate
+    /// consult so they always agree on the effective mode.
+    pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
     pub strict_tool_parsing: bool,
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
@@ -11459,6 +11528,7 @@ impl Default for RuntimeProfileConfig {
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
             memory_recall_limit: None,
+            prompt_injection_mode: None,
             strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
@@ -12057,6 +12127,74 @@ impl Default for HeartbeatConfig {
             max_run_history: default_heartbeat_max_run_history(),
             load_session_context: false,
             task_timeout_secs: default_heartbeat_task_timeout(),
+        }
+    }
+}
+
+// ── TodoTracker ──────────────────────────────────────────────────
+
+/// Location of the ZeroCode TodoWrite tracker panel.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum TodoTrackerLocation {
+    /// Horizontal strip between the transcript and the input bar (Claude Code style).
+    Bottom,
+    /// Vertical side panel on the left.
+    Left,
+    /// Vertical side panel on the right (OpenCode style). Default.
+    #[default]
+    Right,
+}
+
+/// ZeroCode live task tracker configuration (`[todotracker]` section).
+///
+/// Read-only visual tracker driven by the model's `TodoWrite` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "todotracker"]
+pub struct TodoTrackerConfig {
+    /// Master switch. When `false` the tracker never renders and never
+    /// auto-pops. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whether the panel is visible at launch (when `enabled`). When
+    /// `false` it stays hidden until toggled or auto-popped by the first
+    /// plan. Default: `false`.
+    #[serde(default)]
+    pub enabled_at_start: bool,
+    /// Panel location: `bottom` (between transcript and input), `left`,
+    /// or `right` (default).
+    #[serde(default)]
+    pub location: TodoTrackerLocation,
+    /// Side-panel target column width (left/right). Runtime-clamped to at
+    /// most half the terminal width. Ignored for `bottom`. Default: `32`.
+    #[serde(default = "default_todotracker_width")]
+    pub width: u16,
+    /// Bottom-strip maximum height in rows (grows up to this). Ignored for
+    /// left/right. Default: `5`.
+    #[serde(default = "default_todotracker_max_height")]
+    pub max_height: u16,
+}
+
+fn default_todotracker_width() -> u16 {
+    32
+}
+
+fn default_todotracker_max_height() -> u16 {
+    5
+}
+
+impl Default for TodoTrackerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoTrackerLocation::Right,
+            width: default_todotracker_width(),
+            max_height: default_todotracker_max_height(),
         }
     }
 }
@@ -14681,21 +14819,24 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
-/// Where an AMQP delivery is routed once consumed.
+/// Where a fan-in delivery is routed once consumed. Used by AMQP, which carries
+/// this field to choose between the agent loop, the SOP engine, or both.
+/// Agent-loop channels (Telegram, Discord, Slack, ...) do not carry a `dispatch`
+/// field: their fan-in is trigger-driven, opting in via a SOP `channel` trigger
+/// while the normal agent turn always runs. The mode is source-agnostic.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum AmqpDispatch {
-    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`
-    /// shaped by `content_template`/`thread_id_field`. This is the default and
-    /// preserves the original AMQP consumer behavior.
+pub enum SopDispatch {
+    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`.
+    /// This is the default and preserves each channel's original behavior.
     #[default]
     AgentLoop,
-    /// Dispatch the delivery to the SOP engine as an `amqp` `SopEvent`
-    /// (`topic` = routing key, `payload` = delivery body), matching SOPs whose
-    /// `amqp` trigger routing key matches. No agent turn is started.
+    /// Dispatch the delivery to the SOP engine as a `SopEvent` (`topic` =
+    /// source identifier, `payload` = body), matching SOPs whose trigger for
+    /// this source matches. No agent turn is started.
     Sop,
     /// Do both: dispatch to the SOP engine and drive an agent turn from the
     /// same delivery.
@@ -14779,7 +14920,7 @@ pub struct AmqpConfig {
     /// the delivery against SOP `amqp` triggers by routing key.
     #[tab(Behavior)]
     #[serde(default)]
-    pub dispatch: AmqpDispatch,
+    pub dispatch: SopDispatch,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -15223,6 +15364,12 @@ pub struct SecurityConfig {
     #[nested]
     pub audit: AuditConfig,
 
+    /// Outbound credential leak detection and redaction configuration. See
+    /// `[security.leak_detection]` for the detector controls.
+    #[serde(default)]
+    #[nested]
+    pub leak_detection: LeakDetectionConfig,
+
     /// OTP gating configuration for sensitive actions/domains.
     #[serde(default)]
     #[nested]
@@ -15242,6 +15389,52 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+}
+
+/// Outbound credential leak detection configuration.
+///
+/// These settings control the final guardrail pass over outbound channel
+/// responses before they are delivered. Deterministic credential patterns
+/// include API keys, private keys, database URLs, bot tokens, and related
+/// token syntax. The high-entropy pass is a separate heuristic for standalone
+/// opaque tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.leak_detection"]
+pub struct LeakDetectionConfig {
+    /// Enable outbound credential leak detection and redaction.
+    #[serde(default = "default_leak_detection_enabled")]
+    pub enabled: bool,
+
+    /// Detection sensitivity from 0.0 to 1.0; higher is more aggressive.
+    #[serde(default = "default_leak_detection_sensitivity")]
+    pub sensitivity: f64,
+
+    /// Enable high-entropy token redaction; deterministic patterns still run when false.
+    #[serde(default = "default_leak_detection_high_entropy_tokens")]
+    pub high_entropy_tokens: bool,
+}
+
+fn default_leak_detection_enabled() -> bool {
+    true
+}
+
+fn default_leak_detection_sensitivity() -> f64 {
+    0.7
+}
+
+fn default_leak_detection_high_entropy_tokens() -> bool {
+    true
+}
+
+impl Default for LeakDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_leak_detection_enabled(),
+            sensitivity: default_leak_detection_sensitivity(),
+            high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
+        }
+    }
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
@@ -16104,7 +16297,7 @@ impl ChannelConfig for BlueskyConfig {
 /// access token against the instance's `/api/v1` endpoint, named by the
 /// required `api_base_url`. Inbound issue/PR comments are polled from the
 /// forge REST API, so the daemon needs no inbound network exposure.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
 pub struct GitConfig {
@@ -16125,13 +16318,22 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub app_id: u64,
-    /// Path to the app's RS256 private key, the `.pem` file GitHub
-    /// generates on the app's settings page. Should be readable only by
-    /// the daemon user (0600); looser permissions log a startup warning.
-    /// GitHub provider only.
+    /// RS256 private key PEM, the contents of the `.pem` file GitHub
+    /// generates on the app's settings page, inline and encrypted at rest.
+    /// Include the BEGIN/END lines. GitHub provider only.
+    #[secret]
+    #[multiline]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
-    #[serde(default)]
-    pub private_key_path: String,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Filesystem path to the RS256 private key `.pem` file, read at startup
+    /// when `private_key` (inline PEM) is unset. Backward-compatible fallback
+    /// for configs that predate the inline-PEM field. GitHub provider only.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_path: Option<String>,
     /// Installation ID to act as. When unset, the app's installations are
     /// listed on first use and a sole installation is auto-selected;
     /// startup fails if the app has zero or multiple installations.
@@ -16211,6 +16413,36 @@ pub struct GitConfig {
     pub excluded_tools: Vec<String>,
 }
 
+impl std::fmt::Debug for GitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitConfig")
+            .field("enabled", &self.enabled)
+            .field("provider", &self.provider)
+            .field("app_id", &self.app_id)
+            .field("private_key", &self.private_key.as_ref().map(|_| "***"))
+            .field("private_key_path", &self.private_key_path)
+            .field("installation_id", &self.installation_id)
+            .field("api_base_url", &self.api_base_url)
+            .field(
+                "access_token",
+                &if self.access_token.is_empty() {
+                    ""
+                } else {
+                    "***"
+                },
+            )
+            .field("repos", &self.repos)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("mention_only", &self.mention_only)
+            .field("listen_to_bots", &self.listen_to_bots)
+            .field("proxy_url", &self.proxy_url)
+            .field("events", &self.events)
+            .field("events_backbone", &self.events_backbone)
+            .field("excluded_tools", &self.excluded_tools)
+            .finish()
+    }
+}
+
 fn default_github_poll_interval_secs() -> u64 {
     30
 }
@@ -16225,7 +16457,8 @@ impl Default for GitConfig {
             enabled: false,
             provider: default_git_provider(),
             app_id: 0,
-            private_key_path: String::new(),
+            private_key: None,
+            private_key_path: None,
             installation_id: None,
             api_base_url: None,
             access_token: String::new(),
@@ -16845,6 +17078,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -17495,6 +17729,54 @@ impl Config {
                 }
             }
         }
+        out
+    }
+
+    /// Sender usernames authorized to issue `/model --agent <model>` on
+    /// `<channel_type>.<alias>` for agent `agent_alias`. A
+    /// `[peer_groups.<name>]` contributes when its `channel` matches
+    /// (type-wide or dotted), its `admin_for_agent_scope = true`, and its
+    /// `agents` list (if non-empty) contains `agent_alias`. Returns
+    /// deduped and sorted. Live-resolve against the `Config` this method
+    /// is called on — no internal cache. Edits to `peer_groups` take
+    /// effect at the next `Config::channel_agent_scope_admins` call; the
+    /// orchestrator gate reads through a snapshot of this `Config`, so
+    /// operator edits become visible after the runtime context is rebuilt
+    /// (daemon restart). See issue #8044.
+    pub fn channel_agent_scope_admins(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        agent_alias: &str,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for group in self.peer_groups.values() {
+            if !group.admin_for_agent_scope {
+                continue;
+            }
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !group_matches {
+                continue;
+            }
+            // Agent-bound: when the group's `agents` list is non-empty,
+            // only grant the privilege if `agent_alias` appears in it.
+            // An empty `agents` list is interpreted as "all agents"
+            // (backward-compatible channel-wide default).
+            if !group.agents.is_empty() && !group.agents.iter().any(|a| a.as_str() == agent_alias) {
+                continue;
+            }
+            for peer in &group.external_peers {
+                let username = peer.as_str().to_string();
+                if seen.insert(username.clone()) {
+                    out.push(username);
+                }
+            }
+        }
+        out.sort();
         out
     }
 
@@ -18586,6 +18868,15 @@ impl Config {
                 "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
+        for (alias, agent) in &self.agents {
+            if agent.precheck.timeout_secs == 0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{alias}.precheck.timeout_secs"),
+                    "agents.{alias}.precheck.timeout_secs must be greater than 0"
+                );
+            }
+        }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
         if self.heartbeat.enabled {
@@ -18843,6 +19134,13 @@ impl Config {
                 RequiredFieldEmpty,
                 "security.estop.state_file",
                 "security.estop.state_file must not be empty"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.security.leak_detection.sensitivity) {
+            validation_bail!(
+                InvalidNumericRange,
+                "security.leak_detection.sensitivity",
+                "security.leak_detection.sensitivity must be between 0.0 and 1.0"
             );
         }
 
@@ -21092,9 +21390,8 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Required to enable runtime SOP loading. When omitted, no SOPs are loaded
-    /// at runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still
-    /// resolve the default `<workspace>/sops` for offline inspection.
+    /// Optional override. When omitted, the runtime and CLI both resolve the
+    /// default `<workspace>/sops`; SOPs load from there whenever it exists.
     #[serde(default)]
     pub sops_dir: Option<String>,
 
@@ -21379,6 +21676,32 @@ impl HasPropKind for serde_json::Value {
 mod tests {
 
     #[::core::prelude::v1::test]
+    fn todotracker_config_defaults() {
+        let cfg = super::TodoTrackerConfig::default();
+        assert!(cfg.enabled);
+        assert!(!cfg.enabled_at_start);
+        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
+        assert_eq!(cfg.width, 32);
+        assert_eq!(cfg.max_height, 5);
+    }
+
+    #[::core::prelude::v1::test]
+    fn todotracker_config_parses_from_toml() {
+        let toml = r#"
+enabled = true
+enabled_at_start = true
+location = "bottom"
+width = 40
+max_height = 8
+"#;
+        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.enabled_at_start);
+        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
+        assert_eq!(cfg.width, 40);
+        assert_eq!(cfg.max_height, 8);
+    }
+
+    #[::core::prelude::v1::test]
     fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
         // Absent field defaults to empty.
         let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
@@ -21390,6 +21713,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.pinned_resources, vec!["file:///a", "file:///b"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn tool_filter_group_legacy_filter_builtins_key_still_parses() {
+        // `filter_builtins` was declared-but-never-read and is removed
+        // (#6699). `ToolFilterGroup` has no `deny_unknown_fields`, so configs
+        // still carrying the key must keep deserializing (silently ignored).
+        let group: super::ToolFilterGroup = toml::from_str(
+            r#"
+            mode = "always"
+            tools = ["filesystem__*"]
+            filter_builtins = true
+            "#,
+        )
+        .expect("legacy filter_builtins key must not break deserialization");
+        assert!(matches!(group.mode, super::ToolFilterGroupMode::Always));
+        assert_eq!(group.tools, vec!["filesystem__*".to_string()]);
     }
 
     #[::core::prelude::v1::test]
@@ -21477,7 +21817,6 @@ mod tests {
             r#"
             enabled = true
             app_id = 12345
-            private_key_path = "~/.zeroclaw/github-app.pem"
             events_backbone = true
 
             [events]
@@ -21586,7 +21925,7 @@ mod tests {
 
     #[test]
     async fn amqp_dispatch_defaults_to_agent_loop() {
-        assert_eq!(AmqpConfig::default().dispatch, AmqpDispatch::AgentLoop);
+        assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
     #[test]
@@ -22215,6 +22554,147 @@ api_token = "Bearer test-token"
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn runtime_profile_prompt_injection_mode_overrides_global() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+        // A runtime profile that pins compact, and an agent pointing at it.
+        config.runtime_profiles.insert(
+            "compact_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        // A runtime profile that leaves the mode unset (inherits global).
+        config
+            .runtime_profiles
+            .insert("unset_profile".to_string(), RuntimeProfileConfig::default());
+        config.agents.insert(
+            "override".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "compact_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "unset".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "unset_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        // An agent with no runtime profile inherits the global.
+        config
+            .agents
+            .insert("inherit".to_string(), AliasedAgentConfig::default());
+
+        // Profile override beats the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+        // Profile present but mode unset → inherit the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("unset"),
+            SkillsPromptInjectionMode::Full
+        );
+        // No runtime profile → inherit the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("inherit"),
+            SkillsPromptInjectionMode::Full
+        );
+        // Unknown alias also falls back to the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global moves only the inheriting/unset/unknown agents;
+        // the profile override is unaffected.
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        assert_eq!(
+            config.effective_skills_prompt_mode("unset"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("inherit"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+    }
+
+    #[test]
+    async fn runtime_profile_prompt_injection_mode_deserializes() {
+        // Absent → None, so a profile that omits the key inherits the global
+        // mode (no migration for existing global-only configs).
+        let inherited: RuntimeProfileConfig = toml::from_str("").unwrap();
+        assert_eq!(inherited.prompt_injection_mode, None);
+
+        // Explicit wire spellings parse to their variants.
+        let compact: RuntimeProfileConfig =
+            toml::from_str("prompt_injection_mode = \"compact\"").unwrap();
+        assert_eq!(
+            compact.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
+        let full: RuntimeProfileConfig =
+            toml::from_str("prompt_injection_mode = \"full\"").unwrap();
+        assert_eq!(
+            full.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Full)
+        );
+    }
+
+    #[test]
+    async fn resolved_agent_config_bakes_prompt_injection_mode_from_profile() {
+        // The documented invariant: a runtime_profile knob must be threaded
+        // through `resolved_agent_config` into `ResolvedRuntime`, consistent
+        // with the `effective_*` helper.
+        let raw = r#"
+[skills]
+prompt_injection_mode = "full"
+
+[runtime_profiles.fast]
+prompt_injection_mode = "compact"
+
+[agents.default]
+runtime_profile = "fast"
+
+[agents.plain]
+"#;
+        let parsed = parse_test_config(raw);
+
+        // Profiled agent: resolved value + effective helper both see compact.
+        let resolved = parsed
+            .resolved_agent_config("default")
+            .expect("agent default resolves");
+        assert_eq!(
+            resolved.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("default"),
+            SkillsPromptInjectionMode::Compact
+        );
+
+        // Profile-less agent: resolved value falls back to the global default.
+        let plain = parsed
+            .resolved_agent_config("plain")
+            .expect("agent plain resolves");
+        assert_eq!(
+            plain.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
     }
 
     #[test]
@@ -23253,6 +23733,7 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
+            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
@@ -23740,6 +24221,51 @@ reasoning_effort = "turbo"
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
+        assert!(cfg.precheck.enabled);
+        assert_eq!(cfg.precheck.timeout_secs, 5);
+    }
+
+    #[test]
+    async fn agent_precheck_config_parses_from_agent_block() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.precheck]
+enabled = false
+timeout_secs = 12
+"#;
+        let parsed = parse_test_config(raw);
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("[agents.default] parses into agents map");
+        assert!(!agent.precheck.enabled);
+        assert_eq!(agent.precheck.timeout_secs, 12);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_agent_precheck_timeout() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.precheck]
+timeout_secs = 0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("zero precheck timeout must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.default.precheck.timeout_secs")
+        );
     }
 
     #[test]
@@ -23981,6 +24507,7 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -28513,6 +29040,9 @@ default_temperature = 0.7
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
+        assert!(parsed.security.leak_detection.enabled);
+        assert_eq!(parsed.security.leak_detection.sensitivity, 0.7);
+        assert!(parsed.security.leak_detection.high_entropy_tokens);
     }
 
     #[test]
@@ -28544,6 +29074,42 @@ require_otp_to_resume = true
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_toml_parses_leak_detection_section() {
+        let parsed = parse_test_config(
+            r#"
+default_model_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.leak_detection]
+enabled = false
+sensitivity = 0.35
+high_entropy_tokens = false
+"#,
+        );
+
+        assert!(!parsed.security.leak_detection.enabled);
+        assert_eq!(parsed.security.leak_detection.sensitivity, 0.35);
+        assert!(!parsed.security.leak_detection.high_entropy_tokens);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_validation_rejects_out_of_range_leak_detection_sensitivity() {
+        let mut config = Config::default();
+        config.security.leak_detection.sensitivity = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid leak-detection sensitivity");
+        assert!(
+            err.to_string()
+                .contains("security.leak_detection.sensitivity"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -29267,6 +29833,31 @@ url = "http://localhost:8080/mcp"
         assert!(
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
+        );
+    }
+
+    #[test]
+    async fn git_config_debug_redacts_private_key_and_access_token() {
+        let cfg = GitConfig {
+            private_key: Some(
+                "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETPEM\n-----END RSA PRIVATE KEY-----"
+                    .into(),
+            ),
+            access_token: "ghp_supersecrettoken".into(),
+            ..GitConfig::default()
+        };
+        let debug_output = format!("{cfg:?}");
+        assert!(
+            !debug_output.contains("SUPERSECRETPEM"),
+            "Debug output must not contain the raw private_key PEM"
+        );
+        assert!(
+            !debug_output.contains("ghp_supersecrettoken"),
+            "Debug output must not contain the raw access_token"
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Debug output must mask the private_key and access_token"
         );
     }
 

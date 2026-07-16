@@ -22,9 +22,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_log::{Action, EventOutcome};
 
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
@@ -149,6 +150,9 @@ impl AcpSessionStore {
         Self::ensure_killed_at_column(&conn)
             .context("Failed to migrate ACP session killed marker")?;
 
+        Self::ensure_plan_json_column(&conn)
+            .context("Failed to migrate ACP session plan column")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -183,6 +187,42 @@ impl AcpSessionStore {
                 Ok(())
             }
             Err(e) => Err(e).context("Failed to add ACP session killed marker"),
+        }
+    }
+
+    /// Idempotent migration adding the `plan_json` column that stores the
+    /// session's latest TodoWrite plan as a JSON array of `PlanEntry`.
+    /// Existing user databases predate this column; add it if absent so
+    /// the plan survives daemon restarts (durable, like the transcript).
+    fn ensure_plan_json_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "plan_json" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute("ALTER TABLE acp_sessions ADD COLUMN plan_json TEXT", []) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session plan column"),
         }
     }
 
@@ -262,19 +302,62 @@ impl AcpSessionStore {
     /// Killed rows keep their transcript for history/export but are terminal
     /// for runtime restore paths.
     pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
-        if self.is_session_killed(session_uuid)? {
+        let conn = self.conn.lock();
+
+        let row = conn.query_row(
+            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+             FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        );
+
+        let (
+            session_id,
+            agent_alias,
+            workspace_dir,
+            token_count,
+            created_at_s,
+            last_activity_s,
+            killed_at,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
+            Err(e) => return Err(e).context("Failed to query ACP session for restore"),
+        };
+
+        if killed_at.is_some() {
             return Ok(AcpSessionRestore::Killed);
         }
 
-        match self.load_session(session_uuid)? {
-            Some(data) => Ok(AcpSessionRestore::Restorable(data)),
-            None => Ok(AcpSessionRestore::Missing),
-        }
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let messages = Self::load_messages(&conn, session_id)?;
+
+        Ok(AcpSessionRestore::Restorable(AcpSessionData {
+            session_uuid: session_uuid.to_string(),
+            agent_alias,
+            workspace_dir,
+            token_count: token_count.max(0) as u64,
+            created_at,
+            last_activity,
+            messages,
+        }))
     }
 
-    /// List all sessions as lightweight summaries, ordered by most recent
+    /// List restorable sessions as lightweight summaries, ordered by most recent
     /// activity first. This is the picker-facing read: it avoids the full
-    /// message-history hydration that `load_session` performs.
+    /// message-history hydration that `load_session` performs. Killed rows keep
+    /// history/export data but are terminal and must not be offered for restore.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
         let conn = self.conn.lock();
         let mut stmt = conn
@@ -287,6 +370,7 @@ impl AcpSessionStore {
                         s.last_activity,
                         (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
                  FROM acp_sessions s
+                 WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
             )
             .context("Failed to prepare ACP session list query")?;
@@ -609,6 +693,47 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    /// Persist the session's latest TodoWrite plan as a JSON array of
+    /// `PlanEntry` (whole-list replace). An empty slice stores an empty
+    /// array (a cleared plan), distinct from SQL NULL (never had one).
+    pub fn set_plan(&self, session_uuid: &str, entries: &[PlanEntry]) -> Result<()> {
+        let plan_json =
+            serde_json::to_string(entries).context("Failed to serialize plan entries")?;
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions SET plan_json = ?1 WHERE session_uuid = ?2",
+                params![plan_json, session_uuid],
+            )
+            .context("Failed to set plan_json")?;
+        if rows == 0 {
+            return Err(anyhow::Error::msg(format!(
+                "set_plan: no session with uuid {session_uuid}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load the session's stored plan. Returns an empty vec when the
+    /// session has no plan (NULL or absent). Malformed JSON is treated
+    /// as an empty plan rather than a hard error, so a corrupt plan
+    /// column never blocks session restore.
+    pub fn get_plan(&self, session_uuid: &str) -> Result<Vec<PlanEntry>> {
+        let conn = self.conn.lock();
+        let plan_json: Option<String> = conn
+            .query_row(
+                "SELECT plan_json FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query plan_json")?
+            .flatten();
+        Ok(plan_json
+            .and_then(|s| serde_json::from_str::<Vec<PlanEntry>>(&s).ok())
+            .unwrap_or_default())
+    }
+
     /// Record a session-lifecycle event. Caller passes typed enums; the SQLite
     /// layer is the only place strings appear. Same `Action` / `EventOutcome`
     /// values are used at the matching `zeroclaw_log::record!` call site.
@@ -881,6 +1006,51 @@ mod tests {
     fn load_nonexistent_session_returns_none() {
         let (_tmp, store) = open_store();
         assert!(store.load_session("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_and_get_plan_round_trips() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-plan", "alpha", "/tmp/proj")
+            .unwrap();
+
+        // No plan yet → empty.
+        assert!(store.get_plan("sess-plan").unwrap().is_empty());
+
+        let plan = vec![
+            PlanEntry {
+                content: "A".to_string(),
+                status: PlanStatus::Completed,
+                priority: PlanPriority::High,
+                active_form: None,
+            },
+            PlanEntry {
+                content: "B".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::Medium,
+                active_form: Some("Doing B".to_string()),
+            },
+        ];
+        store.set_plan("sess-plan", &plan).unwrap();
+        assert_eq!(store.get_plan("sess-plan").unwrap(), plan);
+
+        // Whole-list replace: empty slice clears.
+        store.set_plan("sess-plan", &[]).unwrap();
+        assert!(store.get_plan("sess-plan").unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_plan_empty_for_unknown_session() {
+        let (_tmp, store) = open_store();
+        assert!(store.get_plan("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_plan_errors_for_unknown_session() {
+        let (_tmp, store) = open_store();
+        assert!(store.set_plan("nope", &[]).is_err());
     }
 
     #[test]
@@ -1270,6 +1440,23 @@ mod tests {
     fn list_sessions_empty_when_no_sessions() {
         let (_tmp, store) = open_store();
         assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_omits_killed_sessions() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-live", "alpha", "/tmp/live")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .create_session("sess-killed", "alpha", "/tmp/killed")
+            .unwrap();
+        store.mark_session_killed("sess-killed").unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_uuid, "sess-live");
     }
 
     #[test]

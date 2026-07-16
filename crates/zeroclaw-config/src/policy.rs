@@ -210,6 +210,15 @@ pub struct SecurityPolicy {
     /// `workspace_dir.parent()`). `None` falls back to the legacy
     /// `workspace_dir.parent()` location.
     pub config_path: Option<PathBuf>,
+    /// Absolute path to the runtime data directory. Holds stores that are
+    /// stateful but live outside the config dir — most importantly
+    /// `webauthn_credentials.json` (see
+    /// `zeroclaw_runtime::security::webauthn::WebAuthnManager::new`, which
+    /// is wired with `&config.data_dir` in `gateway::lib.rs`). When `Some`,
+    /// `runtime_config_dirs()` includes it so the same protected-name
+    /// predicate fires for state files written there too. `None` means the
+    /// runtime data dir wasn't wired (tests, partial configurations).
+    pub data_dir: Option<PathBuf>,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
@@ -285,11 +294,22 @@ impl SecurityPolicy {
             .allowed_tools
             .as_ref()
             .is_none_or(|list| list.iter().any(|t| t == name));
-        let excluded = self
-            .excluded_tools
+        allowed && !self.is_tool_excluded(name)
+    }
+
+    /// True when `name` is on the `excluded_tools` denylist.
+    ///
+    /// `excluded_tools` always subtracts, independent of the `allowed_tools`
+    /// allowlist. Skill-defined tools are gated by this denylist (not the
+    /// allowlist): they are granted explicitly via skill config, and
+    /// `builtin`-kind skill tools are scoped-elevation wrappers whose whole
+    /// purpose is to remain callable when the raw tool is not on the allowlist -
+    /// so applying the allowlist to them would defeat that mechanism. The
+    /// denylist still applies: excluding a skill tool by name removes it.
+    pub fn is_tool_excluded(&self, name: &str) -> bool {
+        self.excluded_tools
             .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name));
-        allowed && !excluded
+            .is_some_and(|list| list.iter().any(|t| t == name))
     }
 }
 
@@ -569,6 +589,7 @@ impl Default for SecurityPolicy {
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
             config_path: None,
+            data_dir: None,
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
@@ -2144,6 +2165,12 @@ impl SecurityPolicy {
     /// `workspace_dir`. The two differ once per-agent workspaces nest
     /// under `<install>/agents/<alias>/workspace/`: the config lives at
     /// the install root, which is no longer `workspace_dir.parent()`.
+    ///
+    /// Also includes the runtime `data_dir` when set — state files that
+    /// the gateway constructs with `&config.data_dir`
+    /// (`webauthn_credentials.json` for `WebAuthnManager`) live there,
+    /// and a prompt-injected agent with `file_write` access to
+    /// `data_dir` could otherwise overwrite the encrypted credentials.
     fn runtime_config_dirs(&self) -> Vec<PathBuf> {
         let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -2156,6 +2183,12 @@ impl SecurityPolicy {
                 dirs.push(dir);
             }
         }
+        if let Some(data_dir) = self.data_dir.as_deref() {
+            let dir = canon(data_dir);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
         dirs
     }
 
@@ -2163,10 +2196,35 @@ impl SecurityPolicy {
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
         };
-        let is_config_name = file_name == "config.toml"
+        let is_protected_name = file_name == "config.toml"
             || file_name == "config.toml.bak"
-            || file_name.starts_with(".config.toml.tmp-");
-        if !is_config_name {
+            || file_name.starts_with(".config.toml.tmp-")
+            // Emergency-stop state file. Without this, a compromised or
+            // prompt-injected agent with `file_write` access to the config
+            // directory can reset estop (write `{}`) and lift the freeze
+            // the operator applied.
+            //
+            // OTP credential store. `OtpValidator::from_config`
+            // (`zeroclaw_runtime::security::otp`) writes the encrypted
+            // TOTP secret to `<zeroclaw_dir>/otp-secret`. The filename is
+            // `otp-secret` (no extension); a previous revision of this
+            // PR claimed `otp-state.json`, which the runtime never
+            // writes. The same write-`{}` / write-empty-ciphertext
+            // exploit applies: overwriting the file would either
+            // disable OTP validation or replace the operator's secret
+            // with a known one.
+            //
+            // WebAuthn credential store. `WebAuthnManager::new`
+            // constructs `credentials_path` at
+            // `storage_dir.join("webauthn_credentials.json")`, and the
+            // gateway wires `storage_dir = &config.data_dir`. So the
+            // file lives under `data_dir`, not the config dir; the
+            // directory predicate above must cover both
+            // (`runtime_config_dirs` includes `data_dir` when set).
+            || file_name == "estop-state.json"
+            || file_name == "otp-secret"
+            || file_name == "webauthn_credentials.json";
+        if !is_protected_name {
             return false;
         }
         let Some(parent) = resolved.parent() else {
@@ -2610,6 +2668,9 @@ impl SecurityPolicy {
             // Set by `for_agent` once the install root is known; the
             // profile-only constructor has no config path.
             config_path: None,
+            // Set by `for_agent` once the data dir is known; the
+            // profile-only constructor has no data dir.
+            data_dir: None,
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
             forbidden_paths,
@@ -2690,6 +2751,11 @@ impl SecurityPolicy {
         // directory holding `config.toml`. Record the real config path so
         // `is_runtime_config_path` guards it directly.
         policy.config_path = Some(config.config_path.clone());
+        // Runtime data dir: same predicate extends there so state files
+        // that the gateway constructs with `&config.data_dir`
+        // (`webauthn_credentials.json` for WebAuthnManager) are protected
+        // from agent overwrites when `data_dir` overlaps an allowed root.
+        policy.data_dir = Some(config.data_dir.clone());
 
         // Shared skills directory: every agent reads from
         // `<install>/shared/skills/` so the `read_skills` tool resolves
@@ -2988,6 +3054,30 @@ mod tests {
         };
         assert!(p.is_tool_allowed("shell"));
         assert!(!p.is_tool_allowed("spawn_subagent"));
+    }
+
+    #[test]
+    fn is_tool_excluded_reflects_denylist_independent_of_allowlist() {
+        // No denylist → nothing excluded, regardless of allowlist.
+        let none = SecurityPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            excluded_tools: None,
+            ..SecurityPolicy::default()
+        };
+        assert!(!none.is_tool_excluded("shell"));
+        assert!(
+            !none.is_tool_excluded("deploy__run"),
+            "a tool omitted from the allowlist is not 'excluded' — the denylist is separate"
+        );
+
+        // Denylist subtracts by name, independent of the allowlist.
+        let denied = SecurityPolicy {
+            allowed_tools: None,
+            excluded_tools: Some(vec!["deploy__status".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(denied.is_tool_excluded("deploy__status"));
+        assert!(!denied.is_tool_excluded("deploy__run"));
     }
 
     // ── from_profiles propagation coverage ────────────────────
@@ -5875,6 +5965,95 @@ mod tests {
         // [workspace] block; protection is no longer required and not
         // claimed.
         assert!(!policy.is_runtime_config_path(&config_dir.join("active_workspace.toml")));
+    }
+
+    #[test]
+    fn runtime_state_files_in_config_dir_are_protected() {
+        // Regression test for audit-zeroclaw-2026-07-03.md finding H1:
+        // a compromised or prompt-injected agent with `file_write` access
+        // to the config directory could reset estop state (write `{}` to
+        // `estop-state.json`) or overwrite the OTP secret / WebAuthn
+        // credential blobs. The predicate must refuse writes to these
+        // files inside the runtime config dirs.
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let config_dir = workspace.parent().unwrap();
+
+        // The state files are protected when they live in a runtime config dir.
+        assert!(policy.is_runtime_config_path(&config_dir.join("estop-state.json")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("webauthn_credentials.json")));
+        // `OtpValidator::from_config` (zeroclaw_runtime::security::otp)
+        // writes the encrypted TOTP secret to `<zeroclaw_dir>/otp-secret`
+        // — the filename is exactly `otp-secret` (no extension). A
+        // previous revision of this PR protected `otp-state.json`, which
+        // the runtime never actually writes; the audit blocker flagged
+        // that misnaming.
+        assert!(policy.is_runtime_config_path(&config_dir.join("otp-secret")));
+
+        // Same names inside the workspace itself are NOT protected — those
+        // are user-owned files; only the runtime-state files at config_dir
+        // are sensitive.
+        assert!(!policy.is_runtime_config_path(&workspace.join("estop-state.json")));
+        assert!(!policy.is_runtime_config_path(&workspace.join("webauthn_credentials.json")));
+        assert!(!policy.is_runtime_config_path(&workspace.join("otp-secret")));
+
+        // Unrelated filenames are unaffected.
+        assert!(!policy.is_runtime_config_path(&config_dir.join("notes.md")));
+        assert!(!policy.is_runtime_config_path(&config_dir.join("agent-state.json")));
+        // The previous revision claimed `otp-state.json` was protected —
+        // the runtime never writes a file by that name, so the predicate
+        // must not falsely flag it. Without this guard, a future addition
+        // of an `otp-state.json` file under the workspace would silently
+        // lose protection if the predicate ever broadened.
+        assert!(!policy.is_runtime_config_path(&config_dir.join("otp-state.json")));
+    }
+
+    #[test]
+    fn runtime_state_files_in_data_dir_are_protected() {
+        // `WebAuthnManager::new` constructs `credentials_path` at
+        // `storage_dir.join("webauthn_credentials.json")`, and the gateway
+        // wires `storage_dir = &config.data_dir` (see
+        // `crates/zeroclaw-gateway/src/lib.rs`). The default install
+        // layout puts that file under `<install>/data/webauthn_credentials.json`,
+        // which is NOT covered by `runtime_config_dirs()`'s config-dir or
+        // workspace-parent logic. The audit blocker on the first review
+        // pass of this PR flagged exactly that — the protected filename
+        // match was right, but the directory predicate missed the
+        // production store location. This test pins the fix: when the
+        // policy carries a `data_dir`, `webauthn_credentials.json` under
+        // it is refused.
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let data_dir = PathBuf::from("/tmp/zeroclaw-profile/data");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            data_dir: Some(data_dir.clone()),
+            ..SecurityPolicy::default()
+        };
+
+        // The WebAuthn credentials file under data_dir is protected.
+        assert!(policy.is_runtime_config_path(&data_dir.join("webauthn_credentials.json")));
+
+        // The same file under the workspace is not — that's a user-owned
+        // file, not a WebAuthn store.
+        assert!(!policy.is_runtime_config_path(&workspace.join("webauthn_credentials.json")));
+
+        // Unrelated files under data_dir are unaffected.
+        assert!(!policy.is_runtime_config_path(&data_dir.join("logs.txt")));
+        assert!(!policy.is_runtime_config_path(&data_dir.join("cache.bin")));
+
+        // Without `data_dir` set, the predicate falls back to the
+        // config-dir-only behavior (matches the legacy flat layout where
+        // everything lives under one tree).
+        let legacy_policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert!(!legacy_policy.is_runtime_config_path(&PathBuf::from(
+            "/tmp/zeroclaw-profile/data/webauthn_credentials.json"
+        )));
     }
 
     #[test]

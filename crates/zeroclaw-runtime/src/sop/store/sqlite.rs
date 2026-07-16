@@ -221,6 +221,25 @@ impl SopRunStore for SqliteRunStore {
         Ok(out)
     }
 
+    fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+        let g = self.lock()?;
+        let mut stmt = g
+            .prepare("SELECT json FROM sop_runs WHERE terminal=1")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out: Vec<PersistedRun> = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        out.sort_by(|a, b| b.run.started_at.cmp(&a.run.started_at));
+        if limit > 0 && out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
     fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
         let g = self.lock()?;
         let json: Option<String> = g
@@ -648,6 +667,45 @@ mod tests {
         );
         assert_eq!(s.backend(), "sqlite");
         assert!(s.health_check());
+    }
+
+    #[test]
+    fn load_terminal_runs_filters_orders_and_limits() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        // One active run must never surface in the terminal load.
+        s.save_run(&run("active", SopRunStatus::Running, "1"))
+            .unwrap();
+        // Three terminal runs finished at ascending progress marks.
+        for (id, prog) in [("t-old", "1"), ("t-mid", "2"), ("t-new", "3")] {
+            s.save_run(&run(id, SopRunStatus::Running, prog)).unwrap();
+            let mut terminal = run(id, SopRunStatus::Completed, prog);
+            terminal.revision = 1;
+            s.finish_run(id, &terminal).unwrap();
+        }
+
+        let all = s.load_terminal_runs(0).unwrap();
+        assert_eq!(all.len(), 3, "unbounded load returns every terminal run");
+        assert!(
+            all.iter().all(|r| r.run.run_id != "active"),
+            "active run excluded from terminal load"
+        );
+        let ids: Vec<&str> = all.iter().map(|r| r.run.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["t-new", "t-mid", "t-old"],
+            "terminal runs ordered newest-first by started_at"
+        );
+
+        let capped = s.load_terminal_runs(2).unwrap();
+        assert_eq!(capped.len(), 2, "limit truncates the tail");
+        assert_eq!(
+            capped
+                .iter()
+                .map(|r| r.run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t-new", "t-mid"],
+            "limit keeps the newest runs"
+        );
     }
 
     #[test]

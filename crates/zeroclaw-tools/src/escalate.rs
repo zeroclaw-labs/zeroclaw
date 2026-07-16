@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -82,7 +82,7 @@ impl EscalateToHumanTool {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"name": name})),
-                            "escalate_to_human: alert channel '' not found in channel map"
+                            "escalate_to_human: alert channel not found in channel map"
                         );
                         None
                     }
@@ -97,7 +97,7 @@ impl EscalateToHumanTool {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e), "name": name})),
-                    "escalate_to_human: alert to channel '' failed"
+                    "escalate_to_human: alert to channel failed"
                 );
             }
         }
@@ -155,7 +155,7 @@ impl Tool for EscalateToHumanTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -192,7 +192,7 @@ impl Tool for EscalateToHumanTool {
         if !VALID_URGENCY_LEVELS.contains(&urgency) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid urgency '{}'. Must be one of: {}",
                     urgency,
@@ -220,7 +220,7 @@ impl Tool for EscalateToHumanTool {
             if channels.is_empty() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("No channels available yet (channels not initialized)".to_string()),
                 });
             }
@@ -247,7 +247,7 @@ impl Tool for EscalateToHumanTool {
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Channel '{channel_name}' cannot receive a free-form reply, \
                      so `wait_for_response` is unsupported (awaits ACP elicitation Phase 2). \
@@ -261,7 +261,7 @@ impl Tool for EscalateToHumanTool {
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send escalation to channel '{channel_name}': {e}"
                 )),
@@ -288,17 +288,17 @@ impl Tool for EscalateToHumanTool {
             match response {
                 Ok(Some(msg)) => Ok(ToolResult {
                     success: true,
-                    output: msg.content,
+                    output: msg.content.into(),
                     error: None,
                 }),
                 Ok(None) => Ok(ToolResult {
                     success: false,
-                    output: "TIMEOUT".to_string(),
+                    output: "TIMEOUT".to_string().into(),
                     error: Some("Channel closed before receiving a response".to_string()),
                 }),
                 Err(_) => Ok(ToolResult {
                     success: false,
-                    output: "TIMEOUT".to_string(),
+                    output: "TIMEOUT".to_string().into(),
                     error: Some(format!(
                         "No response received within {timeout_secs} seconds"
                     )),
@@ -313,7 +313,8 @@ impl Tool for EscalateToHumanTool {
                     "urgency": urgency,
                     "channel": channel_name,
                 })
-                .to_string(),
+                .to_string()
+                .into(),
                 error: None,
             })
         }

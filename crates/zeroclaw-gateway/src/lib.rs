@@ -28,6 +28,7 @@ pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
+pub mod api_sop_author;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -43,6 +44,7 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -51,6 +53,7 @@ pub mod tls;
 pub mod voice_duplex;
 pub mod ws;
 pub mod ws_approval;
+pub mod ws_sop_runs;
 
 use anyhow::{Context, Result};
 #[cfg(any(
@@ -80,7 +83,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -905,6 +908,7 @@ pub async fn run_gateway(
                 connect_peripherals: false,
                 emit_assembly_logs: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: true,
             })
             .await;
             // Wire channel-driven tool handles so the dashboard agent can
@@ -1052,6 +1056,7 @@ pub async fn run_gateway(
             connect_peripherals: false,
             emit_assembly_logs: false,
             exclude_memory: false,
+            list_deferred_mcp_specs: true,
         })
         .await;
         let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
@@ -1706,6 +1711,55 @@ pub async fn run_gateway(
                 .options(api_config::handle_options_prop),
         )
         .route("/api/config/list", get(api_config::handle_list))
+        .route(
+            "/api/sops",
+            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
+        )
+        .route(
+            "/api/sops/{name}",
+            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
+        )
+        .route(
+            "/api/sops/{name}/graph",
+            get(api_sop_author::handle_sop_graph),
+        )
+        .route(
+            "/api/sops/{name}/run",
+            post(api_sop_author::handle_sop_run),
+        )
+        .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
+        .route(
+            "/api/sops/{name}/full",
+            get(api_sop_author::handle_sop_full),
+        )
+        .route(
+            "/api/sops/wire-draft",
+            post(api_sop_author::handle_sop_wire_draft),
+        )
+        .route(
+            "/api/sops/graph-draft",
+            post(api_sop_author::handle_sop_graph_draft),
+        )
+        .route(
+            "/api/sops/trigger-sources",
+            get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/graph-legend",
+            get(api_sop_author::handle_sop_graph_legend),
+        )
+        .route(
+            "/api/tools/param-options",
+            post(api_sop_author::handle_tools_param_options),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_author::handle_sop_run_overlay),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/decide",
+            post(api_sop_author::handle_sop_decide),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",
@@ -1851,6 +1905,10 @@ pub async fn run_gateway(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
@@ -1936,6 +1994,8 @@ pub async fn run_gateway(
         .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket SOP runs feed ──
+        .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
@@ -1980,6 +2040,17 @@ pub async fn run_gateway(
         )
     } else {
         inner
+    };
+
+    let tls_enabled = config
+        .gateway
+        .tls
+        .as_ref()
+        .is_some_and(|tls_cfg| tls_cfg.enabled);
+    let app = if tls_enabled {
+        app.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
+    } else {
+        app.layer(axum::middleware::from_fn(security_headers::apply))
     };
 
     // ── TLS / mTLS setup ───────────────────────────────────────────
@@ -2547,7 +2618,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
+                zeroclaw_runtime::agent::process_message(
+                    config,
+                    &agent_alias,
+                    message,
+                    session_id,
+                    zeroclaw_api::ingress::TurnOrigin::Interactive,
+                ),
             ),
         ))
         .await?;
@@ -4398,7 +4475,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tools::ToolResult> {
             Ok(tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: tools::ToolOutput::default(),
                 error: None,
             })
         }
@@ -8303,8 +8380,19 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = admin_paircode_state(&tmp, true, false);
         // No registry → registry branch is skipped, so persistence is the
-        // only failing step. Point config_path at an unwritable target.
-        state.config.write().config_path = std::path::PathBuf::from("/no/such/dir/config.toml");
+        // only failing step.
+        //
+        // Force `save_dirty` → `write_config_atomically` → `create_dir_all`
+        // to fail deterministically by planting an ordinary file at the
+        // parent segment of `config_path`. `create_dir_all` then hits
+        // ENOTDIR at the kernel level, which root cannot bypass — unlike
+        // the previous `/no/such/dir/config.toml` path, where a uid-0 CI
+        // runner is allowed to create `/no/…` from `/` and the save
+        // silently succeeds, letting the whole rollback path go untested
+        // (and leaking a 200 + token if it ever regresses).
+        let blocker = tmp.path().join("legacy-pair-blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
+        state.config.write().config_path = blocker.join("config.toml");
 
         let code = state
             .pairing

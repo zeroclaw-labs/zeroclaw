@@ -88,7 +88,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -237,7 +237,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: ubuntu-22.04
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
@@ -245,7 +244,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -269,7 +267,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: runner.os != 'Windows'
@@ -311,16 +309,11 @@ jobs:
           fi
           # Resolve the feature set from the canonical registry
           # (`cargo generate features`), the single source of truth that
-          # install.sh and packaging surfaces also consume. `dist` is the
-          # full-channel, no-heavyweight distribution set; it is self-contained
-          # (carries the default leaves), so every target builds with
-          # --no-default-features against the explicit list, no implicit drift.
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist)"
-          # skip_prometheus targets (ARMv6/ARMv7) drop observability-prometheus,
-          # which pulls a backtrace path that segfaults on those devices.
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            FEATURES="$(printf '%s' "$FEATURES" | tr ',' '\n' | grep -vx 'observability-prometheus' | paste -sd,)"
-          fi
+          # install.sh and packaging surfaces also consume. `dist` is the lean
+          # standard distribution set and carries the default leaves, so every
+          # target builds with --no-default-features against the explicit list,
+          # with no implicit feature drift.
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           # MUSL targets build via cross-rs (cross-compiled in a container);
           # all other targets use the host cargo toolchain directly.
@@ -340,7 +333,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB cap for standard release builds
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -389,7 +382,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -495,7 +488,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -544,7 +537,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -717,7 +710,7 @@ jobs:
               --source-digest "$GITHUB_SHA" \
               --bundle "$tmp_dir/$target" \
               --custom-trusted-root "$tmp_dir/trusted_root.jsonl"
-            printf '`%s` | `%s` | `%s`\n' "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+            printf "\`%s\` | \`%s\` | \`%s\`\n" "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
             bundle_count=$((bundle_count + 1))
           done
 
@@ -726,7 +719,7 @@ jobs:
           mv "$tmp_dir"/* .
 
           echo "--- Attestation bundles ---"
-          ls -lh *.attestation.jsonl trusted_root.jsonl ATTESTATION-BUNDLES.md
+          ls -lh ./*.attestation.jsonl ./trusted_root.jsonl ./ATTESTATION-BUNDLES.md
 
       - name: Write release notes
         env:
@@ -749,27 +742,27 @@ jobs:
           Release artifacts have GitHub artifact provenance attestations.
 
           **Online**
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
             --source-digest ${SOURCE_DIGEST}
-          ```
+          \`\`\`
           VERIFY_EOF
 
             if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
               cat >> release-notes.md <<VERIFY_EOF
 
           **Offline**
-          Download `<artifact>`, `<artifact>.attestation.jsonl`, and `trusted_root.jsonl` from the release assets, then run:
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
-            --source-digest ${SOURCE_DIGEST} \
-            --bundle <artifact>.attestation.jsonl \
+          Download \`<artifact>\`, \`<artifact>.attestation.jsonl\`, and \`trusted_root.jsonl\` from the release assets, then run:
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
+            --source-digest ${SOURCE_DIGEST} \\
+            --bundle <artifact>.attestation.jsonl \\
             --custom-trusted-root trusted_root.jsonl
-          ```
+          \`\`\`
           VERIFY_EOF
             else
               cat >> release-notes.md <<VERIFY_EOF
@@ -835,6 +828,45 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
             -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
+
+  deploy-docs:
+    name: Deploy Versioned Docs
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # workflow_dispatch of docs-deploy.yml
+      contents: read
+    steps:
+      # The release tag (needs.validate.outputs.tag) is created by the publish
+      # job via `gh release create` using GITHUB_TOKEN. GitHub does NOT fire
+      # another workflow run from a GITHUB_TOKEN-created tag push
+      # (https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow),
+      # so docs-deploy.yml's `tags: [v*]` trigger never sees this tag. Dispatch
+      # it explicitly instead: workflow_dispatch IS the documented exception
+      # that runs even when invoked with GITHUB_TOKEN. docs-deploy checks out the
+      # tag input internally and builds /<tag>/ on gh-pages.
+      #
+      # Ordering: the version-bump PR merges BEFORE Release Stable runs, so its
+      # `master` docs deploy normally runs first, while /<tag>/ does not yet
+      # exist; that master deploy therefore defers the stable-pointer flip by
+      # design (see docs-deploy.yml). This job then creates /<tag>/, and a LATER
+      # `master` deploy publishes the flip once /<tag>/ is live. This step only
+      # DISPATCHES the tag build; a green job here means the dispatch was
+      # accepted, not that the downstream docs run finished. To advance the
+      # stable pointer after /<tag>/ is live, re-run docs-deploy.yml with
+      # tag=master (see the release runbook, Step 7).
+      - name: Dispatch docs-deploy for the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching docs-deploy.yml for ${TAG} (ref master)..."
+          gh workflow run docs-deploy.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f tag="$TAG"
 
   docker:
     name: Push Docker Image

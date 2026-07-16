@@ -50,7 +50,7 @@ impl Tool for EchoTool {
             .to_string();
         Ok(ToolResult {
             success: true,
-            output: msg,
+            output: msg.into(),
             error: None,
         })
     }

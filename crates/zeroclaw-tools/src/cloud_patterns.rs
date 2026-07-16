@@ -7,7 +7,7 @@ use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// A cloud architecture pattern with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ impl Tool for CloudPatternsTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&output)?,
+                    output: serde_json::to_string_pretty(&output)?.into(),
                     error: None,
                 })
             }
@@ -114,7 +114,7 @@ impl Tool for CloudPatternsTool {
                 if workload.trim().is_empty() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'workload' parameter is required for 'match' action".into()),
                     });
                 }
@@ -129,13 +129,13 @@ impl Tool for CloudPatternsTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&output)?,
+                    output: serde_json::to_string_pretty(&output)?.into(),
                     error: None,
                 })
             }
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown action '{}'. Valid: match, list", action)),
             }),
         }
