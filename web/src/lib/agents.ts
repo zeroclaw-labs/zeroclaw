@@ -1,4 +1,4 @@
-import { getCost, getMapKeys, getMemory, getSessions, listProps, patchConfig } from './api';
+import { getCost, getMapKeys, getMemory, getStatus, getSessions, listProps, patchConfig } from './api';
 
 export interface AgentSummary {
   alias: string;
@@ -23,6 +23,8 @@ export interface AgentSummary {
   monthCostUsd: number | null;
   /** Persisted memory rows attributed to this agent via `agent_alias`. */
   memoryCount: number;
+  /** Number of currently in-flight (executing) turns for this agent. */
+  inFlightCount: number;
 }
 
 export interface AgentPickerSummary {
@@ -70,6 +72,7 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   const sessionsPromise = getSessions().catch(() => []);
   const costPromise = getCost().catch(() => null);
   const memoriesPromise = getMemory().catch(() => []);
+  const statusPromise = getStatus().catch(() => null);
 
   // Reverse-build agent → peer_groups in parallel with the per-agent walks.
   // listProps('peer_groups.<alias>.agents') is the field that names members.
@@ -119,15 +122,17 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         lastActivity: null,
         monthCostUsd: null,
         memoryCount: 0,
+        inFlightCount: 0,
       };
     }),
   );
 
-  const [sessions, cost, peerGroups, memories] = await Promise.all([
+  const [sessions, cost, peerGroups, memories, status] = await Promise.all([
     sessionsPromise,
     costPromise,
     peerGroupsPromise,
     memoriesPromise,
+    statusPromise,
   ]);
   const memoriesByAgent = memories.reduce<Record<string, number>>((acc, m) => {
     if (m.agent_alias) {
@@ -147,6 +152,7 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
     summary.monthCostUsd = agentCost ? agentCost.cost_usd : null;
     summary.peerGroups = peerGroups[summary.alias] ?? [];
     summary.memoryCount = memoriesByAgent[summary.alias] ?? 0;
+    summary.inFlightCount = status?.in_flight_by_agent?.[summary.alias] ?? 0;
   }
 
   return summaries;

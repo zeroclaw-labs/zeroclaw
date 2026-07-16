@@ -1,4 +1,5 @@
 pub mod dora;
+pub mod inflight;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -12,6 +13,8 @@ pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
+#[allow(unused_imports)]
+pub use self::inflight::{InFlightObserver, InFlightRegistry, get_inflight_registry};
 #[allow(unused_imports)]
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
@@ -54,12 +57,6 @@ struct BroadcastHookEntry {
 struct BroadcastHookState {
     next_scoped_id: u64,
     entries: Vec<BroadcastHookEntry>,
-}
-
-impl BroadcastHookState {
-    fn current(&self) -> Option<Arc<dyn Observer>> {
-        self.entries.last().map(|entry| entry.observer.clone())
-    }
 }
 
 fn broadcast_hook_slot() -> &'static RwLock<BroadcastHookState> {
@@ -112,10 +109,6 @@ pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGu
 /// Remove the broadcast hook, if any. Intended for tests and orderly shutdown.
 pub fn clear_broadcast_hook() {
     broadcast_hook_slot().write().entries.clear();
-}
-
-fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
-    broadcast_hook_slot().read().current()
 }
 
 /// Guard that flushes its observer on drop — the telemetry analogue of
@@ -175,8 +168,32 @@ struct TeeObserver {
 impl Observer for TeeObserver {
     fn record_event(&self, event: &ObserverEvent) {
         self.primary.record_event(event);
-        if let Some(hook) = current_broadcast_hook() {
-            hook.record_event(event);
+        // Collect the observers to notify while briefly holding the read lock,
+        // then release the lock *before* invoking any callback. Calling an
+        // observer callback while holding the global hook lock is unsafe: a
+        // callback that installs or drops a scoped hook needs the write lock
+        // (deadlock on this non-reentrant `RwLock`), and any slow or blocking
+        // hook would stall every other event source in the process.
+        let targets: Vec<Arc<dyn Observer>> = {
+            let hook = broadcast_hook_slot().read();
+            if hook.entries.is_empty() {
+                return;
+            }
+            // When multiple scoped hooks are stacked, only the most recent
+            // (highest scoped_id) scoped entry receives events. Non-scoped
+            // entries receive events only when no scoped hook is live.
+            let max_scoped = hook.entries.iter().filter_map(|e| e.scoped_id).max();
+            hook.entries
+                .iter()
+                .filter(|entry| match entry.scoped_id {
+                    Some(id) => Some(id) == max_scoped,
+                    None => max_scoped.is_none(),
+                })
+                .map(|entry| Arc::clone(&entry.observer))
+                .collect()
+        };
+        for observer in targets {
+            observer.record_event(event);
         }
     }
 
@@ -602,7 +619,9 @@ mod tests {
     #[test]
     fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
         let _guard = HOOK_TEST_LOCK.lock();
+        let _inflight_guard = inflight::INFLIGHT_TEST_LOCK.lock();
         clear_broadcast_hook();
+        inflight::registry_clear_for_test();
 
         let old_hook = Arc::new(CountingObserver::default());
         let old_guard = set_scoped_broadcast_hook(old_hook.clone());

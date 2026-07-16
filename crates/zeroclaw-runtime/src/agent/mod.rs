@@ -63,4 +63,4 @@ mod tests;
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
-pub use loop_::{process_message, run};
+pub use loop_::{LoopTurnGuard, process_message, run};

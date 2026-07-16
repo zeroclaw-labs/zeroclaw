@@ -577,6 +577,8 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    /// Per-agent in-flight turn counter for the dashboard.
+    pub in_flight: zeroclaw_runtime::observability::InFlightRegistry,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1530,14 +1532,27 @@ pub async fn run_gateway(
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Install the SSE broadcast hook before building any observer so that
-    // events emitted by the agent's per-call observer (built inside
-    // `process_message`) also reach `/api/events`. The state-level observer
-    // is just the configured backend — `TeeObserver` (created by
-    // `create_observer`) tees its events into the hook automatically.
-    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
-    );
+    // Install a SINGLE fan-out broadcast hook (before building any observer)
+    // containing BOTH the SSE broadcast observer and the in-flight turn
+    // counter, so events emitted by the agent's per-call observer (built
+    // inside `process_message`) reach `/api/events` and update the counter.
+    // The state-level observer is just the configured backend — `TeeObserver`
+    // (from `create_observer`) tees its events into this hook automatically.
+    // Both observers must share one scoped hook:
+    // `TeeObserver::record_event` delivers each event only to the
+    // highest `scoped_id`, so installing them as two separate scoped hooks
+    // would mask whichever was installed first — legacy `ObserverEvent`
+    // traffic would update the in-flight counter but never reach
+    // `/api/events` or `/api/events/history`. Wrapping both in a
+    // `MultiObserver` fans every event out to both sinks.
+    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> =
+        Arc::new(zeroclaw_runtime::observability::MultiObserver::new(vec![
+            Box::new(sse::BroadcastObserver::new(
+                event_tx.clone(),
+                event_buffer.clone(),
+            )),
+            Box::new(zeroclaw_runtime::observability::InFlightObserver::new()),
+        ]));
     let broadcast_hook_guard =
         zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
 
@@ -1649,6 +1664,7 @@ pub async fn run_gateway(
         tui_registry,
         sop_engine,
         sop_audit,
+        in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -2721,6 +2737,50 @@ pub struct WebhookQuery {
 }
 
 /// POST /webhook — main webhook endpoint
+/// RAII guard that guarantees a balanced `AgentEnd` for a gateway webhook turn
+/// even if the request future is dropped mid-`.await` (client disconnect /
+/// cancellation), where the sequential `AgentEnd` emission would otherwise be
+/// skipped and leak the per-agent in-flight counter (#8860). Mirrors the
+/// runtime `LoopTurnGuard`: the success / error arms emit the rich `AgentEnd`
+/// (real duration, tokens, cost) and call [`WebhookTurnGuard::disarm`] so this
+/// guard does not double-emit.
+struct WebhookTurnGuard {
+    observer: Arc<dyn zeroclaw_runtime::observability::Observer>,
+    model_provider: String,
+    model: String,
+    channel_name: &'static str,
+    agent_alias: Option<String>,
+    turn_id: String,
+    started_at: Instant,
+    fired: bool,
+}
+
+impl WebhookTurnGuard {
+    /// Mark the turn's `AgentEnd` as already emitted so `Drop` is a no-op.
+    fn disarm(&mut self) {
+        self.fired = true;
+    }
+}
+
+impl Drop for WebhookTurnGuard {
+    fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        self.observer
+            .record_event(&zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
+                model_provider: self.model_provider.clone(),
+                model: self.model.clone(),
+                duration: self.started_at.elapsed(),
+                tokens_used: None,
+                cost_usd: None,
+                channel: Some(self.channel_name.to_string()),
+                agent_alias: self.agent_alias.clone(),
+                turn_id: Some(self.turn_id.clone()),
+            });
+    }
+}
 async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -2924,6 +2984,23 @@ async fn handle_webhook(
             turn_id: Some(turn_id.clone()),
         },
     );
+
+    // Drop-safe lifecycle guard: the rich `AgentEnd` emitted on the Ok/Err
+    // arms below is ordinary code *after* the `.await`, so a client
+    // disconnect that cancels (drops) this handler future mid-turn would
+    // skip it and leak the in-flight counter (#8860). This guard fires a
+    // final `AgentEnd` on drop unless an arm already emitted one and called
+    // `disarm()`, mirroring the runtime `LoopTurnGuard`.
+    let mut turn_guard = WebhookTurnGuard {
+        observer: state.observer.clone(),
+        model_provider: provider_label.clone(),
+        model: model_label.clone(),
+        channel_name,
+        agent_alias: agent_alias.map(|s| s.to_string()),
+        turn_id: turn_id.clone(),
+        started_at,
+        fired: false,
+    };
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
             model_provider: provider_label.clone(),
@@ -2975,6 +3052,7 @@ async fn handle_webhook(
             state.observer.record_metric(
                 &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
             );
+            turn_guard.disarm();
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
                     model_provider: provider_label,
@@ -3019,6 +3097,7 @@ async fn handle_webhook(
                     component: "gateway".to_string(),
                     message: sanitized.clone(),
                 });
+            turn_guard.disarm();
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
                     model_provider: provider_label,
@@ -4718,6 +4797,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -5377,6 +5457,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -5464,6 +5545,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6058,6 +6140,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6163,6 +6246,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6283,6 +6367,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6384,6 +6469,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6503,6 +6589,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6588,6 +6675,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6678,6 +6766,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6775,6 +6864,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6868,6 +6958,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -7013,6 +7104,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -7848,6 +7940,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -7934,6 +8027,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -8094,6 +8188,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -8423,6 +8518,121 @@ mod tests {
              persist; have {:?}",
             state.pairing.tokens()
         );
+    }
+
+    /// Regression for the #8905 review: the gateway `/webhook` turn emits its
+    /// `AgentEnd` as ordinary code after the `.await`, so a client disconnect
+    /// that drops the handler future mid-turn would skip it and leak the
+    /// in-flight counter. `WebhookTurnGuard` must emit `AgentEnd` on drop
+    /// (the cancellation path) and stay silent once an arm has emitted the
+    /// rich `AgentEnd` and called `disarm()`.
+    #[test]
+    fn webhook_turn_guard_emits_agent_end_on_drop_and_disarm_suppresses() {
+        use zeroclaw_runtime::observability::{Observer, ObserverEvent};
+
+        fn agent_end_count(obs: &CapturingObserver) -> usize {
+            obs.events
+                .lock()
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::AgentEnd { .. }))
+                .count()
+        }
+
+        fn make_guard(observer: Arc<dyn Observer>, turn_id: &str) -> WebhookTurnGuard {
+            WebhookTurnGuard {
+                observer,
+                model_provider: "openai".to_string(),
+                model: "gpt-4".to_string(),
+                channel_name: "gateway",
+                agent_alias: Some("a".to_string()),
+                turn_id: turn_id.to_string(),
+                started_at: Instant::now(),
+                fired: false,
+            }
+        }
+
+        // Cancellation path: dropped without disarm -> exactly one AgentEnd.
+        let obs = Arc::new(CapturingObserver::default());
+        drop(make_guard(obs.clone(), "t1"));
+        assert_eq!(
+            agent_end_count(obs.as_ref()),
+            1,
+            "drop must emit one AgentEnd"
+        );
+
+        // Normal path: arm emitted the rich AgentEnd and disarmed -> no extra.
+        let obs2 = Arc::new(CapturingObserver::default());
+        let mut guard = make_guard(obs2.clone(), "t2");
+        guard.disarm();
+        drop(guard);
+        assert_eq!(
+            agent_end_count(obs2.as_ref()),
+            0,
+            "disarm must suppress drop AgentEnd"
+        );
+    }
+
+    /// Regression mirroring the manual smoke that surfaced the leak: two turns
+    /// for the SAME alias run concurrently; one turn's client disconnects, so
+    /// its `WebhookTurnGuard` fires `AgentEnd` on drop. The cancelled turn must
+    /// decrement exactly once and leave the concurrent turn's count intact.
+    #[test]
+    fn webhook_cancelled_turn_still_decrements_inflight_for_concurrent_alias() {
+        use zeroclaw_runtime::observability::{
+            InFlightObserver, Observer, ObserverEvent, get_inflight_registry,
+        };
+
+        let observer: Arc<dyn Observer> = Arc::new(InFlightObserver::new());
+        let registry = get_inflight_registry();
+        let alias = "webhook_guard_conc_regression";
+        let base = registry.get(alias);
+
+        let start = || ObserverEvent::AgentStart {
+            model_provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            channel: Some("gateway".to_string()),
+            agent_alias: Some(alias.to_string()),
+            turn_id: None,
+        };
+        let make_guard = |turn_id: &str| WebhookTurnGuard {
+            observer: observer.clone(),
+            model_provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            channel_name: "gateway",
+            agent_alias: Some(alias.to_string()),
+            turn_id: turn_id.to_string(),
+            started_at: Instant::now(),
+            fired: false,
+        };
+
+        observer.record_event(&start());
+        let guard_a = make_guard("a");
+        observer.record_event(&start());
+        let mut guard_b = make_guard("b");
+        assert_eq!(registry.get(alias), base + 2, "both turns in flight");
+
+        // Turn A's client disconnects: the handler future is dropped.
+        drop(guard_a);
+        assert_eq!(
+            registry.get(alias),
+            base + 1,
+            "cancelled turn decrements once; concurrent turn survives"
+        );
+
+        // Turn B completes normally (arm emits AgentEnd, then disarms).
+        guard_b.disarm();
+        observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            duration: std::time::Duration::from_millis(1),
+            tokens_used: None,
+            cost_usd: None,
+            channel: Some("gateway".to_string()),
+            agent_alias: Some(alias.to_string()),
+            turn_id: None,
+        });
+        drop(guard_b); // disarmed -> no-op
+        assert_eq!(registry.get(alias), base, "count returns to baseline");
     }
 }
 

@@ -1,9 +1,10 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Bot, Plus, AlertCircle } from 'lucide-react';
 import AgentCard from '@/components/AgentCard';
 import AgentDrawer from '@/components/AgentDrawer';
 import { Button, PageHeader } from '@/components/ui';
+import { usePolling } from '@/hooks/usePolling';
 import { t } from '@/lib/i18n';
 import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
 
@@ -37,9 +38,7 @@ export default function AgentsList() {
       );
   }, []);
 
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  usePolling(refresh, 5000);
 
   const toggleEnabled = useCallback(async (agent: AgentSummary) => {
     setToggling((prev) => new Set(prev).add(agent.alias));

@@ -1,6 +1,9 @@
 /target
 /target-*/
 
+# Qwen Code working directory
+.qwen/
+
 # Desktop installer build artifacts
 *.dmg
 # Kernel sidecar staging for the self-contained desktop build

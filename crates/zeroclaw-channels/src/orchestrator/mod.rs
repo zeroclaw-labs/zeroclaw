@@ -135,8 +135,8 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    LoopKnobs, LoopTurnGuard, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
     get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
     register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
@@ -5571,6 +5571,36 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
+
+    // Emit AgentStart and install RAII guard so the in-flight counter
+    // tracks channel turns the same way it tracks gateway chat turns.
+    // Clone values before they're moved into the async closure below.
+    let _turn_guard = {
+        let observer = Arc::clone(&ctx.observer);
+        let mp = route.model_provider.clone();
+        let model = route.model.clone();
+        let alias = ctx.agent_alias.to_string();
+        let channel = msg.channel.clone();
+        let tid = turn_id.clone();
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: mp.clone(),
+            model: model.clone(),
+            channel: Some(channel.clone()),
+            agent_alias: Some(alias.clone()),
+            turn_id: Some(tid.clone()),
+        });
+        LoopTurnGuard {
+            observer,
+            model_provider: mp,
+            model,
+            channel_name: channel,
+            agent_alias: alias,
+            turn_id: tid,
+            turn_started_at: Instant::now(),
+            done: false,
+        }
+    };
+
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -5759,14 +5789,6 @@ async fn process_channel_message_body(
                             },
                             &runtime_defaults,
                         );
-
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
-                            model_provider: route.model_provider.clone(),
-                            model: route.model.clone(),
-                            channel: Some(msg.channel.to_string()),
-                            agent_alias: Some(ctx.agent_alias.to_string()),
-                            turn_id: Some(turn_id.clone()),
-                        });
 
                         continue;
                     }
