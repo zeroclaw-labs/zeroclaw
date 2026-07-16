@@ -17,7 +17,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
 /// The Bocha key has no boot-time snapshot at all — it is always resolved from
-/// `config.toml` at use time (see [`Self::resolve_bocha_api_key`]), so the
+/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
 /// canonical `[web_search] bocha_api_key` field stays the single source of
 /// truth and rotation/removal takes effect without a restart.
 pub struct WebSearchTool {
