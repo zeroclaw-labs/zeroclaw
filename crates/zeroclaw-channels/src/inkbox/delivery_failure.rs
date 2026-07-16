@@ -753,7 +753,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Mask a phone number / address for logs: keep the mode tag and last 4 chars.
-fn mask_target(t: &str) -> String {
+pub(super) fn mask_target(t: &str) -> String {
     let tail: String = t
         .chars()
         .rev()

@@ -716,7 +716,10 @@ pub(super) async fn run_realtime_bridge(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        format!("[inkbox] caller contact lookup failed for {remote}: {e}"),
+                        format!(
+                            "[inkbox] caller contact lookup failed for {}: {e}",
+                            super::delivery_failure::mask_target(&remote)
+                        ),
                     ),
                 }
             }

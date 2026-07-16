@@ -298,7 +298,7 @@ impl Channel for InkboxChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 format!(
                     "[inkbox] suppressed [SILENT] reply to {}",
-                    message.recipient
+                    delivery_failure::mask_target(&message.recipient)
                 ),
             );
             return Ok(());
@@ -518,6 +518,49 @@ impl Channel for InkboxChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Log lines must not leak recipient identifiers in cleartext: the
+    /// `[SILENT]` suppression log masks the target down to its last 4 chars.
+    #[test]
+    fn silent_suppression_log_masks_the_recipient() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // Client construction spins reqwest's blocking runtime; keep it (and
+        // its eventual drop) off the test runtime's context.
+        let inkbox = std::thread::spawn(|| Inkbox::new("ApiKey_test").expect("client builds"))
+            .join()
+            .expect("client thread");
+        let channel = InkboxChannel::new(inkbox, "ident", "whsec_test", "zc", None);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(channel.send(&SendMessage::new("[SILENT]", "smsto:+15551230000")))
+            .expect("suppressed send returns Ok");
+
+        let mut suppression_log = None;
+        while let Ok(value) = rx.try_recv() {
+            let msg = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if msg.contains("suppressed [SILENT]") {
+                suppression_log = Some(msg);
+            }
+        }
+        let msg = suppression_log.expect("suppression is logged");
+        assert!(
+            !msg.contains("+15551230000") && !msg.contains("5551230000"),
+            "recipient must be masked; got: {msg}"
+        );
+        assert!(msg.contains("…0000"), "masked tail expected; got: {msg}");
+    }
 
     #[test]
     fn reply_route_classifies_every_target_shape() {
