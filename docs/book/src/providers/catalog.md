@@ -101,6 +101,64 @@ Optional further `extra_args` (empty by default), for example
 `["--max-turns", "20"]` or `["--always-approve"]`. Prefer workspace `.grok`
 permission rules over always-approve for channel agents.
 
+#### Grok CLI OS sandbox (how to use it from ZeroClaw)
+
+This is **Grok Build’s process sandbox** (Landlock / Seatbelt / seccomp on the
+`grok` subprocess). It is **not** ZeroClaw’s tool sandbox on
+`[risk_profiles.*.sandbox_*]` — that wraps ZeroClaw tools after native tool
+calls. With `grok_cli`, most file/shell work happens **inside** Grok, so Grok’s
+`--sandbox` is the effective confinement for that work. See also
+[Sandboxing](../security/sandboxing.md) for ZeroClaw’s risk-profile sandbox.
+
+**How to enable (selection):**
+
+| Mechanism | Scope | Example |
+| --------- | ----- | ------- |
+| `extra_args` on the provider alias | That alias’s spawns only | `extra_args = ["--sandbox", "read-only"]` |
+| Process env | Whole ZeroClaw daemon (every `grok` spawn) | `Environment=GROK_SANDBOX=read-only` in the unit |
+| User Grok config | Every local `grok` (CLI + ZeroClaw) | `[sandbox] profile = "read-only"` in `~/.grok/config.toml` |
+
+Project `.grok/config.toml` can hold MCP / plugins / **`[permission]`**, but it
+does **not** select the active sandbox profile by itself. Profile **names** and
+custom profile **bodies** can live in project
+`<workspace>/.grok/sandbox.toml`; you still pass `--sandbox <name>` (via
+`extra_args` or env) to turn that profile on.
+
+**Built-in profiles** (from Grok’s sandbox docs):
+
+| Profile | FS read | FS write | Child process network (Linux) | Typical use |
+| ------- | ------- | -------- | ----------------------------- | ----------- |
+| `off` (default) | unrestricted | unrestricted | unrestricted | Full access |
+| `workspace` | everywhere | CWD + `~/.grok` + tmp | allowed | Everyday coding |
+| `read-only` | everywhere | `~/.grok` + tmp only | blocked | Channel chatbots, review |
+| `strict` | CWD + system paths | CWD + `~/.grok` + tmp | blocked | Untrusted / tightest |
+| `devbox` | everywhere | most of the tree | allowed | Disposable VMs |
+
+Child-network blocking applies to **shell children** on Linux only; in-process
+Grok tools (LLM, built-in web search) still need network.
+
+**Custom profile example** (define in workspace, select from ZeroClaw):
+
+```toml
+# <agent-workspace>/.grok/sandbox.toml
+[profiles.channel-bot]
+extends = "read-only"
+# Optional kernel deny paths (needs bubblewrap on Linux when non-empty):
+# deny = ["**/.env", "**/*.pem"]
+```
+
+```toml
+# ZeroClaw config.toml
+[providers.models.grok_cli.default]
+working_directory = "/path/to/agents/default/workspace"
+extra_args = ["--sandbox", "channel-bot"]
+```
+
+**Per-agent sandbox:** one daemon shares one environment, so use **separate
+provider aliases** with different `extra_args` (for example `read-only` on the
+chatbot alias, no sandbox on an ops alias). Point each agent at the matching
+`model_provider`.
+
 ### Azure OpenAI: slot `azure`
 
 `resource`, `deployment`, and `api_version` live in this typed config, they are not read from environment variables.
