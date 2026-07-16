@@ -19,14 +19,14 @@
 //! - **Conversation history**: Only the system prompt (if present) and the last
 //!   user message are forwarded (same contract as `gemini_cli`).
 //! - **Native tool calls**: This provider does not emit ZeroClaw tool_calls.
-//! - **Permissions / tools**: ZeroClaw does **not** pass `--always-approve`,
-//!   `--permission-mode`, `--disallowed-tools`, or `--max-turns`. Tool
-//!   enablement and permission rules belong in Grok project config under the
-//!   subprocess working directory (typically the agent workspace):
-//!   `.grok/config.toml` (`[permission]`), plus `.grok/skills/`, etc.
-//!   Recommended channel-agent denies (narrow, `zeroclaw channel send` only)
-//!   are documented in `docs/book/src/providers/catalog.md` (Grok Build CLI).
-//!   See also Grok user-guide `05-configuration.md` / `22-permissions-and-safety.md`.
+//! - **Permissions / tools**: By default ZeroClaw does **not** pass
+//!   `--always-approve`, `--permission-mode`, `--disallowed-tools`, or
+//!   `--max-turns`. Prefer Grok project config under the subprocess working
+//!   directory (typically the agent workspace): `.grok/config.toml`
+//!   (`[permission]`), plus `.grok/skills/`, etc. Operators may opt in via
+//!   `extra_args` on the provider alias when they want those flags on argv.
+//!   Recommended channel-agent denies are documented in
+//!   `docs/book/src/providers/catalog.md` (Grok Build CLI).
 //! - **Temperature**: Only baseline values `0.7` and `1.0` are accepted.
 //!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
@@ -49,8 +49,8 @@ const TEMP_EPSILON: f64 = 1e-9;
 
 /// ModelProvider that invokes Grok Build CLI headless.
 ///
-/// Permission and tool policy are owned by Grok (workspace `.grok/`), not by
-/// ZeroClaw argv.
+/// Default argv is permission-agnostic; optional [`Self::extra_args`] and
+/// workspace `.grok/` config own tool/permission policy.
 pub struct GrokCliModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -58,16 +58,20 @@ pub struct GrokCliModelProvider {
     binary_path: PathBuf,
     /// Subprocess cwd so project `.grok/config.toml` resolves correctly.
     working_directory: Option<PathBuf>,
+    /// Operator-supplied argv tokens appended after built-in headless flags.
+    extra_args: Vec<String>,
 }
 
 impl GrokCliModelProvider {
     /// Create a new provider. Pass `None` for `binary_path` to use `"grok"`
     /// from `PATH`. Optional `working_directory` sets the subprocess cwd
-    /// (Grok loads project `.grok/` relative to that path).
+    /// (Grok loads project `.grok/` relative to that path). `extra_args` are
+    /// appended after the built-in headless plumbing flags.
     pub fn new(
         alias: &str,
         binary_path: Option<&str>,
         working_directory: Option<&str>,
+        extra_args: Vec<String>,
     ) -> Self {
         let binary_path = binary_path
             .map(str::trim)
@@ -78,10 +82,16 @@ impl GrokCliModelProvider {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(PathBuf::from);
+        let extra_args = extra_args
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         Self {
             alias: alias.to_string(),
             binary_path,
             working_directory,
+            extra_args,
         }
     }
 
@@ -125,9 +135,13 @@ impl GrokCliModelProvider {
     /// Build argv after the binary. Prompt is always passed via
     /// `--prompt-file` so large system prompts never hit OS ARG_MAX.
     ///
-    /// Only headless plumbing flags — no permission / tool / max-turns policy.
-    /// Those are configured in the workspace `.grok/` tree (see module docs).
-    fn build_cli_args(model: &str, prompt_file: &std::path::Path) -> Vec<String> {
+    /// Built-in flags are headless plumbing only. Operator `extra_args` are
+    /// appended afterward (may include permission/tool flags when configured).
+    fn build_cli_args(
+        model: &str,
+        prompt_file: &std::path::Path,
+        extra_args: &[String],
+    ) -> Vec<String> {
         let mut args = vec![
             "--prompt-file".to_string(),
             prompt_file.display().to_string(),
@@ -139,6 +153,7 @@ impl GrokCliModelProvider {
             args.push("-m".to_string());
             args.push(model.to_string());
         }
+        args.extend(extra_args.iter().cloned());
         args
     }
 
@@ -164,7 +179,7 @@ impl GrokCliModelProvider {
             })?;
 
         let mut cmd = Command::new(&self.binary_path);
-        cmd.args(Self::build_cli_args(model, &prompt_path));
+        cmd.args(Self::build_cli_args(model, &prompt_path, &self.extra_args));
         if let Some(cwd) = self.working_directory.as_ref() {
             cmd.current_dir(cwd);
         }
@@ -329,30 +344,42 @@ mod tests {
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = GrokCliModelProvider::new("test", Some("/home/user/.grok/bin/grok"), None);
+        let p = GrokCliModelProvider::new("test", Some("/home/user/.grok/bin/grok"), None, vec![]);
         assert_eq!(
             p.binary_path,
             PathBuf::from("/home/user/.grok/bin/grok")
         );
         assert!(p.working_directory.is_none());
+        assert!(p.extra_args.is_empty());
     }
 
     #[test]
     fn new_defaults_to_grok() {
-        let p = GrokCliModelProvider::new("test", None, None);
+        let p = GrokCliModelProvider::new("test", None, None, vec![]);
         assert_eq!(p.binary_path, PathBuf::from("grok"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = GrokCliModelProvider::new("test", Some("   "), None);
+        let p = GrokCliModelProvider::new("test", Some("   "), None, vec![]);
         assert_eq!(p.binary_path, PathBuf::from("grok"));
     }
 
     #[test]
     fn new_sets_working_directory() {
-        let p = GrokCliModelProvider::new("test", None, Some("/tmp/agent-ws"));
+        let p = GrokCliModelProvider::new("test", None, Some("/tmp/agent-ws"), vec![]);
         assert_eq!(p.working_directory, Some(PathBuf::from("/tmp/agent-ws")));
+    }
+
+    #[test]
+    fn new_trims_and_drops_empty_extra_args() {
+        let p = GrokCliModelProvider::new(
+            "test",
+            None,
+            None,
+            vec!["--max-turns".into(), "  ".into(), "20".into()],
+        );
+        assert_eq!(p.extra_args, vec!["--max-turns".to_string(), "20".to_string()]);
     }
 
     #[test]
@@ -386,14 +413,14 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_args_is_permission_agnostic_headless_plumbing() {
+    fn build_cli_args_default_is_permission_agnostic_headless_plumbing() {
         let path = PathBuf::from("/tmp/prompt.md");
-        let args = GrokCliModelProvider::build_cli_args(DEFAULT_MODEL_MARKER, &path);
+        let args = GrokCliModelProvider::build_cli_args(DEFAULT_MODEL_MARKER, &path, &[]);
         assert_eq!(args[0], "--prompt-file");
         assert_eq!(args[1], "/tmp/prompt.md");
         assert!(args.iter().any(|a| a == "--output-format"));
         assert!(args.iter().any(|a| a == "plain"));
-        // ZeroClaw must not inject permission / tool policy via argv.
+        // Default path must not inject permission / tool policy via argv.
         for forbidden in [
             "--always-approve",
             "bypassPermissions",
@@ -414,9 +441,24 @@ mod tests {
     }
 
     #[test]
+    fn build_cli_args_appends_extra_args() {
+        let path = PathBuf::from("/tmp/prompt.md");
+        let extra = vec![
+            "--max-turns".to_string(),
+            "20".to_string(),
+            "--always-approve".to_string(),
+        ];
+        let args = GrokCliModelProvider::build_cli_args("grok-4.5", &path, &extra);
+        let m_idx = args.iter().position(|a| a == "-m").expect("-m flag");
+        assert_eq!(args[m_idx + 1], "grok-4.5");
+        // extra_args come after model forwarding
+        assert_eq!(&args[m_idx + 2..], extra.as_slice());
+    }
+
+    #[test]
     fn build_cli_args_forwards_explicit_model() {
         let path = PathBuf::from("/tmp/prompt.md");
-        let args = GrokCliModelProvider::build_cli_args("grok-4.5", &path);
+        let args = GrokCliModelProvider::build_cli_args("grok-4.5", &path, &[]);
         let m_idx = args.iter().position(|a| a == "-m").expect("-m flag");
         assert_eq!(args[m_idx + 1], "grok-4.5");
     }
@@ -427,6 +469,7 @@ mod tests {
             alias: "test".to_string(),
             binary_path: PathBuf::from("/nonexistent/path/to/grok"),
             working_directory: None,
+            extra_args: Vec::new(),
         };
         let result = model_provider.invoke_cli("hello", "default").await;
         assert!(result.is_err());

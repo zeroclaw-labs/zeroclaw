@@ -1388,6 +1388,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
             alias,
             self.binary_path.as_deref(),
             self.working_directory.as_deref(),
+            self.extra_args.clone(),
         )))
     }
 

@@ -2688,9 +2688,15 @@ pub struct GrokCliModelProviderConfig {
     /// Working directory for the `grok` subprocess. Project-scoped Grok
     /// config (`.grok/config.toml` permissions, skills, agents) is resolved
     /// relative to this path. Defaults to the daemon process cwd when unset.
-    /// ZeroClaw does not pass tool/permission flags on the CLI argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Extra argv tokens appended after the built-in headless plumbing flags
+    /// (for example `["--max-turns", "20"]` or `["--always-approve"]`).
+    /// Empty by default: ZeroClaw does not inject permission/tool policy unless
+    /// the operator sets this field. Prefer workspace `.grok` permission rules
+    /// when possible; use `extra_args` for explicit opt-in CLI behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
 }
 
 // ── LMStudio (local default) ──

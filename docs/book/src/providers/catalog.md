@@ -42,9 +42,11 @@ Shells out to the Grok Build CLI (`grok --prompt-file` headless); uses the
 CLI's own login / `XAI_API_KEY`. Optional `binary_path` when `grok` is not on
 `PATH`. Optional `working_directory` sets the subprocess cwd so project
 `.grok/config.toml` permissions, skills, and agents resolve correctly.
-ZeroClaw does **not** pass tool/permission argv (`--always-approve`,
-`--disallowed-tools`, `--max-turns`, etc.); configure those in the workspace
-`.grok/` tree.
+By default ZeroClaw does **not** pass tool/permission argv
+(`--always-approve`, `--disallowed-tools`, `--max-turns`, etc.); prefer the
+workspace `.grok/` tree. Operators who want those flags on the CLI can set
+optional `extra_args` on the alias (appended after the built-in headless
+plumbing flags).
 
 #### Recommended workspace `.grok` settings
 
@@ -76,11 +78,14 @@ Example alias:
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/default/workspace"
+# Optional opt-in CLI flags (empty by default):
+# extra_args = ["--max-turns", "20"]
+# extra_args = ["--always-approve"]  # powerful; prefer .grok [permission] when possible
 ```
 
 ZeroClaw should remain the only path that posts channel replies (`thread_replies`
-and related channel config). Do **not** rely on `--always-approve` from ZeroClaw
-for this provider; permission policy belongs in Grok's `.grok` / settings.
+and related channel config). Prefer workspace `.grok` permission rules over
+`--always-approve` in `extra_args` for channel agents.
 
 ### Azure OpenAI: slot `azure`
 
