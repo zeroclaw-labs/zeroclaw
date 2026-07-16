@@ -18,8 +18,10 @@
 //!
 //! - **Conversation history**: Only the system prompt (if present) and the last
 //!   user message are forwarded (same contract as `gemini_cli`).
-//! - **Native tool calls**: This provider does not emit ZeroClaw tool_calls;
-//!   the CLI may run its own tools internally when auto-approve is enabled.
+//! - **Native tool calls**: This provider does not emit ZeroClaw tool_calls.
+//!   The CLI is invoked as a **one-shot completion** (like `gemini_cli`): no
+//!   always-approve / multi-turn agent loop inside the subprocess. ZeroClaw's
+//!   own agent loop handles multi-step tool use via the text tool protocol.
 //! - **Temperature**: Only baseline values `0.7` and `1.0` are accepted.
 //!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
@@ -33,14 +35,14 @@ const DEFAULT_GROK_CLI_BINARY: &str = "grok";
 
 /// Model name used to signal "use the CLI / config default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
-/// Bound hung subprocesses. Headless agentic turns can be longer than a
-/// plain completion; keep this generous but finite.
-const GROK_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bound hung subprocesses. Matches the completion-oriented timeout used by
+/// `gemini_cli` (not the long agentic tool-loop budget).
+const GROK_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_GROK_CLI_STDERR_CHARS: usize = 512;
 const GROK_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
-/// ModelProvider that invokes Grok Build CLI headless (`grok -p`).
+/// ModelProvider that invokes Grok Build CLI headless as a one-shot completion.
 pub struct GrokCliModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -101,6 +103,10 @@ impl GrokCliModelProvider {
 
     /// Build argv after the binary. Prompt is always passed via
     /// `--prompt-file` so large system prompts never hit OS ARG_MAX.
+    ///
+    /// Intentionally **not** agentic (aligned with `gemini_cli`): no
+    /// `--always-approve` / multi-turn tool loop. `--max-turns 1` keeps the
+    /// CLI to a single completion; ZeroClaw re-invokes for further turns.
     fn build_cli_args(model: &str, prompt_file: &std::path::Path) -> Vec<String> {
         let mut args = vec![
             "--prompt-file".to_string(),
@@ -108,14 +114,11 @@ impl GrokCliModelProvider {
             "--output-format".to_string(),
             "plain".to_string(),
             "--no-auto-update".to_string(),
-            // Non-interactive: do not block on permission prompts when the
-            // CLI elects to run tools while producing the completion.
-            "--always-approve".to_string(),
-            "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
             "--no-plan".to_string(),
+            "--no-subagents".to_string(),
+            // One model step inside the subprocess (not a 40-turn agent).
             "--max-turns".to_string(),
-            "40".to_string(),
+            "1".to_string(),
         ];
         if Self::should_forward_model(model) {
             args.push("-m".to_string());
@@ -358,14 +361,22 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_args_uses_prompt_file_and_headless_flags() {
+    fn build_cli_args_uses_prompt_file_and_completion_flags() {
         let path = PathBuf::from("/tmp/prompt.md");
         let args = GrokCliModelProvider::build_cli_args(DEFAULT_MODEL_MARKER, &path);
         assert_eq!(args[0], "--prompt-file");
         assert_eq!(args[1], "/tmp/prompt.md");
         assert!(args.iter().any(|a| a == "--output-format"));
         assert!(args.iter().any(|a| a == "plain"));
-        assert!(args.iter().any(|a| a == "--always-approve"));
+        // Completion-oriented (gemini_cli-like): no agentic auto-approve loop.
+        assert!(!args.iter().any(|a| a == "--always-approve"));
+        assert!(!args.iter().any(|a| a == "bypassPermissions"));
+        let max_idx = args
+            .iter()
+            .position(|a| a == "--max-turns")
+            .expect("--max-turns");
+        assert_eq!(args[max_idx + 1], "1");
+        assert!(args.iter().any(|a| a == "--no-subagents"));
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a == "-p"));
     }
