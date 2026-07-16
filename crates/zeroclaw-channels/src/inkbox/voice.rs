@@ -413,18 +413,12 @@ mod tests {
     async fn media_route_rejects_unauthenticated_upgrades() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let client =
-            std::thread::spawn(|| inkbox::Inkbox::new("ApiKey_test").expect("client builds"))
-                .join()
-                .expect("client thread");
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let app = super::super::inbound::router(super::super::inbound::AppState {
             tx,
             failure: std::sync::Arc::new(super::super::delivery_failure::FailureTracker::new("zc")),
             signing_key: KEY.to_string(),
             alias: "zc".to_string(),
-            inkbox: client,
-            identity: "ident".to_string(),
             public_host: "example.test".to_string(),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

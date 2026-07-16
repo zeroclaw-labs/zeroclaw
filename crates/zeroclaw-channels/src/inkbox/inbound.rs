@@ -30,10 +30,6 @@ pub struct AppState {
     pub signing_key: String,
     /// ZeroClaw channel alias, stamped onto every inbound message.
     pub alias: String,
-    /// Inkbox client, for API round-trips the inbound handlers need.
-    pub inkbox: std::sync::Arc<inkbox::Inkbox>,
-    /// Agent identity handle this channel runs as.
-    pub identity: String,
     /// Tunnel public host (e.g. `abc.inkbox.ai`), used to build the call-media
     /// WS URL we hand back from the incoming-call webhook with `?call_id=`.
     pub public_host: String,

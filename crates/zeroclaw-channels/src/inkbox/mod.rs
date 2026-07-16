@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
+#[cfg(test)]
+mod boundary_tests;
 mod delivery_failure;
 mod inbound;
 mod voice;
@@ -439,8 +441,6 @@ impl Channel for InkboxChannel {
             failure: self.failure.clone(),
             signing_key: self.signing_key.clone(),
             alias: self.alias.clone(),
-            inkbox: self.inkbox.clone(),
-            identity: self.identity.clone(),
             public_host,
         });
         let server = zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await });
