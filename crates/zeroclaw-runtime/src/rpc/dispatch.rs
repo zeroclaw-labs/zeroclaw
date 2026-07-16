@@ -1006,8 +1006,8 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
             initialize_mcp,
@@ -1458,7 +1458,6 @@ impl RpcDispatcher {
             }
         };
 
-        let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -1467,8 +1466,8 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
             false,
@@ -7759,6 +7758,63 @@ mod tests {
         );
 
         wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    #[tokio::test]
+    async fn existing_session_uses_reloaded_structured_history_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .max_history_messages = Some(2);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old assistant"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new assistant"),
+        ]);
+
+        assert!(
+            matches!(event, Some(TurnEvent::HistoryTrimmed { .. })),
+            "an existing session must observe the reloaded runtime-profile cap"
+        );
+        assert!(!agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat) if chat.content == "old user"
+        )));
+        assert!(agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "new assistant"
+        )));
     }
 
     #[tokio::test]

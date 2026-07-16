@@ -284,8 +284,10 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Construction-time resolution of the canonical Config-derived cap.
-    structured_max_history_messages: usize,
+    /// Resolves the structured-history cap from canonical config at use time.
+    /// Daemon-backed sessions capture the shared live config handle so reloads
+    /// affect existing sessions without duplicating config-derived state.
+    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -447,7 +449,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_max_history_messages: Option<usize>,
+    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -497,7 +499,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_max_history_messages: None,
+            structured_history_cap_resolver: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -577,9 +579,17 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_max_history_messages(mut self, max: usize) -> Self {
-        self.structured_max_history_messages = Some(max);
+    fn structured_history_cap_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
+    ) -> Self {
+        self.structured_history_cap_resolver = Some(resolver);
         self
+    }
+
+    #[cfg(test)]
+    fn structured_max_history_messages(self, max: usize) -> Self {
+        self.structured_history_cap_resolver(Arc::new(move || max))
     }
 
     pub fn multimodal_config(
@@ -791,9 +801,6 @@ impl AgentBuilder {
             })?
         };
         let config = self.config.unwrap_or_default();
-        let structured_max_history_messages = self
-            .structured_max_history_messages
-            .unwrap_or(config.resolved.max_history_messages);
 
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
@@ -839,7 +846,7 @@ impl AgentBuilder {
                 }
             }),
             config,
-            structured_max_history_messages,
+            structured_history_cap_resolver: self.structured_history_cap_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -1227,6 +1234,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1252,6 +1260,36 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
+        )
+        .await
+    }
+
+    /// Build a daemon-backed ACP/WS Agent whose structured-history cap follows
+    /// the shared config after reloads.
+    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(live_config),
         )
         .await
     }
@@ -1281,6 +1319,36 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Build a daemon-backed TUI Agent whose structured-history cap follows
+    /// the shared config after reloads.
+    pub async fn from_live_config_with_tui_env(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            Some(live_config),
         )
         .await
     }
@@ -1296,6 +1364,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
+        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1527,6 +1596,19 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
+        let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
+            if let Some(cap_config) = live_config {
+                let cap_agent_alias = agent_alias.to_string();
+                Arc::new(move || {
+                    cap_config
+                        .read()
+                        .effective_structured_max_history_messages(&cap_agent_alias)
+                })
+            } else {
+                let max = config.effective_structured_max_history_messages(agent_alias);
+                Arc::new(move || max)
+            };
+
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(tools)
@@ -1545,9 +1627,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_max_history_messages(
-                config.effective_structured_max_history_messages(agent_alias),
-            )
+            .structured_history_cap_resolver(structured_history_cap_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
@@ -1596,7 +1676,12 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self.structured_max_history_messages;
+        let max = self
+            .structured_history_cap_resolver
+            .as_ref()
+            .map_or(self.config.resolved.max_history_messages, |resolve| {
+                resolve()
+            });
         if self.history.len() <= max {
             return None;
         }

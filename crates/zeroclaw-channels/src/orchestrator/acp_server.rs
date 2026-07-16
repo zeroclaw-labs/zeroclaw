@@ -65,6 +65,9 @@ struct Session {
 
 pub struct AcpServer {
     config: Config,
+    /// Canonical daemon config for gateway-backed ACP connections. Standalone
+    /// ACP keeps using the immutable `config` snapshot above.
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     acp_config: AcpServerConfig,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
@@ -93,7 +96,7 @@ pub struct AcpServer {
 impl AcpServer {
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
-        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), None)
+        Self::with_writer(config, None, acp_config, writer_tx, Some(writer_rx), None)
     }
 
     pub fn new_with_writer(
@@ -101,7 +104,7 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
     ) -> Self {
-        Self::with_writer(config, acp_config, writer_tx, None, None)
+        Self::with_writer(config, None, acp_config, writer_tx, None, None)
     }
 
     pub fn new_with_store(
@@ -110,7 +113,14 @@ impl AcpServer {
         store: Arc<AcpSessionStore>,
     ) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
-        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), Some(store))
+        Self::with_writer(
+            config,
+            None,
+            acp_config,
+            writer_tx,
+            Some(writer_rx),
+            Some(store),
+        )
     }
 
     pub fn new_with_writer_and_store(
@@ -119,11 +129,38 @@ impl AcpServer {
         writer_tx: mpsc::Sender<String>,
         store: Arc<AcpSessionStore>,
     ) -> Self {
-        Self::with_writer(config, acp_config, writer_tx, None, Some(store))
+        Self::with_writer(config, None, acp_config, writer_tx, None, Some(store))
+    }
+
+    pub fn new_with_live_config_and_writer(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+    ) -> Self {
+        let config = live_config.read().clone();
+        Self::with_writer(config, Some(live_config), acp_config, writer_tx, None, None)
+    }
+
+    pub fn new_with_live_config_and_writer_and_store(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+        store: Arc<AcpSessionStore>,
+    ) -> Self {
+        let config = live_config.read().clone();
+        Self::with_writer(
+            config,
+            Some(live_config),
+            acp_config,
+            writer_tx,
+            None,
+            Some(store),
+        )
     }
 
     fn with_writer(
         config: Config,
+        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
@@ -131,6 +168,7 @@ impl AcpServer {
     ) -> Self {
         Self {
             config,
+            live_config,
             acp_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
@@ -142,6 +180,46 @@ impl AcpServer {
             sop_engine: None,
             sop_audit: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
+        }
+    }
+
+    fn config_snapshot(&self) -> Config {
+        self.live_config
+            .as_ref()
+            .map_or_else(|| self.config.clone(), |config| config.read().clone())
+    }
+
+    async fn build_agent(
+        &self,
+        config: &Config,
+        agent_alias: &str,
+        workspace_dir: &std::path::Path,
+        enable_mcp: bool,
+    ) -> Result<Agent> {
+        if let Some(live_config) = &self.live_config {
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+                Arc::clone(live_config),
+                agent_alias,
+                Some(workspace_dir),
+                enable_mcp,
+                true,
+                self.sop_engine.clone(),
+                self.sop_audit.clone(),
+                self.canvas_store.clone(),
+            )
+            .await
+        } else {
+            Agent::from_config_with_session_cwd_and_mcp_backchannel(
+                config,
+                agent_alias,
+                Some(workspace_dir),
+                enable_mcp,
+                true,
+                self.sop_engine.clone(),
+                self.sop_audit.clone(),
+                self.canvas_store.clone(),
+            )
+            .await
         }
     }
 
@@ -459,6 +537,7 @@ impl AcpServer {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let requested_cwd = self.requested_session_cwd(params);
+        let config = self.config_snapshot();
 
         let workspace_dir = std::fs::canonicalize(&requested_cwd)
             .map_err(|e| RpcError {
@@ -484,10 +563,10 @@ impl AcpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| self.config.acp.default_agent.clone())
+            .or_else(|| config.acp.default_agent.clone())
             .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
+                let mut keys = config.agents.keys();
+                if config.agents.len() == 1 {
                     keys.next().cloned()
                 } else {
                     None
@@ -500,7 +579,7 @@ impl AcpServer {
                     .to_string(),
                 data: None,
             })?;
-        if self.config.agent(&agent_alias).is_none() {
+        if config.agent(&agent_alias).is_none() {
             return Err(RpcError {
                 code: INVALID_PARAMS,
                 message: format!(
@@ -540,21 +619,23 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        let enable_mcp = self
-            .config
-            .agent(&agent_alias)
-            .is_some_and(|a| a.acp_enable_mcp);
-        let agent = match Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &self.config,
-            &agent_alias,
-            Some(std::path::Path::new(&workspace_dir)),
-            enable_mcp,
-            true,
-            self.sop_engine.clone(),
-            self.sop_audit.clone(),
-            self.canvas_store.clone(),
-        )
-        .await
+        // Build agent from global config, with the session's cwd pinned as
+        // the file/shell sandbox boundary. The agent's data directory
+        // (identity, scheduled tasks) still lives under `config.data_dir`.
+        // ACP sessions exclude persistent memory — context comes from the
+        // persisted session history, not the agent's long-term memory store.
+        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
+        // by default to keep `session/new` prompt; on to load this agent's
+        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
+        let enable_mcp = config.agent(&agent_alias).is_some_and(|a| a.acp_enable_mcp);
+        let agent = match self
+            .build_agent(
+                &config,
+                &agent_alias,
+                std::path::Path::new(&workspace_dir),
+                enable_mcp,
+            )
+            .await
         {
             Ok(agent) => agent,
             Err(e) => {
@@ -757,17 +838,18 @@ impl AcpServer {
         };
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
+        let config = self.config_snapshot();
 
         // Restore the agent the session was created with — its alias is
         // persisted on the session row. Fall back to the ACP default (or sole
         // agent, or "default") only when that agent no longer exists in config,
         // so a deleted owner degrades gracefully instead of failing the restore.
         let restore_alias = Some(data.agent_alias.clone())
-            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
-            .or_else(|| self.config.acp.default_agent.clone())
+            .filter(|alias| !alias.is_empty() && config.agent(alias).is_some())
+            .or_else(|| config.acp.default_agent.clone())
             .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
+                let mut keys = config.agents.keys();
+                if config.agents.len() == 1 {
                     keys.next().cloned()
                 } else {
                     None
@@ -777,26 +859,17 @@ impl AcpServer {
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
-        let enable_mcp = self
-            .config
+        let enable_mcp = config
             .agent(&restore_alias)
             .is_some_and(|a| a.acp_enable_mcp);
-        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &self.config,
-            &restore_alias,
-            Some(&workspace_dir),
-            enable_mcp,
-            true,
-            self.sop_engine.clone(),
-            self.sop_audit.clone(),
-            self.canvas_store.clone(),
-        )
-        .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        });
+        let agent_result = self
+            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .await
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to create agent: {e}"),
+                data: None,
+            });
 
         let mut agent = match agent_result {
             Ok(a) => a,
@@ -974,17 +1047,18 @@ impl AcpServer {
         };
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
+        let config = self.config_snapshot();
 
         // Restore the agent the session was created with — its alias is
         // persisted on the session row. Fall back to the ACP default (or sole
         // agent, or "default") only when that agent no longer exists in config,
         // so a deleted owner degrades gracefully instead of failing the restore.
         let restore_alias = Some(data.agent_alias.clone())
-            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
-            .or_else(|| self.config.acp.default_agent.clone())
+            .filter(|alias| !alias.is_empty() && config.agent(alias).is_some())
+            .or_else(|| config.acp.default_agent.clone())
             .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
+                let mut keys = config.agents.keys();
+                if config.agents.len() == 1 {
                     keys.next().cloned()
                 } else {
                     None
@@ -994,26 +1068,17 @@ impl AcpServer {
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
-        let enable_mcp = self
-            .config
+        let enable_mcp = config
             .agent(&restore_alias)
             .is_some_and(|a| a.acp_enable_mcp);
-        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &self.config,
-            &restore_alias,
-            Some(&workspace_dir),
-            enable_mcp,
-            true,
-            self.sop_engine.clone(),
-            self.sop_audit.clone(),
-            self.canvas_store.clone(),
-        )
-        .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        });
+        let agent_result = self
+            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .await
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to create agent: {e}"),
+                data: None,
+            });
 
         let mut agent = match agent_result {
             Ok(a) => a,
@@ -3329,6 +3394,26 @@ mod tests {
         cfg
     }
 
+    #[test]
+    fn gateway_backed_server_reads_reloaded_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = Arc::new(parking_lot::RwLock::new(make_test_config(cwd.path())));
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
+        let server = AcpServer::new_with_live_config_and_writer(
+            Arc::clone(&config),
+            AcpServerConfig::default(),
+            writer_tx,
+        );
+
+        config.write().acp.default_agent = Some("reloaded-agent".to_string());
+
+        assert_eq!(
+            server.config_snapshot().acp.default_agent.as_deref(),
+            Some("reloaded-agent")
+        );
+    }
+
+    /// `session/cancel` on an idle session (no active turn) must succeed silently.
     #[tokio::test]
     async fn session_cancel_idle_session_is_noop() {
         let cwd = tempfile::tempdir().unwrap();
