@@ -114,6 +114,7 @@ impl SkillFrontmatter {
                 credential_class: None,
                 tab: zeroclaw_config::config::ConfigTab::None,
                 alias_source: None,
+                multiline: false,
             },
         ]
     }
@@ -142,6 +143,7 @@ fn field(
         credential_class: None,
         tab: zeroclaw_config::config::ConfigTab::None,
         alias_source: None,
+        multiline: false,
     }
 }
 

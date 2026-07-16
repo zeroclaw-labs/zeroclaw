@@ -4692,18 +4692,17 @@ mod tests {
     #[test]
     fn prompt_guided_tool_fallback_injects_system_instruction() {
         let input = vec![ChatMessage::user("check status")];
-        let tools = vec![zeroclaw_api::tool::ToolSpec {
-            name: "shell_exec".to_string(),
-            description: "Execute shell command".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "shell_exec",
+            "Execute shell command",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" }
                 },
                 "required": ["command"]
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let output = OpenAiCompatibleModelProvider::with_prompt_guided_tool_instructions(
             &input,

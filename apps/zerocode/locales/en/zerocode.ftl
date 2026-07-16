@@ -5,6 +5,7 @@ zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
+zc-pane-sop = SOPs
 
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-reload = Reload daemon
@@ -248,6 +249,20 @@ zc-dashboard-section-by-agent = By Agent
 zc-dashboard-section-command = Command
 zc-dashboard-section-prompt = Prompt
 zc-dashboard-section-last-output = Last Output
+zc-dashboard-section-manual-run = Manual Run
+zc-dashboard-section-recent-runs = Recent Runs
+zc-dashboard-actions = Actions
+zc-dashboard-cron-action-hint = { $run } run now · { $refresh } refresh
+zc-dashboard-loading-runs = Loading runs…
+zc-dashboard-runs-error = Failed to load runs
+zc-dashboard-no-runs = No runs recorded yet
+zc-dashboard-run-succeeded = Run succeeded
+zc-dashboard-run-failed = Run failed
+zc-dashboard-run-running = Run started: { $id }
+zc-dashboard-run-already-running = Run already in progress: { $id }
+zc-dashboard-run-pending-status = running
+zc-dashboard-run-pending-window = starting now
+zc-dashboard-run-pending-output = Manual trigger in progress…
 
 
 zc-dashboard-yes = yes
@@ -345,6 +360,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-switch-error = Failed to switch session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
@@ -393,6 +409,8 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
+zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
 zc-elicit-help-cancel = Cancel
