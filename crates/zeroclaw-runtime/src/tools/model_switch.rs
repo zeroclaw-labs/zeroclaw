@@ -4,8 +4,18 @@ use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+
+#[cfg(test)]
+type ModelCatalogResolver = std::sync::Arc<
+    dyn Fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Vec<String>>> + Send>,
+        > + Send
+        + Sync,
+>;
 
 fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
     let mut profiles = config
@@ -51,6 +61,8 @@ fn resolve_model_provider_profile_ref(config: &Config, raw: &str) -> Result<Stri
 pub struct ModelSwitchTool {
     security: Arc<SecurityPolicy>,
     config: Arc<Config>,
+    #[cfg(test)]
+    catalog_resolver: Option<ModelCatalogResolver>,
 }
 
 impl ModelSwitchTool {
@@ -59,7 +71,12 @@ impl ModelSwitchTool {
     pub const NAME: &'static str = "model_switch";
 
     pub fn new(security: Arc<SecurityPolicy>, config: Arc<Config>) -> Self {
-        Self { security, config }
+        Self {
+            security,
+            config,
+            #[cfg(test)]
+            catalog_resolver: None,
+        }
     }
 }
 
@@ -104,7 +121,7 @@ impl Tool for ModelSwitchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -116,7 +133,7 @@ impl Tool for ModelSwitchTool {
             "list_models" => self.handle_list_models(&args).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action: {}. Valid actions: get, set, list_model_providers, list_models",
                     action
@@ -136,7 +153,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
                 "note": "To switch models, use action 'set' with dotted <type>.<alias> model_provider and model parameters"
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -149,7 +166,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'model_provider' parameter for 'set' action".to_string()),
                 });
             }
@@ -162,7 +179,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'model' parameter for 'set' action".to_string()),
                 });
             }
@@ -180,7 +197,7 @@ impl ModelSwitchTool {
                         "provider_ref_shape": "<type>.<alias>",
                         "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
                         "configured_provider_profiles": configured_profiles
-                    }))?,
+                    }))?.into(),
                     error: Some(error),
                 });
             }
@@ -190,7 +207,7 @@ impl ModelSwitchTool {
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Model ID cannot be empty".to_string()),
             });
         }
@@ -206,7 +223,7 @@ impl ModelSwitchTool {
                 "model_provider": model_provider,
                 "model": model,
                 "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -236,9 +253,17 @@ impl ModelSwitchTool {
                 "configured_count": configured_count,
                 "provider_ref_shape": "<type>.<alias>",
                 "example": "Use action 'set' with a dotted provider profile ref such as 'openai.default'"
-            }))?,
+            }))?.into(),
             error: None,
         })
+    }
+
+    async fn resolve_catalog(&self, family: &str) -> anyhow::Result<Vec<String>> {
+        #[cfg(test)]
+        if let Some(resolver) = &self.catalog_resolver {
+            return resolver(family.to_string()).await;
+        }
+        zeroclaw_providers::catalog::list_models_for_family(family).await
     }
 
     async fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -249,7 +274,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
                         "Missing 'model_provider' parameter for 'list_models' action".to_string(),
                     ),
@@ -266,7 +291,7 @@ impl ModelSwitchTool {
                     output: serde_json::to_string_pretty(&json!({
                         "provider_ref_shape": "<type>.<alias>",
                         "configured_provider_profiles": configured_model_provider_profiles(&self.config)
-                    }))?,
+                    }))?.into(),
                     error: Some(error),
                 });
             }
@@ -283,11 +308,7 @@ impl ModelSwitchTool {
         // `google`). Fall back to the hardcoded list below only when the
         // catalog is unreachable (offline / fetch failure) or empty, so the
         // offline path stays deterministic. See issue #8088.
-        let models: Vec<String> = match zeroclaw_providers::catalog::list_models_for_family(
-            &provider_family,
-        )
-        .await
-        {
+        let models: Vec<String> = match self.resolve_catalog(&provider_family).await {
             Ok(live) if !live.is_empty() => live,
             Ok(_) => hardcoded_models_for(&provider_family),
             Err(error) => {
@@ -313,7 +334,7 @@ impl ModelSwitchTool {
                     "model_provider": model_provider,
                     "models": [],
                     "note": "No common models listed for this model_provider family. Check model_provider documentation for available models."
-                }))?,
+                }))?.into(),
                 error: None,
             });
         }
@@ -324,9 +345,22 @@ impl ModelSwitchTool {
                 "model_provider": model_provider,
                 "models": models,
                 "example": "Use action 'set' with this model_provider and a model ID to switch"
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+impl ModelSwitchTool {
+    fn with_catalog_resolver<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<String>>> + Send + 'static,
+    {
+        self.catalog_resolver = Some(std::sync::Arc::new(move |fam| Box::pin(f(fam))));
+        self
     }
 }
 
@@ -378,9 +412,9 @@ fn hardcoded_models_for(provider_family: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_::{clear_model_switch_request, get_model_switch_state};
-
-    static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::agent::loop_::{
+        MODEL_SWITCH_TEST_LOCK, clear_model_switch_request, get_model_switch_state,
+    };
 
     fn test_config() -> Config {
         let mut config = Config::default();
@@ -583,5 +617,133 @@ mod tests {
             hardcoded_models_for("openai"),
             "live catalog should differ from the stale hardcoded fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_to_hardcoded_on_real_offline_err() {
+        let mut config = Config::default();
+        config.providers.models.ensure("ollama", "local").unwrap();
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "ollama.local" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["model_provider"], "ollama.local");
+        let models: Vec<String> = out["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(models, hardcoded_models_for("ollama")); // real offline Err served the hardcoded list
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_to_hardcoded_on_empty_ok() {
+        let tool = tool().with_catalog_resolver(|_fam| async { Ok(vec![]) }); // empty-Ok arm (292)
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "openai.default" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let models: Vec<String> = out["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(models, hardcoded_models_for("openai"));
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_empty_when_no_hardcoded_fallback() {
+        let result = tool()
+            .handle_list_models(&json!({ "model_provider": "custom.local" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "expected no error, got: {:?}",
+            result.error
+        );
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["model_provider"], "custom.local");
+        assert!(out["models"].as_array().unwrap().is_empty());
+        assert!(
+            out["note"]
+                .as_str()
+                .unwrap()
+                .contains("No common models listed")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_logs_warn_on_catalog_err() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {} // drain prior events
+
+        let mut config = Config::default();
+        config.providers.models.ensure("ollama", "local").unwrap();
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let _ = tool
+            .handle_list_models(&json!({ "model_provider": "ollama.local" }))
+            .await
+            .expect("list_models should return a tool result");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = false;
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    let is_fallback_warn = value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("live catalog unavailable, using hardcoded fallback"))
+                        .unwrap_or(false);
+                    // Sibling tests (e.g. the `custom.local` short-circuit test)
+                    // emit the SAME fallback message on the shared process-global
+                    // broadcast bus, so match on the ollama family too to pin OUR
+                    // event rather than latching the first fallback WARN seen.
+                    let is_ollama = value
+                        .get("attributes")
+                        .and_then(|a| a.get("provider_family"))
+                        .and_then(|v| v.as_str())
+                        == Some("ollama");
+                    if is_fallback_warn && is_ollama {
+                        let attrs = value.get("attributes").expect("attributes present");
+                        assert_eq!(
+                            attrs.get("provider_family").and_then(|v| v.as_str()),
+                            Some("ollama")
+                        );
+                        assert_eq!(
+                            attrs.get("model_provider").and_then(|v| v.as_str()),
+                            Some("ollama.local")
+                        );
+                        assert_eq!(
+                            value.get("severity_text").and_then(|v| v.as_str()),
+                            Some("WARN")
+                        );
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found,
+            "did not capture the model_switch WARN fallback event"
+        );
+        zeroclaw_log::clear_broadcast_hook();
     }
 }

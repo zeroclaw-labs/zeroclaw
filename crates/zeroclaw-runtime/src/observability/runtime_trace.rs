@@ -12,11 +12,23 @@ use zeroclaw_log::LogEvent;
 
 pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
+/// Snapshot the observability config into the decoupled
+/// [`zeroclaw_log::LogConfig`] (the boundary that breaks the `zeroclaw-config`
+/// dependency cycle; see `docs/book/src/architecture/logging.md`).
+///
+/// This copies values at startup and every daemon config reload. The
+/// `zeroclaw-log` writer holds the resulting policy snapshot until the next
+/// explicit re-init, so reload handling must call [`init_from_config`] after a
+/// fresh `Config::load_or_init()` for `log_persistence*` changes to take effect.
 fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
     zeroclaw_log::LogConfig {
         log_persistence: config.log_persistence.as_wire().to_string(),
         log_persistence_path: config.log_persistence_path.clone(),
         log_persistence_max_entries: config.log_persistence_max_entries,
+        log_persistence_max_bytes: config.log_persistence_max_bytes,
+        log_persistence_rotate_daily: config.log_persistence_rotate_daily,
+        log_persistence_retention_max_files: config.log_persistence_retention_max_files,
+        log_persistence_retention_max_age_days: config.log_persistence_retention_max_age_days,
         log_tool_io: config.log_tool_io.as_wire().to_string(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
@@ -142,7 +142,7 @@ impl Tool for PushoverTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -150,7 +150,7 @@ impl Tool for PushoverTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -179,7 +179,7 @@ impl Tool for PushoverTool {
             Some(value) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Invalid 'priority': {value}. Expected integer in range -2..=2"
                     )),
@@ -222,7 +222,7 @@ impl Tool for PushoverTool {
         if !status.is_success() {
             return Ok(ToolResult {
                 success: false,
-                output: body,
+                output: body.into(),
                 error: Some(format!("Pushover API returned status {}", status)),
             });
         }
@@ -237,13 +237,14 @@ impl Tool for PushoverTool {
                 output: format!(
                     "Pushover notification sent successfully. Response: {}",
                     body
-                ),
+                )
+                .into(),
                 error: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
-                output: body,
+                output: body.into(),
                 error: Some("Pushover API returned an application-level error".into()),
             })
         }
@@ -304,6 +305,30 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::Value::String("message".to_string())));
+    }
+
+    #[test]
+    fn pushover_schema_overlaps_standard_notify_shape() {
+        let tool = PushoverTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            PathBuf::from("/tmp"),
+        );
+        let pushover_schema = tool.parameters_schema();
+        let pushover_props = pushover_schema["properties"].as_object().unwrap();
+        let notify_capability = crate::node_capabilities::notification_capabilities()
+            .into_iter()
+            .find(|cap| cap.name == "system.notify")
+            .unwrap();
+        let notify_props = notify_capability.parameters["properties"]
+            .as_object()
+            .unwrap();
+
+        assert!(pushover_props.contains_key("title"));
+        assert!(pushover_props.contains_key("message"));
+        assert!(pushover_props.contains_key("priority"));
+        assert!(notify_props.contains_key("title"));
+        assert!(notify_props.contains_key("body"));
+        assert!(notify_props.contains_key("priority"));
     }
 
     #[tokio::test]

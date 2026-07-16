@@ -43,7 +43,7 @@ The `dev` agent runs from the CLI (no channel binding required, `zeroclaw agent 
 
 ## Local-small no-text-fallback profile
 
-Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use `[runtime_profiles.<alias>]` to tighten the prompt/tool loop behavior.
+Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use `[runtime_profiles.<alias>]` to tighten the prompt/tool loop behavior. ZeroClaw exposes a built-in `local_small` runtime preset for code paths that install runtime presets directly. If you edit config by hand, use this equivalent block:
 
 ```toml
 [providers.models.ollama.local]
@@ -62,20 +62,32 @@ require_approval_for_medium_risk = true
 block_high_risk_commands         = true
 
 [runtime_profiles.local_small]
+agentic                 = true
 compact_context          = true
 strict_tool_parsing      = true
 max_tool_iterations      = 4
+max_actions_per_hour     = 10
+max_cost_per_day_cents   = 100
+shell_timeout_secs       = 30
+max_delegation_depth     = 1
+delegation_timeout_secs  = 60
+agentic_timeout_secs     = 120
 max_history_messages     = 20
 max_context_tokens       = 8000
+parallel_tools           = false
+max_system_prompt_chars  = 4000
 max_tool_result_chars    = 4000
 keep_tool_context_turns  = 1
+memory_recall_limit      = 3
 ```
 
 This profile composes existing primitives:
 
 - `compact_context` keeps startup context small.
 - `strict_tool_parsing` treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.
-- `max_tool_iterations`, `max_context_tokens`, and `max_tool_result_chars` bound runaway loops and oversized tool context.
+- `max_tool_iterations`, `max_context_tokens`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context.
+- `max_actions_per_hour`, `max_cost_per_day_cents`, and the timeout/delegation fields keep local runs on the same budget shape as the built-in preset.
+- `parallel_tools = false` and `keep_tool_context_turns = 1` keep local runs sequential and limit retained tool context.
 
 With Ollama, this is a no-text-fallback profile: authorized tools remain configured in `risk_profile`, but text-form tool markup from the model is not executed. Use it for chat-first local agents, or for providers that return native/structured tool calls. If a local model must use ZeroClaw's text fallback tool syntax, set `strict_tool_parsing = false` and keep the other small-model limits.
 

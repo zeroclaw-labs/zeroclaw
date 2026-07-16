@@ -6,7 +6,7 @@ An agent lists the channels it answers on; see [Agents](../agents/overview.md) f
 
 Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one is feature-gated at compile time, so a minimal build only includes the channels you want.
 
-The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, and Discord. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Pre-built binaries use this lean default. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
+The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, Discord, and filesystem. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Standard pre-built binaries add Matrix, Lark, and WhatsApp Web; the Android artifact omits WhatsApp Web for target compatibility. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
 
 <div class="os-tabs-src">
 
@@ -50,6 +50,14 @@ One-to-many or public-feed integrations.
 
 See [Social channels](./social.md).
 
+### Developer platforms
+
+| Channel | Feature flag | Protocol / service |
+|---|---|---|
+| Git | `channel-git` | Git forge behind a provider seam (GitHub, Gitea, Forgejo); REST polling of issues, PRs, CI runs & releases with per-event routing |
+
+See [Git](./git.md).
+
 ### Email
 
 | Channel | Feature flag | Notes |
@@ -80,6 +88,18 @@ See [Voice & telephony](./voice.md).
 | ACP (Agent Client Protocol) | `channel-acp-server` | JSON-RPC 2.0 over stdio: editor/IDE sessions |
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
+
+### Event sources
+
+Input-only transports that feed events into the agent loop or the SOP engine. They have no outbound reply; each one is also a [SOP fan-in](../sop/fan-in/overview.md).
+
+| Channel | Feature flag | Shape |
+|---|---|---|
+| MQTT | `channel-mqtt` | Broker messages → agent or SOP |
+| AMQP | `channel-amqp` | Broker deliveries → agent or SOP |
+| Filesystem | `channel-filesystem` | Path changes → agent or SOP |
+
+See [MQTT](./mqtt.md), [AMQP](./amqp.md), and [Filesystem](./filesystem.md).
 
 ## Configuration
 

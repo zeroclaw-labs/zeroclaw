@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// RAM base for Nucleo-F401RE (STM32F401)
 const NUCLEO_RAM_BASE: u64 = 0x2000_0000;
@@ -63,7 +63,7 @@ impl Tool for HardwareMemoryReadTool {
         if self.boards.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "No peripherals configured. Add nucleo-f401re to config.toml [peripherals.boards]."
                         .into(),
@@ -82,7 +82,7 @@ impl Tool for HardwareMemoryReadTool {
         if chip.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Memory read only supports nucleo-f401re, nucleo-f411re. Got: {}",
                     board
@@ -107,14 +107,14 @@ impl Tool for HardwareMemoryReadTool {
                 Ok(output) => {
                     return Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     });
                 }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!(
                             "probe-rs read failed: {}. Ensure Nucleo is connected via USB and built with --features probe.",
                             e
@@ -128,7 +128,7 @@ impl Tool for HardwareMemoryReadTool {
         {
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Memory read requires probe feature. Build with: cargo build --features hardware,probe"
                         .into(),
@@ -204,4 +204,64 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
         out.push_str(&format!("0x{:08X}  {:48}  {}\n", addr, hex, ascii));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn execute_with_empty_boards_returns_error() {
+        let tool = HardwareMemoryReadTool::new(Vec::new());
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("No peripherals configured"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_unsupported_board_returns_error() {
+        let tool = HardwareMemoryReadTool::new(vec!["arduino-uno".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Memory read only supports"))
+        );
+    }
+
+    #[cfg(not(feature = "probe"))]
+    #[tokio::test]
+    async fn execute_without_probe_feature_returns_build_hint() {
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("requires probe feature"))
+        );
+    }
+
+    #[cfg(feature = "probe")]
+    #[tokio::test]
+    async fn execute_probe_attach_failure_returns_error() {
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("probe-rs read failed"))
+        );
+    }
 }

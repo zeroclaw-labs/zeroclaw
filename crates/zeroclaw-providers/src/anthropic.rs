@@ -3,6 +3,7 @@ use crate::traits::{
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
@@ -67,7 +68,7 @@ struct ContentBlock {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest<'a> {
+struct NativeChatRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,7 +77,7 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec<'a>>>,
+    tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,10 +155,13 @@ enum NativeContentOut {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolSpec<'a> {
-    name: &'a str,
-    description: &'a str,
-    input_schema: &'a serde_json::Value,
+struct NativeToolSpec {
+    name: String,
+    description: String,
+    /// `Arc`-shared with the tool registry's stored schema when no cleaning
+    /// is required — serialized transparently, deep-cloned only for schemas
+    /// the Anthropic cleaner actually rewrites (#8642).
+    input_schema: std::sync::Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -351,17 +355,20 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
         }
-        let mut native_tools: Vec<NativeToolSpec<'a>> = items
+        let mut native_tools: Vec<NativeToolSpec> = items
             .iter()
             .map(|tool| NativeToolSpec {
-                name: &tool.name,
-                description: &tool.description,
-                input_schema: &tool.parameters,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_shared(
+                    &tool.parameters,
+                    zeroclaw_api::schema::CleaningStrategy::Anthropic,
+                ),
                 cache_control: None,
             })
             .collect();
@@ -841,11 +848,11 @@ impl AnthropicModelProvider {
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(request: &NativeChatRequest<'_>) -> serde_json::Value {
-        let mut body =
-            serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
+    fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(request)
+            .context("Failed to serialize NativeChatRequest to JSON")?;
         body["stream"] = serde_json::Value::Bool(true);
-        body
+        Ok(body)
     }
 
     /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
@@ -890,9 +897,28 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        while let Ok(Some(line)) =
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(read) => read,
+        let mut saw_stop_reason = false;
+
+        loop {
+            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => break,
+                Ok(Err(err)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{err}"),
+                            })),
+                        "stream: SSE read error — aborting stream"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
+                        .await;
+                    return;
+                }
                 Err(_) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -911,8 +937,7 @@ impl AnthropicModelProvider {
                         .await;
                     return;
                 }
-            }
-        {
+            };
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;
@@ -1042,6 +1067,9 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
+                    if stop_reason != "none" {
+                        saw_stop_reason = true;
+                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -1118,18 +1146,7 @@ impl AnthropicModelProvider {
             }
         }
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(::serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                })),
-            "stream: SSE parser reached end of stream, emitting Final"
-        );
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
     }
 }
 
@@ -1362,18 +1379,16 @@ impl ModelProvider for AnthropicModelProvider {
                     );
                     None
                 })?;
-                Some(ToolSpec {
-                    name: name.to_string(),
-                    description: func
-                        .get("description")
+                Some(ToolSpec::new(
+                    name.to_string(),
+                    func.get("description")
                         .and_then(|d| d.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    parameters: func
-                        .get("parameters")
+                    func.get("parameters")
                         .cloned()
                         .unwrap_or(serde_json::json!({"type": "object"})),
-                })
+                ))
             })
             .collect();
 
@@ -1502,9 +1517,7 @@ impl ModelProvider for AnthropicModelProvider {
                 thinking: thinking_config,
             };
             // Serialize eagerly so the request body is owned and `'static`
-            // across the async boundary — `NativeToolSpec<'a>` borrows from
-            // `request.tools`, which prevents moving `native_request` into
-            // the spawned future otherwise.
+            // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
             let client = self.http_client();
@@ -1609,7 +1622,13 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
         };
 
-        let body = Self::build_streaming_request(&native_request);
+        let body = match Self::build_streaming_request(&native_request) {
+            Ok(body) => body,
+            Err(e) => {
+                return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) })
+                    .boxed();
+            }
+        };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
@@ -1910,6 +1929,44 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         assert!(
             probe.is_finished(),
             "guard drop must abort the parser task immediately, not wait out the idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_before_message_stop_surfaces_error_not_final() {
+        // Live repro (trace aaf558a6): the SSE socket closed mid-response
+        // after tool-result submission; the parser fell through to Final and
+        // the turn ended as an empty "final response" with no explanation.
+        // EOF without message_stop (or a stop_reason) is a truncated
+        // response and must surface a retryable error.
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_final = false;
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(e) => last_err = Some(e),
+                Ok(_) => {}
+            }
+        }
+        assert!(!saw_final, "truncated stream must not emit Final");
+        let err = last_err.expect("truncated stream must emit a StreamError");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("truncated")),
+            "expected truncation error, got: {err:?}"
         );
     }
 
@@ -2368,9 +2425,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_tool_spec_without_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather",
-            description: "Get weather info",
-            input_schema: &schema,
+            name: "get_weather".to_string(),
+            description: "Get weather info".to_string(),
+            input_schema: schema.into(),
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2382,9 +2439,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_tool_spec_with_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather",
-            description: "Get weather info",
-            input_schema: &schema,
+            name: "get_weather".to_string(),
+            description: "Get weather info".to_string(),
+            input_schema: schema.into(),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2526,16 +2583,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_tools_adds_cache_to_last_tool() {
         let tools = vec![
-            ToolSpec {
-                name: "tool1".to_string(),
-                description: "First tool".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolSpec {
-                name: "tool2".to_string(),
-                description: "Second tool".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
+            ToolSpec::new("tool1", "First tool", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "tool2",
+                "Second tool",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -2547,16 +2600,97 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_single_tool_gets_cache() {
-        let tools = vec![ToolSpec {
-            name: "tool1".to_string(),
-            description: "Only tool".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "tool1",
+            "Only tool",
+            serde_json::json!({"type": "object"}),
+        )];
 
         let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn convert_tools_cleans_ref_from_input_schema() {
+        let tools = vec![ToolSpec::new(
+            "query",
+            "Search with a ref",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "$ref": "#/$defs/FilterSpec"
+                    }
+                },
+                "$defs": {
+                    "FilterSpec": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        )];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let schema = &native_tools[0].input_schema;
+
+        let filter = &schema["properties"]["filter"];
+        assert!(filter.get("$ref").is_none(), "$ref was not cleaned");
+        assert_eq!(filter["type"], "object");
+        assert_eq!(filter["properties"]["field"]["type"], "string");
+        assert!(schema.get("$defs").is_none(), "$defs was not stripped");
+    }
+
+    #[test]
+    fn convert_tools_cleans_definitions_from_input_schema() {
+        let tools = vec![ToolSpec::new(
+            "query",
+            "Search with a definitions ref",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "$ref": "#/definitions/FilterSpec"
+                    }
+                },
+                "definitions": {
+                    "FilterSpec": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        )];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let schema = &native_tools[0].input_schema;
+
+        let filter = &schema["properties"]["filter"];
+        assert!(filter.get("$ref").is_none(), "$ref was not cleaned");
+        assert_eq!(filter["type"], "object");
+        assert!(
+            schema.get("definitions").is_none(),
+            "definitions was not stripped"
+        );
+    }
+
+    #[test]
+    fn convert_tools_empty_tools_returns_none() {
+        let tools: Vec<ToolSpec> = vec![];
+        let result = AnthropicModelProvider::convert_tools(Some(&tools));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn convert_tools_none_returns_none() {
+        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
+        assert!(result.is_none());
     }
 
     #[test]

@@ -22,9 +22,21 @@ Composite job with multiple matrix legs:
 
 `fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
+Fresh required CI is normally the shared evidence for the Cargo surfaces it actually runs. A local rerun of the same Cargo command on the same head, target, and feature set is duplicate confidence, not a stronger proof. Before asking for extra Cargo or Clippy, compare the changed surface with the current workflow files and the actual checks on the PR. Extra validation belongs where the required gate does not prove the thing under review:
+
+- a platform received compile checks but not tests;
+- a platform, crate, or path is outside the required lint job;
+- a desktop change did not trigger the desktop workflow;
+- a release target is outside the PR matrix and only covered by release/manual workflows;
+- stale, cancelled, skipped, or unavailable CI is not fresh evidence.
+
 ### Daily Advisory Scan (`daily-audit.yml`)
 
 Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tree. Opens an issue on findings. No action unless a vulnerability is reported.
+
+### Daily npm Audit (`daily-npm-audit.yml`)
+
+Runs `npm audit --audit-level=high` daily at 09:23 UTC against `web/package-lock.json`. Opens one deduplicated `security` + `dependencies` issue when high-severity npm advisories affect the committed web lockfile.
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
@@ -33,6 +45,12 @@ Auto-applies path and scope labels based on changed files. It runs on PR open, r
 This workflow does not currently apply `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels. If a PR is missing a path/scope label, check whether the paths in `.github/labeler.yml` cover the changes.
 
 Dependabot has separate label configuration in `.github/dependabot.yml` for its own PRs. Cargo update PRs start with `dependencies`; GitHub Actions and Docker update PRs start with `ci` and `dependencies`.
+
+### Project Dashboard Planner (`project-dashboard-plan.yml`)
+
+Runs manually for a single issue number. It reads issue state and labels, then writes a report-only step summary proposing the existing Project Status value that best matches the issue.
+
+This workflow does not run automatically on issue events, write ProjectV2 fields, edit issues, add labels, post comments, or recalculate PR `risk:*`, `size:*`, or `type:*` labels. Live ProjectV2 mutation or automatic issue-event planning needs a separately approved field mapping, trigger policy, and project-scoped credential.
 
 ### Validate PR title (`pr-title.yml`)
 
@@ -44,7 +62,7 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default and Debian compatibility images without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
+Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default prebuilt image and the Debian compatibility prebuilt image from `Dockerfile.ci` without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
 
 ### Discord Release (`discord-release.yml`)
 
@@ -57,6 +75,12 @@ Fires after a successful stable release. Posts an announcement tweet.
 Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow: run `cargo mdbook sync --provider <name>` for dedicated translation-cache PRs, new locales, and release translation passes. Routine English docs PRs may defer broad generated `.po` churn. See [Docs & Translations](./docs-and-translations.md) for details.
 
 ## Manual and Advisory Workflows
+
+### Monthly Outdated Scan (`monthly-outdated.yml`)
+
+Scheduled monthly scan on the 1st of every month at 09:00 UTC. Runs `cargo outdated --workspace` across all workspace members. Opens a `dependencies`-labeled issue when stale deps are found. Permissions: `contents: read` + `issues: write`. Dedup guard prevents piling up if the previous issue is still open.
+
+First triage step for a new issue: check if the reported outdated crates have semver-incompatible bumps and whether the consuming crate's API changed. If the bump is trivial (patch/minor), create a short dep-only PR. If the upgrade is blocked by semver breaks, close the issue with a note and the blocking crate name.
 
 ### Cross-Platform Build (`cross-platform-build-manual.yml`)
 
@@ -125,16 +149,21 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | Action | Used in | Purpose |
 |---|---|---|
 | `actions/checkout` (`v6.0.2`) | Most workflows | Repository checkout |
-| `actions/cache` (`v5.0.5`) | `tweet-release.yml` | Generic dependency caching |
+| `actions/cache` (`v4.2.3`, `v5.0.5`) | `docker-image-pr.yml`, `tweet-release.yml` | Generic dependency and Trivy database caching |
 | `actions/setup-node` (`v6.4.0`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Node toolchain for the web-dashboard build |
-| `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Upload build artifacts |
-| `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Download build artifacts for packaging |
+| `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Upload build artifacts and Trivy SARIF handoff artifacts |
+| `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
 | `Swatinem/rust-cache` (`v2.9.1`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching |
 | `docker/setup-buildx-action` (`v4.0.0`) | `release-stable-manual.yml` | Docker Buildx setup |
 | `docker/login-action` (`v4.1.0`) | `release-stable-manual.yml` | GHCR authentication |
 | `docker/build-push-action` (`v7.1.0`) | `release-stable-manual.yml` | Multi-platform image build and push |
+| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless signing of release assets and container images |
+| `anchore/sbom-action` (`v0.17.9`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
+| `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
+| `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml` | Report-only container vulnerability scanning |
+| `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml` | Upload Trivy SARIF reports to the Security tab |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
@@ -145,6 +174,11 @@ actions/*
 dtolnay/rust-toolchain@*
 Swatinem/rust-cache@*
 docker/*
+sigstore/cosign-installer@*
+anchore/sbom-action@*
+slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
+aquasecurity/trivy-action@*
+github/codeql-action/upload-sarif@*
 ```
 
 Export the current effective policy:

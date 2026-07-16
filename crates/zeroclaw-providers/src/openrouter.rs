@@ -12,6 +12,7 @@ use futures_util::stream;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
@@ -136,7 +137,9 @@ struct NativeToolSpec {
 struct NativeToolFunctionSpec {
     name: String,
     description: String,
-    parameters: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    parameters: Arc<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -241,7 +244,7 @@ impl OpenRouterModelProvider {
                 function: NativeToolFunctionSpec {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
-                    parameters: tool.parameters.clone(),
+                    parameters: Arc::clone(&tool.parameters),
                 },
             })
             .collect();
@@ -269,10 +272,8 @@ impl OpenRouterModelProvider {
                             },
                         })
                         .collect::<Vec<_>>();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()));
+                    let content = crate::request_payload::non_empty_string_field(&value, "content")
+                        .map(MessageContent::Text);
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
@@ -728,7 +729,9 @@ impl ModelProvider for OpenRouterModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
             stream: None,
@@ -823,7 +826,9 @@ impl ModelProvider for OpenRouterModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
             stream: Some(true),
@@ -935,10 +940,11 @@ impl ModelProvider for OpenRouterModelProvider {
                                 .and_then(|d| d.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            parameters: func
-                                .get("parameters")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({})),
+                            parameters: Arc::new(
+                                func.get("parameters")
+                                    .cloned()
+                                    .unwrap_or(serde_json::json!({})),
+                            ),
                         },
                     })
                 })
@@ -954,7 +960,9 @@ impl ModelProvider for OpenRouterModelProvider {
             model: model.to_string(),
             messages: native_messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
             stream: None,
@@ -1887,21 +1895,21 @@ mod tests {
         use zeroclaw_api::tool::ToolSpec;
 
         let tools = vec![
-            ToolSpec {
-                name: "valid_tool".into(),
-                description: "A valid tool".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolSpec {
-                name: "mcp:server.bad".into(),
-                description: "Invalid name".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolSpec {
-                name: "another-valid".into(),
-                description: "Also valid".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
+            ToolSpec::new(
+                "valid_tool",
+                "A valid tool",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "mcp:server.bad",
+                "Invalid name",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "another-valid",
+                "Also valid",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -1924,17 +1932,17 @@ mod tests {
 
         let tools = vec![
             // New format — must pass through.
-            ToolSpec {
-                name: "openrouter-spend__check_openrouter_spend".into(),
-                description: "Skill tool".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
+            ToolSpec::new(
+                "openrouter-spend__check_openrouter_spend",
+                "Skill tool",
+                serde_json::json!({"type": "object"}),
+            ),
             // Old format — must still be rejected so the regression stays caught.
-            ToolSpec {
-                name: "openrouter-spend.check_openrouter_spend".into(),
-                description: "Skill tool with legacy dotted name".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
+            ToolSpec::new(
+                "openrouter-spend.check_openrouter_spend",
+                "Skill tool with legacy dotted name",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -1953,11 +1961,11 @@ mod tests {
     fn convert_tools_returns_none_when_all_invalid() {
         use zeroclaw_api::tool::ToolSpec;
 
-        let tools = vec![ToolSpec {
-            name: "mcp:bad.name".into(),
-            description: "Invalid".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "mcp:bad.name",
+            "Invalid",
+            serde_json::json!({"type": "object"}),
+        )];
 
         assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
     }

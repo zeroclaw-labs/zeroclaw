@@ -146,7 +146,12 @@ done
 # "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
 # to the version they were written for:
 #   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
-#   - /health response example `"version": "X.Y.Z"`
+#   - /health response example `"version":"X.Y.Z"` (compact or spaced JSON)
+#   - RPC initialize example   `"serverVersion":"X.Y.Z"` (compact or spaced JSON)
+# The `"version"`/`"serverVersion"` swaps tolerate an optional space after the
+# colon and preserve whichever style each occurrence uses, so both minified
+# examples (e.g. the RPC handshake) and pretty-printed ones stay in step. The
+# key anchor is unchanged, so historical-version prose is still skipped.
 # Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
 # with the release. The translation catalogues (`docs/book/po`) live in the
 # zeroclaw-docs-translations submodule and own their own version-literal swaps,
@@ -162,8 +167,11 @@ for f in "${docs_files[@]}"; do
     'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
     "zeroclawlabs/zeroclaw:v${VERSION}"
   bump "$rel" \
-    '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
-    "\"version\": \"${VERSION}\""
+    '"version":( ?)"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"version\":\\1\"${VERSION}\""
+  bump "$rel" \
+    '"serverVersion":( ?)"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"serverVersion\":\\1\"${VERSION}\""
 done
 
 # ── Docs stable-version pointer ────────────────────────────────────
@@ -187,6 +195,24 @@ else
   printf 'v%s\n' "$VERSION" > "$STABLE_PTR"
   echo "  created: docs/book/stable-version.txt"
   changed=$((changed + 1))
+fi
+
+# ── Nix git-dep hashes ──────────────────────────────────────────
+# Refresh NAR hashes for git-sourced dependencies so the flake can
+# resolve them.  Skips gracefully if the script or its prerequisites
+# (nix-prefetch-git, jq) are missing.
+echo "Nix git-dep hashes..."
+REFRESH_SCRIPT="$REPO_ROOT/scripts/dev/refresh-nix-hashes.sh"
+if [[ -x "$REFRESH_SCRIPT" ]]; then
+  if command -v nix-prefetch-git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    ( cd "$REPO_ROOT" && bash "$REFRESH_SCRIPT" ) \
+      && echo "  refreshed nix/hashes.json" \
+      || echo "  warn: refresh-nix-hashes.sh failed; nix/hashes.json may be stale"
+  else
+    echo "  skip: nix-prefetch-git or jq not on PATH"
+  fi
+else
+  echo "  skip: scripts/dev/refresh-nix-hashes.sh not found"
 fi
 
 # ── Generated install surfaces (single source of truth) ───────────

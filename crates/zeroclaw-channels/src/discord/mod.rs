@@ -1238,6 +1238,22 @@ fn channel_passes_filter(
     false
 }
 
+/// Resolve the recipient a Discord send targets. A non-empty per-message
+/// recipient is authoritative; when it is empty (e.g. an escalation alert that
+/// carries no per-message target), fall back to the channel's first configured
+/// `channel_ids` entry so the alert still reaches the operator's channel. When
+/// neither is available there is nowhere to deliver, so the caller must fail
+/// rather than POST to an empty `/channels//messages` path.
+fn effective_discord_recipient<'a>(
+    recipient: &'a str,
+    channel_ids: &'a [String],
+) -> Option<&'a str> {
+    if !recipient.is_empty() {
+        return Some(recipient);
+    }
+    channel_ids.first().map(String::as_str)
+}
+
 /// Pure key-match for the bulk reaction-removal sweep. Reaction rows key as
 /// `discord_reaction_{message_id}_{user_id}_{emoji_key}` (see
 /// [`DiscordChannel::handle_reaction_event`]); `user_id` is a numeric
@@ -1748,6 +1764,27 @@ async fn discord_thread_parent(
     result
 }
 
+/// Cache-only variant of [`discord_thread_parent`]: returns the cached parent
+/// id for `channel_id` if a prior [`discord_thread_parent`] call already
+/// populated the cache, otherwise `None`. It performs **no** Discord REST call,
+/// so it is safe on the per-keystroke autocomplete (type-4) path where an
+/// authenticated round-trip would violate the side-effect-free requirement.
+///
+/// A miss (`channel_id` never looked up, or looked up and found to be a
+/// non-thread) yields `None`, which keeps channel authorization fail-closed:
+/// the thread can only pass an allowlist via a known, already-cached parent.
+async fn discord_thread_parent_cached(
+    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    channel_id: &str,
+) -> Option<String> {
+    thread_channels
+        .lock()
+        .await
+        .get(channel_id)
+        .cloned()
+        .flatten()
+}
+
 // Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
 // exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
 const INTENT_GUILDS: u64 = 1 << 0;
@@ -1988,6 +2025,23 @@ impl Channel for DiscordChannel {
             };
 
         let mut first_message_id: Option<String> = None;
+        let effective_recipient =
+            match effective_discord_recipient(&message.recipient, &self.channel_ids) {
+                Some(r) => r,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "discord send has no recipient: message.recipient is empty and no \
+                     channel_ids are configured to fall back to"
+                    );
+                    anyhow::bail!(
+                        "discord send has no recipient: message.recipient is empty and no \
+                     channel_ids are configured to fall back to"
+                    );
+                }
+            };
         for (i, chunk) in chunks.iter().enumerate() {
             // Embeds (EPIC C) and interactive components (EPIC B) both ride the
             // FIRST chunk only — Discord attaches embeds and action rows
@@ -2007,7 +2061,7 @@ impl Channel for DiscordChannel {
                     send_discord_message_payload(
                         &client,
                         &self.bot_token,
-                        &message.recipient,
+                        effective_recipient,
                         &payload,
                     )
                     .await?
@@ -2015,7 +2069,7 @@ impl Channel for DiscordChannel {
                     send_discord_message_payload_with_files(
                         &client,
                         &self.bot_token,
-                        &message.recipient,
+                        effective_recipient,
                         &payload,
                         &local_files,
                     )
@@ -2025,13 +2079,13 @@ impl Channel for DiscordChannel {
                 send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
-                    &message.recipient,
+                    effective_recipient,
                     &DiscordOutgoing::text(chunk.clone()),
                     &local_files,
                 )
                 .await?
             } else {
-                send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
+                send_discord_message_json(&client, &self.bot_token, effective_recipient, chunk)
                     .await?
             };
             if first_message_id.is_none() {
@@ -2733,7 +2787,8 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
-                                        };
+
+                                            ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
                                         }
@@ -2988,7 +3043,8 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
-                                        };
+
+                                            ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
                                         }
@@ -3037,6 +3093,7 @@ impl Channel for DiscordChannel {
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
                                     let resolver = self.slash_command_resolver.clone();
+                                    let thread_channels = self.thread_channels.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
                                         // Fail-closed authz, side-effect-free:
@@ -3046,12 +3103,22 @@ impl Channel for DiscordChannel {
                                         // don't make here). On denial OR no
                                         // matches we answer an empty choice set.
                                         //
-                                        // No thread-parent REST lookup: it is an
-                                        // authenticated round-trip per keystroke
-                                        // and would defeat the side-effect-free
-                                        // requirement, so a channel-filtered
-                                        // thread simply yields no completions
-                                        // (fail-closed) rather than probing.
+                                        // Thread-parent resolution is CACHE-ONLY:
+                                        // a parent populated by an earlier normal
+                                        // message in this thread lets a
+                                        // parent-allowlisted thread authorize
+                                        // autocomplete consistently with the
+                                        // message path (#6829). It reads the shared
+                                        // cache only — NO Discord REST call — so the
+                                        // per-keystroke path stays side-effect-free;
+                                        // an uncached thread still yields no
+                                        // completions (fail-closed) rather than
+                                        // probing.
+                                        let thread_parent = discord_thread_parent_cached(
+                                            &thread_channels,
+                                            &interaction_channel,
+                                        )
+                                        .await;
                                         let authorized = interaction_gate(
                                             &peers,
                                             &guild_filter,
@@ -3059,7 +3126,7 @@ impl Channel for DiscordChannel {
                                             &user_id,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
-                                            None,
+                                            thread_parent.as_deref(),
                                         )
                                         .is_ok();
 
@@ -3426,7 +3493,8 @@ impl Channel for DiscordChannel {
                         thread_ts,
                         attachments: media_attachments,
                         subject: None,
-                    };
+
+                        ..Default::default()};
 
                     if tx.send(channel_msg).await.is_err() {
                         break;
@@ -3712,6 +3780,7 @@ impl Channel for DiscordChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
             // Flush remaining buffered text.
@@ -3755,7 +3824,24 @@ impl Channel for DiscordChannel {
         // streaming/draft reply renders embeds the same as a normal send.
         let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
             prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&text_without_embeds);
+        // Interactive components next (same ordering as `send()`): the
+        // `[COMPONENTS:{json}]` body also contains `[`/`]`, so strip it before the
+        // attachment scanner runs. A streamed/draft reply must render components
+        // identically to a normal send. `send()` parsed them but `finalize_draft`
+        // did not, so any reply that streamed (stream_mode != Off) leaked the raw
+        // marker as plain text. Each interactive component carrying a `prompt` is
+        // registered in `pending_components` via `build_marker_components`, so a
+        // click dispatches the same as on the non-streaming path. The action rows
+        // ride the first finalized message below, mirroring embeds.
+        let (text_without_components, component_rows) =
+            parse_component_markers(&text_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+        let (cleaned_content, parsed_attachments) =
+            parse_attachment_markers(&text_without_components);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
@@ -3776,10 +3862,11 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    // Embeds + files ride the first message.
+                    // Embeds + components + files ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
                         embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
                         ..Default::default()
                     };
                     send_discord_message_payload_with_files(
@@ -3813,10 +3900,11 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    // Embeds ride the first message.
+                    // Embeds + components ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
                         embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
                         ..Default::default()
                     };
                     send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
@@ -3836,13 +3924,16 @@ impl Channel for DiscordChannel {
             return Ok(());
         }
 
-        // Path 3: simple case — edit in-place (with any embeds); fall back to
-        // delete + POST on failure. The reaction target is the draft message_id
-        // when the edit lands; when the fallback fires it's the freshly posted
-        // message instead.
+        // Path 3: simple case, edit in-place (with any embeds + components); fall
+        // back to delete + POST on failure. The reaction target is the draft
+        // message_id when the edit lands; when the fallback fires it's the freshly
+        // posted message instead. Editing the draft to carry the action rows is
+        // what makes a streamed reply's components render (Discord accepts
+        // `components` on a message edit just as on a create).
         let payload = DiscordOutgoing {
             content: Some(content.clone()),
             embeds: embeds.clone(),
+            components: component_action_rows.clone(),
             ..Default::default()
         };
         let reaction_target = match edit_discord_message_payload(
@@ -4021,6 +4112,26 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_recipient_prefers_per_message_target() {
+        let ids = vec!["fallback_channel".to_string()];
+        assert_eq!(
+            effective_discord_recipient("explicit_channel", &ids),
+            Some("explicit_channel")
+        );
+    }
+
+    #[test]
+    fn effective_recipient_falls_back_to_first_channel_id_when_empty() {
+        let ids = vec!["first_channel".to_string(), "second_channel".to_string()];
+        assert_eq!(effective_discord_recipient("", &ids), Some("first_channel"));
+    }
+
+    #[test]
+    fn effective_recipient_is_none_when_empty_and_no_channel_ids() {
+        assert_eq!(effective_discord_recipient("", &[]), None);
+    }
     use std::fmt::Write as _;
 
     fn s(items: &[&str]) -> Vec<String> {
@@ -4091,6 +4202,33 @@ mod tests {
         assert_eq!(
             payload.to_rest_json(),
             serde_json::json!({ "content": "Result", "embeds": [{ "title": "Report" }] })
+        );
+    }
+
+    #[test]
+    fn finalize_draft_payload_carries_components() {
+        // finalize_draft must lift `[COMPONENTS:...]` out of the final streamed text
+        // and attach the action rows to the first message, the same transformation
+        // send() does. Before this fix only send() parsed components, so any reply
+        // that streamed (stream_mode != Off) leaked the raw marker as plain text.
+        // Pin the transformation so the streaming path can't regress to
+        // content-only.
+        let raw = "Pick one [COMPONENTS:{\"rows\":[[{\"label\":\"Go\",\"style\":\"primary\",\"prompt\":\"go\"}]]}]";
+        let (content, rows) = parse_component_markers(raw);
+        assert_eq!(content.trim(), "Pick one");
+        assert_eq!(rows.len(), 1, "one action row parsed");
+        let mut reg = pending::PendingComponents::default();
+        let component_action_rows = build_component_rows("n", &rows, &mut reg);
+        assert_eq!(component_action_rows.len(), 1, "row rendered");
+        let payload = DiscordOutgoing {
+            content: Some(content.trim().to_string()),
+            components: component_action_rows,
+            ..Default::default()
+        };
+        let json = payload.to_rest_json();
+        assert!(
+            json.get("components").is_some(),
+            "finalize payload must carry the action rows; got {json}"
         );
     }
 
@@ -4371,6 +4509,8 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            force_voice: false,
+            suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
@@ -6920,9 +7060,17 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
-            .expect("one failure should produce a note");
-        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        let failures = [DiscordMarkerFailure::NotFound];
+        let note = delivery_failure_note(&failures).expect("one failure should produce a note");
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English string used to live here but the assertion broke on any
+        // CI runner with a non-English `$LANG` (see PR #8488's blocker).
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
         assert!(
             !note.contains("/workspace/missing.png"),
             "user-facing failure note must not echo local marker targets"
@@ -6931,13 +7079,19 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_plural_redacts_targets() {
-        let note = delivery_failure_note(&[
+        let failures = [
             DiscordMarkerFailure::Refused,
             DiscordMarkerFailure::NotFound,
             DiscordMarkerFailure::Refused,
-        ])
-        .expect("multiple failures should produce a note");
-        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        ];
+        let note =
+            delivery_failure_note(&failures).expect("multiple failures should produce a note");
+        // Locale-independent: see singular test for rationale.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
         assert!(
             !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
             "user-facing failure note must not echo failed marker targets"
@@ -6953,7 +7107,14 @@ mod tests {
         let note = delivery_failure_note(&failures);
         let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
 
-        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        // Locale-independent: the body must keep the original `Done` content,
+        // gain exactly one blank-line separator, and never echo the failed
+        // marker path. The previous literal English assertion was
+        // locale-dependent and broke on non-English CI runners.
+        assert!(
+            composed.starts_with("Done\n\n"),
+            "composed body must preserve original content with blank-line separator, got {composed:?}"
+        );
         assert!(
             !composed.contains("/workspace/missing.png"),
             "composed outbound body must not echo failed marker targets"
@@ -7742,6 +7903,116 @@ mod tests {
         assert!(
             interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
             "empty peer list denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_parent_cached_reads_cache_without_rest() {
+        // Cache-only lookup: a thread whose parent was resolved by an earlier
+        // message returns that parent; a channel cached as a non-thread, or one
+        // never looked up, returns None. No client/token is reachable here, so a
+        // non-None result can only have come from the cache (never a REST probe).
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        {
+            let mut c = cache.lock().await;
+            c.insert("thread1".to_string(), Some("parentA".to_string()));
+            c.insert("plain1".to_string(), None);
+        }
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "thread1").await,
+            Some("parentA".to_string()),
+            "cached thread resolves to its parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "plain1").await,
+            None,
+            "channel cached as a non-thread has no parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "never_seen").await,
+            None,
+            "uncached channel yields None (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_authorizes_parent_allowlisted_thread_only_when_cached() {
+        // Regression for #8103: the type-4 arm resolves the thread parent from
+        // the shared cache (no REST) and passes it to `interaction_gate`, so a
+        // thread under an allowlisted parent authorizes autocomplete exactly as
+        // the message path does (#6829) — but only once the parent is cached.
+        // This reproduces the arm's authz step: cache-only parent → gate.
+        let peers = s(&["*"]);
+        let channel_filter = s(&["parentA"]); // allowlist the PARENT only
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        cache
+            .lock()
+            .await
+            .insert("thread_cached".to_string(), Some("parentA".to_string()));
+
+        // Thread whose parent is cached + allowlisted → autocomplete authorized.
+        let parent = discord_thread_parent_cached(&cache, "thread_cached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_cached",
+                parent.as_deref(),
+            )
+            .is_ok(),
+            "cached allowlisted parent authorizes autocomplete in the thread"
+        );
+
+        // Same allowlist, thread NOT yet cached → no parent → fail-closed,
+        // matching the pre-fix behavior and avoiding a per-keystroke REST probe.
+        let parent = discord_thread_parent_cached(&cache, "thread_uncached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_uncached",
+                parent.as_deref(),
+            )
+            .is_err(),
+            "uncached thread stays fail-closed"
+        );
+    }
+
+    #[test]
+    fn autocomplete_arm_resolves_cached_thread_parent_before_gate() {
+        // Source-level regression for #8103: within the type-4 arm, the parent
+        // is resolved from the cache (`discord_thread_parent_cached`) and that
+        // value (`thread_parent.as_deref()`) — not `None` — is passed to
+        // `interaction_gate`, with resolution preceding the gate. Reverting the
+        // arm to pass `None` removes `thread_parent.as_deref()` and fails this.
+        let src = include_str!("mod.rs");
+        let arm4 = src
+            .find("} else if itype == 4 {")
+            .expect("type-4 arm present");
+        let end = src[arm4..]
+            .find("// MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK")
+            .map(|i| arm4 + i)
+            .expect("type-4 arm end boundary present");
+        let region = &src[arm4..end];
+        let cached = region
+            .find("discord_thread_parent_cached(")
+            .expect("type-4 arm resolves the cached thread parent");
+        let gate = region.find("interaction_gate(").expect("type-4 arm gates");
+        assert!(
+            cached < gate,
+            "cached thread-parent resolution must precede the gate"
+        );
+        assert!(
+            region.contains("thread_parent.as_deref()"),
+            "the resolved cached parent (not None) is passed to interaction_gate"
         );
     }
 

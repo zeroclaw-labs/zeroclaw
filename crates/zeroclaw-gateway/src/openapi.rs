@@ -18,6 +18,23 @@ use axum::{
 };
 use std::sync::OnceLock;
 
+/// Route-specific CSP for the Scalar explorer page. The finalized router is
+/// wrapped by the default security-header layer, whose `set_if_absent` keeps a
+/// handler-owned `content-security-policy`. The default dashboard CSP only
+/// permits `script-src 'self'`, which would block the Scalar bundle served from
+/// `cdn.jsdelivr.net` and silently degrade `/api/docs` to the offline fallback.
+/// This policy admits the CDN script (and the styles/fonts/images it injects)
+/// while still denying framing and object embedding.
+const DOCS_CSP: &str = "default-src 'self'; \
+     script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+     style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+     img-src 'self' data: https://cdn.jsdelivr.net; \
+     font-src 'self' data: https://cdn.jsdelivr.net; \
+     connect-src 'self'; \
+     object-src 'none'; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
+
 #[cfg(feature = "schema-export")]
 use schemars::{JsonSchema, schema_for};
 
@@ -36,6 +53,10 @@ pub async fn handle_docs() -> Response {
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(DOCS_CSP),
     );
     response
 }
@@ -87,6 +108,13 @@ pub fn build_spec() -> serde_json::Value {
             "DriftResponse":    schema_value::<DriftResponse>(),
             "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
+            "Sop":              schema_value::<zeroclaw_runtime::sop::Sop>(),
+            "SopGraph":         schema_value::<zeroclaw_runtime::sop::SopGraph>(),
+            "GraphLegend":      schema_value::<zeroclaw_runtime::sop::GraphLegend>(),
+            "RunOverlay":       schema_value::<zeroclaw_runtime::sop::RunOverlay>(),
+            "ApprovalDecision": schema_value::<zeroclaw_runtime::sop::ApprovalDecision>(),
+            "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
+            "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -193,6 +221,19 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "List of properties.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/skills/slash-option-kinds": {
+            "get": {
+                "tags": ["skills"],
+                "summary": "Typed slash-option kind registry",
+                "description": "Returns the canonical set of typed slash-command option kinds and each kind's constraint capabilities (choices / numeric bounds / length bounds), built by walking the backend kind enum. Surfaces read this instead of restating the kind list.",
+                "responses": {
+                    "200": {
+                        "description": "The slash-option kind registry.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlashOptionKindsResult" } } }
                     }
                 }
             }
@@ -329,9 +370,8 @@ fn augment_spec_with_a2a(
             serde_json::json!({
                 "post": {
                     "tags": ["a2a"],
-                    "security": [],
                     "summary": "Send a task to a published A2A agent",
-                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
+                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
                     "parameters": [{
                         "name": "alias",
                         "in": "path",
@@ -347,6 +387,9 @@ fn augment_spec_with_a2a(
                         "200": {
                             "description": "JSON-RPC response. On success `result` is a completed A2A Task; on a JSON-RPC error (unknown method, bad params) `error` carries the code and message.",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTask" } } }
+                        },
+                        "401": {
+                            "description": "Missing or invalid bearer token while pairing is required."
                         },
                         "404": {
                             "description": "Server disabled, alias unpublished, or alias unknown."
@@ -481,6 +524,7 @@ mod tests {
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
+        assert!(paths.get("/api/skills/slash-option-kinds").is_some());
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
     }
@@ -504,13 +548,58 @@ mod tests {
         assert_eq!(scheme, Some("bearer"));
     }
 
+    #[tokio::test]
+    async fn docs_route_sets_own_csp_admitting_scalar_cdn() {
+        let response = handle_docs().await;
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("docs route must set its own CSP")
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"),
+            "docs CSP must admit the Scalar CDN script: {csp}"
+        );
+    }
+
+    #[test]
+    fn docs_csp_survives_default_security_layer() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(DOCS_CSP),
+        );
+        crate::security_headers::inject(&mut headers, false);
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("https://cdn.jsdelivr.net"),
+            "default layer must not clobber the handler-owned docs CSP: {csp}"
+        );
+    }
+
     #[cfg(all(feature = "schema-export", feature = "a2a"))]
     #[test]
-    fn a2a_task_operation_opts_out_of_bearer_auth() {
+    fn a2a_task_operation_requires_bearer_auth() {
         let spec = build_spec();
-        let security = spec
-            .pointer("/paths/~1a2a~1{alias}/post/security")
-            .and_then(|v| v.as_array());
-        assert_eq!(security, Some(&vec![]));
+        // No per-operation security override: the endpoint inherits the
+        // global `bearerAuth` requirement. A tool-enabled agent turn is never
+        // served unauthenticated.
+        let security = spec.pointer("/paths/~1a2a~1{alias}/post/security");
+        assert_eq!(security, None);
+        let global = spec
+            .pointer("/security")
+            .and_then(|v| v.as_array())
+            .expect("global security present");
+        assert!(
+            global
+                .iter()
+                .any(|scheme| scheme.get("bearerAuth").is_some()),
+            "global security must require bearerAuth"
+        );
     }
 }

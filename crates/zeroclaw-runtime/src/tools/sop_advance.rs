@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::sop::types::{SopRunAction, SopStepResult, SopStepStatus};
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Report a step result and advance an SOP run to the next step.
 pub struct SopAdvanceTool {
@@ -110,7 +110,7 @@ impl Tool for SopAdvanceTool {
             other => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Invalid status '{other}'. Must be: completed, failed, or skipped"
                     )),
@@ -153,6 +153,7 @@ impl Tool for SopAdvanceTool {
                 output: output.to_string(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                tool_calls: Vec::new(),
             };
             let step_result_clone = step_result.clone();
 
@@ -204,6 +205,14 @@ impl Tool for SopAdvanceTool {
             collector.record_run_complete(run);
         }
 
+        if let Ok(ref action) = action {
+            crate::sop::executor::enqueue_live_action(
+                Arc::clone(&self.engine),
+                self.audit.clone(),
+                action,
+            );
+        }
+
         match action {
             Ok(action) => {
                 let result_output = match action {
@@ -241,16 +250,24 @@ impl Tool for SopAdvanceTool {
                             step.title
                         )
                     }
+                    SopRunAction::Pending {
+                        run_id,
+                        step,
+                        reason,
+                        ..
+                    } => {
+                        format!("Step recorded. Run {run_id} pending before step {step}: {reason}")
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
-                    output: result_output,
+                    output: result_output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to advance step: {e}")),
             }),
         }
@@ -284,6 +301,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -293,12 +311,14 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 

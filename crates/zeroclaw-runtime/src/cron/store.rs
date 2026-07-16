@@ -122,6 +122,7 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -140,8 +141,9 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13)",
+                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
+                uses_memory
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 expression,
@@ -156,6 +158,7 @@ pub fn add_agent_job(
                 agent_alias,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                if uses_memory { 1 } else { 0 },
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -210,6 +213,40 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     };
 
     Ok(job)
+}
+
+/// Resolve a job by UUID or by name (case-insensitive). Returns the resolved
+/// job ID. Errors if the name matches zero or multiple jobs.
+///
+/// Name resolution is scoped to `agent_alias`: names are only unique within an
+/// agent's own jobs, so matching across all agents would let one agent mutate
+/// another's job by name and would raise false "ambiguous" errors when two
+/// agents happen to share a name.
+pub fn resolve_job_id_or_name(
+    config: &Config,
+    id_or_name: &str,
+    agent_alias: &str,
+) -> Result<String> {
+    // Fast path: try exact ID lookup first.
+    if let Ok(job) = get_job(config, id_or_name) {
+        return Ok(job.id);
+    }
+
+    // Fallback: search by name within the requesting agent's own jobs.
+    let jobs = list_jobs_by_agent(config, agent_alias)?;
+    let lower = id_or_name.to_lowercase();
+    let matches: Vec<&CronJob> = jobs
+        .iter()
+        .filter(|j| j.name.as_deref().is_some_and(|n| n.to_lowercase() == lower))
+        .collect();
+
+    match matches.len() {
+        0 => anyhow::bail!("No cron job found with id or name '{id_or_name}'"),
+        1 => Ok(matches[0].id.clone()),
+        n => anyhow::bail!(
+            "Ambiguous name '{id_or_name}': matched {n} jobs — use the job ID instead"
+        ),
+    }
 }
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
@@ -466,14 +503,7 @@ pub fn record_last_run_with_status(
 ) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
     with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET last_run = ?1, last_status = ?2, last_output = ?3
-             WHERE id = ?4",
-            params![finished_at.to_rfc3339(), status, bounded_output, job_id],
-        )
-        .context("Failed to update cron last run fields")?;
-        Ok(())
+        apply_last_run_state(conn, job_id, finished_at, status, &bounded_output)
     })
 }
 
@@ -656,6 +686,46 @@ pub fn record_run(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_manual_run_result(
+    config: &Config,
+    job: &CronJob,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
+
+    with_initialized_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+
+        insert_run_and_prune(
+            &tx,
+            config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            bounded_output.as_deref(),
+            duration_ms,
+        )?;
+
+        apply_last_run_state(
+            &tx,
+            &job.id,
+            finished_at,
+            status,
+            bounded_output.as_deref().unwrap_or(""),
+        )?;
+
+        tx.commit()
+            .context("Failed to commit manual cron run result transaction")?;
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_run_result(
     config: &Config,
     job: &CronJob,
@@ -755,6 +825,23 @@ fn insert_run_and_prune(
     )
     .context("Failed to prune cron run history")?;
 
+    Ok(())
+}
+
+fn apply_last_run_state(
+    conn: &Connection,
+    job_id: &str,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE cron_jobs
+         SET last_run = ?1, last_status = ?2, last_output = ?3
+         WHERE id = ?4",
+        params![finished_at.to_rfc3339(), status, output, job_id],
+    )
+    .context("Failed to update cron last run fields")?;
     Ok(())
 }
 
@@ -1480,6 +1567,7 @@ mod tests {
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
+        job_id: &str,
     ) -> serde_json::Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -1490,7 +1578,12 @@ mod tests {
                     if value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|candidate| candidate == message) =>
+                        .is_some_and(|candidate| candidate == message)
+                        && value
+                            .get("attributes")
+                            .and_then(|a| a.get("job_id"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| id == job_id) =>
                 {
                     return value;
                 }
@@ -1499,7 +1592,7 @@ mod tests {
                 Err(_elapsed) => {}
             }
         }
-        panic!("did not find log event: {message}");
+        panic!("did not find log event: {message} for job {job_id}");
     }
 
     #[test]
@@ -1834,6 +1927,7 @@ mod tests {
             }),
             false,
             None,
+            true,
         )
         .unwrap_err();
 
@@ -1896,7 +1990,7 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
 
-        let value = recv_log_event(&mut rx, "Removed cron job").await;
+        let value = recv_log_event(&mut rx, "Removed cron job", &job.id).await;
         assert_eq!(value["event"]["category"], "cron");
         assert_eq!(value["event"]["action"], "delete");
         assert_eq!(value["event"]["outcome"], "success");
@@ -2002,6 +2096,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into(), "web_search".into()]),
+            true,
         )
         .unwrap();
 
@@ -2030,6 +2125,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 
@@ -2711,5 +2807,69 @@ schedule = { kind = "every", every_ms = 300000 }
             Ok(())
         })?;
         Ok(job)
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_scopes_name_to_owning_agent() {
+        // Same job name under two agents. Resolving by name as agent-a must
+        // return only agent-a's job — no false ambiguity from agent-b's
+        // identically-named job, and no reaching across the agent boundary.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mine = add_shell_job(
+            &config,
+            "agent-a",
+            Some("daily_sync".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo a",
+            None,
+        )
+        .unwrap();
+        add_shell_job(
+            &config,
+            "agent-b",
+            Some("daily_sync".into()),
+            Schedule::Cron {
+                expr: "0 9 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let resolved = resolve_job_id_or_name(&config, "daily_sync", "agent-a").unwrap();
+        assert_eq!(
+            resolved, mine.id,
+            "name must resolve to the caller's own job, not the other agent's"
+        );
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_name() {
+        // Only agent-b owns `secret_job`; agent-a must not be able to resolve it.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        add_shell_job(
+            &config,
+            "agent-b",
+            Some("secret_job".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let err = resolve_job_id_or_name(&config, "secret_job", "agent-a").unwrap_err();
+        assert!(
+            err.to_string().contains("No cron job found"),
+            "another agent's job must be unresolvable by name; got: {err}"
+        );
     }
 }

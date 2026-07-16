@@ -17,6 +17,7 @@
 pub mod agent;
 pub mod attribution;
 pub mod channel;
+pub mod elicitation;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
@@ -25,6 +26,7 @@ pub mod memory_traits;
 pub mod model_provider;
 pub mod observability_traits;
 pub mod peripherals_traits;
+pub mod plan;
 pub mod platform;
 pub mod principal;
 pub mod runtime_traits;

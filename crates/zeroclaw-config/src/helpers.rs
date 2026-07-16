@@ -266,6 +266,7 @@ pub fn make_prop_field(
     tab: ConfigTab,
     display_secret_terminals: &[&str],
     alias_source: Option<crate::traits::AliasSource>,
+    multiline: bool,
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -295,6 +296,7 @@ pub fn make_prop_field(
         credential_class,
         tab,
         alias_source,
+        multiline,
     }
 }
 

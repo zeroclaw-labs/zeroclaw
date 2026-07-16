@@ -127,6 +127,9 @@ fn expand_directives(
         "{{#channel-streaming-matrix",
         "{{#thread-context ",
         "{{#config-fields ",
+        "{{#config-set ",
+        "{{#sop-trigger-index",
+        "{{#sop-trigger ",
         "{{#streaming ",
         "{{#env-var-bridge",
         "{{#env-var-table",
@@ -152,6 +155,9 @@ fn expand_directives(
         let rendered = match marker {
             "{{#config-where " => render_config_where(arg, depth)?,
             "{{#config-fields " => render_config_fields(arg)?,
+            "{{#config-set " => render_config_set(arg),
+            "{{#sop-trigger-index" => render_sop_trigger_index()?,
+            "{{#sop-trigger " => render_sop_trigger(arg)?,
             "{{#secret-config " => render_secret_config(arg),
             "{{#thread-context " => render_thread_context(arg)?,
             "{{#streaming " => render_streaming(arg)?,
@@ -231,6 +237,167 @@ fn render_config_fields(arg: &str) -> anyhow::Result<String> {
         .map_err(anyhow::Error::msg)
 }
 
+/// Render a SOP trigger type's field reference plus a load-and-verify widget,
+/// directly from the `SopTrigger` JSON Schema, so the trigger field list can
+/// never drift from the enum. The arg is the lowercase variant tag (`amqp`,
+/// `mqtt`, `filesystem`, …). The variant's own doc-comment is the summary; its
+/// struct fields drive the table via the same `field_table` emitter the config
+/// pages use. The widget defers authoring to the Syntax page and references the
+/// real `zeroclaw sop` verbs. Intended for pages under `sop/fan-in/`.
+/// The ordered `SopTrigger` variants from the live schema: `(tag, variant
+/// object, $defs)`. Single source for every SOP trigger directive so the doc
+/// surface can never list a trigger the enum does not define.
+fn sop_trigger_variants() -> anyhow::Result<(serde_json::Value, Vec<(String, serde_json::Value)>)> {
+    let schema = schemars::schema_for!(zeroclaw_runtime::sop::types::SopTrigger);
+    let root = schema.to_value();
+    let defs = root
+        .get("$defs")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let variants = root
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::Error::msg("sop-trigger: schema has no oneOf"))?
+        .iter()
+        .filter_map(|v| {
+            let tag = v
+                .get("properties")
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.get("const"))
+                .and_then(serde_json::Value::as_str)?
+                .to_string();
+            Some((tag, v.clone()))
+        })
+        .collect();
+    Ok((defs, variants))
+}
+
+/// Field names of a trigger variant, in schema order, with the `type`
+/// discriminator removed and required fields marked.
+fn sop_trigger_field_summary(variant: &serde_json::Value) -> String {
+    let Some(props) = variant
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return "none".to_string();
+    };
+    let empty = Vec::new();
+    let required = variant
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let mut names: Vec<String> = props
+        .keys()
+        .filter(|k| k.as_str() != "type")
+        .map(|k| {
+            let req = required.iter().any(|r| r.as_str() == Some(k.as_str()));
+            if req {
+                format!("`{k}`")
+            } else {
+                format!("optional `{k}`")
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.sort_by_key(|n| n.starts_with("optional"));
+        names.join(", ")
+    }
+}
+
+/// Render the full SOP trigger index table from the `SopTrigger` schema: every
+/// variant, its fields, and the status line from its doc-comment. Replaces any
+/// hand-typed trigger list so the table is a pure projection of the enum.
+fn render_sop_trigger_index() -> anyhow::Result<String> {
+    let (_defs, variants) = sop_trigger_variants()?;
+    let mut out = String::from("| Type | Fields | Notes |\n|---|---|---|\n");
+    for (tag, variant) in variants {
+        let notes = variant
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .replace('\n', " ");
+        let fields = sop_trigger_field_summary(&variant);
+        out.push_str(&format!("| `{tag}` | {fields} | {notes} |\n"));
+    }
+    Ok(out)
+}
+
+/// Render a SOP trigger type's field reference plus a load-and-verify widget,
+/// directly from the `SopTrigger` JSON Schema, so the trigger field list can
+/// never drift from the enum. The arg is the lowercase variant tag (`amqp`,
+/// `mqtt`, `filesystem`, …). The variant's own doc-comment is the summary; its
+/// struct fields drive the table via the same `field_table` emitter the config
+/// pages use. The widget defers authoring to the Syntax page and references the
+/// real `zeroclaw sop` verbs. Intended for pages under `sop/fan-in/`.
+fn render_sop_trigger(arg: &str) -> anyhow::Result<String> {
+    let ty = arg.trim();
+    let (defs, variants) = sop_trigger_variants()?;
+    let variant = variants
+        .into_iter()
+        .find(|(tag, _)| tag == ty)
+        .map(|(_, v)| v)
+        .ok_or_else(|| anyhow::Error::msg(format!("sop-trigger: unknown trigger type `{ty}`")))?;
+
+    let summary = variant
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let mut node = variant;
+    if let Some(props) = node
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        props.remove("type");
+    }
+    if let Some(req) = node
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        req.retain(|r| r.as_str() != Some("type"));
+    }
+    if let Some(obj) = node.as_object_mut() {
+        obj.insert("$defs".to_string(), defs);
+    }
+    let fields = zeroclaw_config::schema_markdown::field_table(&node, true, None, None);
+
+    Ok(format!(
+        r#"{summary}
+
+{fields}
+
+**Load and verify the SOP:**
+
+<div class="os-tabs-src">
+
+#### Define
+
+Author the SOP as described in [Syntax](../syntax.md), with a `{ty}` trigger. The trigger fields above are the supported keys; the page walks the full file.
+
+#### Validate
+
+```sh
+zeroclaw sop validate
+```
+
+#### Inspect
+
+```sh
+zeroclaw sop list
+zeroclaw sop show <name>
+```
+
+</div>
+"#,
+        summary = summary.replace('\n', " "),
+        fields = fields,
+        ty = ty,
+    ))
+}
+
 /// Resolve the display label for a config section path. Prefers the curated
 /// `Section` registry label; falls back to the schema-humanized key for real
 /// schema sections that aren't curated quickstart sections (e.g. `browser`).
@@ -262,19 +429,20 @@ fn render_secret_config(path: &str) -> String {
     // Dashboard deep-link path: dotted prefix minus `<alias>` and the field,
     // slash-joined (`channels.matrix.<alias>.password` -> `channels/matrix`).
     let section = dashboard_section(path);
+    let display_path = display_config_path(path);
     format!(
-        r#"> **`{path}` is a secret.** Stored encrypted, never in plain
+        r#"> **`{display_path}` is a secret.** Stored encrypted, never in plain
 > `config.toml`. Set it through one of these, which encrypt on write:
 
 <div class="os-tabs-src">
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{path}` field there.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
 
 #### zerocode
 
-In the **Config** pane, set the `{path}` field (input is masked).
+In the **Config** pane, set the `{display_path}` field (input is masked).
 
 #### zeroclaw config
 
@@ -286,7 +454,35 @@ zeroclaw config set {path}    # prompts for masked input, stores encrypted
     )
 }
 
-/// Dashboard deep-link section path from a dotted config field path. Drops the
+/// Render a set-it-any-surface widget for a single non-secret config field.
+/// Same three-surface tabs as `secret-config` (gateway dashboard, zerocode,
+/// `zeroclaw config set`) minus the masked-secret framing. The arg is the full
+/// dotted path to the field, e.g. `channels.git.<alias>.app_id`. Used by setup
+/// guides that walk each required field individually.
+fn render_config_set(path: &str) -> String {
+    let path = path.trim();
+    let section = dashboard_section(path);
+    let display_path = display_config_path(path);
+    format!(
+        r#"<div class="os-tabs-src">
+
+#### Gateway dashboard
+
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
+
+#### zerocode
+
+In the **Config** pane, set the `{display_path}` field.
+
+#### zeroclaw config
+
+```sh
+zeroclaw config set {path} <value>
+```
+
+</div>"#,
+    )
+}
 /// `<alias>` placeholder and the trailing field name, slash-joining the rest:
 /// `channels.matrix.<alias>.password` -> `channels/matrix`. A bare section like
 /// `acp.foo` -> `acp`. The gateway resolves these `/config/<section>` routes.
@@ -352,6 +548,7 @@ fn render_thread_context(arg: &str) -> anyhow::Result<String> {
     let configure = match path {
         Some(p) => {
             let section = dashboard_section(p);
+            let display_path = display_config_path(p);
             format!(
                 r#"
 
@@ -361,11 +558,11 @@ Set the thread behavior on any surface:
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and toggle the `{p}` field.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and toggle the `{display_path}` field.
 
 #### zerocode
 
-In the **Config** pane, set the `{p}` field.
+In the **Config** pane, set the `{display_path}` field.
 
 #### zeroclaw config
 
@@ -447,6 +644,7 @@ fn render_streaming(arg: &str) -> anyhow::Result<String> {
     let configure = match (path, mode) {
         (Some(p), m) if m == STREAM_MODE || m == STREAM_DRAFTS => {
             let section = dashboard_section(p);
+            let display_path = display_config_path(p);
             format!(
                 r#"
 
@@ -456,11 +654,11 @@ Set it on any surface:
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{p}` field.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field.
 
 #### zerocode
 
-In the **Config** pane, set the `{p}` field.
+In the **Config** pane, set the `{display_path}` field.
 
 #### zeroclaw config
 
@@ -528,6 +726,10 @@ fn parse_kv_args(arg: &str) -> std::collections::HashMap<String, String> {
         map.insert(key, value);
     }
     map
+}
+
+fn display_config_path(path: &str) -> String {
+    path.to_string()
 }
 
 fn render_example(p: &PeerParams) -> String {
@@ -974,6 +1176,46 @@ mod generated_prose_gate {
             }
         }
         false
+    }
+
+    #[test]
+    fn sop_trigger_channel_renders_live_and_appears_in_index() {
+        let single = super::render_sop_trigger("channel").expect("channel trigger renders");
+        assert!(single.contains("Live: delivered by the channel orchestrator"));
+        assert!(single.contains("channel"));
+
+        let index = super::render_sop_trigger_index().expect("trigger index renders");
+        assert!(index.contains("| `channel` |"));
+        assert!(index.contains("| `amqp` |"));
+    }
+
+    #[test]
+    fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
+        let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
+
+        assert!(rendered.contains("`channels.discord.<alias>.bot_token`"));
+        assert!(rendered.contains("zeroclaw config set channels.discord.<alias>.bot_token"));
+    }
+
+    #[test]
+    fn config_explainers_keep_alias_placeholder_raw_in_markdown() {
+        let thread = super::render_thread_context(
+            r#"channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread""#,
+        )
+        .expect("thread context should render");
+        let streaming = super::render_streaming(
+            r#"channel="Slack" mode="stream_drafts" path="channels.slack.<alias>.stream_drafts""#,
+        )
+        .expect("streaming context should render");
+
+        assert!(thread.contains("`channels.matrix.<alias>.reply_in_thread`"));
+        assert!(
+            thread.contains("zeroclaw config set channels.matrix.<alias>.reply_in_thread true")
+        );
+        assert!(streaming.contains("`channels.slack.<alias>.stream_drafts`"));
+        assert!(
+            streaming.contains("zeroclaw config set channels.slack.<alias>.stream_drafts <value>")
+        );
     }
 
     #[test]

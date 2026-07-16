@@ -216,26 +216,26 @@ mod tests {
     #[test]
     fn build_tool_instructions_text_format() {
         let tools = vec![
-            ToolSpec {
-                name: "shell".to_string(),
-                description: "Execute commands".to_string(),
-                parameters: serde_json::json!({
+            ToolSpec::new(
+                "shell".to_string(),
+                "Execute commands".to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {
                         "command": {"type": "string"}
                     }
                 }),
-            },
-            ToolSpec {
-                name: "file_read".to_string(),
-                description: "Read files".to_string(),
-                parameters: serde_json::json!({
+            ),
+            ToolSpec::new(
+                "file_read".to_string(),
+                "Read files".to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"}
                     }
                 }),
-            },
+            ),
         ];
 
         let instructions = build_tool_instructions_text(&tools);
@@ -297,11 +297,11 @@ mod tests {
             supports_native: false,
         };
 
-        let tools = vec![ToolSpec {
-            name: "test_tool".to_string(),
-            description: "A test tool".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "test_tool".to_string(),
+            "A test tool".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
 
         let payload = model_provider.convert_tools(&tools);
         assert!(matches!(payload, ToolsPayload::PromptGuided { .. }));
@@ -318,11 +318,11 @@ mod tests {
             supports_native: false,
         };
 
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell".to_string(),
+            "Run commands".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
 
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
@@ -469,11 +469,11 @@ mod tests {
             supports_native: false,
         };
 
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell".to_string(),
+            "Run commands".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
 
         let request = ChatRequest {
             messages: &[
@@ -498,11 +498,11 @@ mod tests {
     async fn provider_chat_prompt_guided_uses_convert_tools_override() {
         let model_provider = CustomConvertModelProvider;
 
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell".to_string(),
+            "Run commands".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
 
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
@@ -524,11 +524,11 @@ mod tests {
     async fn provider_chat_prompt_guided_rejects_non_prompt_payload() {
         let model_provider = InvalidConvertModelProvider;
 
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell".to_string(),
+            "Run commands".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
 
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],

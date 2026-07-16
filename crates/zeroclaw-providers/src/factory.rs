@@ -199,6 +199,9 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         p = p.with_tls_ca_cert_path(cert_path);
     }
+    if opts.replay_assistant_reasoning == Some(false) {
+        p = p.without_assistant_reasoning_replay();
+    }
     if let Some(extra) = &opts.provider_extra {
         if extra.is_object() {
             p = p.with_extra_body(extra.clone());
@@ -221,9 +224,10 @@ pub fn apply_compat_options(
 }
 
 /// Build an `OpenAiResponsesModelProvider` from the per-alias runtime options,
-/// applying the same `max_tokens` / `reasoning_effort` overrides every family
-/// that speaks the responses wire shares. Returns `None` unless `wire_api`
-/// selects the responses protocol, so a caller can route with a single
+/// applying the same `max_tokens` / `reasoning_effort` / `timeout_secs` /
+/// `extra_headers` overrides every family that speaks the responses wire
+/// shares. Returns `None` unless `wire_api` selects the responses protocol,
+/// so a caller can route with a single
 /// `if let Some(p) = build_responses_provider_if_requested(..)` and fall
 /// through to its chat-completions build otherwise.
 fn build_responses_provider_if_requested(
@@ -237,11 +241,17 @@ fn build_responses_provider_if_requested(
         return None;
     }
     let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key);
+    if let Some(t) = opts.provider_timeout_secs {
+        p = p.with_timeout_secs(t);
+    }
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
     }
     if let Some(ref effort) = opts.reasoning_effort {
         p = p.with_reasoning_effort(Some(effort.clone()));
+    }
+    if !opts.extra_headers.is_empty() {
+        p = p.with_extra_headers(opts.extra_headers.clone());
     }
     Some(Box::new(p))
 }
@@ -409,6 +419,23 @@ use zeroclaw_config::schema::{
     VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
+
+/// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
+/// Returns None if the provider type is not an OpenAI-compatible family with a DEFAULT_URL const.
+pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
+    Some(match provider_type {
+        "groq" => "https://api.groq.com/openai/v1",
+        "together" => <TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "fireworks" => <FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "deepinfra" => <DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "hyperbolic" => <HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "anyscale" => <AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "novita" => <NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "nebius" => <NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "nvidia" => <NvidiaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        _ => return None,
+    })
+}
 
 // ── Pure-compat families ───────────────────────────────────────────────
 // `OpenAiCompatibleModelProvider::new(DISPLAY, DEFAULT_URL, key, AUTH)` —
@@ -1893,6 +1920,233 @@ mod tests {
             )
             .unwrap();
         assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    // Issue #7690 follow-up: factory forwarding tests for `provider_timeout_secs`
+    // and `extra_headers` through the responses path. The struct-level
+    // builders and `build_default_headers` are covered in
+    // `crates/zeroclaw-providers/src/openai.rs::tests`; these tests pin
+    // the factory layer by exercising the routing + URL composition with
+    // a real `CustomModelProviderConfig` (the existing
+    // `custom_factory_routes_to_responses_provider_when_wire_api_responses`
+    // test above only checks routing with `default()` runtime options).
+    //
+    // Downcasting the `Box<dyn ModelProvider>` to the concrete struct
+    // requires `Any` on the trait, which `ModelProvider` does not
+    // expose. Instead we rely on:
+    //
+    // (a) the public `default_wire_api()` / `default_base_url()` accessors
+    //     to confirm the factory routed to the responses provider, and
+    // (b) the end-to-end timeout test below against a live axum server
+    //     (same shape as
+    //     `openai_factory_forwards_timeout_to_native_provider`), which
+    //     closes the loop by asserting a configured 1s timeout aborts a
+    //     3s server response.
+
+    #[tokio::test]
+    async fn responses_factory_forwards_timeout_secs_to_responses_provider() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::time::{Duration, Instant};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+
+        async fn slow_responses() -> Json<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(json!({
+                "id": "resp_slow",
+                "object": "response",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "too late"}]}],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new().route("/v1/responses", post(slow_responses));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some(format!("http://{addr}/v1")),
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                Some("test-key"),
+                Some(&format!("http://{addr}/v1")),
+                &opts,
+            )
+            .expect("openai responses provider should build");
+
+        // Sanity-check routing + URL composition.
+        assert_eq!(
+            provider.default_wire_api(),
+            "responses",
+            "factory should route to the responses provider when wire_api=Responses"
+        );
+        assert_eq!(
+            provider.default_base_url(),
+            Some(format!("http://{addr}/v1/responses").as_str()),
+            "factory-composed URL must end with /responses"
+        );
+
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-5", Some(0.7))
+            .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "slow response should time out when factory forwards provider_timeout_secs (1s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request waited for the server response instead of using configured 1s timeout: {elapsed:?}"
+        );
+    }
+
+    // Symmetric pair of `responses_factory_forwards_timeout_secs_to_responses_provider`
+    // (singlerider 🟡 follow-up, review 4568610917): the factory wiring for
+    // `extra_headers` must (a) emit configured custom headers on the wire and
+    // (b) drop a case-insensitive `Authorization` from `extra_headers` so the
+    // built-in bearer credential is the only one on the request. The drop is
+    // the security boundary — reqwest 0.12 *appends* per-request headers on
+    // top of `default_headers`, so a duplicated `Authorization` would produce
+    // two values and the server would pick one unpredictably.
+    #[tokio::test]
+    async fn responses_factory_forwards_extra_headers_to_responses_provider() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use serde_json::json;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+
+        async fn capture_headers(
+            State(captured): State<Arc<Mutex<Option<HeaderMap>>>>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            *captured.lock().expect("captured headers mutex") = Some(headers);
+            Json(json!({
+                "id": "resp_ok",
+                "object": "response",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/responses", post(capture_headers))
+            .with_state(Arc::clone(&captured));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some(format!("http://{addr}/v1")),
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let mut extra_headers = HashMap::new();
+        // The two non-reserved custom headers we expect to see on the wire.
+        extra_headers.insert("X-Trace-Id".to_string(), "trace-abc-123".to_string());
+        extra_headers.insert("X-Tenant".to_string(), "acme".to_string());
+        // The reserved-header case we expect the factory to drop — the
+        // built-in `Bearer test-key` (from `Some("test-key")` below) must be
+        // the only Authorization value on the request.
+        extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer should-be-dropped".to_string(),
+        );
+        // And the case-insensitive variant — must be dropped by the same
+        // case-insensitive check in `build_default_headers`.
+        extra_headers.insert(
+            "authorization".to_string(),
+            "Bearer lower-case-should-also-be-dropped".to_string(),
+        );
+        let opts = ModelProviderRuntimeOptions {
+            extra_headers,
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                Some("test-key"),
+                Some(&format!("http://{addr}/v1")),
+                &opts,
+            )
+            .expect("openai responses provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-5", Some(0.7))
+            .await;
+
+        server.abort();
+
+        assert!(result.is_ok(), "fast response should succeed: {result:?}");
+
+        let captured_headers = captured
+            .lock()
+            .expect("captured headers mutex")
+            .clone()
+            .expect("server handler must have captured the request headers");
+
+        // (a) configured custom headers arrive on the wire.
+        assert_eq!(
+            captured_headers
+                .get("X-Trace-Id")
+                .map(|v| v.to_str().unwrap()),
+            Some("trace-abc-123"),
+            "configured extra_headers['X-Trace-Id'] must reach the wire"
+        );
+        assert_eq!(
+            captured_headers
+                .get("X-Tenant")
+                .map(|v| v.to_str().unwrap()),
+            Some("acme"),
+            "configured extra_headers['X-Tenant'] must reach the wire"
+        );
+
+        // (b) only one Authorization value, and it is the built-in one. The
+        // case-insensitive drop in `build_default_headers` (see
+        // `crates/zeroclaw-providers/src/openai.rs::build_default_headers`)
+        // must reject both the `Authorization` and the lowercase
+        // `authorization` entries from extra_headers — the only Authorization
+        // left on the wire is the one the provider built from the
+        // constructor-supplied credential.
+        let auth_values: Vec<&str> = captured_headers
+            .get_all("Authorization")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            auth_values.len(),
+            1,
+            "exactly one Authorization header must reach the wire; got {auth_values:?}"
+        );
+        assert_eq!(
+            auth_values[0], "Bearer test-key",
+            "the surviving Authorization must be the built-in bearer credential, not the dropped extra_headers entry"
+        );
     }
 
     #[test]

@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
+use zeroclaw_config::schema::{ClassificationRule, Config, DelegateTargetConfig, ModelRouteConfig};
 use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
@@ -66,7 +66,7 @@ impl ModelRoutingConfigTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -74,7 +74,7 @@ impl ModelRoutingConfigTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -114,6 +114,56 @@ impl ModelRoutingConfigTool {
         }
 
         anyhow::bail!("'{field}' must be a string or string[]")
+    }
+
+    fn parse_delegate_targets(
+        raw: &Value,
+        field: &str,
+    ) -> anyhow::Result<Vec<DelegateTargetConfig>> {
+        // Keep the config-editing tool as permissive as the schema loader:
+        // operators may pass a comma-separated legacy string, a string array,
+        // or object entries with explicit mode. The stored config still uses
+        // `DelegateTargetConfig`, so mode semantics are not reimplemented here.
+        if let Some(raw_string) = raw.as_str() {
+            return Ok(raw_string
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(DelegateTargetConfig::bounded)
+                .collect());
+        }
+
+        if let Some(array) = raw.as_array() {
+            let mut out = Vec::new();
+            for item in array {
+                let mut target: DelegateTargetConfig =
+                    serde_json::from_value(item.clone()).map_err(|error| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "field": field,
+                                "error": format!("{}", error),
+                            })),
+                            "model_routing_config: delegate target element has invalid shape"
+                        );
+                        anyhow::Error::msg(format!(
+                            "'{field}' array must contain strings or objects with agent/mode: {error}"
+                        ))
+                    })?;
+                target.agent = target.agent.trim().to_string();
+                if !target.agent.is_empty() {
+                    out.push(target);
+                }
+            }
+            return Ok(out);
+        }
+
+        anyhow::bail!("'{field}' must be a string, string[], or delegate target object[]")
     }
 
     fn parse_non_empty_string(args: &Value, field: &str) -> anyhow::Result<String> {
@@ -424,7 +474,7 @@ impl ModelRoutingConfigTool {
         let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?,
+            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?.into(),
             error: None,
         })
     }
@@ -469,7 +519,8 @@ impl ModelRoutingConfigTool {
                         "priority": 50
                     }
                 }
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -585,7 +636,7 @@ impl ModelRoutingConfigTool {
                     success: false,
                     output: format!(
                         "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
-                    ),
+                    ).into(),
                     error: None,
                 });
             }
@@ -599,7 +650,8 @@ impl ModelRoutingConfigTool {
             output: serde_json::to_string_pretty(&json!({
                 "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -771,7 +823,8 @@ impl ModelRoutingConfigTool {
                 "message": "Scenario route upserted",
                 "hint": hint,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -816,7 +869,8 @@ impl ModelRoutingConfigTool {
                 "routes_removed": routes_removed,
                 "classification_rules_removed": rules_removed,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -841,7 +895,7 @@ impl ModelRoutingConfigTool {
         let delegate_same_risk_profile_update =
             Self::parse_optional_bool(args, "delegate_same_risk_profile")?;
         let delegates_update = if let Some(raw) = args.get("delegates") {
-            Some(Self::parse_string_list(raw, "delegates")?)
+            Some(Self::parse_delegate_targets(raw, "delegates")?)
         } else {
             None
         };
@@ -942,7 +996,8 @@ impl ModelRoutingConfigTool {
                 "message": "Delegate agent upserted",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -963,7 +1018,8 @@ impl ModelRoutingConfigTool {
                 "message": "Aliased agent removed",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -980,6 +1036,33 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let delegates_schema = json!({
+            "description": "Explicit delegate roster. Accepts a comma-separated string, string array, or objects with {agent, mode}; mode is bounded or independent.",
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["agent"],
+                                "properties": {
+                                    "agent": {"type": "string", "minLength": 1},
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["bounded", "independent"],
+                                        "default": "bounded"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
         json!({
             "type": "object",
             "properties": {
@@ -1081,13 +1164,7 @@ impl Tool for ModelRoutingConfigTool {
                     "type": "boolean",
                     "description": "Auto-allow delegation to same-risk-profile peers (default true). Set false to restrict reach to the explicit delegates list."
                 },
-                "delegates": {
-                    "description": "Explicit delegate roster: additional agent aliases this agent may delegate to, beyond same-profile peers (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
-                }
+                "delegates": delegates_schema
             },
             "additionalProperties": false
         })
@@ -1127,7 +1204,7 @@ impl Tool for ModelRoutingConfigTool {
             Ok(outcome) => Ok(outcome),
             Err(error) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             }),
         }
@@ -1335,7 +1412,7 @@ mod tests {
                 "model_provider": "openai",
                 "model": "gpt-5.3",
                 "delegate_same_risk_profile": false,
-                "delegates": ["aaalore"]
+                "delegates": [{"agent": "aaalore", "mode": "independent"}]
             }))
             .await
             .unwrap();
@@ -1347,7 +1424,10 @@ mod tests {
             output["agents"]["aaa"]["delegate_same_risk_profile"],
             json!(false)
         );
-        assert_eq!(output["agents"]["aaa"]["delegates"], json!(["aaalore"]));
+        assert_eq!(
+            output["agents"]["aaa"]["delegates"],
+            json!([{"agent": "aaalore", "mode": "independent"}])
+        );
     }
 
     #[tokio::test]

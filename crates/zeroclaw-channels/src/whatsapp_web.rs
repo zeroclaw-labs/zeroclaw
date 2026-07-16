@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 #[cfg(feature = "whatsapp-web")]
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
@@ -75,6 +75,9 @@ pub struct WhatsAppWebChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// When true, only respond to messages that @-mention the bot in groups
     mention_only: bool,
+    /// When true, allowed unaddressed group messages become context-only
+    /// history entries instead of being dropped.
+    passive_group_context: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
     /// Bot LID number (digits only), resolved from device identity at runtime
@@ -143,6 +146,7 @@ impl WhatsAppWebChannel {
         let pair_code = config.pair_code.clone();
         let ws_url = config.ws_url.clone();
         let mention_only = config.mention_only;
+        let passive_group_context = config.passive_group_context;
         let mode = config.mode.clone();
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
@@ -173,6 +177,7 @@ impl WhatsAppWebChannel {
             alias: alias.into(),
             peer_resolver,
             mention_only,
+            passive_group_context,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             bot_lid: Arc::new(Mutex::new(None)),
             mode,
@@ -852,8 +857,88 @@ impl WhatsAppWebChannel {
         if base.document_message.is_some() {
             return "[Document]".to_string();
         }
+        if let Some(ref loc) = base.location_message {
+            // Live locations are silently ignored — they stream
+            // periodic updates and have no meaningful static content.
+            if loc.is_live == Some(true) {
+                return String::new();
+            }
+            let lat = match loc.degrees_latitude {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            let lng = match loc.degrees_longitude {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            return crate::util::format_location_content(lat, lng, loc.name.as_deref());
+        }
 
         String::new()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn group_context_scope(
+        passive_group_context: bool,
+        is_group: bool,
+    ) -> ChannelConversationScope {
+        if passive_group_context && is_group {
+            ChannelConversationScope::ReplyTarget
+        } else {
+            ChannelConversationScope::Sender
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_record_passive_group_context(
+        passive_group_context: bool,
+        is_group: bool,
+        addressed_to_bot: bool,
+    ) -> bool {
+        passive_group_context && is_group && !addressed_to_bot
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_inbound_channel_message(
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        alias: &str,
+        sender: &str,
+        reply_target: String,
+        content: String,
+        attachments: Vec<MediaAttachment>,
+        passive_context: bool,
+        conversation_scope: ChannelConversationScope,
+    ) {
+        if let Err(e) = tx
+            .send(ChannelMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some(alias.to_string()),
+                sender: sender.to_string(),
+                // Reply to the originating chat JID (DM or group), passed
+                // through unchanged (library handles LID addressing internally).
+                reply_target,
+                content,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments,
+                subject: None,
+                internal_sop_event: None,
+                passive_context,
+                explicitly_addressed: false,
+                conversation_scope,
+            })
+            .await
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to send message to channel"
+            );
+        }
     }
 
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
@@ -1051,6 +1136,30 @@ impl WhatsAppWebChannel {
         Box::pin(client.send_message(to.clone(), outgoing))
             .await
             .map_err(|e| anyhow::Error::msg(format!("WhatsApp media send failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Send a native location pin. No file read or media upload is involved —
+    /// the coordinates and labels travel inline in a `LocationMessage`.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_location(
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
+        loc: &WhatsAppLocation,
+    ) -> Result<()> {
+        let outgoing = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(loc.lat),
+                degrees_longitude: Some(loc.lng),
+                name: loc.name.clone(),
+                address: loc.address.clone(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        Box::pin(client.send_message(to.clone(), outgoing))
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp location send failed: {e}")))?;
         Ok(())
     }
 
@@ -1301,14 +1410,43 @@ impl WhatsAppMediaKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WhatsAppMediaMarker {
     kind: WhatsAppMediaKind,
+    /// Path-like target resolved against the workspace before upload.
     target: String,
 }
 
 #[cfg(feature = "whatsapp-web")]
-impl WhatsAppMediaMarker {
+use crate::util::WhatsAppLocation;
+
+/// An outbound marker: either a file-based media attachment (resolved against
+/// the workspace and uploaded) or an inline location pin (no file, no upload).
+///
+/// Both variants carry the raw marker target; validation happens on the send
+/// path (`validate_whatsapp_marker_target` for media,
+/// `validate_whatsapp_location_target` for locations) so an invalid target
+/// counts as a failed delivery instead of vanishing silently.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq)]
+enum WhatsAppMarker {
+    Media(WhatsAppMediaMarker),
+    Location(String),
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMarker {
     fn from_shared_marker(kind: String, target: String) -> Option<Self> {
+        if kind.eq_ignore_ascii_case("LOCATION") {
+            return Some(Self::Location(target));
+        }
         let kind = WhatsAppMediaKind::from_marker(&kind)?;
-        Some(Self { kind, target })
+        Some(Self::Media(WhatsAppMediaMarker { kind, target }))
+    }
+
+    /// Short label for structured logs.
+    fn kind_label(&self) -> String {
+        match self {
+            Self::Media(m) => format!("{:?}", m.kind),
+            Self::Location(_) => "Location".to_string(),
+        }
     }
 }
 
@@ -1434,6 +1572,29 @@ fn validate_whatsapp_marker_target(
     Ok(target_canon)
 }
 
+/// Validate a `[LOCATION:...]` marker target, the location counterpart of
+/// `validate_whatsapp_marker_target`: instead of resolving a workspace file,
+/// it checks that the inline target parses as `lat,lng[,name[,address]]` with
+/// in-range WGS84 coordinates. A malformed target is refused so the send loop
+/// counts it as a failed delivery rather than dropping it silently.
+#[cfg(feature = "whatsapp-web")]
+fn validate_whatsapp_location_target(
+    target: &str,
+) -> std::result::Result<WhatsAppLocation, WhatsAppMarkerError> {
+    WhatsAppLocation::parse(target).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"reason": "invalid_location"})),
+            "whatsapp-web: location marker target is malformed or outside WGS84 range"
+        );
+        WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web location marker must be `lat,lng[,name[,address]]` with in-range WGS84 coordinates",
+        ))
+    })
+}
+
 #[cfg(feature = "whatsapp-web")]
 fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
     if failure_count == 0 {
@@ -1518,7 +1679,7 @@ impl Channel for WhatsAppWebChannel {
         };
         let markers = raw_markers
             .into_iter()
-            .filter_map(|(kind, target)| WhatsAppMediaMarker::from_shared_marker(kind, target))
+            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
             .collect::<Vec<_>>();
 
         // Voice chat mode: send text normally AND queue a voice note of the
@@ -1617,33 +1778,67 @@ impl Channel for WhatsAppWebChannel {
         let mut delivered_markers = 0usize;
         let mut failed_marker_count = 0usize;
         for marker in &markers {
-            let target = match validate_whatsapp_marker_target(
-                &marker.target,
-                self.workspace_dir.as_deref(),
-            ) {
-                Ok(path) => path,
-                Err(err) => {
-                    let kind = err.kind();
-                    let reason = match kind {
-                        WhatsAppMarkerFailure::Refused => "trust boundary",
-                        WhatsAppMarkerFailure::Failed => "not found",
+            // Location markers carry inline data (lat,lng,...) and skip the
+            // workspace file validator, but the coordinates must still parse
+            // and land in WGS84 range; media markers must resolve to a real
+            // file inside the workspace before upload.
+            let result = match marker {
+                WhatsAppMarker::Location(target) => {
+                    match validate_whatsapp_location_target(target) {
+                        Ok(loc) => Self::send_location(&client, &to, &loc).await,
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "kind": "Location",
+                                    "reason": "invalid coordinates",
+                                    "error": err.to_string(),
+                                })),
+                                "whatsapp-web: dropping unresolved outbound attachment marker"
+                            );
+                            failed_marker_count += 1;
+                            continue;
+                        }
+                    }
+                }
+                WhatsAppMarker::Media(media) => {
+                    let target = match validate_whatsapp_marker_target(
+                        &media.target,
+                        self.workspace_dir.as_deref(),
+                    ) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let reason = match err.kind() {
+                                WhatsAppMarkerFailure::Refused => "trust boundary",
+                                WhatsAppMarkerFailure::Failed => "not found",
+                            };
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "kind": format!("{:?}", media.kind),
+                                    "reason": reason,
+                                    "error": err.to_string(),
+                                })),
+                                "whatsapp-web: dropping unresolved outbound attachment marker"
+                            );
+                            failed_marker_count += 1;
+                            continue;
+                        }
                     };
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "kind": format!("{:?}", marker.kind),
-                                "reason": reason,
-                                "error": err.to_string(),
-                            })),
-                        "whatsapp-web: dropping unresolved outbound attachment marker"
-                    );
-                    failed_marker_count += 1;
-                    continue;
+                    Self::send_media_marker(&client, &to, media, &target).await
                 }
             };
-            match Self::send_media_marker(&client, &to, marker, &target).await {
+            match result {
                 Ok(()) => delivered_markers += 1,
                 Err(err) => {
                     ::zeroclaw_log::record!(
@@ -1651,10 +1846,10 @@ impl Channel for WhatsAppWebChannel {
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
-                                "kind": format!("{:?}", marker.kind),
+                                "kind": marker.kind_label(),
                                 "error": err.to_string(),
                             })),
-                        "whatsapp-web: media marker delivery failed"
+                        "whatsapp-web: marker delivery failed"
                     );
                     failed_marker_count += 1;
                 }
@@ -1800,6 +1995,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
+            let passive_group_context = self.passive_group_context;
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
@@ -1837,6 +2033,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
+                    let passive_group_context = passive_group_context;
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
@@ -1982,6 +2179,87 @@ impl Channel for WhatsAppWebChannel {
                                 }
 
                                 let normalized = normalized.unwrap_or_else(|| sender.clone());
+                                let conversation_scope =
+                                    Self::group_context_scope(passive_group_context, is_group);
+                                let mut passive_context = false;
+                                let text_content = msg.text_content().unwrap_or("").trim().to_string();
+                                let mut content = Self::media_fallback_content(text_content, msg);
+
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
+
+                                // mention_only: group messages without a bot mention can become
+                                // passive context when explicitly enabled; otherwise they keep
+                                // the existing drop behavior. This runs before STT/media
+                                // downloads so passive messages have no provider/tool side effects.
+                                if mention_only && is_group {
+                                    let bot_phone = bot_phone_inner.lock();
+                                    let bot_lid = bot_lid_inner.lock();
+                                    if bot_phone.is_some() || bot_lid.is_some() {
+                                        let bp = bot_phone.as_deref().unwrap_or("");
+                                        let bl = bot_lid.as_deref();
+                                        let addressed =
+                                            Self::is_message_addressed_to_bot(msg, &content, bp, bl);
+                                        if Self::should_record_passive_group_context(
+                                            passive_group_context,
+                                            is_group,
+                                            addressed,
+                                        ) {
+                                            passive_context = true;
+                                        } else if !addressed {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
+                                            return;
+                                        }
+                                    } else {
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
+                                        return;
+                                    }
+                                }
+
+                                // ── Mention-pattern gating ──
+                                // If passive group context could record a no-match group message,
+                                // apply group mention gating before STT/media downloads so a
+                                // passive message has no provider/tool side effects. Otherwise,
+                                // defer gating until after STT to preserve the existing active
+                                // voice-note behavior.
+                                let passive_from_mention_gating_possible =
+                                    Self::should_record_passive_group_context(
+                                        passive_group_context,
+                                        is_group,
+                                        false,
+                                    );
+                                if !passive_context && passive_from_mention_gating_possible {
+                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                                        &wa_dm_mention_patterns,
+                                        &wa_group_mention_patterns,
+                                        &content,
+                                        is_group,
+                                    ) {
+                                        Some(c) => content = c,
+                                        None => {
+                                            passive_context = true;
+                                        }
+                                    }
+                                }
+
+                                if passive_context {
+                                    if content.is_empty() {
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty passive group context from {}", normalized));
+                                        return;
+                                    }
+                                    Self::send_inbound_channel_message(
+                                        &tx_inner,
+                                        alias.as_ref(),
+                                        &normalized,
+                                        reply_target,
+                                        content,
+                                        Vec::new(),
+                                        true,
+                                        conversation_scope,
+                                    )
+                                    .await;
+                                    return;
+                                }
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note).
                                 // When `transcribe_non_ptt_audio` is enabled in the transcription
@@ -2009,53 +2287,23 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
-                                let content = if let Some(ref vt) = voice_text {
+                                if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(reply_target.clone());
                                     }
-                                    format!("[Voice] {vt}")
-                                } else {
-                                    if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&reply_target);
-                                    }
-                                    let text = msg.text_content().unwrap_or("");
-                                    text.trim().to_string()
-                                };
-                                let content = Self::media_fallback_content(content, msg);
-
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
+                                    content = format!("[Voice] {vt}");
+                                } else if let Ok(mut vs) = voice_chats.lock() {
+                                    vs.remove(&reply_target);
+                                }
+                                content = Self::media_fallback_content(content, msg);
 
                                 if content.is_empty() {
                                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty or non-text message from {}", normalized));
                                     return;
                                 }
 
-                                // mention_only: skip group messages without a bot mention
-                                if mention_only && is_group {
-                                    let bot_phone = bot_phone_inner.lock();
-                                    let bot_lid = bot_lid_inner.lock();
-                                    if bot_phone.is_some() || bot_lid.is_some() {
-                                        let bp = bot_phone.as_deref().unwrap_or("");
-                                        let bl = bot_lid.as_deref();
-                                        if !Self::is_message_addressed_to_bot(msg, &content, bp, bl) {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
-                                            return;
-                                        }
-                                    } else {
-                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
-                                        return;
-                                    }
-                                }
-
-                                // ── Mention-pattern gating ──
-                                // Apply dm_mention_patterns for DMs and
-                                // group_mention_patterns for group chats.
-                                // When the applicable pattern set is non-empty,
-                                // messages without a match are dropped and
-                                // matched fragments are stripped.
-                                let content =
-                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                                if !passive_from_mention_gating_possible {
+                                    content = match super::whatsapp::WhatsAppChannel::apply_mention_gating(
                                         &wa_dm_mention_patterns,
                                         &wa_group_mention_patterns,
                                         &content,
@@ -2067,6 +2315,7 @@ impl Channel for WhatsAppWebChannel {
                                             return;
                                         }
                                     };
+                                }
 
                                 let mut attachments = Vec::new();
                                 Self::collect_media_attachments(
@@ -2088,27 +2337,17 @@ impl Channel for WhatsAppWebChannel {
                                     .await;
                                 }
 
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        channel_alias: Some((*alias).clone()),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group),
-                                        // passed through unchanged (library handles
-                                        // LID addressing internally).
-                                        reply_target,
-                                        content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                        interruption_scope_id: None,
-                                        attachments,
-                                        subject: None,
-                                    })
-                                    .await
-                                {
-                                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "failed to send message to channel");
-                                }
+                                Self::send_inbound_channel_message(
+                                    &tx_inner,
+                                    alias.as_ref(),
+                                    &normalized,
+                                    reply_target,
+                                    content,
+                                    attachments,
+                                    false,
+                                    conversation_scope,
+                                )
+                                .await;
                             }
                             Event::Connected(_) => {
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
@@ -2478,18 +2717,53 @@ mod tests {
         );
         let markers = raw
             .into_iter()
-            .filter_map(|(kind, target)| WhatsAppMediaMarker::from_shared_marker(kind, target))
+            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
             .collect::<Vec<_>>();
 
         assert_eq!(cleaned, "send");
         assert_eq!(
-            markers.iter().map(|marker| marker.kind).collect::<Vec<_>>(),
+            markers
+                .iter()
+                .map(|marker| match marker {
+                    WhatsAppMarker::Media(m) => m.kind,
+                    WhatsAppMarker::Location(_) => panic!("expected media markers"),
+                })
+                .collect::<Vec<_>>(),
             vec![
                 WhatsAppMediaKind::Image,
                 WhatsAppMediaKind::Document,
                 WhatsAppMediaKind::Voice
             ]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn from_shared_marker_routes_location_kind() {
+        let marker = WhatsAppMarker::from_shared_marker(
+            "LOCATION".to_string(),
+            "40.7128,-74.0060".to_string(),
+        );
+        assert!(matches!(marker, Some(WhatsAppMarker::Location(_))));
+        // An invalid target still routes to the Location variant: validation
+        // is deferred to the send path so the marker counts as a failed
+        // delivery instead of being stripped silently.
+        assert_eq!(
+            WhatsAppMarker::from_shared_marker("LOCATION".to_string(), "999,999".to_string()),
+            Some(WhatsAppMarker::Location("999,999".to_string()))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_location_target_refuses_invalid_coordinates() {
+        // Out-of-range and malformed targets are refused — the send loop
+        // counts these as failed deliveries rather than sending a bogus pin.
+        for target in ["999,999", "not-a-number,0.0", "40.7128", ""] {
+            let err = validate_whatsapp_location_target(target)
+                .expect_err("out-of-range or malformed target must be refused");
+            assert_eq!(err.kind(), WhatsAppMarkerFailure::Refused, "{target}");
+        }
     }
 
     #[test]
@@ -2595,11 +2869,23 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn delivery_failure_note_is_count_only() {
-        let note = whatsapp_delivery_failure_note(2).expect("note");
+        let count: usize = 2;
+        let note = whatsapp_delivery_failure_note(count).expect("note");
 
-        assert!(note.contains("2 WhatsApp media attachments"));
-        assert!(!note.contains("/"));
-        assert!(!note.contains("workspace"));
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English phrase used to live here but the assertion would break
+        // on any CI runner with a non-English `$LANG`.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(count.to_string().as_str()),
+            "note must contain the failure count"
+        );
+        assert!(!note.contains("/"), "note must not contain path separators");
+        assert!(
+            !note.contains("workspace"),
+            "note must not echo local marker targets"
+        );
     }
 
     #[test]
@@ -2625,6 +2911,40 @@ mod tests {
         let dm_jid = "987654321098765@s.whatsapp.net";
         let admitted = !is_group || super::is_group_chat_allowed(dm_jid, &groups);
         assert!(admitted);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passive_group_context_is_default_off_and_group_only() {
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            false, true, false
+        ));
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            true, false, false
+        ));
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            true, true, true
+        ));
+        assert!(WhatsAppWebChannel::should_record_passive_group_context(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passive_group_context_uses_reply_target_scope_for_groups() {
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(false, true),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(true, false),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(true, true),
+            ChannelConversationScope::ReplyTarget
+        );
     }
 
     #[test]
@@ -3367,6 +3687,73 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content_leaves_non_media_messages_empty() {
         let msg = waproto::whatsapp::Message::default();
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_parses_static_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                name: Some("NYC".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Location: 40.712800, -74.006000 — NYC]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_live_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                is_live: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_missing_coordinates() {
+        // Missing longitude — should silently drop, not fabricate 0,0
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: None,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+        // Missing latitude
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: None,
+                degrees_longitude: Some(-74.0060),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
         assert_eq!(
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             ""

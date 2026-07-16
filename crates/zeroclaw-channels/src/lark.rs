@@ -81,10 +81,10 @@ impl LarkPlatform {
     }
 
     fn channel_name(self) -> &'static str {
-        match self {
-            Self::Lark => "lark",
-            Self::Feishu => "feishu",
-        }
+        // Always "lark" for routing identity. `use_feishu` only selects
+        // the API endpoint and display name — the config schema, agent
+        // bindings, and peer groups all use `lark.<alias>`.
+        "lark"
     }
 }
 
@@ -1595,7 +1595,8 @@ impl LarkChannel {
                         interruption_scope_id: None,
                     attachments: vec![],
                         subject: None,
-                    };
+
+                        ..Default::default()};
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
                     if tx.send(channel_msg).await.is_err() { break; }
@@ -2270,6 +2271,8 @@ impl LarkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         }]
     }
 
@@ -2688,6 +2691,8 @@ impl LarkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -2753,6 +2758,15 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API on the Lark/Feishu Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn add_reaction(
@@ -3176,6 +3190,7 @@ impl Channel for LarkChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if message_id.is_empty() {
             return self.send(&SendMessage::new(text, recipient)).await;
@@ -4870,7 +4885,7 @@ mod tests {
 
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
-        assert_eq!(ch.name(), "feishu");
+        assert_eq!(ch.name(), "lark");
     }
 
     #[test]
@@ -6099,9 +6114,9 @@ mod tests {
 
         assert_eq!(
             ch.name(),
-            "feishu",
-            "use_feishu=true must surface the channel identity as 'feishu' \
-             (registry key alignment — see orchestrator::deliver_announcement)"
+            "lark",
+            "use_feishu=true still uses 'lark' as routing identity — \
+             use_feishu only selects the API endpoint"
         );
 
         let message = SendMessage::new("hi from cron", "oc_test_chat_id");
@@ -6342,6 +6357,7 @@ mod tests {
             "oc_test_chat_id",
             "om_draft_media",
             "final caption [IMAGE:draft.png]",
+            false,
         )
         .await
         .expect("finalize_draft should clean text and send image");

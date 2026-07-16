@@ -146,6 +146,13 @@ validate_feature() {
   die "Unknown feature '$1'. Run: $0 --list-features"
 }
 
+selected_feature_enabled() {
+  case ",$USER_FEATURES," in
+  *",$1,"*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # ── List features ─────────────────────────────────────────────────
 
 list_features() {
@@ -164,7 +171,7 @@ list_features() {
     default | ci-all | fantoccini | landlock | metrics) continue ;;
     channel-*) channels="${channels:+$channels, }$feat" ;;
     observability-*) observability="${observability:+$observability, }$feat" ;;
-    hardware | peripheral-* | sandbox-* | browser-* | probe | rag-pdf | webauthn)
+    hardware | peripheral-* | sandbox-* | browser-* | probe | webauthn)
       platform="${platform:+$platform, }$feat"
       ;;
     *) other="${other:+$other, }$feat" ;;
@@ -295,8 +302,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries use the lean default bundle."
-  info "For Slack/Discord or all bundled channels, build from source with --preset full."
+  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -384,7 +391,10 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (historical broad channel bundle). Source builds only.
+                       'full' (every channel plus heavyweight extras such as
+                       whatsapp-web and channel-matrix). Source builds only.
+  --full               Install everything: the 'full' feature preset plus every
+                       installable app (implies --source)
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -408,7 +418,8 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
-  $0 --source --preset full                   # broad channel bundle
+  $0 --source --preset full                   # every channel plus heavyweight extras
+  $0 --full                                    # everything: full preset + every app
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -654,6 +665,16 @@ install_web_dist() {
   fi
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
+  # Prune files the fresh build no longer ships. Copy-then-prune keeps
+  # index.html present throughout, so a running gateway never 503s
+  # mid-install, while stale hashed chunks still get removed.
+  (
+    cd "$web_data_dir" || exit 0
+    find . -type f | while IFS= read -r f; do
+      [ -f "$src_dist/$f" ] || rm -f "$f"
+    done
+    find . -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+  )
   info "Web dashboard installed to $web_data_dir"
 }
 
@@ -668,11 +689,18 @@ install_web_dist() {
 # present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
+  required="${2:-false}"
   if [ ! -d "$src_dir/web" ]; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a web/ directory in the source checkout."
+    fi
     warn "Source has no web/ directory; skipping dashboard build."
     return 0
   fi
   if ! command -v npm >/dev/null 2>&1; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires Node.js/npm to build web/dist before cargo install. Install the Node version from .nvmrc and re-run, or remove embedded-web."
+    fi
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
     warn "  --source to build and install the dashboard."
@@ -683,6 +711,9 @@ build_web_dashboard() {
   # re-runs cheap.
   info "Building web dashboard (cargo web build)..."
   (cd "$src_dir" && cargo web build) || {
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a successful dashboard build before cargo install."
+    fi
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }
@@ -731,6 +762,7 @@ PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-featur
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
+FULL_APPS=false # true when --full: install every discovered app, not just the defaults
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -753,6 +785,11 @@ while [ $# -gt 0 ]; do
     full) PRESET="full" ;;
     *) die "Unknown preset '$1'. Expected: minimal or full" ;;
     esac
+    ;;
+  --full)
+    # Everything: the 'full' feature preset plus every installable app.
+    PRESET="full"
+    FULL_APPS=true
     ;;
   --features)
     if [ $# -lt 2 ]; then
@@ -998,6 +1035,22 @@ See all available features:
     esac
   fi
 
+  # `--preset full` must actually deliver the broad bundle the installer
+  # advertises (whatsapp-web, channel-matrix, the heavyweight extras), not
+  # Cargo's lean `default`. Resolve the explicit feature list from the
+  # canonical registry (`cargo generate features --selection all`), the same
+  # source of truth the release workflow consumes, and build with
+  # --no-default-features against it so the advertised set is exact.
+  if [ "$PRESET" = "full" ]; then
+    preset_features=$(cargo run --quiet -p xtask --bin generate -- features --selection all 2>/dev/null || true)
+    if [ -n "$preset_features" ]; then
+      CARGO_FLAGS="--no-default-features"
+      USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$preset_features"
+    else
+      warn "Could not resolve --preset full from the feature registry; falling back to default features."
+    fi
+  fi
+
   # Interactive picker — only when the operator did not pin features or
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
@@ -1065,7 +1118,7 @@ See all available features:
       fi
     fi
     if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-      info "--preset full: building from source with the historical broad channel bundle."
+      info "--preset full: building from source with the complete feature set (every channel plus heavyweight extras) resolved from the registry."
     fi
   fi
 
@@ -1075,6 +1128,11 @@ See all available features:
 
   # ── Build and install ─────────────────────────────────────────────
 
+  WANT_EMBEDDED_WEB=false
+  if selected_feature_enabled embedded-web; then
+    WANT_EMBEDDED_WEB=true
+  fi
+
   echo
   printf "%s\n" "$(bold "Building ZeroClaw v$VERSION")"
   if [ -n "$CARGO_FLAGS" ]; then
@@ -1083,6 +1141,16 @@ See all available features:
     info "Feature flags: (defaults)"
   fi
   echo
+
+  # embedded-web includes web/dist at Rust compile time, so the dashboard must
+  # exist before cargo install reaches zeroclaw-gateway's build script.
+  if [ "$WANT_EMBEDDED_WEB" = true ]; then
+    if [ "$DRY_RUN" = true ]; then
+      info "[dry-run] Would build web dashboard before cargo install for embedded-web"
+    else
+      build_web_dashboard "$INSTALL_DIR" true
+    fi
+  fi
 
   # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
@@ -1110,7 +1178,13 @@ See all available features:
   esac
   if [ "$WANT_GATEWAY" = true ]; then
     if [ "$DRY_RUN" = true ]; then
-      info "[dry-run] Would build web dashboard"
+      if [ "$WANT_EMBEDDED_WEB" = true ]; then
+        info "[dry-run] Web dashboard would already be built for embedded-web"
+      else
+        info "[dry-run] Would build web dashboard"
+      fi
+    elif [ "$WANT_EMBEDDED_WEB" = true ]; then
+      info "Web dashboard already built for embedded-web"
     else
       build_web_dashboard "$INSTALL_DIR"
     fi
@@ -1124,16 +1198,33 @@ See all available features:
   # Resolve the app set: explicit --apps list, "none" to skip, or the
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
-  if [ "$USER_APPS" = "none" ]; then
+  if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
+    # --full installs every discovered app (an explicit --apps still wins) —
+    # except Tauri-based apps (tauri.conf.json present): they need the Tauri
+    # toolchain + system webview deps (webkit2gtk/GTK on Linux), which most
+    # machines don't have. Request them explicitly via --apps to opt in.
+    WANT_APPS=""
+    for app in $APPS; do
+      app_path=$(app_dir_for "$app") || continue
+      if [ -f "$app_path/tauri.conf.json" ]; then
+        info "Skipping $app: Tauri app needs system webview deps — install explicitly with --apps $app"
+        continue
+      fi
+      WANT_APPS="${WANT_APPS:+$WANT_APPS }$app"
+    done
+  elif [ "$USER_APPS" = "none" ]; then
     WANT_APPS=""
   elif [ -n "$USER_APPS" ]; then
     WANT_APPS=$(printf '%s' "$USER_APPS" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd' ' -)
     for app in $WANT_APPS; do validate_app "$app"; done
   else
     WANT_APPS="$DEFAULT_APPS"
-    if [ "$WITHOUT_TUI" = true ]; then
-      WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
-    fi
+  fi
+
+  # --without-tui drops the TUI app from the resolved default or --full
+  # set (an explicit --apps list is honored as-is).
+  if [ "$WITHOUT_TUI" = true ] && [ -z "$USER_APPS" ]; then
+    WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
   fi
 
   # agent-runtime is a default feature; if defaults are stripped and it
