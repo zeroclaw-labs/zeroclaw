@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
@@ -204,7 +204,7 @@ impl Tool for ToolSearchTool {
         if query.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("query parameter is required".into()),
             });
         }
@@ -305,7 +305,7 @@ impl Tool for ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -391,7 +391,7 @@ impl ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

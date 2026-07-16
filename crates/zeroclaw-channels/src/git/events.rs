@@ -425,7 +425,7 @@ pub fn event_to_sop_message(
 }
 
 fn sop_topic(channel_key: &str, alias: &str, event_type: &str) -> String {
-    format!("{channel_key}.{alias}:{event_type}")
+    zeroclaw_api::channel::ChannelSopTopic::build(channel_key, alias, event_type)
 }
 
 fn event_target(event: &GitEvent) -> String {
