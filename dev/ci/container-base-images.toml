@@ -14,7 +14,7 @@ repo = "library/node"
 image_ref = "node"
 discover = true
 tag = "24-bookworm-slim"
-digest = "sha256:b31e7a42fdf8b8aa5f5ed477c72d694301273f1069c5a2f71d53c6482e99a2fc"
+digest = "sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d"
 
 [[image]]
 zone = "base-arg-rust-slim"
@@ -41,7 +41,7 @@ registry = "dockerhub"
 repo = "library/debian"
 image_ref = "debian"
 tag = "trixie-slim"
-digest = "sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2"
+digest = "sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd"
 
 [[image]]
 zone = "base-arg-distroless"
@@ -50,4 +50,4 @@ registry = "gcr"
 repo = "distroless/cc-debian13"
 image_ref = "gcr.io/distroless/cc-debian13"
 tag = "nonroot"
-digest = "sha256:d3cda6e91129130d7229a1806b6a73d292ef245ab032da7851907798024cefba"
+digest = "sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775"
