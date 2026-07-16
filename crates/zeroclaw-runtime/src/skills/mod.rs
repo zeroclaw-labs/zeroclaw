@@ -91,6 +91,15 @@ pub struct Skill {
     pub slash_options: Vec<SkillSlashOption>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When set, sessions using this skill command are automatically routed to this provider.
+    #[serde(skip)]
+    pub provider: Option<String>,
+    /// Natural-language trigger phrases for auto-activation (from SKILL.toml triggers = [...]).
+    #[serde(skip)]
+    pub triggers: Vec<String>,
+    /// Tools blocked when the current user message contains an image attachment.
+    #[serde(skip)]
+    pub blocked_tools_with_image: Vec<String>,
 }
 
 /// Why the audited resolver dropped a candidate skill directory/file.
@@ -370,6 +379,18 @@ struct SkillMeta {
     prompts: Vec<String>,
     #[serde(default)]
     slash_options: Vec<SkillSlashOption>,
+    #[serde(default)]
+    provider: Option<String>,
+    /// Natural-language trigger phrases; any match activates this skill's provider override.
+    /// Use "__image__" to match any message containing an image attachment.
+    #[serde(default)]
+    triggers: Vec<String>,
+    /// Tools that are forbidden when the current user message contains an image.
+    /// Used to enforce two-turn protocols at the architecture level: e.g. food-logger
+    /// blocks `sparky__sparky_manage_food` on photo turns so auto-logging is
+    /// architecturally impossible, not just prompt-discouraged.
+    #[serde(default)]
+    blocked_tools_with_image: Vec<String>,
 }
 
 /// Provenance metadata emitted by the SkillForge integrator (see
@@ -611,6 +632,80 @@ fn dir_stem(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Match a message against skill auto-activation rules and return the first
+/// matching skill.
+///
+/// Match priority per skill, scanning skills in order:
+/// 1. Slash command: `/skill_name` (hyphen/underscore-insensitive, optional
+///    `@botname` suffix).
+/// 2. Trigger phrases from SKILL.toml `triggers = [...]`, matched
+///    case-insensitively on word boundaries so short triggers like "i had"
+///    cannot fire inside unrelated words.
+/// 3. The `__image__` sentinel trigger, which matches any message that
+///    carries an image attachment (`has_image`).
+///
+/// Callers decide what counts as an image attachment; channel surfaces derive
+/// `has_image` from the typed attachment envelope
+/// (`MediaAttachment::kind() == MediaKind::Image`), never from message text,
+/// so literal `[IMAGE:` content cannot impersonate an attachment.
+///
+/// Skills are scanned in the order the caller provides; discovery sorts
+/// directory entries lexically, so overlapping triggers resolve to the
+/// lexically-first skill deterministically.
+pub fn match_skill_activation<'a>(
+    skills: &'a [Skill],
+    message: &str,
+    has_image: bool,
+) -> Option<&'a Skill> {
+    let trimmed = message.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for skill in skills {
+        // 1. Slash command match: /food_logger or /food-logger.
+        if trimmed.starts_with('/') {
+            let cmd = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .strip_prefix('/')
+                .unwrap_or("")
+                .split('@')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let norm_cmd: String = cmd
+                .chars()
+                .map(|c| if c == '-' { '_' } else { c })
+                .collect();
+            let norm_skill: String = skill
+                .name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if c == '-' { '_' } else { c })
+                .collect();
+            if norm_cmd == norm_skill {
+                return Some(skill);
+            }
+        }
+
+        // 2. Trigger phrases, word-boundary matched. 3. `__image__` sentinel.
+        for trigger in &skill.triggers {
+            let matches = if trigger == "__image__" {
+                has_image
+            } else {
+                let pat = format!(r"\b{}\b", regex::escape(&trigger.to_ascii_lowercase()));
+                regex::Regex::new(&pat)
+                    .map(|re| re.is_match(&lower))
+                    .unwrap_or(false)
+            };
+            if matches {
+                return Some(skill);
+            }
+        }
+    }
+    None
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None, None).0
@@ -662,6 +757,38 @@ pub fn load_skills_for_agent(
     agent_alias: &str,
 ) -> Vec<Skill> {
     load_skills_for_agent_audited(workspace_dir, config, agent_alias).0
+}
+
+/// Fast-path guard for the per-message skill auto-activation scan: answers
+/// "does any skill this agent can load declare auto-activation behavior
+/// (`provider` or `blocked_tools_with_image`)?" and memoizes the answer per
+/// `(workspace dir, agent alias)`, so agents with no such skills skip the
+/// full [`load_skills_for_agent`] walk (directory reads plus content-digest
+/// hashing) on every inbound message.
+///
+/// Freshness: the memo is dropped by [`cache::invalidate`], which the
+/// [`SkillsService`] calls on every skill write/remove, so in-band skill
+/// changes flip the gate on the next message. Writers that cannot reach this
+/// process's invalidate — the CLI `skills install` running as a separate
+/// process, or the open-skills git sync mutating the directory from a load
+/// path this gate skips — are covered by a bounded TTL on every verdict: a
+/// stale `false` (newly installed auto-activation skill) goes live within a
+/// minute without a restart, and a stale `true` (last such skill removed)
+/// stops paying the per-message skill walk within a minute. An invalidate
+/// that lands while a verdict is being computed retires that verdict via an
+/// epoch check rather than letting it overwrite fresher state. The
+/// `ZEROCLAW_SKILLS_CACHE_ENABLED` kill-switch disables the memo along with
+/// the load cache.
+pub fn agent_declares_activation_skills(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> bool {
+    cache::cached_activation_gate(workspace_dir, agent_alias, || {
+        load_skills_for_agent(workspace_dir, config, agent_alias)
+            .iter()
+            .any(|s| s.provider.is_some() || !s.blocked_tools_with_image.is_empty())
+    })
 }
 
 /// Origin tag for a pre-bundle skill, mirroring [`super::service`]'s
@@ -847,6 +974,20 @@ pub fn load_skills_from_directory(
     (out.skills, out.dropped)
 }
 
+/// Single ordering seam for skill discovery: collect entry paths in lexical
+/// order. Every loader routes its `read_dir` entries through this so skill
+/// precedence ("first match wins" in activation) is deterministic across
+/// filesystems and restarts — `read_dir` iteration order is explicitly
+/// unspecified, and the winner of an overlapping trigger controls a safety
+/// restriction (#8965). Injectable input exists so the regression test can
+/// feed an explicitly shuffled list, which a `read_dir`-based fixture cannot
+/// guarantee (a filesystem may happen to iterate lexically on its own).
+fn lexically_sorted_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
+    paths.sort();
+    paths
+}
+
 fn load_skills_from_directory_uncached(
     skills_dir: &Path,
     allow_scripts: bool,
@@ -861,8 +1002,7 @@ fn load_skills_from_directory_uncached(
         return (skills, dropped);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in lexically_sorted_paths(entries.flatten().map(|e| e.path())) {
         if !path.is_dir() {
             continue;
         }
@@ -990,8 +1130,7 @@ fn load_open_skills_from_directory_uncached(
         return (skills, dropped);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in lexically_sorted_paths(entries.flatten().map(|e| e.path())) {
         if !path.is_dir() {
             continue;
         }
@@ -1099,8 +1238,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
         return (skills, dropped);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in lexically_sorted_paths(entries.flatten().map(|e| e.path())) {
         if !path.is_file() {
             continue;
         }
@@ -1417,6 +1555,9 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         prompts,
         slash_options: manifest.skill.slash_options,
         location: Some(path.to_path_buf()),
+        provider: manifest.skill.provider,
+        triggers: manifest.skill.triggers,
+        blocked_tools_with_image: manifest.skill.blocked_tools_with_image,
     })
 }
 
@@ -1446,6 +1587,9 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
+        provider: None,
+        triggers: vec![],
+        blocked_tools_with_image: vec![],
     })
 }
 
@@ -1488,6 +1632,9 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
+        provider: None,
+        triggers: vec![],
+        blocked_tools_with_image: vec![],
     }))
 }
 
@@ -3887,6 +4034,185 @@ descriptin = "oops"
         );
     }
 
+    /// The auto-activation fields must parse under `deny_unknown_fields`
+    /// and map through to the loaded `Skill`.
+    #[test]
+    fn accepts_auto_activation_fields_in_skill_block() {
+        let toml_str = r#"
+[skill]
+name = "food-logger"
+description = "y"
+provider = "openai-codex"
+triggers = ["__image__", "log food"]
+blocked_tools_with_image = ["sparky__sparky_manage_food"]
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str)
+            .expect("manifest with auto-activation fields should parse under deny_unknown_fields");
+        assert_eq!(manifest.skill.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(manifest.skill.triggers, vec!["__image__", "log food"]);
+        assert_eq!(
+            manifest.skill.blocked_tools_with_image,
+            vec!["sparky__sparky_manage_food"]
+        );
+    }
+
+    fn activation_skill(name: &str, triggers: &[&str]) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: String::new(),
+            description_localizations: Default::default(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            slash_options: vec![],
+            location: None,
+            provider: Some("openai-codex".to_string()),
+            triggers: triggers.iter().map(|s| (*s).to_string()).collect(),
+            blocked_tools_with_image: vec![],
+        }
+    }
+
+    #[test]
+    fn activation_matches_slash_command_with_hyphen_underscore_and_bot_suffix() {
+        let skills = vec![activation_skill("food-logger", &[])];
+        for msg in [
+            "/food_logger",
+            "/food-logger log this",
+            "/food_logger@mybot hi",
+        ] {
+            let hit = match_skill_activation(&skills, msg, false);
+            assert_eq!(hit.map(|s| s.name.as_str()), Some("food-logger"), "{msg}");
+        }
+        assert!(match_skill_activation(&skills, "/other", false).is_none());
+    }
+
+    #[test]
+    fn activation_matches_trigger_on_word_boundary_only() {
+        let skills = vec![activation_skill("food-logger", &["i had"])];
+        assert!(match_skill_activation(&skills, "I had a burger", false).is_some());
+        // "i had" inside other words must not fire.
+        assert!(match_skill_activation(&skills, "trinidad semihadron", false).is_none());
+    }
+
+    #[test]
+    fn activation_matches_image_sentinel_only_with_image() {
+        let skills = vec![activation_skill("food-logger", &["__image__"])];
+        assert!(match_skill_activation(&skills, "[IMAGE:data:...] what is this", true).is_some());
+        assert!(match_skill_activation(&skills, "what is this", false).is_none());
+    }
+
+    #[test]
+    fn activation_returns_none_without_triggers_or_slash() {
+        let skills = vec![activation_skill("food-logger", &[])];
+        assert!(match_skill_activation(&skills, "hello there", false).is_none());
+        assert!(match_skill_activation(&skills, "hello there", true).is_none());
+    }
+
+    #[test]
+    fn activation_prefers_first_matching_skill_in_order() {
+        let skills = vec![
+            activation_skill("first", &["log food"]),
+            activation_skill("second", &["log food"]),
+        ];
+        let hit = match_skill_activation(&skills, "please log food now", false);
+        assert_eq!(hit.map(|s| s.name.as_str()), Some("first"));
+    }
+
+    /// Deterministic regression for the discovery ordering seam: a
+    /// `read_dir`-based fixture cannot force a hostile iteration order (a
+    /// filesystem may return lexical order on its own, letting an unsorted
+    /// loader pass), so the seam is exercised directly with an explicitly
+    /// shuffled input. All three skill loaders route their entries through
+    /// [`lexically_sorted_paths`]; removing the sort fails here every run.
+    #[test]
+    fn lexically_sorted_paths_orders_shuffled_input() {
+        let shuffled: Vec<PathBuf> = [
+            "mango-skill",
+            "zeta-skill",
+            "alpha-skill",
+            "tango-skill",
+            "echo-skill",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let expected: Vec<PathBuf> = [
+            "alpha-skill",
+            "echo-skill",
+            "mango-skill",
+            "tango-skill",
+            "zeta-skill",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(lexically_sorted_paths(shuffled), expected);
+    }
+
+    /// End-to-end loader + matcher coverage for deterministic precedence:
+    /// five on-disk skills share the `__image__` trigger, and the winner must
+    /// be the lexically-first directory. This proves the sorted seam is
+    /// actually wired into discovery and that the matcher honors the loader's
+    /// order; the deterministic anti-regression for the sort itself is
+    /// [`lexically_sorted_paths_orders_shuffled_input`], since `read_dir`
+    /// here may coincidentally iterate lexically on some filesystems.
+    #[test]
+    fn activation_overlapping_triggers_resolve_lexically_via_loader() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Created in a deliberately scrambled (non-lexical, non-reverse) order.
+        for name in [
+            "mango-skill",
+            "zeta-skill",
+            "alpha-skill",
+            "tango-skill",
+            "echo-skill",
+        ] {
+            let dir = skills_dir.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.toml"),
+                format!(
+                    r#"
+[skill]
+name = "{name}"
+description = "overlapping image trigger"
+provider = "openai-codex"
+triggers = ["__image__"]
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        assert!(dropped.is_empty(), "no drops expected; got: {dropped:?}");
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha-skill",
+                "echo-skill",
+                "mango-skill",
+                "tango-skill",
+                "zeta-skill"
+            ],
+            "loader must return skills in lexical directory order"
+        );
+
+        let hit = match_skill_activation(&skills, "what is this", true);
+        assert_eq!(
+            hit.map(|s| s.name.as_str()),
+            Some("alpha-skill"),
+            "overlapping __image__ trigger must resolve to the lexically-first skill"
+        );
+    }
+
     /// Positive control covering the new field × strictness intersection:
     /// after the rebase onto master (which added `prompts: Vec<String>`
     /// to `SkillMeta` per #5972), the field must continue to parse cleanly
@@ -4259,6 +4585,9 @@ mod prompt_callable_name_tests {
             prompts: Vec::new(),
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let prompt = skills_to_prompt_with_mode(
@@ -4336,6 +4665,9 @@ mod prompt_callable_name_tests {
             prompts: Vec::new(),
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let registered: Vec<String> =
@@ -4375,6 +4707,9 @@ mod prompt_callable_name_tests {
             prompts: Vec::new(),
             slash_options: Vec::new(),
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let prompt = skills_to_prompt_with_mode(
@@ -4461,6 +4796,54 @@ version = "0.1.0"
             ),
         )
         .unwrap();
+    }
+
+    /// #8965 review: `agent_declares_activation_skills` is false for an agent
+    /// whose skills declare no auto-activation fields, and flips to true after
+    /// an auto-activation skill lands and `cache::invalidate()` runs (what
+    /// every `SkillsService` write does).
+    #[test]
+    fn activation_gate_reflects_declared_skills_after_invalidate() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+        let agent_alias = "gate-agent";
+
+        write_test_skill(agent_workspace.path(), "plain-skill");
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        cache::invalidate();
+        assert!(
+            !agent_declares_activation_skills(agent_workspace.path(), &config, agent_alias),
+            "gate must be false with only a plain skill"
+        );
+
+        // Install an auto-activation skill, then invalidate as the
+        // SkillsService write path would.
+        let auto_dir = agent_workspace.path().join("skills").join("auto-skill");
+        std::fs::create_dir_all(&auto_dir).unwrap();
+        std::fs::write(
+            auto_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "auto-skill"
+description = "declares auto-activation"
+provider = "openai-codex"
+triggers = ["__image__"]
+blocked_tools_with_image = ["some_tool"]
+"#,
+        )
+        .unwrap();
+        cache::invalidate();
+
+        assert!(
+            agent_declares_activation_skills(agent_workspace.path(), &config, agent_alias),
+            "gate must flip to true after the activation skill is installed and invalidated"
+        );
     }
 
     /// #7963: `load_skills_for_agent_from_config_audited` returns the loaded

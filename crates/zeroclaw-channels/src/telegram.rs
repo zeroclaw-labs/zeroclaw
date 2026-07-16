@@ -25,6 +25,8 @@ struct IncomingAttachment {
     file_name: Option<String>,
     file_size: Option<u64>,
     caption: Option<String>,
+    /// Sender-declared MIME type (documents only; Telegram photos carry none).
+    mime_type: Option<String>,
     kind: IncomingAttachmentKind,
 }
 
@@ -350,19 +352,6 @@ impl TelegramAttachmentKind {
     }
 }
 
-/// Check whether a file path has a recognized image extension.
-fn is_image_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Map a TTS audio output format to the Telegram send method, multipart field
 /// name, upload filename, and MIME type.
 ///
@@ -398,24 +387,27 @@ fn telegram_audio_send_spec(
 
 /// Build the user-facing content string for an incoming attachment.
 ///
-/// Photos with a recognized image extension use `[IMAGE:/path]` so the
-/// multimodal pipeline can validate vision capability. Non-image files
-/// always use `[Document: name] /path` regardless of how Telegram
-/// classified them.
+/// Anything the typed envelope conservatively classifies as an image
+/// (`looks_like_image()`: image MIME, image extension, or image magic
+/// bytes) uses `[IMAGE:/path]` so the multimodal pipeline can validate
+/// vision capability, regardless of whether Telegram delivered it as a
+/// photo or a document. Marker and envelope agreeing matters downstream:
+/// the media pipeline suppresses its own base64-inlining annotation only
+/// for attachments whose path the channel already marked in the text, so
+/// an image sent "as file" (even extensionless) must not fall back to the
+/// `[Document: name] /path` format reserved for genuine non-images.
 fn format_attachment_content(
-    kind: IncomingAttachmentKind,
-    local_filename: &str,
+    attachment: &zeroclaw_api::media::MediaAttachment,
     local_path: &Path,
 ) -> String {
-    match kind {
-        IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document
-            if is_image_extension(local_path) =>
-        {
-            format!("[IMAGE:{}]", local_path.display())
-        }
-        _ => {
-            format!("[Document: {}] {}", local_filename, local_path.display())
-        }
+    if attachment.looks_like_image() {
+        format!("[IMAGE:{}]", local_path.display())
+    } else {
+        format!(
+            "[Document: {}] {}",
+            attachment.file_name,
+            local_path.display()
+        )
     }
 }
 
@@ -1818,6 +1810,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .and_then(serde_json::Value::as_str)
                 .map(String::from);
             let file_size = doc.get("file_size").and_then(serde_json::Value::as_u64);
+            let mime_type = doc
+                .get("mime_type")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
             let caption = message
                 .get("caption")
                 .and_then(serde_json::Value::as_str)
@@ -1827,6 +1823,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 file_name,
                 file_size,
                 caption,
+                mime_type,
                 kind: IncomingAttachmentKind::Document,
             });
         }
@@ -1845,6 +1842,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 file_name: None,
                 file_size,
                 caption,
+                mime_type: None,
                 kind: IncomingAttachmentKind::Photo,
             });
         }
@@ -1858,7 +1856,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// `ChannelMessage` with the local file path. Returns `None` if the message
     /// is not an attachment, workspace_dir is not configured, or the file exceeds
     /// size limits.
-    async fn try_parse_attachment_message(
+    /// `pub(crate)` so orchestrator regressions can drive a REAL parsed
+    /// Telegram update through `process_channel_message` (the #8965 live
+    /// smoke failed precisely in the seam between this parser and the
+    /// orchestrator's typed image gate).
+    pub(crate) async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
     ) -> Option<ChannelMessage> {
@@ -1994,11 +1996,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Build message content.
-        // Photos with image extensions use [IMAGE:] marker so the multimodal
-        // pipeline validates vision capability. Non-image files always get
-        // [Document:] format regardless of Telegram's classification.
-        let mut content = format_attachment_content(attachment.kind, &local_filename, &local_path);
+        // Carry a typed envelope alongside the content marker (parity with
+        // Discord's documented attachment contract). Downstream consumers such
+        // as skill auto-activation read image presence from `msg.attachments`,
+        // never from marker text, so an empty envelope here would leave a real
+        // photo turn undetected. Applies to documents too, with the sender's
+        // declared MIME carried through: `looks_like_image()` classifies by
+        // MIME, extension, or magic bytes, so an image sent "as file" (even
+        // extensionless) cannot sidestep image-turn behavior.
+        let media_attachment = zeroclaw_api::media::MediaAttachment {
+            file_name: local_filename.clone(),
+            data: file_data,
+            mime_type: attachment.mime_type.clone(),
+        };
+
+        // Build message content. The marker is decided by the envelope's
+        // conservative image verdict, not Telegram's photo/document
+        // classification, so image documents get the same re-loadable
+        // [IMAGE:] marker as photos and the media pipeline can recognize
+        // them as already-marked instead of re-inlining base64.
+        let mut content = format_attachment_content(&media_attachment, &local_path);
         // `gated_caption` is the trimmed caption when the `mention_only`
         // gate admits it; otherwise the raw caption (or None).
         if let Some(caption) = gated_caption.as_deref()
@@ -2031,7 +2048,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
-            attachments: vec![],
+            attachments: vec![media_attachment],
             subject: None,
 
             ..Default::default()
@@ -7098,15 +7115,27 @@ mod tests {
 
     // ── Attachment content format tests ──────────────────────────────
 
+    /// Build a typed envelope for content-format tests.
+    fn envelope(
+        file_name: &str,
+        mime_type: Option<&str>,
+        data: &[u8],
+    ) -> zeroclaw_api::media::MediaAttachment {
+        zeroclaw_api::media::MediaAttachment {
+            file_name: file_name.to_string(),
+            data: data.to_vec(),
+            mime_type: mime_type.map(str::to_string),
+        }
+    }
+
     /// Photo attachments with image extension must use `[IMAGE:/path]` marker
     /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
     fn attachment_photo_content_uses_image_marker() {
         let local_path = std::path::Path::new("/tmp/workspace/photo_123_45.jpg");
-        let local_filename = "photo_123_45.jpg";
 
         let content =
-            format_attachment_content(IncomingAttachmentKind::Photo, local_filename, local_path);
+            format_attachment_content(&envelope("photo_123_45.jpg", None, &[]), local_path);
 
         assert_eq!(content, "[IMAGE:/tmp/workspace/photo_123_45.jpg]");
         assert!(content.starts_with("[IMAGE:"));
@@ -7117,42 +7146,60 @@ mod tests {
     #[test]
     fn attachment_document_content_uses_document_label() {
         let local_path = std::path::Path::new("/tmp/workspace/report.pdf");
-        let local_filename = "report.pdf";
 
-        let content =
-            format_attachment_content(IncomingAttachmentKind::Document, local_filename, local_path);
+        let content = format_attachment_content(
+            &envelope("report.pdf", Some("application/pdf"), &[]),
+            local_path,
+        );
 
         assert_eq!(content, "[Document: report.pdf] /tmp/workspace/report.pdf");
         assert!(!content.contains("[IMAGE:"));
+    }
+
+    /// An image sent "as file" must get the `[IMAGE:]` marker even without an
+    /// image extension, as long as any envelope signal (MIME here, magic bytes
+    /// below) says it is an image. The marker keeps the media pipeline from
+    /// re-inlining the same image as base64 (#8965 review round 3).
+    #[test]
+    fn image_document_content_uses_image_marker() {
+        let local_path = std::path::Path::new("/tmp/workspace/telegram_files/upload");
+
+        // Sender-declared image MIME, no extension.
+        let content =
+            format_attachment_content(&envelope("upload", Some("image/jpeg"), &[]), local_path);
+        assert_eq!(content, "[IMAGE:/tmp/workspace/telegram_files/upload]");
+
+        // Magic bytes only: no MIME, no extension.
+        let content = format_attachment_content(
+            &envelope("upload", None, &[0xFF, 0xD8, 0xFF, 0xE0]),
+            local_path,
+        );
+        assert_eq!(content, "[IMAGE:/tmp/workspace/telegram_files/upload]");
     }
 
     /// Markdown files must never produce `[IMAGE:]` markers (issue #1274).
     #[test]
     fn markdown_file_never_produces_image_marker() {
         let local_path = std::path::Path::new("/tmp/workspace/telegram_files/notes.md");
-        let local_filename = "notes.md";
 
-        // Even if Telegram misclassifies as Photo, extension guard prevents [IMAGE:].
-        let content =
-            format_attachment_content(IncomingAttachmentKind::Photo, local_filename, local_path);
+        // No envelope signal says image, so even a Telegram misclassification
+        // (photo vs document) cannot produce an [IMAGE:] marker: the verdict
+        // comes from the envelope, not from Telegram's kind.
+        let content = format_attachment_content(
+            &envelope("notes.md", None, b"# heading\nbody text"),
+            local_path,
+        );
         assert!(
             !content.contains("[IMAGE:"),
             "markdown must not get [IMAGE:] marker: {content}"
         );
         assert!(content.starts_with("[Document:"));
-
-        // As Document, it should also be correct.
-        let content_doc =
-            format_attachment_content(IncomingAttachmentKind::Document, local_filename, local_path);
-        assert!(
-            !content_doc.contains("[IMAGE:"),
-            "markdown document must not get [IMAGE:] marker: {content_doc}"
-        );
     }
 
-    /// Non-image files classified as Photo fall back to `[Document:]` format.
+    /// Non-image files fall back to `[Document:]` format regardless of how
+    /// Telegram classified them (the envelope decides, not the kind).
     #[test]
-    fn non_image_photo_falls_back_to_document_format() {
+    fn non_image_attachment_falls_back_to_document_format() {
         for (filename, ext_path) in [
             ("file.md", "/tmp/ws/file.md"),
             ("file.txt", "/tmp/ws/file.txt"),
@@ -7163,7 +7210,8 @@ mod tests {
             ("file", "/tmp/ws/file"),
         ] {
             let path = std::path::Path::new(ext_path);
-            let content = format_attachment_content(IncomingAttachmentKind::Photo, filename, path);
+            let content =
+                format_attachment_content(&envelope(filename, None, b"not image bytes"), path);
             assert!(
                 !content.contains("[IMAGE:"),
                 "{filename}: non-image file should not get [IMAGE:] marker, got: {content}"
@@ -7175,14 +7223,14 @@ mod tests {
         }
     }
 
-    /// All recognized image extensions produce `[IMAGE:]` when classified as Photo.
+    /// All recognized image extensions produce `[IMAGE:]` markers.
     #[test]
     fn image_extensions_produce_image_marker() {
         for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp"] {
             let filename = format!("photo_1_2.{ext}");
             let path_str = format!("/tmp/ws/{filename}");
             let path = std::path::Path::new(&path_str);
-            let content = format_attachment_content(IncomingAttachmentKind::Photo, &filename, path);
+            let content = format_attachment_content(&envelope(&filename, None, &[]), path);
             assert!(
                 content.starts_with("[IMAGE:"),
                 "{ext}: image should get [IMAGE:] marker, got: {content}"
@@ -7195,8 +7243,7 @@ mod tests {
     #[test]
     fn markdown_attachment_not_detected_by_multimodal_image_markers() {
         let content = format_attachment_content(
-            IncomingAttachmentKind::Photo,
-            "notes.md",
+            &envelope("notes.md", None, b"# heading"),
             std::path::Path::new("/tmp/ws/notes.md"),
         );
         let messages = vec![zeroclaw_providers::ChatMessage::user(content)];
@@ -7205,24 +7252,6 @@ mod tests {
             0,
             "markdown file must not trigger image marker detection"
         );
-    }
-
-    /// `is_image_extension` helper recognizes image formats and rejects others.
-    #[test]
-    fn is_image_extension_recognizes_images() {
-        assert!(is_image_extension(std::path::Path::new("photo.png")));
-        assert!(is_image_extension(std::path::Path::new("photo.jpg")));
-        assert!(is_image_extension(std::path::Path::new("photo.jpeg")));
-        assert!(is_image_extension(std::path::Path::new("photo.gif")));
-        assert!(is_image_extension(std::path::Path::new("photo.webp")));
-        assert!(is_image_extension(std::path::Path::new("photo.bmp")));
-        assert!(is_image_extension(std::path::Path::new("PHOTO.PNG")));
-
-        assert!(!is_image_extension(std::path::Path::new("file.md")));
-        assert!(!is_image_extension(std::path::Path::new("file.txt")));
-        assert!(!is_image_extension(std::path::Path::new("file.pdf")));
-        assert!(!is_image_extension(std::path::Path::new("file.csv")));
-        assert!(!is_image_extension(std::path::Path::new("file")));
     }
 
     /// `count_image_markers` from the multimodal module must detect the
@@ -7277,8 +7306,10 @@ mod tests {
         std::fs::write(&doc_path, b"%PDF-1.4 fake").expect("write doc fixture");
         assert!(doc_path.exists(), "document file must exist on disk");
 
-        let doc_content =
-            format_attachment_content(IncomingAttachmentKind::Document, doc_filename, &doc_path);
+        let doc_content = format_attachment_content(
+            &envelope(doc_filename, Some("application/pdf"), b"%PDF-1.4 fake"),
+            &doc_path,
+        );
         assert!(
             doc_content.starts_with("[Document: report.pdf]"),
             "document label format mismatch: {doc_content}"
@@ -7300,8 +7331,9 @@ mod tests {
         std::fs::copy(&fixture, &photo_path).expect("copy photo fixture");
         assert!(photo_path.exists(), "photo file must exist on disk");
 
+        let photo_bytes = std::fs::read(&photo_path).expect("read photo fixture");
         let photo_content =
-            format_attachment_content(IncomingAttachmentKind::Photo, photo_filename, &photo_path);
+            format_attachment_content(&envelope(photo_filename, None, &photo_bytes), &photo_path);
         assert!(
             photo_content.starts_with("[IMAGE:"),
             "photo must use [IMAGE:] marker: {photo_content}"
@@ -7338,8 +7370,10 @@ mod tests {
         let md_filename = "notes.md";
         let md_path = workspace.path().join(md_filename);
         std::fs::write(&md_path, b"# Hello\nSome markdown").expect("write md fixture");
-        let md_content =
-            format_attachment_content(IncomingAttachmentKind::Photo, md_filename, &md_path);
+        let md_content = format_attachment_content(
+            &envelope(md_filename, None, b"# Hello\nSome markdown"),
+            &md_path,
+        );
         assert!(
             !md_content.contains("[IMAGE:"),
             "markdown must not get [IMAGE:] marker: {md_content}"
@@ -7917,6 +7951,216 @@ mod tests {
             "should not append ellipsis when within char limit"
         );
         assert_eq!(result, desc.trim());
+    }
+
+    #[tokio::test]
+    async fn inbound_photo_populates_typed_image_attachment_envelope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::media::MediaKind;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let photo_bytes: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02];
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_1\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "photo": [
+                    { "file_id": "small", "file_size": 10 },
+                    { "file_id": "best", "file_size": 20 }
+                ],
+                "caption": "log this automatically"
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("photo update should parse into a channel message");
+
+        // The typed envelope is the source of truth for image presence
+        // (skill auto-activation reads it, never the content marker), so a
+        // real photo must land here even though the marker is also emitted.
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].kind(), MediaKind::Image);
+        assert_eq!(msg.attachments[0].data, photo_bytes);
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "content marker must still be emitted for the multimodal pipeline: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_image_document_populates_image_kind_envelope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::media::MediaKind;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_7.jpg" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_7\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0x01u8, 0x02]))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 43,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "document": {
+                    "file_id": "doc1",
+                    "file_name": "menu.jpg",
+                    "file_size": 2
+                }
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("document update should parse into a channel message");
+
+        // An image sent "as file" must classify as an image in the envelope,
+        // so image-turn behavior cannot be sidestepped by attaching the photo
+        // as a document.
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].kind(), MediaKind::Image);
+        // And the content marker must match: an [IMAGE:] path marker, not
+        // [Document:], so the media pipeline recognizes the file as already
+        // marked instead of re-inlining it as base64.
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "image document must get an [IMAGE:] marker: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_extensionless_document_carries_mime_and_flags_image() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_8" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_8$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // An image uploaded as an extensionless document: no extension to
+        // classify by, only the sender-declared MIME (and, failing that, the
+        // payload's magic bytes). Both must reach the envelope so the image
+        // gate cannot be dodged by stripping the file name.
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 44,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "document": {
+                    "file_id": "doc2",
+                    "file_name": "upload",
+                    "mime_type": "image/jpeg",
+                    "file_size": 4
+                }
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("document update should parse into a channel message");
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].mime_type.as_deref(), Some("image/jpeg"));
+        assert!(msg.attachments[0].looks_like_image());
+        // Even without an extension, the envelope's image verdict must drive
+        // the content marker so downstream marker-based consumers (media
+        // pipeline dedup) agree with the typed envelope.
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "extensionless image document must get an [IMAGE:] marker: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("upload"),
+            "marker must carry the saved file path: {}",
+            msg.content
+        );
     }
 
     #[tokio::test]

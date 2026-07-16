@@ -65,6 +65,16 @@ impl<'a> MediaPipeline<'a> {
                     annotations.push(annotation);
                 }
                 MediaKind::Image if self.config.describe_images => {
+                    // Channels that save the image to disk (Telegram, Discord)
+                    // already emit a re-loadable `[IMAGE:<path>]` marker for
+                    // this attachment in the message text. Adding a second,
+                    // base64-inlined marker here would send the same image to
+                    // the provider twice and persist megabytes of base64 into
+                    // session history (the current turn is stored verbatim;
+                    // only older turns get inline payloads collapsed, #3460).
+                    if text_already_references_image(original_text, &attachment.file_name) {
+                        continue;
+                    }
                     let annotation = self.process_image(attachment);
                     annotations.push(annotation);
                 }
@@ -147,6 +157,37 @@ impl<'a> MediaPipeline<'a> {
     fn process_video(&self, attachment: &MediaAttachment) -> String {
         format!("[Video: {} attached]", attachment.file_name)
     }
+}
+
+/// True when the message text already carries an `[IMAGE:<target>]` marker
+/// whose target's final path component is exactly this attachment's file
+/// name, i.e. the channel saved the image to disk and emitted a re-loadable
+/// path marker itself. Each marker's target is parsed and compared by exact
+/// basename (not substring-matched), so a caption that merely mentions the
+/// file name next to an unrelated marker, or a marker for a differently
+/// named file, cannot suppress a genuinely new attachment. The match is not
+/// provenance-aware: a marker for a SAME-named file in another directory
+/// would still count, which is acceptable because the channels that emit
+/// these markers (Telegram, Discord) always add one for the attachment they
+/// deliver in the same message.
+fn text_already_references_image(text: &str, file_name: &str) -> bool {
+    if file_name.is_empty() {
+        return false;
+    }
+    let mut rest = text;
+    while let Some(start) = rest.find("[IMAGE:") {
+        let after = &rest[start + "[IMAGE:".len()..];
+        let Some(end) = after.find(']') else {
+            return false;
+        };
+        let target = &after[..end];
+        let basename = target.rsplit(['/', '\\']).next().unwrap_or(target);
+        if basename == file_name {
+            return true;
+        }
+        rest = &after[end + 1..];
+    }
+    false
 }
 
 fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
@@ -317,6 +358,135 @@ mod tests {
             "expected image data marker, got: {result}"
         );
         assert!(result.contains("check this"));
+    }
+
+    #[tokio::test]
+    async fn image_already_marked_by_channel_is_not_double_described() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // A channel (Telegram, Discord) that saved the file to disk emits a
+        // re-loadable path marker itself; the pipeline must not add a second,
+        // base64-inlined copy of the same image.
+        let original = "[IMAGE:/workspace/telegram_files/photo.jpg]\n\nlog this automatically";
+        let result = pipeline.process(original, &[sample_image()]).await;
+        assert_eq!(
+            result, original,
+            "pre-marked image must pass through unchanged"
+        );
+        assert!(
+            !result.contains("base64"),
+            "no inline base64 may be added for a pre-marked image: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_image_marker_does_not_suppress_new_attachment() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // A quoted older image marker for a DIFFERENT file must not swallow
+        // the annotation for the newly attached one.
+        let original = "[IMAGE:/workspace/telegram_files/old_photo.png] earlier pic";
+        let result = pipeline.process(original, &[sample_image()]).await;
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "new attachment must still be annotated: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_document_marked_by_channel_is_not_inlined() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // An image sent "as file" (extensionless, image MIME): the channel
+        // now emits the same [IMAGE:<path>] marker as for photos, so the
+        // pipeline must not add a second, base64-inlined copy (#8965 review
+        // round 3).
+        let attachment = MediaAttachment {
+            file_name: "upload".to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some("image/jpeg".to_string()),
+        };
+        let original = "[IMAGE:/workspace/telegram_files/upload]\n\nplease describe";
+        let result = pipeline.process(original, &[attachment]).await;
+        assert_eq!(
+            result, original,
+            "channel-marked image document must pass through unchanged"
+        );
+        assert!(
+            !result.contains("IMAGE:data:"),
+            "no inline base64 may be added for a channel-marked image document: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn caption_mentioning_file_name_does_not_suppress_new_attachment() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // The caption mentions the new file's name and an unrelated marker is
+        // present, but no marker actually targets photo.jpg. Substring
+        // matching would wrongly skip here; precise marker parsing must not.
+        let original = "[IMAGE:/workspace/telegram_files/old.png] compare with photo.jpg please";
+        let result = pipeline.process(original, &[sample_image()]).await;
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "a caption mention must not count as a channel marker: {result}"
+        );
+    }
+
+    #[test]
+    fn text_already_references_image_matches_marker_targets_precisely() {
+        // Exact basename match against a path marker.
+        assert!(text_already_references_image(
+            "[IMAGE:/ws/files/photo.jpg]",
+            "photo.jpg"
+        ));
+        // Extensionless target (image sent as document).
+        assert!(text_already_references_image(
+            "[IMAGE:/ws/files/upload] caption",
+            "upload"
+        ));
+        // Windows-style separators.
+        assert!(text_already_references_image(
+            r"[IMAGE:C:\ws\files\photo.jpg]",
+            "photo.jpg"
+        ));
+        // Second marker matches after a non-matching first one.
+        assert!(text_already_references_image(
+            "[IMAGE:/ws/old.png] and [IMAGE:/ws/photo.jpg]",
+            "photo.jpg"
+        ));
+
+        // Marker for a different file does not match.
+        assert!(!text_already_references_image(
+            "[IMAGE:/ws/old.png]",
+            "photo.jpg"
+        ));
+        // File name in caption text only (no marker targeting it).
+        assert!(!text_already_references_image(
+            "[IMAGE:/ws/old.png] see photo.jpg",
+            "photo.jpg"
+        ));
+        // Basename must match exactly, not as a suffix or prefix.
+        assert!(!text_already_references_image(
+            "[IMAGE:/ws/not_photo.jpg]",
+            "photo.jpg"
+        ));
+        // Data-URI markers (pipeline-generated) never match a file name.
+        assert!(!text_already_references_image(
+            "[IMAGE:data:image/jpeg;base64,AAAA]",
+            "photo.jpg"
+        ));
+        // Unterminated marker cannot match.
+        assert!(!text_already_references_image(
+            "[IMAGE:/ws/photo.jpg",
+            "photo.jpg"
+        ));
+        // Empty file name never matches.
+        assert!(!text_already_references_image("[IMAGE:/ws/photo.jpg]", ""));
     }
 
     #[cfg(feature = "image-normalization")]

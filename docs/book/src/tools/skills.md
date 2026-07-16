@@ -89,6 +89,27 @@ required = true
 description_localizations = { fr = "La requête de recherche" }
 ```
 
+### Auto-activation: triggers, provider switch, and image-turn tool blocking
+
+A skill can activate itself on inbound channel messages instead of waiting to be named. Three optional `[skill]` keys control this:
+
+- `triggers`: natural-language phrases matched case-insensitively on word boundaries, so a short trigger like `"i had"` cannot fire inside unrelated words. The special sentinel `"__image__"` matches any message that carries an image attachment. A message starting with `/skill_name` (hyphens and underscores interchangeable, optional `@botname` suffix) always matches regardless of triggers.
+- `provider`: when the skill activates, the session is switched to this model provider. Use it to route a vision-heavy skill to a multimodal provider or a cheap skill to a local model. The switch persists for the session, exactly as if the user had issued `/model`.
+- `blocked_tools_with_image`: tool names that are removed from the tool set whenever the current message contains an image attachment. This enforces two-turn protocols at the architecture level: the model cannot call the listed tools on a photo turn even if it ignores its instructions. List MCP tools with their composed names (`<server>__<tool>`).
+
+```toml
+[skill]
+name = "food-logger"
+description = "Log a food photo as a nutrition entry"
+provider = "openai-codex"
+triggers = ["__image__", "log food", "i ate"]
+# On photo turns the model must describe and confirm first; it can only
+# write the entry on the follow-up text turn.
+blocked_tools_with_image = ["sparky__sparky_manage_food"]
+```
+
+Matching runs once per inbound message in the channel orchestrator, before the routing decision. The first skill whose rules match wins, scanning in load order. Skills that declare neither `provider` nor `blocked_tools_with_image` are never scanned.
+
 ## Manage installed skills
 
 List the full inventory:

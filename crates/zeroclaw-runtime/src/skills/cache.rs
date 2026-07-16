@@ -40,7 +40,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct CacheKey {
@@ -71,6 +73,139 @@ struct CacheEntry {
 fn cache() -> &'static RwLock<HashMap<CacheKey, CacheEntry>> {
     static CACHE: OnceLock<RwLock<HashMap<CacheKey, CacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// How long a gate verdict (either direction) may be served before it is
+/// recomputed.
+///
+/// An entry can go stale without any in-process [`invalidate`] call:
+/// `zeroclaw skills install` runs in a *separate process* (its invalidate
+/// clears its own map, not the daemon's), and the open-skills git sync
+/// mutates the directory in-process from load paths this gate
+/// short-circuits away. Bounding verdicts to this TTL covers both
+/// directions: a stale `false` (out-of-band install of the first
+/// auto-activation skill) goes live within a minute instead of "dead until
+/// restart", and a stale `true` (out-of-band removal of the last one) stops
+/// paying a full per-message skill walk within a minute instead of forever.
+/// The steady state — the case the reviewer's latency finding is about — is
+/// one filesystem probe per TTL instead of one per message. The stale-false
+/// window is the one that matters for safety (it delays a declared
+/// image-turn tool block); in-process writes close it immediately via
+/// [`invalidate`], and out-of-band writers are bounded by this TTL.
+const GATE_TTL: Duration = Duration::from_secs(60);
+
+/// One memoized gate verdict plus when it was computed (for the TTL).
+struct GateEntry {
+    declared: bool,
+    checked_at: Instant,
+}
+
+/// Memo for [`super::agent_declares_activation_skills`], keyed by
+/// `(canonical workspace dir, agent alias)`. Unlike the load cache above it
+/// has no content-digest freshness key: its whole purpose is to answer the
+/// per-message "does this agent declare any auto-activation skill?" question
+/// without touching the filesystem at all. Staleness is bounded three ways:
+/// [`invalidate`] (every [`super::SkillsService`] write clears it),
+/// [`GATE_TTL`] (every verdict is re-probed after the TTL, which covers
+/// writers that *can't* call this process's invalidate: the CLI
+/// `skills install` in another process, the in-process open-skills git sync),
+/// and process restart.
+///
+/// The `epoch` counter closes the invalidate/compute race: a verdict computed
+/// against pre-invalidate filesystem state must not be stored after the
+/// invalidate (the load cache self-heals via signatures; this memo has no
+/// signature, so a stale `false` would otherwise stick for a full TTL).
+/// [`GateStore::invalidate`] bumps the epoch *before* clearing the map, and
+/// the memoizer only stores a computed verdict if the epoch is unchanged from
+/// just before its compute began.
+struct GateStore {
+    map: RwLock<HashMap<(PathBuf, String), GateEntry>>,
+    epoch: AtomicU64,
+}
+
+impl GateStore {
+    fn new() -> Self {
+        Self {
+            map: RwLock::new(HashMap::new()),
+            epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Drop every memoized verdict and retire in-flight computes. The epoch
+    /// bump must happen *before* the clear: a compute that sampled the old
+    /// epoch is refused at store time even if it lands after the clear.
+    fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.map.write().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+fn activation_gate() -> &'static GateStore {
+    static GATE: OnceLock<GateStore> = OnceLock::new();
+    GATE.get_or_init(GateStore::new)
+}
+
+/// Memoize `compute` for `(workspace_dir, agent_alias)`. A hit does zero
+/// filesystem work; verdicts are re-probed after [`GATE_TTL`]. Honors the
+/// [`CACHE_ENABLED_ENV`] kill-switch (disabled → recompute every call, the
+/// pre-cache behavior).
+pub(super) fn cached_activation_gate(
+    workspace_dir: &Path,
+    agent_alias: &str,
+    compute: impl FnOnce() -> bool,
+) -> bool {
+    cached_activation_gate_in(
+        activation_gate(),
+        GATE_TTL,
+        workspace_dir,
+        agent_alias,
+        compute,
+    )
+}
+
+/// Core of [`cached_activation_gate`] parameterized over the backing store
+/// (so tests isolate hit/miss assertions from the process-global map and its
+/// epoch) and the TTL (so tests force expiry with `Duration::ZERO` or pin
+/// memoization with `Duration::MAX`).
+fn cached_activation_gate_in(
+    gate: &GateStore,
+    ttl: Duration,
+    workspace_dir: &Path,
+    agent_alias: &str,
+    compute: impl FnOnce() -> bool,
+) -> bool {
+    if !cache_enabled() {
+        return compute();
+    }
+    let key = (canonical(workspace_dir), agent_alias.to_string());
+    {
+        let guard = gate.map.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get(&key) {
+            // Verdicts in BOTH directions expire, so out-of-band skill
+            // installs AND removals are noticed within a TTL even without an
+            // in-process invalidate (see GATE_TTL).
+            if entry.checked_at.elapsed() < ttl {
+                return entry.declared;
+            }
+        }
+    }
+    // Sample the epoch BEFORE computing: if an invalidate lands mid-compute,
+    // the verdict below may describe pre-invalidate filesystem state and must
+    // not be stored (returning it is fine — it was accurate when computed;
+    // the next call recomputes).
+    let epoch_before = gate.epoch.load(Ordering::Acquire);
+    let declared = compute();
+    let mut guard = gate.map.write().unwrap_or_else(|e| e.into_inner());
+    if gate.epoch.load(Ordering::Acquire) == epoch_before {
+        guard.insert(
+            key,
+            GateEntry {
+                declared,
+                checked_at: Instant::now(),
+            },
+        );
+    }
+    declared
 }
 
 /// Best-effort canonicalization so two spellings of the same directory share an
@@ -241,9 +376,12 @@ fn cached_load_in(
 
 /// Drop every cached entry. Call after any out-of-band mutation of a skills
 /// directory (e.g. [`super::SkillsService`] writes/removes) so the change is
-/// reflected on the next load even before mtimes are re-examined.
+/// reflected on the next load even before mtimes are re-examined. Also drops
+/// the activation-gate memo, so a newly added/removed auto-activation skill
+/// flips [`super::agent_declares_activation_skills`] on the next message.
 pub fn invalidate() {
     cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+    activation_gate().invalidate();
 }
 
 #[cfg(test)]
@@ -280,6 +418,9 @@ mod tests {
                     prompts: vec![],
                     slash_options: vec![],
                     location: None,
+                    provider: None,
+                    triggers: vec![],
+                    blocked_tools_with_image: vec![],
                 }],
                 dropped: vec![],
             }
@@ -509,6 +650,214 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "absent directory should bypass the cache entirely"
+        );
+    }
+
+    // #8965 review: the activation gate must memoize per (workspace, alias)
+    // so a hit does no filesystem work, and per-alias entries must not share
+    // a slot.
+    #[test]
+    fn activation_gate_memoizes_per_workspace_and_alias() {
+        let local_gate = GateStore::new();
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let calls = AtomicUsize::new(0);
+
+        let compute = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        assert!(cached_activation_gate_in(
+            &local_gate,
+            GATE_TTL,
+            &ws,
+            "a",
+            compute
+        ));
+        assert!(cached_activation_gate_in(
+            &local_gate,
+            GATE_TTL,
+            &ws,
+            "a",
+            compute
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second call for the same (workspace, alias) must be a memo hit"
+        );
+
+        // A different alias is a distinct key and recomputes.
+        assert!(!cached_activation_gate_in(
+            &local_gate,
+            GATE_TTL,
+            &ws,
+            "b",
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // #8965 Codex review: verdicts in both directions must expire after the
+    // TTL, because out-of-band writers (CLI `skills install` in another
+    // process, the in-process open-skills git sync) never call this
+    // process's invalidate(). Expired false → a new install goes live;
+    // expired true → the fast path is restored after the last activation
+    // skill is removed.
+    #[test]
+    fn gate_verdicts_expire_after_ttl_in_both_directions() {
+        let local_gate = GateStore::new();
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let calls = AtomicUsize::new(0);
+
+        // Duration::ZERO: every entry is instantly stale.
+        for (alias, verdict) in [("neg", false), ("pos", true)] {
+            let compute = || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                verdict
+            };
+            assert_eq!(
+                cached_activation_gate_in(&local_gate, Duration::ZERO, &ws, alias, compute),
+                verdict
+            );
+            assert_eq!(
+                cached_activation_gate_in(&local_gate, Duration::ZERO, &ws, alias, compute),
+                verdict
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "an expired verdict must be recomputed regardless of direction"
+        );
+    }
+
+    // Complement of the expiry test: within the TTL a verdict IS a memo hit,
+    // i.e. the TTL bounds staleness without reintroducing the per-message
+    // filesystem probe the gate exists to avoid.
+    #[test]
+    fn gate_verdict_is_memoized_within_ttl() {
+        let local_gate = GateStore::new();
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let calls = AtomicUsize::new(0);
+        let compute = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+
+        assert!(!cached_activation_gate_in(
+            &local_gate,
+            Duration::MAX,
+            &ws,
+            "a",
+            compute
+        ));
+        assert!(!cached_activation_gate_in(
+            &local_gate,
+            Duration::MAX,
+            &ws,
+            "a",
+            compute
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a fresh verdict must be a memo hit"
+        );
+    }
+
+    // #8965 Codex review: invalidate() racing an in-flight compute. The
+    // compute samples the filesystem BEFORE the invalidating write lands, so
+    // its verdict is stale the moment invalidate() runs; storing it would
+    // pin a wrong `false` for a full TTL with no signature to self-heal it.
+    // The epoch check must refuse the store, making the next call recompute.
+    #[test]
+    fn invalidate_during_compute_does_not_store_stale_verdict() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        let store = Arc::new(GateStore::new());
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+
+        let thread_store = Arc::clone(&store);
+        let thread_ws = ws.clone();
+        let racer = std::thread::spawn(move || {
+            cached_activation_gate_in(
+                &thread_store,
+                Duration::MAX,
+                &thread_ws,
+                "raced-agent",
+                move || {
+                    started_tx.send(()).unwrap();
+                    // Block mid-compute until the invalidate has fired.
+                    resume_rx.recv().unwrap();
+                    // Verdict computed from PRE-invalidate filesystem state.
+                    false
+                },
+            )
+        });
+
+        started_rx.recv().unwrap();
+        // A skill install lands and invalidates while the compute is blocked.
+        store.invalidate();
+        resume_tx.send(()).unwrap();
+        assert!(
+            !racer.join().unwrap(),
+            "the in-flight call still returns its own (then-accurate) verdict"
+        );
+
+        // The stale false must NOT have been memoized: the next call has to
+        // recompute and sees the post-install truth.
+        let calls = AtomicUsize::new(0);
+        let declared = cached_activation_gate_in(&store, Duration::MAX, &ws, "raced-agent", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        assert!(declared);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a verdict computed before an invalidate must not survive it"
+        );
+    }
+
+    // #8965 review: SkillsService writes call invalidate(), which must also
+    // drop the gate memo so a newly installed auto-activation skill flips the
+    // gate without a restart.
+    #[test]
+    fn invalidate_drops_activation_gate_memo() {
+        invalidate();
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let calls = AtomicUsize::new(0);
+        let compute = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+
+        cached_activation_gate(&ws, "invalidate-gate-agent", compute);
+        invalidate();
+        cached_activation_gate(&ws, "invalidate-gate-agent", compute);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "invalidate() must force the gate to recompute"
         );
     }
 
