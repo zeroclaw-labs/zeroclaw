@@ -252,4 +252,18 @@ mod tests {
         assert!(!out[1].passed); // invalid regex -> fail, not a panic
         assert!(out[1].detail.contains("invalid regex"));
     }
+
+    #[test]
+    fn invalid_response_regex_does_not_short_circuit_later_checks() {
+        let expects = TraceExpects {
+            response_matches: vec!["(unclosed".to_string(), "world$".to_string()],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &run("hello world", &[], true));
+        assert_eq!(out.len(), 2);
+        assert!(!out[0].passed);
+        assert!(out[0].detail.contains("invalid regex"));
+        assert!(out[1].passed);
+        assert_eq!(out[1].detail, "matched");
+    }
 }

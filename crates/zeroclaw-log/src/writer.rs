@@ -18,7 +18,7 @@
 //! because rolling trim and size-based rotation rename the file out
 //! from under an open handle), runs the rotation hooks inline, and
 //! calls `sync_all` on a periodic cadence (every
-//! [`SYNC_EVERY_N_WRITES`] writes or [`SYNC_INTERVAL`] of wall-clock
+//! `SYNC_EVERY_N_WRITES` writes or `SYNC_INTERVAL` of wall-clock
 //! time, whichever comes first). This trades per-event durability
 //! (the prior behaviour was `sync_data` after every write) for bounded
 //! write latency: a process crash may lose up to one sync interval of
