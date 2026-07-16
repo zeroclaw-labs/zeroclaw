@@ -56,13 +56,29 @@ Use a **dedicated provider alias** for the messaging agent (for example
 `.grok` cannot choose the active profile by itself); **permission** rules live
 in the agent workspace `.grok/config.toml`.
 
+**Reply-intent precheck (classifier):** ZeroClaw runs a short REPLY /
+`NO_REPLY[*]` classification before the full agent loop. Prefer a **stable
+chat-completions API** for that precheck (for example the HTTP/OAuth
+`xai` slot, or any other non-CLI model alias), and keep **`grok_cli` only for
+`model_provider`** (the full answer). CLI agent backends often emit planning
+prose instead of a single sentinel token; that prose can be delivered as the
+channel message (“staying silent” / “no Slack reply”). Empty
+`classifier_provider` reuses `model_provider` — fine for API models, not for
+CLI channel bots. ACP channels skip the classifier entirely.
+
 ```toml
-# Channel chatbot — strict OS sandbox + workspace permissions
+# Full answers — Grok Build CLI with strict OS sandbox + workspace permissions
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/default/workspace"
 extra_args = ["--sandbox", "strict"]
+
+# REPLY / NO_REPLY precheck — API (format-stable). Reuse an existing xAI
+# HTTP alias if you already have one; do not point this at grok_cli.
+[providers.models.xai.default]
+model = "grok-4.5"
+# uri / auth as for the normal xAI provider (OAuth session or api_key)
 
 # Ops / coding agents — no strict sandbox (writes / broader FS reads allowed)
 [providers.models.grok_cli.ops]
@@ -71,6 +87,7 @@ binary_path = "/home/you/.grok/bin/grok"
 
 [agents.default]
 model_provider = "grok_cli.default"
+classifier_provider = "xai.default"
 channels = ["slack.default"]   # example
 
 [agents.dependabot]
@@ -93,9 +110,12 @@ deny = [
 
 | Layer | Where | Purpose |
 | ----- | ----- | ------- |
+| Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
+| Full answer | `model_provider` → `grok_cli.default` | Grok Build CLI agent loop (tools, workspace `.grok`) |
 | OS sandbox | `extra_args = ["--sandbox", "strict"]` | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
 | App permissions | `<workspace>/.grok/config.toml` `[permission]` | Deny `zeroclaw channel send` variants |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
+| Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |
 
 Optional further `extra_args` (empty by default), for example
 `["--max-turns", "20"]` or `["--always-approve"]`. Prefer workspace `.grok`
