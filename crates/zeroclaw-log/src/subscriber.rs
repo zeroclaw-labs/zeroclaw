@@ -4,16 +4,18 @@
 //! workspace never names a `tracing` or `tracing_subscriber` type.
 
 use tracing::Subscriber;
+use tracing::field::{Field, Visit};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::field::{RecordFields, VisitOutput};
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::FormatFields;
-use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::format::{DefaultVisitor, Writer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::event::ZeroclawAttribution;
-use crate::layer::LogCaptureLayer;
+use crate::layer::{F_EPHEMERAL_ATTRS, LogCaptureLayer};
 
 /// Install the global tracing subscriber. Two independent axes:
 ///
@@ -65,6 +67,7 @@ pub fn install_global_subscriber(
     };
 
     let fmt_layer = fmt::layer()
+        .fmt_fields(RedactEphemeralFields)
         .with_writer(std::io::stderr)
         .event_format(AgentAliasFormatter::new())
         .with_filter(fmt_filter);
@@ -92,6 +95,82 @@ pub fn try_install_capture_subscriber() {
     use tracing_subscriber::Registry;
     let subscriber = Registry::default().with(LogCaptureLayer);
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// Field formatter that renders event fields exactly like the default
+/// formatter but drops the `zc_ephemeral_attrs` transport field, so
+/// short-lived pairing credentials (QR payloads, pair codes) never reach the
+/// terminal in verbose mode. The field still rides the event to the
+/// `LogCaptureLayer`, which routes it onto the broadcast-only ephemeral path;
+/// only the human-readable stderr display is redacted. All other fields keep
+/// the default rendering (the delegated `DefaultVisitor` handles `message`
+/// escaping, error sources, etc.).
+struct RedactEphemeralFields;
+
+impl<'writer> FormatFields<'writer> for RedactEphemeralFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        writer: Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        let mut visitor = RedactEphemeralVisitor {
+            inner: DefaultVisitor::new(writer, true),
+        };
+        fields.record(&mut visitor);
+        visitor.inner.finish()
+    }
+}
+
+/// Visitor wrapper that forwards every field to the default visitor except
+/// the ephemeral-attributes transport field, which it swallows. The
+/// credential arrives via `%Display` (recorded through `record_debug`); the
+/// `record_str` guard is defense-in-depth in case the transport ever changes.
+struct RedactEphemeralVisitor<'a> {
+    inner: DefaultVisitor<'a>,
+}
+
+impl Visit for RedactEphemeralVisitor<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == F_EPHEMERAL_ATTRS {
+            return;
+        }
+        self.inner.record_debug(field, value);
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == F_EPHEMERAL_ATTRS {
+            return;
+        }
+        self.inner.record_str(field, value);
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.inner.record_error(field, value);
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.inner.record_f64(field, value);
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.inner.record_i64(field, value);
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.inner.record_u64(field, value);
+    }
+
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        self.inner.record_i128(field, value);
+    }
+
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        self.inner.record_u128(field, value);
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.inner.record_bool(field, value);
+    }
 }
 
 /// Tracing event formatter that prefixes each log line with the most
@@ -138,5 +217,78 @@ where
             .unwrap_or_else(|| "system".to_string());
         write!(writer, "[{label}] ")?;
         self.inner.format_event(ctx, writer, event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// In-memory `MakeWriter` so a test can capture what the fmt layer would
+    /// have written to stderr in verbose mode.
+    #[derive(Clone, Default)]
+    struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct BufGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufMakeWriter {
+        type Writer = BufGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufGuard(self.0.clone())
+        }
+    }
+
+    /// Regression for the ephemeral-credential-at-verbose-stderr leak: the
+    /// terminal fmt layer must render the login event but never print the
+    /// `zc_ephemeral_attrs` transport field (which carries the QR payload /
+    /// pair code), so a supervisor or log collector scraping stderr in
+    /// verbose mode cannot retain the pairing secret.
+    #[test]
+    fn verbose_terminal_output_redacts_ephemeral_credentials() {
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new());
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            crate::record!(
+                INFO,
+                crate::Event::new(module_path!(), crate::Action::Note)
+                    .with_attrs(::serde_json::json!({"login": {"state": "qr"}}))
+                    .with_ephemeral_attrs(::serde_json::json!({
+                        "login": {"qr_payload": "SUPER-SECRET-QR-MARKER"}
+                    })),
+                "qr pairing login event"
+            );
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("qr pairing login event"),
+            "the login event should still be logged: {out:?}"
+        );
+        assert!(
+            !out.contains("SUPER-SECRET-QR-MARKER"),
+            "verbose stderr must not contain the ephemeral pairing credential: {out:?}"
+        );
+        assert!(
+            !out.contains(F_EPHEMERAL_ATTRS),
+            "the ephemeral transport field must be dropped entirely: {out:?}"
+        );
     }
 }

@@ -51,6 +51,7 @@ pub use event::{
     severity_text_from_tracing_level,
 };
 pub use layer::LogCaptureLayer;
+pub use writer::EPHEMERAL_BROADCAST_MARKER;
 
 /// Opaque span handle. Same wire format as `tracing::Span` (we re-export
 /// the type) but the public path is `zeroclaw_log::Span` — no `tracing`

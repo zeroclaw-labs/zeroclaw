@@ -52,8 +52,13 @@ pub async fn handle_sse_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Auth check
-    if state.pairing.require_pairing() {
+    // Auth check. When pairing is enabled every subscriber that reaches the
+    // stream below has passed the bearer check, so the stream is authenticated;
+    // when it is disabled no subscriber is authenticated. That posture decides
+    // whether broadcast-only pairing secrets may ride the stream (see
+    // `sse_frame_for_stream`).
+    let auth_enforced = state.pairing.require_pairing();
+    if auth_enforced {
         let token = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -71,15 +76,13 @@ pub async fn handle_sse_events(
 
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
-        |result: Result<
+        move |result: Result<
             serde_json::Value,
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
         >| {
             match result {
-                Ok(value) if is_public_sse_event(&value) => Some(Ok::<_, Infallible>(
-                    Event::default().data(value.to_string()),
-                )),
-                Ok(_) => None,
+                Ok(value) => sse_frame_for_stream(value, auth_enforced)
+                    .map(|v| Ok::<_, Infallible>(Event::default().data(v.to_string()))),
                 Err(_) => None, // Skip lagged messages
             }
         },
@@ -88,6 +91,41 @@ pub async fn handle_sse_events(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Decide the deliverable form of a broadcast frame for an SSE stream with the
+/// given authentication posture. Returns `None` to withhold the frame.
+///
+/// Fail-closed contract: a frame carrying broadcast-only pairing secrets
+/// (stamped [`zeroclaw_log::EPHEMERAL_BROADCAST_MARKER`] by the log layer when
+/// it merges `ephemeral_attributes` — QR payloads, pair codes) is withheld
+/// entirely unless `auth_enforced` is true. This keeps the credential off any
+/// unauthenticated `/api/events` stream even though the pre-existing handler
+/// skips the bearer check when pairing is disabled. The internal marker is
+/// stripped before delivery so the public event shape is unchanged.
+fn sse_frame_for_stream(
+    mut value: serde_json::Value,
+    auth_enforced: bool,
+) -> Option<serde_json::Value> {
+    if !is_public_sse_event(&value) {
+        return None;
+    }
+    if frame_carries_ephemeral_credentials(&value) && !auth_enforced {
+        return None;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER);
+    }
+    Some(value)
+}
+
+/// True when a broadcast frame was stamped by the log layer as carrying
+/// broadcast-only pairing secrets.
+fn frame_carries_ephemeral_credentials(event: &serde_json::Value) -> bool {
+    event
+        .get(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// GET /api/events/history — return buffered recent events as JSON.
@@ -467,6 +505,69 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["type"], "agent_start");
         assert_eq!(events[1]["type"], "gateway_lifecycle");
+    }
+
+    /// Build a broadcast frame stamped the way `zeroclaw_log::record_event`
+    /// stamps a credential-bearing login event (ephemeral attrs merged into
+    /// `attributes.login`, plus the fail-closed marker).
+    fn credential_login_frame() -> serde_json::Value {
+        serde_json::json!({
+            "source": "observability",
+            "attributes": { "login": { "state": "qr", "qr_payload": "SECRET-QR-PAYLOAD" } },
+            zeroclaw_log::EPHEMERAL_BROADCAST_MARKER: true,
+        })
+    }
+
+    #[test]
+    fn ephemeral_credential_frame_is_withheld_from_unauthenticated_stream() {
+        // Pairing disabled ⇒ the `/api/events` handler skips the bearer check,
+        // so the stream is unauthenticated. The credential frame must be
+        // withheld entirely rather than fanned out to an anonymous subscriber.
+        let frame = credential_login_frame();
+        assert!(
+            sse_frame_for_stream(frame, /* auth_enforced */ false).is_none(),
+            "pairing secret must never ride an unauthenticated /api/events stream"
+        );
+    }
+
+    #[test]
+    fn ephemeral_credential_frame_reaches_authenticated_stream_without_marker() {
+        // Pairing enabled ⇒ every subscriber passed the bearer check, so the
+        // credential may be delivered; the internal marker is stripped first.
+        let delivered =
+            sse_frame_for_stream(credential_login_frame(), /* auth_enforced */ true)
+                .expect("authenticated stream should receive the credential frame");
+        assert_eq!(
+            delivered["attributes"]["login"]["qr_payload"], "SECRET-QR-PAYLOAD",
+            "authenticated stream still renders the QR payload"
+        );
+        assert!(
+            delivered
+                .get(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER)
+                .is_none(),
+            "internal fail-closed marker must be stripped before delivery"
+        );
+    }
+
+    #[test]
+    fn credential_free_frame_flows_on_unauthenticated_stream() {
+        // A lifecycle frame with no ephemeral secret is unmarked and still
+        // flows when auth is disabled (unchanged behavior for non-secret data).
+        let frame = serde_json::json!({
+            "source": "observability",
+            "attributes": { "login": { "state": "connected" } },
+        });
+        assert!(
+            sse_frame_for_stream(frame, /* auth_enforced */ false).is_some(),
+            "credential-free lifecycle frames are unaffected"
+        );
+    }
+
+    #[test]
+    fn session_scoped_frame_is_withheld_regardless_of_auth() {
+        let frame = serde_json::json!({ "type": "message", "session_id": "operator-1" });
+        assert!(sse_frame_for_stream(frame.clone(), true).is_none());
+        assert!(sse_frame_for_stream(frame, false).is_none());
     }
 
     #[test]

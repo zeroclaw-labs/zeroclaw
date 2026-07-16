@@ -43,7 +43,11 @@ const F_ACTION: &str = "zc_action";
 const F_OUTCOME: &str = "zc_outcome";
 const F_CATEGORY: &str = "zc_category";
 const F_ATTRS: &str = "zc_attrs";
-const F_EPHEMERAL_ATTRS: &str = "zc_ephemeral_attrs";
+/// `record!` transport field carrying broadcast-only ephemeral attributes
+/// (QR payloads, pair codes). Shared with the terminal formatter so it can
+/// redact this field from verbose stderr output. See
+/// `subscriber::RedactEphemeralFields`.
+pub(crate) const F_EPHEMERAL_ATTRS: &str = "zc_ephemeral_attrs";
 const F_HAS_DURATION: &str = "zc_has_duration";
 const F_DURATION_MS: &str = "zc_duration_ms";
 const F_FILE: &str = "zc_file";

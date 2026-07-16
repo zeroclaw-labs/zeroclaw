@@ -43,6 +43,16 @@ use crate::observer_bridge;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+/// Top-level marker stamped onto a broadcast frame when it carries
+/// `ephemeral_attributes` (short-lived pairing secrets deep-merged into the
+/// live copy). Broadcast consumers use it to withhold the frame from any
+/// stream that is not bearer-authenticated — the frame's secrets must fail
+/// closed rather than ride an unauthenticated `/api/events` subscriber. It is
+/// stamped only on the broadcast copy (never the persisted value, which drops
+/// `ephemeral_attributes` via `serde(skip)`) and is stripped by the SSE layer
+/// before delivery, so the public event shape is unchanged.
+pub const EPHEMERAL_BROADCAST_MARKER: &str = "_ephemeral_credentials";
+
 /// Capacity of the bounded mpsc between `record_event` and the worker.
 /// Sized for high-throughput agent turns (each turn can emit 20-100 events)
 /// while keeping the queue's RSS footprint bounded. When the queue is full
@@ -438,6 +448,12 @@ pub fn record_event(event: LogEvent) {
         let mut broadcast_value = value.clone();
         if !event.ephemeral_attributes.is_null() {
             merge_ephemeral_into_attributes(&mut broadcast_value, &event.ephemeral_attributes);
+            // Mark the frame so a broadcast consumer that cannot authenticate
+            // its subscribers (an unauthenticated `/api/events` stream) fails
+            // closed on the pairing secret instead of fanning it out.
+            if let Value::Object(map) = &mut broadcast_value {
+                map.insert(EPHEMERAL_BROADCAST_MARKER.to_string(), Value::Bool(true));
+            }
         }
         let _ = hook.send(broadcast_value);
     }
@@ -953,6 +969,43 @@ mod tests {
         let line: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
         assert!(line["attributes"]["login"].get("qr_payload").is_none());
         assert!(line.get("ephemeral_attributes").is_none());
+        // The broadcast-only fail-closed marker also never reaches disk.
+        assert!(line.get(EPHEMERAL_BROADCAST_MARKER).is_none());
+
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    /// A frame carrying `ephemeral_attributes` is stamped with the
+    /// fail-closed marker on the broadcast copy so an SSE layer that cannot
+    /// authenticate its subscribers can withhold the pairing secret. A frame
+    /// with no ephemeral attributes is never stamped.
+    #[test]
+    fn broadcast_frame_marks_ephemeral_credentials_for_fail_closed_delivery() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        let mut with_secret = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        with_secret.attributes = serde_json::json!({ "login": { "state": "qr" } });
+        with_secret.ephemeral_attributes =
+            serde_json::json!({ "login": { "qr_payload": "SECRET-QR-PAYLOAD" } });
+        record_event(with_secret);
+        let framed = rx.try_recv().expect("broadcast copy delivered");
+        assert_eq!(
+            framed[EPHEMERAL_BROADCAST_MARKER], true,
+            "credential-bearing frame must be marked for fail-closed delivery: {framed}"
+        );
+
+        let mut no_secret = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        no_secret.attributes = serde_json::json!({ "login": { "state": "connected" } });
+        record_event(no_secret);
+        let plain = rx.try_recv().expect("broadcast copy delivered");
+        assert!(
+            plain.get(EPHEMERAL_BROADCAST_MARKER).is_none(),
+            "credential-free frame must not be marked: {plain}"
+        );
 
         crate::broadcast::clear_broadcast_hook();
     }
