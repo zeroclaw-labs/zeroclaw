@@ -10257,6 +10257,15 @@ pub struct MarkdownStorageConfig {
 pub struct LucidStorageConfig {
     /// Optional path to the lucid-memory binary.
     pub binary_path: Option<String>,
+    /// Recall (context) timeout override, in milliseconds. Lucid CLI cold
+    /// starts (loading the local embedding model) can exceed 1.5s on ARM
+    /// hosts; raise this if recalls still time out on your hardware.
+    /// Unset falls back to the built-in default (3000ms).
+    pub recall_timeout_ms: Option<u64>,
+    /// Store timeout override, in milliseconds. Same cold-start
+    /// consideration as `recall_timeout_ms`. Unset falls back to the
+    /// built-in default (3000ms).
+    pub store_timeout_ms: Option<u64>,
 }
 
 fn default_storage_schema() -> String {
@@ -24061,6 +24070,28 @@ connect_timeout_secs = 12
         assert_eq!(pg.schema, "public");
         assert_eq!(pg.table, "memories");
         assert_eq!(pg.connect_timeout_secs, Some(12));
+    }
+
+    #[test]
+    async fn storage_lucid_timeout_overrides_deserialize() {
+        let raw = r#"
+default_temperature = 0.7
+
+[storage.lucid.default]
+binary_path = "/opt/lucid/bin/lucid"
+recall_timeout_ms = 5000
+store_timeout_ms = 4000
+"#;
+
+        let parsed = parse_test_config(raw);
+        let lucid = parsed
+            .storage
+            .lucid
+            .get("default")
+            .expect("lucid.default present");
+        assert_eq!(lucid.binary_path.as_deref(), Some("/opt/lucid/bin/lucid"));
+        assert_eq!(lucid.recall_timeout_ms, Some(5000));
+        assert_eq!(lucid.store_timeout_ms, Some(4000));
     }
 
     #[test]

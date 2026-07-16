@@ -500,9 +500,12 @@ pub fn create_memory(
 
 /// Factory: create memory with a resolved active storage backend and embedding routes.
 ///
-/// Pass [`ActiveStorage::None`] when no typed storage config is needed (sqlite,
-/// markdown, lucid, none — all infer settings from the workspace). Postgres and
-/// Qdrant require their typed variants and will error if the wrong variant is
+/// Pass [`ActiveStorage::None`] when no typed storage config is needed
+/// (sqlite, markdown, none — all infer settings from the workspace). Lucid
+/// falls back to its built-in defaults the same way when no
+/// `[storage.lucid.<alias>]` entry resolves, but will use one when
+/// `active_storage` carries [`ActiveStorage::Lucid`]. Postgres and Qdrant
+/// require their typed variants and will error if the wrong variant is
 /// supplied.
 ///
 /// `providers` is the canonical `providers.models` catalog, used to resolve a
@@ -690,6 +693,36 @@ pub fn create_memory_with_storage_and_routes(
             ),
         };
         return build_postgres_memory(pg_cfg);
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Lucid) {
+        // Unlike Postgres/Qdrant, Lucid has always worked with zero
+        // `[storage.lucid.<alias>]` config (it shells out to `lucid` on
+        // PATH using built-in defaults), so an unresolved alias falls back
+        // to defaults here instead of erroring.
+        let (lucid_binary_path, lucid_recall_timeout_ms, lucid_store_timeout_ms) =
+            match active_storage {
+                ActiveStorage::Lucid(l) => (
+                    l.binary_path.clone(),
+                    l.recall_timeout_ms,
+                    l.store_timeout_ms,
+                ),
+                _ => (None, None, None),
+            };
+        let local = build_sqlite_memory(
+            config,
+            sqlite_open_timeout_secs,
+            workspace_dir,
+            &resolved_embedding,
+        )?;
+        return Ok(Box::new(LucidMemory::with_overrides(
+            "lucid",
+            workspace_dir,
+            local,
+            lucid_binary_path,
+            lucid_recall_timeout_ms,
+            lucid_store_timeout_ms,
+        )));
     }
 
     create_memory_with_builders(
@@ -992,7 +1025,7 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::EmbeddingRouteConfig;
+    use zeroclaw_config::schema::{EmbeddingRouteConfig, LucidStorageConfig};
 
     #[test]
     fn factory_sqlite() {
@@ -1258,6 +1291,30 @@ mod tests {
             ..MemoryConfig::default()
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "lucid");
+    }
+
+    #[test]
+    fn factory_lucid_accepts_storage_overrides() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "lucid".into(),
+            ..MemoryConfig::default()
+        };
+        let lucid_storage = LucidStorageConfig {
+            binary_path: Some("/opt/lucid/bin/lucid".to_string()),
+            recall_timeout_ms: Some(5_000),
+            store_timeout_ms: Some(4_000),
+        };
+        let mem = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::Lucid(&lucid_storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(mem.name(), "lucid");
     }
 

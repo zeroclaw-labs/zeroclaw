@@ -34,14 +34,32 @@ impl LucidMemory {
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
     pub fn new(alias: &str, workspace_dir: &Path, local: SqliteMemory) -> Self {
+        Self::with_overrides(alias, workspace_dir, local, None, None, None)
+    }
+
+    /// Construct with config-sourced overrides (`[storage.lucid.<alias>]`).
+    /// Each `None` falls back to the built-in default, so an unconfigured
+    /// alias behaves exactly like [`Self::new`].
+    pub fn with_overrides(
+        alias: &str,
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        lucid_cmd: Option<String>,
+        recall_timeout_ms: Option<u64>,
+        store_timeout_ms: Option<u64>,
+    ) -> Self {
         Self {
             alias: alias.to_string(),
             local,
-            lucid_cmd: Self::DEFAULT_LUCID_CMD.to_string(),
+            lucid_cmd: lucid_cmd.unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string()),
             token_budget: Self::DEFAULT_TOKEN_BUDGET,
             workspace_dir: workspace_dir.to_path_buf(),
-            recall_timeout: Duration::from_millis(Self::DEFAULT_RECALL_TIMEOUT_MS),
-            store_timeout: Duration::from_millis(Self::DEFAULT_STORE_TIMEOUT_MS),
+            recall_timeout: Duration::from_millis(
+                recall_timeout_ms.unwrap_or(Self::DEFAULT_RECALL_TIMEOUT_MS),
+            ),
+            store_timeout: Duration::from_millis(
+                store_timeout_ms.unwrap_or(Self::DEFAULT_STORE_TIMEOUT_MS),
+            ),
             local_hit_threshold: Self::DEFAULT_LOCAL_HIT_THRESHOLD,
             failure_cooldown: Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
             last_failure_at: Mutex::new(None),
@@ -769,6 +787,67 @@ exit 1
             entries
                 .iter()
                 .any(|e| e.content.contains("Delayed token refresh guidance"))
+        );
+    }
+
+    #[tokio::test]
+    async fn with_overrides_none_matches_new_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let delayed_cmd = write_delayed_lucid_script(tmp.path());
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory =
+            LucidMemory::with_overrides("test", tmp.path(), sqlite, Some(delayed_cmd), None, None);
+
+        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Delayed token refresh guidance")),
+            "with_overrides(None, None, None) must apply the same raised \
+             default timeout as `new`, tolerating the simulated 1.5s cold start"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_overrides_recall_timeout_ms_is_applied() {
+        let tmp = TempDir::new().unwrap();
+        let delayed_cmd = write_delayed_lucid_script(tmp.path());
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some(delayed_cmd),
+            Some(50),
+            None,
+        );
+
+        memory
+            .store(
+                "local_note",
+                "Local sqlite auth fallback note",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Local sqlite auth fallback note")),
+            "local sqlite results must still come back on Lucid timeout"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.content.contains("Delayed token refresh guidance")),
+            "a 50ms recall_timeout_ms override must time out against the \
+             1.5s simulated cold start, proving the override reaches the \
+             running timeout rather than being ignored"
         );
     }
 
