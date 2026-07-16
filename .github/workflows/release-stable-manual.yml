@@ -202,7 +202,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # 90 min: the x86_64-apple-darwin leg needs ~45-50 min on GitHub's slower
+    # Intel macOS runners (v0.8.3 hit the old 40-min ceiling twice, killing the
+    # cache save each time and compounding the slowdown). Fast legs are
+    # unaffected; this is a ceiling, not an allocation.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
