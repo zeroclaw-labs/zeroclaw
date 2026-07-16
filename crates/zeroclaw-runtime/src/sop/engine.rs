@@ -285,8 +285,8 @@ impl SopEngine {
         // appended INSIDE `revise_checkpoint_draft` instead — only once the new
         // draft exists and before the run is mutated — so a failed re-draft
         // records nothing and leaves the old draft parked.
-        if !matches!(decision, ApprovalDecision::Revise { .. }) {
-            if let Err(e) = self.record_gate_event(GateLedgerEntry {
+        if !matches!(decision, ApprovalDecision::Revise { .. })
+            && let Err(e) = self.record_gate_event(GateLedgerEntry {
                 run_id: run_id.to_string(),
                 step,
                 gate_revision: Some(checkpoint_revision),
@@ -296,14 +296,14 @@ impl SopEngine {
                 decision: Some(decision.clone()),
                 principal: principal.clone(),
                 ts: now_iso8601(),
-            }) {
-                if claim_reacquired {
-                    self.release_claim_on_park(run_id);
-                }
-                return Err(anyhow::Error::msg(format!(
-                    "failed to persist checkpoint resolution ledger event (fail-closed): {e}"
-                )));
+            })
+        {
+            if claim_reacquired {
+                self.release_claim_on_park(run_id);
             }
+            return Err(anyhow::Error::msg(format!(
+                "failed to persist checkpoint resolution ledger event (fail-closed): {e}"
+            )));
         }
 
         match decision {

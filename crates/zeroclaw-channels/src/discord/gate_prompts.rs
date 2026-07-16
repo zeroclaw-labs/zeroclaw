@@ -64,7 +64,10 @@ pub(crate) struct GatePromptInput {
     pub(crate) prefill: Option<String>,
 }
 
-static GATE_PROMPTS: LazyLock<Mutex<HashMap<String, Vec<(Instant, GatePromptRecord)>>>> =
+type GatePromptEntries = Vec<(Instant, GatePromptRecord)>;
+type GatePromptRegistry = HashMap<String, GatePromptEntries>;
+
+static GATE_PROMPTS: LazyLock<Mutex<GatePromptRegistry>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Record a sent gate prompt under its reference. A gate can be presented more

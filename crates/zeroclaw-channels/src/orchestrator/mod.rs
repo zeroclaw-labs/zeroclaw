@@ -7008,9 +7008,8 @@ async fn run_message_dispatch_loop(
                     let mut keys: Vec<String> = gate_ctx
                         .channels_by_name
                         .iter()
-                        .filter_map(|(key, channel)| {
-                            Arc::ptr_eq(channel, target).then(|| key.clone())
-                        })
+                        .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
+                        .map(|(key, _channel)| key.clone())
                         .collect();
                     let inbound_key = channel_key_for_message(&msg);
                     if !keys.iter().any(|key| key == &inbound_key) {

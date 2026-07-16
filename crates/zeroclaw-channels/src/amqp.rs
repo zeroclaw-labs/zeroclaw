@@ -1072,9 +1072,10 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         }
 
         let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
-        let mut config = SopConfig::default();
-        config.max_concurrent_total = 1;
-        let mut eng = SopEngine::new(config);
+        let mut eng = SopEngine::new(SopConfig {
+            max_concurrent_total: 1,
+            ..SopConfig::default()
+        });
         eng.set_sops_for_test(vec![amqp_sop("amqp-a"), amqp_sop("amqp-b")]);
         (Arc::new(Mutex::new(eng)), audit)
     }
