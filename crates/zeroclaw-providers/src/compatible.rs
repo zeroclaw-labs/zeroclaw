@@ -969,30 +969,6 @@ struct Choice {
     message: ResponseMessage,
 }
 
-/// Remove `<think>...</think>` blocks from model output.
-/// Some reasoning models (e.g. MiniMax) embed their chain-of-thought inline
-/// in the `content` field rather than a separate `reasoning_content` field.
-/// The resulting `<think>` tags must be stripped before returning to the user.
-fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
-            } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result.trim().to_string()
-}
-
 /// OpenAI Chat Completions may return assistant `message.content` as a string,
 /// null, or an array of typed parts. Normalize it before storing the internal
 /// response shape so compatible gateways that preserve typed parts still work,
@@ -1095,21 +1071,25 @@ impl ResponseMessage {
     /// `reasoning_content` is preserved separately in
     /// `ChatResponse.reasoning_content` for history round-tripping.
     ///
-    /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
-    /// inline in `content` instead of using a separate field.
+    /// Returns the `content` field as-is. Previously this stripped
+    /// `<think>...</think>` blocks that some reasoning models (e.g. MiniMax)
+    /// embedded inline in `content` instead of using a separate field, but
+    /// that unconditional rewrite silently mangled responses whose `content`
+    /// legitimately contained literal `<think>...</think>` markup (HTML, code
+    /// samples, quoted discussion of the tag itself, and unclosed tails).
+    /// Model providers that need inline think-block filtering should do it
+    /// downstream of this response shape, with full visibility into the
+    /// model's actual output.
     fn effective_content(&self) -> String {
         self.content
             .as_ref()
-            .map(|c| strip_think_tags(c))
+            .cloned()
             .filter(|c| !c.is_empty())
             .unwrap_or_default()
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        self.content
-            .as_ref()
-            .map(|c| strip_think_tags(c))
-            .filter(|c| !c.is_empty())
+        self.content.as_ref().cloned().filter(|c| !c.is_empty())
     }
 }
 
@@ -4658,9 +4638,20 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_tags_drops_unclosed_block_suffix() {
-        let input = "visible<think>hidden";
-        assert_eq!(strip_think_tags(input), "visible");
+    fn effective_content_preserves_literal_think_tags() {
+        // The deleted `strip_think_tags()` helper searched for the exact
+        // substring `<think>` / `</think>` and stripped those blocks
+        // unconditionally. This regression pins that literal `<think>` tags
+        // now round-trip byte-for-byte, including legitimate uses where the
+        // model legitimately discusses the tag (HTML sample, code quoting,
+        // meta-discussion).
+        let json = r#"{"choices":[{"message":{"content":"Here is the HTML: <think>internal note</think>"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(
+            msg.effective_content(),
+            "Here is the HTML: <think>internal note</think>"
+        );
     }
 
     #[test]
@@ -5440,17 +5431,49 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_tags_removes_multiple_blocks_with_surrounding_text() {
-        let input = "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done";
-        let output = strip_think_tags(input);
-        assert_eq!(output, "Answer A  and B  done");
+    fn effective_content_preserves_unclosed_think_tag() {
+        // An unclosed literal `<think>` tag must NOT discard the rest of the
+        // response. The old `strip_think_tags()` helper saw no closing
+        // ` closing ` and dropped the trailing tail ("Visible  think"
+        // → "Visible"). The new path returns the input unchanged.
+        let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Visible <think>hidden tail");
     }
 
     #[test]
-    fn strip_think_tags_drops_tail_for_unclosed_block() {
-        let input = "Visible<think>hidden tail";
-        let output = strip_think_tags(input);
-        assert_eq!(output, "Visible");
+    fn effective_content_preserves_multiple_think_blocks() {
+        // Multiple literal `<think>` blocks in `content` survive the removal
+        // intact. The old `strip_think_tags()` helper would have collapsed
+        // the visible text to "Answer A  and B  done", losing the
+        // inter-block separators and the tag delimiters themselves.
+        let json = r#"{"choices":[{"message":{"content":"Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(
+            msg.effective_content(),
+            "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"
+        );
+    }
+    #[test]
+    fn effective_content_preserves_think_tags_with_reasoning_content() {
+        // When both `content` and `reasoning_content` are present,
+        // the literal `<think>` blocks in `content` survive intact while
+        // `reasoning_content` is preserved separately and is NOT leaked
+        // into the response text.
+        let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail</think>","reasoning_content":"reasoning separately"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(
+            msg.effective_content(),
+            "Visible <think>hidden tail</think>"
+        );
+        assert!(!msg.effective_content().contains("reasoning separately"));
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("reasoning separately")
+        );
     }
 
     // ----------------------------------------------------------
@@ -5501,14 +5524,24 @@ mod tests {
 
     #[test]
     fn reasoning_content_preserved_when_content_only_think_tags() {
-        // When content only has <think> tags (stripped to empty),
-        // effective_content returns "" — reasoning_content is preserved
-        // separately, not leaked into the response text.
+        // The compatible provider no longer strips literal
+        // `<think>...</think>` blocks from `content`. Previously the
+        // `<think>secret</think>`-only content was collapsed to the empty
+        // string by `strip_think_tags()`, and `effective_content()` returned
+        // `""` so the visible-text field was effectively replaced by the
+        // model's chain-of-thought marker. Now the literal `<think>` tags
+        // round-trip into `effective_content()` byte-for-byte, and
+        // `reasoning_content` is still preserved separately and not leaked
+        // into the response text.
         let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Thinking text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "");
-        assert_eq!(msg.effective_content_optional(), None);
+        assert!(msg.effective_content().contains("secret"));
+        assert!(msg.effective_content().contains("<think>"));
+        assert_eq!(
+            msg.effective_content_optional().as_deref(),
+            Some("<think>secret</think>"),
+        );
         assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking text"));
     }
 
