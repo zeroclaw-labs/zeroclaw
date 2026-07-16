@@ -24,7 +24,9 @@
 //!   enablement and permission rules belong in Grok project config under the
 //!   subprocess working directory (typically the agent workspace):
 //!   `.grok/config.toml` (`[permission]`), plus `.grok/skills/`, etc.
-//!   See Grok user-guide `05-configuration.md` / `22-permissions-and-safety.md`.
+//!   Recommended channel-agent denies (narrow, `zeroclaw channel send` only)
+//!   are documented in `docs/book/src/providers/catalog.md` (Grok Build CLI).
+//!   See also Grok user-guide `05-configuration.md` / `22-permissions-and-safety.md`.
 //! - **Temperature**: Only baseline values `0.7` and `1.0` are accepted.
 //!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};

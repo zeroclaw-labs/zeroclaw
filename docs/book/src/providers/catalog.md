@@ -46,6 +46,42 @@ ZeroClaw does **not** pass tool/permission argv (`--always-approve`,
 `--disallowed-tools`, `--max-turns`, etc.); configure those in the workspace
 `.grok/` tree.
 
+#### Recommended workspace `.grok` settings
+
+When `grok_cli` is used as a channel agent (Slack, Discord, …), Grok may shell
+out to `zeroclaw channel send` from skill text. That posts **outside** ZeroClaw's
+normal reply path (often top-level, without `thread_ts`) while ZeroClaw still
+delivers the final model text — **dual delivery**.
+
+Put a **project** config under the agent workspace (the path you set as
+`working_directory`), and keep the Bash denies **narrow** so unrelated commands
+that merely contain the words “channel send” are not blocked:
+
+```toml
+# <agent-workspace>/.grok/config.toml
+[permission]
+# Block ZeroClaw CLI channel posts only (not a blanket "channel send" substring).
+deny = [
+  "Bash(zeroclaw channel send:*)",   # plain: zeroclaw channel send …
+  "Bash(zeroclaw *channel send*)",   # flags between binary and subcommand
+  "Bash(*zeroclaw channel send*)",   # absolute path to zeroclaw
+  "Bash(*zeroclaw *channel send*)",  # absolute path + flags
+]
+```
+
+Example alias:
+
+```toml
+[providers.models.grok_cli.default]
+model = "grok-4.5"
+binary_path = "/home/you/.grok/bin/grok"
+working_directory = "/path/to/agents/default/workspace"
+```
+
+ZeroClaw should remain the only path that posts channel replies (`thread_replies`
+and related channel config). Do **not** rely on `--always-approve` from ZeroClaw
+for this provider; permission policy belongs in Grok's `.grok` / settings.
+
 ### Azure OpenAI: slot `azure`
 
 `resource`, `deployment`, and `api_version` live in this typed config, they are not read from environment variables.
