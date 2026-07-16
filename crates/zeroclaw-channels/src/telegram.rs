@@ -1088,10 +1088,10 @@ impl TelegramChannel {
                         "total_before_cap": total_before_cap,
                         "registered": registered,
                     })),
-                &format!(
-                    "Telegram limits bots to {} commands; configured {}, registering first {}. Reduce installed skills to expose more commands.",
-                    TELEGRAM_MAX_BOT_COMMANDS, total_before_cap, registered,
-                )
+                // Stable literal per the logging contract: per-event
+                // measurements (limit, configured, registered) ride solely in
+                // `attributes` above, never in the message.
+                "Telegram command registration truncated to the platform limit"
             );
         }
 
@@ -7967,6 +7967,19 @@ mod tests {
         ch.register_bot_commands().await;
     }
 
+    /// Scoped cleanup for the process-wide broadcast hook: clears the hook on
+    /// drop so a panicking assertion cannot leak the installed hook into later
+    /// tests. Declare after `__private_test_hook_lock()` so the clear runs
+    /// while the hook lock is still held (guards drop in reverse declaration
+    /// order).
+    struct BroadcastHookGuard;
+
+    impl Drop for BroadcastHookGuard {
+        fn drop(&mut self) {
+            zeroclaw_log::clear_broadcast_hook();
+        }
+    }
+
     #[tokio::test]
     async fn register_bot_commands_truncates_to_telegram_max() {
         use wiremock::matchers::{method, path_regex};
@@ -8012,6 +8025,7 @@ mod tests {
         // Install a broadcast hook so we can capture the WARN log event.
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _hook_cleanup = BroadcastHookGuard;
         zeroclaw_log::try_install_capture_subscriber();
         let mut rx = zeroclaw_log::subscribe_or_install();
         while rx.try_recv().is_ok() {}
@@ -8043,7 +8057,8 @@ mod tests {
             "last registered command must be the 94th tool (built-ins + 94 tools = 100)"
         );
 
-        // Verify the WARN event: rendered message, structured attributes, and known keys.
+        // Verify the WARN event: stable literal message identifies the event,
+        // and the per-event counts ride solely in structured attributes.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut found_warn = false;
         while !found_warn && std::time::Instant::now() < deadline {
@@ -8054,7 +8069,11 @@ mod tests {
                     if value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.contains("Telegram limits bots to 100 commands; configured 107, registering first 100"))
+                        .map(|s| {
+                            s.contains(
+                                "Telegram command registration truncated to the platform limit",
+                            )
+                        })
                         .unwrap_or(false)
                     {
                         found_warn = true;
@@ -8067,7 +8086,9 @@ mod tests {
                         );
                         let attrs = attrs.unwrap();
                         assert_eq!(
-                            attrs.get("TELEGRAM_MAX_BOT_COMMANDS").and_then(|v| v.as_u64()),
+                            attrs
+                                .get("TELEGRAM_MAX_BOT_COMMANDS")
+                                .and_then(|v| v.as_u64()),
                             Some(TELEGRAM_MAX_BOT_COMMANDS as u64),
                             "structured attribute TELEGRAM_MAX_BOT_COMMANDS"
                         );
@@ -8090,7 +8111,7 @@ mod tests {
         }
         assert!(
             found_warn,
-            "truncation WARN must log the rendered counts, not literal braces"
+            "truncation WARN must be captured with the stable literal message"
         );
     }
 
@@ -8144,6 +8165,7 @@ mod tests {
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _hook_cleanup = BroadcastHookGuard;
         zeroclaw_log::try_install_capture_subscriber();
         let mut rx = zeroclaw_log::subscribe_or_install();
         while rx.try_recv().is_ok() {}
@@ -8168,7 +8190,7 @@ mod tests {
                         .and_then(|v| v.as_str())
                         .map(|s| {
                             s.contains(
-                                "Telegram limits bots to 100 commands; configured 107, registering first 100",
+                                "Telegram command registration truncated to the platform limit",
                             )
                         })
                         .unwrap_or(false)
@@ -8198,17 +8220,16 @@ mod tests {
                             .get("attributes")
                             .expect("WARN event must carry structured attributes");
                         assert_eq!(
-                            attrs.get("TELEGRAM_MAX_BOT_COMMANDS").and_then(|v| v.as_u64()),
+                            attrs
+                                .get("TELEGRAM_MAX_BOT_COMMANDS")
+                                .and_then(|v| v.as_u64()),
                             Some(TELEGRAM_MAX_BOT_COMMANDS as u64),
                         );
                         assert_eq!(
                             attrs.get("total_before_cap").and_then(|v| v.as_u64()),
                             Some(107),
                         );
-                        assert_eq!(
-                            attrs.get("registered").and_then(|v| v.as_u64()),
-                            Some(100),
-                        );
+                        assert_eq!(attrs.get("registered").and_then(|v| v.as_u64()), Some(100),);
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
@@ -8220,8 +8241,6 @@ mod tests {
             found_warn,
             "truncation WARN must be captured with channel attribution",
         );
-
-        zeroclaw_log::clear_broadcast_hook();
     }
 
     // ── Approval inline keyboard tests ────────────────────────
