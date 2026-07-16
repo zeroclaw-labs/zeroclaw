@@ -74,7 +74,10 @@ subscriptions for the identity's mail, SMS, iMessage, and calls. Inbound events
 are forwarded over that tunnel to the gateway's loopback listener, so no inbound
 port needs to be open. Inkbox signs each webhook with an HMAC over the body;
 configure `signing_key` so the channel can verify and reject unsigned or forged
-traffic.
+traffic. Call-media WebSocket upgrades are signed the same way (over the signed
+call context) and are verified before the socket is accepted: a forged, stale,
+or replayed upgrade is rejected before any audio bridge or external model
+connection exists.
 
 ## Delivery failures
 
