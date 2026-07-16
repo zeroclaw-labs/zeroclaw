@@ -249,6 +249,40 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
+/// Foreground-echo gate for `daemon::run` (issue #9000): true only when
+/// stderr is an interactive terminal AND this process owns that terminal's
+/// foreground process group. A shell background job (`zeroclaw daemon ... &`)
+/// inherits the TTY descriptor, so `is_terminal()` alone would wrongly print
+/// the startup banner for background callers; the process-group comparison
+/// is what separates an interactive foreground caller from a background job.
+#[cfg(unix)]
+fn stderr_is_interactive_foreground() -> bool {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return false;
+    }
+    // SAFETY: `tcgetpgrp` and `getpgrp` take no pointers and are safe to
+    // call on any fd / from any process state. `tcgetpgrp` returns -1 on
+    // error (e.g. no controlling terminal); `getpgrp` cannot fail.
+    let foreground_pgrp = unsafe { libc::tcgetpgrp(libc::STDERR_FILENO) };
+    let own_pgrp = unsafe { libc::getpgrp() };
+    stderr_foreground_decision(foreground_pgrp, own_pgrp)
+}
+
+/// Non-unix platforms have no POSIX foreground process group; the TTY
+/// descriptor check is the best available signal there.
+#[cfg(not(unix))]
+fn stderr_is_interactive_foreground() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Pure decision behind [`stderr_is_interactive_foreground`], split out so
+/// the interactive-background and detached-service cases are unit-testable
+/// without a PTY. `foreground_pgrp <= 0` is the `tcgetpgrp` error return.
+#[cfg(unix)]
+fn stderr_foreground_decision(foreground_pgrp: i32, own_pgrp: i32) -> bool {
+    foreground_pgrp > 0 && foreground_pgrp == own_pgrp
+}
+
 fn print_no_command_help(cmd: clap::Command) -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     {
@@ -4238,11 +4272,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     ephemeral,
                     // Foreground echo (issue #9000): only true when this
                     // daemon is the user's interactive foreground process
-                    // (no `--verbose`, stderr is a real tty). Background
-                    // / systemd-supervised callers stay silent so we
-                    // don't pollute the journal with the seven
+                    // (no `--verbose`, stderr is a real tty, and on unix
+                    // this process owns the tty's foreground process
+                    // group — a shell background job inherits the tty
+                    // descriptor but is not the foreground owner).
+                    // Background / systemd-supervised callers stay silent
+                    // so we don't pollute the journal with the seven
                     // pre-#7934 informational lines.
-                    !cli.verbose && std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                    !cli.verbose && stderr_is_interactive_foreground(),
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -8186,6 +8223,22 @@ mod tests {
         let mut line = String::from("abcdefgh");
         cap_line_utf8_safe(&mut line, 4);
         assert_eq!(line, "abcd");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stderr_foreground_decision_true_only_for_foreground_owner() {
+        // Interactive foreground: the shell gave this process group the
+        // terminal — echo is appropriate.
+        assert!(stderr_foreground_decision(123, 123));
+        // Interactive background job (`zeroclaw daemon ... &`): inherits
+        // the tty descriptor but the foreground group belongs to the shell
+        // or another job — must stay silent (#9000 round-2 premise).
+        assert!(!stderr_foreground_decision(123, 456));
+        // No controlling terminal / tcgetpgrp error: -1 must never pass.
+        assert!(!stderr_foreground_decision(-1, 123));
+        // Defensive: 0 is not a valid process group id.
+        assert!(!stderr_foreground_decision(0, 0));
     }
 
     #[test]
