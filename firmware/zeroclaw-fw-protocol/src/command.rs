@@ -58,10 +58,7 @@ mod tests {
         let line = br#"{"id":"2","cmd":"gpio_write","args":{"pin":13,"value":1}}"#;
         assert_eq!(
             Command::from_line(line),
-            Some(Command::GpioWrite {
-                pin: 13,
-                value: 1
-            })
+            Some(Command::GpioWrite { pin: 13, value: 1 })
         );
     }
 
@@ -70,10 +67,7 @@ mod tests {
         let line = br#"{"id":"2","cmd":"gpio_write","args":{"pin":13,"value":0}}"#;
         assert_eq!(
             Command::from_line(line),
-            Some(Command::GpioWrite {
-                pin: 13,
-                value: 0
-            })
+            Some(Command::GpioWrite { pin: 13, value: 0 })
         );
     }
 
@@ -91,6 +85,9 @@ mod tests {
     #[test]
     fn parse_gpio_read_missing_pin() {
         let line = br#"{"id":"3","cmd":"gpio_read"}"#;
-        assert_eq!(Command::from_line(line), Some(Command::GpioRead { pin: -1 }));
+        assert_eq!(
+            Command::from_line(line),
+            Some(Command::GpioRead { pin: -1 })
+        );
     }
 }
