@@ -302,8 +302,8 @@ mod tests {
 
     #[test]
     fn normalize_command_name_unicode_preserved() {
-        assert_eq!(normalize_command_name("/新"), Some("新"));
-        assert_eq!(normalize_command_name("/新@my_bot"), Some("新"));
+        assert_eq!(normalize_command_name("/新"), Some("新".to_string()));
+        assert_eq!(normalize_command_name("/新@my_bot"), Some("新".to_string()));
     }
 
     #[test]
