@@ -27,13 +27,6 @@ use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
 
-/// Per-family construction trait. Implemented (directly or via the
-/// `CompatFamilySpec` blanket) by every typed `<Family>ModelProviderConfig`.
-///
-/// `&self` IS the typed alias config — implementations read their own
-/// per-alias fields directly instead of through a flat options dumping
-/// ground. `api_url` is the resolved endpoint URL (operator override or
-/// pre-resolved family default); `key` is the resolved API credential.
 pub trait FamilyProviderFactory {
     fn create_provider(
         &self,
@@ -60,14 +53,6 @@ pub trait CompatFamilySpec {
     const AUTH: AuthStyle;
     const FALLBACK_ALLOWS_MISSING_API_KEY: bool = false;
 
-    /// `models.dev` catalog key for this provider, when present in the
-    /// public catalog. Lets `list_models()` pre-populate the model
-    /// picker without a credential — the gateway and TUI both surface
-    /// the cataloged IDs even before the operator pastes their API key.
-    /// Set to `None` for providers that don't have a `models.dev`
-    /// entry; their picker stays empty until a credential unlocks the
-    /// live `/models` endpoint, which the dashboard already falls back
-    /// to a free-text input for.
     const MODELS_DEV_KEY: Option<&'static str> = None;
 
     /// OpenRouter vendor prefix used by `list_models` as a last-resort
@@ -76,24 +61,10 @@ pub trait CompatFamilySpec {
     /// (e.g. Sambanova, Hyperbolic — no public catalog at all without a key).
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = None;
 
-    /// Wire protocol selector for this entry, when the family reads it from
-    /// per-alias config. Defaults to `None` so families that only speak
-    /// chat_completions need no override.
-    ///
-    /// A family whose endpoint can serve the responses wire MUST override this
-    /// to return `self.base.wire_api`; otherwise a user's
-    /// `wire_api = "responses"` is silently ignored and routed through
-    /// chat_completions. The blanket `create_provider` consults this before
-    /// building the compat client.
     fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
         None
     }
 
-    /// Whether this provider's `/models` endpoint is accessible without an
-    /// API key. When `true`, `list_models()` and `list_models_with_pricing()`
-    /// will query the live endpoint even when no credential is configured.
-    /// Defaults to `false`; set to `true` for providers like Kilo Gateway
-    /// whose model catalog is public.
     const PUBLIC_MODEL_LISTING: bool = false;
 
     /// Build the base compat provider with both catalog consts applied. Use
@@ -234,13 +205,6 @@ pub fn apply_compat_options(
     Box::new(p)
 }
 
-/// Build an `OpenAiResponsesModelProvider` from the per-alias runtime options,
-/// applying the same `max_tokens` / `reasoning_effort` / `timeout_secs` /
-/// `extra_headers` overrides every family that speaks the responses wire
-/// shares. Returns `None` unless `wire_api` selects the responses protocol,
-/// so a caller can route with a single
-/// `if let Some(p) = build_responses_provider_if_requested(..)` and fall
-/// through to its chat-completions build otherwise.
 fn build_responses_provider_if_requested(
     wire_api: Option<zeroclaw_config::schema::WireApi>,
     alias: &str,
@@ -285,21 +249,6 @@ pub(crate) fn build_kimi_code_compat(
         .models_dev_key("moonshotai")
 }
 
-/// Dispatch family construction by routing `(family, alias)` to the typed
-/// slot's `FamilyProviderFactory` impl. Generated from
-/// `for_each_model_provider_slot!` so the family list lives in exactly one
-/// place — adding a row to the slot macro requires a corresponding impl,
-/// caught at compile time when the macro expands.
-///
-/// `family` is the canonicalized family name (post-V2 synonym mapping);
-/// `alias` is the per-family entry key (`default`, `prod_v2`, …).
-///
-/// `config` is `Option` so legacy entry points (tests, programmatic
-/// factory calls without agent context) can dispatch without a real
-/// `Config` — those fall back to the family struct's `Default` impl,
-/// which gives compat-only families full functionality and bespoke
-/// families their unconfigured defaults (Azure errors helpfully on
-/// missing `resource`, etc.).
 pub fn dispatch_family_factory(
     config: Option<&zeroclaw_config::schema::Config>,
     family: &str,
@@ -397,12 +346,6 @@ pub(crate) fn fallback_auth_ready_for_alias(
     }
     zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
 }
-
-// ════════════════════════════════════════════════════════════════════════
-// Per-family impls — grouped by category. Adding a family means: one row
-// in `for_each_model_provider_slot!` (zeroclaw-config) plus one impl
-// here. Compiler enforces both via the slot-macro-driven dispatch above.
-// ════════════════════════════════════════════════════════════════════════
 
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
@@ -834,12 +777,6 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // OAuth refresh path: when the operator supplied an
-        // `oauth_refresh_token`, exchange it for a short-lived access
-        // token before constructing the provider. Region picked from
-        // the typed `endpoint` enum (Cn/Intl). Operators preferring
-        // dashboard-generated long-lived API keys leave the refresh
-        // token unset and populate `api_key` directly.
         let refreshed_key: Option<String> = self
             .oauth_refresh_token
             .as_deref()
@@ -1252,11 +1189,6 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Per-alias OAuth refresh path: when `oauth_refresh_token` is set
-        // on this alias config, exchange it for a short-lived access
-        // token immediately. Operator override of the baked client_id
-        // and resource URL flow through the same path. When unset, fall
-        // through to the upstream `qwen login` file-cache integration.
         let alias_oauth: Option<crate::QwenOauthCredentials> = self
             .oauth_refresh_token
             .as_deref()
@@ -1620,10 +1552,6 @@ mod tests {
     use super::*;
     use zeroclaw_config::schema::ModelProviderConfig;
 
-    /// Regression for the #7136 review: the Kilo Gateway default exists in two
-    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
-    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
-    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
     #[test]
     fn kilo_gateway_default_url_matches_schema_endpoint() {
         use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};
@@ -1936,27 +1864,6 @@ mod tests {
         assert_ne!(provider.default_wire_api(), "responses");
     }
 
-    // Issue #7690 follow-up: factory forwarding tests for `provider_timeout_secs`
-    // and `extra_headers` through the responses path. The struct-level
-    // builders and `build_default_headers` are covered in
-    // `crates/zeroclaw-providers/src/openai.rs::tests`; these tests pin
-    // the factory layer by exercising the routing + URL composition with
-    // a real `CustomModelProviderConfig` (the existing
-    // `custom_factory_routes_to_responses_provider_when_wire_api_responses`
-    // test above only checks routing with `default()` runtime options).
-    //
-    // Downcasting the `Box<dyn ModelProvider>` to the concrete struct
-    // requires `Any` on the trait, which `ModelProvider` does not
-    // expose. Instead we rely on:
-    //
-    // (a) the public `default_wire_api()` / `default_base_url()` accessors
-    //     to confirm the factory routed to the responses provider, and
-    // (b) the end-to-end timeout test below against a live axum server
-    //     (same shape as
-    //     `openai_factory_forwards_timeout_to_native_provider`), which
-    //     closes the loop by asserting a configured 1s timeout aborts a
-    //     3s server response.
-
     #[tokio::test]
     async fn responses_factory_forwards_timeout_secs_to_responses_provider() {
         use axum::{Json, Router, routing::post};
@@ -2032,14 +1939,6 @@ mod tests {
         );
     }
 
-    // Symmetric pair of `responses_factory_forwards_timeout_secs_to_responses_provider`
-    // (singlerider 🟡 follow-up, review 4568610917): the factory wiring for
-    // `extra_headers` must (a) emit configured custom headers on the wire and
-    // (b) drop a case-insensitive `Authorization` from `extra_headers` so the
-    // built-in bearer credential is the only one on the request. The drop is
-    // the security boundary — reqwest 0.12 *appends* per-request headers on
-    // top of `default_headers`, so a duplicated `Authorization` would produce
-    // two values and the server would pick one unpredictably.
     #[tokio::test]
     async fn responses_factory_forwards_extra_headers_to_responses_provider() {
         use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
@@ -2140,13 +2039,6 @@ mod tests {
             "configured extra_headers['X-Tenant'] must reach the wire"
         );
 
-        // (b) only one Authorization value, and it is the built-in one. The
-        // case-insensitive drop in `build_default_headers` (see
-        // `crates/zeroclaw-providers/src/openai.rs::build_default_headers`)
-        // must reject both the `Authorization` and the lowercase
-        // `authorization` entries from extra_headers — the only Authorization
-        // left on the wire is the one the provider built from the
-        // constructor-supplied credential.
         let auth_values: Vec<&str> = captured_headers
             .get_all("Authorization")
             .iter()
@@ -2245,11 +2137,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
-        // Security/privacy fallback pin: with no alias-level `uri`, the blanket
-        // compat route must hand OpenCode's DEFAULT_URL to the responses
-        // provider. If it stopped doing so, the provider would silently default
-        // to OpenAI's /v1/responses and send OpenCode credentials to the wrong
-        // host.
         assert_eq!(
             provider.default_base_url(),
             Some("https://opencode.ai/zen/v1/responses")

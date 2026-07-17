@@ -1,15 +1,4 @@
 //! GitHub Copilot model_provider with OAuth device-flow authentication.
-//!
-//! Authenticates via GitHub's device code flow (same as VS Code Copilot),
-//! then exchanges the OAuth token for short-lived Copilot API keys.
-//! Tokens are cached to disk and auto-refreshed.
-//!
-//! **Note:** This uses VS Code's OAuth client ID (`Iv1.b507a08c87ecfe98`) and
-//! editor headers. This is the same approach used by LiteLLM, Codex CLI,
-//! and other third-party Copilot integrations. The Copilot token endpoint is
-//! private; there is no public OAuth scope or app registration for it.
-//! GitHub could change or revoke this at any time, which would break all
-//! third-party integrations simultaneously.
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -183,11 +172,6 @@ struct ResponseMessage {
 
 // ── ModelProvider ─────────────────────────────────────────────────────
 
-/// GitHub Copilot model_provider with automatic OAuth and token refresh.
-///
-/// On first use, prompts the user to visit github.com/login/device.
-/// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
-/// automatically.
 pub struct CopilotModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,

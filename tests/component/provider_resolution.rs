@@ -1,11 +1,4 @@
 //! TG1: ModelProvider End-to-End Resolution Tests
-//!
-//! Prevents: Pattern 1 — ModelProvider configuration & resolution bugs (27% of user bugs).
-//! Issues: #831, #834, #721, #580, #452, #451, #796, #843
-//!
-//! Tests the full pipeline from config values through `create_model_provider_with_url()`
-//! to model_provider construction, verifying factory resolution, URL construction,
-//! credential wiring, and auth header format.
 
 use zeroclaw::providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use zeroclaw::providers::{
@@ -195,7 +188,7 @@ fn compatible_provider_base_url_trailing_slash_normalized() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ModelProvider with api_url override (simulates #721 - Ollama api_url config)
+// ModelProvider with api_url override (simulates- Ollama api_url config)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]

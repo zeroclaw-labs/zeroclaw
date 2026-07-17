@@ -1,17 +1,4 @@
 //! Telnyx AI inference model_provider.
-//!
-//! Telnyx provides AI inference through an OpenAI-compatible API at
-//! <https://api.telnyx.com/v2/ai> with access to 53+ models including
-//! GPT-4o, Claude, Llama, Mistral, and more.
-//!
-//! # Configuration
-//!
-//! Set the `TELNYX_API_KEY` environment variable or configure in `config.toml`:
-//!
-//! ```toml
-//! default_model_provider = "telnyx"
-//! default_model = "openai/gpt-4o"
-//! ```
 
 use crate::traits::{ChatMessage, ModelProvider};
 use async_trait::async_trait;
@@ -21,21 +8,6 @@ use serde::Deserialize;
 /// Telnyx Inference Engine public endpoint.
 pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 
-/// Telnyx AI inference model_provider.
-///
-/// Uses the OpenAI-compatible chat completions API at `/v2/ai/chat/completions`.
-/// Supports 53+ models including OpenAI, Anthropic (via API), Meta Llama,
-/// Mistral, and more.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use zeroclaw::providers::telnyx::TelnyxModelProvider;
-/// use zeroclaw::providers::ModelProvider;
-///
-/// let model_provider = TelnyxModelProvider::builder("test").api_key(Some("your-api-key")).build();
-/// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
-/// ```
 pub struct TelnyxModelProvider {
     /// `[providers.models.telnyx.<alias>]` config-key alias.
     alias: String,
@@ -93,7 +65,6 @@ impl TelnyxModelProvider {
     }
 
     /// List available models from Telnyx AI.
-    ///
     /// Returns a list of model IDs that can be used with the chat API.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {

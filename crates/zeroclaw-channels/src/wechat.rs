@@ -1,8 +1,4 @@
 //! WeChat personal iLink Bot channel.
-//!
-//! Note: the iLink consent screen ("Connect X to Weixin") shows the bot name
-//! from the iLink developer portal, not from ZeroClaw config. Users who
-//! register their own iLink bot will see their own name there.
 
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
@@ -454,9 +450,6 @@ pub struct WeChatChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle. `None` in tests; `Some` in the
-    /// long-running daemon, wired via `.with_persistence(config)`. RwLock so
-    /// concurrent peer reads from sibling channels don't serialize.
     persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard for /bind flow.
     pairing: Option<PairingGuard>,
@@ -715,11 +708,7 @@ impl WeChatChannel {
             Some(guard)
         };
 
-        let state_dir = state_dir.unwrap_or_else(|| {
-            directories::UserDirs::new()
-                .map(|u| u.home_dir().join(".zeroclaw").join("wechat"))
-                .unwrap_or_else(|| PathBuf::from(".zeroclaw/wechat"))
-        });
+        let state_dir = state_dir.unwrap_or_else(Self::default_state_dir);
 
         let mut channel = Self {
             bot_token: RwLock::new(None),
@@ -758,12 +747,45 @@ impl WeChatChannel {
         self
     }
 
+    /// Default state directory when `[channels.wechat.<alias>] state_dir`
+    /// is unset: `~/.zeroclaw/wechat`.
+    fn default_state_dir() -> PathBuf {
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".zeroclaw").join("wechat"))
+            .unwrap_or_else(|| PathBuf::from(".zeroclaw/wechat"))
+    }
+
+    /// Resolve the effective state directory from the raw
+    /// `[channels.wechat.<alias>] state_dir` config value: tilde-expanded
+    /// when set, [`Self::default_state_dir`] otherwise. Single source of
+    /// truth for every consumer of the config value — channel construction
+    /// and the readiness probe must agree on the directory.
+    pub fn resolve_state_dir(configured: Option<&str>) -> PathBuf {
+        match configured {
+            Some(path) => PathBuf::from(shellexpand::tilde(path).as_ref()),
+            None => Self::default_state_dir(),
+        }
+    }
+
+    /// Read `account.json` from a state directory, if present and parseable.
+    fn read_account_data(state_dir: &Path) -> Option<AccountData> {
+        let data = std::fs::read_to_string(state_dir.join("account.json")).ok()?;
+        serde_json::from_str::<AccountData>(&data).ok()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether this state
+    /// directory holds the same signal [`Self::load_persisted_state`] uses
+    /// to resume a session without a fresh QR scan — an `account.json`
+    /// carrying a non-empty bot token. Read-only; never creates files.
+    pub fn has_persisted_login(state_dir: &Path) -> bool {
+        Self::read_account_data(state_dir)
+            .and_then(|account| account.token)
+            .is_some_and(|token| !token.is_empty())
+    }
+
     /// Load persisted token and cursor from state_dir.
     fn load_persisted_state(&mut self) {
-        let account_path = self.state_dir.join("account.json");
-        if let Ok(data) = std::fs::read_to_string(&account_path)
-            && let Ok(account) = serde_json::from_str::<AccountData>(&data)
-        {
+        if let Some(account) = Self::read_account_data(&self.state_dir) {
             if let Some(ref token) = account.token
                 && !token.is_empty()
             {
@@ -908,55 +930,13 @@ impl WeChatChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-        use zeroclaw_config::providers::ChannelRef;
-
-        let Some(config) = &self.persist else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"identity": identity})),
-                "paired identity not persisted (no persistence handle wired)"
-            );
-            return Ok(());
-        };
-        let normalized = identity.trim().to_string();
-        if normalized.is_empty() {
-            anyhow::bail!("Cannot persist empty WeChat identity");
-        }
-        let group_name = format!("wechat_{}", self.alias);
-        let channel_ref = ChannelRef::new(format!("wechat.{}", self.alias));
-        let snapshot = {
-            let mut cfg = config.write();
-            if !cfg.channels.wechat.contains_key(&self.alias) {
-                anyhow::bail!(
-                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app-id=<id>` to configure.",
-                    self.alias
-                );
-            }
-            let group = cfg
-                .peer_groups
-                .entry(group_name)
-                .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
-                    ..PeerGroupConfig::default()
-                });
-            if group
-                .external_peers
-                .iter()
-                .any(|p| p.as_str() == normalized)
-            {
-                return Ok(());
-            }
-            group.external_peers.push(PeerUsername::new(normalized));
-            cfg.clone()
-        };
-        snapshot
-            .save()
-            .await
-            .context("Failed to persist WeChat peer to config.toml")?;
-        Ok(())
+        crate::identity_persist::persist_external_peer(
+            self.persist.as_ref(),
+            "wechat",
+            &self.alias,
+            identity,
+        )
+        .await
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -990,18 +970,6 @@ impl WeChatChannel {
         )
     }
 
-    /// Resolve `candidate` (already lexically inside `workspace_dir`) to its
-    /// real on-disk path and verify that the canonical target still lives
-    /// under the canonical workspace. Closes the symlink-escape hole that a
-    /// purely-lexical `resolve_under` leaves open: a workspace entry such as
-    /// `outside -> /etc` would otherwise pass lexical containment and let an
-    /// incoming marker like `[DOCUMENT:/workspace/outside/passwd]` read
-    /// `/etc/passwd` once `tokio::fs::read` follows the link.
-    ///
-    /// When `candidate` does not exist (and therefore cannot be canonicalized),
-    /// the lexical result is returned unchanged: a non-existent path cannot
-    /// resolve through a symlink. The lexical check is the safety net for
-    /// non-existent targets.
     fn canonicalize_within_workspace(
         candidate: &Path,
         workspace_dir: &Path,
@@ -2468,7 +2436,6 @@ impl Channel for WeChatChannel {
 
     async fn send_draft(&self, _msg: &SendMessage) -> anyhow::Result<Option<String>> {
         // TODO: Re-enable placeholder if WeChat adds message edit/revoke support.
-        //
         // Current behavior: Return draft_id without sending placeholder.
         // The final response will be sent in finalize_draft().
         let draft_id = format!("draft_{}", uuid::Uuid::new_v4());
@@ -2537,6 +2504,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ch.name(), "wechat");
+    }
+
+    #[test]
+    fn has_persisted_login_requires_non_empty_account_token() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+
+        assert!(!WeChatChannel::has_persisted_login(dir));
+
+        // A token cleared on logout is not a persisted login.
+        std::fs::write(dir.join("account.json"), r#"{"token": ""}"#).unwrap();
+        assert!(!WeChatChannel::has_persisted_login(dir));
+
+        std::fs::write(
+            dir.join("account.json"),
+            r#"{"token": "tok_persisted", "account_id": "acct_1"}"#,
+        )
+        .unwrap();
+        assert!(WeChatChannel::has_persisted_login(dir));
     }
 
     #[test]
@@ -2869,12 +2855,6 @@ mod tests {
     // lexical-only containment path is still exercised by the
     // other tests in this module.
     fn resolve_local_attachment_path_rejects_symlink_escaping_workspace() {
-        // Workspace contains `outside -> /tmp/.../outside-target`, where the
-        // target dir lives outside the workspace. Lexical normalization
-        // (which `resolve_under` does) is not enough — the symlink must be
-        // resolved and the canonical target must be re-checked against the
-        // canonical workspace, otherwise `[DOCUMENT:outside/file.txt]` would
-        // read the file the symlink points at.
         let temp = tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2958,11 +2938,6 @@ mod tests {
         assert_eq!(parse_aes_key(&hex_key).unwrap(), raw);
         assert_eq!(parse_aes_key(&base64_key).unwrap(), raw);
 
-        // Outbound CDNMedia `aes_key` must be base64(hex(key)), matching the
-        // official @tencent-weixin/openclaw-weixin client (base64-decode then
-        // hex-decode back to 16 bytes). Encoding raw bytes directly is
-        // undecryptable by the client ("image expired"), so it must NOT equal
-        // base64(raw) and must round-trip through the same parser.
         let outbound = base64::engine::general_purpose::STANDARD.encode(hex::encode(raw));
         assert_ne!(outbound, base64_key);
         assert_eq!(parse_aes_key(&outbound).unwrap(), raw);

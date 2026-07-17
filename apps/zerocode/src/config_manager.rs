@@ -41,11 +41,6 @@ pub(crate) fn init_terminal() -> Result<Term> {
         EnableMouseCapture,
         EnableBracketedPaste,
     )?;
-    // Keyboard progressive enhancement (Kitty protocol) is optional — it
-    // enables key-release/repeat reporting on capable terminals. Legacy
-    // Windows consoles (conhost) don't support it and return an error; treat
-    // it as best-effort so an unsupported console degrades gracefully instead
-    // of aborting startup.
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
@@ -149,7 +144,6 @@ impl ConfigSection {
 }
 
 // ── Keymap-derived chord glyphs (footers + help) ─────────────────
-//
 // Footer hints and the help overlay must show the live, possibly-overridden
 // chord for each action — never a hardcoded glyph.
 
@@ -229,11 +223,6 @@ fn switch_tabs_keys() -> Vec<String> {
         .collect()
 }
 
-/// Display form of a config directory. Replaces the user's home prefix with
-/// "~" so a long path like "/home/alice/.zeroclaw" reads as
-/// "~/.zeroclaw" in the Config header. Falls back to the original path
-/// representation when the path is not under the current home directory or
-/// when the home directory cannot be resolved.
 fn shorten_home(path: &Path) -> String {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let Some(home) = home else {
@@ -404,11 +393,6 @@ impl App {
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
-        // Group the section list for display: stable sort by group rank
-        // keeps the canonical (dependency-correct) order within each
-        // group. Daemons that predate group plumbing send "" for every
-        // entry — all ranks tie, the sort is a no-op, and the pane
-        // renders the flat list exactly as before.
         self.sections.sort_by_key(|s| Self::group_rank(&s.group));
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
@@ -796,11 +780,6 @@ impl App {
             }
         }
 
-        // The zerocode pane owns its own mouse handling. Drain the locale
-        // sync afterward so a mouse-driven "Download locale file" (or a
-        // click into the Locale tab) triggers the lazy list/fetch RPC the
-        // same way the key path does — otherwise the request is queued and
-        // never sent, leaving the tab stuck on "loading locales…".
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
             self.sync_zerocode_locales().await;
@@ -846,11 +825,6 @@ impl App {
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
                 {
                     let labels: Vec<&str> = self.tab_names.iter().map(|t| t.label()).collect();
-                    // Each rendered label is "▸ <label>" (active, +2 chars) or
-                    // "<label>" (inactive). For hit testing we use the plain
-                    // label width + 2 for the active tab's prefix. However
-                    // `tab_click_index` just walks fixed widths, so build
-                    // display labels matching what draw_field_list renders.
                     let display: Vec<String> = labels
                         .iter()
                         .enumerate()
@@ -1400,12 +1374,6 @@ impl App {
         Ok(())
     }
 
-    /// Pre-fill a freshly created cost-rate resource from the live provider
-    /// catalog, matching the web Costs editor. Reuses the existing
-    /// `catalog_models` RPC (same payload the gateway serves the dashboard);
-    /// only the `models` category carries token pricing, so other categories
-    /// are left for manual entry. Best-effort: any miss leaves the sheet
-    /// empty rather than surfacing an error.
     async fn prefill_cost_rates_from_catalog(&self, base_path: &str, resource: &str) {
         let Some(provider_type) = base_path.strip_prefix("cost.rates.providers.models.") else {
             return;
@@ -1686,11 +1654,6 @@ impl App {
         }
     }
 
-    /// Load the highlighted section's content into the right pane for preview,
-    /// without moving keyboard focus off the section list. Re-previewing the
-    /// already-loaded section is a no-op so its cursor is preserved; switching to
-    /// a different section saves the outgoing cursor and restores the incoming
-    /// section's remembered position.
     async fn preview_section(&mut self, idx: usize) -> Result<()> {
         if self.loaded_section == Some(idx) {
             return Ok(());
@@ -3338,15 +3301,6 @@ impl App {
         Ok(())
     }
 
-    /// Persistent left pane: the section list. `active` is true while the
-    /// SectionList screen holds focus (bright highlight); once a section is
-    /// entered the list dims to a "you are here" marker.
-    /// Display rank of a section-group label. Mirror of
-    /// `zeroclaw_config::sections::SECTION_GROUPS` — zerocode talks to
-    /// remote daemons over the wire, so like the dashboard's
-    /// `GROUP_ORDER` (web/src/pages/Config.tsx) it carries its own copy
-    /// of the order instead of linking the config crate. Unknown and
-    /// empty labels rank with "Other" so nothing ever vanishes.
     fn group_rank(label: &str) -> usize {
         const ORDER: &[&str] = &[
             "Foundation",
@@ -3388,12 +3342,6 @@ impl App {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
 
-        // Grouped display: dim header rows between groups, sections
-        // beneath. Active only when the daemon sent group labels and no
-        // filter narrows the list — filtering and old daemons render the
-        // flat all-sections list unchanged. `row_map` records what each
-        // display row is so the cursor and mouse hit-testing resolve
-        // through it instead of assuming row == section position.
         let grouped = self.filter.is_none() && self.sections.iter().any(|s| !s.group.is_empty());
         let mut row_map: Vec<Option<usize>> = Vec::with_capacity(visible.len());
         let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
@@ -3856,15 +3804,6 @@ impl App {
                 };
 
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
-                // In the field list (selection) screen, the row is only
-                // *selected*; it is not yet editable. Make this explicit so the
-                // affordance no longer mimics an active text input. The press
-                // hint is derived from the same row used for ListState
-                // selection, so it stays aligned with the highlight even when
-                // a field-list filter is active. The key name is resolved from
-                // the current keymap so rebinding ConfigTabAction::Enter is
-                // reflected here, and the prose is rendered through Fluent for
-                // localization.
                 let press_hint = if Some(i) == selected_field {
                     let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
                     format!(

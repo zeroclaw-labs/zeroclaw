@@ -122,20 +122,6 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
     }
 }
 
-/// Open the main dashboard window pointed at the running web gateway.
-///
-/// Invoked by the splash window once it confirms the gateway is healthy.
-/// Pairs with the gateway (when pairing is required) and seeds the bearer
-/// token into the WebView's localStorage through an initialization script —
-/// which runs *before* any gateway page script, so the React app never
-/// flashes the pairing dialog and lands straight on the dashboard (or the
-/// Quickstart, on a fresh install). Idempotent: focuses the existing window
-/// if the dashboard is already open.
-///
-/// The window targets the gateway *root* (`/`), not `/_app/`. The gateway
-/// serves the SPA shell at the root via its fallback route and only static
-/// assets under `/_app/`; loading the dashboard at root is what lets the web
-/// app's fresh-install redirect take the user to `/quickstart`.
 #[tauri::command]
 async fn open_dashboard(
     app: tauri::AppHandle,
@@ -201,7 +187,6 @@ pub fn run() {
     let shared = shared_state();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance launches, focus whichever surface is current.

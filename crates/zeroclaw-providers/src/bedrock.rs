@@ -1,11 +1,4 @@
 //! AWS Bedrock model_provider using the Converse API.
-//!
-//! Authentication: supports three methods:
-//! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
-//! - **SigV4 signing**: AWS AKSK (Access Key ID + Secret Access Key)
-//!   via environment variables, `credential_process` in `~/.aws/config`,
-//!   or EC2 IMDSv2. SigV4 signing is implemented manually using hmac/sha2
-//!   crates — no AWS SDK dependency.
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -408,7 +401,6 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
 }
 
 /// Build the SigV4 `Authorization` header value.
-///
 /// `headers` must be sorted by lowercase header name.
 fn build_authorization_header(
     credentials: &AwsCredentials,
@@ -489,12 +481,6 @@ struct ConverseMessage {
     content: Vec<ContentBlock>,
 }
 
-/// Content blocks use Bedrock's union style:
-/// `{"text": "..."}`, `{"toolUse": {...}}`, `{"toolResult": {...}}`, `{"cachePoint": {...}}`.
-///
-/// Note: `text` is a simple string value, not a nested object. `toolUse` and `toolResult`
-/// are nested objects. We use `#[serde(untagged)]` with manual struct wrappers to
-/// match this mixed format.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ContentBlock {
@@ -624,26 +610,10 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-/// Whether a Bedrock model accepts the fixed-budget native-thinking shape
-/// (`additionalModelRequestFields.thinking = {"type": "enabled", "budget_tokens": N}`).
-/// AWS's Opus 4.7 model card states the model only supports adaptive thinking
-/// and rejects fixed budgets with a 400; until adaptive thinking is implemented,
-/// those models stay on prompt-based reasoning.
-/// AWS docs:
-/// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html>
 fn bedrock_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
 
-/// Whether a Bedrock model accepts `cachePoint` blocks for prompt caching.
-///
-/// Only Anthropic Claude and Amazon Nova models support prompt caching on
-/// Bedrock; other families (Qwen, Llama, Mistral, DeepSeek, …) reject a request
-/// that contains a `cachePoint` with a 400: "You invoked an unsupported model or
-/// your request did not allow prompt caching". Caching is purely an
-/// optimization, so we allowlist the known-supported families and skip
-/// `cachePoint` insertion everywhere else rather than risk that error.
-/// AWS docs: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.contains("claude") || model.contains("nova")
@@ -672,7 +642,7 @@ struct ToolSpecDef {
 #[derive(Debug, Serialize)]
 struct InputSchema {
     /// `Arc`-shared with the tool registry's stored schema — serialized
-    /// transparently, never deep-cloned per request (#8642).
+    /// transparently, never deep-cloned per request
     json: Arc<serde_json::Value>,
 }
 
@@ -712,12 +682,6 @@ struct ConverseOutputMessage {
     content: Vec<ResponseContentBlock>,
 }
 
-/// Response content blocks from the Converse API.
-///
-/// Uses `#[serde(untagged)]` to match Bedrock's union format where `text` is a
-/// simple string value and `toolUse` is a nested object. `reasoningContent`
-/// carries extended thinking output. Unknown block types (e.g. `guardContent`)
-/// are captured as `Other` to prevent deserialization failures.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ResponseContentBlock {
@@ -1099,13 +1063,6 @@ impl BedrockModelProvider {
         (system, converse_messages)
     }
 
-    /// Remove empty text ContentBlocks from converse messages.
-    ///
-    /// Bedrock rejects requests where a ContentBlock has a blank `text` field
-    /// with: "The text field in the ContentBlock object is blank". This can
-    /// occur when a daemon restart interrupts a streaming response, leaving a
-    /// partially-persisted message with empty content, or when bot/attachment-
-    /// only messages produce empty text blocks.
     fn sanitize_empty_content_blocks(messages: &mut [ConverseMessage]) {
         for msg in messages.iter_mut() {
             msg.content.retain(|block| match block {
@@ -1120,17 +1077,6 @@ impl BedrockModelProvider {
         }
     }
 
-    /// Strip `toolUse` blocks that have no matching `toolResult` anywhere in
-    /// the request.
-    ///
-    /// Belt-and-suspenders defence: the runtime's history pruner is the first
-    /// line (it strips unpaired tool_calls before the request is built), but if
-    /// an orphaned tool_use ever reaches the converter — e.g. a max-iteration
-    /// graceful-shutdown path that wasn't sanitised — Bedrock rejects the whole
-    /// request with: "Expected toolResult blocks at messages.N.content for the
-    /// following Ids: tooluse_*". Here we drop the unpaired `toolUse` blocks so
-    /// the request still succeeds; an assistant message left empty gets a
-    /// placeholder so Bedrock's non-empty-content invariant holds.
     fn strip_orphaned_tool_uses(messages: &mut [ConverseMessage]) {
         use std::collections::HashSet;
 
@@ -1182,11 +1128,6 @@ impl BedrockModelProvider {
             .map(String::from)
     }
 
-    /// Find the first unmatched tool_use_id from the last assistant message.
-    ///
-    /// When a tool result can't be parsed at all (not even the ID), we fall
-    /// back to matching it against the preceding assistant turn's toolUse
-    /// blocks that don't yet have a corresponding toolResult.
     fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
         let last_assistant = converse_messages
             .iter()
@@ -1705,7 +1646,7 @@ impl ModelProvider for BedrockModelProvider {
 
         // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
         // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
-        // insertion on model support (see issue #7312).
+        // insertion on model support.
         let supports_caching = bedrock_model_supports_prompt_caching(model);
 
         // Apply cachePoint to system if large.
@@ -2368,7 +2309,7 @@ mod tests {
 
     #[test]
     fn prompt_caching_unsupported_for_other_families() {
-        // Regression for #7312: Qwen (and other non-Claude/Nova families) reject
+        // Qwen (and other non-Claude/Nova families) reject
         // cachePoint blocks, so caching must be disabled for them.
         for model in [
             "qwen.qwen3-coder-next",
