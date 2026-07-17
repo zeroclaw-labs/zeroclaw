@@ -16,7 +16,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -32,12 +31,12 @@ use zeroclaw_api::media::MediaAttachment;
 pub struct WasmChannel {
     endpoint: PluginChannelEndpoint,
     capabilities: ChannelCapabilities,
-    state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
+    state: Mutex<(Store<PluginState>, ChannelPlugin)>,
     inbound: InboundQueue,
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
-    poll_healthy: Arc<AtomicBool>,
+    poll_healthy: AtomicBool,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -161,12 +160,12 @@ impl WasmChannel {
         Ok(Self {
             endpoint,
             capabilities,
-            state: Arc::new(Mutex::new((store, bindings))),
+            state: Mutex::new((store, bindings)),
             inbound,
             cached_self_handle,
             cached_self_addressed_mention,
             cached_multi_message_delay_ms,
-            poll_healthy: Arc::new(AtomicBool::new(true)),
+            poll_healthy: AtomicBool::new(true),
         })
     }
 
@@ -267,59 +266,60 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let endpoint = self.endpoint.clone();
-        let state = Arc::clone(&self.state);
-        let poll_healthy = Arc::clone(&self.poll_healthy);
-        zeroclaw_spawn::spawn!(async move {
-            const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
-            const MAX_BACKOFF: Duration = Duration::from_millis(500);
-            let mut backoff = INITIAL_BACKOFF;
-            loop {
-                let polled = {
-                    let mut guard = state.lock().await;
-                    let (ref mut store, ref mut bindings) = *guard;
-                    crate::component::refuel(store);
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_poll_message(store)
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+        const MAX_BACKOFF: Duration = Duration::from_millis(500);
+        let mut backoff = INITIAL_BACKOFF;
+        // Keep the poll loop inside the Channel::listen future. The
+        // orchestrator owns cancellation and restart supervision; detaching a
+        // second task here would make every apparent exit leak another loop.
+        loop {
+            let polled = {
+                let mut guard = self.state.lock().await;
+                let (ref mut store, ref mut bindings) = *guard;
+                crate::component::refuel(store);
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_poll_message(store)
+                    .await
+            };
+            match polled {
+                Ok(Some(wit_msg)) => {
+                    mark_poll_healthy(&self.poll_healthy, true);
+                    backoff = INITIAL_BACKOFF;
+                    if tx
+                        .send(from_wit_inbound(wit_msg, &self.endpoint))
                         .await
-                };
-                match polled {
-                    Ok(Some(wit_msg)) => {
-                        mark_poll_healthy(&poll_healthy, true);
-                        backoff = INITIAL_BACKOFF;
-                        if tx.send(from_wit_inbound(wit_msg, &endpoint)).await.is_err() {
-                            break;
-                        }
+                        .is_err()
+                    {
+                        return Ok(());
                     }
-                    Ok(None) => {
-                        mark_poll_healthy(&poll_healthy, true);
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
-                    Err(e) => {
-                        mark_poll_healthy(&poll_healthy, false);
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Inbound
-                            )
+                    continue;
+                }
+                Ok(None) => {
+                    mark_poll_healthy(&self.poll_healthy, true);
+                }
+                Err(e) => {
+                    mark_poll_healthy(&self.poll_healthy, false);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "channel": endpoint.channel_type(),
-                                "channel_alias": endpoint.alias(),
+                                "channel": self.endpoint.channel_type(),
+                                "channel_alias": self.endpoint.alias(),
                                 "error": format!("{e:#}"),
                             })),
-                            "channel plugin poll-message trapped; backing off"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
+                        "channel plugin poll-message trapped; backing off"
+                    );
                 }
             }
-        });
-        Ok(())
+
+            tokio::select! {
+                () = tx.closed() => return Ok(()),
+                () = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
     }
 
     async fn health_check(&self) -> bool {

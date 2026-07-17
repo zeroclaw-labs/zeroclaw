@@ -310,7 +310,7 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     unsafe { Component::deserialize_file(engine(), wasm_path) }
 }
 
-/// Run an async call against a warm `Arc<Mutex<(Store, bindings)>>` plugin,
+/// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
 /// holding the store lock for the duration of the single component call.
 macro_rules! call_plugin {
     ($self:expr, $body:expr) => {{

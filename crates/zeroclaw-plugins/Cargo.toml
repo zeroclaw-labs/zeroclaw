@@ -17,7 +17,6 @@ plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
@@ -44,3 +43,4 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
 [dev-dependencies]
 tempfile = "3.26"
 zeroclaw-config = { path = "../zeroclaw-config" }
+zeroclaw-spawn.workspace = true

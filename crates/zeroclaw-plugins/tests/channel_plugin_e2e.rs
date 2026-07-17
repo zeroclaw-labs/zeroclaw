@@ -126,7 +126,7 @@ async fn channel_component_runs_through_host_ingress() {
     });
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    channel.listen(tx).await.expect("start fixture listener");
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("fixture message arrives before timeout")
@@ -137,4 +137,28 @@ async fn channel_component_runs_through_host_ingress() {
     assert_eq!(message.timestamp, 7);
     assert_eq!(message.channel, "plugin");
     assert_eq!(message.channel_alias.as_deref(), Some("main"));
+
+    assert!(
+        !listener.is_finished(),
+        "listen must retain ownership of its polling loop"
+    );
+    listener.abort();
+    let error = listener
+        .await
+        .expect_err("aborting listen must cancel its polling loop");
+    assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn channel_listener_stops_when_receiver_closes() {
+    let channel = channel("closed").await;
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(1), listener)
+        .await
+        .expect("listener observes receiver closure")
+        .expect("listener task joins")
+        .expect("listener exits cleanly");
 }
