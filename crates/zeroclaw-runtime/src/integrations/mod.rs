@@ -94,7 +94,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw config set channels.telegram.default.bot-token <token>");
+            println!("    3. Run: zeroclaw config set channels.telegram.default.bot_token <token>");
             println!("    4. Start: zeroclaw channel start");
         }
         "Discord" => {

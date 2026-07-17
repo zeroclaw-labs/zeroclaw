@@ -2278,7 +2278,6 @@ mod tests {
             initial_prompt: None,
             max_audio_bytes: None,
             max_duration_secs: 120,
-            max_audio_bytes: None,
             openai: None,
             deepgram: None,
             assemblyai: None,
