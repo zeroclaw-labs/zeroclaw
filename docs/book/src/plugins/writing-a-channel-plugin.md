@@ -242,6 +242,13 @@ must grant `config_read`; ZeroClaw then supplies each enabled, agent-owned
 parallel `plugins.entries` config block. Omit `provides` for a novel channel,
 which binds as `plugin.<manifest-name>` and reads its own plugin entry.
 
+Declare how the guest represents inbound sender identities with `sender_match`:
+`exact`, `case_insensitive`, `handle`, or `email`. For example, a guest that
+emits Telegram-style usernames with or without a leading `@` uses
+`sender_match = "handle"`. Omission defaults to `exact` for compatibility. This
+field describes only the emitted string; operators continue to authorize
+identities in `peer_groups`, which the host resolves live for every message.
+
 ## Build and install
 
 {{#include ../_snippets/plugin-build-component.md}}

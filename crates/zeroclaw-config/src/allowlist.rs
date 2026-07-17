@@ -64,6 +64,20 @@ pub fn email_match(allowed: &str, email: &str) -> bool {
     }
 }
 
+/// Compare one handle allowlist entry with a guest-emitted handle.
+///
+/// Both sides are trimmed and may carry a leading `@`. An entry that
+/// normalizes to an empty string never authorizes a sender.
+#[must_use]
+pub fn handle_match(allowed: &str, sender: &str) -> bool {
+    fn normalize(value: &str) -> &str {
+        value.trim().trim_start_matches('@')
+    }
+
+    let allowed = normalize(allowed);
+    !allowed.is_empty() && allowed == normalize(sender)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +122,14 @@ mod tests {
         assert!(is_user_allowed_by(&list, "anyone@Example.com", email_match));
         assert!(is_user_allowed_by(&list, "BOSS@corp.io", email_match));
         assert!(!is_user_allowed_by(&list, "user@evil.com", email_match));
+    }
+
+    #[test]
+    fn handle_match_trims_and_ignores_leading_at() {
+        assert!(handle_match(" @alice ", "alice"));
+        assert!(handle_match("alice", " @alice "));
+        assert!(!handle_match("@alice", "Alice"));
+        assert!(!handle_match("@", ""));
     }
 
     #[test]

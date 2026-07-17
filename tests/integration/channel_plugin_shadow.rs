@@ -70,7 +70,7 @@ fn fixture() -> PathBuf {
 }
 
 fn install_fixture(wasm: &Path, plugins_dir: &Path) {
-    install_fixture_as(wasm, plugins_dir, PLUGIN_NAME, None, false);
+    install_fixture_as(wasm, plugins_dir, PLUGIN_NAME, None, false, None);
 }
 
 fn install_fixture_as(
@@ -79,6 +79,7 @@ fn install_fixture_as(
     plugin_name: &str,
     provides: Option<&str>,
     config_read: bool,
+    sender_match: Option<&str>,
 ) {
     let plugin_dir = plugins_dir.join(plugin_name);
     fs::create_dir_all(&plugin_dir).expect("create throwaway plugin directory");
@@ -95,10 +96,13 @@ fn install_fixture_as(
              wasm_path = \"channel-fixture.wasm\"\n\
              wasm_sha256 = \"{digest}\"\n\
              capabilities = [\"channel\"]\n\
-             permissions = [{}]\n{}",
+             permissions = [{}]\n{}{}",
             if config_read { "\"config_read\"" } else { "" },
             provides.map_or_else(String::new, |channel_type| {
                 format!("provides = \"{channel_type}\"\n")
+            }),
+            sender_match.map_or_else(String::new, |sender_match| {
+                format!("sender_match = \"{sender_match}\"\n")
             })
         ),
     )
@@ -121,7 +125,7 @@ fn drain_configure_markers(rx: &mut tokio::sync::broadcast::Receiver<Value>) -> 
     count
 }
 
-fn mirror_config(plugins_dir: &Path, mirror_owner_enabled: bool) -> Config {
+fn mirror_config(plugins_dir: &Path, mirror_owner_enabled: bool) -> Arc<RwLock<Config>> {
     let mut config = Config::default();
     config.plugins.enabled = true;
     config.plugins.plugins_dir = plugins_dir.to_string_lossy().into_owned();
@@ -154,6 +158,14 @@ fn mirror_config(plugins_dir: &Path, mirror_owner_enabled: bool) -> Config {
         .channels
         .telegram
         .insert("backup".to_string(), backup);
+    config.peer_groups.insert(
+        "mirror-fixture".to_string(),
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            channel: "telegram.backup".into(),
+            external_peers: vec!["@blocked".into()],
+            ..Default::default()
+        },
+    );
 
     config.agents.clear();
     config.agents.insert(
@@ -182,7 +194,7 @@ fn mirror_config(plugins_dir: &Path, mirror_owner_enabled: bool) -> Config {
     config
         .validate()
         .expect("mirror fixture uses a valid daemon config");
-    config
+    Arc::new(RwLock::new(config))
 }
 
 async fn first_inbound(channel: Arc<dyn Channel>) -> ChannelMessage {
@@ -474,6 +486,7 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         "telegram-mirror",
         Some("telegram"),
         true,
+        Some("handle"),
     );
     let selected_config = mirror_config(&selected_plugins, true);
     let occupied = HashSet::from(["telegram.main".to_string()]);
@@ -487,6 +500,12 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     );
     let (alias, channel) = built.pop().expect("one selected mirror alias");
     assert_eq!(alias, "backup");
+    selected_config
+        .write()
+        .peer_groups
+        .get_mut("mirror-fixture")
+        .expect("canonical mirror peer group")
+        .external_peers = vec!["@tester".into()];
     let message = first_inbound(channel).await;
     assert_eq!(message.channel, "telegram");
     assert_eq!(message.channel_alias.as_deref(), Some("backup"));
@@ -514,6 +533,7 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         "disabled-mirror",
         Some("telegram"),
         true,
+        None,
     );
     let disabled_config = mirror_config(&disabled_plugins, false);
     let built =
@@ -532,6 +552,7 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         "ungranted-mirror",
         Some("telegram"),
         false,
+        None,
     );
     let ungranted_config = mirror_config(&ungranted_plugins, true);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
@@ -552,6 +573,7 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         "telegram-mirror-a",
         Some("telegram"),
         true,
+        None,
     );
     install_fixture_as(
         &wasm,
@@ -559,6 +581,7 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         "telegram-mirror-b",
         Some("telegram"),
         true,
+        None,
     );
     let duplicate_config = mirror_config(&duplicate_plugins, true);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(

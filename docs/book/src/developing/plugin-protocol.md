@@ -281,6 +281,15 @@ If more than one installed manifest claims the same `provides` value, the
 identity is ambiguous and every claimant is rejected before any guest export
 or channel credential is reached.
 
+Every novel or mirror channel plugin may declare `sender_match` to describe the
+identity string its guest places in each inbound message's `sender` field. The
+supported values are `exact` (the backward-compatible default),
+`case_insensitive`, `handle` (trim whitespace and an optional leading `@`), and
+`email` (full-address or domain-class matching). This is a guest contract, not a
+platform-name lookup: the host applies the declared representation to the live
+`peer_groups` entries for that channel on every message. The manifest never
+contains or copies the authorized identities themselves.
+
 ### Permissions
 
 `permissions` is a list of `PluginPermission` values, also defined in

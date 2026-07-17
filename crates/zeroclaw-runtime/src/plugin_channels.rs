@@ -220,7 +220,12 @@ pub async fn build_channel_plugins(
                             continue;
                         }
                     };
-                    let authorizer = channel_authorizer(&config_handle, channel_type, alias);
+                    let authorizer = channel_authorizer(
+                        &config_handle,
+                        channel_type,
+                        alias,
+                        manifest.sender_match,
+                    );
                     note_if_no_allowlist(&config, channel_type, alias, &manifest.name);
                     match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_digest(
                         channel_type,
@@ -257,7 +262,8 @@ pub async fn build_channel_plugins(
                     .entry_config(&manifest.name)
                     .cloned()
                     .unwrap_or_default();
-                let authorizer = channel_authorizer(&config_handle, &manifest.name, "");
+                let authorizer =
+                    channel_authorizer(&config_handle, &manifest.name, "", manifest.sender_match);
                 note_if_no_allowlist(&config, &manifest.name, "", &manifest.name);
                 match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_digest(
                     manifest.name.clone(),
@@ -352,17 +358,44 @@ pub async fn build_channel_plugins(
     Vec::new()
 }
 
+/// Apply a manifest-declared sender representation to a freshly-resolved peer
+/// list. Matching primitives live in `zeroclaw-config`; the manifest is the
+/// only source of truth for which representation a guest emits.
+#[cfg(feature = "plugins-wasm")]
+fn sender_allowed(
+    sender_match: zeroclaw_plugins::SenderMatch,
+    peers: &[String],
+    sender: &str,
+) -> bool {
+    use zeroclaw_config::allowlist::{self, Match};
+
+    match sender_match {
+        zeroclaw_plugins::SenderMatch::Exact => {
+            allowlist::is_user_allowed(peers, sender, Match::Sensitive)
+        }
+        zeroclaw_plugins::SenderMatch::CaseInsensitive => {
+            allowlist::is_user_allowed(peers, sender, Match::CaseInsensitive)
+        }
+        zeroclaw_plugins::SenderMatch::Handle => {
+            allowlist::is_user_allowed_by(peers, sender, allowlist::handle_match)
+        }
+        zeroclaw_plugins::SenderMatch::Email => {
+            allowlist::is_user_allowed_by(peers, sender, allowlist::email_match)
+        }
+    }
+}
+
 /// Build a default-deny sender gate for one plugin channel.
 ///
-/// Novel plugins in this lower stack use exact sender identities. Mirror
-/// plugins add their platform-specific matcher when the `provides` contract is
-/// introduced. In both cases the peer list is resolved live from the same
-/// `Config::peer_groups` state native channels consult.
+/// Both novel and mirror plugins declare how their guest represents `sender`
+/// in `PluginManifest::sender_match`. Peer membership is resolved live from the
+/// same `Config::peer_groups` state native channels consult.
 #[cfg(feature = "plugins-wasm")]
 fn channel_authorizer(
     config: &Arc<RwLock<Config>>,
     channel_type: &str,
     alias: &str,
+    sender_match: zeroclaw_plugins::SenderMatch,
 ) -> SenderAuthorizer {
     let config = Arc::clone(config);
     let channel_type = channel_type.to_string();
@@ -370,11 +403,7 @@ fn channel_authorizer(
 
     Arc::new(move |sender: &str| {
         let peers = config.read().channel_external_peers(&channel_type, &alias);
-        zeroclaw_config::allowlist::is_user_allowed(
-            &peers,
-            sender,
-            zeroclaw_config::allowlist::Match::Sensitive,
-        )
+        sender_allowed(sender_match, &peers, sender)
     })
 }
 
@@ -411,7 +440,8 @@ mod tests {
     #[test]
     fn sender_authorizer_resolves_peer_groups_live() {
         let config = Arc::new(RwLock::new(Config::default()));
-        let authorizer = channel_authorizer(&config, "fixture", "");
+        let authorizer =
+            channel_authorizer(&config, "fixture", "", zeroclaw_plugins::SenderMatch::Exact);
 
         assert!(!authorizer("tester"), "empty peer groups deny by default");
 
@@ -445,6 +475,52 @@ mod tests {
         assert!(authorizer("tester"), "wildcard uses shared semantics");
     }
 
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn manifest_sender_match_selects_shared_identity_semantics() {
+        use zeroclaw_plugins::SenderMatch;
+
+        let peers = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_string()).collect()
+        };
+
+        assert!(sender_allowed(
+            SenderMatch::Exact,
+            &peers(&["alice"]),
+            "alice"
+        ));
+        assert!(!sender_allowed(
+            SenderMatch::Exact,
+            &peers(&["alice"]),
+            "Alice"
+        ));
+        assert!(sender_allowed(
+            SenderMatch::CaseInsensitive,
+            &peers(&["Alice"]),
+            "alice"
+        ));
+        assert!(sender_allowed(
+            SenderMatch::Handle,
+            &peers(&[" @alice "]),
+            "@alice"
+        ));
+        assert!(sender_allowed(
+            SenderMatch::Email,
+            &peers(&["@example.com"]),
+            "user@Example.com"
+        ));
+
+        for sender_match in [
+            SenderMatch::Exact,
+            SenderMatch::CaseInsensitive,
+            SenderMatch::Handle,
+            SenderMatch::Email,
+        ] {
+            assert!(!sender_allowed(sender_match, &[], "anyone"));
+            assert!(sender_allowed(sender_match, &peers(&["*"]), "anyone"));
+        }
+    }
+
     #[test]
     fn shadowed_plugins_are_filtered_before_instantiation() {
         let claimed = HashSet::from(["telegram.main".to_string()]);
@@ -468,6 +544,7 @@ mod tests {
                 wasm_sha256: None,
                 capabilities: vec![zeroclaw_plugins::PluginCapability::Channel],
                 provides: provides.map(str::to_string),
+                sender_match: zeroclaw_plugins::SenderMatch::Exact,
                 permissions: Vec::new(),
                 signature: None,
                 publisher_key: None,
