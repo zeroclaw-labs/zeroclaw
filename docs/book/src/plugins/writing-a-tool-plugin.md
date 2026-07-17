@@ -36,16 +36,18 @@ the plugin host compiled in to run it.
 
 Understand the runtime shape before writing code:
 
-1. At startup, discovery finds your plugin directory, validates the manifest,
-   and runs signature policy. Survivors become `WasmTool` instances.
+1. At startup, discovery finds your plugin directory, validates the manifest
+   shape, runs signature policy, and then validates `config_schema`. Before
+   registration, the host materializes the plugin's operator values to typed
+   JSON and validates them. Survivors become `WasmTool` instances.
 2. At registration, the host instantiates the component once to read
    `name`, `description`, and `parameters-schema`. These are cached; they are
-   never re-asked. If that probe fails, the tool registers under its manifest
-   name and description with a generic single-`input` fallback schema, and
-   the failure is logged.
-3. Per call, `WasmTool::execute` creates a **fresh store** (new WASI context,
-   new fuel budget, no state from the previous call), instantiates the
-   component, injects your config under `__config`, and invokes `execute`.
+   never re-asked. If that probe fails, registration fails; the host never
+   substitutes synthetic metadata for a broken component.
+3. Per call, `WasmTool::execute` resolves and validates config from canonical
+   state, creates a **fresh store** (new WASI context, new fuel budget, no state
+   from the previous call), instantiates the component, injects the typed object
+   under `__config`, and invokes `execute`.
 
 The fresh-store-per-call model is the design constraint that matters most:
 a tool plugin is stateless by construction. Anything you want to persist
@@ -67,42 +69,24 @@ thin to be wrong.
 `src/redact.rs` holds a config struct and a pure function:
 
 ```rust
-use std::collections::HashMap;
-
 pub const DEFAULT_REPLACEMENT: &str = "[REDACTED]";
 
 /// Redaction policy resolved from the plugin's own config section.
+#[derive(Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RedactConfig {
     pub replacement: String,
     pub redact_emails: bool,
     pub patterns: Vec<String>,
 }
 
-impl RedactConfig {
-    /// Build from the flat string map the host injects. Absent or empty keys
-    /// fall back to defaults, which is also what an unprivileged plugin
-    /// (no config_read) sees.
-    pub fn from_section(section: &HashMap<String, String>) -> Self {
-        let replacement = section
-            .get("replacement")
-            .filter(|v| !v.is_empty())
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_REPLACEMENT.to_string());
-        let redact_emails = section
-            .get("redact_emails")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
-        let patterns = section
-            .get("patterns")
-            .map(|v| {
-                v.split(',')
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self { replacement, redact_emails, patterns }
+impl Default for RedactConfig {
+    fn default() -> Self {
+        Self {
+            replacement: DEFAULT_REPLACEMENT.to_string(),
+            redact_emails: true,
+            patterns: Vec::new(),
+        }
     }
 }
 
@@ -115,12 +99,13 @@ pub fn redact(input: &str, cfg: &RedactConfig) -> (String, usize) {
 }
 ```
 
-Note the config shape: the host hands you a flat `string -> string` map, so
-every typed field is a parse-with-default. Design the defaults so an **empty
-map produces safe behavior**. The empty map is not an edge case; it is exactly
-what your plugin receives when the operator has not configured it, and when
-the manifest lacks `config_read` entirely (the host substitutes an empty map,
-per `effective_config` in `runtime.rs`).
+The guest receives the schema-materialized JSON object, so deserialize it once
+instead of repeating string parsing. This example's schema makes every field
+optional, and `Default` owns their behavior when the host supplies `{}`. An
+empty object is normal when the operator has not configured the plugin or when
+the host denies the requested `config_read` grant. If a plugin cannot operate
+without a value, mark it required in `config_schema`; the host will then reject
+an empty object before guest code starts.
 
 ## 3. Implement the world
 
@@ -162,8 +147,6 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::collections::HashMap;
-
     use crate::redact::{redact, RedactConfig};
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
@@ -177,7 +160,7 @@ mod component {
     struct ExecuteArgs {
         text: String,
         #[serde(rename = "__config", default)]
-        config: HashMap<String, String>,
+        config: RedactConfig,
     }
 
     impl PluginInfo for RedactPlugin {
@@ -227,8 +210,7 @@ mod component {
                 }
             };
 
-            let cfg = RedactConfig::from_section(&parsed.config);
-            let (output, count) = redact(&parsed.text, &cfg);
+            let (output, count) = redact(&parsed.text, &parsed.config);
 
             log_record(
                 LogLevel::Info,
@@ -286,25 +268,36 @@ Contract points, each anchored in the host source:
 ## 4. The `__config` jail
 
 A plugin never reads process environment variables and never sees global
-config. When (and only when) the manifest declares `config_read`, the host
-resolves the config section stored under your plugin's name and merges it
-into the `execute` arguments under the reserved `__config` key. The mechanics
-(`inject_config` / `effective_config` in `runtime.rs`):
+config. A manifest that requests `config_read` must also declare
+`config_schema`; a schema without that permission is equally invalid. The
+schema is Draft 2020-12, its root must be an object with a `properties` map and
+`additionalProperties = false`, and every top-level property must explicitly
+resolve to `string`, `boolean`, `integer`, `number`, `array`, or `object`.
+
+The host resolves the section stored under the versioned config-entry key
+derived from this instance's package, `tool` capability, and binding,
+materializes it according to the package schema, validates the typed object,
+and only then merges it into `execute` under the reserved `__config` key:
 
 - Any `__config` already present in the model-supplied arguments is deleted
   first. Spoofing is structurally impossible.
-- Without `config_read`, the injected section is the empty map, so the
-  arguments carry no `__config` key at all. This is why the
-  `#[serde(default)]` on the field and the defaults-from-empty-map design in
-  step 2 are load-bearing, not defensive fluff.
-- Values arrive already decrypted. Operators set them per plugin name through
-  zerocode, the gateway, or the CLI (`zeroclaw config set`), and they encrypt
-  at rest under the config's secret key. Which keys exist is entirely your
-  contract; document them in your plugin's README.
+- Operator storage remains an encrypted string map. Store strings directly;
+  encode booleans and numbers as JSON scalars (`"true"`, `"4"`, `"0.5"`) and
+  arrays and objects as JSON (`'["secret-a","secret-b"]'`). The guest receives
+  real JSON booleans, numbers, arrays, and objects, not those storage strings.
+- If `config_read` was requested but not effectively granted, the host resolves
+  `{}` and validates it. This example's optional schema therefore causes the
+  tool to omit `__config` and `#[serde(default)]` selects `RedactConfig::default`.
+  A required schema fails closed instead of running without credentials.
+- Unknown keys, invalid JSON encodings, wrong types, and schema constraint
+  failures reject the plugin before its code runs. Operators currently set
+  values under the installation-printed instance key through TOML or the
+  generic `zeroclaw config set` path; those values encrypt at rest under the
+  config's secret key. Schema-driven zerocode and gateway editors are future
+  SDK/config-surface work.
 
-For this tool the section is three keys, all optional: `replacement` (mask
-string, default `[REDACTED]`), `redact_emails` (`true`/`false` string, default
-true), `patterns` (comma-separated literals, default empty).
+For this tool the typed section has three optional keys: `replacement` is a
+string, `redact_emails` is a boolean, and `patterns` is an array of strings.
 
 ## 5. The manifest
 
@@ -316,6 +309,36 @@ For this plugin: `name` and `version` matching what `plugin-info` reports,
 `config_read`. Add `http_client` only if your tool makes outbound HTTP calls.
 The tool adapter implements `wasi:http`, but links it only after that grant is
 validated; without both adapter support and the grant there is no HTTP surface.
+
+The matching manifest contract for the typed `RedactConfig` is:
+
+```toml
+name = "my-redact-plugin"
+version = "0.1.0"
+wasm_path = "my_redact_plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.replacement]
+type = "string"
+minLength = 1
+
+[config_schema.properties.redact_emails]
+type = "boolean"
+
+[config_schema.properties.patterns]
+type = "array"
+items = { type = "string" }
+```
+
+These properties are optional, matching the guest's defaults. For a credential
+that must exist, add its name to `required` in `[config_schema]`; a denied grant
+or missing value will then prevent the component from starting.
 
 ### Tools that call the network
 
@@ -364,7 +387,7 @@ the host:
 ```rust
 #[test]
 fn empty_config_falls_back_to_defaults() {
-    let cfg = RedactConfig::from_section(&HashMap::new());
+    let cfg: RedactConfig = serde_json::from_str("{}").unwrap();
     let (out, n) = redact("mail me at a@b.example", &cfg);
     assert_eq!(n, 1);
     assert!(out.contains("[REDACTED]"));
@@ -416,9 +439,9 @@ Two operational constraints worth repeating from the
 | Symptom | Likely cause |
 |---|---|
 | Plugin missing from `zeroclaw plugin list` | Plugin system disabled; malformed manifest; `wasm_path` file missing; signature policy rejected it. The startup log carries the specific skip warning. |
-| Tool registered but schema is a generic `input` object, name from manifest | The metadata probe failed at registration (the host substitutes the manifest name, description, and a fallback single-`input` schema; `wasm_tool.rs`). Check the log for the probe error; usually a component built against mismatched WIT. |
+| Tool rejected during registration | Config validation or the metadata probe failed. Check the log for the specific error; a probe failure usually means the component was built against mismatched WIT. |
 | Tool never selected by the model | Name collides with a built-in, or the description/schema do not tell the model when the tool applies. |
-| `__config` absent despite configured section | Manifest lacks `config_read`, or the entry name does not match the manifest `name`. |
+| `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, or the validated object is empty. A `config_schema`/permission mismatch rejects the plugin instead. |
 | Call traps | Fuel or memory ceiling hit. Raise `plugins.limits.call_fuel` / `plugins.limits.max_memory_mb`, or do less per call. |
 | Load fails on a runtime-only host | You shipped `.wasm` to a host with no JIT; ship a version-matched `.cwasm` instead. |
 

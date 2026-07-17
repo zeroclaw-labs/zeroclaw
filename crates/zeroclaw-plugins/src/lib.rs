@@ -6,6 +6,7 @@
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+pub mod config;
 pub mod endpoint;
 pub mod error;
 pub mod host;
@@ -45,6 +46,10 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Draft 2020-12 JSON Schema for this plugin's private config object.
+    /// Required exactly when `config_read` is requested.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
