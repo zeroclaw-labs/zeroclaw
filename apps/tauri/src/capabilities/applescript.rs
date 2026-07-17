@@ -1,7 +1,10 @@
 //! AppleScript capability — runs arbitrary AppleScript via osascript, gated by
 //! the macOS Automation TCC permission (per-target-app prompts handled by the
 //! system). This is a *risky* capability and will be wrapped behind a per-app
-//! approval allowlist when the full NodeClient lands/
+//! approval allowlist when the full NodeClient lands.
+//!
+//! Gateway-served content has no remote Tauri capability and cannot invoke this
+//! command. Any future caller must provide a separately reviewed ACL boundary.
 
 #[cfg(target_os = "macos")]
 use std::process::Command;

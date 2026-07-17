@@ -342,6 +342,18 @@ impl Channel for WebhookChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        // Fail-fast: a webhook with no secret accepts *all* incoming requests,
+        // including unauthenticated ones.  Refuse to start so the operator is
+        // forced to configure a secret.
+        if self.secret.is_none() {
+            anyhow::bail!(
+                "webhook channel requires a `secret` configured for request \
+                 authentication; set [channels.webhook.{}].secret in config \
+                 or remove the channel to silence this error",
+                self.alias,
+            );
+        }
+
         use axum::{
             Router,
             body::Bytes,
@@ -792,6 +804,18 @@ mod tests {
         assert_eq!(json["content"], "response");
         assert!(json.get("thread_id").is_none());
         assert!(json.get("recipient").is_none());
+    }
+
+    #[tokio::test]
+    async fn listen_requires_secret() {
+        let ch = make_channel(); // no secret
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = ch.listen(tx).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires a `secret`"),
+            "expected error about missing secret, got: {msg}",
+        );
     }
 
     #[test]

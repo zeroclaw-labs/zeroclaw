@@ -924,7 +924,7 @@ impl TelegramChannel {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot-token=<token>` to configure.",
+                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot_token <token>` to configure.",
                     self.alias
                 );
             }

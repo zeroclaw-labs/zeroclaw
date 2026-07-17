@@ -147,6 +147,8 @@ pub struct QuickstartState {
     pub agents: Vec<String>,
     pub risk_profiles: Vec<String>,
     pub runtime_profiles: Vec<String>,
+    #[serde(default)]
+    pub default_runtime_profile: Option<String>,
     pub model_providers: Vec<String>,
     pub channels: Vec<String>,
     #[serde(default)]
@@ -181,6 +183,8 @@ pub struct QuickstartTypeOption {
     pub display_name: String,
     #[serde(default)]
     pub local: bool,
+    #[serde(default)]
+    pub default_runtime_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

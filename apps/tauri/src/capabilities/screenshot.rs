@@ -1,5 +1,8 @@
 //! Screenshot capability — captures the current display(s) using the system
 //! `screencapture` tool, which respects the Screen Recording TCC permission.
+//!
+//! Returns a base64-encoded PNG. Gateway-served content has no remote Tauri
+//! capability; any future caller requires a separately reviewed ACL boundary.
 
 #[cfg(target_os = "macos")]
 use base64::Engine;

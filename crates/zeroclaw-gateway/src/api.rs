@@ -298,6 +298,10 @@ pub async fn handle_api_status(
 
     let process = zeroclaw_runtime::process_stats::sample();
 
+    // Upgrade affordance: whether the dashboard should poll for updates / offer
+    // the upgrade button, and which restart command to show afterwards.
+    let restart = crate::version::detect_restart();
+
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "model_provider": model_provider,
@@ -313,6 +317,10 @@ pub async fn handle_api_status(
         "health": health,
         "agent_alias": agent_alias,
         "process": process,
+        "check_updates": config.gateway.check_updates,
+        "allow_self_upgrade": config.gateway.allow_self_upgrade,
+        "restart_mode": restart.mode.as_str(),
+        "restart_hint": restart.hint,
     });
 
     Json(body).into_response()
@@ -1315,14 +1323,53 @@ fn channel_readiness(
         if info.channel_type == "webhook" {
             apply_webhook_readiness(config, &info.alias, health, state, &mut readiness);
         } else {
-            readiness.notes.push(format!(
-                "Live readiness is not checked for `{}` channels yet.",
-                info.channel_type
-            ));
+            apply_persisted_login_readiness(config, info, &mut readiness);
         }
     }
 
     readiness
+}
+
+/// Fill `readiness.authenticated` from the channel-owned persisted-login
+/// probe (`zeroclaw_channels::login_probe`). The probe resolves the same
+/// on-disk session signal each QR-pairing channel uses at startup to decide
+/// between resuming a session and minting a fresh QR code; nothing is
+/// cached and nothing is written. Channel types without a typed QR-pairing
+/// key (no probe, or feature not compiled) keep `authenticated: unknown`
+/// and the existing "not checked yet" note.
+fn apply_persisted_login_readiness(
+    config: &zeroclaw_config::schema::Config,
+    info: &zeroclaw_config::schema::ChannelAliasInfo,
+    readiness: &mut ChannelReadiness,
+) {
+    use zeroclaw_channels::login_probe::PersistedLogin;
+
+    // Resolve the string key to the typed QR-pairing channel once; all
+    // downstream dispatch is on the enum.
+    let compiled_key = compiled_readiness_key_for_alias(config, info);
+    let Some(channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
+        readiness.notes.push(format!(
+            "Live readiness is not checked for `{}` channels yet.",
+            info.channel_type
+        ));
+        return;
+    };
+
+    match zeroclaw_channels::login_probe::persisted_login(channel, config, &info.alias) {
+        PersistedLogin::Present => {
+            readiness.authenticated = ChannelReadinessState::Ready;
+            readiness.notes.push(format!(
+                "Live listener readiness is not checked for `{}` channels yet.",
+                info.channel_type
+            ));
+        }
+        PersistedLogin::Absent => {
+            readiness.authenticated = ChannelReadinessState::Missing;
+            readiness.requirements.push(
+                "Pair this channel: no persisted login session was found on disk.".to_string(),
+            );
+        }
+    }
 }
 
 fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'static str) {
@@ -1332,10 +1379,10 @@ fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'s
         return ("inactive", "degraded");
     }
 
-    if readiness.authenticated == ChannelReadinessState::Unknown
-        && readiness.listening == ChannelReadinessState::Unknown
+    if readiness.authenticated == ChannelReadinessState::Missing
+        || readiness.listening == ChannelReadinessState::Missing
     {
-        return ("unknown", "degraded");
+        return ("error", "down");
     }
 
     if readiness.authenticated == ChannelReadinessState::Ready
@@ -1343,7 +1390,9 @@ fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'s
     {
         ("active", "healthy")
     } else {
-        ("error", "down")
+        // At least one probe is Unknown and none reported Missing: not
+        // enough signal to call the channel either healthy or down.
+        ("unknown", "degraded")
     }
 }
 
@@ -2423,6 +2472,150 @@ pub(crate) mod tests {
         assert_eq!(nextcloud["compiled"], false);
         assert_eq!(nextcloud["status"], "not_compiled");
         assert_eq!(nextcloud["health"], "unavailable");
+    }
+
+    /// Bind `channel_ref` (e.g. `"wechat.admin"`) to an enabled agent so
+    /// readiness reaches the authenticated/listening probes.
+    fn bind_channel_to_agent(config: &mut zeroclaw_config::schema::Config, channel_ref: &str) {
+        config.agents.insert(
+            "rowan".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    channel_ref.to_string(),
+                )],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    #[tokio::test]
+    async fn api_channels_wechat_authenticated_tracks_persisted_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.wechat.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WeChatConfig {
+                enabled: true,
+                state_dir: Some(temp.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        bind_channel_to_agent(&mut config, "wechat.admin");
+
+        // Unpaired: nothing persisted in the channel's state dir.
+        let response = handle_api_channels(State(test_state(config.clone())), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "wechat.admin")
+            .cloned()
+            .expect("wechat channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "missing");
+        assert_eq!(channel["status"], "error");
+        assert_eq!(channel["health"], "down");
+        assert!(
+            channel["readiness"]["requirements"]
+                .as_array()
+                .expect("requirements array")
+                .iter()
+                .any(|item| item
+                    .as_str()
+                    .is_some_and(|s| s.contains("Pair this channel")))
+        );
+
+        // Paired: the channel's own persisted login (account.json token).
+        std::fs::write(
+            temp.path().join("account.json"),
+            r#"{"token": "tok_persisted", "account_id": "acct_1"}"#,
+        )
+        .unwrap();
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "wechat.admin")
+            .cloned()
+            .expect("wechat channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "ready");
+        // Listener liveness is still unprobed, so the summary stays
+        // conservative rather than claiming the channel is up.
+        assert_eq!(channel["readiness"]["listening"], "unknown");
+        assert_eq!(channel["status"], "unknown");
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channels_whatsapp_web_unpaired_reports_missing_auth_without_touching_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("session.db");
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some(session_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        bind_channel_to_agent(&mut config, "whatsapp.admin");
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "whatsapp.admin")
+            .cloned()
+            .expect("whatsapp channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "missing");
+        assert_eq!(channel["status"], "error");
+        assert!(
+            !session_path.exists(),
+            "the readiness probe must never create the session database"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channels_without_login_probe_keeps_authenticated_unknown() {
+        let mut config = config_with_telegram("default");
+        bind_channel_to_agent(&mut config, "telegram.default");
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "telegram.default")
+            .cloned()
+            .expect("telegram channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "unknown");
+        assert!(
+            channel["readiness"]["notes"]
+                .as_array()
+                .expect("notes array")
+                .iter()
+                .any(|note| {
+                    note.as_str()
+                        .is_some_and(|s| s.contains("not checked for `telegram`"))
+                })
+        );
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {

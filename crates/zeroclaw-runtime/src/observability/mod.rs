@@ -29,11 +29,116 @@ pub use verbose::VerboseObserver;
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use traits::ObserverMetric;
 use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 
+/// Drop-safe lifecycle bracket for one logical agent turn.
+///
+/// Construction emits exactly one [`ObserverEvent::AgentStart`]. Calling
+/// [`finish`](Self::finish), or dropping the guard during an error or panic,
+/// emits exactly one matching [`ObserverEvent::AgentEnd`]. Entry points that
+/// invoke the tool loop directly should use this guard instead of open-coding
+/// lifecycle events so in-flight observers cannot be left unbalanced.
+#[must_use = "hold the guard for the lifetime of the agent turn"]
+pub struct AgentTurnGuard<'a> {
+    observer: &'a dyn Observer,
+    model_provider: String,
+    model: String,
+    channel: Option<String>,
+    agent_alias: Option<String>,
+    turn_id: Option<String>,
+    turn_started_at: Instant,
+    tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
+    cost_usd: Option<f64>,
+    done: bool,
+}
+
+impl<'a> AgentTurnGuard<'a> {
+    /// Open a lifecycle bracket and emit its start event.
+    pub fn start(
+        observer: &'a dyn Observer,
+        model_provider: impl Into<String>,
+        model: impl Into<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    ) -> Self {
+        let model_provider = model_provider.into();
+        let model = model.into();
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: model_provider.clone(),
+            model: model.clone(),
+            channel: channel.clone(),
+            agent_alias: agent_alias.clone(),
+            turn_id: turn_id.clone(),
+        });
+        Self {
+            observer,
+            model_provider,
+            model,
+            channel,
+            agent_alias,
+            turn_id,
+            turn_started_at: Instant::now(),
+            tokens_used: None,
+            cost_usd: None,
+            done: false,
+        }
+    }
+
+    /// Attribute the closing event to the model route actually used.
+    pub fn set_model_route(&mut self, model_provider: impl Into<String>, model: impl Into<String>) {
+        self.model_provider = model_provider.into();
+        self.model = model.into();
+    }
+
+    /// Attach aggregate usage to the closing event.
+    pub fn set_usage(
+        &mut self,
+        tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
+        cost_usd: Option<f64>,
+    ) {
+        self.tokens_used = tokens_used;
+        self.cost_usd = cost_usd;
+    }
+
+    /// Emit the matching end event once. Later calls and `Drop` are no-ops.
+    pub fn finish(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: self.model_provider.clone(),
+            model: self.model.clone(),
+            duration: self.turn_started_at.elapsed(),
+            tokens_used: self.tokens_used.clone(),
+            cost_usd: self.cost_usd,
+            channel: self.channel.clone(),
+            agent_alias: self.agent_alias.clone(),
+            turn_id: self.turn_id.clone(),
+        });
+    }
+}
+
+impl Drop for AgentTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Process-wide broadcast hook installed by long-running subsystems (today: the
+/// gateway) so that events emitted by observers built in *other* subsystems —
+/// notably the agent loop's `process_message` — also fan out to the SSE
+/// broadcast channel. Without this, observers created per call site stay
+/// isolated and `/api/events` only sees the gateway's own direct emissions.
+///
+/// Uses `parking_lot::RwLock` so the event-recording path never has to handle
+/// lock poisoning: a panic inside a hook would not silently disable the entire
+/// observability channel on subsequent calls.
 static BROADCAST_HOOK: OnceLock<RwLock<BroadcastHookState>> = OnceLock::new();
 
 struct BroadcastHookEntry {
@@ -104,6 +209,23 @@ fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
     broadcast_hook_slot().read().current()
 }
 
+/// Guard that flushes its observer on drop — the telemetry analogue of
+/// [`AgentTurnGuard`]. Held for the lifetime of a short-lived agent
+/// invocation (today: the CLI one-shot, `zeroclaw agent -m ...`), whose
+/// process exits before the OTLP batch exporter / metric
+/// `PeriodicReader`'s background interval fires. Without this flush all
+/// buffered telemetry — including the never-ended `gen_ai.agent.invoke`
+/// span, which is only `.end()`'d inside [`Observer::flush`] — is lost
+/// when the runtime is torn down.
+///
+/// Long-lived callers (daemon heartbeat/cron, channel `process_message`,
+/// subagent spawns) pass `interactive = false` and skip this guard: they
+/// rely on the periodic export firing on its own cadence, and a flush
+/// per turn would add a synchronous OTLP HTTP POST to every invocation.
+///
+/// Backend-agnostic: calls `Observer::flush()`, which is a no-op for
+/// synchronous backends (`Log`/`Verbose`/`Noop`) and meaningless-but-
+/// harmless for pull backends (`Prometheus` — see startup warning).
 #[must_use = "hold the guard for the lifetime of the agent invocation; dropping it flushes"]
 pub struct FlushGuard {
     observer: Arc<dyn Observer>,
@@ -632,5 +754,50 @@ mod tests {
         // Dropping after fire must not flush again.
         drop(guard);
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn agent_turn_guard_closes_once_during_panic_unwind() {
+        let observer = CountingObserver::default();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = AgentTurnGuard::start(
+                &observer,
+                "provider",
+                "model",
+                Some("channel".into()),
+                Some("agent".into()),
+                Some("turn".into()),
+            );
+            panic!("test unwind");
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(
+            observer.events.load(Ordering::SeqCst),
+            2,
+            "panic unwind must emit one start and one end"
+        );
+    }
+
+    #[test]
+    fn agent_turn_guard_explicit_finish_is_idempotent() {
+        let observer = CountingObserver::default();
+        let mut guard = AgentTurnGuard::start(
+            &observer,
+            "provider",
+            "model",
+            Some("channel".into()),
+            Some("agent".into()),
+            Some("turn".into()),
+        );
+        guard.finish();
+        guard.finish();
+        drop(guard);
+
+        assert_eq!(
+            observer.events.load(Ordering::SeqCst),
+            2,
+            "explicit finish and drop must still emit one matched pair"
+        );
     }
 }

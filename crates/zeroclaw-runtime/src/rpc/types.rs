@@ -1393,6 +1393,9 @@ rpc_type! {
         pub agents: Vec<String>,
         pub risk_profiles: Vec<String>,
         pub runtime_profiles: Vec<String>,
+        /// Canonical runtime fallback for providers without a recommendation.
+        #[serde(default)]
+        pub default_runtime_profile: Option<String>,
         /// `<provider_type>.<alias>` refs.
         pub model_providers: Vec<String>,
         /// `<channel_type>.<alias>` refs.
@@ -1428,6 +1431,9 @@ rpc_type! {
         /// `true` when the entry runs locally and needs no remote
         /// credential. Always `false` for channels.
         pub local: bool,
+        /// Daemon-derived runtime preset to auto-select for this provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub default_runtime_profile: Option<String>,
     }
 }
 
@@ -1719,13 +1725,16 @@ mod tests {
             kind: "anthropic".into(),
             display_name: "Anthropic".into(),
             local: false,
+            default_runtime_profile: Some("unbounded".into()),
         };
         let v = serde_json::to_value(&opt).unwrap();
         assert_eq!(v["kind"], json!("anthropic"));
         assert_eq!(v["local"], json!(false));
+        assert_eq!(v["default_runtime_profile"], json!("unbounded"));
         let back: QuickstartTypeOption = serde_json::from_value(v).unwrap();
         assert_eq!(back.kind, opt.kind);
         assert_eq!(back.local, opt.local);
+        assert_eq!(back.default_runtime_profile, opt.default_runtime_profile);
     }
 
     #[test]

@@ -238,6 +238,46 @@ pub fn is_channel_type_compiled(channel_type: &str) -> bool {
     false
 }
 
+/// Typed key over the QR-pairing channels that own persisted login/session
+/// state on disk.
+///
+/// This is the single dispatch value for channel-owned login-state
+/// operations (`crate::login_probe::persisted_login`, and any future hooks
+/// over the same state). Callers resolve a channel type key to this enum
+/// once via [`qr_pairing_channel`] and dispatch on the typed value; the raw
+/// string key never travels past the resolution point.
+///
+/// Variants are feature-gated so a binary without the channel feature
+/// cannot name (or dispatch on) a channel it cannot run — dispatch sites
+/// stay exhaustive without a dead fallback arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrPairingChannel {
+    #[cfg(feature = "channel-wechat")]
+    WeChat,
+    #[cfg(feature = "whatsapp-web")]
+    WhatsAppWeb,
+}
+
+/// Resolve a channel type key to its typed QR-pairing channel.
+///
+/// This is the one place a QR-login key is parsed from a string; everything
+/// downstream dispatches on [`QrPairingChannel`]. Uses the same key space
+/// as [`is_channel_type_compiled`] (kebab-case schema keys plus legacy
+/// underscore spellings, per `type_keys` in the compile-spec registry
+/// above — `qr_pairing_keys_stay_registered_in_compile_specs` pins the
+/// agreement). Returns `None` for channel types that have no channel-owned
+/// QR login state and for channels not compiled into this binary — the two
+/// cases callers treat identically as "unsupported".
+pub fn qr_pairing_channel(channel_type: &str) -> Option<QrPairingChannel> {
+    match channel_type {
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => Some(QrPairingChannel::WeChat),
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp-web" | "whatsapp_web" => Some(QrPairingChannel::WhatsAppWeb),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CHANNEL_COMPILE_SPECS, ChannelsConfig};
@@ -345,6 +385,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn qr_pairing_keys_stay_registered_in_compile_specs() {
+        // Every key the QR-pairing resolver accepts must exist in the
+        // compile-spec registry with a matching compiled flag, so the typed
+        // key space cannot drift from the canonical channel inventory.
+        for (key, feature_compiled) in [
+            ("wechat", cfg!(feature = "channel-wechat")),
+            ("whatsapp-web", cfg!(feature = "whatsapp-web")),
+            ("whatsapp_web", cfg!(feature = "whatsapp-web")),
+        ] {
+            assert!(
+                CHANNEL_COMPILE_SPECS
+                    .iter()
+                    .any(|spec| spec.type_keys.contains(&key)),
+                "QR-pairing key `{key}` is missing from CHANNEL_COMPILE_SPECS"
+            );
+            assert_eq!(
+                super::qr_pairing_channel(key).is_some(),
+                feature_compiled,
+                "QR-pairing resolution for `{key}` drifted from its compile feature"
+            );
+        }
+
+        // Channel types without channel-owned QR login state never resolve.
+        assert_eq!(super::qr_pairing_channel("telegram"), None);
+        assert_eq!(super::qr_pairing_channel("whatsapp"), None);
+        assert_eq!(super::qr_pairing_channel("not-a-channel"), None);
     }
 
     #[test]

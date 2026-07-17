@@ -143,6 +143,12 @@ fn yolo_risk() -> RiskProfileConfig {
 // Runtime presets
 // ─────────────────────────────────────────────────────────────────────
 
+/// Canonical fallback used when no provider-specific runtime recommendation exists.
+pub const DEFAULT_RUNTIME_PRESET_NAME: &str = "unbounded";
+
+/// Canonical compact runtime recommended by local inference backends.
+pub const LOCAL_SMALL_RUNTIME_PRESET_NAME: &str = "local_small";
+
 /// One row in the Runtime preset table. Same shape and contract as
 /// [`RiskPreset`] — see its docs for the per-field semantics.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -172,7 +178,7 @@ pub const RUNTIME_PRESETS: &[RuntimePreset] = &[
         values: tight_runtime,
     },
     RuntimePreset {
-        preset_name: "local_small",
+        preset_name: LOCAL_SMALL_RUNTIME_PRESET_NAME,
         label: "Local Small",
         help: "Compact no-text-fallback profile for smaller local models. \
                Keeps context and tool results small, disables parallel tool \
@@ -187,7 +193,7 @@ pub const RUNTIME_PRESETS: &[RuntimePreset] = &[
         values: balanced_runtime,
     },
     RuntimePreset {
-        preset_name: "unbounded",
+        preset_name: DEFAULT_RUNTIME_PRESET_NAME,
         label: "Unbounded",
         help: "Wide-open budgets and long timeouts. Pick this when you're \
                actively driving the agent through a hard task and don't \
@@ -203,6 +209,17 @@ pub fn runtime_preset(preset_name: &str) -> Option<&'static RuntimePreset> {
     RUNTIME_PRESETS
         .iter()
         .find(|p| p.preset_name == preset_name)
+}
+
+/// Resolve an optional provider recommendation against the canonical preset table.
+/// Unknown or absent recommendations fall back to `unbounded`, then to the first
+/// available preset so consumers never duplicate fallback policy.
+#[must_use]
+pub fn recommended_runtime_preset(recommendation: Option<&str>) -> Option<&'static RuntimePreset> {
+    recommendation
+        .and_then(runtime_preset)
+        .or_else(|| runtime_preset(DEFAULT_RUNTIME_PRESET_NAME))
+        .or_else(|| RUNTIME_PRESETS.first())
 }
 
 fn tight_runtime() -> RuntimeProfileConfig {
@@ -595,6 +612,21 @@ mod tests {
         assert_eq!(values.keep_tool_context_turns, Some(1));
         assert_eq!(values.memory_recall_limit, Some(3));
         assert!(values.strict_tool_parsing);
+    }
+
+    #[test]
+    fn runtime_recommendation_resolution_uses_canonical_fallback() {
+        assert_eq!(
+            recommended_runtime_preset(Some(LOCAL_SMALL_RUNTIME_PRESET_NAME))
+                .map(|preset| preset.preset_name),
+            Some(LOCAL_SMALL_RUNTIME_PRESET_NAME),
+        );
+        for recommendation in [None, Some("unknown-runtime-profile")] {
+            assert_eq!(
+                recommended_runtime_preset(recommendation).map(|preset| preset.preset_name),
+                Some(DEFAULT_RUNTIME_PRESET_NAME),
+            );
+        }
     }
 
     #[test]
