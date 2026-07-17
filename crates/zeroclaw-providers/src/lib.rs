@@ -1804,16 +1804,16 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
         CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
         DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
-        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
+        FriendliModelProviderConfig, GithubModelsModelProviderConfig, HailoOllamaEndpoint,
         HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
         InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
-        NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
-        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
-        UpstageModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-        YiModelProviderConfig,
+        LitellmModelProviderConfig, MistralModelProviderConfig, ModelEndpoint,
+        MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
+        NovitaModelProviderConfig, NscaleModelProviderConfig, OpencodeModelProviderConfig,
+        PerplexityModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+        SglangModelProviderConfig, SiliconflowModelProviderConfig, SyntheticModelProviderConfig,
+        TogetherModelProviderConfig, UpstageModelProviderConfig, VercelModelProviderConfig,
+        VllmModelProviderConfig, YiModelProviderConfig,
     };
 
     match name {
@@ -1821,6 +1821,10 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "openai" => Some(openai::BASE_URL),
         "openrouter" => Some(openrouter::BASE_URL),
         "ollama" => Some(ollama::BASE_URL),
+        // The typed family config resolves per-alias `uri` overrides, while
+        // this endpoint enum supplies the canonical default. Keep the default
+        // here instead of duplicating it in a provider-local BASE_URL constant.
+        "hailo_ollama" => Some(HailoOllamaEndpoint::default().uri()),
         "telnyx" => Some(telnyx::BASE_URL),
         "gemini" => Some(gemini::BASE_URL),
         "vercel" => Some(<VercelModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
@@ -1924,6 +1928,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("telnyx", "Telnyx", false),
             ("azure", "Azure OpenAI", false),
             ("ollama", "Ollama", true),
+            ("hailo_ollama", "Hailo-Ollama", true),
             ("gemini", "Google Gemini", false),
         ],
     );
@@ -3503,9 +3508,13 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
+            let api_key = if model_provider.name == "hailo_ollama" {
+                None
+            } else {
+                Some("provider-test-credential")
+            };
             assert!(
-                create_model_provider(model_provider.name, Some("provider-test-credential"))
-                    .is_ok(),
+                create_model_provider(model_provider.name, api_key).is_ok(),
                 "Canonical model model_provider id should be constructible: {}",
                 model_provider.name
             );
