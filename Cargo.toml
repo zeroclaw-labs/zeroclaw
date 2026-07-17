@@ -75,9 +75,6 @@ required-features = ["acp-bridge"]
 name = "zeroclaw"
 path = "src/lib.rs"
 
-[build-dependencies]
-embed-resource = "3.0"
-
 [dependencies]
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true

@@ -64,9 +64,9 @@ fn macos_desktop_sidecar_embeds_the_web_artifact() {
     let prepare = fs::read_to_string(root.join("scripts/desktop/prepare-kernel.sh"))
         .expect("desktop kernel preparation script should be readable");
     assert!(
-        prepare.lines().any(|line| {
-            line.contains("cargo build") && line.contains("--features \"$FEATURES\"")
-        }),
+        prepare.contains("local features=\"$FEATURES\"")
+            && prepare.contains("build_args+=(--features \"$features\")")
+            && prepare.contains("cargo build \"${build_args[@]}\""),
         "prepare-kernel.sh must forward the requested Cargo features"
     );
 }

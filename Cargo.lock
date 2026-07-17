@@ -13908,7 +13908,6 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "directories",
- "embed-resource",
  "flate2",
  "futures-util",
  "glob",
