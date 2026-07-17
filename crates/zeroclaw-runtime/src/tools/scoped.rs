@@ -385,15 +385,23 @@ impl ScopedToolRegistry {
                                 );
                             }
                         }
+                        // Centralized single source of truth for the deferred-MCP
+                        // tool set: the same `filtered_deferred` drives both the
+                        // prompt-side `build_deferred_tools_section_filtered` and
+                        // the `ToolSearchTool` constructor, so a denied tool cannot
+                        // leak into either side. The `with_access_policy` step on
+                        // the search tool is now defense-in-depth — the stub set is
+                        // already pre-filtered.
+                        let filtered_deferred = deferred_set.filter_by_policy(mcp_policy.as_ref());
                         let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set
+                            filtered_deferred
                                 .stubs
                                 .iter()
                                 .map(|stub| stub.prefixed_name.as_str()),
                             mcp_policy.as_ref(),
                         );
                         deferred_section = tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
+                            &filtered_deferred,
                             mcp_policy.as_ref(),
                         );
                         // Listing registries expose the real deferred MCP tools as
@@ -453,7 +461,7 @@ impl ScopedToolRegistry {
                                 &preactivated_names,
                             );
                             let mut tool_search =
-                                tools::ToolSearchTool::new(deferred_set, activated);
+                                tools::ToolSearchTool::new(filtered_deferred, activated);
                             if let Some(policy) = mcp_policy {
                                 tool_search = tool_search.with_access_policy(policy);
                             }
