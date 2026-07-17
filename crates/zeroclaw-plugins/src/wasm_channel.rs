@@ -1,7 +1,6 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
 
-use crate::PluginCapability;
 use crate::PluginPermission;
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
@@ -11,7 +10,8 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
 use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
-use crate::instance::{PluginGrantSet, PluginInstanceScope};
+use crate::endpoint::PluginChannelEndpoint;
+use crate::instance::PluginGrantSet;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ use zeroclaw_api::media::MediaAttachment;
 
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
-    scope: PluginInstanceScope,
+    endpoint: PluginChannelEndpoint,
     capabilities: ChannelCapabilities,
     state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
     inbound: InboundQueue,
@@ -56,7 +56,7 @@ impl Attributable for WasmChannel {
         Role::Channel(ChannelKind::Plugin)
     }
     fn alias(&self) -> &str {
-        self.scope.id().binding()
+        self.endpoint.alias()
     }
 }
 
@@ -93,16 +93,15 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 
 impl WasmChannel {
     pub async fn from_wasm(
-        scope: PluginInstanceScope,
+        endpoint: PluginChannelEndpoint,
         wasm_path: &Path,
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
-        scope.require_capability(PluginCapability::Channel)?;
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
         let mut store = crate::component::new_store(
-            PluginStoreSpec::new(scope.clone(), limits)
+            PluginStoreSpec::new(endpoint.scope().clone(), limits)
                 .with_granted_http()
                 .with_inbound(inbound.clone()),
         );
@@ -120,7 +119,7 @@ impl WasmChannel {
         // section is withheld unless the admitted scope grants `ConfigRead`, matching
         // the tool-plugin `__config` rule, so a plugin without the permission is
         // configured with an empty object rather than another channel's secrets.
-        let config_json = resolve_configure_json(config, scope.grants());
+        let config_json = resolve_configure_json(config, endpoint.scope().grants());
         wt(
             channel.call_configure(&mut store, &config_json).await,
             "channel.configure trapped",
@@ -160,7 +159,7 @@ impl WasmChannel {
             };
 
         Ok(Self {
-            scope,
+            endpoint,
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
             inbound,
@@ -206,14 +205,16 @@ fn to_wit_send(msg: &SendMessage) -> WitSendMessage {
     }
 }
 
-fn from_wit_inbound(msg: WitInboundMessage, channel_name: &str) -> ChannelMessage {
+fn from_wit_inbound(msg: WitInboundMessage, endpoint: &PluginChannelEndpoint) -> ChannelMessage {
     ChannelMessage {
         id: msg.id,
         sender: msg.sender,
         reply_target: msg.reply_target,
         content: msg.content,
-        channel: channel_name.to_string(),
-        channel_alias: msg.channel_alias,
+        // Routing identity is issued by the host. Guest-supplied channel and
+        // alias fields cannot select a different owner or session namespace.
+        channel: endpoint.channel_type().to_string(),
+        channel_alias: Some(endpoint.alias().to_string()),
         timestamp: msg.timestamp,
         thread_ts: msg.thread_ts,
         interruption_scope_id: msg.interruption_scope_id,
@@ -245,7 +246,7 @@ fn from_wit_approval_response(r: WitApprovalResponse) -> ChannelApprovalResponse
 #[async_trait]
 impl Channel for WasmChannel {
     fn name(&self) -> &str {
-        self.scope.id().binding()
+        self.endpoint.channel_type()
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -266,7 +267,7 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_name = self.scope.id().binding().to_string();
+        let endpoint = self.endpoint.clone();
         let state = Arc::clone(&self.state);
         let poll_healthy = Arc::clone(&self.poll_healthy);
         zeroclaw_spawn::spawn!(async move {
@@ -287,11 +288,7 @@ impl Channel for WasmChannel {
                     Ok(Some(wit_msg)) => {
                         mark_poll_healthy(&poll_healthy, true);
                         backoff = INITIAL_BACKOFF;
-                        if tx
-                            .send(from_wit_inbound(wit_msg, &channel_name))
-                            .await
-                            .is_err()
-                        {
+                        if tx.send(from_wit_inbound(wit_msg, &endpoint)).await.is_err() {
                             break;
                         }
                     }
@@ -310,7 +307,8 @@ impl Channel for WasmChannel {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "channel_alias": channel_name,
+                                "channel": endpoint.channel_type(),
+                                "channel_alias": endpoint.alias(),
                                 "error": format!("{e:#}"),
                             })),
                             "channel plugin poll-message trapped; backing off"
@@ -751,6 +749,7 @@ impl Channel for WasmChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PluginCapability;
 
     #[test]
     fn media_round_trip() {
@@ -814,19 +813,40 @@ mod tests {
         assert_eq!(v["identity"], "on-call", "granted section round-trips");
     }
 
-    #[tokio::test]
-    async fn from_wasm_rejects_a_scope_for_another_capability() {
-        let scope = crate::instance::test_scope(PluginCapability::Tool, "main", []);
-        let result = WasmChannel::from_wasm(
-            scope,
-            Path::new("/path/that/must/not/be-read.wasm"),
-            &HashMap::new(),
-            crate::component::test_limits(0),
-        )
-        .await;
+    #[test]
+    fn host_endpoint_overrides_guest_routing_identity() {
+        for (channel_type, alias, guest_alias) in [
+            ("plugin", "acme.chat", Some("guest-selected-alias")),
+            ("telegram", "work", None),
+            ("gmail_push", "main", Some("")),
+        ] {
+            let scope = crate::instance::test_scope(PluginCapability::Channel, alias, []);
+            let endpoint = PluginChannelEndpoint::new(scope, channel_type).unwrap();
+            let message = from_wit_inbound(
+                WitInboundMessage {
+                    id: "evt-1".to_string(),
+                    sender: "sender".to_string(),
+                    reply_target: "room".to_string(),
+                    content: "hello".to_string(),
+                    channel: "guest-selected-type".to_string(),
+                    channel_alias: guest_alias.map(str::to_string),
+                    timestamp: 42,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: Vec::new(),
+                    subject: None,
+                },
+                &endpoint,
+            );
 
-        let error = result.err().expect("capability mismatch must fail");
-        assert!(format!("{error:#}").contains("capability"));
+            assert_eq!(message.channel, channel_type);
+            assert_eq!(message.channel_alias.as_deref(), Some(alias));
+            assert_ne!(message.channel, endpoint.instance_id().package());
+            assert_eq!(message.content, "hello");
+            assert!(message.internal_sop_event.is_none());
+            assert!(!message.passive_context);
+            assert!(!message.explicitly_addressed);
+        }
     }
 
     #[test]

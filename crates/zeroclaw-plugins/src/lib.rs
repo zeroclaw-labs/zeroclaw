@@ -6,6 +6,7 @@
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+pub mod endpoint;
 pub mod error;
 pub mod host;
 pub mod instance;

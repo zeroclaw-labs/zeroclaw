@@ -13,6 +13,9 @@ pub enum PluginError {
     #[error("invalid plugin instance identity: {0}")]
     InvalidInstanceId(String),
 
+    #[error("invalid plugin endpoint: {0}")]
+    InvalidEndpoint(String),
+
     #[error("failed to load WASM module: {0}")]
     LoadFailed(String),
 

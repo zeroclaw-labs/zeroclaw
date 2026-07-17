@@ -114,14 +114,16 @@ auto-deny. Fail closed.
 
 ## Inbound message shape
 
-Translate platform events into `inbound-message` records faithfully; the
-runtime's session and threading logic keys off these fields
+Translate platform events into `inbound-message` records faithfully. The
+runtime's threading logic keys off the platform payload fields, while routing
+identity comes only from the host-issued endpoint
 (`channel.wit`, `from_wit_inbound` in `wasm_channel.rs`):
 
 - `id`, `sender`, `content`: the basics. `reply-target` is where a response
   should go (channel ID, chat ID, email address).
-- `channel` is the platform type identifier; `channel-alias` distinguishes
-  multiple bot instances of the same platform and feeds distinct session IDs.
+- `channel` and `channel-alias` are legacy hints retained in the v0 record. The
+  host ignores both for routing and stamps the admitted channel type and
+  configured binding, so a plugin cannot select another owner or session.
 - `thread-ts` carries the platform's thread identifier for threaded replies;
   `subject` exists for email threading.
 - `interruption-scope-id` groups messages for interruption/cancellation.
