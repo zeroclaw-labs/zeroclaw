@@ -38,11 +38,6 @@ fn authorize_fixture_sender(config: &mut Config) {
     );
 }
 
-fn config_resolver(config: &Config) -> zeroclaw_runtime::plugin_channels::ChannelConfigResolver {
-    let config = config.clone();
-    Arc::new(move || config.clone())
-}
-
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
     FIXTURE
@@ -278,13 +273,9 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     // Positive control: without a native collision, the actual component is
     // instantiated and its configure export emits the marker through the host
     // logging import.
-    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
-        &config,
-        config_resolver(&config),
-        &HashSet::new(),
-        None,
-    )
-    .await;
+    let built =
+        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new(), None)
+            .await;
     assert_eq!(built.len(), 1, "unshadowed fixture is instantiated");
     let marker = receive_configure_marker(&mut rx).await;
     assert_eq!(marker["message"], CONFIGURE_MARKER);
@@ -294,13 +285,8 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     // already occupied. The builder must reject it before `from_wasm`, so no
     // guest startup export can emit the marker.
     let occupied = HashSet::from([PLUGIN_NAME.to_string()]);
-    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
-        &config,
-        config_resolver(&config),
-        &occupied,
-        None,
-    )
-    .await;
+    let built =
+        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &occupied, None).await;
     assert!(built.is_empty(), "shadowed plugin is not registered");
 
     while let Ok(event) = rx.try_recv() {
@@ -333,13 +319,9 @@ async fn supervised_wasm_listener_cancels_its_only_poll_generation() {
     zeroclaw_log::try_install_capture_subscriber();
     let mut logs = zeroclaw_log::subscribe_or_install();
 
-    let mut built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
-        &config,
-        config_resolver(&config),
-        &HashSet::new(),
-        None,
-    )
-    .await;
+    let mut built =
+        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new(), None)
+            .await;
     assert_eq!(built.len(), 1, "real fixture is instantiated once");
     receive_configure_marker(&mut logs).await;
     let (id, channel) = built.pop().expect("one built channel");
@@ -458,13 +440,9 @@ async fn disabled_plugin_owner_blocks_guest_startup_before_configure() {
     zeroclaw_log::try_install_capture_subscriber();
     let mut logs = zeroclaw_log::subscribe_or_install();
 
-    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
-        &config,
-        config_resolver(&config),
-        &HashSet::new(),
-        None,
-    )
-    .await;
+    let built =
+        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new(), None)
+            .await;
     assert_eq!(built.len(), 1, "enabled plugin owner admits the guest");
     receive_configure_marker(&mut logs).await;
     while logs.try_recv().is_ok() {}
@@ -479,13 +457,9 @@ async fn disabled_plugin_owner_blocks_guest_startup_before_configure() {
         .read()
         .validate()
         .expect("disabling the plugin owner preserves a valid daemon config");
-    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
-        &config,
-        config_resolver(&config),
-        &HashSet::new(),
-        None,
-    )
-    .await;
+    let built =
+        zeroclaw_runtime::plugin_channels::build_channel_plugins(&config, &HashSet::new(), None)
+            .await;
     assert!(built.is_empty(), "disabled plugin owner blocks startup");
     while let Ok(event) = logs.try_recv() {
         assert!(
@@ -521,13 +495,9 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     );
     let selected_config = mirror_config(&selected_plugins, true);
     let occupied = HashSet::from(["telegram.main".to_string()]);
-    let mut built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
-        &selected_config,
-        config_resolver(&selected_config),
-        &occupied,
-        None,
-    )
-    .await;
+    let mut built =
+        zeroclaw_runtime::plugin_channels::build_channel_plugins(&selected_config, &occupied, None)
+            .await;
     assert_eq!(built.len(), 1, "only the unshadowed alias is admitted");
     assert_eq!(
         drain_configure_markers(&mut logs),
@@ -574,7 +544,6 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     let disabled_config = mirror_config(&disabled_plugins, false);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &disabled_config,
-        config_resolver(&disabled_config),
         &HashSet::new(),
         None,
     )
@@ -597,7 +566,6 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     let ungranted_config = mirror_config(&ungranted_plugins, true);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &ungranted_config,
-        config_resolver(&ungranted_config),
         &HashSet::new(),
         None,
     )
@@ -628,7 +596,6 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     let duplicate_config = mirror_config(&duplicate_plugins, true);
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &duplicate_config,
-        config_resolver(&duplicate_config),
         &HashSet::new(),
         None,
     )
@@ -641,9 +608,14 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn mirror_webhook_aliases_with_one_path_fail_closed() {
     let wasm = fixture();
+    let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+    let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+    zeroclaw_log::clear_broadcast_hook();
+    let _hook_cleanup = scopeguard::guard((), |_| zeroclaw_log::clear_broadcast_hook());
     let tmp = tempdir().expect("create duplicate webhook path root");
     let plugins_dir = tmp.path().join("plugins");
     install_fixture_as(
@@ -652,13 +624,13 @@ async fn mirror_webhook_aliases_with_one_path_fail_closed() {
         "telegram-webhook-mirror",
         Some("telegram"),
         true,
+        None,
     );
     let config = mirror_config(&plugins_dir, true);
     let registry = zeroclaw_api::webhook::PluginWebhookRegistry::new();
 
     let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
         &config,
-        config_resolver(&config),
         &HashSet::new(),
         Some(&registry),
     )

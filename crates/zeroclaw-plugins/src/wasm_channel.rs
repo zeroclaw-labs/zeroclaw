@@ -543,18 +543,14 @@ fn from_wit_inbound(msg: WitInboundMessage, channel_ref: &str) -> ChannelMessage
     }
 }
 
-/// Forward a normalized inbound message only when its sender is currently
-/// authorized by the host.
-///
-/// Keeping this check at the final host-to-agent boundary makes the same gate
-/// reusable by polling today and by later host-fed transports without trusting
-/// a guest to enforce operator policy.
-async fn forward_if_authorized(
-    tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+/// Return whether a normalized inbound message's sender is currently
+/// authorized by the host, logging a rejected delivery without exposing policy
+/// details to the guest transport.
+fn sender_is_authorized(
     authorizer: &SenderAuthorizer,
     channel_alias: &str,
-    msg: ChannelMessage,
-) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMessage>> {
+    msg: &ChannelMessage,
+) -> bool {
     if !authorizer(&msg.sender) {
         ::zeroclaw_log::record!(
             WARN,
@@ -566,6 +562,25 @@ async fn forward_if_authorized(
                 })),
             "ignoring channel-plugin inbound from unauthorized sender"
         );
+        return false;
+    }
+
+    true
+}
+
+/// Forward a normalized inbound message only when its sender is currently
+/// authorized by the host.
+///
+/// Keeping this check at the final host-to-agent boundary makes the same gate
+/// reusable by polling and host-fed transports without trusting a guest to
+/// enforce operator policy.
+async fn forward_if_authorized(
+    tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    authorizer: &SenderAuthorizer,
+    channel_alias: &str,
+    msg: ChannelMessage,
+) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMessage>> {
+    if !sender_is_authorized(authorizer, channel_alias, &msg) {
         return Ok(());
     }
 
@@ -710,6 +725,14 @@ impl Channel for WasmChannel {
                     Some(Ok(Ok(messages))) => {
                         let mut delivery_failed = false;
                         for message in messages {
+                            let message = from_wit_inbound(message, &webhook_channel_ref);
+                            if !sender_is_authorized(
+                                &webhook_authorizer,
+                                &webhook_channel_ref,
+                                &message,
+                            ) {
+                                continue;
+                            }
                             let message_id = message.id.trim().to_string();
                             let reservation =
                                 if message_id.is_empty() {
@@ -734,16 +757,10 @@ impl Channel for WasmChannel {
                                 } else {
                                     None
                                 };
-                            let message = from_wit_inbound(message, &webhook_channel_ref);
                             let sent = tokio::select! {
                                 biased;
                                 () = cancellation.cancelled() => None,
-                                result = forward_if_authorized(
-                                    &webhook_tx,
-                                    &webhook_authorizer,
-                                    &webhook_channel_ref,
-                                    message,
-                                ) => Some(result),
+                                result = webhook_tx.send(message) => Some(result),
                             };
                             match sent {
                                 Some(Ok(())) => {}

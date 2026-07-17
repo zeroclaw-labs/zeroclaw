@@ -500,6 +500,7 @@ async fn authenticated_webhook_message_ids_are_idempotent() {
             &[PluginPermission::ConfigRead],
             "test-secret",
             test_limits(),
+            allow_all(),
         )
         .await
         .expect("fixture instantiates"),
@@ -568,6 +569,81 @@ async fn authenticated_webhook_message_ids_are_idempotent() {
             );
         }
     }
+
+    listener.abort();
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_webhook_sender_does_not_reserve_message_id() {
+    let wasm = fixture();
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror(
+            "fixture",
+            "default",
+            &wasm,
+            &[PluginPermission::ConfigRead],
+            "test-secret",
+            test_limits(),
+            Arc::new(|sender| sender != "webhook"),
+        )
+        .await
+        .expect("fixture instantiates"),
+    );
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    // The authorizer permits the fixture's one-shot poll sender but denies the
+    // sender decoded from webhooks.
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("fixture emits configure echo")
+        .expect("listener remains active");
+
+    let reservations = Arc::new(AtomicUsize::new(0));
+    let reserve_count = Arc::clone(&reservations);
+    let idempotency = WebhookIdempotency::new(
+        move |_| {
+            reserve_count.fetch_add(1, Ordering::SeqCst);
+            true
+        },
+        |_| {},
+    );
+
+    for body in [b"first denied".as_slice(), b"denied retry".as_slice()] {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        sink_tx
+            .send(RawWebhook {
+                headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+                body: body.to_vec(),
+                cancellation: WebhookCancellation::new(),
+                idempotency: Some(idempotency.clone()),
+                reply: reply_tx,
+            })
+            .await
+            .expect("sink accepts authenticated webhook");
+        assert!(matches!(reply_rx.await, Ok(Ok(()))));
+    }
+
+    assert_eq!(
+        reservations.load(Ordering::SeqCst),
+        0,
+        "host-denied senders cannot consume authenticated message IDs"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "host-denied webhook messages never reach the agent queue"
+    );
 
     listener.abort();
     assert!(
