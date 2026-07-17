@@ -1,17 +1,3 @@
-//! Alias-bound attribution surface used by every emission in the
-//! workspace. Each "thing" that participates in an event (channel,
-//! agent, tool, cron job, model provider, memory backend, peer group,
-//! skill bundle, MCP bundle, session) implements [`Attributable`].
-//! Entry points open `attribution_span!(thing)` once at the start of
-//! their work; the `LogCaptureLayer` in `zeroclaw-log` walks the span
-//! scope and fills the typed attribution slots automatically.
-//!
-//! Adding a new variant: extend the relevant `Kind` enum (the variant
-//! name's snake_case form is the canonical `<type>` string via
-//! `strum::IntoStaticStr`), and — only if a new role family is needed —
-//! update the [`Role::composite_prefix`] / [`Role::attribution_field`]
-//! / [`Role::default_category`] match arms. No call-site changes.
-
 use strum_macros::{EnumIter, EnumString, IntoStaticStr};
 
 /// Trait every alias-bound "thing" implements once next to its struct.

@@ -1,10 +1,4 @@
 //! TG2: Config Load/Save Round-Trip Tests
-//!
-//! Prevents: Pattern 2 — Config persistence & workspace discovery bugs (13% of user bugs).
-//! Issues: #547, #417, #621, #802
-//!
-//! Tests Config::load_or_init() with isolated temp directories, env var overrides,
-//! and config file round-trips to verify workspace discovery and persistence.
 
 use std::fs;
 use zeroclaw::config::{Config, MemoryConfig};

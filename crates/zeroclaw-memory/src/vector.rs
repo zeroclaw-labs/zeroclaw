@@ -63,12 +63,6 @@ pub struct ScoredResult {
     pub final_score: f32,
 }
 
-/// Hybrid merge: combine vector and keyword results with weighted fusion.
-///
-/// Normalizes each score set to [0, 1], then computes:
-///   `final_score` = `vector_weight` * `vector_score` + `keyword_weight` * `keyword_score`
-///
-/// Deduplicates by id, keeping the best score from each source.
 pub fn hybrid_merge(
     vector_results: &[(String, f32)],  // (id, cosine_similarity)
     keyword_results: &[(String, f32)], // (id, bm25_score)

@@ -1,10 +1,4 @@
 //! Voice Wake Word detection channel.
-//!
-//! Listens on the default microphone via `cpal`, detects a configurable wake
-//! word using energy-based VAD followed by transcription-based keyword matching,
-//! then captures the subsequent utterance and dispatches it as a channel message.
-//!
-//! Gated behind the `voice-wake` Cargo feature.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -390,7 +384,6 @@ pub fn compute_rms_energy(samples: &[f32]) -> f32 {
 }
 
 /// Encode raw f32 PCM samples as a WAV byte buffer (16-bit PCM).
-///
 /// This produces a minimal valid WAV file that Whisper-compatible APIs accept.
 pub fn encode_wav_from_f32(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     let bits_per_sample: u16 = 16;

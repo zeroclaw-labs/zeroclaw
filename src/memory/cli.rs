@@ -55,15 +55,6 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
     }
 }
 
-/// Create a memory backend with the configured embedder wired in.
-///
-/// Unlike `create_cli_memory`, which skips embedding setup for pure
-/// read/delete operations, this factory is used by commands that must
-/// actually compute embeddings (e.g. `reindex`). Mirrors the gateway's
-/// memory construction so the same model provider / route resolution
-/// applies. Removed `model_providers.fallback`; the embedder API key falls
-/// back to the first configured model provider, matching how the gateway
-/// resolves it (`crates/zeroclaw-gateway/src/lib.rs` `fallback`).
 fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
@@ -102,11 +93,6 @@ async fn handle_reindex(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Create a lightweight memory backend for CLI management operations.
-///
-/// CLI commands (list/get/stats/clear) never use vector search, so we skip
-/// embedding model_provider initialisation for local backends by using the
-/// migration factory.
 fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
 

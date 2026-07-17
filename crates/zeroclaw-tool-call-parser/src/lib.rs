@@ -1,12 +1,4 @@
 //! Tool call parsing for LLM responses.
-//!
-//! Extracts structured tool calls from free-text LLM output. Handles a dozen
-//! different formats: JSON, XML `<tool_call>` tags, GLM-style shortened syntax,
-//! MiniMax `<invoke>` blocks, Perl-style `[TOOL_CALL]` blocks, markdown fences,
-//! OpenAI native format, and more.
-//!
-//! This crate has no dependency on agent state, memory, model_providers, or channels.
-//! It is pure text transformation.
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
@@ -987,15 +979,6 @@ fn strip_leading_close_tags(mut input: &str) -> &str {
     }
 }
 
-/// Extract JSON values from a string.
-///
-/// # Security Warning
-///
-/// This function extracts ANY JSON objects/arrays from the input. It MUST only
-/// be used on content that is already trusted to be from the LLM, such as
-/// content inside `<invoke>` tags where the LLM has explicitly indicated intent
-/// to make a tool call. Do NOT use this on raw user input or content that
-/// could contain prompt injection payloads.
 fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     let trimmed = input.trim();
@@ -1329,15 +1312,6 @@ fn find_json_end(input: &str) -> Option<usize> {
     None
 }
 
-/// Parse XML attribute-style tool calls from response text.
-/// This handles MiniMax and similar model_providers that output:
-/// ```xml
-/// <minimax:toolcall>
-/// <invoke name="shell">
-/// <parameter name="command">ls</parameter>
-/// </invoke>
-/// </minimax:toolcall>
-/// ```
 fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -1387,20 +1361,6 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
-/// Parse Perl/hash-ref style tool calls from response text.
-/// This handles formats like:
-/// ```text
-/// TOOL_CALL
-/// {tool => "shell", args => {
-///   --command "ls -la"
-///   --description "List current directory contents"
-/// }}
-/// /TOOL_CALL
-/// ```
-/// Also handles the square bracket variant emitted by models like MiniMax 2.7:
-/// ```text
-/// [TOOL_CALL]{tool => "shell", args => {--command "echo hello"}}[/TOOL_CALL]
-/// ```
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -1474,14 +1434,6 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
-/// Parse FunctionCall-style tool calls from response text.
-/// This handles formats like:
-/// ```text
-/// <FunctionCall>
-/// file_read
-/// <code>path>/Users/kylelampa/Documents/zeroclaw/README.md</code>
-/// </FunctionCall>
-/// ```
 fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -1531,12 +1483,6 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// Map tool name aliases from various LLM model_providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
-    // Strip any dotted namespace prefix (keep only the final segment).
-    // Covers Gemini-emitted `default_api.<name>` and `tools.<name>`, plus
-    // MCP-server-name prefixes like `google_workspace.search_gmail_messages`
-    // that Gemini-via-OpenRouter also emits when the tool originates from
-    // an MCP server. The registry is indexed by bare tool name, so we
-    // normalize by taking the last segment.
     let tool_name = tool_name
         .rsplit_once('.')
         .map(|(_, suffix)| suffix)
@@ -1635,11 +1581,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
-/// Return the canonical default parameter name for a tool.
-///
-/// When a model emits a shortened call like `shell>uname -a` (without an
-/// explicit `/param_name`), we need to infer which parameter the value maps
-/// to. This function encodes the mapping for known ZeroClaw tools.
 fn default_param_for_tool(tool: &str) -> &'static str {
     match tool {
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "command",
@@ -1658,17 +1599,6 @@ fn default_param_for_tool(tool: &str) -> &'static str {
     }
 }
 
-/// Parse GLM-style shortened tool call bodies found inside `<tool_call>` tags.
-///
-/// Handles three sub-formats that GLM-4.7 emits:
-///
-/// 1. **Shortened**: `tool_name>value` — single value mapped via
-///    [`default_param_for_tool`].
-/// 2. **YAML-like multi-line**: `tool_name>\nkey: value\nkey: value` — each
-///    subsequent `key: value` line becomes a parameter.
-/// 3. **Attribute-style**: `tool_name key="value" [/]>` — XML-like attributes.
-///
-/// Returns `None` if the body does not match any of these formats.
 fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let body = body.trim();
     if body.is_empty() {
@@ -1813,30 +1743,6 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     None
 }
 
-// ── Tool-Call Parsing ─────────────────────────────────────────────────────
-// LLM responses may contain tool calls in multiple formats depending on
-// the model_provider. Parsing follows a priority chain:
-//   1. OpenAI-style JSON with `tool_calls` array (native API)
-//   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
-//   3. Markdown code blocks with `tool_call` language
-//   4. GLM-style line-based format (e.g. `shell/command>ls`)
-// SECURITY: We never fall back to extracting arbitrary JSON from the
-// response body, because that would enable prompt-injection attacks where
-// malicious content in emails/files/web pages mimics a tool call.
-
-/// Parse tool calls from an LLM response that uses XML-style function calling.
-///
-/// Expected format (common with system-prompt-guided tool use):
-/// ```text
-/// <tool_call>
-/// {"name": "shell", "arguments": {"command": "ls"}}
-/// </tool_call>
-/// ```
-///
-/// Also accepts common tag variants (`<toolcall>`, `<tool-call>`) for model
-/// compatibility.
-///
-/// Also supports JSON with `tool_calls` array from OpenAI-format responses.
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -2131,12 +2037,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // XML attribute-style tool calls:
-    // <minimax:toolcall>
-    // <invoke name="shell">
-    // <parameter name="command">ls</parameter>
-    // </invoke>
-    // </minimax:toolcall>
     if calls.is_empty() {
         let xml_calls = parse_xml_attribute_tool_calls(remaining);
         if !xml_calls.is_empty() {
@@ -2161,13 +2061,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // Perl/hash-ref style tool calls:
-    // TOOL_CALL
-    // {tool => "shell", args => {
-    //   --command "ls -la"
-    //   --description "List current directory contents"
-    // }}
-    // /TOOL_CALL
     if calls.is_empty() {
         let perl_calls = parse_perl_style_tool_calls(remaining);
         if !perl_calls.is_empty() {
@@ -2245,16 +2138,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             remaining = "";
         }
     }
-
-    // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
-    // here. That would enable prompt injection attacks where malicious content
-    // (e.g., in emails, files, or web pages) could include JSON that mimics a
-    // tool call. Tool calls MUST be explicitly wrapped in either:
-    // 1. OpenAI-style JSON with a "tool_calls" array
-    // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
-    // 3. Markdown code blocks with tool_call/toolcall/tool-call language
-    // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
-    // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
     if !remaining.trim().is_empty() {
@@ -2404,7 +2287,7 @@ pub fn build_native_assistant_history_from_parsed_calls(
     // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
     // assistant messages that carry `tool_calls: []`. When there are no
     // parsed calls, return None so the caller falls through to a plain
-    // text assistant message. See #6298.
+    // text assistant message.
     if tool_calls.is_empty() {
         return None;
     }
@@ -2450,7 +2333,6 @@ mod tests {
         // Regression: strict providers (DeepSeek V4, NVIDIA NIM) reject
         // assistant messages carrying `tool_calls: []`. Empty input must
         // not produce a serialised assistant message with an empty array.
-        // See #6298.
         let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
         assert!(
             result.is_none(),
@@ -2739,7 +2621,7 @@ I will now call the tool with this payload:
     fn parse_tool_calls_handles_plural_tool_calls_wrapper() {
         // Regression: Llama 4 Scout (via Groq) emits a plural `<tool_calls>`
         // wrapper rather than the singular `<tool_call>`. The parser must
-        // enter it and execute the call instead of exposing raw XML. See #6875.
+        // enter it and execute the call instead of exposing raw XML.
         let (text, calls) = parse_tool_calls(
             "<tool_calls>\n{\"name\":\"myserver__some_tool\",\"arguments\":{\"key\":\"value\"}}\n</tool_calls>",
         );

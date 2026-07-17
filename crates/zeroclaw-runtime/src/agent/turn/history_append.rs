@@ -4,12 +4,6 @@
 
 use zeroclaw_providers::{ChatMessage, ToolCall};
 
-/// Append this round's assistant message and tool results to history
-/// (upstream loop body, history-append section).
-///
-/// Native mode uses JSON-structured messages so `convert_messages()` can
-/// reconstruct proper OpenAI-format `tool_calls` and tool result messages;
-/// prompt mode uses the XML-based text format as before.
 pub(crate) fn append_tool_round_to_history(
     history: &mut Vec<ChatMessage>,
     assistant_history_content: String,
