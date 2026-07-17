@@ -63,6 +63,7 @@
   - [Feature and support matrix](./reference/feature-matrix.md)
   - [API (rustdoc)](./api.md)
   - [Gateway HTTP API](./gateway/api.md)
+  - [Chat Completions API](./gateway/chat-completions-api.md)
   - [A2A agent discovery](./gateway/a2a-discovery.md)
   - [Web dashboard (web_dist_dir)](./gateway/web-dashboard.md)
 - [Agents](./agents/overview.md)

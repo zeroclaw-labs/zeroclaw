@@ -6765,6 +6765,17 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Max `/v1/chat/completions` requests per minute per client key.
+    /// Set to 0 to disable rate limiting for chat completions.
+    #[serde(default = "default_chat_rate_limit")]
+    pub chat_rate_limit_per_minute: u32,
+
+    /// Whether the `/v1/chat/completions` endpoint is enabled.
+    /// When false (default), the route is not registered and requests return 404.
+    /// Must be explicitly set to true to expose the OpenAI-compatible chat API.
+    #[serde(default)]
+    pub chat_completions_enabled: bool,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -6864,6 +6875,10 @@ fn default_webhook_rate_limit() -> u32 {
     60
 }
 
+fn default_chat_rate_limit() -> u32 {
+    60
+}
+
 fn default_idempotency_ttl_secs() -> u64 {
     300
 }
@@ -6903,6 +6918,8 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            chat_rate_limit_per_minute: default_chat_rate_limit(),
+            chat_completions_enabled: false,
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -26831,6 +26848,8 @@ allowed_numbers = ["+1", "+2"]
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            chat_rate_limit_per_minute: 60,
+            chat_completions_enabled: false,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,

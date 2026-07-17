@@ -1279,7 +1279,7 @@ mod tests {
                 &[],
             )),
             trust_forwarded_headers: false,
-            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: std::sync::Arc::new(crate::IdempotencyStore::new(
                 std::time::Duration::from_secs(300),

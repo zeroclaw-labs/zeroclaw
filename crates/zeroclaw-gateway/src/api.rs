@@ -1986,7 +1986,13 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    // Sanitize so the lookup matches the key the turn runner registers;
+    // without this, `/api/sessions/{id}/abort` against an HTTP
+    // chat-completions turn returns `no_active_response`.
+    let session_key = format!(
+        "gw_{}",
+        zeroclaw_api::session_keys::sanitize_session_key(&id)
+    );
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
@@ -2220,7 +2226,7 @@ pub(crate) mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]

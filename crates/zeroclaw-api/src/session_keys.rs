@@ -25,6 +25,17 @@ pub fn sanitize_session_key(key: &str) -> String {
         .collect()
 }
 
+/// Canonical memory-session identifier shared by WS and HTTP paths.
+///
+/// Both transports must pass the same identifier to
+/// `Agent::set_memory_session_id` so the memory backend sees a single
+/// scope regardless of transport. This is the sanitized form of the
+/// client-supplied session ID, matching the on-disk JSONL filename and
+/// the `session_id` column in SQLite backends.
+pub fn canonical_memory_id(session_id: &str) -> String {
+    sanitize_session_key(session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +70,16 @@ mod tests {
     fn preserves_unicode_alphanumeric() {
         // is_alphanumeric() treats unicode letters/digits as alphanumeric.
         assert_eq!(sanitize_session_key("user_Алиса"), "user_Алиса");
+    }
+
+    #[test]
+    fn canonical_memory_id_preserves_punctuation_key() {
+        // WS and HTTP must produce identical memory-scope identifiers for
+        // the same client session ID, including keys with punctuation.
+        assert_eq!(canonical_memory_id("alpha.beta"), "alpha_beta");
+        assert_eq!(canonical_memory_id("test.alpha"), "test_alpha");
+        // UUID-based IDs are unaffected.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(canonical_memory_id(uuid), uuid);
     }
 }

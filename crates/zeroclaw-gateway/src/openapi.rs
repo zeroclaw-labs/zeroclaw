@@ -71,8 +71,11 @@ pub fn build_spec() -> serde_json::Value {
         serde_json::to_value(schema_for!(T)).unwrap_or(serde_json::Value::Null)
     }
 
+    use crate::api_chat_completions::ErrorResponse;
+
     let components = serde_json::json!({
         "schemas": {
+            "ChatError":       schema_value::<ErrorResponse>(),
             "ConfigApiError":   schema_value::<ConfigApiError>(),
             "PropPutBody":      schema_value::<PropPutBody>(),
             "PropResponse":     schema_value::<PropResponse>(),
@@ -340,7 +343,7 @@ pub fn build_spec() -> serde_json::Value {
                 }
             }
         },
-        "/api/version/check": {
+         "/api/version/check": {
             "get": {
                 "tags": ["version"],
                 "summary": "Check for a newer release",
@@ -386,6 +389,133 @@ pub fn build_spec() -> serde_json::Value {
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeStatusResponse" } } }
                     },
                     "404": version_error("Unknown `handoff_id`."),
+                }
+            }
+        },
+        "/v1/chat/completions": {
+            "post": {
+                "tags": ["chat"],
+                "summary": "OpenAI-compatible chat completions",
+                "description": "Route to a ZeroClaw agent via `model: zeroclaw/<alias>`. Supports streaming (SSE) and non-streaming (JSON) modes. `tools` and `tool_choice` restrict the available tool set per request. Session continuity via `x-session-key` header. Disabled by default (`chat_completions_enabled`). Rate-limited independently (`chat_rate_limit_per_minute`).",
+                "security": [{ "bearerAuth": [] }],
+                "parameters": [
+                    {
+                        "name": "x-session-key",
+                        "in": "header",
+                        "required": false,
+                        "schema": { "type": "string" },
+                        "description": "Session ID for multi-turn continuity. If omitted, a new UUID is generated and returned in the response header."
+                    },
+                    {
+                        "name": "x-request-id",
+                        "in": "header",
+                        "required": false,
+                        "schema": { "type": "string" },
+                        "description": "Client-supplied request identifier. Echoed in the response."
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["messages"],
+                                "properties": {
+                                    "model": {
+                                        "type": "string",
+                                        "description": "Agent routing target (`zeroclaw/<alias>`). Empty or omitted routes to the default agent."
+                                    },
+                                    "messages": {
+                                        "type": "array",
+                                        "description": "Conversation messages. Supports system/developer/user/assistant/tool roles.",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["role", "content"],
+                                            "properties": {
+                                                "role": { "type": "string", "enum": ["system", "user", "assistant", "tool", "developer", "function"] },
+                                                "content": { "type": "string" }
+                                            }
+                                        }
+                                    },
+                                    "stream": { "type": "boolean", "default": false, "description": "Enable SSE streaming." },
+                                    "temperature": { "type": "number", "default": 0.7 },
+                                    "tools": { "type": "array", "description": "Available tool definitions. Filtered against the agent's configured tools." },
+                                    "tool_choice": { "description": "Tool selection strategy. Supported: \"auto\", \"none\"." },
+                                    "stream_options": { "type": "object", "properties": { "include_usage": { "type": "boolean" } } }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful completion.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "object": { "type": "string", "enum": ["chat.completion"] },
+                                        "created": { "type": "integer" },
+                                        "model": { "type": "string" },
+                                        "choices": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "index": { "type": "integer" },
+                                                    "message": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "role": { "type": "string", "enum": ["assistant"] },
+                                                            "content": { "type": "string" }
+                                                        }
+                                                    },
+                                                    "finish_reason": { "type": "string", "enum": ["stop"] }
+                                                }
+                                            }
+                                        },
+                                        "usage": {
+                                            "type": "object",
+                                            "properties": {
+                                                "prompt_tokens": { "type": "integer" },
+                                                "completion_tokens": { "type": "integer" },
+                                                "total_tokens": { "type": "integer" }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "text/event-stream": {
+                                "schema": {
+                                    "type": "string",
+                                    "description": "SSE stream; each chunk is a chat.completion.chunk JSON object terminated by data: [DONE]"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request, unsupported parameter, unknown agent, or unavailable tool.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "401": {
+                        "description": "Authentication required (when `require_pairing` is enabled).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "429": {
+                        "description": "Rate limit exceeded (`chat_rate_limit_per_minute`).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "500": {
+                        "description": "Internal server or provider error.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "503": {
+                        "description": "Agent not configured (complete onboarding).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    }
                 }
             }
         }
