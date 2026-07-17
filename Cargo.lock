@@ -13097,6 +13097,7 @@ dependencies = [
  "whatsapp-rust-ureq-http-client",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-commands",
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-log",

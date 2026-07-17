@@ -99,8 +99,10 @@ use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -110,6 +112,7 @@ use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_commands::{BuiltinCommandId, CommandExecution, CommandSurface, parse_command_token};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
@@ -276,9 +279,16 @@ fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs.saturating_mul(scale)
 }
 
+/// Resolved model route for one channel turn.
+///
+/// This is a per-turn selection result, not persisted preference state. Stored
+/// overrides live in the route/scope override maps and config; this struct is
+/// the shape passed to the model-call path after precedence has been resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelRouteSelection {
+    /// Provider reference selected for this turn.
     model_provider: String,
+    /// Model id selected for this turn.
     model: String,
     /// Route-specific API key override. When set, this credential is passed
     /// directly to the requested provider instead of the alias entry's key.
@@ -312,59 +322,187 @@ fn channel_runtime_scope_label(scope: OverrideScope) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Runtime command recognized before the message reaches the model.
+///
+/// These commands are channel ingress concerns, not agent instructions. Parsing
+/// them here keeps operational commands such as `/goal` from becoming prompt
+/// text while still letting the goal controller attach trusted route/principal
+/// facts later through `GoalAdmissionContext`.
+#[derive(Debug, Clone, PartialEq)]
 enum ChannelRuntimeCommand {
+    /// Render the configured provider list.
     ShowProviders,
+    /// Set the per-sender provider override.
     SetProvider(String),
+    /// Render the active model/provider selection.
     ShowModel,
+    /// Set the per-sender model override.
     SetModel(String),
     /// `/model --user|--agent <ref>` — set the model at an explicit scope.
     SetModelScoped(OverrideScope, String),
+    /// Render runtime config visible from this channel surface.
     ShowConfig,
+    /// Reset conversation history for this sender/reply scope.
     NewSession,
+    /// Set or clear a thinking-level override.
     SetThinking(Option<ThinkingLevel>),
+    /// Parsed `/think` command was syntactically invalid.
     InvalidThinking(String),
+    /// Parsed `/goal` command. Trusted channel facts are attached later via
+    /// `GoalAdmissionContext`; this variant carries only command payload.
+    Goal(zeroclaw_runtime::control_plane::GoalCommand),
+    /// Parsed `/goal` input failed before admission.
+    InvalidGoal(String),
 }
+
+/// Result of local runtime-command handling for a channel message.
+///
+/// Most commands are handled entirely by the orchestrator. Goal commands can
+/// additionally ask the orchestrator to synthesize a follow-up agent turn using
+/// the same channel history and trusted route context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeCommandOutcome {
+    /// Message should be routed to the normal LLM path.
+    NotCommand,
+    /// Command has been handled and should not reach the model.
+    Handled,
+    /// Command changed durable goal state and should enqueue a goal
+    /// continuation turn.
+    ContinueGoal {
+        task_id: String,
+        prompt: GoalContinuationPrompt,
+    },
+}
+
+/// Prompt intent used when a goal command/recovery path continues the agent.
+///
+/// The enum intentionally carries only prompt ingredients. Durable goal state is
+/// read from the task/goal registries, and trusted routing facts remain on the
+/// surrounding `GoalAdmissionContext`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalContinuationPrompt {
+    /// First model turn after a successful `/goal start`.
+    Start {
+        /// Original untrusted objective text stored in the goal extension row.
+        objective: String,
+    },
+    /// Follow-up turn requested by the verifier after it found remaining work.
+    Continue {
+        /// Original untrusted objective text stored in the goal extension row.
+        objective: String,
+    },
+    /// Continuation after `/goal resume`, optionally with an untrusted operator
+    /// reason.
+    Resume {
+        /// Original untrusted objective text stored in the goal extension row.
+        objective: String,
+        /// Optional operator reason supplied with `/goal resume`.
+        /// It is prompt input only.
+        resume_reason: Option<String>,
+    },
+    /// Continuation after budget limits changed enough to unblock the goal.
+    Budget {
+        /// Original untrusted objective text stored in the goal extension row.
+        objective: String,
+    },
+    /// Continuation synthesized during daemon restart recovery.
+    Restart {
+        /// Original untrusted objective text stored in the goal extension row.
+        objective: String,
+    },
+}
+
+/// Local outcome after processing a channel message.
+///
+/// `Continue` holds a boxed synthetic message so recovery/goal control paths can
+/// re-enter the same processing pipeline without duplicating channel-loop code.
+enum ChannelProcessOutcome {
+    /// Processing is complete for this message.
+    Done,
+    /// Process the supplied synthetic continuation message next.
+    Continue(Box<zeroclaw_api::channel::ChannelMessage>),
+}
+
+type ChannelProcessFuture = Pin<Box<dyn Future<Output = ChannelProcessOutcome> + Send>>;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ModelCacheState {
+    /// Cached provider model lists loaded from the local model cache file.
     entries: Vec<ModelCacheEntry>,
 }
 
+/// One provider's cached model list as stored on disk.
+///
+/// The cache is advisory UI/help data for `/models`; it is not the source of
+/// truth for provider capability during an actual model request.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ModelCacheEntry {
+    /// Provider reference or type represented by this cache entry.
     model_provider: String,
+    /// Model ids advertised by the provider cache.
     models: Vec<String>,
 }
 
+/// Baseline runtime settings resolved from config for a channel worker.
+///
+/// Per-sender overrides and hot config reloads layer on top of this value; it
+/// should not be treated as a persisted user preference.
 #[derive(Debug, Clone)]
 struct ChannelRuntimeDefaults {
+    /// Default provider reference from the owning agent config.
     default_model_provider: String,
+    /// Default model id from the selected provider profile.
     model: String,
+    /// Default sampling temperature for this runtime, if configured.
     temperature: Option<f64>,
+    /// Optional API key resolved for this provider alias.
     api_key: Option<String>,
+    /// Optional API base URL resolved for this provider alias.
     api_url: Option<String>,
+    /// Reliability policy applied to model calls from this channel runtime.
     reliability: zeroclaw_config::schema::ReliabilityConfig,
 }
 
+/// Channel defaults plus the config generation they came from.
+///
+/// The channel loop uses this to decide whether a hot-reload snapshot can be
+/// applied without rebuilding the whole runtime.
 #[derive(Debug, Clone)]
 struct ChannelRuntimeDefaultsSnapshot {
+    /// Config snapshot used to resolve the defaults.
     config: Arc<Config>,
+    /// Resolved channel runtime defaults.
     defaults: ChannelRuntimeDefaults,
+    /// Whether the snapshot is safe to apply in-place.
     hot: bool,
+    /// Monotonic reload generation for comparing snapshots.
     generation: u64,
 }
 
+/// Applied hot-reload override for a channel runtime.
+///
+/// This value carries replacement config/defaults while the larger
+/// `ChannelRuntimeContext` remains alive; it is a runtime view, not a durable
+/// config copy.
 #[derive(Debug, Clone)]
 struct ChannelRuntimeOverride {
+    /// Config snapshot associated with the override.
     config: Arc<Config>,
+    /// Defaults resolved from that snapshot.
     defaults: ChannelRuntimeDefaults,
+    /// Reload generation that produced the override.
     generation: u64,
 }
 
+/// File identity used to detect config changes cheaply.
+///
+/// It intentionally stores only filesystem metadata. Parsed config remains in
+/// `Config`; this stamp just decides when to attempt a reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigFileStamp {
+    /// Last modification time reported by the filesystem.
     modified: SystemTime,
+    /// File length reported by the filesystem.
     len: u64,
 }
 
@@ -373,14 +511,26 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
+/// Per-channel same-sender interruption policy resolved from config.
+///
+/// This is a per-call materialized view over channel config, not a stored
+/// runtime preference. It lets the hot message path ask one small object whether
+/// a newer message should cancel/wait behind an in-flight turn for the channel
+/// family that received it.
 #[derive(Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)]
 struct InterruptOnNewMessageConfig {
+    /// Telegram should cancel/wait same-sender in-flight work on newer input.
     telegram: bool,
+    /// Slack should cancel/wait same-sender in-flight work on newer input.
     slack: bool,
+    /// Discord should cancel/wait same-sender in-flight work on newer input.
     discord: bool,
+    /// Mattermost should cancel/wait same-sender in-flight work on newer input.
     mattermost: bool,
+    /// Matrix should cancel/wait same-sender in-flight work on newer input.
     matrix: bool,
+    /// WhatsApp should cancel/wait same-sender in-flight work on newer input.
     whatsapp: bool,
 }
 
@@ -429,17 +579,34 @@ fn interrupt_on_new_message_config(
     }
 }
 
+/// Cost-tracking dependencies shared by channel turns for one agent runtime.
+///
+/// The tracker remains the canonical ledger writer. This state only carries
+/// the dependencies needed to create a per-turn task-local cost context; goal
+/// attribution is resolved later from trusted route/principal facts.
 #[derive(Clone)]
 struct ChannelCostTrackingState {
+    /// Shared ledger writer and budget checker.
     tracker: Arc<zeroclaw_runtime::cost::CostTracker>,
+    /// Type-level pricing view used by this channel runtime.
     model_provider_pricing: Arc<zeroclaw_runtime::agent::cost::ModelProviderPricing>,
+    /// Agent alias stamped on cost records and used for active-goal lookup.
     agent_alias: Arc<String>,
 }
 
+/// Immutable-ish runtime bundle shared by channel message workers.
+///
+/// This is operational wiring, not a durable session snapshot. Per-message
+/// state such as goal admission context, in-flight ordering, and tool-loop
+/// cost attribution is layered on top of this bundle when a turn starts.
 #[derive(Clone)]
 struct ChannelRuntimeContext {
+    /// Registered outbound channel handles keyed by runtime channel name.
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    /// Default provider handle for this channel runtime before per-route
+    /// overrides are applied.
     model_provider: Arc<dyn ModelProvider>,
+    /// Default provider reference resolved from agent/channel config.
     model_provider_ref: Arc<String>,
     /// Alias of the agent that owns this runtime context. Stamped onto
     /// every per-message tracing span so descendant events inherit the
@@ -449,59 +616,101 @@ struct ChannelRuntimeContext {
     /// runtime context. Per-channel agent dispatch (one agent per
     /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
+    /// Config snapshot used for prompt construction and per-turn policy. Hot
+    /// reload can replace this via `runtime_defaults_override`.
     prompt_config: Arc<zeroclaw_config::schema::Config>,
+    /// Memory backend shared by channel turns for this runtime.
     memory: Arc<dyn Memory>,
+    /// Memory loading/selection policy used before constructing prompts.
     memory_strategy: Arc<dyn MemoryStrategy>,
+    /// Static tool registry offered to the model after per-turn filtering.
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    /// Observer sink for turn, tool, and provider events.
     observer: Arc<dyn Observer>,
+    /// Base system prompt for this runtime before per-turn additions.
     system_prompt: Arc<String>,
+    /// Default model id before route/model overrides.
     model: Arc<String>,
+    /// Default model temperature before provider-specific defaults.
     temperature: Option<f64>,
+    /// Whether channel turns persist conversation memory automatically.
     auto_save_memory: bool,
+    /// Maximum tool-loop iterations allowed for one channel turn.
     max_tool_iterations: usize,
+    /// Minimum memory relevance threshold for prompt hydration.
     min_relevance_score: f64,
+    /// In-memory conversation histories keyed by sender/reply scope.
     conversation_histories: ConversationHistoryMap,
+    /// Sender/reply scopes whose next turn should start a fresh session.
     pending_new_sessions: PendingNewSessionSet,
+    /// Cached provider model lists used for `/models`-style UI output.
     provider_cache: ProviderCacheMap,
+    /// Per-route model/provider overrides set through runtime commands.
     route_overrides: RouteSelectionMap,
+    /// Per-route thinking-level overrides set through `/think`.
     thinking_overrides: ThinkingOverrideMap,
     /// Session-only `/model` overrides scoped by user/agent (see
     /// [`ScopedRouteMap`]). Consulted above `route_overrides` in
     /// [`get_route_selection`]; never persisted.
     scope_overrides: ScopedRouteMap,
+    /// Reliability policy used by provider calls from this runtime.
     reliability: Arc<zeroclaw_config::schema::ReliabilityConfig>,
+    /// Provider runtime knobs resolved from the config alias.
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    /// Workspace path used by file, memory, and media helpers.
     workspace_dir: Arc<PathBuf>,
+    /// Base timeout budget for one inbound channel message.
     message_timeout_secs: u64,
+    /// Per-channel cancellation behavior for newer same-sender messages.
     interrupt_on_new_message: InterruptOnNewMessageConfig,
+    /// Multimodal prompt/input policy for this runtime.
     multimodal: zeroclaw_config::schema::MultimodalConfig,
+    /// Media processing limits and routing for inbound attachments.
     media_pipeline: zeroclaw_config::schema::MediaPipelineConfig,
+    /// Speech-to-text settings used by the media pipeline.
     transcription_config: zeroclaw_config::schema::TranscriptionConfig,
     /// Resolved per-agent transcription provider alias (`<type>.<alias>`)
     /// for the runtime-active agent that owns this channel context.
     /// Empty when the agent has no transcription_provider set; downstream
     /// `TranscriptionManager.transcribe` calls then fail loud.
     agent_transcription_provider: String,
+    /// Optional hook runner for channel turn lifecycle hooks.
     hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+    /// Tool names withheld from non-CLI channel turns by policy.
     non_cli_excluded_tools: Arc<Vec<String>>,
+    /// Autonomy level used by approval and tool-admission policy.
     autonomy_level: AutonomyLevel,
+    /// Tool names excluded from tool-call de-duplication.
     tool_call_dedup_exempt: Arc<Vec<String>>,
+    /// Model routing rules used for query-classification based selection.
     model_routes: Arc<Vec<zeroclaw_config::schema::ModelRouteConfig>>,
+    /// Query classification policy used before route/model selection.
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
+    /// Whether supported channels acknowledge inbound messages with reactions.
     ack_reactions: bool,
+    /// Whether tool call progress is rendered into the channel.
     show_tool_calls: bool,
+    /// Optional persistent session backend for conversation history.
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
+    /// Session-scoped activated tool set, when dynamic tool activation is
+    /// enabled for this runtime.
     activated_tools:
         Option<std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
+    /// Cost-tracking dependencies used to create per-turn task-local cost
+    /// contexts.
     cost_tracking: Option<ChannelCostTrackingState>,
+    /// User-visible pacing/delay policy for channel responses.
     pacing: zeroclaw_config::schema::PacingConfig,
+    /// Maximum tool-result text retained in prompt/history surfaces.
     max_tool_result_chars: usize,
+    /// Token budget used when trimming channel conversation context.
     context_token_budget: usize,
+    /// Debouncer that groups rapid same-sender messages before model dispatch.
     debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
     /// HMAC receipt generator. `Some` when `[agent.resolved.tool_receipts] enabled = true`.
     /// Threaded into `run_tool_call_loop` so `tool_execution::execute_one_tool`
@@ -511,7 +720,9 @@ struct ChannelRuntimeContext {
     /// `process_channel_message` renders the per-turn collector as a trailing
     /// `Tool receipts:` block sent after the main reply.
     show_receipts_in_response: bool,
+    /// Last config file metadata snapshot successfully applied to this runtime.
     last_applied_config_stamp: Arc<Mutex<Option<ConfigFileStamp>>>,
+    /// Latest hot-reload defaults awaiting or already used by channel turns.
     runtime_defaults_override: Arc<Mutex<Option<Arc<ChannelRuntimeOverride>>>>,
     /// Per-conversation-history-key locks that serialize persistence mutations
     /// (append / remove_last / delete_session) for the same sender without
@@ -531,15 +742,62 @@ fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync
         .clone()
 }
 
+/// In-memory same-sender ordering node.
+///
+/// The orchestrator stores only the latest node per sender; predecessors form a
+/// short chain that queued messages wait on before entering the LLM loop. This
+/// prevents a `/goal start` command from being admitted into an already-running
+/// same-sender loop.
 #[derive(Clone)]
 struct InFlightSenderTaskState {
+    /// Monotonic in-memory id used only for ordering same-sender channel turns.
     task_id: u64,
+    /// Cancellation token for this turn and any queued descendants that should
+    /// be interrupted by newer same-sender input.
     cancellation: CancellationToken,
+    /// Completion signal released when this turn finishes or is dropped.
     completion: Arc<InFlightTaskCompletion>,
+    /// Previous same-sender turn that must complete before this queued turn can
+    /// enter the agent loop.
+    predecessor: Option<Arc<InFlightSenderTaskState>>,
 }
 
+/// Registered in-flight channel turn plus its completion guard.
+///
+/// Owning this value means the turn is visible in the same-sender in-flight
+/// chain. Dropping it releases queued successors through `completion_guard`.
+struct InFlightRegistration {
+    /// Node currently registered in the sender-scoped in-flight map.
+    state: InFlightSenderTaskState,
+    /// Completion guard that releases queued successors on every exit path.
+    completion_guard: InFlightCompletionGuard,
+}
+
+impl InFlightRegistration {
+    fn new(state: InFlightSenderTaskState) -> Self {
+        Self {
+            completion_guard: InFlightCompletionGuard::new(Arc::clone(&state.completion)),
+            state,
+        }
+    }
+
+    fn mark_done(self) {
+        self.completion_guard.mark_done();
+    }
+}
+
+/// One-shot completion latch for a registered channel turn.
+///
+/// `Notify` alone is not sufficient because a successor can begin waiting after
+/// notification. The atomic flag is the source of truth for completion; the
+/// notify only wakes waiters to re-check it.
 struct InFlightTaskCompletion {
+    /// Authoritative completion bit for this in-memory latch.
+    ///
+    /// This avoids the lost-wakeup hole in `Notify`: waiters always re-check
+    /// this flag after being awakened or after subscribing.
     done: AtomicBool,
+    /// Wake-up primitive for tasks waiting on `done`.
     notify: tokio::sync::Notify,
 }
 
@@ -556,11 +814,101 @@ impl InFlightTaskCompletion {
         self.notify.notify_waiters();
     }
 
-    async fn wait(&self) {
-        if self.done.load(Ordering::Acquire) {
-            return;
+    async fn wait_released_or_cancelled(&self, cancellation: &CancellationToken) -> bool {
+        // Same-sender queueing has an external locus of control: a queued turn
+        // waits for its predecessor only while the queued registration is still
+        // valid. Encoding the cancellation token in this API prevents callers
+        // from accidentally using the lost-wakeup-safe wait as an unbounded
+        // standalone wait.
+        // The predecessor side is released by `InFlightCompletionGuard`, which
+        // marks done on normal completion and on drop if a worker exits early.
+        loop {
+            // `Notify::notify_waiters` does not leave a permit for waiters
+            // created after the notification. Create the wait future before
+            // reading `done` so a predecessor cannot finish between the check
+            // and the await, leaving this queued task parked forever.
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return true;
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return false,
+                _ = notified => {}
+            }
         }
-        self.notify.notified().await;
+    }
+}
+
+/// Drop guard that makes in-flight completion fail-open for queued successors.
+///
+/// A channel worker can return normally, be cancelled, or unwind through early
+/// error paths. In all cases successors must not wait forever for a predecessor
+/// that no longer owns the turn.
+struct InFlightCompletionGuard {
+    /// Completion latch to release on explicit completion or drop.
+    ///
+    /// `None` means this guard has already fired, which keeps the one-shot
+    /// release idempotent.
+    completion: Option<Arc<InFlightTaskCompletion>>,
+}
+
+impl InFlightCompletionGuard {
+    fn new(completion: Arc<InFlightTaskCompletion>) -> Self {
+        Self {
+            completion: Some(completion),
+        }
+    }
+
+    fn mark_done(mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.mark_done();
+        }
+    }
+}
+
+impl Drop for InFlightCompletionGuard {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.mark_done();
+        }
+    }
+}
+
+/// Result of attempting to pre-register a channel message in the in-flight map.
+///
+/// This keeps registration, queueing, and immediate abandonment distinct so the
+/// caller can either proceed, wait on a predecessor with external cancellation,
+/// or drop the message without accidentally activating a goal in an existing
+/// loop.
+enum InFlightPreRegistration {
+    /// Serialization is disabled or not needed for this message.
+    NotNeeded,
+    /// This message owns the active slot and may enter the agent loop.
+    Registered(InFlightRegistration),
+    /// This message is registered but must wait for a predecessor first.
+    Queued {
+        registration: InFlightRegistration,
+        predecessor: InFlightSenderTaskState,
+    },
+    /// Newer input superseded this message before it could run.
+    Abandoned,
+}
+
+impl InFlightPreRegistration {
+    fn into_registered(self) -> Option<InFlightRegistration> {
+        match self {
+            Self::Registered(registration) => Some(registration),
+            Self::Queued { .. } | Self::NotNeeded | Self::Abandoned => None,
+        }
+    }
+}
+
+fn cancel_in_flight_chain(state: &InFlightSenderTaskState) {
+    let mut current = Some(state.clone());
+    while let Some(state) = current {
+        state.cancellation.cancel();
+        current = state.predecessor.as_deref().cloned();
     }
 }
 
@@ -605,6 +953,89 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+/// Collision-safe principal identity for goal ownership. This is deliberately
+/// separate from the sanitizer-backed session key because task visibility is a
+/// security boundary, not a filesystem-name convenience.
+fn goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    (!msg.sender.trim().is_empty()).then(|| {
+        canonical_goal_identity(&[
+            msg.channel.as_str(),
+            msg.channel_alias.as_deref().unwrap_or(""),
+            msg.sender.as_str(),
+        ])
+    })
+}
+
+fn goal_task_conversation_scope(
+    scope: zeroclaw_api::channel::ChannelConversationScope,
+) -> zeroclaw_runtime::control_plane::TaskContinuationConversationScope {
+    match scope {
+        zeroclaw_api::channel::ChannelConversationScope::Sender => {
+            zeroclaw_runtime::control_plane::TaskContinuationConversationScope::Sender
+        }
+        zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => {
+            zeroclaw_runtime::control_plane::TaskContinuationConversationScope::ReplyTarget
+        }
+    }
+}
+
+fn goal_channel_conversation_scope(
+    scope: zeroclaw_runtime::control_plane::TaskContinuationConversationScope,
+) -> zeroclaw_api::channel::ChannelConversationScope {
+    match scope {
+        zeroclaw_runtime::control_plane::TaskContinuationConversationScope::Sender => {
+            zeroclaw_api::channel::ChannelConversationScope::Sender
+        }
+        zeroclaw_runtime::control_plane::TaskContinuationConversationScope::ReplyTarget => {
+            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget
+        }
+    }
+}
+
+fn goal_continuation_context_from_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_runtime::control_plane::TaskContinuationContext {
+    zeroclaw_runtime::control_plane::TaskContinuationContext {
+        channel: msg.channel.clone(),
+        channel_alias: msg.channel_alias.clone(),
+        reply_target: msg.reply_target.clone(),
+        sender: msg.sender.clone(),
+        thread_ts: msg.thread_ts.clone(),
+        interruption_scope_id: msg.interruption_scope_id.clone(),
+        conversation_scope: goal_task_conversation_scope(msg.conversation_scope),
+    }
+}
+
+/// Collision-safe control-plane identity. Unlike session-key sanitization this
+/// preserves every raw trusted component with explicit boundaries.
+fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    canonical_goal_identity(&[
+        msg.channel.as_str(),
+        msg.channel_alias.as_deref().unwrap_or(""),
+        msg.sender.as_str(),
+        msg.reply_target.as_str(),
+        msg.thread_ts.as_deref().unwrap_or(""),
+        match msg.conversation_scope {
+            zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
+            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
+        },
+    ])
+}
+
+fn canonical_goal_identity(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| format!("{}:{part}", part.len()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Build the [`ScopedRouteMap`] key for a `/model` override at `scope`.
+///
+/// Keyspaces are kept disjoint from [`conversation_history_key`] via a
+/// `user::`/`agent::` prefix applied before sanitizing. Each tier deliberately
+/// drops identifiers below its scope: `User` spans all of a sender's chats (no
+/// reply_target/thread), `Agent` spans everything (no sender).
 fn scope_override_key(
     scope: OverrideScope,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -1316,6 +1747,354 @@ fn is_matrix_channel_name(channel_name: &str) -> bool {
     channel_name == "matrix" || channel_name.starts_with("matrix:")
 }
 
+fn goal_channel_type(channel_name: &str) -> String {
+    channel_name
+        .split_once(':')
+        .map_or(channel_name, |(channel_type, _)| channel_type)
+        .to_string()
+}
+
+fn goal_channel_status_updates_enabled(
+    config: &zeroclaw_config::schema::Config,
+    channel_name: &str,
+) -> bool {
+    channel_name != "cli" && config.goal.channel_status_updates
+}
+
+const GOAL_CONTROLLER_MAX_CONTINUATIONS_PER_MESSAGE: usize = 16;
+
+fn goal_continuation_prompt(task_id: &str, prompt: &GoalContinuationPrompt) -> String {
+    match prompt {
+        GoalContinuationPrompt::Start { objective } => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-start-work-prompt",
+                &[("task_id", task_id), ("objective", objective)],
+            )
+        }
+        GoalContinuationPrompt::Continue { objective } => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-continue-work-prompt",
+                &[("task_id", task_id), ("objective", objective)],
+            )
+        }
+        GoalContinuationPrompt::Resume {
+            objective,
+            resume_reason,
+        } => match resume_reason {
+            Some(reason) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-resume-work-with-reason-prompt",
+                &[
+                    ("task_id", task_id),
+                    ("objective", objective),
+                    ("reason", reason),
+                ],
+            ),
+            None => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-resume-work-prompt",
+                &[("task_id", task_id), ("objective", objective)],
+            ),
+        },
+        GoalContinuationPrompt::Budget { objective } => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-budget-work-prompt",
+                &[("task_id", task_id), ("objective", objective)],
+            )
+        }
+        GoalContinuationPrompt::Restart { objective } => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-restart-work-prompt",
+                &[("task_id", task_id), ("objective", objective)],
+            )
+        }
+    }
+}
+
+fn goal_continuation_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    task_id: &str,
+    objective: String,
+) -> zeroclaw_api::channel::ChannelMessage {
+    goal_continuation_message_with_prompt(
+        msg,
+        task_id,
+        &GoalContinuationPrompt::Continue { objective },
+    )
+}
+
+fn goal_continuation_message_with_prompt(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    task_id: &str,
+    prompt: &GoalContinuationPrompt,
+) -> zeroclaw_api::channel::ChannelMessage {
+    synthetic_goal_message_from(
+        msg,
+        format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4()),
+        goal_continuation_prompt(task_id, prompt),
+    )
+}
+
+fn synthetic_goal_message_from(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    id: String,
+    content: String,
+) -> zeroclaw_api::channel::ChannelMessage {
+    let mut next = zeroclaw_api::channel::ChannelMessage::new(
+        id,
+        msg.sender.clone(),
+        msg.reply_target.clone(),
+        content,
+        msg.channel.clone(),
+        msg.timestamp,
+    );
+    next.channel_alias = msg.channel_alias.clone();
+    next.thread_ts = msg.thread_ts.clone();
+    next.interruption_scope_id = msg.interruption_scope_id.clone();
+    next.subject = msg.subject.clone();
+    next.conversation_scope = msg.conversation_scope;
+    next.passive_context = false;
+    next
+}
+
+fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn recovered_goal_continuation_message(
+    task_id: &str,
+    objective: String,
+    context: zeroclaw_runtime::control_plane::TaskContinuationContext,
+) -> zeroclaw_api::channel::ChannelMessage {
+    let mut msg = zeroclaw_api::channel::ChannelMessage::new(
+        format!("goal-restart:{task_id}:{}", uuid::Uuid::new_v4()),
+        context.sender,
+        context.reply_target,
+        goal_continuation_prompt(task_id, &GoalContinuationPrompt::Restart { objective }),
+        context.channel,
+        unix_timestamp_secs(),
+    );
+    msg.channel_alias = context.channel_alias;
+    msg.thread_ts = context.thread_ts;
+    msg.interruption_scope_id = context.interruption_scope_id;
+    msg.conversation_scope = goal_channel_conversation_scope(context.conversation_scope);
+    msg.passive_context = false;
+    msg
+}
+
+fn is_recovered_goal_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    msg.id.starts_with("goal-restart:")
+}
+
+fn is_goal_controller_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    msg.id.contains(":goal:") || is_recovered_goal_continuation_message(msg)
+}
+
+fn should_enrich_message_links(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    command_requested_goal_continuation: bool,
+    link_enricher_enabled: bool,
+) -> bool {
+    if !link_enricher_enabled {
+        return false;
+    }
+    // Goal-controller continuations are runtime-authored prompts. Enriching an
+    // objective URL here would prepend text outside the controller prompt shape,
+    // blurring trusted runtime instructions with untrusted objective content.
+    !command_requested_goal_continuation && !is_goal_controller_continuation_message(msg)
+}
+
+fn should_autosave_message_to_memory(
+    content: &str,
+    auto_save_memory: bool,
+    goal_controller_continuation: bool,
+) -> bool {
+    if !auto_save_memory || goal_controller_continuation {
+        return false;
+    }
+    content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(content)
+}
+
+fn should_consolidate_message_memory(
+    content: &str,
+    auto_save_memory: bool,
+    goal_controller_continuation: bool,
+) -> bool {
+    auto_save_memory
+        && !goal_controller_continuation
+        && content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+}
+
+fn goal_admission_context_for_message(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    _history_key: &str,
+) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
+    zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
+        .with_command_surface(CommandSurface::Channel)
+        .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
+        .with_originator_route(Some(goal_trusted_route(msg)))
+        .with_principal_id(goal_principal_id(msg))
+        .with_continuation_context(Some(goal_continuation_context_from_message(msg)))
+}
+
+fn goal_cost_tracking_context_for_turn(
+    context: zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext,
+    goal_admission_context: Option<&zeroclaw_runtime::control_plane::GoalAdmissionContext>,
+    goal_controller_continuation: bool,
+) -> zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext {
+    match goal_admission_context {
+        Some(goal_ctx) if goal_controller_continuation => {
+            context.with_goal_admission_context(goal_ctx)
+        }
+        Some(goal_ctx) => context.with_goal_admission_filters(goal_ctx),
+        None => context,
+    }
+}
+
+async fn goal_objective_for_prompt(task_id: &str) -> String {
+    let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
+        return goal_objective_unavailable(task_id, "control plane unavailable");
+    };
+    match control_plane.goal_store.get_goal_task(task_id).await {
+        Ok(Some(goal)) => goal.objective,
+        Ok(None) => goal_objective_unavailable(task_id, "goal extension missing"),
+        Err(error) => goal_objective_unavailable(task_id, &format!("{error:#}")),
+    }
+}
+
+fn goal_objective_unavailable(task_id: &str, reason: &str) -> String {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "task_id": task_id, "reason": reason })),
+        "goal continuation prompt missing objective"
+    );
+    format!("Objective unavailable from durable goal state for task {task_id}.")
+}
+
+fn goal_controller_limit_pause_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_api::channel::ChannelMessage {
+    let reason =
+        zeroclaw_runtime::i18n::get_required_cli_string("goal-command-controller-limit-pause");
+    synthetic_goal_message_from(
+        msg,
+        format!("{}:goal-limit:{}", msg.id, uuid::Uuid::new_v4()),
+        format!("/goal pause {reason}"),
+    )
+}
+
+async fn send_goal_controller_update(
+    config: &zeroclaw_config::schema::Config,
+    channel: Option<&Arc<dyn Channel>>,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    message: &str,
+) {
+    if !goal_channel_status_updates_enabled(config, msg.channel.as_str()) {
+        return;
+    }
+    let Some(channel) = channel else {
+        return;
+    };
+    let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-goal-state-update",
+        &[("message", message)],
+    );
+    if let Err(err) = channel
+        .send(&SendMessage::new(text, &msg.reply_target).in_thread(followup_thread_id(msg)))
+        .await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "failed to send goal controller update"
+        );
+    }
+}
+
+fn spawn_goal_state_update_task(
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    thread_ts: Option<String>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<
+        zeroclaw_runtime::control_plane::GoalStateUpdateEvent,
+    >,
+) -> tokio::task::JoinHandle<()> {
+    let supports_drafts = channel.supports_draft_updates();
+    zeroclaw_spawn::spawn!(async move {
+        use zeroclaw_runtime::control_plane::GoalStateUpdateEvent;
+
+        let mut verifier_draft_id: Option<String> = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                GoalStateUpdateEvent::VerifierStarted(text) if supports_drafts => {
+                    match channel
+                        .send_draft(
+                            &SendMessage::new(&text, &reply_target).in_thread(thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        Ok(Some(draft_id)) => verifier_draft_id = Some(draft_id),
+                        Ok(None) => {}
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                                "goal verifier draft send failed"
+                            );
+                        }
+                    }
+                }
+                GoalStateUpdateEvent::VerifierStarted(_) => {}
+                GoalStateUpdateEvent::Status(text) => {
+                    if let Some(draft_id) = verifier_draft_id.take() {
+                        if let Err(err) = channel
+                            .finalize_draft(&reply_target, &draft_id, &text, true)
+                            .await
+                        {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                                "goal verifier draft finalize failed; sending final status"
+                            );
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&text, &reply_target)
+                                        .in_thread(thread_ts.clone()),
+                                )
+                                .await;
+                        }
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(&text, &reply_target)
+                                    .in_thread(thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        if let Some(draft_id) = verifier_draft_id.take() {
+            let _ = channel.cancel_draft(&reply_target, &draft_id).await;
+        }
+    })
+}
+
 fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -1334,6 +2113,12 @@ fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>
     }
 }
 
+/// Effective thinking parameters for one channel turn.
+///
+/// The parser may consume an inline `/think` directive from message text, then
+/// resolves it against session override and config. The result is transient
+/// prompt/provider input; persistent thinking preferences remain in config or
+/// the session override maps.
 struct ChannelThinkingResolution {
     effective_content: String,
     level: ThinkingLevel,
@@ -1380,23 +2165,19 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
 
     let mut parts = trimmed.split_whitespace();
     let command_token = parts.next()?;
-    let base_command = command_token
-        .split('@')
-        .next()
-        .unwrap_or(command_token)
-        .to_ascii_lowercase();
+    let command = parse_command_token(command_token, CommandSurface::Channel)?.command;
 
-    match base_command.as_str() {
+    match command.id {
         // `/new` and bare `/clear` are available on every channel — no model-switch gate.
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
-        "/clear" => {
+        BuiltinCommandId::New => Some(ChannelRuntimeCommand::NewSession),
+        BuiltinCommandId::Clear => {
             if parts.next().is_none() {
                 Some(ChannelRuntimeCommand::NewSession)
             } else {
                 None
             }
         }
-        "/thinking" => {
+        BuiltinCommandId::Thinking => {
             let arg = parts.next();
             if parts.next().is_some() {
                 Some(ChannelRuntimeCommand::InvalidThinking(
@@ -1410,7 +2191,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         // Model/model_provider switching is channel-gated.
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Models if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     model_provider.trim().to_string(),
@@ -1419,7 +2200,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Model if supports_runtime_model_switch(channel_name) => {
             let rest: Vec<&str> = parts.collect();
             // An optional leading `--user|--agent` flag selects the override
             // scope; without it, bare `/model <ref>` keeps its existing
@@ -1440,13 +2221,56 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 (Some(scope), false) => Some(ChannelRuntimeCommand::SetModelScoped(scope, model)),
             }
         }
-        "/config" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Config if supports_runtime_model_switch(channel_name) => {
             Some(ChannelRuntimeCommand::ShowConfig)
+        }
+        BuiltinCommandId::Goal => {
+            match zeroclaw_runtime::control_plane::goal::parse_goal_command(trimmed) {
+                Ok(command) => Some(ChannelRuntimeCommand::Goal(command)),
+                Err(error) => Some(ChannelRuntimeCommand::InvalidGoal(error.to_string())),
+            }
         }
         _ => None,
     }
 }
 
+fn strip_leading_channel_command_address<'a>(
+    content: &'a str,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> Option<&'a str> {
+    // Best-effort bridge for chat clients that reserve naked `/commands`.
+    // Channel-specific mention discovery must stay with channel implementations;
+    // this helper only strips the one canonical address exposed by `Channel`
+    // after the remaining command token resolves to a runtime-owned command in
+    // the shared catalogue. Unknown slash text must stay intact for the model.
+    // The proper home is a `zeroclaw-commands` command-ingress trait bound to
+    // channel objects; keeping this temporary bridge narrow avoids turning it
+    // into a half-parser for every chat protocol.
+    let mention = target_channel.and_then(|channel| channel.self_addressed_mention())?;
+    let command =
+        crate::addressed_command::strip_leading_addressed_command(content, [mention.as_str()])?;
+    is_channel_runtime_slash_command(command).then_some(command)
+}
+
+fn is_channel_runtime_slash_command(content: &str) -> bool {
+    let Some(token) = content.split_whitespace().next() else {
+        return false;
+    };
+    let Some(parsed) = parse_command_token(token, CommandSurface::Channel) else {
+        return false;
+    };
+    matches!(
+        parsed.command.execution,
+        CommandExecution::RuntimeCommand | CommandExecution::GoalAdmission
+    )
+}
+
+/// Verify `name` matches a canonical model provider family known to the
+/// runtime registry. Returns the canonical (case-corrected) name, or `None`
+/// when the input doesn't name a known family. Used by the channel
+/// `/models` slash command, which accepts only the bare family name; dotted
+/// aliases (`<family>.<alias>`) are resolved elsewhere through
+/// `create_resilient_model_provider_from_ref`.
 fn canonical_model_provider_name(name: &str) -> Option<String> {
     let candidate = name.trim();
     if candidate.is_empty() {
@@ -1667,6 +2491,13 @@ async fn load_runtime_config_and_defaults(
     let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
         .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
+    if let Some(zeroclaw_dir) = path.parent() {
+        // `config_path`/`data_dir` are runtime metadata skipped by config
+        // serialization. A hot reload must rebuild them from the same install
+        // root as `Config::load_or_init`; otherwise downstream subsystems such
+        // as the cost ledger try to open relative defaults like `state/*.jsonl`.
+        parsed.data_dir = zeroclaw_dir.join("data");
+    }
 
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
@@ -2702,19 +3533,20 @@ async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
-) -> bool {
+) -> RuntimeCommandOutcome {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
-        return false;
+        return RuntimeCommandOutcome::NotCommand;
     };
 
     let Some(channel) = target_channel else {
-        return true;
+        return RuntimeCommandOutcome::Handled;
     };
 
     let sender_key = conversation_history_key(msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
+    let mut outcome = RuntimeCommandOutcome::Handled;
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
@@ -2958,6 +3790,67 @@ async fn handle_runtime_command_if_needed(
             "channel-runtime-thinking-invalid",
             &[("raw", raw.as_str())],
         ),
+        ChannelRuntimeCommand::Goal(command) => {
+            let action = command.action;
+            let command_objective = command.objective.clone();
+            let resume_reason = command.resume_reason.clone();
+            let defaults_snapshot = runtime_defaults_snapshot(ctx);
+            match zeroclaw_runtime::control_plane::admit_goal_command(
+                zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
+                    ctx.agent_alias.as_ref().clone(),
+                )
+                .with_command_surface(CommandSurface::Channel)
+                .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
+                .with_originator_route(Some(sender_key.clone()))
+                .with_principal_id(goal_principal_id(msg))
+                .with_continuation_context(Some(goal_continuation_context_from_message(msg))),
+                command,
+                defaults_snapshot.config.as_ref(),
+                Some(ctx.agent_cfg.as_ref()),
+            )
+            .await
+            {
+                Ok(admission) => {
+                    if admission.continue_goal
+                        && let Some(task_id) = admission.task_id.clone()
+                    {
+                        let prompt = match action {
+                            zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
+                                command_objective
+                                    .clone()
+                                    .map(|objective| GoalContinuationPrompt::Start { objective })
+                            }
+                            zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
+                                Some(GoalContinuationPrompt::Resume {
+                                    objective: goal_objective_for_prompt(&task_id).await,
+                                    resume_reason: resume_reason.clone(),
+                                })
+                            }
+                            zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
+                                Some(GoalContinuationPrompt::Budget {
+                                    objective: goal_objective_for_prompt(&task_id).await,
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(prompt) = prompt {
+                            outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
+                        }
+                    }
+                    admission.message
+                }
+                Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-goal-command-failed",
+                    &[("error", &error.to_string())],
+                ),
+            }
+        }
+        ChannelRuntimeCommand::InvalidGoal(raw) => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-command-invalid",
+                &[("raw", &raw)],
+            )
+        }
     };
 
     if let Err(err) = channel
@@ -2988,7 +3881,7 @@ async fn handle_runtime_command_if_needed(
         );
     }
 
-    true
+    outcome
 }
 
 fn is_group_reply_target(reply_target: &str) -> bool {
@@ -3122,6 +4015,11 @@ impl NoReplyKind {
     }
 }
 
+/// Agent response delivery outcome for a channel turn.
+///
+/// This separates "model produced a reply" from intentional no-reply cases so
+/// conversation history can record what happened without pretending a hidden
+/// channel send occurred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AssistantChannelOutcome {
     Reply(String),
@@ -4327,34 +5225,46 @@ fn spawn_scoped_typing_task(
     })
 }
 
-async fn process_channel_message(
+fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
-) {
-    if cancellation_token.is_cancelled() {
-        return;
-    }
-
-    let channel_composite = match &msg.channel_alias {
-        Some(alias) => format!("{}.{}", msg.channel, alias),
-        None => msg.channel.clone(),
-    };
-    let agent_alias = Arc::clone(&ctx.agent_alias);
-    let sender = msg.sender.clone();
-    let message_id = msg.id.clone();
-    let composite_for_body = channel_composite.clone();
-    zeroclaw_log::scope!(
-        category: "channel",
-        agent_alias: agent_alias.as_str(),
-        channel: channel_composite.as_str(),
-        sender: sender.as_str(),
-        message_id: message_id.as_str(),
-        => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+) -> ChannelProcessFuture {
+    Box::pin(async move {
+        if cancellation_token.is_cancelled() {
+            return ChannelProcessOutcome::Done;
         }
-    )
-    .await;
+
+        let channel_composite = match &msg.channel_alias {
+            Some(alias) => format!("{}.{}", msg.channel, alias),
+            None => msg.channel.clone(),
+        };
+        let agent_alias = Arc::clone(&ctx.agent_alias);
+        let sender = msg.sender.clone();
+        let message_id = msg.id.clone();
+        let composite_for_body = channel_composite.clone();
+        zeroclaw_log::scope!(
+            category: "channel",
+            agent_alias: agent_alias.as_str(),
+            channel: channel_composite.as_str(),
+            sender: sender.as_str(),
+            message_id: message_id.as_str(),
+            => async move {
+                // The channel turn body captures routing, media, tool-loop,
+                // draft, and goal-controller state. Box it at the public helper
+                // boundary so direct callers, including focused regression tests,
+                // do not inherit that full state machine in their own async frame.
+                Box::pin(process_channel_message_body(
+                    ctx,
+                    msg,
+                    cancellation_token,
+                    composite_for_body,
+                ))
+                .await
+            }
+        )
+        .await
+    })
 }
 
 fn resolve_channel_ack_reactions(
@@ -4480,7 +5390,7 @@ async fn process_channel_message_body(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     channel_composite: String,
-) {
+) -> ChannelProcessOutcome {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -4507,7 +5417,7 @@ async fn process_channel_message_body(
                         .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
                     "incoming message dropped by hook"
                 );
-                return;
+                return ChannelProcessOutcome::Done;
             }
             zeroclaw_runtime::hooks::HookResult::Continue(modified) => modified,
         }
@@ -4525,7 +5435,7 @@ async fn process_channel_message_body(
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "dropping self-authored inbound message (self-loop guard, sdk layer)"
             );
-            return;
+            return ChannelProcessOutcome::Done;
         }
         if zeroclaw_runtime::peers::should_drop_self_loop(
             &msg.sender,
@@ -4537,7 +5447,7 @@ async fn process_channel_message_body(
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
             );
-            return;
+            return ChannelProcessOutcome::Done;
         }
     }
 
@@ -4566,7 +5476,17 @@ async fn process_channel_message_body(
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
-        return;
+        return ChannelProcessOutcome::Done;
+    }
+
+    if let Some(command_content) =
+        strip_leading_channel_command_address(&msg.content, target_channel.as_ref())
+            .map(str::to_string)
+    {
+        // Several chat clients reserve naked `/commands` locally. Accept the
+        // platform-native bot mention as an address prefix only when the
+        // addressed payload is itself a runtime slash command.
+        msg.content = command_content;
     }
 
     // The early ack is spawned (fire-and-forget) so it lands before the
@@ -4611,6 +5531,45 @@ async fn process_channel_message_body(
             None
         };
 
+    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "Failed to apply runtime config update"
+        );
+    }
+
+    // Runtime slash commands must be parsed before media/link enrichment can
+    // mutate the leading command token. Otherwise `/goal start ... https://...`
+    // can become `[Link: ...]\n/goal ...` and leak into the model as prompt text.
+    let mut command_requested_goal_continuation = false;
+    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        RuntimeCommandOutcome::NotCommand => {}
+        RuntimeCommandOutcome::Handled => {
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{2705}"),
+            )
+            .await;
+            return ChannelProcessOutcome::Done;
+        }
+        RuntimeCommandOutcome::ContinueGoal { task_id, prompt } => {
+            msg.content = goal_continuation_prompt(&task_id, &prompt);
+            msg.attachments.clear();
+            msg.passive_context = false;
+            command_requested_goal_continuation = true;
+        }
+    }
+
+    let goal_controller_continuation =
+        command_requested_goal_continuation || is_goal_controller_continuation_message(&msg);
+
+    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let thinking_override = ctx
         .thinking_overrides
         .lock()
@@ -4621,7 +5580,7 @@ async fn process_channel_message_body(
         &msg.content,
         thinking_override,
         &ctx.agent_cfg.resolved.thinking,
-        runtime_defaults_snapshot(ctx.as_ref()).defaults.temperature,
+        runtime_defaults.defaults.temperature,
     );
     if thinking.effective_content != msg.content {
         ::zeroclaw_log::record!(
@@ -4662,7 +5621,7 @@ async fn process_channel_message_body(
 
     // ── Link enricher: prepend URL summaries before agent sees the message ──
     let le_config = &ctx.prompt_config.link_enricher;
-    if le_config.enabled {
+    if should_enrich_message_links(&msg, command_requested_goal_continuation, le_config.enabled) {
         let enricher_cfg = link_enricher::LinkEnricherConfig {
             enabled: le_config.enabled,
             max_links: le_config.max_links,
@@ -4680,28 +5639,58 @@ async fn process_channel_message_body(
         }
     }
 
-    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-            "Failed to apply runtime config update"
-        );
-    }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
-        reconcile_early_ack(
-            ctx.as_ref(),
-            &msg,
-            target_channel.as_ref(),
-            early_ack_task,
-            Some("\u{2705}"),
+    if goal_controller_continuation {
+        let goal_ctx = goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key);
+        match zeroclaw_runtime::control_plane::admit_goal_autonomous_turn(
+            &goal_ctx,
+            runtime_defaults.config.as_ref(),
         )
-        .await;
-        return;
+        .await
+        {
+            Ok(Some(admission)) => {
+                send_goal_controller_update(
+                    runtime_defaults.config.as_ref(),
+                    target_channel.as_ref(),
+                    &msg,
+                    &admission.message,
+                )
+                .await;
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{2705}"),
+                )
+                .await;
+                return ChannelProcessOutcome::Done;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-goal-controller-failed",
+                    &[("error", &error.to_string())],
+                );
+                send_goal_controller_update(
+                    runtime_defaults.config.as_ref(),
+                    target_channel.as_ref(),
+                    &msg,
+                    &error_text,
+                )
+                .await;
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return ChannelProcessOutcome::Done;
+            }
+        }
     }
 
-    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
 
     if let Some(hint) =
@@ -4748,7 +5737,7 @@ async fn process_channel_message_body(
                 Some("\u{26A0}\u{FE0F}"),
             )
             .await;
-            return;
+            return ChannelProcessOutcome::Done;
         }
     };
     let history_user_content = msg.content.clone();
@@ -4757,10 +5746,11 @@ async fn process_channel_message_body(
     // store; the channel-history cache still keeps the re-loadable markers via
     // collapse_inline_image_payloads downstream.
     let autosave_content = strip_inline_data_image_markers(&history_user_content);
-    if ctx.auto_save_memory
-        && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
-    {
+    if should_autosave_message_to_memory(
+        &autosave_content,
+        ctx.auto_save_memory,
+        goal_controller_continuation,
+    ) {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
@@ -5107,7 +6097,7 @@ async fn process_channel_message_body(
                 })),
             "channel_message_no_reply"
         );
-        return;
+        return ChannelProcessOutcome::Done;
     }
 
     let use_draft_streaming = target_channel
@@ -5265,6 +6255,30 @@ async fn process_channel_message_body(
         }))
     };
 
+    let goal_status_updates_enabled =
+        goal_channel_status_updates_enabled(runtime_defaults.config.as_ref(), msg.channel.as_str());
+    let (goal_state_update_scope, goal_state_update_task) =
+        if goal_status_updates_enabled && let Some(channel) = target_channel.clone() {
+            let (goal_state_tx, goal_state_rx) = tokio::sync::mpsc::unbounded_channel::<
+                zeroclaw_runtime::control_plane::GoalStateUpdateEvent,
+            >();
+            let reply_target = msg.reply_target.clone();
+            let thread_ts = followup_thread_id(&msg);
+            (
+                Some(zeroclaw_runtime::control_plane::GoalStateUpdateSink::new(
+                    goal_state_tx,
+                )),
+                Some(spawn_goal_state_update_task(
+                    channel,
+                    reply_target,
+                    thread_ts,
+                    goal_state_rx,
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
@@ -5280,12 +6294,23 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
+    let goal_admission_context = Some(goal_admission_context_for_message(
+        ctx.as_ref(),
+        &msg,
+        &history_key,
+    ));
+    let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+        let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,
             state.model_provider_pricing,
         )
-        .with_agent_alias(state.agent_alias.as_str())
+        .with_agent_alias(state.agent_alias.as_str());
+        goal_cost_tracking_context_for_turn(
+            context,
+            goal_admission_context.as_ref(),
+            goal_controller_continuation,
+        )
     });
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
@@ -5416,8 +6441,19 @@ async fn process_channel_message_body(
                 .scope(receipt_scope.clone(), tool_loop);
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
+            let goal_runtime_scope = zeroclaw_runtime::control_plane::GoalRuntimeScope::new(
+                goal_admission_context.clone(),
+                goal_state_update_scope.clone(),
+                Some(Arc::clone(&goal_turn_evaluation_requested)),
+            );
+            let tool_loop =
+                zeroclaw_runtime::control_plane::scope_goal_runtime(goal_runtime_scope, tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            // This future captures the full channel turn, provider dispatch,
+            // and scoped runtime contexts. Keep it off the test thread stack so
+            // nextest/Linux does not abort in provider-error recovery tests.
+            let tool_loop = Box::pin(tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
@@ -5592,6 +6628,7 @@ async fn process_channel_message_body(
         LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
         _ => "\u{26A0}\u{FE0F}",                                // ⚠️
     };
+    let mut goal_controller_next: Option<zeroclaw_api::channel::ChannelMessage> = None;
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
@@ -5655,7 +6692,7 @@ async fn process_channel_message_body(
                         {
                             let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                         }
-                        return;
+                        return ChannelProcessOutcome::Done;
                     }
                     zeroclaw_runtime::hooks::HookResult::Continue((
                         hook_channel,
@@ -5765,7 +6802,11 @@ async fn process_channel_message_body(
             // agent's resolved temperature through unchanged — `None`
             // means the provider sends no `temperature` field (necessary
             // for models that reject it, e.g. claude-opus-4-7).
-            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if should_consolidate_message_memory(
+                &msg.content,
+                ctx.auto_save_memory,
+                goal_controller_continuation,
+            ) {
                 let memory_strategy = Arc::clone(&ctx.memory_strategy);
                 let model_provider = Arc::clone(&ctx.model_provider);
                 let model = ctx.model.to_string();
@@ -5987,6 +7028,61 @@ async fn process_channel_message_body(
                     );
                 }
             }
+
+            if !cancellation_token.is_cancelled()
+                && goal_turn_evaluation_requested.load(Ordering::Acquire)
+                && let Some(goal_ctx) = goal_admission_context.as_ref()
+            {
+                let evaluation = zeroclaw_runtime::control_plane::scope_goal_state_updates(
+                    goal_state_update_scope.clone(),
+                    zeroclaw_runtime::control_plane::evaluate_goal_turn(
+                        goal_ctx,
+                        runtime_defaults.config.as_ref(),
+                        &delivered_response,
+                    ),
+                )
+                .await;
+                match evaluation {
+                    Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Completed {
+                        ..
+                    }))
+                    | Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Paused {
+                        ..
+                    })) => {}
+                    Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Continue {
+                        task_id,
+                        objective,
+                        ..
+                    })) => {
+                        goal_controller_next =
+                            Some(goal_continuation_message(&msg, &task_id, objective));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                            "channel-goal-controller-failed",
+                            &[("error", &error.to_string())],
+                        );
+                        if let Some(sink) = goal_state_update_scope.as_ref() {
+                            let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                                "channel-goal-state-update",
+                                &[("message", &error_text)],
+                            );
+                            sink.send(
+                                zeroclaw_runtime::control_plane::GoalStateUpdateEvent::Status(text),
+                            );
+                        } else {
+                            send_goal_controller_update(
+                                runtime_defaults.config.as_ref(),
+                                target_channel.as_ref(),
+                                &msg,
+                                &error_text,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e)
@@ -6195,6 +7291,11 @@ async fn process_channel_message_body(
         }
     }
 
+    drop(goal_state_update_scope);
+    if let Some(handle) = goal_state_update_task {
+        let _ = handle.await;
+    }
+
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
     // spawned ack add first so the remove can never race ahead of it.
     if resolve_channel_ack_reactions(&ctx, &msg)
@@ -6210,54 +7311,217 @@ async fn process_channel_message_body(
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
     }
+
+    match goal_controller_next {
+        Some(message) => ChannelProcessOutcome::Continue(Box::new(message)),
+        None => ChannelProcessOutcome::Done,
+    }
 }
 
-/// Shared worker body extracted so both the normal path and the debounce path
-/// can reuse the same in-flight tracking / cancellation / process logic.
-async fn dispatch_worker(
-    ctx: Arc<ChannelRuntimeContext>,
-    msg: zeroclaw_api::channel::ChannelMessage,
-    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
-    task_sequence: Arc<AtomicU64>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _permit = permit;
+async fn pre_register_in_flight_before_permit(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    task_sequence: &AtomicU64,
+) -> InFlightPreRegistration {
+    if msg.channel == "cli" || msg.passive_context {
+        return InFlightPreRegistration::NotNeeded;
+    }
+
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
-    let sender_scope_key = interruption_scope_key(&msg);
-    let cancellation_token = CancellationToken::new();
-    let completion = Arc::new(InFlightTaskCompletion::new());
-    let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+    let sender_scope_key = interruption_scope_key(msg);
+    let mut active = in_flight.lock().await;
+    let predecessor = active.get(&sender_scope_key).cloned();
+    let state = InFlightSenderTaskState {
+        task_id: task_sequence.fetch_add(1, Ordering::Relaxed),
+        cancellation: CancellationToken::new(),
+        completion: Arc::new(InFlightTaskCompletion::new()),
+        predecessor: predecessor.clone().map(Arc::new),
+    };
+    active.insert(sender_scope_key, state.clone());
+    let registration = InFlightRegistration::new(state);
 
-    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
-
-    if register_in_flight {
-        let previous = {
-            let mut active = in_flight.lock().await;
-            active.insert(
-                sender_scope_key.clone(),
-                InFlightSenderTaskState {
-                    task_id,
-                    cancellation: cancellation_token.clone(),
-                    completion: Arc::clone(&completion),
-                },
-            )
-        };
-
-        if interrupt_enabled && let Some(previous) = previous {
+    match predecessor {
+        Some(predecessor) if interrupt_enabled => {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "interrupting previous in-flight request for sender"
             );
-            previous.cancellation.cancel();
-            previous.completion.wait().await;
+            cancel_in_flight_chain(&predecessor);
+            InFlightPreRegistration::Queued {
+                registration,
+                predecessor,
+            }
+        }
+        Some(predecessor) => InFlightPreRegistration::Queued {
+            registration,
+            predecessor,
+        },
+        None => InFlightPreRegistration::Registered(registration),
+    }
+}
+
+async fn complete_pre_registered_in_flight(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    pre_registration: InFlightPreRegistration,
+) -> InFlightPreRegistration {
+    match pre_registration {
+        InFlightPreRegistration::Queued {
+            registration,
+            predecessor,
+        } => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                "waiting for previous in-flight request for sender"
+            );
+            // Same-sender ordering is intentional here: the queued request may
+            // proceed only when its predecessor completes or when this queued
+            // registration is cancelled. A local timeout would let a later
+            // message overtake a still-running predecessor; the channel-turn
+            // timeout belongs inside `process_channel_message`.
+            let cancellation = registration.state.cancellation.clone();
+            if !predecessor
+                .completion
+                .wait_released_or_cancelled(&cancellation)
+                .await
+            {
+                registration.mark_done();
+                return InFlightPreRegistration::Abandoned;
+            }
+            if registration.state.cancellation.is_cancelled() {
+                registration.mark_done();
+                return InFlightPreRegistration::Abandoned;
+            }
+            InFlightPreRegistration::Registered(registration)
+        }
+        other => other,
+    }
+}
+
+async fn unregister_pre_registered_in_flight(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    registration: InFlightRegistration,
+) {
+    let scope_key = interruption_scope_key(msg);
+    let mut active = in_flight.lock().await;
+    let state = &registration.state;
+    if active
+        .get(&scope_key)
+        .is_some_and(|active| active.task_id == state.task_id)
+    {
+        active.remove(&scope_key);
+    }
+    registration.mark_done();
+}
+
+async fn acquire_dispatch_permit_or_cancel(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    pre_registered: &mut Option<InFlightRegistration>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let cancellation = pre_registered
+        .as_ref()
+        .map(|registration| registration.state.cancellation.clone());
+
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    if let Some(state) = pre_registered.take() {
+                        unregister_pre_registered_in_flight(msg, in_flight, state).await;
+                    }
+                    None
+                }
+                permit = semaphore.acquire_owned() => match permit {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        if let Some(state) = pre_registered.take() {
+                            unregister_pre_registered_in_flight(msg, in_flight, state).await;
+                        }
+                        None
+                    }
+                },
+            }
+        }
+        None => semaphore.acquire_owned().await.ok(),
+    }
+}
+
+async fn dispatch_worker(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    task_sequence: Arc<AtomicU64>,
+    pre_registered: Option<InFlightRegistration>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+    let sender_scope_key = interruption_scope_key(&msg);
+    let registration = pre_registered.unwrap_or_else(|| {
+        InFlightRegistration::new(InFlightSenderTaskState {
+            task_id: task_sequence.fetch_add(1, Ordering::Relaxed),
+            cancellation: CancellationToken::new(),
+            completion: Arc::new(InFlightTaskCompletion::new()),
+            predecessor: None,
+        })
+    });
+    let InFlightRegistration {
+        state,
+        completion_guard,
+    } = registration;
+    let InFlightSenderTaskState {
+        task_id,
+        cancellation: cancellation_token,
+        predecessor: _,
+        ..
+    } = state;
+
+    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
+
+    let mut next_message = Some(msg);
+    let mut goal_continuations = 0usize;
+    while let Some(current_msg) = next_message {
+        if cancellation_token.is_cancelled() {
+            break;
+        }
+        // `process_channel_message` owns the full channel turn and tool-loop
+        // state machine. Keep that large future boxed at the worker boundary so
+        // dispatch tests and small-stack runtimes do not have to carry it
+        // inline inside every queued worker future.
+        let process = Box::pin(process_channel_message(
+            Arc::clone(&ctx),
+            current_msg,
+            cancellation_token.clone(),
+        ));
+        next_message = match process.await {
+            ChannelProcessOutcome::Done => None,
+            ChannelProcessOutcome::Continue(message) => Some(*message),
+        };
+        if next_message.is_some() {
+            goal_continuations = goal_continuations.saturating_add(1);
+            if goal_continuations >= GOAL_CONTROLLER_MAX_CONTINUATIONS_PER_MESSAGE {
+                if let Some(limit_msg) = next_message.take() {
+                    let pause_msg = goal_controller_limit_pause_message(&limit_msg);
+                    let process = Box::pin(process_channel_message(
+                        Arc::clone(&ctx),
+                        pause_msg,
+                        cancellation_token.clone(),
+                    ));
+                    let _ = process.await;
+                }
+                break;
+            }
         }
     }
-
-    process_channel_message(ctx, msg, cancellation_token).await;
 
     if register_in_flight {
         let mut active = in_flight.lock().await;
@@ -6269,7 +7533,7 @@ async fn dispatch_worker(
         }
     }
 
-    completion.mark_done();
+    completion_guard.mark_done();
 }
 
 #[derive(Clone)]
@@ -6453,7 +7717,7 @@ async fn run_message_dispatch_loop(
                 active.remove(&scope_key)
             };
             let reply = if let Some(state) = previous {
-                state.cancellation.cancel();
+                cancel_in_flight_chain(&state);
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
@@ -6480,7 +7744,9 @@ async fn run_message_dispatch_loop(
 
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" {
+        // Startup recovery prompts are trusted controller turns; debouncing
+        // them with a real user message would merge two different authorities.
+        let msg = if msg.channel != "cli" && !is_recovered_goal_continuation_message(&msg) {
             let debounce_key = conversation_history_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
@@ -6518,9 +7784,31 @@ async fn run_message_dispatch_loop(
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
-                        let permit = match debounce_semaphore.acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => return,
+                        let pre_registration = pre_register_in_flight_before_permit(
+                            debounce_ctx.as_ref(),
+                            &debounce_msg,
+                            debounce_in_flight.as_ref(),
+                            debounce_task_seq.as_ref(),
+                        )
+                        .await;
+                        let mut pre_registered = match complete_pre_registered_in_flight(
+                            &debounce_msg,
+                            pre_registration,
+                        )
+                        .await
+                        {
+                            InFlightPreRegistration::Abandoned => return,
+                            pre_registered => pre_registered.into_registered(),
+                        };
+
+                        let Some(permit) = acquire_dispatch_permit_or_cancel(
+                            &debounce_msg,
+                            debounce_in_flight.as_ref(),
+                            debounce_semaphore,
+                            &mut pre_registered,
+                        )
+                        .await else {
+                            return;
                         };
 
                         dispatch_worker(
@@ -6528,6 +7816,7 @@ async fn run_message_dispatch_loop(
                             debounce_msg,
                             debounce_in_flight,
                             debounce_task_seq,
+                            pre_registered,
                             permit,
                         )
                         .await;
@@ -6544,16 +7833,44 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
+        let worker_semaphore = Arc::clone(&semaphore);
+        let pre_registration = pre_register_in_flight_before_permit(
+            worker_ctx.as_ref(),
+            &msg,
+            in_flight.as_ref(),
+            task_sequence.as_ref(),
+        )
+        .await;
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            let mut pre_registered =
+                match complete_pre_registered_in_flight(&msg, pre_registration).await {
+                    InFlightPreRegistration::Abandoned => return,
+                    pre_registered => pre_registered.into_registered(),
+                };
+
+            let Some(permit) = acquire_dispatch_permit_or_cancel(
+                &msg,
+                in_flight.as_ref(),
+                worker_semaphore,
+                &mut pre_registered,
+            )
+            .await
+            else {
+                return;
+            };
+
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                task_sequence,
+                pre_registered,
+                permit,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -6563,6 +7880,356 @@ async fn run_message_dispatch_loop(
 
     while let Some(result) = workers.join_next().await {
         log_worker_join_result(result);
+    }
+}
+
+async fn enqueue_recovered_goal_continuations(
+    tx: &tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    agent_ctxs: &HashMap<String, Arc<ChannelRuntimeContext>>,
+) {
+    let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
+        return;
+    };
+    let recovered_goal_ids = control_plane.take_recovered_goal_ids();
+    if recovered_goal_ids.is_empty() {
+        return;
+    }
+
+    for task_id in recovered_goal_ids {
+        let task = match control_plane.store.get(&task_id).await {
+            Ok(Some(task))
+                if task.kind == zeroclaw_runtime::control_plane::TaskKind::Goal
+                    && task.status == zeroclaw_runtime::control_plane::TaskStatus::Running =>
+            {
+                task
+            }
+            Ok(Some(task)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                            "kind": format!("{:?}", task.kind),
+                            "status": format!("{:?}", task.status),
+                        })),
+                    "skipping recovered goal continuation for non-running task"
+                );
+                continue;
+            }
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"task_id": task_id})),
+                    "skipping recovered goal continuation for missing task"
+                );
+                continue;
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                            "error": format!("{error:#}"),
+                        })),
+                    "failed to read recovered goal task"
+                );
+                continue;
+            }
+        };
+
+        let Some(ctx) = agent_ctxs.get(&task.agent) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": task.id,
+                        "agent": task.agent,
+                    })),
+                "skipping recovered goal continuation for disabled or unknown agent"
+            );
+            pause_recovered_goal_continuation_blocked(
+                control_plane.goal_store.as_ref(),
+                &task,
+                RecoveredGoalContinuationBlocker::AgentUnavailable,
+                ::serde_json::json!({
+                    "agent": task.agent.as_str(),
+                }),
+            )
+            .await;
+            continue;
+        };
+
+        let context = match control_plane
+            .goal_store
+            .get_continuation_context(&task.id)
+            .await
+        {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"task_id": task.id})),
+                    "skipping recovered goal continuation without channel context"
+                );
+                pause_recovered_goal_continuation_blocked(
+                    control_plane.goal_store.as_ref(),
+                    &task,
+                    RecoveredGoalContinuationBlocker::MissingContinuationContext,
+                    ::serde_json::json!({}),
+                )
+                .await;
+                continue;
+            }
+            Err(error) => {
+                let error_text = format!("{error:#}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task.id,
+                            "error": error_text,
+                        })),
+                    "failed to read recovered goal continuation context"
+                );
+                pause_recovered_goal_continuation_blocked(
+                    control_plane.goal_store.as_ref(),
+                    &task,
+                    RecoveredGoalContinuationBlocker::ContinuationContextReadFailed,
+                    ::serde_json::json!({
+                        "error": error_text,
+                    }),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        let goal = match control_plane.goal_store.get_goal_task(&task.id).await {
+            Ok(Some(goal)) => goal,
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"task_id": task.id})),
+                    "skipping recovered goal continuation without goal extension"
+                );
+                pause_recovered_goal_continuation_blocked(
+                    control_plane.goal_store.as_ref(),
+                    &task,
+                    RecoveredGoalContinuationBlocker::MissingGoalExtension,
+                    ::serde_json::json!({}),
+                )
+                .await;
+                continue;
+            }
+            Err(error) => {
+                let error_text = format!("{error:#}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task.id,
+                            "error": error_text,
+                        })),
+                    "failed to read recovered goal extension"
+                );
+                pause_recovered_goal_continuation_blocked(
+                    control_plane.goal_store.as_ref(),
+                    &task,
+                    RecoveredGoalContinuationBlocker::GoalExtensionReadFailed,
+                    ::serde_json::json!({
+                        "error": error_text,
+                    }),
+                )
+                .await;
+                continue;
+            }
+        };
+        let objective = goal.objective.clone();
+        let msg = recovered_goal_continuation_message(&task.id, objective, context);
+        let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg).cloned() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": task.id,
+                        "channel": msg.channel,
+                        "channel_alias": msg.channel_alias,
+                    })),
+                "skipping recovered goal continuation for unavailable channel"
+            );
+            pause_recovered_goal_continuation_blocked(
+                control_plane.goal_store.as_ref(),
+                &task,
+                RecoveredGoalContinuationBlocker::ChannelUnavailable,
+                ::serde_json::json!({
+                    "channel": msg.channel,
+                    "channel_alias": msg.channel_alias,
+                }),
+            )
+            .await;
+            continue;
+        };
+
+        let status_context = msg.clone();
+
+        if let Err(error) = tx.send(msg).await {
+            let error_text = format!("{error}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": task.id,
+                        "error": error_text,
+                    })),
+                "failed to enqueue recovered goal continuation"
+            );
+            pause_recovered_goal_continuation_blocked(
+                control_plane.goal_store.as_ref(),
+                &task,
+                RecoveredGoalContinuationBlocker::QueueUnavailable,
+                ::serde_json::json!({
+                    "error": error_text,
+                }),
+            )
+            .await;
+            continue;
+        }
+
+        let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+        let recovery_message = zeroclaw_runtime::control_plane::goal_recovery_status_message(
+            &goal,
+            Some(runtime_defaults.config.as_ref()),
+        );
+        send_goal_controller_update(
+            runtime_defaults.config.as_ref(),
+            Some(&channel),
+            &status_context,
+            &recovery_message,
+        )
+        .await;
+    }
+}
+
+/// Controller-owned reason a recovered goal could not be re-enqueued.
+///
+/// The enum keeps restart-recovery policy on stable machine codes while the
+/// persisted human-readable blocker message is produced through Fluent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredGoalContinuationBlocker {
+    /// Goal owner no longer resolves to an enabled agent runtime.
+    AgentUnavailable,
+    /// Durable goal row has no continuation delivery context.
+    MissingContinuationContext,
+    /// Continuation context could not be read from the goal store.
+    ContinuationContextReadFailed,
+    /// Durable task row has no goal-specific extension record.
+    MissingGoalExtension,
+    /// Goal-specific extension could not be read from the goal store.
+    GoalExtensionReadFailed,
+    /// The channel referenced by the continuation context is unavailable.
+    ChannelUnavailable,
+    /// The channel worker queue rejected the recovered continuation.
+    QueueUnavailable,
+}
+
+impl RecoveredGoalContinuationBlocker {
+    fn code(self) -> &'static str {
+        match self {
+            Self::AgentUnavailable => "agent_unavailable",
+            Self::MissingContinuationContext => "missing_continuation_context",
+            Self::ContinuationContextReadFailed => "continuation_context_read_failed",
+            Self::MissingGoalExtension => "missing_goal_extension",
+            Self::GoalExtensionReadFailed => "goal_extension_read_failed",
+            Self::ChannelUnavailable => "channel_unavailable",
+            Self::QueueUnavailable => "queue_unavailable",
+        }
+    }
+
+    fn reason_key(self) -> &'static str {
+        match self {
+            Self::AgentUnavailable => "goal-command-restart-recovery-reason-agent-unavailable",
+            Self::MissingContinuationContext => {
+                "goal-command-restart-recovery-reason-missing-continuation"
+            }
+            Self::ContinuationContextReadFailed => {
+                "goal-command-restart-recovery-reason-read-continuation-failed"
+            }
+            Self::MissingGoalExtension => {
+                "goal-command-restart-recovery-reason-missing-goal-extension"
+            }
+            Self::GoalExtensionReadFailed => {
+                "goal-command-restart-recovery-reason-read-goal-extension-failed"
+            }
+            Self::ChannelUnavailable => "goal-command-restart-recovery-reason-channel-unavailable",
+            Self::QueueUnavailable => "goal-command-restart-recovery-reason-queue-unavailable",
+        }
+    }
+
+    fn localized_reason(self) -> String {
+        zeroclaw_runtime::i18n::get_required_cli_string(self.reason_key())
+    }
+}
+
+fn recovered_goal_continuation_blocked_pause(
+    blocker: RecoveredGoalContinuationBlocker,
+    mut payload: serde_json::Value,
+) -> zeroclaw_runtime::control_plane::GoalPauseState {
+    if let Some(payload) = payload.as_object_mut() {
+        payload.insert(
+            "reason_code".into(),
+            serde_json::Value::String(blocker.code().into()),
+        );
+    }
+    let reason = blocker.localized_reason();
+    zeroclaw_runtime::control_plane::GoalPauseState {
+        reason: zeroclaw_runtime::control_plane::GoalPauseReason::DaemonRestart,
+        description: Some(zeroclaw_runtime::i18n::get_required_cli_string(
+            "goal-command-restart-recovery-paused-description",
+        )),
+        blockers: vec![zeroclaw_runtime::control_plane::GoalBlocker {
+            kind: zeroclaw_runtime::control_plane::GoalBlockerKind::RestartRecovery,
+            message: zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "goal-command-restart-recovery-blocker",
+                &[("reason", &reason)],
+            ),
+            payload: Some(payload),
+        }],
+    }
+}
+
+async fn pause_recovered_goal_continuation_blocked(
+    goal_store: &dyn zeroclaw_runtime::control_plane::GoalTaskRegistry,
+    task: &zeroclaw_runtime::control_plane::TaskRecord,
+    blocker: RecoveredGoalContinuationBlocker,
+    payload: serde_json::Value,
+) {
+    let pause = recovered_goal_continuation_blocked_pause(blocker, payload);
+    if let Err(error) = goal_store.pause_goal_task(&task.id, pause).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "task_id": task.id,
+                    "reason_code": blocker.code(),
+                    "error": format!("{error:#}"),
+                })),
+            "failed to pause recovered goal after continuation blocker"
+        );
     }
 }
 
@@ -9749,6 +11416,8 @@ pub async fn start_channels(
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
         None;
+    let mut tx_holder: Option<tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>> =
+        None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
@@ -9847,6 +11516,7 @@ pub async fn start_channels(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
+            tools::GoalAdmissionToolPolicy::Include,
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -10332,6 +12002,7 @@ pub async fn start_channels(
                     cancel.clone(),
                 ));
             }
+            tx_holder = Some(tx.clone());
             drop(tx);
 
             // Composite-key registry (see `composite_channel_key`).
@@ -10456,6 +12127,7 @@ pub async fn start_channels(
                 config.cost.clone(),
                 &config.data_dir,
             )
+            .filter(|tracker| tracker.is_enabled())
             .map(|tracker| {
                 let by_type =
                     zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config);
@@ -10573,6 +12245,11 @@ pub async fn start_channels(
                 "closed orphaned session turns from previous crash"
             );
         }
+    }
+
+    if let Some(tx) = tx_holder.take() {
+        enqueue_recovered_goal_continuations(&tx, &agent_ctxs).await;
+        drop(tx);
     }
 
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
