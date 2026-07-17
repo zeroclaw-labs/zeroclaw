@@ -88,14 +88,13 @@ A manifest declares two separate things, and the distinction matters.
   HTTP egress, configuration, memory. A permission the manifest does not declare
   is a host function the plugin cannot reach.
 
-The host grants permissions narrowly: a permission the manifest does not declare
-is a host function the plugin cannot reach. The HTTP-egress and per-plugin
-configuration boundaries (SSRF-guarded egress that cannot reach loopback,
-private, link-local, or cloud-metadata addresses or redirect into one; config
-injected per-alias so a plugin reads only its own resolved values and never the
-raw process environment or another plugin's secrets) are delivered by the
-companion plugin-hardening work and are documented alongside those changes. This
-page covers the signature-policy boundary.
+The host grants permissions narrowly: a permission the manifest does not
+declare is a host function the plugin cannot reach. Config is resolved from a
+host-issued instance identity, so a plugin cannot select another package or
+binding and never reads the raw process environment. `http_client` gates the
+outbound `wasi:http` surface; the shared SSRF-guarded egress policy remains
+companion plugin-hardening work. This page covers the signature-policy
+boundary.
 
 ## Configuration reference
 
@@ -129,9 +128,12 @@ Even with every permission granted, the sandbox bounds a plugin:
   the filesystem outside its rooted workspace. Network egress is gated by the
   HTTP permission; the SSRF-guarded egress boundary itself is delivered by the
   companion plugin-hardening work.
-- Secret-value isolation at the egress boundary (the host injecting credentials
-  so the plugin learns only that a secret exists, never its value) is part of
-  that same companion work; this PR does not add it.
+- A trusted tool plugin can read a schema-designated secret's plaintext through
+  its scoped `secrets.get` import while the host dispatches `execute`. The host
+  prevents public config injection and cross-instance selection; it does not
+  provide stronger egress-boundary credential injection where guest code never
+  learns the value. Channel manifests cannot use `x-secret` until the host has
+  a coherent warm-store secret lifecycle.
 - It cannot displace a built-in tool: the built-ins register first and tool
   dispatch resolves names first-match, so a colliding plugin tool is simply
   never selected.

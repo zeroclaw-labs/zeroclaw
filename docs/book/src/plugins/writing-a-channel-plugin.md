@@ -35,11 +35,15 @@ ways, and each drives a design decision in your code:
 2. **Configuration arrives before anything else.** The host calls your
    `configure` export exactly once, at load, before any other call. The
    argument is the typed JSON object materialized and validated against your
-   manifest's `config_schema`, with secrets already decrypted. If the requested
-   `config_read` grant is denied, the host validates `{}` instead; an optional
+   manifest's `config_schema`, including credential fields the schema treats
+   as ordinary strings. If the requested `config_read` grant is denied, the
+   host validates `{}` instead; an optional
    schema receives that object, while required fields make construction fail
    before guest code runs. Deserialize the object into a typed config struct
-   and store it in your component's state.
+   and store it in your component's state. The channel world does not import
+   the scoped secret service yet, so admission rejects channel-capable
+   manifests containing `x-secret` until the host has a coherent warm-store
+   secret lifecycle.
 3. **You do not listen; the host feeds you.** The WASI context has no network
    listener capability. Inbound traffic reaches you through the imported
    `inbound` interface: the host runs the actual listener (webhook server,
@@ -281,6 +285,13 @@ package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
 isolated.
 
+> **Credential limitation.** Do not add `x-secret` to this channel schema.
+> The current channel world has no `secrets` import, and admission rejects any
+> channel-capable manifest containing that marker. Credentials therefore arrive
+> in the one typed `configure` object and remain in warm guest state. A channel
+> migration that requires scoped reads or rotation must remain built in until a
+> coherent warm-store secret lifecycle lands.
+
 ## Build and install
 
 {{#include ../_snippets/plugin-build-component.md}}
@@ -305,12 +316,12 @@ cargo add --dev zeroclaw-plugins \
   --no-default-features --features plugins-wasm-cranelift
 ```
 
-The test then loads your built component through `WasmChannel::from_wasm` with
-a `PluginConfigResolver` backed by the manifest and test operator values,
-enqueues onto the `InboundQueue` handle it exposes, and asserts your
-`poll-message` drains and translates the message. That is the same code path a
-production daemon will run; passing it is the strongest pre-distribution signal
-you can get without a live host.
+The test then wraps a `PluginConfigResolver::new` backed by the manifest and
+test operator values in `PluginHostServices`, loads your component through
+`WasmChannel::from_wasm`, enqueues onto the `InboundQueue` handle it exposes,
+and asserts your `poll-message` drains and translates the message. That is the
+same code path a production daemon will run; passing it is the strongest
+pre-distribution signal you can get without a live host.
 
 ## Next
 

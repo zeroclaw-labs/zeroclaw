@@ -6,6 +6,8 @@
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_secrets;
 pub mod config;
 pub mod endpoint;
 pub mod error;
@@ -14,6 +16,8 @@ pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod services;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
@@ -48,6 +52,9 @@ pub struct PluginManifest {
     pub permissions: Vec<PluginPermission>,
     /// Draft 2020-12 JSON Schema for this plugin's private config object.
     /// Required exactly when `config_read` is requested.
+    /// For tool-only execution, direct top-level string properties marked
+    /// `x-secret: true` are withheld from public config and served only through
+    /// the scoped secrets import during `execute`.
     #[serde(default)]
     pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).

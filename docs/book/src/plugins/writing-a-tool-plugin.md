@@ -44,10 +44,11 @@ Understand the runtime shape before writing code:
    `name`, `description`, and `parameters-schema`. These are cached; they are
    never re-asked. If that probe fails, registration fails; the host never
    substitutes synthetic metadata for a broken component.
-3. Per call, `WasmTool::execute` resolves and validates config from canonical
-   state, creates a **fresh store** (new WASI context, new fuel budget, no state
-   from the previous call), instantiates the component, injects the typed object
-   under `__config`, and invokes `execute`.
+3. Per call, `WasmTool::execute` prevalidates live config, creates a **fresh
+   store** (new WASI context, new fuel budget, no state from the previous call),
+   and instantiates the component. The execution frame resolves the complete
+   config once, injects only non-secret values under `__config`, serves marked
+   secrets through the scoped `secrets` import, and invokes `execute`.
 
 The fresh-store-per-call model is the design constraint that matters most:
 a tool plugin is stateless by construction. Anything you want to persist
@@ -99,13 +100,13 @@ pub fn redact(input: &str, cfg: &RedactConfig) -> (String, usize) {
 }
 ```
 
-The guest receives the schema-materialized JSON object, so deserialize it once
-instead of repeating string parsing. This example's schema makes every field
-optional, and `Default` owns their behavior when the host supplies `{}`. An
-empty object is normal when the operator has not configured the plugin or when
-the host denies the requested `config_read` grant. If a plugin cannot operate
-without a value, mark it required in `config_schema`; the host will then reject
-an empty object before guest code starts.
+The guest receives the schema-materialized public JSON object, so deserialize
+it once instead of repeating string parsing. This example's schema makes every
+field optional, and `Default` owns their behavior when the host supplies `{}`.
+An empty object is normal when the operator has not configured the plugin or
+when the host denies the requested `config_read` grant. If a plugin cannot
+operate without a value, mark it required in `config_schema`; the host will
+then reject an empty object before guest code starts.
 
 ## 3. Implement the world
 
@@ -114,6 +115,7 @@ an empty object before guest code starts.
 ```wit
 world tool-plugin {
     import logging;
+    import secrets;
     export plugin-info;
     export tool;
 }
@@ -276,8 +278,9 @@ resolve to `string`, `boolean`, `integer`, `number`, `array`, or `object`.
 
 The host resolves the section stored under the versioned config-entry key
 derived from this instance's package, `tool` capability, and binding,
-materializes it according to the package schema, validates the typed object,
-and only then merges it into `execute` under the reserved `__config` key:
+materializes it according to the package schema, validates the complete typed
+object, and partitions it. Only non-secret properties are merged into `execute`
+under the reserved `__config` key:
 
 - Any `__config` already present in the model-supplied arguments is deleted
   first. Spoofing is structurally impossible.
@@ -285,6 +288,14 @@ and only then merges it into `execute` under the reserved `__config` key:
   encode booleans and numbers as JSON scalars (`"true"`, `"4"`, `"0.5"`) and
   arrays and objects as JSON (`'["secret-a","secret-b"]'`). The guest receives
   real JSON booleans, numbers, arrays, and objects, not those storage strings.
+- A direct top-level string property marked `x-secret = true` is excluded from
+  `__config`. Read it explicitly with the generated
+  `zeroclaw::plugin::secrets::get` function. Nested markers, false/non-boolean
+  markers, and secret non-string properties fail manifest admission.
+- The host enables secret reads only while dispatching `execute`. Calls from
+  component initialization or metadata exports return `unavailable` without
+  resolving config. Public `__config` and secret reads during one execution use
+  the same resolved config view.
 - If `config_read` was requested but not effectively granted, the host resolves
   `{}` and validates it. This example's optional schema therefore causes the
   tool to omit `__config` and `#[serde(default)]` selects `RedactConfig::default`.
@@ -344,8 +355,20 @@ or missing value will then prevent the component from starting.
 
 Arguably the most common real-world tool shape is not a pure transform like
 `redact` but a bridge to an external API: declare `http_client` in the
-manifest, read credentials from `__config`, make an outbound request. The
-missing piece relative to this guide is an HTTP client that works inside a
+manifest, read credentials through the scoped secret service, and make an
+outbound request. Mark the credential in the signed schema:
+
+```toml
+[config_schema]
+required = ["api_key"]
+
+[config_schema.properties.api_key]
+type = "string"
+minLength = 1
+x-secret = true
+```
+
+The missing piece relative to this guide is an HTTP client that works inside a
 component: `reqwest` and friends do not, because there is no socket surface,
 only `wasi:http`. A client known to work against this host is
 [`waki`](https://crates.io/crates/waki), which is blocking and therefore fits
@@ -356,9 +379,11 @@ target so your pure-logic modules stay natively testable:
 cargo add waki --target 'cfg(target_family = "wasm")'
 ```
 
-The shape of a call, inside `execute` after parsing `__config`:
+The shape of a call, inside `execute` after parsing public `__config`:
 
 ```rust
+let api_key = zeroclaw::plugin::secrets::get("api_key")
+    .map_err(|_| "api_key is unavailable".to_string())?;
 let resp = waki::Client::new()
     .get("https://api.example.com/search")
     .query([("q", term.as_str())])
@@ -441,7 +466,9 @@ Two operational constraints worth repeating from the
 | Plugin missing from `zeroclaw plugin list` | Plugin system disabled; malformed manifest; `wasm_path` file missing; signature policy rejected it. The startup log carries the specific skip warning. |
 | Tool rejected during registration | Config validation or the metadata probe failed. Check the log for the specific error; a probe failure usually means the component was built against mismatched WIT. |
 | Tool never selected by the model | Name collides with a built-in, or the description/schema do not tell the model when the tool applies. |
-| `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, or the validated object is empty. A `config_schema`/permission mismatch rejects the plugin instead. |
+| `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, or every validated property is marked secret. A `config_schema`/permission mismatch rejects the plugin instead. |
+| `secrets.get` returns `not-found` | The property is missing or is not a direct top-level string marked `x-secret = true` in the admitted schema. |
+| `secrets.get` returns `unavailable` | The call ran outside `execute`, config resolution failed, or the execution exhausted its fixed host-call budget. |
 | Call traps | Fuel or memory ceiling hit. Raise `plugins.limits.call_fuel` / `plugins.limits.max_memory_mb`, or do less per call. |
 | Load fails on a runtime-only host | You shipped `.wasm` to a host with no JIT; ship a version-matched `.cwasm` instead. |
 

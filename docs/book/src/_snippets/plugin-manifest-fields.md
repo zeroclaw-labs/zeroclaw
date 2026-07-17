@@ -12,7 +12,7 @@ fields are the serde surface of `PluginManifest` in
 | `wasm_path` | for WASM capabilities | Component file name, relative to the plugin directory. Required unless the only capability is `skill`. Discovery skips the plugin if the named file does not exist. |
 | `capabilities` | yes, non-empty | What the plugin is: any of `tool`, `channel`, `memory`, `observer`, `skill` (`PluginCapability`, serialized snake_case). |
 | `permissions` | no | Host services the code may reach: `http_client`, `config_read`, `file_read`, `file_write`, `memory_read`, `memory_write` (`PluginPermission`). Only the first two are enforced today; the rest are accepted but inert. Declaring `config_read` requires `config_schema`, and only tool/channel adapters currently deliver it. |
-| `config_schema` | exactly with `config_read` | Draft 2020-12 JSON Schema for this plugin's private config; it is included in the canonical manifest bytes and therefore covered when the manifest is signed. The root must be an object with a `properties` map and `additionalProperties = false`. Every top-level property must have one explicit supported type, directly or through a local JSON Pointer: `string`, `boolean`, `integer`, `number`, `array`, or `object`. A schema without `config_read`, or `config_read` without a schema, is rejected. |
+| `config_schema` | exactly with `config_read` | Draft 2020-12 JSON Schema for this plugin's private config; it is included in the canonical manifest bytes and therefore covered when the manifest is signed. The root must be an object with a `properties` map and `additionalProperties = false`. Every top-level property must have one explicit supported type, directly or through a local JSON Pointer: `string`, `boolean`, `integer`, `number`, `array`, or `object`. A manifest that includes `tool` and excludes `channel` may set `x-secret = true` directly on a top-level string property to remove it from public config and expose it through the scoped `secrets.get` host import during `execute`. Nested, false, or non-boolean secret markers and secret non-string properties are rejected. A manifest with the `channel` capability and any `x-secret` property is also rejected until the host has a coherent warm-store secret lifecycle. A schema without `config_read`, or `config_read` without a schema, is rejected. |
 | `signature` | no | Base64url Ed25519 signature over the canonical manifest bytes. Set when signing for distribution. |
 | `publisher_key` | no | Hex-encoded Ed25519 public key of the signer. |
 
@@ -26,7 +26,11 @@ package, capability, and binding identity (installation prints and seeds the
 package-name tool key): strings are stored as-is, booleans and numbers use JSON
 scalar text, and arrays and objects use JSON text. Before any guest code runs,
 the host materializes those strings to the package schema's types and validates
-the resulting object for tool and channel adapters. If `config_read` was
-requested but not effectively granted, the plugin receives an empty object;
+the complete object for tool and channel adapters. For a tool, non-secret
+properties form `__config`, while a property marked `x-secret = true` is
+available only through `secrets.get("property")` during that instance's
+`execute` frame. A channel receives its validated object through `configure`;
+channel manifests cannot currently use `x-secret`. If `config_read` was
+requested but not effectively granted, the host validates an empty object;
 therefore a schema with required properties fails closed instead of starting
-without its required configuration.
+without required configuration.

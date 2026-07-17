@@ -81,13 +81,15 @@ The manifest declares two orthogonal things:
   install machinery, not code, and needs no component.
 - **Permissions**: what host services the plugin's code may *reach*. The
   `PluginPermission` enum in the same file. Today `config_read` (tool and
-  channel adapters receive their own schema-materialized, validated config) and
+  channel adapters receive their own schema-materialized, validated config, and
+  tools can resolve schema-designated secrets during `execute`) and
   `http_client` have behavioral effect. The HTTP permission is the necessary
   grant for adapters that implement outbound `wasi:http`: tool and channel
-  enable that surface, while memory intentionally does not yet. `config_read`
-  must be paired with the manifest's `config_schema`; either one without the
-  other is rejected. The filesystem and memory-access permissions are accepted
-  by the schema but not yet backed by host functions, so declaring them grants
+  enable that surface, while memory intentionally does not yet.
+  `config_read` must be paired with the manifest's `config_schema`; either one
+  without the other is rejected. Channel-capable manifests cannot use
+  `x-secret` yet. The filesystem and memory-access permissions are accepted by
+  the schema but not yet backed by host functions, so declaring them grants
   nothing.
 
 ## The worlds
@@ -100,8 +102,8 @@ version) plus its primary interface:
 
 | World | Exports | Store lifecycle |
 |-------|---------|-----------------|
-| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; nothing persists between calls |
-| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; also imports `inbound` |
+| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` |
+| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports `inbound` |
 | `memory-plugin` | `memory`: store, recall, get, forget, plus {{#include ../_snippets/plugin-memory-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call |
 
 The channel and memory worlds use **capability flags**: a bitmask the host
@@ -121,16 +123,17 @@ a precompiled `.cwasm`. Each plugin instantiation gets:
 - a `Store` carrying the sandboxed WASI context, the resource table, the
   optional HTTP context, and the fuel budget;
 - a `Linker` with exactly the imports its world, grants, and adapter support call
-  for: `logging` always, `inbound` for channels, and `wasi:http` for tool and
-  channel adapters only when the manifest grants `http_client`. Memory creates
-  neither an HTTP context nor an HTTP linker. Each adapter cross-checks its
-  context and linker at instantiation (`ensure_http_coherent`).
+  for: `logging` always, `secrets` for tools, `inbound` for channels, and
+  `wasi:http` for tool and channel adapters only when the manifest grants
+  `http_client`. Memory creates neither an HTTP context nor an HTTP linker. Each
+  adapter cross-checks its context and linker at instantiation
+  (`ensure_http_coherent`).
 
 Tool calls are stateless by construction: `WasmTool::execute` builds a fresh
-store, runs the call, and drops it. Channels and memory backends are stateful
-by nature, so they hold one warm store for the plugin's lifetime; the host
-refuels it before every call so a long-lived plugin gets a full budget per
-call rather than draining over time.
+store, runs the call, and drops it. Channels and memory backends are stateful by
+nature, so they hold one warm store for the plugin's lifetime; the host refuels
+it before every call so a long-lived plugin gets a full budget per call rather
+than draining over time.
 
 The boundary is 32-bit: `wasm32-wasip2` is the only WASI Preview 2 target the
 Rust toolchain ships, and the component ABI lowers offsets as 32-bit
@@ -190,20 +193,29 @@ remain encrypted at rest (`enc2:…`). A plugin that requests `config_read`
 declares the map's single type contract in `config_schema`: a closed Draft
 2020-12 object whose
 top-level properties explicitly use `string`, `boolean`, `integer`, `number`,
-`array`, or `object`. Store strings directly, JSON scalar text for booleans and
-numbers, and JSON text for arrays and objects. The host materializes and
-validates the resulting typed object before instantiating tool or channel guest
-code; unknown, malformed, or out-of-range values fail instead of reaching the
-plugin. Memory plugins do not yet have a config export and must not request
-`config_read` until that ABI is added.
+`array`, or `object`. A manifest that includes `tool` and excludes `channel`
+may set `x-secret = true` on a top-level string property; the host validates it
+with the full object, removes it from `__config`, and makes it available only
+through the admitted instance's `secrets.get` import during `execute`. A
+manifest that declares the `channel` capability cannot use `x-secret` until
+the host has a coherent warm-store secret lifecycle. Store strings directly,
+JSON scalar text for booleans and numbers, and JSON text for arrays and
+objects. The host
+materializes and validates the resulting typed object before using tool or
+channel guest code; unknown, malformed, or out-of-range values fail instead of
+reaching the plugin. Memory plugins do not yet have a config export and must
+not request `config_read` until that ABI is added.
 
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
 schema matching the current values, update tool/channel guests to deserialize
 typed JSON rather than a string map, rebuild, and re-sign because the schema is
-signature-covered. Host integrations now inject `PluginConfigResolver` instead
-of an owned config map and pass only `ResolvedPluginConfig` to low-level guest
-calls.
+signature-covered. Host integrations inject `PluginHostServices`, which wraps
+a `PluginConfigResolver`, instead of an owned config map. Each tool `execute`
+frame materializes one scope-bound `ResolvedPluginConfig`, uses that one view
+for public config and secret reads, and drops it when the frame ends. Channels
+receive their validated typed object once through `configure`; their manifests
+cannot currently contain `x-secret`.
 
 This is a strict pre-1.0 key format: legacy entries named only after a package
 or binding are not consulted. For an existing tool package, run `zeroclaw

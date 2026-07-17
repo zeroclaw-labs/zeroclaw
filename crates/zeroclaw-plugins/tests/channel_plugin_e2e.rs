@@ -18,6 +18,7 @@ use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
 use zeroclaw_plugins::instance::PluginInstanceScope;
+use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
@@ -96,8 +97,9 @@ async fn channel(binding: &str) -> WasmChannel {
     let config = PluginConfigResolver::new(move |scope| {
         resolve_plugin_config(&manifest, scope, Some(&configured))
     });
+    let services = PluginHostServices::new(config);
 
-    WasmChannel::from_wasm(endpoint, &fixture(), &config, limits())
+    WasmChannel::from_wasm(endpoint, &fixture(), &services, limits())
         .await
         .expect("instantiate fixture channel")
 }
