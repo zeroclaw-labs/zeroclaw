@@ -106,6 +106,7 @@ pub mod error_codes {
     pub const SESSION_NOT_OWNED: i32 = -32003;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
+    pub const FORBIDDEN: i32 = -32012;
 
     // SOP authoring
     pub const SOP_ALREADY_EXISTS: i32 = -32020;

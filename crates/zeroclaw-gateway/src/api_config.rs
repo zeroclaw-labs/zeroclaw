@@ -24,7 +24,7 @@ use zeroclaw_config::sections::section_for_path;
 use zeroclaw_config::traits::MaskSecrets;
 
 use super::AppState;
-use super::api::require_auth;
+use crate::api::require_auth;
 
 // ── Request / response shapes ───────────────────────────────────────
 
@@ -114,11 +114,7 @@ pub struct PatchResponse {
 /// dashboard pages. New clients should prefer the per-property API, but
 /// returning a masked snapshot here avoids a hard 405 when an older page is
 /// served by a newer gateway.
-pub async fn handle_config_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_config_get(State(state): State<AppState>) -> Response {
     let mut cfg = state.config.read().clone();
     cfg.mask_secrets();
     Json(cfg).into_response()
@@ -699,13 +695,8 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 /// are deliberately withheld per the secrets-handling boundary.
 pub async fn handle_prop_get(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<PropQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let config = state.config.read().clone();
     let info = match lookup_prop_field(&config, &q.path) {
         Some(info) => info,
@@ -746,13 +737,8 @@ pub async fn handle_prop_get(
 /// only `{path, populated: true}` — never echoes the value back.
 pub async fn handle_prop_put(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::Json(body): axum::Json<PropPutBody>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let mut new_config = state.config.read().clone();
     if new_config.ensure_map_key_for_path(&body.path) {
         // Refused to vivify the reserved `default` agent: surface the same
@@ -853,13 +839,8 @@ pub async fn handle_prop_put(
 /// (re-deriving the field's literal default) is a refinement for a later step.
 pub async fn handle_prop_delete(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<PropQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let mut new_config = state.config.read().clone();
     let info = match lookup_prop_field(&new_config, &q.path) {
         Some(info) => info,
@@ -902,15 +883,7 @@ pub async fn handle_prop_delete(
 /// Enumerates every property the schema exposes. Secret entries appear as
 /// `{path, populated}` with `value: None`; non-secrets carry the display
 /// value. Optional `prefix` query filters entries whose path starts with it.
-pub async fn handle_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<ListQuery>,
-) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_list(State(state): State<AppState>, Query(q): Query<ListQuery>) -> Response {
     let config = state.config.read().clone();
     let prefix = q.prefix.as_deref();
 
@@ -967,10 +940,7 @@ pub struct DriftResponse {
 
 /// `GET /api/config/drift` — explicit drift summary for clients that want just
 /// the diff. Same `DriftEntry` shape used in `ListResponse.drifted`.
-pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_drift(State(state): State<AppState>) -> Response {
     let config = state.config.read().clone();
     let drifted = compute_drift(&config).await;
     axum::Json(DriftResponse { drifted }).into_response()
@@ -989,10 +959,7 @@ pub struct ReloadStatusResponse {
 
 /// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
 /// reload banner. Goes true on any config write, false on `/admin/reload`.
-pub async fn handle_reload_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_reload_status(State(state): State<AppState>) -> Response {
     let pending_reload = state
         .pending_reload
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1049,10 +1016,7 @@ pub struct TemplateEntry {
 /// truth, no hand-maintained list. Adding a new `HashMap<String, T>` or
 /// `#[nested] Vec<T>` field anywhere in the schema makes it appear here
 /// automatically.
-pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_templates(State(state): State<AppState>) -> Response {
     let _ = state; // templates are static per build, but auth-gated for consistency
 
     let templates: Vec<TemplateEntry> = zeroclaw_config::schema::Config::map_key_sections()
@@ -1088,12 +1052,8 @@ pub struct AliasSourceQuery {
 /// config via the shared `Config::resolve_alias_source`.
 pub async fn handle_resolve_alias_source(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<AliasSourceQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
     let values = cfg.resolve_alias_source(q.source);
     axum::Json(serde_json::json!({ "source": q.source, "values": values })).into_response()
@@ -1103,12 +1063,8 @@ pub async fn handle_resolve_alias_source(
 /// a map-keyed section path, e.g. `channels.discord` → `["default","work"]`.
 pub async fn handle_get_map_keys(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<MapPathQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
     match cfg.get_map_keys(&q.path) {
         Some(keys) => {
@@ -1130,12 +1086,8 @@ pub async fn handle_get_map_keys(
 /// non-aliased sections keep the generic raw key removal. Persists on success.
 pub async fn handle_delete_map_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let working = state.config.read().clone();
     match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
@@ -1397,13 +1349,8 @@ async fn delete_config_cascade(
 /// addable here automatically.
 pub async fn handle_map_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let mut working = state.config.read().clone();
     let path = q.path.clone();
     let key = q.key.clone();
@@ -1510,12 +1457,8 @@ pub struct DeletePlanResponse {
 /// cascade for an aliased entry. Read-only; never mutates.
 pub async fn handle_delete_plan(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let config = state.config.read().clone();
     let to_dto = |s: &zeroclaw_config::alias_refs::RefSite| RefSiteDto {
         path: s.path.clone(),
@@ -1676,13 +1619,8 @@ fn delete_error_response(
 /// keep the generic key-swap behaviour.
 pub async fn handle_rename_map_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::Json(body): axum::Json<RenameMapKeyBody>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let working = state.config.read().clone();
 
     match zeroclaw_config::alias_refs::alias_kind_for_map_path(&body.path) {
@@ -2095,10 +2033,6 @@ pub async fn handle_patch(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let ops = match parse_patch_ops(body) {
         Ok(ops) => ops,
         Err(e) => return error_response(e),
@@ -2408,15 +2342,7 @@ pub struct InitResponse {
 /// POST /api/config/init?section=model_providers — instantiate `None` nested
 /// sections with defaults. Mirrors `zeroclaw config init`. When every
 /// requested section is already configured, returns `{initialized: []}`.
-pub async fn handle_init(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<InitQuery>,
-) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_init(State(state): State<AppState>, Query(q): Query<InitQuery>) -> Response {
     let mut working = state.config.read().clone();
     let initialized: Vec<String> = working
         .init_defaults(q.section.as_deref())
@@ -2458,11 +2384,7 @@ pub struct MigrateResponse {
 /// up the previous content alongside the original (`config.toml.bak`)
 /// before writing the migrated form. Returns `{migrated: false}` when the
 /// config is already at the current schema version.
-pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_migrate(State(state): State<AppState>) -> Response {
     let config_path = state.config.read().config_path.clone();
 
     let raw = match tokio::fs::read_to_string(&config_path).await {
@@ -2922,7 +2844,6 @@ mod tests {
         let (status, json) = response_json(
             handle_delete_map_key(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
                 axum::extract::Query(MapKeyQuery {
                     path: "providers.models.anthropic".to_string(),
                     key: "default".to_string(),
@@ -2973,7 +2894,6 @@ mod tests {
         let (status, json) = response_json(
             handle_delete_map_key(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
                 axum::extract::Query(MapKeyQuery {
                     path: "providers.models.anthropic".to_string(),
                     key: "default".to_string(),
@@ -3015,7 +2935,6 @@ mod tests {
         let (status, json) = response_json(
             handle_delete_map_key(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
                 axum::extract::Query(MapKeyQuery {
                     path: "channels.discord".to_string(),
                     key: "main".to_string(),
@@ -3061,7 +2980,6 @@ mod tests {
         let (status, json) = response_json(
             handle_delete_plan(
                 axum::extract::State(state),
-                axum::http::HeaderMap::new(),
                 axum::extract::Query(MapKeyQuery {
                     path: "providers.tts.elevenlabs".to_string(),
                     key: "default".to_string(),
@@ -3089,7 +3007,6 @@ mod tests {
         let (status, json) = response_json(
             handle_delete_map_key(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
                 axum::extract::Query(MapKeyQuery {
                     path: "providers.tts.elevenlabs".to_string(),
                     key: "default".to_string(),

@@ -80,11 +80,13 @@ pub struct LocalTransport {
     reader: BufReader<LocalReadHalf>,
     writer_tx: mpsc::Sender<String>,
     peer_label: String,
+    peer_uid: Option<u32>,
 }
 
 impl LocalTransport {
     pub fn new(stream: LocalStream) -> Self {
         let peer_label = platform::peer_label_from(&stream);
+        let peer_uid = platform::peer_uid_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
@@ -104,6 +106,7 @@ impl LocalTransport {
             reader: BufReader::new(read_half),
             writer_tx,
             peer_label,
+            peer_uid,
         }
     }
 }
@@ -131,6 +134,17 @@ impl RpcTransport for LocalTransport {
 
     fn peer_label(&self) -> String {
         self.peer_label.clone()
+    }
+
+    fn kind(&self) -> crate::rpc::transport::TransportKind {
+        crate::rpc::transport::TransportKind::Local
+    }
+
+    fn credential(&self) -> crate::security::auth_provider::Credential {
+        match self.peer_uid {
+            Some(uid) => crate::security::auth_provider::Credential::Peercred { uid },
+            None => crate::security::auth_provider::Credential::None,
+        }
     }
 }
 
@@ -307,6 +321,17 @@ mod platform {
         let _ = stream;
         "unix:unknown".to_string()
     }
+
+    pub fn peer_uid_from(stream: &LocalStream) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(cred) = stream.peer_cred() {
+                return Some(cred.uid());
+            }
+        }
+        let _ = stream;
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -377,6 +402,10 @@ mod platform {
         "pipe:local".to_string()
     }
 
+    pub fn peer_uid_from(_stream: &LocalStream) -> Option<u32> {
+        None
+    }
+
     fn path_to_pipe_name(path: &Path) -> String {
         path.to_string_lossy().into_owned()
     }
@@ -444,6 +473,9 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(read_half);
 
         let params = InitializeParams {
+            auth_token: None,
+            auth_username: None,
+            auth_signature: None,
             protocol_version: 1,
             tui_id: None,
             tui_sig: None,
@@ -491,6 +523,9 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(read_half);
 
         let init_params = InitializeParams {
+            auth_token: None,
+            auth_username: None,
+            auth_signature: None,
             protocol_version: 1,
             tui_id: None,
             tui_sig: None,
@@ -641,8 +676,11 @@ mod tests {
 
         let (pending_tx, mut pending_rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
-        ctx.approval_pending
-            .insert("test-req-1".to_string(), pending_tx);
+        ctx.approval_pending.insert(
+            "test-req-1".to_string(),
+            "test-sess-1".to_string(),
+            pending_tx,
+        );
 
         let approve_params = serde_json::json!({
             "session_id": "unused",
@@ -736,6 +774,9 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(read_half);
 
         let init_params = InitializeParams {
+            auth_token: None,
+            auth_username: None,
+            auth_signature: None,
             protocol_version: 1,
             tui_id: None,
             tui_sig: None,

@@ -19,7 +19,7 @@
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,6 @@ use zeroclaw_runtime::rpc::types::{
 };
 
 use super::AppState;
-use super::api::require_auth;
 
 // ── HTTP-specific request/response shapes (not shared) ──────────────
 
@@ -154,13 +153,8 @@ fn truncate_to_chars(content: &str, max: usize) -> (String, bool) {
 /// named agent's workspace.
 pub async fn handle_index(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<AgentQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
         Ok(p) => p,
         Err(resp) => return resp.into_response(),
@@ -198,14 +192,9 @@ pub async fn handle_index(
 /// GET /api/personality/{filename} — read one file's full content.
 pub async fn handle_get(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(filename): axum::extract::Path<String>,
     Query(q): Query<AgentQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let allowed = match validate_filename(&filename) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
@@ -253,15 +242,10 @@ pub async fn handle_get(
 /// PUT /api/personality/{filename} — overwrite the file.
 pub async fn handle_put(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(filename): axum::extract::Path<String>,
     Query(q): Query<AgentQuery>,
     Json(body): Json<PersonalityPutBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let allowed = match validate_filename(&filename) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
@@ -348,13 +332,8 @@ pub async fn handle_put(
 /// having to repeat themselves.
 pub async fn handle_templates(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<TemplateQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let (memory_default_enabled, agent_display_default) = {
         let cfg = state.config.read();
         let mem = cfg.memory.backend.as_str() != "none";

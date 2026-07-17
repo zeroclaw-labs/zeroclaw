@@ -19,6 +19,18 @@
 //! later phase), so it changes no runtime behaviour. Default-deny means an empty
 //! registry rejects everything — wiring it on is a deliberate, later step.
 
+pub mod enrollment;
+pub mod native;
+pub mod oidc;
+pub mod peercred;
+pub mod ssh_key;
+
+pub use enrollment::{DeviceGrantStart, DevicePollOutcome, EnrolledToken, Enrollment};
+pub use native::NativeAuthProvider;
+pub use oidc::OidcAuthProvider;
+pub use peercred::PeercredAuthProvider;
+pub use ssh_key::{RosterUser, SshKeyAuthProvider, UserRoster};
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

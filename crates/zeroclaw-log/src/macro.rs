@@ -73,9 +73,10 @@ macro_rules! attribution_span {
 /// Field keys recognized by the layer: `agent_alias`, `tool`,
 /// `session_key`, `cron_job_id`, `risk_profile`, `runtime_profile`,
 /// `memory_namespace`, `skill_bundle`, `knowledge_bundle`, `mcp_bundle`,
-/// `peer_group`, `sop_name`, `model`, `embedding_provider`, `channel`,
-/// `model_provider`, `tts_provider`, `transcription_provider`,
-/// `tunnel_provider`. Anything else lands in event `attributes`.
+/// `peer_group`, `sop_name`, `model`, `embedding_provider`,
+/// `principal_id`, `channel`, `model_provider`, `tts_provider`,
+/// `transcription_provider`, `tunnel_provider`, `auth_provider`.
+/// Anything else lands in event `attributes`.
 #[macro_export]
 macro_rules! scope {
     ($($key:ident : $value:expr),+ $(,)? => $body:expr) => {{

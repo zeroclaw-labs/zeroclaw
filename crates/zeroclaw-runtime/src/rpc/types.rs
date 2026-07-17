@@ -63,6 +63,21 @@ rpc_type! {
         /// HMAC signature proving ownership of the claimed TUI ID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_sig: Option<String>,
+        /// RFC #7141 auth credential: a bearer token resolved by the daemon's
+        /// auth provider registry (e.g. the gateway pairing token for the
+        /// `native` provider, or an OIDC access token). Required on WSS;
+        /// ignored when the daemon has no provider registry configured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_token: Option<String>,
+        /// Username for the ssh-key challenge handshake. Paired with
+        /// `auth_signature` over the nonce previously issued by
+        /// `auth/challenge` on this connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_username: Option<String>,
+        /// Base64 signature over the `auth/challenge` nonce, made with a key
+        /// registered in `[users.<auth_username>].authorized_keys`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_signature: Option<String>,
         /// Shell environment from the TUI process, used to forward the user's
         /// real env (PATH, credentials, etc.) to subprocesses spawned by the
         /// daemon on their behalf. Omitted by older clients; defaults to empty.
@@ -108,6 +123,10 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Auth methods the daemon's provider registry advertises (RFC #7141).
+        /// Empty when no registry is configured (legacy trust).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub auth_methods: Vec<String>,
     }
 }
 

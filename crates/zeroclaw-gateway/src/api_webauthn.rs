@@ -4,10 +4,9 @@
 //! `webauthn` feature flag.
 
 use super::AppState;
-use crate::api::require_auth;
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Json},
 };
 use parking_lot::Mutex;
@@ -64,13 +63,8 @@ pub struct CredentialsQuery {
 /// POST /api/webauthn/register/start
 pub async fn handle_register_start(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<StartRegistrationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -104,13 +98,8 @@ pub async fn handle_register_start(
 /// POST /api/webauthn/register/finish
 pub async fn handle_register_finish(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<FinishRegistrationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -158,13 +147,8 @@ pub async fn handle_register_finish(
 /// POST /api/webauthn/auth/start
 pub async fn handle_auth_start(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<StartAuthenticationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -195,13 +179,8 @@ pub async fn handle_auth_start(
 /// POST /api/webauthn/auth/finish
 pub async fn handle_auth_finish(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<FinishAuthenticationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -244,13 +223,8 @@ pub async fn handle_auth_finish(
 /// GET /api/webauthn/credentials?user_id=...
 pub async fn handle_list_credentials(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<CredentialsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -288,14 +262,9 @@ pub async fn handle_list_credentials(
 /// DELETE /api/webauthn/credentials/:id?user_id=...
 pub async fn handle_delete_credential(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(credential_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<CredentialsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {

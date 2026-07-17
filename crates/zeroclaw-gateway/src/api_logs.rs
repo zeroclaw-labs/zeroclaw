@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -30,7 +30,6 @@ use zeroclaw_log::{
 };
 
 use super::AppState;
-use super::api::require_auth;
 
 const TOP_LEVEL_PARAMS: &[&str] = &[
     "since_ts",
@@ -95,14 +94,9 @@ fn attribution_keys_for_response() -> Vec<String> {
 
 #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
 pub async fn handle_api_logs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(path) = zeroclaw_log::current_log_path() else {
         return Json(LogsResponse {
             events: Vec::new(),

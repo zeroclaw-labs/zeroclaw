@@ -91,7 +91,11 @@ struct Cli {
 /// Where zerocode should connect.
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
-    Wss { url: String, skip_verify: bool },
+    Wss {
+        url: String,
+        skip_verify: bool,
+        auth_token: Option<String>,
+    },
 }
 
 impl ConnectTarget {
@@ -126,8 +130,19 @@ impl ConnectTarget {
             Self::LocalSocket(socket) => {
                 client::RpcClient::connect(socket, prev_id, prev_sig).await
             }
-            Self::Wss { url, skip_verify } => {
-                client::RpcClient::connect_wss(url, prev_id, prev_sig, *skip_verify).await
+            Self::Wss {
+                url,
+                skip_verify,
+                auth_token,
+            } => {
+                client::RpcClient::connect_wss(
+                    url,
+                    prev_id,
+                    prev_sig,
+                    *skip_verify,
+                    auth_token.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -137,10 +152,23 @@ fn resolve_wss_target(
     cli_connect: Option<String>,
     cli_skip_verify: bool,
     cfg_wss: &config::WssSection,
-) -> Option<(String, bool)> {
+) -> Option<(String, bool, Option<String>)> {
+    let env_token = std::env::var("ZEROCLAW_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    resolve_wss_target_with(cli_connect, cli_skip_verify, cfg_wss, env_token)
+}
+
+fn resolve_wss_target_with(
+    cli_connect: Option<String>,
+    cli_skip_verify: bool,
+    cfg_wss: &config::WssSection,
+    env_token: Option<String>,
+) -> Option<(String, bool, Option<String>)> {
     let uri = cli_connect.or_else(|| cfg_wss.uri.clone())?;
     let skip_verify = cli_skip_verify || cfg_wss.tls.skip_verify;
-    Some((uri, skip_verify))
+    let auth_token = env_token.or_else(|| cfg_wss.auth_token.clone());
+    Some((uri, skip_verify, auth_token))
 }
 
 #[tokio::main]
@@ -293,12 +321,13 @@ async fn run() -> anyhow::Result<()> {
 
     let target = {
         let cfg_wss = &loaded_config.connection.wss;
-        if let Some((uri, skip_verify)) =
+        if let Some((uri, skip_verify, auth_token)) =
             resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
         {
             ConnectTarget::Wss {
                 url: uri,
                 skip_verify,
+                auth_token,
             }
         } else {
             let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
@@ -325,7 +354,11 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        ConnectTarget::Wss { url, skip_verify } => {
+        ConnectTarget::Wss {
+            url,
+            skip_verify,
+            auth_token,
+        } => {
             if *skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
                 match confirm_insecure_tls(url)? {
                     InsecureTlsChoice::Once => {}
@@ -337,7 +370,8 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
+            client::RpcClient::connect_wss(url, None, None, *skip_verify, auth_token.as_deref())
+                .await?
         }
     };
 
@@ -472,8 +506,8 @@ mod connection_tests {
             uri: Some("wss://config:1".to_string()),
             ..Default::default()
         };
-        let got = resolve_wss_target(Some("wss://flag:2".to_string()), false, &cfg);
-        assert_eq!(got, Some(("wss://flag:2".to_string(), false)));
+        let got = resolve_wss_target_with(Some("wss://flag:2".to_string()), false, &cfg, None);
+        assert_eq!(got, Some(("wss://flag:2".to_string(), false, None)));
     }
 
     #[test]
@@ -482,14 +516,14 @@ mod connection_tests {
             uri: Some("wss://config:1".to_string()),
             ..Default::default()
         };
-        let got = resolve_wss_target(None, false, &cfg);
-        assert_eq!(got, Some(("wss://config:1".to_string(), false)));
+        let got = resolve_wss_target_with(None, false, &cfg, None);
+        assert_eq!(got, Some(("wss://config:1".to_string(), false, None)));
     }
 
     #[test]
     fn no_uri_anywhere_is_local_socket() {
         let cfg = WssSection::default();
-        assert_eq!(resolve_wss_target(None, false, &cfg), None);
+        assert_eq!(resolve_wss_target_with(None, false, &cfg, None), None);
     }
 
     #[test]
@@ -500,17 +534,42 @@ mod connection_tests {
         };
         cfg.tls.skip_verify = true;
         assert_eq!(
-            resolve_wss_target(None, false, &cfg),
-            Some(("wss://h:1".to_string(), true))
+            resolve_wss_target_with(None, false, &cfg, None),
+            Some(("wss://h:1".to_string(), true, None))
         );
         cfg.tls.skip_verify = false;
         assert_eq!(
-            resolve_wss_target(None, true, &cfg),
-            Some(("wss://h:1".to_string(), true))
+            resolve_wss_target_with(None, true, &cfg, None),
+            Some(("wss://h:1".to_string(), true, None))
         );
         assert_eq!(
-            resolve_wss_target(None, false, &cfg),
-            Some(("wss://h:1".to_string(), false))
+            resolve_wss_target_with(None, false, &cfg, None),
+            Some(("wss://h:1".to_string(), false, None))
+        );
+    }
+
+    #[test]
+    fn auth_token_env_overrides_config() {
+        let cfg = WssSection {
+            uri: Some("wss://h:1".to_string()),
+            auth_token: Some("cfg_token".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_wss_target_with(None, false, &cfg, Some("env_token".to_string())),
+            Some((
+                "wss://h:1".to_string(),
+                false,
+                Some("env_token".to_string())
+            ))
+        );
+        assert_eq!(
+            resolve_wss_target_with(None, false, &cfg, None),
+            Some((
+                "wss://h:1".to_string(),
+                false,
+                Some("cfg_token".to_string())
+            ))
         );
     }
 }

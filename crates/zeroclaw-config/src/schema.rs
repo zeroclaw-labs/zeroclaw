@@ -462,6 +462,28 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
+    /// issuer whose tokens this daemon accepts; incoming tokens are routed
+    /// to the matching entry by their `iss` claim. Any standards-compliant
+    /// IdP works; there is no per-vendor configuration.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub oidc: HashMap<String, OidcConfig>,
+
+    /// Local user roster (`[users.<name>]`) for the `ssh-key` and `peercred`
+    /// auth providers. OIDC-authenticated users are NOT listed here; their
+    /// identity and grants come from the IdP token.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub users: HashMap<String, UserConfig>,
+
+    /// Named permission profiles (`[permission_profiles.<alias>]`): the
+    /// grant sets that OIDC role mappings and user roster entries resolve
+    /// to. Deny-by-default: anything a profile does not grant is refused.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -11193,6 +11215,238 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 // ── Profiles & Bundles ───────────────────────────────────────────
 
+/// One OIDC trust relationship (`[oidc.<alias>]`).
+///
+/// The alias is an operator-chosen handle (it appears in logs and audit
+/// attribution as `oidc.<alias>`), not a vendor name. Incoming tokens are
+/// routed to the entry whose `issuer` matches the token's `iss` claim, then
+/// validated per `validation`, and their claims mapped to a permission
+/// profile through `role_map`. A token whose mapped claim values match no
+/// `role_map` entry is denied.
+#[derive(Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "oidc"]
+pub struct OidcConfig {
+    /// Issuer URL exactly as it appears in the token `iss` claim
+    /// (e.g. `https://sso.example.com/realms/main`). Discovery is fetched
+    /// from `<issuer>/.well-known/openid-configuration`.
+    pub issuer: String,
+    /// Audience the token must carry in its `aud` claim (typically the
+    /// client ID registered for this daemon at the IdP).
+    pub audience: String,
+    /// Client ID used for enrollment flows (device authorization grant,
+    /// client credentials). Defaults to `audience` when empty.
+    #[serde(default)]
+    pub client_id: String,
+    /// Client secret for confidential-client flows (token introspection,
+    /// client credentials). Not required for JWKS validation of public
+    /// clients. Encrypted at rest.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: Option<String>,
+    /// How presented tokens are validated.
+    #[serde(default)]
+    pub validation: OidcValidation,
+    /// Dotted path to the claim holding this deployment's role/group values
+    /// (e.g. `realm_access.roles`, `groups`). Must be set explicitly: the
+    /// daemon refuses to start when empty, rather than guessing where
+    /// grants live in a token.
+    #[serde(default)]
+    pub claim_path: String,
+    /// Maps a claim value found at `claim_path` to a
+    /// `[permission_profiles.<alias>]` name. Values with no mapping grant
+    /// nothing; a token mapping to no profile at all is denied.
+    #[serde(default)]
+    pub role_map: HashMap<String, String>,
+    /// Require the token/session to attest MFA (`amr` containing `mfa`,
+    /// `otp`, or `hwk`) before authentication succeeds.
+    #[serde(default)]
+    pub require_mfa: bool,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("validation", &self.validation)
+            .field("claim_path", &self.claim_path)
+            .field("role_map", &self.role_map)
+            .field("require_mfa", &self.require_mfa)
+            .finish()
+    }
+}
+
+impl OidcConfig {
+    pub fn validate(&self, alias: &str) -> Result<()> {
+        if self.issuer.trim().is_empty() {
+            anyhow::bail!("oidc.{alias}.issuer is required");
+        }
+        if !self.issuer.starts_with("https://") && !self.issuer.starts_with("http://") {
+            anyhow::bail!("oidc.{alias}.issuer must be an http(s) URL");
+        }
+        if self.audience.trim().is_empty() {
+            anyhow::bail!("oidc.{alias}.audience is required");
+        }
+        if self.claim_path.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.claim_path is required: set the dotted path to the \
+                 claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
+            );
+        }
+        if self.role_map.is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.role_map is required: map at least one claim value to a \
+                 permission profile or every token from this issuer will be denied"
+            );
+        }
+        if self.validation == OidcValidation::Introspection && self.client_secret.is_none() {
+            anyhow::bail!(
+                "oidc.{alias}.client_secret is required when validation is `introspection`"
+            );
+        }
+        Ok(())
+    }
+
+    /// The client ID used for enrollment flows; falls back to `audience`.
+    #[must_use]
+    pub fn enrollment_client_id(&self) -> &str {
+        if self.client_id.trim().is_empty() {
+            &self.audience
+        } else {
+            &self.client_id
+        }
+    }
+}
+
+/// Token validation strategy for an OIDC trust relationship.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OidcValidation {
+    /// Validate token signatures offline against the issuer's published
+    /// JWKS (fetched at boot, refreshed on key rotation). No per-request
+    /// IdP round-trip; revocation is only as fresh as token expiry.
+    #[default]
+    Jwks,
+    /// Validate every token online via the issuer's RFC 7662 introspection
+    /// endpoint. Immediate revocation, one IdP round-trip per validation.
+    /// Requires `client_secret`.
+    Introspection,
+}
+
+/// One local user (`[users.<name>]`) for the `ssh-key` and `peercred` auth
+/// providers.
+///
+/// The map key is the username presented during the SSH challenge handshake
+/// and recorded as the principal id. OIDC users do not appear here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "user"]
+#[serde(default)]
+pub struct UserConfig {
+    /// SSH public keys (authorized_keys format, e.g. `ssh-ed25519 AAAA...`)
+    /// accepted for this user's challenge-response login.
+    pub authorized_keys: Vec<String>,
+    /// Unix uid accepted for this user over the local socket (`peercred`).
+    /// Unset means this user cannot authenticate via peer credential.
+    pub uid: Option<u32>,
+    /// The `[permission_profiles.<alias>]` entry granting this user's
+    /// permissions. Required; a user with no profile cannot authenticate.
+    pub permission_profile: String,
+}
+
+impl UserConfig {
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if self.permission_profile.trim().is_empty() {
+            anyhow::bail!("users.{name}.permission_profile is required");
+        }
+        if self.authorized_keys.is_empty() && self.uid.is_none() {
+            anyhow::bail!(
+                "users.{name} has no credential: set authorized_keys (ssh) and/or uid (peercred)"
+            );
+        }
+        for key in &self.authorized_keys {
+            let mut parts = key.split_whitespace();
+            let algo = parts.next().unwrap_or_default();
+            let body = parts.next().unwrap_or_default();
+            if !algo.starts_with("ssh-") && !algo.starts_with("ecdsa-") {
+                anyhow::bail!(
+                    "users.{name}.authorized_keys entry does not look like an OpenSSH \
+                     public key (expected `<algo> <base64> [comment]`, got algo {algo:?})"
+                );
+            }
+            if body.is_empty() {
+                anyhow::bail!("users.{name}.authorized_keys entry is missing the key body");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One named grant set (`[permission_profiles.<alias>]`).
+///
+/// Profiles are the single authorization vocabulary: OIDC `role_map` values
+/// and `[users.<name>].permission_profile` both resolve here. A profile
+/// grants exactly what it lists; everything else is denied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "permission_profile"]
+#[serde(default)]
+pub struct PermissionProfileConfig {
+    /// Grant everything. When true all other fields are irrelevant.
+    pub admin: bool,
+    /// Agent aliases holders of this profile may bind or address.
+    pub allowed_agents: Vec<String>,
+    /// Dotted config path prefixes holders may write. A trailing `.*`
+    /// grants the subtree (e.g. `channels.*`); a bare path grants that
+    /// exact prop.
+    pub config_write_paths: Vec<String>,
+    /// Tool names holders may cause an agent to run. Empty imposes no
+    /// profile-level tool restriction (the agent's own policy still
+    /// applies).
+    pub allowed_tools: Vec<String>,
+    /// Resource-class grants: for each resource kind, the verbs permitted.
+    /// Resources: `system`, `sessions`, `memory`, `cron`, `config`,
+    /// `agents`, `cost`, `skills`, `personality`, `logs`, `tui`, `files`,
+    /// `locales`, `quickstart`, `channels`, `providers`, `models`,
+    /// `peer_groups`, `plugins`, `tools`. Verbs: `create`, `read`,
+    /// `update`, `delete`, `execute`. An unlisted resource is denied.
+    pub grants: HashMap<zeroclaw_api::grants::Resource, Vec<zeroclaw_api::grants::Verb>>,
+}
+
+impl PermissionProfileConfig {
+    /// Compile this profile into the runtime grant shape.
+    #[must_use]
+    pub fn resolve(&self) -> zeroclaw_api::grants::ResolvedGrants {
+        use zeroclaw_api::principal::AgentAlias;
+        let mut resolved = zeroclaw_api::grants::ResolvedGrants::none();
+        resolved.admin = self.admin;
+        resolved.allowed_agents = self
+            .allowed_agents
+            .iter()
+            .map(|a| AgentAlias(a.clone()))
+            .collect();
+        resolved.config_write_paths = self.config_write_paths.clone();
+        resolved.allowed_tools = self.allowed_tools.clone();
+        for (resource, verbs) in &self.grants {
+            resolved
+                .resources
+                .insert(*resource, verbs.iter().copied().collect());
+        }
+        resolved
+    }
+}
+
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
 /// Unified policy surface. Agents reference a profile by alias and the
@@ -15274,11 +15528,6 @@ pub struct SecurityConfig {
     #[nested]
     pub estop: EstopConfig,
 
-    /// Nevis IAM integration for SSO/MFA authentication and role-based access.
-    #[serde(default)]
-    #[nested]
-    pub nevis: NevisConfig,
-
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     #[nested]
@@ -15501,169 +15750,6 @@ impl Default for EstopConfig {
             require_otp_to_resume: true,
         }
     }
-}
-
-/// Nevis IAM integration configuration.
-///
-/// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
-/// Security Suite instance and maps Nevis roles to tool/workspace permissions.
-#[derive(Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "security.nevis"]
-#[serde(deny_unknown_fields)]
-pub struct NevisConfig {
-    /// Enable Nevis IAM integration. Defaults to false for backward compatibility.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
-    #[serde(default)]
-    pub instance_url: String,
-
-    /// Nevis realm to authenticate against.
-    #[serde(default = "default_nevis_realm")]
-    pub realm: String,
-
-    /// OAuth2 client ID registered in Nevis.
-    #[serde(default)]
-    pub client_id: String,
-
-    /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub client_secret: Option<String>,
-
-    /// Token validation strategy: `"local"` (JWKS) or `"remote"` (introspection).
-    #[serde(default = "default_nevis_token_validation")]
-    pub token_validation: String,
-
-    /// JWKS endpoint URL for local token validation.
-    #[serde(default)]
-    pub jwks_url: Option<String>,
-
-    /// Nevis role to ZeroClaw permission mappings.
-    #[serde(default)]
-    pub role_mapping: Vec<NevisRoleMappingConfig>,
-
-    /// Require MFA verification for all Nevis-authenticated requests.
-    #[serde(default)]
-    pub require_mfa: bool,
-
-    /// Session timeout in seconds.
-    #[serde(default = "default_nevis_session_timeout_secs")]
-    pub session_timeout_secs: u64,
-}
-
-impl std::fmt::Debug for NevisConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NevisConfig")
-            .field("enabled", &self.enabled)
-            .field("instance_url", &self.instance_url)
-            .field("realm", &self.realm)
-            .field("client_id", &self.client_id)
-            .field(
-                "client_secret",
-                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("token_validation", &self.token_validation)
-            .field("jwks_url", &self.jwks_url)
-            .field("role_mapping", &self.role_mapping)
-            .field("require_mfa", &self.require_mfa)
-            .field("session_timeout_secs", &self.session_timeout_secs)
-            .finish()
-    }
-}
-
-impl NevisConfig {
-    /// Validate that required fields are present when Nevis is enabled.
-    ///
-    /// Call at config load time to fail fast on invalid configuration rather
-    /// than deferring errors to the first authentication request.
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        if self.instance_url.trim().is_empty() {
-            return Err("nevis.instance_url is required when Nevis IAM is enabled".into());
-        }
-
-        if self.client_id.trim().is_empty() {
-            return Err("nevis.client_id is required when Nevis IAM is enabled".into());
-        }
-
-        if self.realm.trim().is_empty() {
-            return Err("nevis.realm is required when Nevis IAM is enabled".into());
-        }
-
-        match self.token_validation.as_str() {
-            "local" | "remote" => {}
-            other => {
-                return Err(format!(
-                    "nevis.token_validation has invalid value '{other}': \
-                     expected 'local' or 'remote'"
-                ));
-            }
-        }
-
-        if self.token_validation == "local" && self.jwks_url.is_none() {
-            return Err("nevis.jwks_url is required when token_validation is 'local'".into());
-        }
-
-        if self.session_timeout_secs == 0 {
-            return Err("nevis.session_timeout_secs must be greater than 0".into());
-        }
-
-        Ok(())
-    }
-}
-
-fn default_nevis_realm() -> String {
-    "master".into()
-}
-
-fn default_nevis_token_validation() -> String {
-    "local".into()
-}
-
-fn default_nevis_session_timeout_secs() -> u64 {
-    3600
-}
-
-impl Default for NevisConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            instance_url: String::new(),
-            realm: default_nevis_realm(),
-            client_id: String::new(),
-            client_secret: None,
-            token_validation: default_nevis_token_validation(),
-            jwks_url: None,
-            role_mapping: Vec::new(),
-            require_mfa: false,
-            session_timeout_secs: default_nevis_session_timeout_secs(),
-        }
-    }
-}
-
-/// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct NevisRoleMappingConfig {
-    /// Nevis role name (case-insensitive).
-    pub nevis_role: String,
-
-    /// Tool names this role can access. Use `"all"` for unrestricted tool access.
-    #[serde(default)]
-    pub zeroclaw_permissions: Vec<String>,
-
-    /// Workspace names this role can access. Use `"all"` for unrestricted.
-    #[serde(default)]
-    pub workspace_access: Vec<String>,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -17002,6 +17088,9 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -19669,9 +19758,46 @@ impl Config {
             }
         }
 
-        // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
-        if let Err(msg) = self.security.nevis.validate() {
-            anyhow::bail!("security.nevis: {msg}");
+        for (alias, oidc) in &self.oidc {
+            oidc.validate(alias)?;
+            for (claim_value, profile) in &oidc.role_map {
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.role_map"),
+                        "oidc.{alias}.role_map[{claim_value:?}] names permission profile \
+                         {profile:?} but [permission_profiles.{profile}] is not configured"
+                    );
+                }
+            }
+        }
+        for (name, user) in &self.users {
+            user.validate(name)?;
+            if !self
+                .permission_profiles
+                .contains_key(&user.permission_profile)
+            {
+                validation_bail!(
+                    DanglingReference,
+                    format!("users.{name}.permission_profile"),
+                    "users.{name}.permission_profile names {:?} but [permission_profiles.{}] \
+                     is not configured",
+                    user.permission_profile,
+                    user.permission_profile
+                );
+            }
+        }
+        for (alias, profile) in &self.permission_profiles {
+            for agent in &profile.allowed_agents {
+                if !self.agents.contains_key(agent) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("permission_profiles.{alias}.allowed_agents"),
+                        "permission_profiles.{alias}.allowed_agents names {agent:?} but \
+                         [agents.{agent}] is not configured"
+                    );
+                }
+            }
         }
 
         // Delegate tool global defaults
@@ -21818,6 +21944,220 @@ max_height = 8
         assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
+    // ── Auth config sections (#7141) ─────────────────────────
+
+    fn valid_oidc() -> OidcConfig {
+        OidcConfig {
+            issuer: "https://sso.example.com/realms/main".into(),
+            audience: "zeroclaw".into(),
+            claim_path: "realm_access.roles".into(),
+            role_map: HashMap::from([("admin".to_string(), "admins".to_string())]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    async fn oidc_validate_accepts_minimal_jwks_entry() {
+        assert!(valid_oidc().validate("corp").is_ok());
+    }
+
+    #[test]
+    async fn oidc_validate_fails_fast_on_each_required_field() {
+        let missing_issuer = OidcConfig {
+            issuer: String::new(),
+            ..valid_oidc()
+        };
+        assert!(
+            missing_issuer
+                .validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("issuer")
+        );
+
+        let bad_issuer = OidcConfig {
+            issuer: "ldap://nope".into(),
+            ..valid_oidc()
+        };
+        assert!(
+            bad_issuer
+                .validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("http(s)")
+        );
+
+        let missing_audience = OidcConfig {
+            audience: String::new(),
+            ..valid_oidc()
+        };
+        assert!(
+            missing_audience
+                .validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("audience")
+        );
+
+        let missing_claim_path = OidcConfig {
+            claim_path: String::new(),
+            ..valid_oidc()
+        };
+        assert!(
+            missing_claim_path
+                .validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("claim_path")
+        );
+
+        let empty_role_map = OidcConfig {
+            role_map: HashMap::new(),
+            ..valid_oidc()
+        };
+        assert!(
+            empty_role_map
+                .validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("role_map")
+        );
+
+        let introspection_no_secret = OidcConfig {
+            validation: OidcValidation::Introspection,
+            client_secret: None,
+            ..valid_oidc()
+        };
+        assert!(
+            introspection_no_secret
+                .validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("client_secret")
+        );
+    }
+
+    #[test]
+    async fn oidc_enrollment_client_id_falls_back_to_audience() {
+        let cfg = valid_oidc();
+        assert_eq!(cfg.enrollment_client_id(), "zeroclaw");
+        let explicit = OidcConfig {
+            client_id: "device-cli".into(),
+            ..valid_oidc()
+        };
+        assert_eq!(explicit.enrollment_client_id(), "device-cli");
+    }
+
+    #[test]
+    async fn user_validate_requires_profile_and_credential() {
+        let no_profile = UserConfig {
+            authorized_keys: vec!["ssh-ed25519 AAAAC3Nza test".into()],
+            ..Default::default()
+        };
+        assert!(
+            no_profile
+                .validate("op")
+                .unwrap_err()
+                .to_string()
+                .contains("permission_profile")
+        );
+
+        let no_credential = UserConfig {
+            permission_profile: "ops".into(),
+            ..Default::default()
+        };
+        assert!(
+            no_credential
+                .validate("op")
+                .unwrap_err()
+                .to_string()
+                .contains("no credential")
+        );
+
+        let malformed_key = UserConfig {
+            permission_profile: "ops".into(),
+            authorized_keys: vec!["not-a-key".into()],
+            ..Default::default()
+        };
+        assert!(malformed_key.validate("op").is_err());
+
+        let uid_only = UserConfig {
+            permission_profile: "ops".into(),
+            uid: Some(1000),
+            ..Default::default()
+        };
+        assert!(uid_only.validate("op").is_ok());
+    }
+
+    #[test]
+    async fn config_validate_rejects_dangling_auth_references() {
+        let mut config = Config::default();
+        config.oidc.insert("corp".into(), valid_oidc());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("permission_profiles"),
+            "role_map to unconfigured profile must fail validation: {err}"
+        );
+
+        let mut config = Config::default();
+        config.users.insert(
+            "op".into(),
+            UserConfig {
+                permission_profile: "ghost".into(),
+                uid: Some(1000),
+                ..Default::default()
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ghost"),
+            "user profile ref must resolve: {err}"
+        );
+
+        let mut config = Config::default();
+        config.permission_profiles.insert(
+            "ops".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["no_such_agent".into()],
+                ..Default::default()
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("no_such_agent"),
+            "agent ref must resolve: {err}"
+        );
+    }
+
+    #[test]
+    async fn permission_profile_resolve_maps_grants() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let profile = PermissionProfileConfig {
+            allowed_agents: vec!["assistant".into()],
+            config_write_paths: vec!["channels.*".into()],
+            allowed_tools: vec!["shell".into()],
+            grants: HashMap::from([(Resource::Sessions, vec![Verb::Create, Verb::Read])]),
+            ..Default::default()
+        };
+        let resolved = profile.resolve();
+        assert!(!resolved.admin);
+        assert!(resolved.permits(Resource::Sessions, Verb::Create));
+        assert!(!resolved.permits(Resource::Sessions, Verb::Delete));
+        assert!(!resolved.permits(Resource::Cron, Verb::Read));
+        assert!(resolved.may_use_agent("assistant"));
+        assert!(!resolved.may_use_agent("other"));
+        assert!(resolved.may_write_config("channels.discord.main"));
+        assert!(!resolved.may_write_config("providers.models"));
+        assert!(resolved.may_use_tool("shell"));
+        assert!(!resolved.may_use_tool("browser"));
+
+        let admin = PermissionProfileConfig {
+            admin: true,
+            ..Default::default()
+        };
+        assert!(admin.resolve().permits(Resource::Plugins, Verb::Delete));
+    }
+
     #[test]
     async fn filesystem_validate_requires_path() {
         let cfg = FilesystemConfig {
@@ -23598,6 +23938,9 @@ auto_save = true
                 );
                 m
             },
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -24428,6 +24771,9 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -29470,21 +29816,31 @@ url = "http://localhost:8080/mcp"
     }
 
     #[tokio::test]
-    async fn nevis_client_secret_encrypt_decrypt_roundtrip() {
+    async fn oidc_client_secret_encrypt_decrypt_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
-            "zeroclaw_test_nevis_secret_{}",
+            "zeroclaw_test_oidc_secret_{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).await.unwrap();
 
-        let plaintext_secret = "nevis-test-client-secret-value";
+        let plaintext_secret = "oidc-test-client-secret-value";
 
         let mut config = Config {
             data_dir: dir.join("workspace"),
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.security.nevis.client_secret = Some(plaintext_secret.into());
+        config.oidc.insert(
+            "corp".into(),
+            OidcConfig {
+                issuer: "https://sso.example.com/realms/main".into(),
+                audience: "zeroclaw".into(),
+                client_secret: Some(plaintext_secret.into()),
+                claim_path: "realm_access.roles".into(),
+                role_map: HashMap::from([("admin".to_string(), "admins".to_string())]),
+                ..Default::default()
+            },
+        );
 
         // Save (triggers encryption)
         config.save().await.unwrap();
@@ -29500,7 +29856,7 @@ url = "http://localhost:8080/mcp"
 
         // Parse stored TOML and verify the value is encrypted
         let stored: Config = toml::from_str(&raw_toml).unwrap();
-        let stored_secret = stored.security.nevis.client_secret.as_ref().unwrap();
+        let stored_secret = stored.oidc["corp"].client_secret.as_ref().unwrap();
         assert!(
             crate::secrets::SecretStore::is_encrypted(stored_secret),
             "Stored client_secret must be marked as encrypted"
@@ -29516,137 +29872,12 @@ url = "http://localhost:8080/mcp"
         let load_store = crate::secrets::SecretStore::new(&dir, loaded.secrets.encrypt);
         loaded.decrypt_secrets(&load_store).unwrap();
         assert_eq!(
-            loaded.security.nevis.client_secret.as_deref().unwrap(),
+            loaded.oidc["corp"].client_secret.as_deref().unwrap(),
             plaintext_secret,
             "Loaded client_secret must match the original plaintext after decryption"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // Nevis config validation tests
-    // ══════════════════════════════════════════════════════════
-
-    #[test]
-    async fn nevis_config_validate_disabled_accepts_empty_fields() {
-        let cfg = NevisConfig::default();
-        assert!(!cfg.enabled);
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_instance_url() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: String::new(),
-            client_id: "test-client".into(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("instance_url"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_client_id() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: String::new(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("client_id"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_realm() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            realm: String::new(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("realm"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_local_without_jwks() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            token_validation: "local".into(),
-            jwks_url: None,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("jwks_url"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_zero_session_timeout() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            token_validation: "remote".into(),
-            session_timeout_secs: 0,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("session_timeout_secs"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_accepts_valid_enabled_config() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            realm: "master".into(),
-            client_id: "test-client".into(),
-            token_validation: "remote".into(),
-            session_timeout_secs: 3600,
-            ..NevisConfig::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_invalid_token_validation() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            realm: "master".into(),
-            client_id: "test-client".into(),
-            token_validation: "invalid_mode".into(),
-            session_timeout_secs: 3600,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.contains("invalid value 'invalid_mode'"),
-            "Expected invalid token_validation error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn nevis_config_debug_redacts_client_secret() {
-        let cfg = NevisConfig {
-            client_secret: Some("super-secret".into()),
-            ..NevisConfig::default()
-        };
-        let debug_output = format!("{:?}", cfg);
-        assert!(
-            !debug_output.contains("super-secret"),
-            "Debug output must not contain the raw client_secret"
-        );
-        assert!(
-            debug_output.contains("[REDACTED]"),
-            "Debug output must show [REDACTED] for client_secret"
-        );
     }
 
     #[test]

@@ -579,6 +579,303 @@ pub struct AppState {
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
+/// The bearer-authenticated dashboard API router (#6250). Every route added
+/// here sits behind [`api::require_auth_middleware`] via `route_layer`, so
+/// auth is structural: a handler added to this group cannot forget the check.
+/// Surfaces that authenticate differently (pairing handshake, webhook
+/// signatures, localhost-gated admin, WS/ACP per-connection checks) stay on
+/// the public router in `run_gateway`.
+fn protected_api_routes(state: AppState) -> Router<AppState> {
+    let protected = Router::new()
+        .route("/api/status", get(api::handle_api_status))
+        .route("/api/logs", get(api_logs::handle_api_logs))
+        .route(
+            "/api/config",
+            get(api_config::handle_config_get)
+                .patch(api_config::handle_patch)
+                .options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route(
+            "/api/config/reload-status",
+            get(api_config::handle_reload_status),
+        )
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
+        .route("/api/config/catalog", get(api_sections::handle_catalog))
+        .route(
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
+        )
+        .route("/api/config/status", get(api_sections::handle_section_status))
+        .route(
+            "/api/config/agent-options",
+            get(api_sections::handle_agent_options),
+        )
+        .route("/api/config/sections", get(api_sections::handle_sections))
+        .route(
+            "/api/config/sections/{section}",
+            get(api_sections::handle_section_picker),
+        )
+        .route(
+            "/api/config/sections/{section}/items/{key}",
+            post(api_sections::handle_section_select),
+        )
+        .route("/api/personality", get(api_personality::handle_index))
+        .route(
+            "/api/quickstart/state",
+            get(api_quickstart::handle_state),
+        )
+        .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route(
+            "/api/quickstart/apply",
+            post(api_quickstart::handle_apply),
+        )
+        .route(
+            "/api/quickstart/dismiss",
+            post(api_quickstart::handle_dismiss),
+        )
+        .route(
+            "/api/personality/templates",
+            get(api_personality::handle_templates),
+        )
+        .route(
+            "/api/personality/{filename}",
+            get(api_personality::handle_get).put(api_personality::handle_put),
+        )
+        .route("/api/browse", get(api_browse::handle_browse))
+        .route("/api/browse/mkdir", post(api_browse::handle_browse_mkdir))
+        .route("/api/browse/rmdir", delete(api_browse::handle_browse_rmdir))
+        .route(
+            "/api/agents/{alias}/workspace/list",
+            get(api_browse::handle_agent_workspace_list),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/read",
+            get(api_browse::handle_agent_workspace_read),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/path",
+            delete(api_browse::handle_agent_workspace_delete),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/move",
+            post(api_browse::handle_agent_workspace_move),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/mkdir",
+            post(api_browse::handle_agent_workspace_mkdir),
+        )
+        .route(
+            "/api/agents/{alias}/skills",
+            get(api_skills::handle_agent_skills),
+        )
+        .route(
+            "/api/skills/slash-option-kinds",
+            get(api_skills::handle_slash_option_kinds),
+        )
+        .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
+        .route(
+            "/api/skills/bundles/{alias}/skills",
+            get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
+        )
+        .route(
+            "/api/skills/bundles/{alias}/skills/{name}",
+            get(api_skills::handle_read_skill)
+                .put(api_skills::handle_write_skill)
+                .delete(api_skills::handle_delete_skill),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/cron", get(api::handle_api_cron_list))
+        .route("/api/cron", post(api::handle_api_cron_add))
+        .route(
+            "/api/cron/settings",
+            get(api::handle_api_cron_settings_get).patch(api::handle_api_cron_settings_patch),
+        )
+        .route(
+            "/api/cron/{id}",
+            delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
+        )
+        .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        // Note: `/api/cron/{id}/run` is registered on a separate router below
+        // with a longer TimeoutLayer — manual cron triggers run the job
+        // synchronously and routinely exceed the 30s gateway-wide default.
+        .route("/api/integrations", get(api::handle_api_integrations))
+        .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integrations_settings),
+        )
+        .route(
+            "/api/doctor",
+            get(api::handle_api_doctor).post(api::handle_api_doctor),
+        )
+        .route("/api/memory", get(api::handle_api_memory_list))
+        .route("/api/memory", post(api::handle_api_memory_store))
+        .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/cost", get(api::handle_api_cost))
+        .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/channels", get(api::handle_api_channels))
+        .route("/api/health", get(api::handle_api_health))
+        .route("/api/tuis", get(api::handle_api_tuis))
+        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route(
+            "/api/sessions/{id}/messages",
+            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+        )
+        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        // ── Pairing + Device management API ──
+        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
+        .route("/api/devices", get(api_pairing::list_devices))
+        .route(
+            "/api/devices/me/capabilities",
+            post(api_pairing::update_my_capabilities),
+        )
+        .route("/api/devices/{id}", delete(api_pairing::revoke_device))
+        .route(
+            "/api/devices/{id}/token/rotate",
+            post(api_pairing::rotate_token),
+        )
+        // ── Live Canvas (A2UI) routes ──
+        .route("/api/canvas", get(canvas::handle_canvas_list))
+        .route(
+            "/api/canvas/{id}",
+            get(canvas::handle_canvas_get)
+                .post(canvas::handle_canvas_post)
+                .delete(canvas::handle_canvas_clear),
+        )
+        .route(
+            "/api/canvas/{id}/history",
+            get(canvas::handle_canvas_history),
+        );
+
+    // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
+    #[cfg(feature = "webauthn")]
+    let protected = protected
+        .route(
+            "/api/webauthn/register/start",
+            post(api_webauthn::handle_register_start),
+        )
+        .route(
+            "/api/webauthn/register/finish",
+            post(api_webauthn::handle_register_finish),
+        )
+        .route(
+            "/api/webauthn/auth/start",
+            post(api_webauthn::handle_auth_start),
+        )
+        .route(
+            "/api/webauthn/auth/finish",
+            post(api_webauthn::handle_auth_finish),
+        )
+        .route(
+            "/api/webauthn/credentials",
+            get(api_webauthn::handle_list_credentials),
+        )
+        .route(
+            "/api/webauthn/credentials/{id}",
+            delete(api_webauthn::handle_delete_credential),
+        );
+
+    // ── SOP authoring + execution (auth-gated dashboard surfaces) ──
+    let protected = protected
+        .route(
+            "/api/sops",
+            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
+        )
+        .route(
+            "/api/sops/{name}",
+            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
+        )
+        .route(
+            "/api/sops/{name}/graph",
+            get(api_sop_author::handle_sop_graph),
+        )
+        .route("/api/sops/{name}/run", post(api_sop_author::handle_sop_run))
+        .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
+        .route(
+            "/api/sops/{name}/full",
+            get(api_sop_author::handle_sop_full),
+        )
+        .route(
+            "/api/sops/wire-draft",
+            post(api_sop_author::handle_sop_wire_draft),
+        )
+        .route(
+            "/api/sops/graph-draft",
+            post(api_sop_author::handle_sop_graph_draft),
+        )
+        .route(
+            "/api/sops/trigger-sources",
+            get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/graph-legend",
+            get(api_sop_author::handle_sop_graph_legend),
+        )
+        .route(
+            "/api/tools/param-options",
+            post(api_sop_author::handle_tools_param_options),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_author::handle_sop_run_overlay),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/decide",
+            post(api_sop_author::handle_sop_decide),
+        )
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        );
+
+    // ── Plugin management API (requires plugins-wasm feature) ──
+    #[cfg(feature = "plugins-wasm")]
+    let protected = protected.route(
+        "/api/plugins",
+        get(api_plugins::plugin_routes::list_plugins),
+    );
+
+    protected
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        .route("/api/events/history", get(sse::handle_events_history))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            api::require_auth_middleware,
+        ))
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
@@ -1675,8 +1972,14 @@ pub async fn run_gateway(
         },
     };
 
-    // Build router with middleware
-    let inner = Router::new()
+    // Build router with middleware. Two groups (#6250): `public` carries the
+    // surfaces that authenticate some other way (localhost gate, pairing
+    // handshake, webhook signatures, per-connection WS/ACP checks) or are
+    // deliberately unauthenticated (health, OpenAPI docs, A2A discovery
+    // cards). `protected` carries the whole dashboard API and gets the
+    // pairing/bearer check structurally via `route_layer`, so a handler
+    // added there cannot forget auth.
+    let public = Router::new()
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
@@ -1694,185 +1997,9 @@ pub async fn run_gateway(
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
-        // ── Web Dashboard API routes ──
-        .route("/api/status", get(api::handle_api_status))
-        .route("/api/logs", get(api_logs::handle_api_logs))
-        .route(
-            "/api/config",
-            get(api_config::handle_config_get)
-                .patch(api_config::handle_patch)
-                .options(api_config::handle_options_config),
-        )
-        .route(
-            "/api/config/prop",
-            get(api_config::handle_prop_get)
-                .put(api_config::handle_prop_put)
-                .delete(api_config::handle_prop_delete)
-                .options(api_config::handle_options_prop),
-        )
-        .route("/api/config/list", get(api_config::handle_list))
-        .route(
-            "/api/sops",
-            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
-        )
-        .route(
-            "/api/sops/{name}",
-            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
-        )
-        .route(
-            "/api/sops/{name}/graph",
-            get(api_sop_author::handle_sop_graph),
-        )
-        .route(
-            "/api/sops/{name}/run",
-            post(api_sop_author::handle_sop_run),
-        )
-        .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
-        .route(
-            "/api/sops/{name}/full",
-            get(api_sop_author::handle_sop_full),
-        )
-        .route(
-            "/api/sops/wire-draft",
-            post(api_sop_author::handle_sop_wire_draft),
-        )
-        .route(
-            "/api/sops/graph-draft",
-            post(api_sop_author::handle_sop_graph_draft),
-        )
-        .route(
-            "/api/sops/trigger-sources",
-            get(api_sop_author::handle_sop_trigger_sources),
-        )
-        .route(
-            "/api/sops/graph-legend",
-            get(api_sop_author::handle_sop_graph_legend),
-        )
-        .route(
-            "/api/tools/param-options",
-            post(api_sop_author::handle_tools_param_options),
-        )
-        .route(
-            "/api/sops/{name}/runs/{run_id}/overlay",
-            get(api_sop_author::handle_sop_run_overlay),
-        )
-        .route(
-            "/api/sops/{name}/runs/{run_id}/decide",
-            post(api_sop_author::handle_sop_decide),
-        )
-        .route("/api/config/drift", get(api_config::handle_drift))
-        .route(
-            "/api/config/reload-status",
-            get(api_config::handle_reload_status),
-        )
-        .route("/api/config/templates", get(api_config::handle_templates))
-        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
-        .route(
-            "/api/config/resolve-alias-source",
-            get(api_config::handle_resolve_alias_source),
-        )
-        .route(
-            "/api/config/map-key",
-            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
-        )
-        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
-        .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
-            post(api_config::handle_refresh_context_window),
-        )
-        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
-        .route("/api/config/catalog", get(api_sections::handle_catalog))
-        .route(
-            "/api/config/catalog/models",
-            get(api_sections::handle_catalog_models),
-        )
-        .route("/api/config/status", get(api_sections::handle_section_status))
-        .route(
-            "/api/config/agent-options",
-            get(api_sections::handle_agent_options),
-        )
-        .route("/api/config/sections", get(api_sections::handle_sections))
-        .route(
-            "/api/config/sections/{section}",
-            get(api_sections::handle_section_picker),
-        )
-        .route(
-            "/api/config/sections/{section}/items/{key}",
-            post(api_sections::handle_section_select),
-        )
-        .route("/api/personality", get(api_personality::handle_index))
-        .route(
-            "/api/quickstart/state",
-            get(api_quickstart::handle_state),
-        )
-        .route(
-            "/api/quickstart/fields",
-            post(api_quickstart::handle_fields),
-        )
-        .route(
-            "/api/quickstart/validate",
-            post(api_quickstart::handle_validate),
-        )
-        .route(
-            "/api/quickstart/apply",
-            post(api_quickstart::handle_apply),
-        )
-        .route(
-            "/api/quickstart/dismiss",
-            post(api_quickstart::handle_dismiss),
-        )
-        .route(
-            "/api/personality/templates",
-            get(api_personality::handle_templates),
-        )
-        .route(
-            "/api/personality/{filename}",
-            get(api_personality::handle_get).put(api_personality::handle_put),
-        )
-        .route("/api/browse", get(api_browse::handle_browse))
-        .route("/api/browse/mkdir", post(api_browse::handle_browse_mkdir))
-        .route("/api/browse/rmdir", delete(api_browse::handle_browse_rmdir))
-        .route(
-            "/api/agents/{alias}/workspace/list",
-            get(api_browse::handle_agent_workspace_list),
-        )
-        .route(
-            "/api/agents/{alias}/workspace/read",
-            get(api_browse::handle_agent_workspace_read),
-        )
-        .route(
-            "/api/agents/{alias}/workspace/path",
-            delete(api_browse::handle_agent_workspace_delete),
-        )
-        .route(
-            "/api/agents/{alias}/workspace/move",
-            post(api_browse::handle_agent_workspace_move),
-        )
-        .route(
-            "/api/agents/{alias}/workspace/mkdir",
-            post(api_browse::handle_agent_workspace_mkdir),
-        )
-        .route(
-            "/api/agents/{alias}/skills",
-            get(api_skills::handle_agent_skills),
-        )
-        .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
-        .route(
-            "/api/skills/slash-option-kinds",
-            get(api_skills::handle_slash_option_kinds),
-        )
-        .route(
-            "/api/skills/bundles/{alias}/skills",
-            get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
-        )
-        .route(
-            "/api/skills/bundles/{alias}/skills/{name}",
-            get(api_skills::handle_read_skill)
-                .put(api_skills::handle_write_skill)
-                .delete(api_skills::handle_delete_skill),
-        )
-        .route("/api/config/init", post(api_config::handle_init))
-        .route("/api/config/migrate", post(api_config::handle_migrate))
+        // ── Pairing handshake (must run unauthenticated) ──
+        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        // ── OpenAPI spec + docs (unauthenticated by design) ──
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
@@ -1947,13 +2074,13 @@ pub async fn run_gateway(
         );
 
     #[cfg(feature = "a2a")]
-    let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
+    let public = public.merge(a2a::a2a_routes_with_endpoint(Some(
         a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
     )));
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
-    let inner = inner
+    let public = public
         .route(
             "/api/webauthn/register/start",
             post(api_webauthn::handle_register_start),
@@ -1981,12 +2108,12 @@ pub async fn run_gateway(
 
     // ── Plugin management API (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
+    let public = public.route(
         "/api/plugins",
         get(api_plugins::plugin_routes::list_plugins),
     );
 
-    let inner = inner
+    let public = public
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
@@ -2003,7 +2130,10 @@ pub async fn run_gateway(
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── SPA fallback: non-API GET requests serve index.html ──
-        .fallback(get(static_files::handle_spa_fallback))
+        .fallback(get(static_files::handle_spa_fallback));
+
+    let inner = public
+        .merge(protected_api_routes(state.clone()))
         .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -2015,8 +2145,12 @@ pub async fn run_gateway(
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
     // synchronous agent turn inline. Layers attached here travel with the
     // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::require_auth_middleware,
+        ));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
@@ -4412,6 +4546,106 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// #6250 route-layer pin: unauthenticated requests against the protected
+    /// dashboard router are rejected by the middleware itself with the same
+    /// error shape the old per-handler blocks returned, valid bearers pass,
+    /// and CORS preflight stays exempt. Handlers no longer carry their own
+    /// check, so this layer IS the auth boundary.
+    mod protected_router_auth {
+        use super::*;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "route-layer-test-token";
+
+        fn paired_router() -> Router {
+            let mut state = api::test_state(zeroclaw_config::schema::Config::default());
+            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            protected_api_routes(state.clone()).with_state(state)
+        }
+
+        async fn response_for(
+            router: Router,
+            method: &str,
+            uri: &str,
+            bearer: Option<&str>,
+        ) -> axum::response::Response {
+            let mut req = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(token) = bearer {
+                req = req.header("authorization", format!("Bearer {token}"));
+            }
+            router
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .expect("router response")
+        }
+
+        #[tokio::test]
+        async fn unauthenticated_request_is_rejected_with_pairing_error_shape() {
+            // One representative route per formerly-per-handler module.
+            for uri in [
+                "/api/status",
+                "/api/config",
+                "/api/config/sections",
+                "/api/browse",
+                "/api/skills/bundles",
+                "/api/personality",
+                "/api/quickstart/state",
+                "/api/logs",
+                "/api/devices",
+                "/api/canvas",
+                "/api/events/history",
+            ] {
+                let response = response_for(paired_router(), "GET", uri, None).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "expected 401 for unauthenticated GET {uri}"
+                );
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&body)
+                    .unwrap_or_else(|_| panic!("non-JSON 401 body for {uri}"));
+                assert!(
+                    json["error"]
+                        .as_str()
+                        .is_some_and(|e| e.contains("pair first")),
+                    "401 body for {uri} lost the pairing hint: {json}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn invalid_bearer_is_rejected() {
+            let response =
+                response_for(paired_router(), "GET", "/api/status", Some("wrong-token")).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn valid_bearer_passes_the_layer() {
+            let response = response_for(paired_router(), "GET", "/api/status", Some(TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn cors_preflight_is_exempt_from_auth() {
+            let response = response_for(paired_router(), "OPTIONS", "/api/config", None).await;
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "OPTIONS must bypass the auth layer for CORS preflight"
+            );
+        }
+
+        #[tokio::test]
+        async fn pairing_disabled_allows_unauthenticated_requests() {
+            let state = api::test_state(zeroclaw_config::schema::Config::default());
+            let router = protected_api_routes(state.clone()).with_state(state);
+            let response = response_for(router, "GET", "/api/status", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};

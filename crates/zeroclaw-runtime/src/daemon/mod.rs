@@ -630,6 +630,86 @@ pub async fn run(
             None
         };
 
+        let auth_registry: Option<
+            std::sync::Arc<crate::security::auth_provider::ProviderRegistry>,
+        > = if config.wss.enabled
+            || !config.users.is_empty()
+            || !config.oidc.is_empty()
+            || !config.gateway.paired_tokens.is_empty()
+        {
+            use crate::security::auth_provider::{
+                NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
+                RosterUser, SshKeyAuthProvider, UserRoster,
+            };
+            if config.wss.enabled
+                && config.gateway.paired_tokens.is_empty()
+                && config.oidc.is_empty()
+                && config.users.is_empty()
+            {
+                anyhow::bail!(
+                    "wss is enabled but no auth provider can resolve a remote credential: \
+                     no gateway pairing token exists, no [oidc.<alias>] issuer is \
+                     configured, and no [users.<name>] roster entry exists. Pair a \
+                     client, configure an OIDC issuer or user roster, or disable [wss]."
+                );
+            }
+            let profiles: std::sync::Arc<
+                std::collections::HashMap<String, zeroclaw_api::grants::ResolvedGrants>,
+            > = std::sync::Arc::new(
+                config
+                    .permission_profiles
+                    .iter()
+                    .map(|(alias, profile)| (alias.clone(), profile.resolve()))
+                    .collect(),
+            );
+            let roster: std::sync::Arc<UserRoster> = std::sync::Arc::new(
+                config
+                    .users
+                    .iter()
+                    .filter_map(|(name, user)| {
+                        profiles.get(&user.permission_profile).map(|grants| {
+                            (
+                                name.clone(),
+                                RosterUser {
+                                    authorized_keys: user.authorized_keys.clone(),
+                                    uid: user.uid,
+                                    grants: grants.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+            );
+            let mut registry = ProviderRegistry::new();
+            registry.register(std::sync::Arc::new(
+                PeercredAuthProvider::for_current_process().with_roster(roster.clone()),
+            ));
+            if !roster.is_empty() {
+                registry.register(std::sync::Arc::new(SshKeyAuthProvider::new(roster)));
+            }
+            for (alias, oidc_config) in &config.oidc {
+                registry.register(std::sync::Arc::new(OidcAuthProvider::new(
+                    format!("oidc.{alias}"),
+                    oidc_config.clone(),
+                    profiles.clone(),
+                )?));
+            }
+            if !config.gateway.paired_tokens.is_empty() {
+                registry.register(std::sync::Arc::new(NativeAuthProvider::from_paired_tokens(
+                    &config.gateway.paired_tokens,
+                )));
+            }
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"providers": registry.names()})),
+                "RPC auth provider registry enabled"
+            );
+            Some(std::sync::Arc::new(registry))
+        } else {
+            None
+        };
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             sessions,
@@ -653,6 +733,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             hooks,
+            auth_registry,
         }))
     } else {
         None

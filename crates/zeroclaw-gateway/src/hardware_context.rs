@@ -42,31 +42,9 @@ use tokio::io::AsyncWriteExt as _;
 /// Maximum bytes allowed in a single append payload.
 const MAX_APPEND_BYTES: usize = 32_768; // 32 KB
 
-// ── Auth helper (re-uses the pattern from api.rs) ─────────────────────────────
+// ── Auth: canonical helper from api.rs ────────────────────────────────────────
 
-fn require_auth(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if !state.pairing.require_pairing() {
-        return Ok(());
-    }
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if state.pairing.is_authenticated(token) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            })),
-        ))
-    }
-}
+use crate::api::require_auth;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 

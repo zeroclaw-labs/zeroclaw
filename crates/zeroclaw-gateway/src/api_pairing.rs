@@ -383,25 +383,8 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
-    if state.pairing.require_pairing() {
-        let token = extract_bearer(headers).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
-        }
-    }
-    Ok(())
-}
-
 /// POST /api/pairing/initiate — initiate a new pairing session
-pub async fn initiate_pairing(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn initiate_pairing(State(state): State<AppState>) -> impl IntoResponse {
     match state.pairing.generate_new_pairing_code() {
         Some(code) => Json(serde_json::json!({
             "pairing_code": code,
@@ -537,11 +520,7 @@ pub async fn submit_pairing_enhanced(
 }
 
 /// GET /api/devices — list paired devices
-pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
     let devices = match state.device_registry.as_ref() {
         Some(r) => match r.list() {
             Ok(devices) => devices,
@@ -574,13 +553,8 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
 /// DELETE /api/devices/{id} — revoke a paired device and its bearer token.
 pub async fn revoke_device(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(registry) = state.device_registry.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -632,10 +606,6 @@ pub async fn update_my_capabilities(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let token = match extract_bearer(&headers) {
         Some(t) => t,
         None => return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
@@ -696,13 +666,8 @@ pub async fn update_my_capabilities(
 /// is the intended path for "rotate my own token after I think it leaked."
 pub async fn rotate_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(registry) = state.device_registry.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

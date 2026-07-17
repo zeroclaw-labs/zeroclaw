@@ -155,6 +155,10 @@ impl RpcTransport for WssTransport {
     fn peer_label(&self) -> String {
         self.peer_label.clone()
     }
+
+    fn kind(&self) -> crate::rpc::transport::TransportKind {
+        crate::rpc::transport::TransportKind::Wss
+    }
 }
 
 // ── TLS acceptor ─────────────────────────────────────────────────

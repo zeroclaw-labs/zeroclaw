@@ -885,6 +885,7 @@ mod tests {
             channel_id: channel_id.map(str::to_string),
             room_id: None,
             sender_id: None,
+            principal_id: None,
         }
     }
 

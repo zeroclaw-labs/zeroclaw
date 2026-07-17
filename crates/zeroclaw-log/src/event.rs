@@ -167,6 +167,7 @@ pub const ATTRIBUTION_FIELDS: &[&str] = &[
     "model",
     "embedding_provider",
     "owner_tui_id",
+    "principal_id",
     "system_alias",
 ];
 
@@ -180,6 +181,7 @@ pub const COMPOSITE_PREFIXES: &[&str] = &[
     "tts_provider",
     "transcription_provider",
     "tunnel_provider",
+    "auth_provider",
 ];
 
 /// Derive the `_type` decomposed key for a composite prefix. Single source
@@ -608,6 +610,23 @@ mod tests {
         assert!(is_attribution_field("model_provider_alias"));
         assert!(is_attribution_field("agent_alias"));
         assert!(!is_attribution_field("not_a_real_field"));
+    }
+
+    #[test]
+    fn is_attribution_field_recognises_principal_fields() {
+        assert!(is_attribution_field("principal_id"));
+        assert!(is_attribution_field("auth_provider"));
+        assert!(is_attribution_field("auth_provider_type"));
+        assert!(is_attribution_field("auth_provider_alias"));
+    }
+
+    #[test]
+    fn set_composite_splits_auth_provider() {
+        let mut attribution = ZeroclawAttribution::default();
+        attribution.set_composite("auth_provider", "oidc.corp");
+        assert_eq!(attribution.get("auth_provider"), Some("oidc.corp"));
+        assert_eq!(attribution.get("auth_provider_type"), Some("oidc"));
+        assert_eq!(attribution.get("auth_provider_alias"), Some("corp"));
     }
 
     #[test]
