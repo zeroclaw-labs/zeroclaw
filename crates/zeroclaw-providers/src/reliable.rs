@@ -207,6 +207,9 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     // Heuristic: detect auth/model failures by keyword when no HTTP status
     // is available (e.g. gRPC or custom transport errors).
     let msg_lower = msg.to_lowercase();
+    if msg_lower.contains("hailo-ollama provider is quarantined") {
+        return true;
+    }
     let auth_failure_hints = [
         "invalid api key",
         "incorrect api key",
@@ -2719,6 +2722,9 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::Error::msg("connection reset")));
         assert!(!is_non_retryable(&anyhow::Error::msg(
             "model overloaded, try again later"
+        )));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "Hailo-Ollama provider is quarantined after an ambiguous request timeout"
         )));
         // Context window errors are now recoverable (not non-retryable)
         assert!(!is_non_retryable(&anyhow::Error::msg(

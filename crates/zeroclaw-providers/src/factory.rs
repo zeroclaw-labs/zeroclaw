@@ -383,22 +383,23 @@ use zeroclaw_config::schema::{
     DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
     FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    GlmModelProviderConfig, GroqModelProviderConfig, HailoOllamaEndpoint,
+    HailoOllamaModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
+    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    ModelEndpoint, MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 /// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
@@ -1090,6 +1091,74 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
             build_ollama_compat_provider(alias, key, api_url, opts),
             opts,
         ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if has_api_key(key) {
+            anyhow::bail!("Hailo-Ollama does not support API-key authentication");
+        }
+        if !opts.extra_headers.is_empty() {
+            anyhow::bail!("Hailo-Ollama does not support extra_headers");
+        }
+        if opts.tls_ca_cert_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support tls_ca_cert_path");
+        }
+        if opts.think == Some(true) {
+            anyhow::bail!("Hailo-Ollama does not support think=true");
+        }
+        if opts.provider_extra.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support provider_extra");
+        }
+        if opts.api_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support api_path");
+        }
+        if opts.wire_api.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support wire_api overrides");
+        }
+        if opts.chat_template_kwargs.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support chat_template_kwargs");
+        }
+        if opts.native_tools == Some(true) {
+            anyhow::bail!("Hailo-Ollama does not support native tool calling");
+        }
+
+        let max_tokens = opts
+            .provider_max_tokens
+            .map_or(crate::ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
+                i32::try_from(value).unwrap_or(i32::MAX)
+            });
+        let tuning = crate::ollama::OllamaTuning {
+            num_ctx: self
+                .base
+                .context_window
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+                .unwrap_or(crate::ollama::HAILO_DEFAULT_NUM_CTX),
+            num_predict: max_tokens,
+            temperature_override: None,
+        };
+        let endpoint = HailoOllamaEndpoint::default();
+        let base_url = api_url.unwrap_or_else(|| endpoint.uri());
+        Ok(Box::new(crate::ollama::OllamaModelProvider::new_hailo(
+            alias,
+            Some(base_url),
+            opts.provider_timeout_secs
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            self.queue_timeout_secs
+                .unwrap_or(crate::ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
+            tuning,
+        )?))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
