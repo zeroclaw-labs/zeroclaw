@@ -91,7 +91,15 @@ pub(crate) async fn execute(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+#[path = "platform_linux.rs"]
+mod platform;
+
+#[cfg(target_os = "windows")]
+#[path = "platform_windows.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod platform {
     use super::*;
 
@@ -108,7 +116,7 @@ mod platform {
         ) -> Result<ResponseData, ProtocolError> {
             Err(ProtocolError::new(
                 ErrorCode::UnsupportedPlatform,
-                "computer use is not implemented on this platform; Linux and Windows backends fail closed",
+                "computer use is not implemented on this platform",
                 false,
             ))
         }
@@ -2163,7 +2171,10 @@ function run(argv) {
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(all(
+    test,
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
 mod tests {
     use super::*;
     use crate::computer_use::protocol::{Action, PROTOCOL_VERSION, Policy};

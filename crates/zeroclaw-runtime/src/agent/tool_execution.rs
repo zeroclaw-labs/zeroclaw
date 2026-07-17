@@ -55,7 +55,10 @@ fn find_activated_tool(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"tool": name})),
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "tool.activated_tool_lock_poisoned",
+                        "tool": name,
+                    })),
                 "activated-tool lock poisoned while resolving tool; recovering guard for read"
             );
             poisoned.into_inner()

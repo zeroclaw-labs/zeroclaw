@@ -182,7 +182,7 @@ define_actions! {
         modifiers: Vec<KeyModifier>,
         expected_application: String,
     },
-    /// Find exactly one accessibility element and invoke its AXPress action.
+    /// Find exactly one accessibility element and invoke its native action.
     PressElement => "press_element", confirmation = true, model_required = ["application", "title"] {
         application: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,7 +243,7 @@ impl Request {
 pub struct Policy {
     /// Whether application access is exact-allowlist or desktop-wide.
     pub application_access: ComputerUseApplicationAccess,
-    /// Exact application names or bundle identifiers admitted for this call.
+    /// Exact application names or stable identifiers admitted for this call.
     pub allowed_applications: Vec<String>,
     /// Inclusive minimum global x coordinate.
     pub min_coordinate_x: Option<i64>,
@@ -290,7 +290,7 @@ impl Policy {
         Ok(())
     }
 
-    /// Whether an identity supplied by macOS matches this policy exactly.
+    /// Whether an identity supplied by the platform backend matches exactly.
     #[must_use]
     pub fn allows(&self, application: &ApplicationIdentity) -> bool {
         self.application_access == ComputerUseApplicationAccess::Desktop
@@ -653,7 +653,7 @@ define_keys! {
 pub struct ApplicationIdentity {
     /// Process display name.
     pub name: String,
-    /// Bundle identifier when macOS reports one.
+    /// Stable bundle/application identifier when the platform reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
     /// Operating-system process identifier.
@@ -676,14 +676,14 @@ impl ApplicationIdentity {
 /// Identity namespace selected by an application allowlist entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationSelectorKind {
-    /// Reverse-DNS-style bundle identifier; only `bundle_id` may match.
+    /// Reverse-DNS-style application identifier; only `bundle_id` may match.
     BundleIdentifier,
     /// Human-visible process/application name; only `name` may match.
     DisplayName,
 }
 
 /// Classify one exact application selector without cross-matching identity
-/// namespaces. Dotted reverse-DNS-shaped values are bundle identifiers.
+/// namespaces. Dotted reverse-DNS-shaped values are application identifiers.
 #[must_use]
 pub fn application_selector_kind(selector: &str) -> ApplicationSelectorKind {
     let mut segments = selector.split('.');
@@ -759,7 +759,7 @@ pub struct AccessibilitySnapshot {
     pub max_depth: u32,
 }
 
-/// Summary of an element selected for `AXPress`.
+/// Summary of an element selected for a native press/invoke action.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElementSummary {
@@ -779,9 +779,9 @@ pub struct ElementSummary {
 pub enum Platform {
     /// Apple macOS.
     Macos,
-    /// Linux desktop (future backend).
+    /// Linux desktop.
     Linux,
-    /// Microsoft Windows (future backend).
+    /// Microsoft Windows.
     Windows,
 }
 

@@ -75,6 +75,9 @@ required-features = ["acp-bridge"]
 name = "zeroclaw"
 path = "src/lib.rs"
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [dependencies]
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
@@ -394,7 +397,7 @@ dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
-computer-use = ["agent-runtime", "zeroclaw-tools/computer-use", "zeroclaw-runtime/computer-use"]
+computer-use = ["agent-runtime", "zeroclaw-runtime/computer-use"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]

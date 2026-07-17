@@ -73,9 +73,13 @@ build_kernel() {
     return
   fi
   local build_args=(--profile "$PROFILE" --bin zeroclaw)
-  # The native backend is macOS-only today. Bundle it into Apple desktop
-  # kernels without advertising an unsupported tool in Linux/Windows builds.
-  [[ "$triple" == *-apple-darwin ]] && build_args+=(--features computer-use)
+  # Bundle the native backend only for supported desktop targets. Android is
+  # intentionally excluded even though its target triples contain `linux`.
+  case "$triple" in
+    *-apple-darwin|*-linux-gnu*|*-windows-msvc)
+      build_args+=(--features computer-use)
+      ;;
+  esac
   build_args+=(--target "$triple")
   printf 'prepare-kernel: cargo build' >&2
   printf ' %q' "${build_args[@]}" >&2

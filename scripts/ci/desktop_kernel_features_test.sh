@@ -63,8 +63,9 @@ assert_feature_selection() {
 
 assert_feature_selection aarch64-apple-darwin 1
 assert_feature_selection x86_64-apple-darwin 1
-assert_feature_selection x86_64-unknown-linux-gnu 0
-assert_feature_selection x86_64-pc-windows-msvc 0
+assert_feature_selection x86_64-unknown-linux-gnu 1
+assert_feature_selection x86_64-pc-windows-msvc 1
+assert_feature_selection aarch64-linux-android 0
 
 # Supplying a prebuilt kernel must continue to bypass Cargo and its feature
 # selection entirely.

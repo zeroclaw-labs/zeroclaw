@@ -1,0 +1,2 @@
+#define RT_MANIFEST 24
+1 RT_MANIFEST "apps/tauri/windows/app.manifest"

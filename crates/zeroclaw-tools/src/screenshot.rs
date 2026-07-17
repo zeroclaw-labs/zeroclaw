@@ -29,7 +29,8 @@ const MAX_SCREENSHOT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 ///
 /// Cleanup stays armed until the complete screenshot has been verified and the
 /// caller explicitly retains it. The drop implementation only unlinks the path
-/// when it still names this held inode, so a replacement path is never removed.
+/// when it still names this held OS file identity, so a replacement path is
+/// never removed.
 pub(crate) struct ScreenshotReservation {
     path: PathBuf,
     file: Option<std::fs::File>,
@@ -77,8 +78,27 @@ impl ScreenshotReservation {
                 anyhow::bail!("screenshot destination is not the reserved private file");
             }
         }
+        #[cfg(windows)]
+        if !self.path_matches_held_file()? {
+            anyhow::bail!("screenshot destination is not the reserved file");
+        }
 
         Ok(file_metadata)
+    }
+
+    #[cfg(windows)]
+    fn path_matches_held_file(&self) -> Result<bool> {
+        let held_file = self
+            .file
+            .as_ref()
+            .context("screenshot reservation is closed")?
+            .try_clone()
+            .context("clone reserved screenshot file for identity check")?;
+        let held = same_file::Handle::from_file(held_file)
+            .context("inspect reserved screenshot file identity")?;
+        let path = same_file::Handle::from_path(&self.path)
+            .context("inspect reserved screenshot path identity")?;
+        Ok(held == path)
     }
 
     pub(crate) async fn replace_from_bounded_reader<R>(
@@ -150,9 +170,10 @@ impl Drop for ScreenshotReservation {
                         && file.ino() == path.ino()
                 })
         };
-        #[cfg(not(unix))]
-        let should_remove = std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.file_type().is_file());
+        #[cfg(windows)]
+        let should_remove = self.path_matches_held_file().unwrap_or(false);
+        #[cfg(not(any(unix, windows)))]
+        let should_remove = false;
 
         drop(self.file.take());
         if should_remove {
@@ -703,7 +724,7 @@ impl ScreenshotTool {
         }
     }
 
-    /// Read the held screenshot inode and return a base64-encoded result.
+    /// Read the held screenshot file and return a base64-encoded result.
     async fn read_and_encode(reservation: &ScreenshotReservation) -> anyhow::Result<ToolResult> {
         // Check file size before reading to prevent OOM on large screenshots
         const MAX_RAW_BYTES: u64 = 1_572_864; // ~1.5 MB (base64 expands ~33%)
@@ -1092,7 +1113,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reservation_is_private_and_drop_removes_only_its_held_inode() {
+    async fn reservation_is_private_and_drop_removes_only_its_held_file() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let workspace = tempfile::tempdir().unwrap();
@@ -1108,9 +1129,10 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn replacement_is_rejected_and_never_overwritten_or_unlinked() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let workspace = tempfile::tempdir().unwrap();
@@ -1120,6 +1142,7 @@ mod tests {
         let destination = reservation.path().to_path_buf();
         std::fs::remove_file(&destination).unwrap();
         std::fs::write(&destination, b"replacement").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let staging = private_capture_staging().unwrap();
