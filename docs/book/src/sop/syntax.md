@@ -43,6 +43,8 @@ Parser behavior:
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- when:` guards an explicit `- next:` jump; when the condition is false, the
+  run advances to the next linear step (`current_step + 1`) instead of completing.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
