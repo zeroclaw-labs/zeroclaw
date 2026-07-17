@@ -3,11 +3,6 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// Pinggy Tunnel — uses SSH to expose a local port via pinggy.io.
-///
-/// No separate binary required — uses the system `ssh` command.
-/// Free tier works without a token; Pro features require a token
-/// from dashboard.pinggy.io.
 pub struct PinggyTunnel {
     token: Option<String>,
     region: Option<String>,

@@ -1,15 +1,5 @@
 //! Hand-maintained mirrors for every type that crosses the JSON-RPC
 //! wire between `zerocode` and the ZeroClaw daemon.
-//!
-//! These mirrors exist so `apps/zerocode/Cargo.toml` carries zero
-//! `zeroclaw-*` crate dependencies. The TUI talks JSON-RPC
-//! to whatever daemon is at the configured address; the wire shape is
-//! the contract, not a shared Rust type.
-//!
-//! Some mirrors here are unused by the running TUI today — they
-//! exist to lock the wire contract for every type the daemon emits
-//! so that adding a new use-site in the TUI doesn't have to re-derive
-//! the shape from scratch and risk drift.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -162,6 +152,8 @@ pub struct QuickstartState {
     pub agents: Vec<String>,
     pub risk_profiles: Vec<String>,
     pub runtime_profiles: Vec<String>,
+    #[serde(default)]
+    pub default_runtime_profile: Option<String>,
     pub model_providers: Vec<String>,
     pub channels: Vec<String>,
     #[serde(default)]
@@ -196,6 +188,8 @@ pub struct QuickstartTypeOption {
     pub display_name: String,
     #[serde(default)]
     pub local: bool,
+    #[serde(default)]
+    pub default_runtime_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -470,14 +464,6 @@ pub struct FsStatError {
 /// just forwards them.
 pub type RawValue = Value;
 
-// ── Elicitation wire shapes (ACP `elicitation/create` RFD) ─────
-//
-// Mirrors of `zeroclaw_api::elicitation::*`. Carried locally so
-// `apps/zerocode/Cargo.toml` stays free of `zeroclaw-*` crate deps.
-// Wire keys are camelCase to match the daemon (and the upstream ACP
-// RFD); the channel that emits these requests is `RpcApprovalChannel`
-// in the daemon, which uses the shared `zeroclaw_api` types.
-
 /// Mode discriminator for an outbound `elicitation/create` request.
 /// Phase 1 of the rollout only emits `Form`; `Url` is on the wire
 /// for future use.
@@ -739,13 +725,6 @@ mod elicitation_wire_tests {
         assert!(ElicitationShape::from_schema(&schema).is_none());
     }
 }
-
-// ── TodoWrite plan wire shapes (mirror of the daemon's plan entry) ───
-//
-// Carried locally so `apps/zerocode/Cargo.toml` stays free of
-// `zeroclaw-*` crate deps. Field casing matches the daemon exactly:
-// snake-case status/priority values (`in_progress`), `activeForm` for
-// the optional extension.
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

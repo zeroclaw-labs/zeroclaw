@@ -1,14 +1,4 @@
 //! AardvarkTransport — implements the Transport trait for Total Phase Aardvark USB adapters.
-//!
-//! The Aardvark is NOT a microcontroller firmware target; it is a USB bridge
-//! that speaks I2C / SPI / GPIO directly.  Unlike [`HardwareSerialTransport`],
-//! this transport interprets [`ZcCommand`] locally and calls the Aardvark C
-//! library (via [`aardvark_sys`]) rather than forwarding JSON over a serial wire.
-//!
-//! Lazy-open strategy: a fresh [`aardvark_sys::AardvarkHandle`] is opened at
-//! the start of each [`send`](AardvarkTransport::send) call and automatically
-//! closed (dropped) before the call returns.  No persistent handle is held,
-//! matching the design of [`HardwareSerialTransport`].
 
 use super::protocol::{ZcCommand, ZcResponse};
 use super::transport::{Transport, TransportError, TransportKind};
@@ -16,7 +6,6 @@ use aardvark_sys::AardvarkHandle;
 use async_trait::async_trait;
 
 /// Transport implementation for Total Phase Aardvark USB adapters.
-///
 /// Supports I2C, SPI, and direct GPIO operations via the Aardvark C library.
 pub struct AardvarkTransport {
     /// Aardvark port index (0 = first available adapter).
@@ -27,7 +16,6 @@ pub struct AardvarkTransport {
 
 impl AardvarkTransport {
     /// Create a new transport for the given port and bitrate.
-    ///
     /// The port number matches the index returned by
     /// [`AardvarkHandle::find_devices`].
     pub fn new(port: i32, bitrate_khz: u32) -> Self {
