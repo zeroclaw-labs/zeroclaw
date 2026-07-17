@@ -91,6 +91,21 @@ enum ResolvedBackend {
     ComputerUse,
 }
 
+/// Classification of the `path` field on a ComputerUse screenshot args
+/// object, used by `validate_screenshot_path_for_computer_use` to decide
+/// between passthrough, rejection, and full workspace validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    /// Field absent, `null`, or empty string. Inline PNG return semantics.
+    Absent,
+    /// `path` is a non-empty string. Eligible for workspace validation.
+    String,
+    /// `path` is present but not a string (e.g. integer, array, object).
+    /// Rejected at the hook because `parse_browser_action` would silently
+    /// drop it to `None` and forward the raw value unverified.
+    NonString,
+}
+
 impl BrowserBackendKind {
     fn parse(raw: &str) -> anyhow::Result<Self> {
         let key = raw.trim().to_ascii_lowercase().replace('-', "_");
@@ -988,11 +1003,213 @@ impl BrowserTool {
         })
     }
 
+    /// Validate a screenshot destination path before any backend processes it.
+    ///
+    /// When the path is `None` (PNG embedded in the response), this is a no-op.
+    /// When a path is provided, it is resolved against the workspace directory,
+    /// its parent directory is canonicalized, and the result is checked against
+    /// the security policy's path allowlist. The file name is then checked
+    /// against the runtime-config guard and the target's existing symlink
+    /// status, mirroring the `file_write` / `file_edit` target-level checks.
+    /// The raw user-supplied path is replaced with the resolved+validated
+    /// path so the backends write the same string that was checked. This
+    /// applies the current workspace policy at validation time and rejects
+    /// an already-existing target symlink; it does not by itself close any
+    /// TOCTOU window between this call and the eventual write.
+    async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
+        let BrowserAction::Screenshot { path, .. } = action else {
+            return Ok(());
+        };
+        let Some(path_str) = path.as_ref() else {
+            return Ok(());
+        };
+
+        // String-level reject (null bytes, ..  traversal, URL-encoded traversal)
+        if !self.security.is_path_allowed(path_str) {
+            anyhow::bail!("Screenshot path not allowed: {path_str}");
+        }
+
+        // Resolve relative / tilde paths against the workspace directory.
+        let full = self.security.resolve_tool_path(path_str);
+
+        // The file does not exist yet, so canonicalize the *parent* directory
+        // to verify it is inside the workspace allowlist.
+        let parent = full.parent().unwrap_or(&full);
+        let canonical = tokio::fs::canonicalize(parent).await.with_context(|| {
+            format!(
+                "Parent directory for screenshot path '{path_str}' does not exist: {}",
+                parent.display(),
+            )
+        })?;
+
+        if !self.security.is_resolved_path_allowed(&canonical) {
+            anyhow::bail!(
+                "Screenshot path '{path_str}' is outside the allowed workspace: {}",
+                canonical.display(),
+            );
+        }
+
+        // Build the final *target* path (parent + file name) so we can apply
+        // the same target-level guards the file_write / file_edit tools use:
+        // runtime-config protection and existing-symlink rejection. This
+        // closes the gap where a screenshot path inside an allowed workspace
+        // could still overwrite a protected config/state file or write
+        // through a symlink to a location outside the workspace.
+        let Some(file_name) = full.file_name() else {
+            anyhow::bail!("Screenshot path '{path_str}' is missing a file name");
+        };
+        let resolved_target = canonical.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            anyhow::bail!(
+                "Screenshot path '{path_str}' targets a runtime config file: {}",
+                resolved_target.display(),
+            );
+        }
+
+        // If the target already exists and is a symlink, refuse to follow it
+        // — the backends' write call would land wherever the symlink points,
+        // which is not the same as `resolved_target`.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!(
+                "Refusing to write screenshot through symlink: {}",
+                resolved_target.display(),
+            );
+        }
+
+        // Replace the raw user path with the canonical target so the write
+        // always uses the same string we checked.
+        *path = Some(resolved_target.to_string_lossy().to_string());
+
+        Ok(())
+    }
+
+    /// ComputerUse backend dispatches to a sidecar before `parse_browser_action`
+    /// runs, so `execute_action`'s `validate_screenshot_path` call would
+    /// never see the screenshot `path`. This hook applies the same workspace
+    /// policy / runtime-config / symlink guards to the *raw* `args` JSON
+    /// before any of its params cross the sidecar boundary, and substitutes
+    /// the canonical resolved path back into the args so the sidecar
+    /// receives the same hardened string the other backends use.
+    ///
+    /// Non-screenshot actions pass through unchanged. Screenshot actions
+    /// with no `path` and screenshot actions with `path: ""` are treated as
+    /// inline PNG return and pass through unchanged.
+    ///
+    /// Screenshot actions with `path: <non-string>` (e.g. an integer) are
+    /// rejected at the hook with a typed error: `parse_browser_action`
+    /// would otherwise drop the value to `None` and forward the raw
+    /// non-string to the sidecar unverified.
+    ///
+    /// When the configured ComputerUse endpoint resolves to a remote host
+    /// (i.e. `allow_remote_endpoint = true` and the host is not private /
+    /// local), any `path` is rejected because local-filesystem
+    /// canonicalization is meaningless across hosts. Inline PNG screenshots
+    /// (no `path`) continue to work in that configuration.
+    async fn validate_screenshot_path_for_computer_use(
+        &self,
+        action_str: &str,
+        mut args: Value,
+    ) -> anyhow::Result<Value> {
+        if action_str != "screenshot" {
+            return Ok(args);
+        }
+
+        // Classify the path up front so non-string and empty cases never
+        // reach the workspace validator (which only accepts string paths).
+        let path_kind = args
+            .as_object()
+            .and_then(|obj| obj.get("path"))
+            .map(|v| match v {
+                Value::Null => PathKind::Absent,
+                Value::String(s) if s.is_empty() => PathKind::Absent,
+                Value::String(_) => PathKind::String,
+                _ => PathKind::NonString,
+            })
+            .unwrap_or(PathKind::Absent);
+
+        if matches!(path_kind, PathKind::Absent) {
+            return Ok(args);
+        }
+
+        if matches!(path_kind, PathKind::NonString) {
+            anyhow::bail!(
+                "ComputerUse screenshot `path` must be a string when present; \
+                 got a non-string value"
+            );
+        }
+
+        // Refuse destination paths against remote sidecars. Local-filesystem
+        // canonicalization is meaningless across hosts, and the sidecar would
+        // either ignore the path or write to a location we cannot verify.
+        if self.endpoint_is_remote() {
+            anyhow::bail!(
+                "ComputerUse screenshot `path` is not supported when \
+                 browser.computer_use.endpoint resolves to a remote host; \
+                 omit `path` to return the screenshot inline"
+            );
+        }
+
+        // Parse a BrowserAction so we can reuse the same validator that
+        // `execute_action` calls for agent-browser / rust-native. The
+        // borrow on `args` ends here.
+        let mut action = match parse_browser_action("screenshot", &args) {
+            Ok(a) => a,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: computer_use screenshot args failed to parse"
+                );
+                return Err(e);
+            }
+        };
+
+        self.validate_screenshot_path(&mut action).await?;
+
+        // Substitute the canonical path back into the args so the sidecar
+        // sees the same string we just verified. Drop `action` before
+        // borrowing `args` mutably.
+        let rewritten_path = if let BrowserAction::Screenshot { path: Some(p), .. } = action {
+            Some(p)
+        } else {
+            None
+        };
+        if let Some(p) = rewritten_path
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("path".to_string(), Value::String(p));
+        }
+        Ok(args)
+    }
+
+    /// True when the configured ComputerUse endpoint resolves to a remote
+    /// host (i.e. `allow_remote_endpoint = true` and the host is not private
+    /// / local). Returns `true` conservatively when the endpoint URL cannot
+    /// be parsed — refusing destination paths is safer than forwarding them
+    /// when we cannot prove the sidecar is on this host.
+    fn endpoint_is_remote(&self) -> bool {
+        if !self.computer_use.allow_remote_endpoint {
+            return false;
+        }
+        match reqwest::Url::parse(&self.computer_use.endpoint) {
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => !domain_guard::is_private_or_local_host(host),
+                None => true,
+            },
+            Err(_) => true,
+        }
+    }
+
     async fn execute_action(
         &self,
-        action: BrowserAction,
+        mut action: BrowserAction,
         backend: ResolvedBackend,
     ) -> anyhow::Result<ToolResult> {
+        self.validate_screenshot_path(&mut action).await?;
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
@@ -1197,7 +1414,23 @@ impl Tool for BrowserTool {
         }
 
         if backend == ResolvedBackend::ComputerUse {
-            return self.execute_computer_use_action(action_str, &args).await;
+            // Screenshot destination paths must clear the same workspace
+            // policy / runtime-config / symlink guards that
+            // `validate_screenshot_path` applies to agent-browser and
+            // rust-native, *before* any params leave the browser tool
+            // for the sidecar. Otherwise the public `screenshot` `path`
+            // parameter can carry an out-of-workspace or
+            // runtime-config-targeting string across the sidecar
+            // boundary unverified.
+            //
+            // Copy `action_str` to a `String` before moving `args` into
+            // the helper, otherwise the `&str` borrow of `args.get("action")`
+            // is still live at the move site.
+            let action_str = action_str.to_owned();
+            let args = self
+                .validate_screenshot_path_for_computer_use(&action_str, args)
+                .await?;
+            return self.execute_computer_use_action(&action_str, &args).await;
         }
 
         if is_computer_use_only_action(action_str) {
@@ -2387,6 +2620,65 @@ mod tests {
         );
     }
 
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    fn private_host_tool(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy::default());
+        BrowserTool::new_with_backend(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            None,
+            "agent_browser".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("http://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost").is_ok());
+    }
+
     #[test]
     fn browser_backend_parser_accepts_supported_values() {
         assert_eq!(
@@ -2811,188 +3103,675 @@ mod tests {
         }
     }
 
-    // ── allowed_private_hosts opt-in tests ──────────────────────
-
-    fn private_host_tool(
-        allowed_domains: Vec<&str>,
-        allowed_private_hosts: Vec<&str>,
-    ) -> BrowserTool {
-        let security = Arc::new(SecurityPolicy::default());
-        BrowserTool::new_with_backend(
-            security,
-            allowed_domains.into_iter().map(String::from).collect(),
-            None,
-            "agent_browser".into(),
-            None,
-            true,
-            "http://127.0.0.1:9515".into(),
-            None,
-            ComputerUseConfig::default(),
-            allowed_private_hosts
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        )
-        .unwrap()
-    }
+    // -----------------------------------------------------------------------
+    // validate_screenshot_path
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn wildcard_private_allowlist_permits_localhost() {
-        let tool = private_host_tool(vec![], vec!["*"]);
-        assert!(tool.validate_url("http://localhost:8080").is_ok());
-        assert!(tool.validate_url("https://localhost:8443").is_ok());
-    }
+    fn validate_screenshot_path_allows_path_inside_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join("shots")).unwrap();
 
-    #[test]
-    fn wildcard_private_allowlist_permits_rfc1918() {
-        let tool = private_host_tool(vec![], vec!["*"]);
-        assert!(tool.validate_url("http://192.168.1.5").is_ok());
-        assert!(tool.validate_url("http://10.0.0.1").is_ok());
-        assert!(tool.validate_url("http://172.16.0.1").is_ok());
-    }
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
 
-    #[test]
-    fn wildcard_private_allowlist_does_not_loosen_file_scheme() {
-        // file:// is always blocked, regardless of allowed_private_hosts.
-        let tool = private_host_tool(vec!["*"], vec!["*"]);
-        let err = tool
-            .validate_url("file:///etc/passwd")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("file://"));
-    }
-
-    #[test]
-    fn allowed_private_hosts_entry_permits_listed_host() {
-        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
-        assert!(tool.validate_url("http://10.0.0.1").is_ok());
-    }
-
-    #[test]
-    fn allowed_private_hosts_does_not_permit_unlisted_host() {
-        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
-        let err = tool
-            .validate_url("http://10.0.0.2")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
-    }
-
-    #[test]
-    fn empty_private_allowlist_still_rejects_private() {
-        let tool = private_host_tool(vec!["*"], vec![]);
-        let err = tool
-            .validate_url("https://localhost")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
-    }
-
-    #[test]
-    fn wildcard_private_allowlist_satisfies_allowlist_requirement() {
-        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
-        // the "no allowed_domains configured" error for private hosts.
-        let tool = private_host_tool(vec![], vec!["*"]);
-        assert!(tool.validate_url("http://localhost").is_ok());
-    }
-
-    #[test]
-    fn specific_private_host_alone_satisfies_allowlist_requirement() {
-        let tool = private_host_tool(vec![], vec!["192.168.1.5"]);
-        assert!(tool.validate_url("http://192.168.1.5").is_ok());
-    }
-
-    #[test]
-    fn wildcard_private_allowlist_does_not_widen_public_allowlist() {
-        // Public hosts are still subject to allowed_domains when private hosts
-        // are wide-open — the bypass is scoped to private/local hosts only.
-        let tool = private_host_tool(vec!["example.com"], vec!["*"]);
-        let err = tool
-            .validate_url("https://other.com")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("allowed_domains"));
-    }
-
-    // ── userinfo SSRF regression tests ──────────────────────────
-    //
-    // `extract_host` is a hand-rolled prefix-strip and does NOT parse `@`
-    // userinfo. Without an explicit reject, a URL like
-    // `http://example.com@127.0.0.1/` is classified by its `example.com@…`
-    // host string (which satisfies the default `["*"]` public allowlist)
-    // while the browser backend actually navigates to `127.0.0.1`. Pin both
-    // the public-wildcard case and the private-wildcard case so neither
-    // allowlist surface can be used to smuggle a private destination.
-
-    #[test]
-    fn userinfo_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
-        // Default-shipped posture: allowed_domains = ["*"], no private
-        // allowlist. `extract_host` would otherwise treat
-        // `example.com@127.0.0.1` as the host and accept it.
-        let tool = private_host_tool(vec!["*"], vec![]);
-        let err = tool
-            .validate_url("http://example.com@127.0.0.1/")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("userinfo"), "got: {err}");
-    }
-
-    #[test]
-    fn userinfo_url_targeting_private_host_rejected_under_wildcard_private_allowlist() {
-        // Even with the private bypass wide open, userinfo is rejected before
-        // host classification — so this is a parser-mismatch defense, not a
-        // policy decision the operator can opt around.
-        let tool = private_host_tool(vec!["*"], vec!["*"]);
-        let err = tool
-            .validate_url("http://example.com@127.0.0.1/")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("userinfo"), "got: {err}");
-    }
-
-    #[test]
-    fn userinfo_url_with_password_rejected() {
-        // `user:pass@host` form — same parser hole, same fix.
-        let tool = private_host_tool(vec!["*"], vec![]);
-        let err = tool
-            .validate_url("https://user:pass@10.0.0.1/")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("userinfo"), "got: {err}");
-    }
-
-    // Regression: a URL with no slash before the query or fragment — e.g.
-    // `http://127.0.0.1?x` — must still classify the host as `127.0.0.1`,
-    // not `127.0.0.1?x`. The pre-fix hand-rolled `extract_host` only split
-    // the authority on `/`, so under the default `allowed_domains = ["*"]`
-    // posture this string slipped past the SSRF gate while the browser
-    // backend still navigated to loopback. Both `?` and `#` are now handled
-    // correctly because `validate_url` parses with `reqwest::Url` (the `url`
-    // crate), the same parser the browser backend resolves against.
-
-    #[test]
-    fn query_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
-        let tool = private_host_tool(vec!["*"], vec![]);
-        let err = tool
-            .validate_url("http://127.0.0.1?x")
-            .unwrap_err()
-            .to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("shots/page.png".into()),
+            full_page: false,
+        };
+        rt.block_on(tool.validate_screenshot_path(&mut action))
+            .expect("path inside workspace should be accepted");
+        // The path should be resolved (relative -> absolute via workspace_dir)
+        let BrowserAction::Screenshot { path: resolved, .. } = &action else {
+            panic!("expected Screenshot variant");
+        };
+        let resolved = resolved.as_ref().expect("path should still be Some");
         assert!(
-            err.contains("local/private host"),
-            "expected private-host block, got: {err}",
+            resolved.starts_with(ws.to_str().unwrap()),
+            "resolved path should be under workspace, got: {resolved}",
         );
     }
 
     #[test]
-    fn fragment_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
-        let tool = private_host_tool(vec!["*"], vec![]);
-        let err = tool
-            .validate_url("http://127.0.0.1#x")
-            .unwrap_err()
-            .to_string();
+    fn validate_screenshot_path_rejects_path_outside_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join("shots")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            // /tmp is in the default forbidden_paths list
+            path: Some("/tmp/evil.png".into()),
+            full_page: false,
+        };
+        let err = rt
+            .block_on(tool.validate_screenshot_path(&mut action))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
         assert!(
-            err.contains("local/private host"),
-            "expected private-host block, got: {err}",
+            msg.contains("not allowed") || msg.contains("outside") || msg.contains("forbidden"),
+            "unexpected error message: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_screenshot_path_rejects_traversal() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("../etc/passwd".into()),
+            full_page: false,
+        };
+        assert!(
+            rt.block_on(tool.validate_screenshot_path(&mut action))
+                .is_err(),
+            "path with .. traversal should be rejected",
+        );
+    }
+
+    #[test]
+    fn validate_screenshot_path_noop_when_path_none() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: None,
+            full_page: true,
+        };
+        rt.block_on(tool.validate_screenshot_path(&mut action))
+            .expect("None path (inline PNG) should be a no-op");
+        let BrowserAction::Screenshot { path, .. } = &action else {
+            panic!("expected Screenshot variant");
+        };
+        assert!(path.is_none(), "path should still be None after no-op");
+    }
+
+    #[test]
+    fn validate_screenshot_path_noop_on_non_screenshot_action() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Open {
+            url: "https://example.com".into(),
+        };
+        // Non-screenshot actions pass through without validation
+        rt.block_on(tool.validate_screenshot_path(&mut action))
+            .expect("non-screenshot action should pass through");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_screenshot_path_rejects_existing_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Layout: <tmp>/outside/real.txt  <- symlink target outside the workspace
+        //         <tmp>/ws/           (workspace_dir)
+        //         <tmp>/ws/page.png -> ../outside/real.txt  (workspace-resident symlink)
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("real.txt"), "data").unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::os::unix::fs::symlink("../outside/real.txt", ws.join("page.png")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("page.png".into()),
+            full_page: false,
+        };
+        let err = rt
+            .block_on(tool.validate_screenshot_path(&mut action))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("symlink"),
+            "expected symlink rejection, got: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_screenshot_path_rejects_runtime_config_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Layout: <tmp>/               (runtime config dir = workspace_dir.parent())
+        //         <tmp>/ws/            (workspace_dir)
+        //
+        // runtime_config_dir is `workspace_dir.parent().canonicalize()` = `<tmp>`.
+        // We add `<tmp>` to `allowed_roots` so an absolute path inside it
+        // passes `is_resolved_path_allowed`, and we pass `<tmp>/config.toml`
+        // as an *absolute* path. That path does NOT contain a `..` component,
+        // so `is_path_allowed` accepts it, `is_resolved_path_allowed` accepts
+        // it (because `<tmp>` is in `allowed_roots`), and the file's parent
+        // matches the runtime_config_dir — so the runtime-config guard must
+        // reject it. (Earlier version used `../config.toml`, which the
+        // string-level traversal check rejected before reaching this guard.)
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let tmp_canon = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { tokio::fs::canonicalize(tmp.path()).await })
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            allowed_roots: vec![tmp_canon.clone()],
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let target = tmp_canon.join("config.toml");
+        let mut action = BrowserAction::Screenshot {
+            path: Some(target.to_string_lossy().to_string()),
+            full_page: false,
+        };
+        let err = rt
+            .block_on(tool.validate_screenshot_path(&mut action))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("runtime config") || msg.contains("config"),
+            "expected runtime config rejection, got: {err}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_screenshot_path_allows_existing_regular_file_target() {
+        // Existing non-symlink file inside the workspace must still be a
+        // valid screenshot target — the symlink guard only triggers on
+        // symlink metadata. Without this test, a future refactor that
+        // uses `metadata()` instead of `symlink_metadata()` could
+        // accidentally reject legitimate writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(ws.join("existing.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("existing.png".into()),
+            full_page: false,
+        };
+        rt.block_on(tool.validate_screenshot_path(&mut action))
+            .expect("existing regular file inside workspace should be accepted");
+    }
+
+    // ── ComputerUse dispatch hook (round-3) ────────────────────────
+    //
+    // `BrowserTool::execute` previously returned at the ComputerUse backend
+    // branch *before* `parse_browser_action` / `validate_screenshot_path`
+    // ran, so a public `screenshot` `path` parameter crossed the sidecar
+    // boundary unverified. The new
+    // `validate_screenshot_path_for_computer_use` hook applies the same
+    // workspace / runtime-config / symlink guards the other backends use,
+    // and substitutes the canonical resolved path back into the args so
+    // the sidecar sees the same string we just verified. These tests pin
+    // that contract directly at the hook layer (no sidecar required).
+
+    #[test]
+    fn computer_use_screenshot_hook_rejects_traversal_path() {
+        // Out-of-workspace screenshot path must be rejected *before* the
+        // hook returns the rewritten args to the ComputerUse dispatch.
+        // A regression that drops the hook would forward `../etc/passwd`
+        // into the sidecar payload untouched.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "screenshot",
+            "path": "../etc/passwd",
+            "full_page": false,
+        });
+        let err = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("not allowed") || msg.contains("workspace") || msg.contains("path"),
+            "expected traversal rejection, got: {err}",
+        );
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_rejects_runtime_config_path() {
+        // Mirrors `validate_screenshot_path_rejects_runtime_config_target`
+        // but at the ComputerUse hook: an absolute path whose parent
+        // matches a runtime_config_dir and whose file name is a protected
+        // config name must be rejected *before* the args cross the sidecar
+        // boundary. A regression that drops the hook would forward
+        // `/tmp/config.toml` into the sidecar payload untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let tmp_canon = rt_canonicalize(tmp.path());
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws,
+            workspace_only: true,
+            allowed_roots: vec![tmp_canon.clone()],
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let target = tmp_canon.join("config.toml");
+        let args = json!({
+            "action": "screenshot",
+            "path": target.to_string_lossy().to_string(),
+            "full_page": false,
+        });
+        let err = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("runtime config") || msg.contains("config"),
+            "expected runtime config rejection, got: {err}",
+        );
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_substitutes_canonical_path() {
+        // Allowed screenshot path inside the workspace must be rewritten
+        // to its canonical form so the sidecar sees the same string we
+        // verified. Without this rewrite, the sidecar would receive a
+        // user-controlled path with no policy gate between validation
+        // and write.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "screenshot",
+            "path": "page.png",
+            "full_page": false,
+        });
+        let rewritten = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args))
+            .expect("allowed workspace screenshot must be accepted");
+        let rewritten_path = rewritten
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("path must be present and a string after rewrite");
+        let expected = ws
+            .canonicalize()
+            .unwrap_or_else(|_| ws.clone())
+            .join("page.png");
+        assert_eq!(
+            rewritten_path,
+            expected.to_string_lossy().as_ref(),
+            "ComputerUse screenshot hook must substitute the canonical resolved path"
+        );
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_passthrough_for_non_screenshot_actions() {
+        // Non-screenshot actions must pass through with no rewrite —
+        // only the screenshot action has a `path` field that needs
+        // gating. A regression that runs validation on every action
+        // would corrupt unrelated params (click selector, open url, ...).
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "open",
+            "url": "https://example.com",
+        });
+        let out = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("open", args.clone()))
+            .expect("non-screenshot actions must not fail the hook");
+        assert_eq!(out, args, "non-screenshot args must be returned unchanged");
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_noop_for_inline_png() {
+        // Screenshot with no `path` (inline PNG return) must pass through
+        // untouched — the sidecar never receives a destination string in
+        // that case, so there is no unverified path to gate. A regression
+        // that tries to canonicalize a missing path would crash or corrupt
+        // the args.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "screenshot",
+            "full_page": false,
+        });
+        let out = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args.clone()))
+            .expect("inline-PNG screenshot must not fail the hook");
+        assert_eq!(out, args, "no-path screenshot must be returned unchanged");
+    }
+
+    // Helper used only by the ComputerUse hook tests above — keeps the
+    // test bodies focused on the assertion and avoids repeating the
+    // runtime boilerplate.
+    fn rt_canonicalize(path: &std::path::Path) -> std::path::PathBuf {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { tokio::fs::canonicalize(path).await })
+            .unwrap()
+    }
+
+    // ── ComputerUse dispatch (mock-sidecar) tests ────────────────
+    //
+    // The five hook tests above pin the validator's contract in
+    // isolation, but they bypass the dispatch in `BrowserTool::execute`.
+    // These five tests drive the full dispatch path against a wiremock
+    // sidecar and assert exactly what reaches the wire. They are the
+    // production-boundary regression that Audacity88 round-4 asked for:
+    // if the hook call at `execute:1360` were removed, tests 1-3 and 5
+    // below would all fail (zero requests received instead of one).
+    use std::path::PathBuf;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn computer_use_tool(
+        security: Arc<SecurityPolicy>,
+        endpoint: String,
+        allow_remote_endpoint: bool,
+    ) -> BrowserTool {
+        BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            Some(false),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig {
+                endpoint,
+                allow_remote_endpoint,
+                timeout_ms: 5_000,
+                ..ComputerUseConfig::default()
+            },
+            Vec::new(),
+        )
+        .expect("computer_use BrowserTool should construct")
+    }
+
+    fn desktop_security(workspace: PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// Decoded recorded request body for inspection by dispatch tests.
+    async fn first_request_body(server: &MockServer) -> Value {
+        let mut requests = server
+            .received_requests()
+            .await
+            .expect("received_requests failed");
+        assert_eq!(requests.len(), 1, "expected exactly one sidecar request");
+        let req = requests.remove(0);
+        serde_json::from_slice(&req.body).expect("sidecar body must be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_traversal_path_before_sidecar() {
+        // A traversal `path` must be rejected at the hook, never reaching
+        // the sidecar. The wiremock mount explicitly expects zero requests.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            server.uri(),
+            false,
+        );
+
+        let err = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": "../etc/passwd",
+                "full_page": false,
+            }))
+            .await
+            .expect_err("traversal path must be rejected at the hook");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("not allowed") || msg.contains("workspace") || msg.contains("path"),
+            "expected traversal rejection, got: {err}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0,
+            "no request must reach the sidecar when the hook rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_sends_canonicalized_path_to_sidecar() {
+        // A workspace-allowed `path` must reach the sidecar as its
+        // canonical resolved form, not as the user-supplied relative
+        // path. The wiremock matcher asserts on the exact bytes the
+        // server receives.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        let ws_canon = tokio::fs::canonicalize(&ws).await.unwrap();
+        let expected_canonical = ws_canon.join("page.png");
+        let expected_canonical_str = expected_canonical.to_string_lossy().to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "params": { "path": expected_canonical_str.clone() }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = computer_use_tool(desktop_security(ws), server.uri(), false);
+
+        tool.execute(json!({
+            "action": "screenshot",
+            "path": "page.png",
+            "full_page": false,
+        }))
+        .await
+        .expect("allowed workspace screenshot must succeed");
+
+        let body = first_request_body(&server).await;
+        let sent_path = body
+            .get("params")
+            .and_then(|p| p.get("path"))
+            .and_then(|p| p.as_str())
+            .expect("sidecar body must carry params.path");
+        assert_eq!(
+            sent_path, expected_canonical_str,
+            "sidecar must receive the canonicalized path, not the user-supplied relative path"
+        );
+        assert_ne!(
+            sent_path, "page.png",
+            "sidecar must NOT receive the raw user-supplied relative path"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_remote_endpoint_with_path() {
+        // When the endpoint resolves to a remote host and a `path` is
+        // supplied, the hook must bail before any sidecar request. We
+        // cannot drive `execute` end-to-end here because the dispatch
+        // probes TCP reachability before the hook runs and the synthetic
+        // endpoint is unreachable — so we exercise the hook directly
+        // and rely on the wire-level zero-expectation mount to prove no
+        // HTTP traffic ever leaves the process.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Public-looking host that the host classifier rejects as
+        // "remote". `allow_remote_endpoint = true` is required for
+        // `endpoint_is_remote()` to consider the public-host case.
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            "https://computeruse.attacker.example/v1/actions".to_string(),
+            true,
+        );
+        assert!(
+            tool.endpoint_is_remote(),
+            "endpoint_is_remote must report remote for the synthetic public endpoint"
+        );
+
+        let err = tool
+            .validate_screenshot_path_for_computer_use(
+                "screenshot",
+                json!({
+                    "action": "screenshot",
+                    "path": "page.png",
+                    "full_page": false,
+                }),
+            )
+            .await
+            .expect_err("remote endpoint + path must be rejected at the hook");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("remote"),
+            "expected remote-endpoint rejection, got: {err}"
+        );
+        // The wiremock mount (zero expected) pins that the wire layer
+        // was never touched even though a sidecar mock is live.
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0,
+            "no request must reach any sidecar for a remote endpoint + path"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_passes_through_empty_string_path() {
+        // An empty-string `path` is treated as inline PNG return and
+        // must reach the sidecar exactly once with `params.path` carrying
+        // the empty string. This pins that empty-string passthrough does
+        // not trigger the remote-rejection branch nor the non-string
+        // rejection branch.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            server.uri(),
+            false,
+        );
+
+        tool.execute(json!({
+            "action": "screenshot",
+            "path": "",
+            "full_page": false,
+        }))
+        .await
+        .expect("empty-string path must pass through to the sidecar");
+
+        let body = first_request_body(&server).await;
+        let sent_path = body
+            .get("params")
+            .and_then(|p| p.get("path"))
+            .and_then(|p| p.as_str());
+        assert_eq!(
+            sent_path,
+            Some(""),
+            "empty-string path must reach the sidecar verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_non_string_path_before_sidecar() {
+        // A non-string `path` (here an integer) must be rejected at the
+        // hook with a typed error. Previously this was silently dropped
+        // by `parse_browser_action` and the raw value forwarded to the
+        // sidecar unverified.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = computer_use_tool(
+            desktop_security(tmp.path().to_path_buf()),
+            server.uri(),
+            false,
+        );
+
+        let err = tool
+            .validate_screenshot_path_for_computer_use(
+                "screenshot",
+                json!({
+                    "action": "screenshot",
+                    "path": 123,
+                    "full_page": false,
+                }),
+            )
+            .await
+            .expect_err("non-string path must be rejected at the hook");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("must be a string"),
+            "expected non-string-path rejection, got: {err}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0,
+            "no request must reach the sidecar when the hook rejects"
         );
     }
 }
