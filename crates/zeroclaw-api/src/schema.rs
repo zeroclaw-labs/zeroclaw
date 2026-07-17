@@ -24,17 +24,17 @@
 //!     "properties": {
 //!         "name": {
 //!             "type": "string",
-//!             "minLength": 1,  // Gemini rejects this
-//!             "pattern": "^[a-z]+$"  // Gemini rejects this
+//!             "minLength": 1, // Gemini rejects this
+//!             "pattern": "^[a-z]+$" // Gemini rejects this
 //!         },
 //!         "age": {
-//!             "$ref": "#/$defs/Age"  // Needs resolution
+//!             "$ref": "#/$defs/Age" // Needs resolution
 //!         }
 //!     },
 //!     "$defs": {
 //!         "Age": {
 //!             "type": "integer",
-//!             "minimum": 0  // Gemini rejects this
+//!             "minimum": 0 // Gemini rejects this
 //!         }
 //!     }
 //! });
@@ -43,11 +43,11 @@
 //!
 //! // Result:
 //! // {
-//! //   "type": "object",
-//! //   "properties": {
-//! //     "name": { "type": "string" },
-//! //     "age": { "type": "integer" }
-//! //   }
+//! // "type": "object",
+//! // "properties": {
+//! // "name": { "type": "string" },
+//! // "age": { "type": "integer" }
+//! // }
 //! // }
 //! ```
 //!
@@ -136,8 +136,8 @@ impl SchemaCleanr {
         Self::clean(schema, CleaningStrategy::OpenAI)
     }
 
-    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas
-    /// (#8642): returns the same `Arc` when the pre-scan proves cleaning is a
+    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas:
+    /// returns the same `Arc` when the pre-scan proves cleaning is a
     /// no-op, deep-copying the tree only when a rewrite is actually needed.
     pub fn clean_shared(schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
         if Self::needs_cleaning(schema, strategy) {
@@ -153,7 +153,7 @@ impl SchemaCleanr {
     /// False positives are allowed (a flagged schema may clean to an equal
     /// value); false negatives are not — `!needs_cleaning(s)` must imply
     /// `clean(s) == s`. The triggers mirror every rewrite path in
-    /// [`Self::clean_object`]: strategy-specific keyword removal, plus the
+    /// `clean_object`: strategy-specific keyword removal, plus the
     /// strategy-independent rewrites (`$ref` resolution, `const` → `enum`,
     /// `anyOf`/`oneOf` simplification and sibling-`type` skipping, and
     /// null-stripping in `type` arrays).
@@ -588,7 +588,7 @@ mod tests {
     use super::*;
 
     /// `!needs_cleaning(s)` must imply `clean(s) == s` — the safety contract
-    /// that lets `clean_shared` skip the deep copy (#8642).
+    /// that lets `clean_shared` skip the deep copy.
     #[test]
     fn test_needs_cleaning_false_implies_clean_is_identity() {
         let clean_schemas = [

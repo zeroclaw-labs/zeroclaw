@@ -17,26 +17,6 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::event::ZeroclawAttribution;
 use crate::layer::{F_EPHEMERAL_ATTRS, LogCaptureLayer};
 
-/// Install the global tracing subscriber. Two independent axes:
-///
-/// * **Recording floor** — what reaches the `LogCaptureLayer` (and thus
-///   the JSONL writer, broadcast hook, and Observer bridge). Resolved
-///   as: `recording_override` (the `--log-level` flag) if `Some`,
-///   else `RUST_LOG` from the environment, else `default_filter`.
-///
-/// * **Terminal display** — the stderr fmt layer. Gated entirely by
-///   `verbose`: when `false` the fmt layer is muted (no log lines ever
-///   reach the terminal; direct `println!`/stdout is untouched). When
-///   `true` it surfaces events down to the same recording floor.
-///
-/// All filter strings are `RUST_LOG`-compatible directives (e.g.
-/// `"info"` or `"debug,matrix_sdk=warn"`).
-///
-/// Both axes are fixed for the process lifetime — the global subscriber
-/// is installed once and cannot be reconfigured without a restart.
-///
-/// Panics on subscriber install failure — the daemon cannot operate
-/// without logging.
 pub fn install_global_subscriber(
     recording_override: Option<&str>,
     default_filter: &str,
@@ -50,11 +30,6 @@ pub fn install_global_subscriber(
         }
     };
 
-    // The fmt (terminal) layer carries its own filter so display can be
-    // muted without touching what the capture layer records. When
-    // verbose is off, an OFF filter discards every event before it
-    // formats — stdout (println!) is unaffected because it never routes
-    // through tracing.
     let fmt_filter = if verbose {
         match recording_override {
             Some(flag) => EnvFilter::new(flag),
@@ -79,17 +54,6 @@ pub fn install_global_subscriber(
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
 
-/// Test-only helper: install a minimal global subscriber that routes
-/// `record!` emissions through `LogCaptureLayer` (and thus the broadcast
-/// hook) without any terminal fmt output. Returns a guard that resets
-/// the broadcast hook on drop. Use in combination with
-/// [`crate::subscribe`] to capture events from a unit test without
-/// the test crate depending on `tracing` / `tracing-subscriber`.
-///
-/// Idempotent: subsequent calls are no-ops if a subscriber is already
-/// installed (the global default cannot be replaced once set). For
-/// isolated capture across multiple tests, use the broadcast hook
-/// directly without changing the global subscriber.
 #[doc(hidden)]
 pub fn try_install_capture_subscriber() {
     use tracing_subscriber::Registry;

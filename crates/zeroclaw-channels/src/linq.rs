@@ -3,12 +3,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
-/// Linq channel — uses the Linq Partner V3 API for iMessage, RCS, and SMS.
-///
-/// This channel operates in webhook mode (push-based) rather than polling.
-/// Messages are received via the gateway's `/linq` webhook endpoint.
-/// The `listen` method here is a keepalive placeholder; actual message handling
-/// happens in the gateway when Linq sends webhook events.
 pub struct LinqChannel {
     api_token: String,
     from_phone: String,
@@ -126,47 +120,6 @@ impl LinqChannel {
             .or_else(|| data.get("parts").and_then(|value| value.as_array()))
     }
 
-    /// Parse an incoming webhook payload from Linq and extract messages.
-    ///
-    /// Supports two webhook formats:
-    ///
-    /// **New format (webhook_version 2026-02-03):**
-    /// ```json
-    /// {
-    ///   "api_version": "v3",
-    ///   "webhook_version": "2026-02-03",
-    ///   "event_type": "message.received",
-    ///   "data": {
-    ///     "id": "msg-...",
-    ///     "direction": "inbound",
-    ///     "sender_handle": { "handle": "+1...", "is_me": false },
-    ///     "chat": { "id": "chat-..." },
-    ///     "parts": [{ "type": "text", "value": "..." }]
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// **Legacy format (webhook_version 2025-01-01):**
-    /// ```json
-    /// {
-    ///   "api_version": "v3",
-    ///   "event_type": "message.received",
-    ///   "data": {
-    ///     "chat_id": "...",
-    ///     "from": "+1...",
-    ///     "is_from_me": false,
-    ///     "message": {
-    ///       "id": "...",
-    ///       "parts": [{ "type": "text", "value": "..." }]
-    ///     }
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// Also accepts the current 2026-02-03 payload shape where `chat_id`,
-    /// `from`, `is_from_me`, and `message.parts` moved under:
-    /// `data.chat.id`, `data.sender_handle.handle`, `data.sender_handle.is_me`,
-    /// and `data.parts`.
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
@@ -488,11 +441,6 @@ impl Channel for LinqChannel {
     }
 }
 
-/// Verify a Linq webhook signature.
-///
-/// Linq signs webhooks with HMAC-SHA256 over `"{timestamp}.{body}"`.
-/// The signature is sent in `X-Webhook-Signature` (hex-encoded) and the
-/// timestamp in `X-Webhook-Timestamp`. Reject timestamps older than 300s.
 pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signature: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
