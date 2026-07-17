@@ -39,7 +39,7 @@
 /firmware/**                  @JordanTheJet
 /src/providers/**             @JordanTheJet @Nillth
 /src/hardware/**              @JordanTheJet
-/web/**                       @JordanTheJet
+/web/**                       @JordanTheJet @IftekharUddin
 /dist/**                      @JordanTheJet
 /apps/**                      @JordanTheJet
 
@@ -138,7 +138,7 @@
 # Explicit i18n files Audacity flagged on PR #6537. Would otherwise resolve
 # to their broader area without the i18n specialist on them.
 /crates/zeroclaw-runtime/src/i18n.rs @Audacity88 @JordanTheJet
-/web/src/lib/i18n.ts                 @JordanTheJet
+/web/src/lib/i18n.ts                 @JordanTheJet @IftekharUddin
 
 # ---------------------------------------------------------------------------
 # Other docs (Audacity-led + JordanTheJet). Must come BEFORE architecture-doc
@@ -150,6 +150,12 @@
 # Architecture docs (high-risk, paired)
 # ---------------------------------------------------------------------------
 /docs/book/src/foundations/** @Audacity88 @JordanTheJet
+
+# ---------------------------------------------------------------------------
+# Maintainer-process docs (PM/process lane). Narrower than /docs/**, so it
+# must come after it (last match wins).
+# ---------------------------------------------------------------------------
+/docs/book/src/maintainers/** @Audacity88 @IftekharUddin
 
 # ---------------------------------------------------------------------------
 # Governance, release, CI (high-risk)
@@ -175,6 +181,14 @@
 /rustfmt.toml           @Audacity88
 /clippy.toml            @Audacity88
 /taplo.toml             @Audacity88
+
+# ---------------------------------------------------------------------------
+# Issue/PR process templates and label taxonomy (PM/process lane).
+# Narrower than /.github/**, so these must come after it (last match wins).
+# ---------------------------------------------------------------------------
+/.github/ISSUE_TEMPLATE/**        @Audacity88 @IftekharUddin
+/.github/pull_request_template.md @Audacity88 @IftekharUddin
+/.github/labeler.yml              @Audacity88 @IftekharUddin
 
 # ---------------------------------------------------------------------------
 # Security (high-risk, paired: Audacity + JordanTheJet)
