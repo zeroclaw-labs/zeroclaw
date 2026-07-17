@@ -12,7 +12,6 @@ use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -84,50 +83,6 @@ pub fn build_session_model_provider(
     )?;
 
     Ok((model_provider, model_provider_name, model_name))
-}
-
-struct TurnGuard {
-    observer: Arc<dyn Observer>,
-    model_provider: String,
-    model: String,
-    turn_id: Option<String>,
-    turn_started_at: Instant,
-    agent_alias: Option<String>,
-    channel_name: String,
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    saw_usage: bool,
-    done: bool,
-}
-
-impl TurnGuard {
-    fn fire(&mut self) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        self.observer.record_event(&ObserverEvent::AgentEnd {
-            model_provider: self.model_provider.clone(),
-            model: self.model.clone(),
-            duration: self.turn_started_at.elapsed(),
-            tokens_used: self.saw_usage.then_some(
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: self.total_input_tokens,
-                    output_tokens: self.total_output_tokens,
-                },
-            ),
-            cost_usd: None,
-            channel: Some(self.channel_name.clone()),
-            agent_alias: self.agent_alias.clone(),
-            turn_id: self.turn_id.clone(),
-        });
-    }
-}
-
-impl Drop for TurnGuard {
-    fn drop(&mut self) {
-        self.fire();
-    }
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -2332,29 +2287,15 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         let turn_id = Self::new_turn_id();
-        let turn_started_at = Instant::now();
-
-        self.observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: self.model_provider_name.clone(),
-            model: effective_model.clone(),
-            channel: Some(self.channel_name.clone()),
-            agent_alias: self.observer_agent_alias(),
-            turn_id: Some(turn_id.clone()),
-        });
-
-        let mut guard = TurnGuard {
-            observer: Arc::clone(&self.observer),
-            model_provider: self.model_provider_name.clone(),
-            model: effective_model.clone(),
-            turn_id: Some(turn_id.clone()),
-            turn_started_at,
-            agent_alias: self.observer_agent_alias(),
-            channel_name: self.channel_name.clone(),
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            saw_usage: false,
-            done: false,
-        };
+        let turn_observer = Arc::clone(&self.observer);
+        let mut guard = crate::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            self.model_provider_name.clone(),
+            effective_model.clone(),
+            Some(self.channel_name.clone()),
+            self.observer_agent_alias(),
+            Some(turn_id.clone()),
+        );
 
         // Response cache: check once before entering the loop (only for
         // deterministic, text-only prompts). The key must include the whole
@@ -2508,9 +2449,13 @@ impl Agent {
         // still report usage from calls that succeeded earlier in the turn.
         let usage = cost_context.snapshot_turn_usage();
         if usage.input_tokens > 0 || usage.output_tokens > 0 {
-            guard.total_input_tokens = usage.input_tokens;
-            guard.total_output_tokens = usage.output_tokens;
-            guard.saw_usage = true;
+            guard.set_usage(
+                Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                }),
+                None,
+            );
         }
         // Replay the loop's transcript additions into the conversation
         // history BEFORE propagating any loop error: rounds that already
@@ -2639,31 +2584,17 @@ impl Agent {
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_pending_model_switch`) can rebind it for later rounds (#6173).
         let mut effective_model = self.classify_model(user_message);
-        let turn_started_at = Instant::now();
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
-
-        self.observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: self.model_provider_name.clone(),
-            model: effective_model.clone(),
-            channel: Some(self.channel_name.clone()),
-            agent_alias: self.observer_agent_alias(),
-            turn_id: Some(turn_id.clone()),
-        });
-
-        let mut guard = TurnGuard {
-            observer: Arc::clone(&self.observer),
-            model_provider: self.model_provider_name.clone(),
-            model: effective_model.clone(),
-            turn_id: Some(turn_id.clone()),
-            turn_started_at,
-            agent_alias: self.observer_agent_alias(),
-            channel_name: self.channel_name.clone(),
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            saw_usage: false,
-            done: false,
-        };
+        let turn_observer = Arc::clone(&self.observer);
+        let mut guard = crate::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            self.model_provider_name.clone(),
+            effective_model.clone(),
+            Some(self.channel_name.clone()),
+            self.observer_agent_alias(),
+            Some(turn_id.clone()),
+        );
 
         // Response cache: check once before the round loop, keyed on the full
         // provider-visible transcript (matches `Agent::turn`; the old code
@@ -2886,9 +2817,13 @@ impl Agent {
             // calls that succeeded earlier in the turn.
             let usage = cost_context.snapshot_turn_usage();
             if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                guard.total_input_tokens = usage.input_tokens;
-                guard.total_output_tokens = usage.output_tokens;
-                guard.saw_usage = true;
+                guard.set_usage(
+                    Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                    }),
+                    None,
+                );
             }
 
             // Replay everything the loop appended this round into the

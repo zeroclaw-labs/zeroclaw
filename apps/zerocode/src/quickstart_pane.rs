@@ -70,9 +70,10 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 7] = [
+    const ALL: [Selector; 8] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
+        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -373,24 +374,41 @@ fn risk_options() -> [PickerOption; 3] {
     ]
 }
 
-fn runtime_options() -> [PickerOption; 3] {
-    [
-        opt(
-            "tight",
-            crate::i18n::t("zc-quickstart-runtime-tight"),
-            crate::i18n::t("zc-quickstart-runtime-tight-desc"),
-        ),
-        opt(
-            "balanced",
-            crate::i18n::t("zc-quickstart-runtime-balanced"),
-            crate::i18n::t("zc-quickstart-runtime-balanced-desc"),
-        ),
-        opt(
-            "unbounded",
-            crate::i18n::t("zc-quickstart-runtime-unbounded"),
-            crate::i18n::t("zc-quickstart-runtime-unbounded-desc"),
-        ),
-    ]
+fn runtime_picker_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
+    snapshot
+        .into_iter()
+        .flat_map(|snapshot| &snapshot.runtime_presets)
+        .map(|preset| {
+            let localized = match preset.preset_name.as_str() {
+                "tight" => Some((
+                    "zc-quickstart-runtime-tight",
+                    "zc-quickstart-runtime-tight-desc",
+                )),
+                "local_small" => Some((
+                    "zc-quickstart-runtime-local-small",
+                    "zc-quickstart-runtime-local-small-desc",
+                )),
+                "balanced" => Some((
+                    "zc-quickstart-runtime-balanced",
+                    "zc-quickstart-runtime-balanced-desc",
+                )),
+                "unbounded" => Some((
+                    "zc-quickstart-runtime-unbounded",
+                    "zc-quickstart-runtime-unbounded-desc",
+                )),
+                _ => None,
+            };
+            let (label, help) = localized
+                .map(|(label_key, help_key)| {
+                    (
+                        crate::i18n::try_t(label_key).unwrap_or_else(|| preset.label.clone()),
+                        crate::i18n::try_t(help_key).unwrap_or_else(|| preset.help.clone()),
+                    )
+                })
+                .unwrap_or_else(|| (preset.label.clone(), preset.help.clone()));
+            opt(&preset.preset_name, label, help)
+        })
+        .collect()
 }
 
 fn memory_options() -> Vec<PickerOption> {
@@ -570,6 +588,7 @@ struct FormState {
     risk_mode: SelectorMode,
     runtime: String,
     runtime_mode: SelectorMode,
+    runtime_auto_defaulted: bool,
     memory: MemoryKind,
     memory_mode: SelectorMode,
     /// `true` once the user has explicitly committed a Memory
@@ -599,6 +618,7 @@ impl FormState {
             risk_mode: SelectorMode::Fresh,
             runtime: String::new(),
             runtime_mode: SelectorMode::Fresh,
+            runtime_auto_defaulted: false,
             memory: MemoryKind::Sqlite,
             memory_mode: SelectorMode::Fresh,
             memory_chosen: false,
@@ -717,9 +737,7 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        // Runtime profile picker removed from all surfaces; apply silently
-        // forces the `unbounded` preset. Submit it so the field is well-formed.
-        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
+        let runtime_profile = self.runtime_profile_choice();
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -752,6 +770,51 @@ impl FormState {
             },
         }
     }
+
+    fn runtime_profile_choice(&self) -> SelectorChoice<String> {
+        match self.runtime_mode {
+            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
+            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
+        }
+    }
+
+    fn apply_provider_runtime_default(&mut self, default: Option<&str>) {
+        let Some(next) = default else { return };
+        if self.runtime.is_empty() || self.runtime_auto_defaulted {
+            self.runtime = next.to_string();
+            self.runtime_mode = SelectorMode::Fresh;
+            self.runtime_auto_defaulted = true;
+        }
+    }
+}
+
+fn provider_runtime_default<'a>(
+    snapshot: Option<&'a QuickstartStateResult>,
+    type_key: &str,
+) -> Option<&'a str> {
+    let snapshot = snapshot?;
+    snapshot
+        .model_provider_types
+        .iter()
+        .find(|provider| provider.kind == type_key)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .or(snapshot.default_runtime_profile.as_deref())
+}
+
+fn apply_existing_provider_choice(
+    form: &mut FormState,
+    snapshot: Option<&QuickstartStateResult>,
+    dotted_ref: &str,
+) {
+    let Some((provider_type, alias)) = dotted_ref.split_once('.') else {
+        return;
+    };
+    form.provider_type = provider_type.to_string();
+    form.provider_alias = alias.to_string();
+    form.provider_mode = SelectorMode::Existing;
+    form.model.clear();
+    form.provider_fields.clear();
+    form.apply_provider_runtime_default(provider_runtime_default(snapshot, provider_type));
 }
 
 /// Modal kinds the pane can put up over the main checklist. Each
@@ -1535,7 +1598,7 @@ impl QuickstartPane {
     fn open_picker_modal(&mut self, sel: Selector) {
         let mut options: Vec<PickerOption> = match sel {
             Selector::RiskProfile => risk_options().to_vec(),
-            Selector::RuntimeProfile => runtime_options().to_vec(),
+            Selector::RuntimeProfile => runtime_picker_options(self.state_snapshot.as_ref()),
             Selector::Memory => memory_options(),
             _ => return,
         };
@@ -1559,6 +1622,9 @@ impl QuickstartPane {
                 }
                 options.push(existing_opt(alias.clone()));
             }
+        }
+        if options.is_empty() {
+            return;
         }
         let cursor = match sel {
             Selector::RiskProfile => options
@@ -1611,8 +1677,10 @@ impl QuickstartPane {
                     }
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    if let Some(expanded) = p.options[p.cursor].existing_provider_toggle_expanded()
-                    {
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if let Some(expanded) = option.existing_provider_toggle_expanded() {
                         p.options =
                             model_provider_picker_options(self.state_snapshot.as_ref(), !expanded);
                         p.cursor = p
@@ -1626,11 +1694,14 @@ impl QuickstartPane {
                             });
                         return;
                     }
-                    if !p.options[p.cursor].is_selectable() {
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if !option.is_selectable() {
                         return;
                     }
-                    let chosen = p.options[p.cursor].value.clone();
-                    let use_existing = p.options[p.cursor].use_existing();
+                    let chosen = option.value.clone();
+                    let use_existing = option.use_existing();
                     let selector = p.selector;
                     let purpose = p.purpose;
                     match (purpose, use_existing) {
@@ -2079,17 +2150,7 @@ impl QuickstartPane {
     }
 
     fn adopt_existing_provider(&mut self, dotted_ref: String) {
-        if let Some((ty, alias)) = dotted_ref.split_once('.') {
-            self.form.provider_type = ty.to_string();
-            self.form.provider_alias = alias.to_string();
-            self.form.provider_mode = SelectorMode::Existing;
-            // Default model / field values aren't carried in the
-            // "existing" path — the runtime resolves the alias against
-            // the live config at apply time. Leave them empty so they
-            // don't overwrite the existing alias's values.
-            self.form.model.clear();
-            self.form.provider_fields.clear();
-        }
+        apply_existing_provider_choice(&mut self.form, self.state_snapshot.as_ref(), &dotted_ref);
     }
 
     fn adopt_existing_channel(&mut self, dotted_ref: String) {
@@ -2308,6 +2369,9 @@ impl QuickstartPane {
         }
         match f.selector {
             Selector::ModelProvider => {
+                let runtime_default =
+                    provider_runtime_default(self.state_snapshot.as_ref(), &f.type_key)
+                        .map(str::to_string);
                 let pick = |key: &str| {
                     f.fields
                         .iter()
@@ -2346,6 +2410,8 @@ impl QuickstartPane {
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
+                self.form
+                    .apply_provider_runtime_default(runtime_default.as_deref());
             }
             Selector::Channels => {
                 let pick = |key: &str| {
@@ -2393,6 +2459,7 @@ impl QuickstartPane {
             Selector::RuntimeProfile => {
                 self.form.runtime = value;
                 self.form.runtime_mode = mode;
+                self.form.runtime_auto_defaulted = false;
             }
             Selector::Memory => {
                 if use_existing {
@@ -3555,6 +3622,7 @@ mod tests {
             agents: Vec::new(),
             risk_profiles: Vec::new(),
             runtime_profiles: Vec::new(),
+            default_runtime_profile: Some("unbounded".into()),
             model_providers: existing.into_iter().map(str::to_string).collect(),
             channels: Vec::new(),
             unassigned_channels: Vec::new(),
@@ -3564,16 +3632,19 @@ mod tests {
                     kind: "openrouter".into(),
                     display_name: "OpenRouter".into(),
                     local: false,
+                    default_runtime_profile: Some("unbounded".into()),
                 },
                 crate::client::QuickstartTypeOption {
                     kind: "anthropic".into(),
                     display_name: "Anthropic".into(),
                     local: false,
+                    default_runtime_profile: Some("unbounded".into()),
                 },
                 crate::client::QuickstartTypeOption {
-                    kind: "ollama".into(),
-                    display_name: "Ollama".into(),
+                    kind: "lmstudio".into(),
+                    display_name: "LM Studio".into(),
                     local: true,
+                    default_runtime_profile: Some("local_small".into()),
                 },
             ],
             channel_types: Vec::new(),
@@ -3629,6 +3700,84 @@ mod tests {
         assert!(expanded_labels.contains(&"xai.grok"));
         assert!(expanded_labels.contains(&"  [- Show fewer existing providers]"));
         assert!(expanded_labels.contains(&"OpenRouter"));
+    }
+
+    #[test]
+    fn existing_local_provider_adoption_uses_daemon_runtime_default() {
+        let snapshot = model_provider_snapshot(vec!["lmstudio.default"]);
+        let mut form = FormState::default_form();
+
+        apply_existing_provider_choice(&mut form, Some(&snapshot), "lmstudio.default");
+
+        assert_eq!(form.provider_type, "lmstudio");
+        assert_eq!(form.provider_alias, "default");
+        assert_eq!(form.provider_mode, SelectorMode::Existing);
+        assert_eq!(form.runtime, "local_small");
+        assert!(form.runtime_auto_defaulted);
+    }
+
+    #[test]
+    fn runtime_picker_includes_daemon_advertised_local_small_preset() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![crate::client::QuickstartPresetMirror {
+            preset_name: "local_small".into(),
+            label: "Local small".into(),
+            help: "Safe defaults for local models.".into(),
+        }];
+
+        let options = runtime_picker_options(Some(&snapshot));
+        let local_small = options
+            .iter()
+            .find(|option| option.value == "local_small")
+            .expect("daemon-advertised runtime preset should be selectable");
+
+        assert!(!local_small.use_existing());
+    }
+
+    #[test]
+    fn runtime_picker_localizes_known_presets_and_preserves_unknown_daemon_text() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![
+            crate::client::QuickstartPresetMirror {
+                preset_name: "tight".into(),
+                label: "Daemon Tight".into(),
+                help: "Daemon tight help.".into(),
+            },
+            crate::client::QuickstartPresetMirror {
+                preset_name: "future_runtime".into(),
+                label: "Future Runtime".into(),
+                help: "Future runtime help.".into(),
+            },
+        ];
+
+        let options = runtime_picker_options(Some(&snapshot));
+
+        assert_eq!(
+            options[0].label,
+            crate::i18n::t("zc-quickstart-runtime-tight")
+        );
+        assert_eq!(
+            options[0].help,
+            crate::i18n::t("zc-quickstart-runtime-tight-desc")
+        );
+        assert_eq!(options[1].label, "Future Runtime");
+        assert_eq!(options[1].help, "Future runtime help.");
+    }
+
+    #[tokio::test]
+    async fn runtime_picker_does_not_open_without_advertised_presets() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = std::sync::Arc::new(crate::client::RpcClient::with_rpc(std::sync::Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let reconnect_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, reconnect_state);
+
+        pane.open_picker_modal(Selector::RuntimeProfile);
+
+        assert!(pane.active_modal.is_none());
     }
 
     #[test]
@@ -3744,6 +3893,144 @@ mod tests {
         assert!(f.is_satisfied(Selector::Channels));
         assert!(f.is_satisfied(Selector::PeerGroups));
         assert!(f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn submission_preserves_selected_fresh_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn submission_preserves_selected_existing_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "small-laptop".into();
+        f.runtime_mode = SelectorMode::Existing;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Existing("small-laptop".into())
+        );
+    }
+
+    #[test]
+    fn local_provider_defaults_to_local_small_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn cloud_provider_defaults_to_unbounded_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("unbounded"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn missing_provider_override_uses_daemon_state_fallback() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.model_provider_types[0].default_runtime_profile = None;
+
+        assert_eq!(
+            provider_runtime_default(Some(&snapshot), "openrouter"),
+            Some("unbounded"),
+        );
+    }
+
+    #[test]
+    fn missing_provider_and_state_defaults_leave_runtime_incomplete() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(None);
+
+        assert!(f.runtime.is_empty());
+        assert!(!f.selector_is_complete(Selector::RuntimeProfile, &[]));
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_runtime_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "tight".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "tight");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("tight".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_unbounded_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_local_small_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("unbounded"));
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_choice_stops_provider_default_rewrites() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("local_small"));
+        assert_eq!(f.runtime, "local_small");
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+        f.runtime_auto_defaulted = false;
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
     }
 
     #[test]
@@ -4086,6 +4373,19 @@ mod tests {
     #[test]
     fn completed_selector_advances_to_next_row() {
         let form = FormState::default_form();
+        assert_eq!(
+            Selector::ALL,
+            [
+                Selector::ModelProvider,
+                Selector::RiskProfile,
+                Selector::RuntimeProfile,
+                Selector::Memory,
+                Selector::Channels,
+                Selector::PeerGroups,
+                Selector::Agent,
+                Selector::Submit,
+            ],
+        );
         assert_eq!(
             next_selector_index_after(Selector::ModelProvider, &form),
             Some(1)

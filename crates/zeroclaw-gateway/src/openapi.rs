@@ -86,6 +86,10 @@ pub fn build_spec() -> serde_json::Value {
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
     };
+    use crate::version::{
+        UpgradeAcceptedResponse, UpgradeRequest, UpgradeStatusResponse, VersionCheckResponse,
+        VersionErrorResponse,
+    };
     use zeroclaw_config::api_error::ConfigApiError;
 
     fn schema_value<T: JsonSchema>() -> serde_json::Value {
@@ -108,6 +112,11 @@ pub fn build_spec() -> serde_json::Value {
             "DriftResponse":    schema_value::<DriftResponse>(),
             "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
+            "VersionCheckResponse":   schema_value::<VersionCheckResponse>(),
+            "UpgradeRequest":         schema_value::<UpgradeRequest>(),
+            "UpgradeAcceptedResponse": schema_value::<UpgradeAcceptedResponse>(),
+            "UpgradeStatusResponse":  schema_value::<UpgradeStatusResponse>(),
+            "VersionError":           schema_value::<VersionErrorResponse>(),
             "Sop":              schema_value::<zeroclaw_runtime::sop::Sop>(),
             "SopGraph":         schema_value::<zeroclaw_runtime::sop::SopGraph>(),
             "GraphLegend":      schema_value::<zeroclaw_runtime::sop::GraphLegend>(),
@@ -148,6 +157,37 @@ pub fn build_spec() -> serde_json::Value {
         "schema": { "type": "string" },
         "description": "Section prefix to scope the init pass (e.g. `model_providers`)."
     });
+
+    let force_param = serde_json::json!({
+        "name": "force",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "boolean" },
+        "description": "Bypass the 1h server-side cache and re-query GitHub."
+    });
+
+    let check_version_param = serde_json::json!({
+        "name": "version",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Check a specific release tag instead of the latest."
+    });
+
+    let handoff_param = serde_json::json!({
+        "name": "handoff_id",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Scope the status read to a specific upgrade run (404 on mismatch)."
+    });
+
+    let version_error = |description: &str| {
+        serde_json::json!({
+            "description": description,
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VersionError" } } }
+        })
+    };
 
     let error_responses = serde_json::json!({
         "400": {
@@ -322,6 +362,55 @@ pub fn build_spec() -> serde_json::Value {
                         "description": "Migration applied (or already at the current schema version).",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MigrateResponse" } } }
                     }
+                }
+            }
+        },
+        "/api/version/check": {
+            "get": {
+                "tags": ["version"],
+                "summary": "Check for a newer release",
+                "description": "Runs `zeroclaw update --check --json` server-side (1h cache, force-refreshable). Never fails the dashboard: on any error it still returns 200 with `is_newer: false` and an `error` string so the version badge degrades gracefully.",
+                "parameters": [force_param, check_version_param],
+                "responses": {
+                    "200": {
+                        "description": "Version comparison, or a soft-error envelope carrying `error`.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VersionCheckResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/version/upgrade": {
+            "post": {
+                "tags": ["version"],
+                "summary": "Apply an upgrade via `zeroclaw update`",
+                "description": "Replaces the running binary and (opt-in) restarts the process. Gated by `gateway.allow_self_upgrade` (default off → 403). Single-flight: a concurrent call returns 409. Returns 202 with a `handoff_id`; poll `/api/version/upgrade/status` for progress. An empty body uses defaults (latest version, no auto-restart).",
+                "requestBody": {
+                    "required": false,
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeRequest" } } }
+                },
+                "responses": {
+                    "202": {
+                        "description": "Upgrade accepted; it runs on a detached task.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeAcceptedResponse" } } }
+                    },
+                    "400": version_error("Invalid JSON body, or `auto_restart` is not available in this environment (container/non-unix bare process)."),
+                    "403": version_error("Self-upgrade is disabled (`gateway.allow_self_upgrade = false`)."),
+                    "409": version_error("An upgrade is already in progress."),
+                }
+            }
+        },
+        "/api/version/upgrade/status": {
+            "get": {
+                "tags": ["version"],
+                "summary": "Poll in-flight upgrade progress",
+                "description": "Returns `{ state: \"idle\" }` when no upgrade has run this process, else the live phase (0..=6), the last ~50 log lines, and restart metadata. Pass `handoff_id` to scope the read to a specific run.",
+                "parameters": [handoff_param],
+                "responses": {
+                    "200": {
+                        "description": "Current upgrade progress.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeStatusResponse" } } }
+                    },
+                    "404": version_error("Unknown `handoff_id`."),
                 }
             }
         }
@@ -524,9 +613,30 @@ mod tests {
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
+        assert!(paths.get("/api/version/check").is_some());
+        assert!(paths.get("/api/version/upgrade").is_some());
+        assert!(paths.get("/api/version/upgrade/status").is_some());
         assert!(paths.get("/api/skills/slash-option-kinds").is_some());
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn spec_registers_version_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("VersionCheckResponse").is_some());
+        assert!(schemas.get("UpgradeRequest").is_some());
+        assert!(schemas.get("UpgradeAcceptedResponse").is_some());
+        assert!(schemas.get("UpgradeStatusResponse").is_some());
+        assert!(schemas.get("VersionError").is_some());
+        // The `state` enum is hoisted out of UpgradeStatusResponse's `$defs`
+        // into top-level components by `flatten_defs_into_components`.
+        assert!(schemas.get("UpgradeStatusState").is_some());
+        // Refs must be rewritten to point at the hoisted component, not `$defs`.
+        let spec_str = serde_json::to_string(&spec).unwrap();
+        assert!(!spec_str.contains("#/$defs/"));
     }
 
     #[cfg(all(feature = "schema-export", feature = "a2a"))]

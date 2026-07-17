@@ -28,6 +28,7 @@ source "$extracted"
 
 REPO_ROOT="$tmp/repo"
 export PROFILE="release"
+export FEATURES=""
 mkdir -p "$REPO_ROOT"
 
 cargo() {
@@ -39,9 +40,15 @@ check_arch() {
 }
 
 feature_count() {
-  awk '
+  local expected="$1"
+  awk -v expected="$expected" '
     $0 == "--features" {
-      if (getline && $0 == "computer-use") count++
+      if (getline) {
+        gsub(/,/, " ")
+        for (i = 1; i <= NF; i++) {
+          if ($i == expected) count++
+        }
+      }
     }
     END { print count + 0 }
   ' "$cargo_log"
@@ -51,8 +58,9 @@ assert_feature_selection() {
   local triple="$1" expected="$2" actual
   : >"$cargo_log"
   unset ZEROCLAW_KERNEL_PATH
+  FEATURES=""
   build_kernel "$triple" >/dev/null
-  actual="$(feature_count)"
+  actual="$(feature_count computer-use)"
   if [[ "$actual" != "$expected" ]]; then
     echo "FAIL: $triple expected computer-use feature count $expected, got $actual" >&2
     echo "cargo arguments:" >&2
@@ -66,6 +74,17 @@ assert_feature_selection x86_64-apple-darwin 1
 assert_feature_selection x86_64-unknown-linux-gnu 1
 assert_feature_selection x86_64-pc-windows-msvc 1
 assert_feature_selection aarch64-linux-android 0
+
+# Explicit feature requests compose with the platform-required feature without
+# duplicating either entry.
+: >"$cargo_log"
+FEATURES="embedded-web"
+build_kernel x86_64-unknown-linux-gnu >/dev/null
+if [[ "$(feature_count embedded-web)" != 1 || "$(feature_count computer-use)" != 1 ]]; then
+  echo "FAIL: explicit and platform-required features did not compose exactly once" >&2
+  sed 's/^/  /' "$cargo_log" >&2
+  exit 1
+fi
 
 # Supplying a prebuilt kernel must continue to bypass Cargo and its feature
 # selection entirely.

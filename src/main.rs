@@ -1023,6 +1023,9 @@ Examples:
         /// Target version (default: latest)
         #[arg(long)]
         version: Option<String>,
+        /// With --check, emit machine-readable JSON instead of human text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run diagnostic self-tests
@@ -1227,6 +1230,20 @@ fn apply_homebrew_onboard_config_dir() {
             unsafe { std::env::set_var(name, value) };
         },
     );
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_runtime_profile_for_provider(
+    provider_type: &str,
+    providers: &[zeroclaw_runtime::quickstart::QuickstartTypeOption],
+    default_runtime_profile: &str,
+) -> String {
+    providers
+        .iter()
+        .find(|provider| provider.kind == provider_type)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .unwrap_or(default_runtime_profile)
+        .to_string()
 }
 
 /// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
@@ -2374,6 +2391,18 @@ async fn run_quickstart_cli(
     };
 
     let provider = form.provider.expect("provider satisfied");
+    let provider_type = match &provider {
+        ProviderChoice::Fresh { kind, .. } => kind.as_str(),
+        ProviderChoice::Existing { alias_ref } => alias_ref
+            .split_once('.')
+            .map(|(provider_type, _)| provider_type)
+            .unwrap_or(alias_ref),
+    };
+    let runtime_profile = SelectorChoice::Fresh(quickstart_runtime_profile_for_provider(
+        provider_type,
+        providers,
+        &state.default_runtime_profile,
+    ));
     let model_provider = match provider {
         ProviderChoice::Fresh {
             kind,
@@ -2393,9 +2422,6 @@ async fn run_quickstart_cli(
         PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
         PresetChoice::Existing(a) => SelectorChoice::Existing(a),
     };
-    // Runtime profile picker removed from all surfaces; apply silently
-    // forces the `unbounded` preset. Submit it so the field stays well-formed.
-    let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
     let channels = form
         .channels
@@ -4198,6 +4224,11 @@ async fn main() -> Result<()> {
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
+            // Capture the launch command now, before any in-app upgrade can
+            // swap the binary on disk (after which `current_exe()` resolves to a
+            // "(deleted)" path on Linux). Used by the post-loop self-respawn.
+            zeroclaw_runtime::restart::record_launch();
+
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
             // (loop re-reads config from disk and re-runs). The PID stays
@@ -4404,6 +4435,11 @@ async fn main() -> Result<()> {
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
             }
+            // Bare-process auto-restart: the daemon has now torn down (the
+            // gateway listener is released), so launch the upgraded binary as a
+            // detached child before we exit. No-op unless an in-app upgrade
+            // requested a self-respawn.
+            zeroclaw_runtime::restart::respawn_if_requested();
             Ok(())
         }
 
@@ -5253,10 +5289,25 @@ async fn main() -> Result<()> {
             check,
             force,
             version,
+            json,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
-                if info.is_newer {
+                if json {
+                    // Machine-readable shape consumed by the gateway's
+                    // `GET /api/version/check`. Keep field names stable.
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "current_version": info.current_version,
+                            "latest_version": info.latest_version,
+                            "is_newer": info.is_newer,
+                            "release_url": info.release_url,
+                            "release_notes": info.release_notes,
+                            "published_at": info.published_at,
+                        }))?
+                    );
+                } else if info.is_newer {
                     println!(
                         "{}",
                         ta(
@@ -7868,6 +7919,10 @@ async fn run_gateway_if_enabled(
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
+    // Capture the launch command before the gateway starts so in-app upgrade
+    // can self-respawn after the listener is released. Must mirror the same
+    // call in the Daemon branch.
+    zeroclaw_runtime::restart::record_launch();
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
@@ -7876,6 +7931,10 @@ async fn run_gateway_if_enabled(
         host, port, config, tx, None, None, None, None, None,
     ))
     .await;
+    // Self-respawn after the listener is released, if an in-app upgrade
+    // requested it. No-op when no respawn was requested or on supervised
+    // restart modes.
+    zeroclaw_runtime::restart::respawn_if_requested();
     match result {
         Err(err) if is_addr_in_use_error(&err) => {
             let restart_port = available_gateway_restart_hint_port(host, port);
@@ -8079,6 +8138,51 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "lmstudio".into(),
+            display_name: "LM Studio".into(),
+            local: true,
+            default_runtime_profile: Some("local_small".into()),
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("lmstudio", &providers, "unbounded"),
+            "local_small"
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_advertised_remote_provider_runtime_default() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            local: false,
+            default_runtime_profile: Some("unbounded".into()),
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("anthropic", &providers, "unbounded"),
+            "unbounded"
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_state_fallback_when_provider_has_no_override() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "ollama".into(),
+            display_name: "Ollama".into(),
+            local: true,
+            default_runtime_profile: None,
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("ollama", &providers, "unbounded"),
+            "unbounded"
+        );
+    }
 
     #[test]
     fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {
@@ -9149,6 +9253,36 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_missing_channel_alias() {
+        let mut config = Config::default();
+        let path = "channels.telegram.default.bot_token";
+
+        assert!(
+            !config.channels.telegram.contains_key("default"),
+            "fresh config should not already contain the default channel alias"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known channel path should be materialized");
+
+        assert!(created, "missing channel alias should be created");
+        config
+            .set_prop_persistent(path, "test-token")
+            .expect("materialized channel path should be writable");
+        assert_eq!(
+            config
+                .channels
+                .telegram
+                .get("default")
+                .unwrap()
+                .bot_token
+                .as_str(),
+            "test-token"
         );
     }
 

@@ -201,7 +201,6 @@ pub fn run() {
     let shared = shared_state();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance launches, focus whichever surface is current.

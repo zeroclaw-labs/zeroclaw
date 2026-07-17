@@ -49,6 +49,7 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
 pub mod ws;
@@ -1696,6 +1697,12 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route("/api/version/check", get(version::handle_version_check))
+        .route("/api/version/upgrade", post(version::handle_version_upgrade))
+        .route(
+            "/api/version/upgrade/status",
+            get(version::handle_version_upgrade_status),
+        )
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
             "/api/config",
@@ -2471,15 +2478,9 @@ pub(crate) async fn persist_pairing_tokens(
     Ok(())
 }
 
-/// Result of a gateway chat turn. Carries the response text plus per-turn
-/// token / cost totals collected from `TOOL_LOOP_TURN_USAGE` (when scoped)
-/// so callers can populate observer-event annotations without racing
-/// concurrent webhook traffic that shares the same `CostTracker`.
+/// Result of a gateway chat turn.
 struct GatewayChatOutcome {
     response: String,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cost_usd: Option<f64>,
 }
 
 struct UnconfiguredModelProvider;
@@ -2573,7 +2574,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock model_provider directly
     // instead of bootstrapping the full agent runtime. The mock path
-    // doesn't go through the cost-tracking scope, so usage stays None.
+    // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
         let _ = (session_id, agent_override);
@@ -2581,12 +2582,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
             .await?;
-        Ok(GatewayChatOutcome {
-            response,
-            input_tokens: None,
-            output_tokens: None,
-            cost_usd: None,
-        })
+        Ok(GatewayChatOutcome { response })
     }
 
     #[cfg(not(test))]
@@ -2596,9 +2592,10 @@ pub(crate) async fn run_gateway_chat_with_tools(
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
-        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals
-        // so callers can read the per-turn cost without racing concurrent
-        // requests sharing the same tracker. Pricing is built from the
+        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals so
+        // the runtime-owned lifecycle guard can annotate its `AgentEnd`
+        // without racing concurrent requests sharing the same tracker.
+        // Pricing is built from the
         // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
         // wins over legacy per-alias pricing).
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
@@ -2628,23 +2625,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
             ),
         ))
         .await?;
-        let usage = turn_usage
-            .map(|cell| *cell.lock())
-            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
-        let (input_tokens, output_tokens, cost_usd) = match usage {
-            Some(usage) => (
-                Some(usage.input_tokens),
-                Some(usage.output_tokens),
-                Some(usage.cost_usd),
-            ),
-            None => (None, None, None),
-        };
-        Ok(GatewayChatOutcome {
-            response,
-            input_tokens,
-            output_tokens,
-            cost_usd,
-        })
+        Ok(GatewayChatOutcome { response })
     }
 }
 
@@ -2887,17 +2868,13 @@ async fn handle_webhook(
             .await;
     }
 
-    let (provider_label, model_label, resolved_agent_alias) = {
+    let model_label = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
         let resolved_provider = resolved_agent_alias
             .as_deref()
             .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
-        let provider_label = resolved_provider
-            .as_ref()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let model_label = resolved_provider
+        resolved_provider
             .and_then(|(_, _, entry)| {
                 entry
                     .model
@@ -2907,85 +2884,20 @@ async fn handle_webhook(
                     .map(ToString::to_string)
             })
             .or_else(|| cfg.resolve_default_model())
-            .unwrap_or_else(|| "<unresolved>".to_string());
-        (provider_label, model_label, resolved_agent_alias)
+            .unwrap_or_else(|| "<unresolved>".to_string())
     };
+    // HTTP transport owns request latency and response mapping. The production
+    // dispatch below enters `process_message`, whose runtime turn guard is the
+    // sole owner of lifecycle and LLM events. Emitting another bracket here
+    // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
-    let turn_id = uuid::Uuid::new_v4().to_string();
-    let agent_alias = resolved_agent_alias.as_deref();
-    let channel_name = "gateway";
-
-    state.observer.record_event(
-        &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
-            model_provider: provider_label.clone(),
-            model: model_label.clone(),
-            channel: Some(channel_name.to_string()),
-            agent_alias: agent_alias.map(|s| s.to_string()),
-            turn_id: Some(turn_id.clone()),
-        },
-    );
-    state.observer.record_event(
-        &zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
-            model_provider: provider_label.clone(),
-            model: model_label.clone(),
-            messages_count: 1,
-            channel: Some(channel_name.to_string()),
-            agent_alias: agent_alias.map(|s| s.to_string()),
-            turn_id: Some(turn_id.clone()),
-        },
-    );
 
     match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
     {
-        Ok(GatewayChatOutcome {
-            response,
-            input_tokens,
-            output_tokens,
-            cost_usd,
-        }) => {
+        Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
-            // Per-turn token / cost annotation captured from the cost-tracking
-            // scope inside `run_gateway_chat_with_tools` (None outside of test
-            // / when no LLM call recorded). `TurnUsage` always carries the real
-            // input/output split together, so `.zip` either gives both or
-            // neither — never fabricate `output_tokens: 0` from an aggregate.
-            // Cost is also persisted to /api/cost and costs.jsonl via the same
-            // scope.
-            let tokens_used = input_tokens.zip(output_tokens).map(|(i, o)| {
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: i,
-                    output_tokens: o,
-                }
-            });
-            state.observer.record_event(
-                &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                    model_provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: true,
-                    error_message: None,
-                    input_tokens,
-                    output_tokens,
-                    channel: Some(channel_name.to_string()),
-                    agent_alias: agent_alias.map(|s| s.to_string()),
-                    turn_id: Some(turn_id.clone()),
-                    messages: None,
-                },
-            );
             state.observer.record_metric(
                 &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state.observer.record_event(
-                &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                    model_provider: provider_label,
-                    model: model_label.clone(),
-                    duration,
-                    tokens_used,
-                    cost_usd,
-                    channel: Some(channel_name.to_string()),
-                    agent_alias: agent_alias.map(|s| s.to_string()),
-                    turn_id: Some(turn_id.clone()),
-                },
             );
 
             let body = serde_json::json!({"response": response, "model": model_label});
@@ -2994,22 +2906,6 @@ async fn handle_webhook(
         Err(e) => {
             let duration = started_at.elapsed();
             let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-
-            state.observer.record_event(
-                &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                    model_provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: false,
-                    error_message: Some(sanitized.clone()),
-                    input_tokens: None,
-                    output_tokens: None,
-                    channel: Some(channel_name.to_string()),
-                    agent_alias: agent_alias.map(|s| s.to_string()),
-                    turn_id: Some(turn_id.clone()),
-                    messages: None,
-                },
-            );
             state.observer.record_metric(
                 &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
             );
@@ -3019,19 +2915,6 @@ async fn handle_webhook(
                     component: "gateway".to_string(),
                     message: sanitized.clone(),
                 });
-            state.observer.record_event(
-                &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                    model_provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                    channel: Some(channel_name.to_string()),
-                    agent_alias: agent_alias.map(|s| s.to_string()),
-                    turn_id: Some(turn_id),
-                },
-            );
-
             if is_needs_quickstart_err(&e) {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -6221,7 +6104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_explicit_agent_reports_agent_model() {
+    async fn webhook_explicit_agent_reports_model_without_owning_lifecycle() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
@@ -6329,15 +6212,14 @@ mod tests {
         assert_eq!(parsed["model"], "agent-model");
         let events = observer_impl.events.lock();
         assert!(
-            events.iter().any(|event| matches!(
+            !events.iter().any(|event| matches!(
                 event,
-                zeroclaw_runtime::observability::ObserverEvent::AgentStart {
-                    model_provider,
-                    model,
-                    ..
-                } if model_provider == &expected_provider && model == "agent-model"
+                zeroclaw_runtime::observability::ObserverEvent::AgentStart { .. }
+                    | zeroclaw_runtime::observability::ObserverEvent::AgentEnd { .. }
+                    | zeroclaw_runtime::observability::ObserverEvent::LlmRequest { .. }
+                    | zeroclaw_runtime::observability::ObserverEvent::LlmResponse { .. }
             )),
-            "expected AgentStart to use the explicit agent model; events were: {events:?}"
+            "the HTTP handler must not create a second agent lifecycle; events were: {events:?}"
         );
     }
 

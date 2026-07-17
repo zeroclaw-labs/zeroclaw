@@ -892,8 +892,10 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
-             - Paths inside markers MUST be absolute (starting with /). Never use relative paths.\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Local marker paths may be workspace-relative or absolute, but they must resolve inside the configured workspace directory.\n\
+             - Copy paths from inbound messages or file tools exactly into markers. Do not add, remove, or rewrite path components.\n\
+             - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
@@ -5571,6 +5573,22 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
+    // Bracket the channel turn so lifecycle events
+    // reach observers (and, via the broadcast hook, /api/events and
+    // /api/events/history) for channel-originated turns — mirroring the CLI
+    // `run` and `Agent::turn_streamed` entry points. The drop-safe guard opens
+    // exactly once before the model-switch retry loop and closes on every exit.
+    // A successful switch updates the closing attribution without creating a
+    // second lifecycle start for the same logical turn.
+    let turn_observer = Arc::clone(&ctx.observer);
+    let mut turn_guard = zeroclaw_runtime::observability::AgentTurnGuard::start(
+        turn_observer.as_ref(),
+        route.model_provider.clone(),
+        route.model.clone(),
+        Some(msg.channel.to_string()),
+        Some(ctx.agent_alias.to_string()),
+        Some(turn_id.clone()),
+    );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -5760,14 +5778,6 @@ async fn process_channel_message_body(
                             &runtime_defaults,
                         );
 
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
-                            model_provider: route.model_provider.clone(),
-                            model: route.model.clone(),
-                            channel: Some(msg.channel.to_string()),
-                            agent_alias: Some(ctx.agent_alias.to_string()),
-                            turn_id: Some(turn_id.clone()),
-                        });
-
                         continue;
                     }
                     Err(err) => {
@@ -5793,6 +5803,22 @@ async fn process_channel_message_body(
         (llm_result, fb)
     })
     .await;
+
+    // Attribute the closing event to the final route and attach aggregate
+    // usage. Explicit completion records the normal duration; the guard's
+    // `Drop` path supplies the same matched end on panic or early unwind.
+    let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+        let usage = ctx.snapshot_turn_usage();
+        (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+            zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            },
+        )
+    });
+    turn_guard.set_model_route(route.model_provider.clone(), route.model.clone());
+    turn_guard.set_usage(turn_tokens_used, None);
+    turn_guard.finish();
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     ::zeroclaw_log::record!(
@@ -6669,6 +6695,26 @@ fn channel_sop_target(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
         })
 }
 
+/// Resolve effective debounce window: a per-channel override with a positive
+/// value wins, otherwise falls back to the global default from `ChannelsConfig`.
+/// A per-channel value of `0` is treated as unset (falls back to global).
+fn resolve_effective_debounce_window(
+    global_ms: u64,
+    channel: &str,
+    channel_alias: Option<&str>,
+    telegram_configs: &std::collections::HashMap<String, zeroclaw_config::schema::TelegramConfig>,
+) -> std::time::Duration {
+    let per_channel_ms = if channel == "telegram" {
+        channel_alias
+            .and_then(|alias| telegram_configs.get(alias))
+            .and_then(|cfg| cfg.debounce_ms)
+            .filter(|ms| *ms > 0)
+    } else {
+        None
+    };
+    std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -6727,9 +6773,24 @@ async fn run_message_dispatch_loop(
 
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" && ctx.debouncer.enabled() {
+        let msg = if msg.channel != "cli" {
             let debounce_key = conversation_history_key(&msg);
-            match ctx.debouncer.debounce(&debounce_key, &msg.content).await {
+
+            // Resolve effective debounce window: per-channel override wins,
+            // otherwise falls back to the global default from ChannelsConfig.
+            // A per-channel value of 0 is treated as unset (falls back to global).
+            let debounce_window = resolve_effective_debounce_window(
+                ctx.prompt_config.channels.debounce_ms,
+                &msg.channel,
+                msg.channel_alias.as_deref(),
+                &ctx.prompt_config.channels.telegram,
+            );
+
+            match ctx
+                .debouncer
+                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
+                .await
+            {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
                     // to expire, then feeds the combined message through the normal
@@ -6875,7 +6936,7 @@ pub fn bind_channel_identity_into(
     if !channel_alias_configured(config, channel_type, alias) {
         anyhow::bail!(
             "{channel_type} channel alias `{alias}` is not configured. Run \
-             `zeroclaw config set channels.{channel_type}.{alias}.bot-token=<token>` first \
+             `zeroclaw config set channels.{channel_type}.{alias}.bot_token <token>` \
              (see docs/book/src/channels/overview.md for the full field list)."
         );
     }
@@ -7311,6 +7372,7 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
                     WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
+                        .with_persistence(config_arc.clone())
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -7493,7 +7555,7 @@ fn build_channel_by_id(
                     peer_resolver,
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
-                    wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
+                    Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
                 )?
                 .with_persistence(config_arc.clone())
                 .with_workspace_dir(workspace_dir),
@@ -8718,6 +8780,7 @@ fn collect_configured_channels(
                                     peer_resolver,
                                     allowed_groups_resolver,
                                 )
+                                .with_persistence(config_arc.clone())
                                 .with_transcription(config.transcription.clone())
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
@@ -9487,7 +9550,9 @@ fn collect_configured_channels(
             peer_resolver,
             wechat.api_base_url.clone(),
             wechat.cdn_base_url.clone(),
-            wechat.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
+            Some(WeChatChannel::resolve_state_dir(
+                wechat.state_dir.as_deref(),
+            )),
         ) {
             Ok(channel) => {
                 channels.push(ConfiguredChannel {
@@ -11144,7 +11209,7 @@ pub async fn deliver_announcement(
                 peer_resolver,
                 wc.api_base_url.clone(),
                 wc.cdn_base_url.clone(),
-                wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
             )?
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
@@ -11293,11 +11358,6 @@ pub async fn deliver_announcement(
     }
     #[allow(unreachable_code)]
     Ok(())
-}
-
-#[cfg(feature = "channel-wechat")]
-fn expand_tilde_in_path(path: &str) -> PathBuf {
-    PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
 // ── Concurrent persist lock test (#7753) ─────────────────────────
@@ -12181,15 +12241,17 @@ temperature = 0.3
 
     #[cfg(feature = "channel-wechat")]
     #[test]
-    fn expand_tilde_in_path_expands_home_prefix() {
-        let expanded = expand_tilde_in_path("~/wechat-state");
+    fn wechat_resolve_state_dir_expands_home_prefix() {
+        use crate::wechat::WeChatChannel;
+
+        let expanded = WeChatChannel::resolve_state_dir(Some("~/wechat-state"));
         assert!(!expanded.starts_with("~"));
         assert!(expanded.ends_with("wechat-state"));
 
-        let absolute = expand_tilde_in_path("/absolute/path");
+        let absolute = WeChatChannel::resolve_state_dir(Some("/absolute/path"));
         assert_eq!(absolute, PathBuf::from("/absolute/path"));
 
-        let relative = expand_tilde_in_path("relative/path");
+        let relative = WeChatChannel::resolve_state_dir(Some("relative/path"));
         assert_eq!(relative, PathBuf::from("relative/path"));
     }
 
@@ -13745,6 +13807,26 @@ api_key = "anthropic-key"
         model_provider_ref: &str,
         hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     ) -> Arc<ChannelRuntimeContext> {
+        test_runtime_ctx_with_observer(
+            channel,
+            model_provider,
+            prompt_config,
+            agent_cfg,
+            model_provider_ref,
+            hooks,
+            Arc::new(NoopObserver),
+        )
+    }
+
+    fn test_runtime_ctx_with_observer(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+    ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
@@ -13763,7 +13845,7 @@ api_key = "anthropic-key"
                 ),
             ),
             tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
+            observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
@@ -13888,6 +13970,279 @@ api_key = "anthropic-key"
                 "ok".to_string()
             )]
         );
+    }
+
+    /// Serializes tests that interact with the process-wide model-switch
+    /// request (`MODEL_SWITCH_REQUEST` in zeroclaw-runtime's agent loop).
+    /// While a pending request exists, ANY concurrently running
+    /// `process_channel_message` turn can observe it, short-circuit to the
+    /// switch handler, and clear it — so the test that sets it AND tests
+    /// whose assertions are sensitive to an unexpected switch retry must
+    /// hold this guard. `tokio::sync::Mutex` because it is held across
+    /// awaits; the `OnceLock` wrapper gives a `'static` initializer in a
+    /// `static` context without `lazy_static`.
+    static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn model_switch_test_guard() -> &'static tokio::sync::Mutex<()> {
+        MODEL_SWITCH_TEST_GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Observer that records every event, for turn-lifecycle assertions.
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: std::sync::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for RecordingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    /// Provider stub that cancels the turn's `CancellationToken` from inside
+    /// the LLM call and then parks forever, so the orchestrator's
+    /// `tokio::select!` deterministically takes the cancelled arm mid-turn.
+    struct CancelMidTurnModelProvider {
+        token: CancellationToken,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CancelMidTurnModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.token.cancel();
+            std::future::pending::<()>().await;
+            unreachable!("parked future never resumes")
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.token.cancel();
+            std::future::pending::<()>().await;
+            unreachable!("parked future never resumes")
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CancelMidTurnModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CancelMidTurnModelProvider"
+        }
+    }
+
+    /// (start bracket entries, end bracket entries) — each entry is
+    /// `(channel, agent_alias, turn_id)`. Aliased to keep the return type
+    /// readable (clippy::type_complexity).
+    type LifecycleBracketSnapshot = (
+        Vec<(Option<String>, Option<String>, Option<String>)>,
+        Vec<(Option<String>, Option<String>, Option<String>)>,
+    );
+
+    fn lifecycle_bracket_snapshot(events: &[ObserverEvent]) -> LifecycleBracketSnapshot {
+        let starts = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => Some((channel.clone(), agent_alias.clone(), turn_id.clone())),
+                _ => None,
+            })
+            .collect();
+        let ends = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => Some((channel.clone(), agent_alias.clone(), turn_id.clone())),
+                _ => None,
+            })
+            .collect();
+        (starts, ends)
+    }
+
+    /// Regression guard for the fix where channel-originated turns (Telegram,
+    /// Discord, ...) never emitted `AgentStart`/`AgentEnd`, so
+    /// `/api/events/history` showed `llm_request` frames but no turn
+    /// lifecycle brackets. A successful turn must emit exactly one
+    /// `AgentStart` (before the LLM request) and one `AgentEnd` (last),
+    /// all sharing one `turn_id` and carrying the channel + agent alias.
+    #[tokio::test]
+    async fn process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
+        // The exactly-one-AgentStart assertion is sensitive to a leaked
+        // process-wide model-switch request (the switch retry emits an
+        // extra re-attributing AgentStart), so serialize on the guard.
+        let _guard = model_switch_test_guard().lock().await;
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(starts.len(), 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends.len(), 1, "exactly one AgentEnd, got {events:?}");
+
+        let start_pos = events
+            .iter()
+            .position(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .unwrap();
+        let llm_request_pos = events
+            .iter()
+            .position(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+            .expect("turn should emit an LlmRequest");
+        assert!(
+            start_pos < llm_request_pos,
+            "AgentStart must precede the LlmRequest: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "AgentEnd must be the last event: {events:?}"
+        );
+
+        let (start_channel, start_alias, start_turn_id) = starts[0].clone();
+        let (end_channel, end_alias, end_turn_id) = ends[0].clone();
+        assert_eq!(start_channel.as_deref(), Some("test-channel"));
+        assert_eq!(end_channel.as_deref(), Some("test-channel"));
+        assert_eq!(start_alias.as_deref(), Some("test-agent"));
+        assert_eq!(end_alias.as_deref(), Some("test-agent"));
+        assert!(start_turn_id.is_some(), "AgentStart must carry a turn_id");
+        assert_eq!(start_turn_id, end_turn_id, "brackets must share a turn_id");
+
+        let llm_request_turn_id = events.iter().find_map(|e| match e {
+            ObserverEvent::LlmRequest { turn_id, .. } => Some(turn_id.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            llm_request_turn_id,
+            Some(start_turn_id),
+            "inner LlmRequest must share the brackets' turn_id"
+        );
+    }
+
+    /// An erroring LLM turn must still close its bracket: one `AgentStart`
+    /// and one `AgentEnd`, same `turn_id`.
+    #[tokio::test]
+    async fn process_channel_message_emits_brackets_when_llm_errors() {
+        // See the guard note on the success-turn bracket test.
+        let _guard = model_switch_test_guard().lock().await;
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+        );
+
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(starts.len(), 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends.len(), 1, "exactly one AgentEnd, got {events:?}");
+        assert_eq!(
+            starts[0].2, ends[0].2,
+            "brackets must share a turn_id even on error"
+        );
+        assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
+    }
+
+    /// A turn cancelled mid-flight (interrupt-on-new-message) must still
+    /// close its bracket — the ZeroHome-critical guarantee that a cancelled
+    /// turn cannot wedge an "agent in flight" indicator with an unmatched
+    /// `AgentStart`.
+    #[tokio::test]
+    async fn process_channel_message_emits_brackets_when_cancelled_mid_turn() {
+        // See the guard note on the success-turn bracket test.
+        let _guard = model_switch_test_guard().lock().await;
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(
+            starts.len(),
+            1,
+            "cancelled turn must still emit AgentStart, got {events:?}"
+        );
+        assert_eq!(
+            ends.len(),
+            1,
+            "cancelled turn must still emit AgentEnd, got {events:?}"
+        );
+        assert_eq!(
+            starts[0].2, ends[0].2,
+            "brackets must share a turn_id even when cancelled"
+        );
+        assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
     }
 
     #[tokio::test]
@@ -16242,15 +16597,7 @@ BTC is currently around $65,000 based on latest tool output."#
     async fn process_channel_message_persists_model_switch_with_route_credential() {
         // Serialize on the process-wide model-switch state so this test
         // doesn't race other tests that also touch the same static.
-        // `tokio::sync::Mutex` is held across the awaits below; the
-        // `OnceLock` wrapper gives us a `'static` initializer in a
-        // `static` context without `lazy_static`.
-        static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        let _guard = MODEL_SWITCH_TEST_GUARD
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
+        let _guard = model_switch_test_guard().lock().await;
         clear_model_switch_request();
 
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -16262,6 +16609,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
         let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
 
         // The switch handler resolves the requested provider `openrouter` to
         // a configured `<type>.<alias>` ref via
@@ -16331,7 +16679,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ),
             ),
             tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
+            observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
@@ -16412,6 +16760,25 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
+        {
+            let events = observer.events.lock().unwrap();
+            let (starts, ends) = lifecycle_bracket_snapshot(&events);
+            assert_eq!(
+                starts.len(),
+                1,
+                "a model switch must not create a second AgentStart: {events:?}"
+            );
+            assert_eq!(
+                ends.len(),
+                1,
+                "the switched turn must close once: {events:?}"
+            );
+            assert_eq!(
+                starts[0], ends[0],
+                "the switched turn's lifecycle pair must keep one correlation triple"
+            );
+        }
+
         // After the switch handler runs, the route override must be
         // persisted for this sender with the resolved api_key.
         let route_key = "telegram_chat-1_alice";
@@ -16470,6 +16837,19 @@ BTC is currently around $65,000 based on latest tool output."#
             "follow-up message must be served by the switched provider (the persisted \
              route override), not by the original default provider"
         );
+        {
+            let events = observer.events.lock().unwrap();
+            let (starts, ends) = lifecycle_bracket_snapshot(&events);
+            assert_eq!(
+                starts.len(),
+                2,
+                "two logical turns need two starts: {events:?}"
+            );
+            assert_eq!(ends.len(), 2, "two logical turns need two ends: {events:?}");
+            for (start, end) in starts.iter().zip(&ends) {
+                assert_eq!(start, end, "each logical turn must keep one matched pair");
+            }
+        }
 
         // Clean up shared global state so we don't leak into other tests.
         clear_model_switch_request();
@@ -21843,6 +22223,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_persists_image_payload_verbatim() {
+        // `calls.len() == 1` below is sensitive to a leaked process-wide
+        // model-switch request (a pending request makes this turn
+        // short-circuit and retry, doubling the provider calls), so
+        // serialize on the shared guard. Observed colliding with
+        // `process_channel_message_persists_model_switch_with_route_credential`
+        // in parallel runs.
+        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22124,6 +22511,36 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_matrix_match_marker_contract() {
+        let block = channel_delivery_instructions("matrix")
+            .expect("matrix channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Matrix:"),
+            "matrix block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path-or-url>]"),
+            "matrix block must describe local path or URL marker syntax"
+        );
+        assert!(
+            block.contains("workspace-relative or absolute"),
+            "matrix block must match the validator's local path contract"
+        );
+        assert!(
+            block.contains("Copy paths from inbound messages or file tools exactly"),
+            "matrix block must prevent rewriting inbound or tool-returned paths"
+        );
+        assert!(
+            block.contains("http:// or https:// URLs"),
+            "matrix block must describe supported remote marker targets"
+        );
+        assert!(
+            !block.contains("Never use relative paths"),
+            "matrix block must not contradict the workspace-relative marker contract"
+        );
     }
 
     #[test]
@@ -24787,6 +25204,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
@@ -24815,6 +25233,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         config
@@ -26826,5 +27245,77 @@ mod omitted_feature_tests {
             "Telegram must be absent from collect_configured_channels when \
              channel-telegram feature is not compiled in"
         );
+    }
+}
+
+#[cfg(test)]
+mod debounce_resolution_tests {
+    use super::resolve_effective_debounce_window;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use zeroclaw_config::schema::TelegramConfig;
+
+    #[test]
+    fn per_channel_debounce_zero_falls_back_to_global() {
+        let mut telegram_configs = HashMap::new();
+        telegram_configs.insert(
+            "default".into(),
+            TelegramConfig {
+                debounce_ms: Some(0),
+                ..Default::default()
+            },
+        );
+        let duration =
+            resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn per_channel_debounce_positive_overrides_global() {
+        let mut telegram_configs = HashMap::new();
+        telegram_configs.insert(
+            "default".into(),
+            TelegramConfig {
+                debounce_ms: Some(500),
+                ..Default::default()
+            },
+        );
+        let duration =
+            resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn per_channel_debounce_none_falls_back_to_global() {
+        let mut telegram_configs = HashMap::new();
+        telegram_configs.insert(
+            "default".into(),
+            TelegramConfig {
+                debounce_ms: None,
+                ..Default::default()
+            },
+        );
+        let duration =
+            resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn non_telegram_channel_uses_global() {
+        let telegram_configs = HashMap::new();
+        let duration = resolve_effective_debounce_window(1000, "discord", None, &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn unknown_telegram_alias_uses_global() {
+        let telegram_configs = HashMap::new();
+        let duration = resolve_effective_debounce_window(
+            1000,
+            "telegram",
+            Some("nonexistent"),
+            &telegram_configs,
+        );
+        assert_eq!(duration, Duration::from_millis(1000));
     }
 }

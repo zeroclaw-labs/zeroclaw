@@ -16,10 +16,13 @@ set -euo pipefail
 #   scripts/desktop/prepare-kernel.sh --target aarch64-apple-darwin
 #   scripts/desktop/prepare-kernel.sh --target universal-apple-darwin
 #       # builds both mac arches and fuses them with lipo
+#   scripts/desktop/prepare-kernel.sh --target universal-apple-darwin \
+#       --features embedded-web
 #
 # Environment:
 #   ZEROCLAW_KERNEL_PATH   Reuse an existing kernel binary instead of building
-#                          (single-target only; ignored for universal).
+#                          (single-target only; ignored for universal). Requested
+#                          features must already be present in that binary.
 #   CARGO_PROFILE          Cargo profile to build (default: release).
 #
 # Then bundle with the sidecar overlay:
@@ -30,10 +33,12 @@ OUT_DIR="$REPO_ROOT/apps/tauri/binaries"
 PROFILE="${CARGO_PROFILE:-release}"
 
 TARGET=""
+FEATURES=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
-    -h|--help) sed -n '3,25p' "$0"; exit 0 ;;
+    --features) FEATURES="$2"; shift 2 ;;
+    -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -72,15 +77,19 @@ build_kernel() {
     echo "$ZEROCLAW_KERNEL_PATH"
     return
   fi
-  local build_args=(--profile "$PROFILE" --bin zeroclaw)
+  local features="$FEATURES"
   # Bundle the native backend only for supported desktop targets. Android is
   # intentionally excluded even though its target triples contain `linux`.
   case "$triple" in
     *-apple-darwin|*-linux-gnu*|*-windows-msvc)
-      build_args+=(--features computer-use)
+      case ",${features// /,}," in
+        *,computer-use,*) ;;
+        *) features="${features:+$features,}computer-use" ;;
+      esac
       ;;
   esac
-  build_args+=(--target "$triple")
+  local build_args=(--profile "$PROFILE" --bin zeroclaw --target "$triple")
+  [[ -n "$features" ]] && build_args+=(--features "$features")
   printf 'prepare-kernel: cargo build' >&2
   printf ' %q' "${build_args[@]}" >&2
   printf '\n' >&2

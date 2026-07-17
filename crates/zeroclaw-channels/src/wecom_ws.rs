@@ -273,7 +273,9 @@ impl MediaDecryptor {
         let mut buf = encrypted.to_vec();
         let plaintext = cbc::Decryptor::<Aes256>::new(key.into(), iv.into())
             .decrypt_padded_mut::<NoPadding>(&mut buf)
-            .map_err(|_| anyhow::Error::msg("failed to decrypt WeCom media attachment"))?;
+            .map_err(|e| {
+                anyhow::Error::msg(format!("failed to decrypt WeCom media attachment: {e}"))
+            })?;
         Ok(strip_wecom_padding(plaintext)?.to_vec())
     }
 }
@@ -384,7 +386,7 @@ impl WeComWsChannel {
         let tx = self.wait_for_ws_sender().await?;
         tx.send(WsOutbound::Frame(frame))
             .await
-            .map_err(|_| anyhow::Error::msg("WeCom WS outbound channel closed"))
+            .map_err(|e| anyhow::Error::msg(format!("WeCom WS outbound channel closed: {e}")))
     }
 
     async fn ws_send_frame_and_wait_for_response(
