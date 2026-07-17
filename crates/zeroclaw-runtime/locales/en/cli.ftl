@@ -698,6 +698,9 @@ cli-security-status-agent-enabled = Agent enabled: {$enabled}
 cli-security-status-risk-profile = Risk profile: {$v}
 cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
+cli-fresh-confirmation-single-call = Tool '{$tool}' requires fresh confirmation and must be issued alone so approval immediately precedes execution.
+cli-fresh-confirmation-unsafe-arguments = Fresh-confirmation arguments could not be shown completely and unambiguously, or contain control, bidi, or invisible formatting characters; the call was rejected before prompting.
+cli-fresh-confirmation-busy = Another freshly confirmed action is awaiting approval or execution. Retry after it finishes so this call can be reviewed against current state.
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
@@ -904,6 +907,7 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
 turn-ingress-dropped = This request was not processed: { $reason }
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
+turn-fresh-tool-interrupted-outcome-unknown = [freshly approved action was interrupted; its outcome may be unknown—inspect current state before requesting any retry]
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
@@ -1047,4 +1051,3 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
-

@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role};
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{ConfirmationRequirement, Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
@@ -98,6 +98,29 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn confirmation_requirement(&self, args: &serde_json::Value) -> ConfirmationRequirement {
+        self.inner.confirmation_requirement(args)
+    }
+
+    fn effective_confirmation_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
+        self.inner.effective_confirmation_arguments(args)
+    }
+
+    fn output_sensitivity(
+        &self,
+        args: &serde_json::Value,
+    ) -> zeroclaw_api::tool::ToolOutputSensitivity {
+        self.inner.output_sensitivity(args)
+    }
+
+    fn audit_output(
+        &self,
+        args: &serde_json::Value,
+        result: &ToolResult,
+    ) -> Option<serde_json::Value> {
+        self.inner.audit_output(args, result)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -210,6 +233,29 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
         self.inner.param_domains()
     }
 
+    fn confirmation_requirement(&self, args: &serde_json::Value) -> ConfirmationRequirement {
+        self.inner.confirmation_requirement(args)
+    }
+
+    fn effective_confirmation_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
+        self.inner.effective_confirmation_arguments(args)
+    }
+
+    fn output_sensitivity(
+        &self,
+        args: &serde_json::Value,
+    ) -> zeroclaw_api::tool::ToolOutputSensitivity {
+        self.inner.output_sensitivity(args)
+    }
+
+    fn audit_output(
+        &self,
+        args: &serde_json::Value,
+        result: &ToolResult,
+    ) -> Option<serde_json::Value> {
+        self.inner.audit_output(args, result)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(arg) = self.extract_path_string(&args) {
             // For shell command arguments, use the full token-aware scanner.
@@ -305,6 +351,33 @@ mod tests {
                 output: "ok".into(),
                 error: None,
             })
+        }
+    }
+
+    struct FreshTool;
+
+    zeroclaw_api::mock_tool_attribution!(FreshTool);
+
+    #[async_trait]
+    impl Tool for FreshTool {
+        fn name(&self) -> &str {
+            "fresh"
+        }
+
+        fn description(&self) -> &str {
+            "fresh"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        fn confirmation_requirement(&self, _args: &serde_json::Value) -> ConfirmationRequirement {
+            ConfirmationRequirement::Fresh
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::ok("ok"))
         }
     }
 
@@ -432,6 +505,17 @@ mod tests {
             .unwrap();
         assert!(!blocked.success);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn composed_wrappers_delegate_fresh_confirmation() {
+        let sec = policy(AutonomyLevel::Full);
+        let tool = RateLimitedTool::new(PathGuardedTool::new(FreshTool, sec.clone()), sec);
+
+        assert_eq!(
+            tool.confirmation_requirement(&serde_json::json!({"action": "mutate"})),
+            ConfirmationRequirement::Fresh
+        );
     }
 
     #[tokio::test]

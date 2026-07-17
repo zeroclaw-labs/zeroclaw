@@ -14,6 +14,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
+static FRESH_CONFIRMATION_EXECUTION_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// The prepared subset of one round's tool calls.
 ///
 /// `ordered_results` has one slot per incoming call; prep fills the slots for
@@ -25,6 +28,10 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
+    /// Process-wide lease acquired before a Fresh prompt and retained until
+    /// the approved call finishes. This closes approval-to-execution races
+    /// between concurrent turns and between different Fresh tools.
+    pub(crate) fresh_confirmation_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
 fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (String, String) {
@@ -33,14 +40,14 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
     (tool_name.trim().to_ascii_lowercase(), args_json)
 }
 
-async fn record_duplicate_tool_call(
+async fn record_rejected_tool_call(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
+    reason: String,
+    deduplicated: bool,
 ) -> ToolExecutionOutcome {
-    let duplicate =
-        format!("Skipped duplicate tool call '{tool_name}' with identical arguments in this turn.");
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
@@ -51,8 +58,8 @@ async fn record_duplicate_tool_call(
                 "iteration": iteration + 1,
                 "tool": tool_name,
                 "arguments": scrub_credentials(&tool_args.to_string()),
-                "result": duplicate,
-                "deduplicated": true,
+                "result": reason,
+                "deduplicated": deduplicated,
                 "trace_id": ctx.turn_id,
             })),
         "tool_call_result"
@@ -61,14 +68,15 @@ async fn record_duplicate_tool_call(
         let _ = tx
             .send(StreamDelta::Status(format!(
                 "\u{274c} {}: {}\n",
-                tool_name, duplicate
+                tool_name, reason
             )))
             .await;
     }
     ToolExecutionOutcome {
-        output: duplicate.clone(),
+        output: reason.clone(),
+        audit_output: None,
         success: false,
-        error_reason: Some(duplicate),
+        error_reason: Some(reason),
         duration: Duration::ZERO,
         receipt: None,
         output_data: None,
@@ -80,6 +88,8 @@ async fn record_duplicate_tool_call(
 pub(crate) async fn prepare_tool_calls(
     ctx: &TurnCtx<'_>,
     tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     seen_tool_signatures: &mut HashSet<(String, String)>,
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
     iteration: usize,
@@ -89,6 +99,7 @@ pub(crate) async fn prepare_tool_calls(
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut fresh_confirmation_guard = None;
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
@@ -129,6 +140,7 @@ pub(crate) async fn prepare_tool_calls(
                     }
                     let outcome = ToolExecutionOutcome {
                         output: cancelled,
+                        audit_output: None,
                         success: false,
                         error_reason: Some(reason),
                         duration: Duration::ZERO,
@@ -160,18 +172,116 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+        crate::agent::set_computer_use_approval_context(&tool_name, &mut tool_args, None);
 
-        let requires_prompt = ctx
-            .approval
-            .map(|mgr| mgr.needs_approval(&tool_name))
-            .unwrap_or(false);
+        let confirmation = crate::agent::tool_execution::confirmation_for_call(
+            tools_registry,
+            activated_tools,
+            &tool_name,
+            &tool_args,
+        );
+        let confirmation_requirement = confirmation.requirement;
+        crate::agent::set_fresh_confirmation_approved_arg(
+            confirmation_requirement,
+            &mut tool_args,
+            false,
+        );
+        let confirmation_args = confirmation.effective_arguments;
+
+        if confirmation_requirement == zeroclaw_api::tool::ConfirmationRequirement::Fresh
+            && !crate::approval::confirmation_args_are_review_safe(&confirmation_args)
+        {
+            let rejected =
+                crate::i18n::get_required_cli_string("cli-fresh-confirmation-unsafe-arguments");
+            let outcome = record_rejected_tool_call(
+                ctx,
+                &tool_name,
+                &confirmation_args,
+                iteration,
+                rejected,
+                false,
+            )
+            .await;
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+            continue;
+        }
+
+        if confirmation_requirement == zeroclaw_api::tool::ConfirmationRequirement::Fresh
+            && tool_calls.len() != 1
+        {
+            let rejected = crate::i18n::get_required_cli_string_with_args(
+                "cli-fresh-confirmation-single-call",
+                &[("tool", &tool_name)],
+            );
+            let outcome = record_rejected_tool_call(
+                ctx,
+                &tool_name,
+                &confirmation_args,
+                iteration,
+                rejected,
+                false,
+            )
+            .await;
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+            continue;
+        }
+
+        let call_fresh_confirmation_guard =
+            if confirmation_requirement == zeroclaw_api::tool::ConfirmationRequirement::Fresh {
+                match FRESH_CONFIRMATION_EXECUTION_LOCK.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        let rejected =
+                            crate::i18n::get_required_cli_string("cli-fresh-confirmation-busy");
+                        let outcome = record_rejected_tool_call(
+                            ctx,
+                            &tool_name,
+                            &confirmation_args,
+                            iteration,
+                            rejected,
+                            false,
+                        )
+                        .await;
+                        if let Some(tx) = ctx.event_tx {
+                            emit_tool_call_pair(tx, call, &outcome).await;
+                        }
+                        ordered_results[idx] =
+                            Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+        let requires_prompt = confirmation_requirement
+            == zeroclaw_api::tool::ConfirmationRequirement::Fresh
+            || ctx
+                .approval
+                .map(|mgr| mgr.needs_approval(&tool_name))
+                .unwrap_or(false);
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
         if requires_prompt && tool_name == "shell" && !reentrant_agent_tool {
             let prompt_signature = tool_call_signature(&tool_name, &tool_args);
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
-                let duplicate =
-                    record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+                let duplicate = record_rejected_tool_call(
+                    ctx,
+                    &tool_name,
+                    &tool_args,
+                    iteration,
+                    format!(
+                        "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
+                    ),
+                    true,
+                )
+                .await;
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
                 continue;
@@ -207,7 +317,15 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
-        let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
+        let approved = match gate_tool_approval(
+            ctx,
+            &tool_name,
+            &confirmation_args,
+            confirmation_requirement,
+            iteration,
+        )
+        .await
+        {
             ApprovalGateOutcome::Proceed { approved } => approved,
             ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
                 // Streaming consumers see the denied/replaced call and its
@@ -222,13 +340,43 @@ pub(crate) async fn prepare_tool_calls(
             }
         };
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
+        crate::agent::set_fresh_confirmation_approved_arg(
+            confirmation_requirement,
+            &mut tool_args,
+            approved,
+        );
+        let approval_context = approved.then(|| zeroclaw_api::tool::ApprovalContext {
+            provenance: match confirmation_requirement {
+                zeroclaw_api::tool::ConfirmationRequirement::Policy => {
+                    zeroclaw_api::tool::ApprovalProvenance::Policy
+                }
+                zeroclaw_api::tool::ConfirmationRequirement::Fresh => {
+                    zeroclaw_api::tool::ApprovalProvenance::Fresh
+                }
+            },
+            effective_arguments: confirmation_args.clone(),
+        });
+        crate::agent::set_computer_use_approval_context(
+            &tool_name,
+            &mut tool_args,
+            approval_context,
+        );
 
         let signature = tool_call_signature(&tool_name, &tool_args);
         let dedup_exempt =
             ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name) || reentrant_agent_tool;
         if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
-            let duplicate =
-                record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+            let duplicate = record_rejected_tool_call(
+                ctx,
+                &tool_name,
+                &tool_args,
+                iteration,
+                format!(
+                    "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
+                ),
+                true,
+            )
+            .await;
             ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
             continue;
         }
@@ -293,11 +441,16 @@ pub(crate) async fn prepare_tool_calls(
             arguments: tool_args,
             tool_call_id: Some(call_id),
         });
+        if call_fresh_confirmation_guard.is_some() {
+            debug_assert!(fresh_confirmation_guard.is_none());
+            fresh_confirmation_guard = call_fresh_confirmation_guard;
+        }
     }
 
     Ok(PreparedToolCalls {
         ordered_results,
         executable_indices,
         executable_calls,
+        fresh_confirmation_guard,
     })
 }

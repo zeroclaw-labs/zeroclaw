@@ -342,6 +342,17 @@ pub struct Config {
     #[group = "Tools"]
     pub browser: BrowserConfig,
 
+    /// Desktop computer-use configuration (`[computer_use]`).
+    ///
+    /// This is intentionally separate from `[browser.computer_use]`: browser
+    /// automation and whole-desktop control have different policy and approval
+    /// boundaries. The desktop tool is also compile-time gated and remains
+    /// unavailable unless the binary is built with `--features computer-use`.
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub computer_use: ComputerUseConfig,
+
     /// Browser delegation configuration (`[browser_delegate]`).
     ///
     /// Delegates browser-based tasks to a browser-capable CLI subprocess (e.g.
@@ -7150,6 +7161,123 @@ impl Default for SecretsConfig {
 }
 
 // ── Browser (friendly-service browsing only) ───────────────────
+
+/// Hard per-action text limit chosen so approval surfaces display the complete
+/// intended input without truncating a hidden suffix.
+pub const COMPUTER_USE_MAX_TEXT_CHARS: usize = zeroclaw_api::tool::CONFIRMATION_SUMMARY_VALUE_CHARS;
+/// Maximum exact application selectors admitted by one desktop policy.
+pub const COMPUTER_USE_MAX_ALLOWED_APPLICATIONS: usize = 128;
+/// Maximum Unicode scalar values in one exact application selector.
+pub const COMPUTER_USE_MAX_APPLICATION_CHARS: usize = 512;
+/// Shorter deadlines make post-input outcomes needlessly ambiguous.
+pub const COMPUTER_USE_MIN_TIMEOUT_MS: u64 = 1_000;
+/// Upper bound prevents a stuck platform operation from monopolizing desktop control.
+pub const COMPUTER_USE_MAX_TIMEOUT_MS: u64 = 60_000;
+
+/// Application boundary enforced by the native computer-use driver.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseApplicationAccess {
+    /// Admit only exact entries from `allowed_applications`.
+    #[default]
+    Allowlist,
+    /// Admit any valid application identity resolved by the operating system.
+    Desktop,
+}
+
+/// Operator-confirmation cadence for mutating computer-use actions.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseConfirmationMode {
+    /// Require a new operator decision immediately before every input action.
+    #[default]
+    Fresh,
+    /// Use ordinary risk-profile approval, including session `Always` grants.
+    Session,
+}
+
+/// Whole-desktop computer-use configuration (`[computer_use]` section).
+///
+/// This section is the canonical operator policy for the separate desktop
+/// tool. The native platform driver stays private to the feature-gated tool;
+/// the core runtime only exposes it when both this config and the
+/// `computer-use` build feature are enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "computer_use"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Computer use",
+    description = "Accessibility-first desktop inspection and controlled input",
+    status_field = "enabled"
+)]
+pub struct ComputerUseConfig {
+    /// Enable the desktop `computer_use` tool. Requires a computer-use build.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Application boundary: exact `allowlist` (default) or all `desktop` apps.
+    #[serde(default)]
+    pub application_access: ComputerUseApplicationAccess,
+    /// Approval cadence for input actions: `fresh` (default) or `session`.
+    #[serde(default)]
+    pub confirmation_mode: ComputerUseConfirmationMode,
+    /// Maximum wall-clock time for one platform action, in milliseconds.
+    #[serde(default = "default_computer_use_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Applications the native driver may inspect or control.
+    ///
+    /// Used only when `application_access = "allowlist"`. Matching is exact
+    /// against the current process/application name or bundle identifier. An
+    /// empty list denies application inspection and all input actions.
+    #[serde(default)]
+    pub allowed_applications: Vec<String>,
+    /// Optional lower X bound in global logical display coordinates.
+    #[serde(default)]
+    pub min_coordinate_x: Option<i64>,
+    /// Optional lower Y bound in global logical display coordinates.
+    #[serde(default)]
+    pub min_coordinate_y: Option<i64>,
+    /// Optional upper X bound in global logical display coordinates.
+    #[serde(default)]
+    pub max_coordinate_x: Option<i64>,
+    /// Optional upper Y bound in global logical display coordinates.
+    #[serde(default)]
+    pub max_coordinate_y: Option<i64>,
+    /// Maximum Unicode scalar values accepted by one text-input action.
+    #[serde(default = "default_computer_use_max_text_chars")]
+    pub max_text_chars: usize,
+}
+
+fn default_computer_use_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_computer_use_max_text_chars() -> usize {
+    COMPUTER_USE_MAX_TEXT_CHARS
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            application_access: ComputerUseApplicationAccess::default(),
+            confirmation_mode: ComputerUseConfirmationMode::default(),
+            timeout_ms: default_computer_use_timeout_ms(),
+            allowed_applications: Vec::new(),
+            min_coordinate_x: None,
+            min_coordinate_y: None,
+            max_coordinate_x: None,
+            max_coordinate_y: None,
+            max_text_chars: default_computer_use_max_text_chars(),
+        }
+    }
+}
 
 /// Computer-use sidecar configuration (`[browser.computer_use]` section).
 ///
@@ -17010,6 +17138,7 @@ impl Default for Config {
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
@@ -18666,6 +18795,111 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        if self.computer_use.enabled {
+            if !(COMPUTER_USE_MIN_TIMEOUT_MS..=COMPUTER_USE_MAX_TIMEOUT_MS)
+                .contains(&self.computer_use.timeout_ms)
+            {
+                validation_bail!(
+                    InvalidNumericRange,
+                    "computer_use.timeout_ms",
+                    "computer_use.timeout_ms must be between {COMPUTER_USE_MIN_TIMEOUT_MS} and {COMPUTER_USE_MAX_TIMEOUT_MS}"
+                );
+            }
+            if self.computer_use.max_text_chars == 0
+                || self.computer_use.max_text_chars > COMPUTER_USE_MAX_TEXT_CHARS
+            {
+                validation_bail!(
+                    InvalidNumericRange,
+                    "computer_use.max_text_chars",
+                    "computer_use.max_text_chars must be between 1 and {COMPUTER_USE_MAX_TEXT_CHARS} so approval shows the complete input"
+                );
+            }
+            if self.computer_use.application_access == ComputerUseApplicationAccess::Desktop
+                && !self.computer_use.allowed_applications.is_empty()
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    "computer_use.allowed_applications",
+                    "computer_use.allowed_applications must be empty when application_access='desktop'"
+                );
+            }
+            if self
+                .computer_use
+                .allowed_applications
+                .iter()
+                .any(|application| application == "*")
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    "computer_use.allowed_applications",
+                    "computer_use.allowed_applications does not accept wildcards; set computer_use.application_access='desktop' for desktop-wide control"
+                );
+            }
+            for (min, max, axis) in [
+                (
+                    self.computer_use.min_coordinate_x,
+                    self.computer_use.max_coordinate_x,
+                    "x",
+                ),
+                (
+                    self.computer_use.min_coordinate_y,
+                    self.computer_use.max_coordinate_y,
+                    "y",
+                ),
+            ] {
+                if let (Some(min), Some(max)) = (min, max)
+                    && min > max
+                {
+                    let path = format!("computer_use.{axis}_coordinate_bounds");
+                    validation_bail!(
+                        InvalidNumericRange,
+                        path,
+                        "computer_use minimum {axis} coordinate {min} exceeds maximum {max}"
+                    );
+                }
+            }
+            if self
+                .computer_use
+                .allowed_applications
+                .iter()
+                .any(|application| {
+                    application.trim() != application
+                        || application.is_empty()
+                        || application.chars().count() > COMPUTER_USE_MAX_APPLICATION_CHARS
+                        || application
+                            .chars()
+                            .any(zeroclaw_api::tool::is_unsafe_confirmation_character)
+                })
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    "computer_use.allowed_applications",
+                    "computer_use.allowed_applications entries must be trimmed, single-line, and at most {COMPUTER_USE_MAX_APPLICATION_CHARS} characters"
+                );
+            }
+            if self.computer_use.allowed_applications.len() > COMPUTER_USE_MAX_ALLOWED_APPLICATIONS
+            {
+                validation_bail!(
+                    InvalidNumericRange,
+                    "computer_use.allowed_applications",
+                    "computer_use.allowed_applications accepts at most {COMPUTER_USE_MAX_ALLOWED_APPLICATIONS} entries"
+                );
+            }
+            let mut unique_applications = std::collections::HashSet::new();
+            if self
+                .computer_use
+                .allowed_applications
+                .iter()
+                .any(|application| !unique_applications.insert(application))
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    "computer_use.allowed_applications",
+                    "computer_use.allowed_applications entries must be unique"
+                );
+            }
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -23725,6 +23959,7 @@ auto_save = true
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
@@ -24436,6 +24671,7 @@ default_temperature = 0.7
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
@@ -26092,6 +26328,133 @@ default_temperature = 0.7
         assert!(c.secrets.encrypt);
         assert!(c.browser.enabled);
         assert_eq!(c.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
+    #[test]
+    async fn computer_use_config_is_fail_closed_by_default() {
+        let c = ComputerUseConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(
+            c.application_access,
+            ComputerUseApplicationAccess::Allowlist
+        );
+        assert_eq!(c.confirmation_mode, ComputerUseConfirmationMode::Fresh);
+        assert_eq!(c.timeout_ms, 15_000);
+        assert!(c.allowed_applications.is_empty());
+        assert!(c.min_coordinate_x.is_none());
+        assert!(c.min_coordinate_y.is_none());
+        assert!(c.max_coordinate_x.is_none());
+        assert!(c.max_coordinate_y.is_none());
+        assert_eq!(c.max_text_chars, COMPUTER_USE_MAX_TEXT_CHARS);
+    }
+
+    #[test]
+    async fn computer_use_config_serde_roundtrip() {
+        let config = ComputerUseConfig {
+            enabled: true,
+            application_access: ComputerUseApplicationAccess::Allowlist,
+            confirmation_mode: ComputerUseConfirmationMode::Session,
+            timeout_ms: 8_000,
+            allowed_applications: vec!["Preview".into()],
+            min_coordinate_x: Some(-1_920),
+            min_coordinate_y: Some(0),
+            max_coordinate_x: Some(2_560),
+            max_coordinate_y: Some(1_440),
+            max_text_chars: 64,
+        };
+        let encoded = toml::to_string(&config).unwrap();
+        let parsed: ComputerUseConfig = toml::from_str(&encoded).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(
+            parsed.application_access,
+            ComputerUseApplicationAccess::Allowlist
+        );
+        assert_eq!(
+            parsed.confirmation_mode,
+            ComputerUseConfirmationMode::Session
+        );
+        assert_eq!(parsed.allowed_applications, vec!["Preview"]);
+        assert_eq!(parsed.min_coordinate_x, Some(-1_920));
+        assert_eq!(parsed.max_coordinate_y, Some(1_440));
+        assert_eq!(parsed.max_text_chars, 64);
+    }
+
+    #[test]
+    async fn computer_use_desktop_session_mode_is_explicit_and_round_trips() {
+        let parsed: ComputerUseConfig = toml::from_str(
+            r#"
+enabled = true
+application_access = "desktop"
+confirmation_mode = "session"
+allowed_applications = []
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.application_access,
+            ComputerUseApplicationAccess::Desktop
+        );
+        assert_eq!(
+            parsed.confirmation_mode,
+            ComputerUseConfirmationMode::Session
+        );
+        assert!(parsed.allowed_applications.is_empty());
+
+        assert!(toml::from_str::<ComputerUseConfig>("application_access = 'everything'").is_err());
+        assert!(toml::from_str::<ComputerUseConfig>("confirmation_mode = 'never'").is_err());
+    }
+
+    #[test]
+    async fn computer_use_missing_section_stays_disabled() {
+        let parsed = parse_test_config("");
+        assert!(!parsed.computer_use.enabled);
+        assert_eq!(
+            parsed.computer_use.application_access,
+            ComputerUseApplicationAccess::Allowlist
+        );
+        assert_eq!(
+            parsed.computer_use.confirmation_mode,
+            ComputerUseConfirmationMode::Fresh
+        );
+        assert!(parsed.computer_use.allowed_applications.is_empty());
+    }
+
+    #[test]
+    async fn computer_use_enabled_config_rejects_unreviewable_or_duplicate_applications() {
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
+        config.computer_use.allowed_applications = vec!["Preview\nspoof".into()];
+        assert!(config.validate().is_err());
+
+        config.computer_use.allowed_applications = vec!["Preview".into(), "Preview".into()];
+        assert!(config.validate().is_err());
+
+        config.computer_use.allowed_applications = vec!["*".into()];
+        assert!(config.validate().is_err());
+
+        config.computer_use.application_access = ComputerUseApplicationAccess::Desktop;
+        config.computer_use.allowed_applications = vec!["Preview".into()];
+        assert!(config.validate().is_err());
+
+        config.computer_use.allowed_applications.clear();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn computer_use_enabled_config_rejects_invalid_limits() {
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
+        config.computer_use.timeout_ms = COMPUTER_USE_MIN_TIMEOUT_MS - 1;
+        assert!(config.validate().is_err());
+
+        config.computer_use.timeout_ms = default_computer_use_timeout_ms();
+        config.computer_use.max_text_chars = COMPUTER_USE_MAX_TEXT_CHARS + 1;
+        assert!(config.validate().is_err());
+
+        config.computer_use.max_text_chars = default_computer_use_max_text_chars();
+        config.computer_use.min_coordinate_x = Some(2);
+        config.computer_use.max_coordinate_x = Some(1);
+        assert!(config.validate().is_err());
     }
 
     #[test]

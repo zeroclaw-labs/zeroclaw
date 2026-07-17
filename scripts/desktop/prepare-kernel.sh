@@ -77,13 +77,23 @@ build_kernel() {
     echo "$ZEROCLAW_KERNEL_PATH"
     return
   fi
-  if [[ -n "$FEATURES" ]]; then
-    echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple --features $FEATURES" >&2
-    (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple" --features "$FEATURES")
-  else
-    echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple" >&2
-    (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple")
-  fi
+  local features="$FEATURES"
+  # Bundle the native backend only for supported desktop targets. Android is
+  # intentionally excluded even though its target triples contain `linux`.
+  case "$triple" in
+    *-apple-darwin|*-linux-gnu*|*-windows-msvc)
+      case ",${features// /,}," in
+        *,computer-use,*) ;;
+        *) features="${features:+$features,}computer-use" ;;
+      esac
+      ;;
+  esac
+  local build_args=(--profile "$PROFILE" --bin zeroclaw --target "$triple")
+  [[ -n "$features" ]] && build_args+=(--features "$features")
+  printf 'prepare-kernel: cargo build' >&2
+  printf ' %q' "${build_args[@]}" >&2
+  printf '\n' >&2
+  (cd "$REPO_ROOT" && cargo build "${build_args[@]}")
   local dir="release"
   [[ "$PROFILE" != "release" ]] && dir="$PROFILE"
   echo "$REPO_ROOT/target/$triple/$dir/zeroclaw$exe"

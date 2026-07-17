@@ -345,6 +345,98 @@ impl OptionEntry {
     }
 }
 
+/// Per-call confirmation policy declared by a concrete tool.
+///
+/// The runtime resolves this from the tool after call arguments have been
+/// rewritten by hooks, so tools can require a fresh operator decision only for
+/// actions that mutate external state while leaving read-only actions on the
+/// ordinary risk-profile policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfirmationRequirement {
+    /// Apply the runtime's ordinary risk-profile approval policy.
+    #[default]
+    Policy,
+    /// Require a new operator decision for this execution. Full autonomy,
+    /// `auto_approve`, and session-scoped "Always" decisions cannot bypass it.
+    Fresh,
+}
+
+/// One atomically resolved operator-confirmation decision and review view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolConfirmation {
+    pub requirement: ConfirmationRequirement,
+    pub effective_arguments: serde_json::Value,
+}
+
+/// Reserved internal argument carrying a trusted, per-call approval grant.
+pub const APPROVAL_CONTEXT_ARG: &str = "approval_context";
+
+/// Runtime decision that authorized one concrete tool execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalProvenance {
+    /// Ordinary risk-profile policy approved the call.
+    Policy,
+    /// A new operator decision approved this exact call.
+    Fresh,
+}
+
+/// Ephemeral runtime grant bound to the exact arguments an operator reviewed.
+///
+/// `effective_arguments` is a per-call materialized view, not stored policy.
+/// Tools compare it with a freshly resolved view immediately before acting so
+/// a config reload cannot silently broaden an already approved operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalContext {
+    pub provenance: ApprovalProvenance,
+    pub effective_arguments: serde_json::Value,
+}
+
+/// Logging and persistence policy for a concrete tool result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolOutputSensitivity {
+    /// The ordinary rendered result may be recorded.
+    #[default]
+    Ordinary,
+    /// The result may be sent to the model/user data path, but audit,
+    /// observability, receipts, hooks, and workflow capture must use only the
+    /// tool's bounded [`Tool::audit_output`] projection.
+    Sensitive,
+}
+
+/// Maximum rendered size of a tool-provided sensitive-output audit projection.
+pub const MAX_TOOL_AUDIT_OUTPUT_CHARS: usize = 1_024;
+
+/// Maximum number of Unicode scalar values rendered for one argument value
+/// in an ordinary operator-confirmation summary. Fresh confirmations use the
+/// separate complete-action bound below and never truncate.
+pub const CONFIRMATION_SUMMARY_VALUE_CHARS: usize = 80;
+
+/// Maximum size of the complete canonical JSON shown for a fresh-confirmation
+/// call. Calls above this bound are rejected before prompting; the review
+/// surface must never approve a truncated action.
+pub const FRESH_CONFIRMATION_SUMMARY_CHARS: usize = 1_024;
+
+/// Whether a character can make a confirmation prompt render differently from
+/// the underlying argument (terminal controls, bidi overrides/isolates, and
+/// invisible format controls). Fresh-confirmation arguments containing these
+/// characters must be rejected before display.
+#[must_use]
+pub fn is_unsafe_confirmation_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
+
 /// Core tool trait — implement for any capability.
 ///
 /// Every `Tool` is `Attributable`: log emissions and audit traces from
@@ -378,6 +470,45 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// selectable choices. Default: no domain-typed parameters.
     fn param_domains(&self) -> Vec<(&'static str, OptionDomain)> {
         Vec::new()
+    }
+
+    /// Return the operator-confirmation policy for these concrete arguments.
+    ///
+    /// The default preserves the runtime's existing risk-profile behavior.
+    fn confirmation_requirement(&self, _args: &serde_json::Value) -> ConfirmationRequirement {
+        ConfirmationRequirement::Policy
+    }
+
+    /// Return the exact effective arguments that an operator reviews.
+    /// Wrappers that inject or lock arguments must materialize that per-call
+    /// view here; the default action is unchanged.
+    fn effective_confirmation_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
+        args.clone()
+    }
+
+    /// Resolve confirmation cadence and review arguments as one per-call view.
+    /// Tools backed by reloadable policy should override this method so both
+    /// fields come from the same canonical config read.
+    fn confirmation(&self, args: &serde_json::Value) -> ToolConfirmation {
+        ToolConfirmation {
+            requirement: self.confirmation_requirement(args),
+            effective_arguments: self.effective_confirmation_arguments(args),
+        }
+    }
+
+    /// Classify the result produced for these concrete arguments.
+    fn output_sensitivity(&self, _args: &serde_json::Value) -> ToolOutputSensitivity {
+        ToolOutputSensitivity::Ordinary
+    }
+
+    /// Build bounded, non-sensitive metadata for a sensitive result.
+    /// Returning `None` uses a generic omission marker.
+    fn audit_output(
+        &self,
+        _args: &serde_json::Value,
+        _result: &ToolResult,
+    ) -> Option<serde_json::Value> {
+        None
     }
 
     /// Execute the tool with given arguments
@@ -496,5 +627,16 @@ mod tests {
         let out = with_ephemeral_workspace_warning("body");
         assert!(out.starts_with(EPHEMERAL_WORKSPACE_WARNING));
         assert!(out.ends_with("\n\nbody"));
+    }
+
+    #[test]
+    fn confirmation_character_policy_rejects_controls_and_bidi_overrides() {
+        assert!(is_unsafe_confirmation_character('\n'));
+        assert!(is_unsafe_confirmation_character('\u{202e}'));
+        assert!(is_unsafe_confirmation_character('\u{2028}'));
+        assert!(is_unsafe_confirmation_character('\u{2029}'));
+        assert!(is_unsafe_confirmation_character('\u{2066}'));
+        assert!(!is_unsafe_confirmation_character('é'));
+        assert!(!is_unsafe_confirmation_character('界'));
     }
 }

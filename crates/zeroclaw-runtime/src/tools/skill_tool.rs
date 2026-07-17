@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{ConfirmationRequirement, Tool, ToolOutput, ToolResult};
 
 /// Default execution time for a skill shell command when the manifest does not
 /// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
@@ -444,6 +444,33 @@ impl Tool for SkillBuiltinTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.advertised_schema.clone()
+    }
+
+    fn confirmation_requirement(&self, args: &serde_json::Value) -> ConfirmationRequirement {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.confirmation_requirement(&merged)
+    }
+
+    fn effective_confirmation_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.effective_confirmation_arguments(&merged)
+    }
+
+    fn output_sensitivity(
+        &self,
+        args: &serde_json::Value,
+    ) -> zeroclaw_api::tool::ToolOutputSensitivity {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.output_sensitivity(&merged)
+    }
+
+    fn audit_output(
+        &self,
+        args: &serde_json::Value,
+        result: &ToolResult,
+    ) -> Option<serde_json::Value> {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.audit_output(&merged, result)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -994,6 +1021,13 @@ mod tests {
                 "required": ["action"]
             })
         }
+        fn confirmation_requirement(&self, args: &serde_json::Value) -> ConfirmationRequirement {
+            if args.get("action").and_then(serde_json::Value::as_str) == Some("execute") {
+                ConfirmationRequirement::Fresh
+            } else {
+                ConfirmationRequirement::Policy
+            }
+        }
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
@@ -1070,6 +1104,30 @@ mod tests {
         assert!(
             !required.contains(&"action"),
             "locked key removed from required"
+        );
+    }
+
+    #[test]
+    fn skill_elevated_tool_delegates_confirmation_with_locked_args() {
+        let target: Arc<dyn Tool> = Arc::new(EchoArgsTool {
+            name: "computer_use".into(),
+        });
+        let mut locked = HashMap::new();
+        locked.insert("action".to_string(), "execute".to_string());
+        let st = elevation_skill_tool("builtin", "computer_use", locked.clone());
+        let tool = SkillBuiltinTool::new("desktop", &st, target, locked);
+
+        assert_eq!(
+            tool.confirmation_requirement(&serde_json::json!({"action": "screenshot"})),
+            ConfirmationRequirement::Fresh,
+            "the target's locked mutating action must determine confirmation policy"
+        );
+        assert_eq!(
+            tool.effective_confirmation_arguments(
+                &serde_json::json!({"action": "screenshot", "title": "visible"})
+            ),
+            serde_json::json!({"action": "execute", "title": "visible"}),
+            "the approval surface must include the locked effective action"
         );
     }
 

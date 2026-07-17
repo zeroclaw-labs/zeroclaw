@@ -1663,6 +1663,11 @@ pub async fn run(
         "screenshot",
         "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
     ));
+        if config.computer_use.enabled
+            && let Some(description) = crate::i18n::get_tool_description("computer_use")
+        {
+            tool_descs.push(("computer_use", description));
+        }
         tool_descs.push((
         "image_info",
         "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
@@ -3201,6 +3206,11 @@ pub async fn process_message(
         }
         if config.browser.enabled {
             tool_descs.push(("browser_open", "Open approved URLs in browser."));
+        }
+        if config.computer_use.enabled
+            && let Some(description) = crate::i18n::get_tool_description("computer_use")
+        {
+            tool_descs.push(("computer_use", description));
         }
         if config.composio.enabled {
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));

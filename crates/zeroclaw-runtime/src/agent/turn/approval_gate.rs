@@ -7,6 +7,9 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
+use zeroclaw_api::tool::ConfirmationRequirement;
+
+const DENIED_BY_USER: &str = "Denied by user.";
 
 /// Outcome of [`gate_tool_approval`] for one tool call.
 ///
@@ -19,6 +22,47 @@ pub(crate) enum ApprovalGateOutcome {
     Replace(ToolExecutionOutcome),
 }
 
+async fn deny_tool_call(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    iteration: usize,
+    denied: String,
+) -> ApprovalGateOutcome {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "tool": tool_name,
+                "arguments": scrub_credentials(&tool_args.to_string()),
+                "result": denied,
+                "trace_id": ctx.turn_id,
+            })),
+        "tool_call_result"
+    );
+    if let Some(tx) = ctx.on_delta {
+        let _ = tx
+            .send(StreamDelta::Status(format!(
+                "\u{274c} {}: {}\n",
+                tool_name, denied
+            )))
+            .await;
+    }
+    ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+        output: denied.clone(),
+        audit_output: None,
+        success: false,
+        error_reason: Some(denied),
+        duration: Duration::ZERO,
+        receipt: None,
+        output_data: None,
+    })
+}
+
 /// Run the approval flow for one tool call (upstream loop body, approval
 /// section): resolve the tool's approval requirement, prompt interactively on
 /// CLI or via the channel's inline approval on non-interactive channels
@@ -27,15 +71,27 @@ pub(crate) async fn gate_tool_approval(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
+    confirmation_requirement: ConfirmationRequirement,
     iteration: usize,
 ) -> ApprovalGateOutcome {
-    let mut approval_requirement = ctx
-        .approval
-        .map(|mgr| mgr.approval_requirement(tool_name))
-        .unwrap_or(ApprovalRequirement::NotRequired);
-    if let Some(mgr) = ctx.approval
-        && approval_requirement == ApprovalRequirement::Prompt
-    {
+    let mut approval_requirement = match confirmation_requirement {
+        ConfirmationRequirement::Policy => ctx
+            .approval
+            .map(|mgr| mgr.approval_requirement(tool_name))
+            .unwrap_or(ApprovalRequirement::NotRequired),
+        ConfirmationRequirement::Fresh => ApprovalRequirement::Prompt,
+    };
+    if approval_requirement == ApprovalRequirement::Prompt {
+        let Some(mgr) = ctx.approval else {
+            return deny_tool_call(
+                ctx,
+                tool_name,
+                tool_args,
+                iteration,
+                DENIED_BY_USER.to_string(),
+            )
+            .await;
+        };
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
@@ -49,7 +105,10 @@ pub(crate) async fn gate_tool_approval(
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary: crate::approval::summarize_args_for_confirmation(
+                        &request.arguments,
+                        confirmation_requirement,
+                    ),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
@@ -94,7 +153,10 @@ pub(crate) async fn gate_tool_approval(
             };
             (decision, decided_by)
         } else {
-            (mgr.prompt_cli(&request), None)
+            (
+                mgr.prompt_cli_with_confirmation(&request, confirmation_requirement),
+                None,
+            )
         };
 
         // The approval audit records which surface decided. On the streaming
@@ -105,41 +167,23 @@ pub(crate) async fn gate_tool_approval(
         // to WS/ACP, not "cli". Single channels and the CLI prompt path leave it
         // `None` and keep `channel_name`.
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        mgr.record_decision_with_confirmation(
+            tool_name,
+            tool_args,
+            &decision,
+            &decision_channel,
+            confirmation_requirement,
+        );
 
         if decision == ApprovalResponse::No {
-            let denied = "Denied by user.".to_string();
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model": ctx.model,
-                        "iteration": iteration + 1,
-                        "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "result": denied,
-                        "trace_id": ctx.turn_id,
-                    })),
-                "tool_call_result"
-            );
-            if let Some(tx) = ctx.on_delta {
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
-                        "\u{274c} {}: {}\n",
-                        tool_name, denied
-                    )))
-                    .await;
-            }
-            return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
-                output: denied.clone(),
-                success: false,
-                error_reason: Some(denied),
-                duration: Duration::ZERO,
-                receipt: None,
-                output_data: None,
-            });
+            return deny_tool_call(
+                ctx,
+                tool_name,
+                tool_args,
+                iteration,
+                DENIED_BY_USER.to_string(),
+            )
+            .await;
         }
 
         if let ApprovalResponse::ReplaceWith(replacement) = &decision {
@@ -169,6 +213,7 @@ pub(crate) async fn gate_tool_approval(
             );
             return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
                 output: crate::approval::sanitize_tool_replacement(replacement),
+                audit_output: None,
                 success: true,
                 error_reason: None,
                 duration: Duration::ZERO,

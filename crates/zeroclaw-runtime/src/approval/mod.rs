@@ -11,6 +11,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::BufReader;
 use std::io::{self, BufRead, Write};
+use zeroclaw_api::tool::ConfirmationRequirement;
 use zeroclaw_config::schema::RiskProfileConfig;
 
 // ── Types ────────────────────────────────────────────────────────
@@ -229,14 +230,36 @@ impl ApprovalManager {
         decision: &ApprovalResponse,
         channel: &str,
     ) {
+        self.record_decision_with_confirmation(
+            tool_name,
+            args,
+            decision,
+            channel,
+            ConfirmationRequirement::Policy,
+        );
+    }
+
+    /// Record an approval decision using the concrete tool call's confirmation
+    /// requirement. A fresh confirmation treats an "Always" response as
+    /// approval for this call only and therefore never updates session state.
+    pub(crate) fn record_decision_with_confirmation(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        decision: &ApprovalResponse,
+        channel: &str,
+        confirmation_requirement: ConfirmationRequirement,
+    ) {
         // If "Always", add to session allowlist.
-        if *decision == ApprovalResponse::Always {
+        if *decision == ApprovalResponse::Always
+            && confirmation_requirement == ConfirmationRequirement::Policy
+        {
             let mut allowlist = self.session_allowlist.lock();
             allowlist.insert(tool_name.to_string());
         }
 
         // Append to audit log.
-        let summary = summarize_args(args);
+        let summary = summarize_args_for_confirmation(args, confirmation_requirement);
         let entry = ApprovalLogEntry {
             timestamp: Utc::now().to_rfc3339(),
             tool_name: tool_name.to_string(),
@@ -263,7 +286,15 @@ impl ApprovalManager {
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
-        prompt_cli_interactive(request)
+        prompt_cli_interactive(request, ConfirmationRequirement::Policy)
+    }
+
+    pub(crate) fn prompt_cli_with_confirmation(
+        &self,
+        request: &ApprovalRequest,
+        confirmation_requirement: ConfirmationRequirement,
+    ) -> ApprovalResponse {
+        prompt_cli_interactive(request, confirmation_requirement)
     }
 }
 
@@ -271,8 +302,11 @@ impl ApprovalManager {
 
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
-fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
-    let summary = summarize_args(&request.arguments);
+fn prompt_cli_interactive(
+    request: &ApprovalRequest,
+    confirmation_requirement: ConfirmationRequirement,
+) -> ApprovalResponse {
+    let summary = summarize_args_for_confirmation(&request.arguments, confirmation_requirement);
     eprintln!();
     eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
     eprintln!("   {summary}");
@@ -354,10 +388,16 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
                     "[redacted]".to_string()
                 } else {
                     match v {
-                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        serde_json::Value::String(s) => truncate_for_summary(
+                            s,
+                            zeroclaw_api::tool::CONFIRMATION_SUMMARY_VALUE_CHARS,
+                        ),
                         other => {
                             let s = other.to_string();
-                            truncate_for_summary(&s, 80)
+                            truncate_for_summary(
+                                &s,
+                                zeroclaw_api::tool::CONFIRMATION_SUMMARY_VALUE_CHARS,
+                            )
                         }
                     }
                 };
@@ -372,10 +412,16 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
                     "[redacted]".to_string()
                 } else {
                     match v {
-                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        serde_json::Value::String(s) => truncate_for_summary(
+                            s,
+                            zeroclaw_api::tool::CONFIRMATION_SUMMARY_VALUE_CHARS,
+                        ),
                         other => {
                             let s = other.to_string();
-                            truncate_for_summary(&s, 80)
+                            truncate_for_summary(
+                                &s,
+                                zeroclaw_api::tool::CONFIRMATION_SUMMARY_VALUE_CHARS,
+                            )
                         }
                     }
                 };
@@ -388,6 +434,109 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
             truncate_for_summary(&s, 120)
         }
     }
+}
+
+/// Render the exact action reviewed by an operator. Fresh confirmations use
+/// complete compact JSON with non-alphanumeric string content Unicode-escaped
+/// so punctuation cannot masquerade as fields or Markdown, and no
+/// action-distinguishing suffix is truncated.
+pub(crate) fn summarize_args_for_confirmation(
+    args: &serde_json::Value,
+    confirmation_requirement: ConfirmationRequirement,
+) -> String {
+    if confirmation_requirement == ConfirmationRequirement::Fresh {
+        render_fresh_confirmation_args(args)
+    } else {
+        summarize_args(args)
+    }
+}
+
+fn render_fresh_confirmation_args(value: &serde_json::Value) -> String {
+    fn render_string(value: &str, output: &mut String) {
+        output.push('"');
+        for character in value.chars() {
+            if character.is_ascii_alphanumeric() || character == ' ' {
+                output.push(character);
+                continue;
+            }
+            let codepoint = u32::from(character);
+            if codepoint <= 0xffff {
+                output.push_str(&format!("\\u{codepoint:04x}"));
+            } else {
+                let scalar = codepoint - 0x1_0000;
+                let high = 0xd800 + (scalar >> 10);
+                let low = 0xdc00 + (scalar & 0x3ff);
+                output.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+            }
+        }
+        output.push('"');
+    }
+
+    fn render(value: &serde_json::Value, output: &mut String) {
+        match value {
+            serde_json::Value::Null => output.push_str("null"),
+            serde_json::Value::Bool(value) => {
+                output.push_str(if *value { "true" } else { "false" })
+            }
+            serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+            serde_json::Value::String(value) => render_string(value, output),
+            serde_json::Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    render(value, output);
+                }
+                output.push(']');
+            }
+            serde_json::Value::Object(values) => {
+                output.push('{');
+                for (index, (key, value)) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    render_string(key, output);
+                    output.push(':');
+                    render(value, output);
+                }
+                output.push('}');
+            }
+        }
+    }
+
+    let mut output = String::new();
+    render(value, &mut output);
+    output
+}
+
+/// Fresh-confirmation prompts reject strings that could visually reorder,
+/// hide, or inject content into an approval surface.
+pub(crate) fn confirmation_args_are_review_safe(value: &serde_json::Value) -> bool {
+    confirmation_value_fits_fresh_summary(value) && confirmation_value_is_review_safe(value)
+}
+
+fn confirmation_value_is_review_safe(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => !value
+            .chars()
+            .any(zeroclaw_api::tool::is_unsafe_confirmation_character),
+        serde_json::Value::Array(values) => values.iter().all(confirmation_value_is_review_safe),
+        serde_json::Value::Object(values) => values.iter().all(|(key, value)| {
+            confirmation_key_is_review_safe(key) && confirmation_value_is_review_safe(value)
+        }),
+        _ => true,
+    }
+}
+
+fn confirmation_key_is_review_safe(key: &str) -> bool {
+    !key.chars()
+        .any(zeroclaw_api::tool::is_unsafe_confirmation_character)
+}
+
+fn confirmation_value_fits_fresh_summary(value: &serde_json::Value) -> bool {
+    render_fresh_confirmation_args(value).chars().count()
+        <= zeroclaw_api::tool::FRESH_CONFIRMATION_SUMMARY_CHARS
 }
 
 /// Heuristic for argument keys that should have their value redacted in
@@ -417,11 +566,18 @@ fn looks_like_secret_key(key: &str) -> bool {
 
 fn truncate_for_summary(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
+    let mut truncated = String::new();
+    for character in chars.by_ref().take(max_chars) {
+        if zeroclaw_api::tool::is_unsafe_confirmation_character(character) {
+            truncated.push_str(&format!("\\u{{{:x}}}", u32::from(character)));
+        } else {
+            truncated.push(character);
+        }
+    }
     if chars.next().is_some() {
         format!("{truncated}…")
     } else {
-        input.to_string()
+        truncated
     }
 }
 
@@ -711,6 +867,50 @@ mod tests {
         let summary = summarize_args(&args);
         assert!(summary.contains("content:"));
         assert!(summary.contains('…'));
+    }
+
+    #[test]
+    fn summarize_args_escapes_prompt_control_characters() {
+        let args = serde_json::json!({"text": "approve\n\u{202e}deny"});
+        let summary = summarize_args(&args);
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\u{202e}'));
+        assert!(summary.contains("\\u{a}"));
+        assert!(summary.contains("\\u{202e}"));
+    }
+
+    #[test]
+    fn fresh_review_safety_recurses_through_arguments() {
+        assert!(confirmation_args_are_review_safe(
+            &serde_json::json!({"text": "ordinary Unicode 界"})
+        ));
+        assert!(!confirmation_args_are_review_safe(
+            &serde_json::json!({"nested": ["safe", "spoof\u{2066}"]})
+        ));
+    }
+
+    #[test]
+    fn fresh_confirmation_summary_is_complete_canonical_json() {
+        let args = serde_json::json!({
+            "action": "press_element",
+            "title": "OK, application: [Unrelated](https://example.test) `hidden` @all"
+        });
+        let summary = summarize_args_for_confirmation(&args, ConfirmationRequirement::Fresh);
+        assert!(summary.contains("\"title\":\"OK\\u002c application\\u003a "));
+        assert!(summary.contains("\\u005bUnrelated\\u005d\\u0028https"));
+        assert!(summary.contains("\\u0060hidden\\u0060 \\u0040all"));
+        assert!(!summary.contains("[Unrelated]("));
+        assert!(!summary.contains('`'));
+        assert!(!summary.contains("@all"));
+        assert!(!summary.contains('…'));
+    }
+
+    #[test]
+    fn fresh_review_rejects_an_action_too_large_to_show_completely() {
+        let args = serde_json::json!({
+            "text": "x".repeat(zeroclaw_api::tool::FRESH_CONFIRMATION_SUMMARY_CHARS)
+        });
+        assert!(!confirmation_args_are_review_safe(&args));
     }
 
     #[test]

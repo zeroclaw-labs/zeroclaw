@@ -6,6 +6,12 @@ This guide covers setting up browser automation capabilities in ZeroClaw, includ
 
 ZeroClaw supports multiple browser access methods:
 
+Browser automation is intentionally separate from whole-desktop mouse and
+keyboard control. For arbitrary local applications, see
+[Computer use](./computer-use.md). The legacy `browser.backend =
+"computer_use"` setting is an external browser-sidecar client; it is not the
+feature-gated desktop tool described in that guide.
+
 | Method | Use Case | Requirements |
 |--------|----------|--------------|
 | **agent-browser CLI** | Headless automation, AI agents | npm, Chrome |
