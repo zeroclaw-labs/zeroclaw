@@ -24,6 +24,19 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# ── Runner selection: reversible Blacksmith toggle (compile-heavy jobs) ────
+# The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test) read `runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}`
+# so they can move to faster Blacksmith runners; the light housekeeping jobs and
+# the Windows/macOS jobs stay on GitHub-hosted runners on purpose.
+#   • Variable unset (default) → GitHub-hosted `ubuntu-latest`; identical to before.
+#   • Set the repo/org Actions variable `CI_LINUX_RUNNER` to a Blacksmith label
+#     (e.g. `blacksmith-8vcpu-ubuntu-2404`) to speed up these compiles. Requires the
+#     Blacksmith GitHub App installed on the org that owns this repo.
+#   • Roll back instantly by clearing the variable — no code change or revert PR.
+# Never leave a `blacksmith-*` value set while the App is uninstalled: such jobs
+# queue with no runner (~24h) instead of failing fast.
+
 jobs:
   # ── Fast serial gate: fail formatting errors before burning compute ───────
 
@@ -84,7 +97,7 @@ jobs:
   lint:
     name: Lint
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -264,7 +277,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Linux entry follows the CI_LINUX_RUNNER toggle; the check name is
+          # `${{ matrix.label }} ${{ matrix.target }}` (not matrix.os), so the
+          # required-check name is unchanged whichever runner this resolves to.
+          - os: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -334,7 +350,7 @@ jobs:
   check:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -367,7 +383,7 @@ jobs:
   check-plugin-backends:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -409,7 +425,7 @@ jobs:
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -432,7 +448,7 @@ jobs:
   bench:
     name: Benchmarks Compile
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -486,7 +502,7 @@ jobs:
   test:
     name: Test
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
