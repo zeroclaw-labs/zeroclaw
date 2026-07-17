@@ -607,8 +607,6 @@ impl AnthropicModelProvider {
             }
         }
 
-        Self::backfill_orphaned_tool_uses(&mut native_messages);
-
         // Always use Blocks format with cache_control for system prompts
         let system_prompt = system_text.map(|text| {
             SystemPrompt::Blocks(vec![SystemBlock {
@@ -619,77 +617,6 @@ impl AnthropicModelProvider {
         });
 
         (system_prompt, native_messages)
-    }
-
-    /// Pair any orphaned `tool_use` with a stub `tool_result` so interrupted
-    /// turns can't wedge the session with a hard 400 on replay. Defensive
-    /// backstop for the canonical-history guard in the runtime.
-    fn backfill_orphaned_tool_uses(messages: &mut Vec<NativeMessage>) {
-        let mut idx = 0;
-        while idx < messages.len() {
-            let pending: Vec<String> = messages[idx]
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    NativeContentOut::ToolUse { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect();
-
-            if pending.is_empty() {
-                idx += 1;
-                continue;
-            }
-
-            let answered: std::collections::HashSet<String> = messages
-                .get(idx + 1)
-                .map(|next| {
-                    next.content
-                        .iter()
-                        .filter_map(|block| match block {
-                            NativeContentOut::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let stubs: Vec<NativeContentOut> = pending
-                .into_iter()
-                .filter(|id| !answered.contains(id))
-                .map(|tool_use_id| NativeContentOut::ToolResult {
-                    tool_use_id,
-                    content: "[tool result missing from history — the turn was \
-                              interrupted before this tool finished]"
-                        .to_string(),
-                    cache_control: None,
-                })
-                .collect();
-
-            if !stubs.is_empty() {
-                if messages
-                    .get(idx + 1)
-                    .is_some_and(|next| next.role == "user")
-                {
-                    let next = &mut messages[idx + 1];
-                    let mut merged = stubs;
-                    merged.append(&mut next.content);
-                    next.content = merged;
-                } else {
-                    messages.insert(
-                        idx + 1,
-                        NativeMessage {
-                            role: "user".to_string(),
-                            content: stubs,
-                        },
-                    );
-                }
-            }
-
-            idx += 1;
-        }
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
@@ -3256,98 +3183,6 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn convert_messages_backfills_orphaned_tool_use() {
-        // A turn interrupted mid-flight: assistant emitted a tool_use but the
-        // matching tool_result was never persisted, and a new user message
-        // follows. Sending this raw is a hard 400. The converter must
-        // synthesize a stub tool_result so the history stays well-formed.
-        let messages = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Do a thing.".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "orphan_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}
-                    ]
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Actually, never mind.".to_string(),
-            },
-        ];
-
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
-
-        let assistant_idx = native_msgs
-            .iter()
-            .position(|m| m.role == "assistant")
-            .expect("assistant message present");
-        let next = native_msgs
-            .get(assistant_idx + 1)
-            .expect("a message must follow the tool_use");
-
-        let has_stub = next.content.iter().any(|block| {
-            matches!(
-                block,
-                NativeContentOut::ToolResult { tool_use_id, .. } if tool_use_id == "orphan_1"
-            )
-        });
-        assert!(
-            has_stub,
-            "orphaned tool_use should be answered by a synthesized tool_result"
-        );
-
-        // The tool_result must lead its message (before sibling text).
-        assert!(
-            matches!(
-                next.content.first(),
-                Some(NativeContentOut::ToolResult { .. })
-            ),
-            "tool_result must precede any text in the user message"
-        );
-    }
-
-    #[test]
-    fn convert_messages_backfills_trailing_orphaned_tool_use() {
-        // The interrupted tool_use is the very last thing in history with no
-        // following message at all. A tool_result message must be appended.
-        let messages = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Do a thing.".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "trailing_1", "name": "shell", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
-            },
-        ];
-
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
-
-        let last = native_msgs.last().expect("messages present");
-        assert_eq!(last.role, "user");
-        assert!(
-            last.content.iter().any(|block| matches!(
-                block,
-                NativeContentOut::ToolResult { tool_use_id, .. } if tool_use_id == "trailing_1"
-            )),
-            "trailing orphaned tool_use should get an appended tool_result message"
-        );
-    }
-
-    #[test]
     fn convert_messages_no_adjacent_same_role() {
         // Verify that convert_messages never produces adjacent messages with the
         // same role, regardless of input ordering.
@@ -3389,5 +3224,53 @@ data: {\"type\":\"message_stop\"}\n\n";
                 window[0].role
             );
         }
+    }
+
+    #[test]
+    fn convert_messages_orphan_tool_result_yields_unmatched_tool_use_id() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "PONG".to_string(),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({
+                    "tool_call_id": "toolu_01N3UHKgVVhAPPaBtCmgYVHX",
+                    "content": "orphan result with no preceding tool_use"
+                })
+                .to_string(),
+            },
+        ];
+
+        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let mut tool_use_ids: Vec<String> = Vec::new();
+        let mut tool_result_ids: Vec<String> = Vec::new();
+        for m in &native_msgs {
+            for block in &m.content {
+                match block {
+                    NativeContentOut::ToolUse { id, .. } => tool_use_ids.push(id.clone()),
+                    NativeContentOut::ToolResult { tool_use_id, .. } => {
+                        tool_result_ids.push(tool_use_id.clone())
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(
+            tool_result_ids,
+            vec!["toolu_01N3UHKgVVhAPPaBtCmgYVHX".to_string()],
+            "the orphan tool result must survive conversion as a native tool_result block"
+        );
+        assert!(
+            !tool_use_ids.contains(&"toolu_01N3UHKgVVhAPPaBtCmgYVHX".to_string()),
+            "no tool_use block answers this id, this is the 400 shape enforce_tool_pairing prevents"
+        );
     }
 }

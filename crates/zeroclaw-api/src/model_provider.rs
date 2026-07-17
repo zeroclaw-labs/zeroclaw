@@ -238,6 +238,81 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// Placeholder result content for a `tool_use` whose real result never made it
+/// into history (the turn was interrupted, or a prior compaction dropped the
+/// result row while keeping the call). Backfilling a stub keeps every
+/// `tool_use` answered so no provider 400s on an unanswered call.
+pub const MISSING_TOOL_RESULT_STUB: &str =
+    "[tool result missing from history, the turn was interrupted before this tool finished]";
+
+/// Enforce the tool-call pairing invariant on a conversation history, once, in
+/// the canonical `ConversationMessage` representation that every provider and
+/// resume path shares.
+///
+/// Providers reject two shapes of broken pairing:
+///   1. a `tool_result` with no preceding `tool_use` (Anthropic: "unexpected
+///      tool_use_id found in tool_result blocks"), and
+///   2. a `tool_use` with no following `tool_result`.
+///
+/// Both arise when history is reassembled after compaction/trim/interruption
+/// (notably ACP/RPC session resume). Enforcing here means no per-provider
+/// converter needs its own orphan handling.
+///
+/// The rules, applied in one forward pass:
+///   - a `ToolResults` block keeps only results whose `tool_call_id` matches a
+///     `tool_use` id in the immediately preceding `AssistantToolCalls`; a block
+///     with no preceding `AssistantToolCalls`, or left empty after filtering,
+///     is dropped entirely, and
+///   - any `AssistantToolCalls` id not answered by the following `ToolResults`
+///     gets a stub result so the call is never left dangling.
+pub fn enforce_tool_pairing(history: &mut Vec<ConversationMessage>) {
+    let mut i = 0;
+    while i < history.len() {
+        let call_ids: Vec<String> = match &history[i] {
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                tool_calls.iter().map(|c| c.id.clone()).collect()
+            }
+            ConversationMessage::ToolResults(_) => {
+                history.remove(i);
+                continue;
+            }
+            ConversationMessage::Chat(_) => {
+                i += 1;
+                continue;
+            }
+        };
+
+        match history.get_mut(i + 1) {
+            Some(ConversationMessage::ToolResults(results)) => {
+                results.retain(|r| call_ids.contains(&r.tool_call_id));
+                let answered: Vec<String> =
+                    results.iter().map(|r| r.tool_call_id.clone()).collect();
+                for id in &call_ids {
+                    if !answered.contains(id) {
+                        results.push(ToolResultMessage {
+                            tool_call_id: id.clone(),
+                            content: MISSING_TOOL_RESULT_STUB.to_string(),
+                            tool_name: String::new(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                let stubs = call_ids
+                    .iter()
+                    .map(|id| ToolResultMessage {
+                        tool_call_id: id.clone(),
+                        content: MISSING_TOOL_RESULT_STUB.to_string(),
+                        tool_name: String::new(),
+                    })
+                    .collect();
+                history.insert(i + 1, ConversationMessage::ToolResults(stubs));
+            }
+        }
+        i += 2;
+    }
+}
+
 /// A chunk of content from a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
@@ -958,5 +1033,139 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tool_pairing_tests {
+    use super::{
+        ChatMessage, ConversationMessage, MISSING_TOOL_RESULT_STUB, ToolCall, ToolResultMessage,
+        enforce_tool_pairing,
+    };
+
+    fn call(id: &str) -> ConversationMessage {
+        ConversationMessage::AssistantToolCalls {
+            text: Some(format!("calling {id}")),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        }
+    }
+
+    fn results(ids: &[&str]) -> ConversationMessage {
+        ConversationMessage::ToolResults(
+            ids.iter()
+                .map(|id| ToolResultMessage {
+                    tool_call_id: id.to_string(),
+                    content: format!("result {id}"),
+                    tool_name: String::new(),
+                })
+                .collect(),
+        )
+    }
+
+    fn result_ids(msg: &ConversationMessage) -> Vec<String> {
+        match msg {
+            ConversationMessage::ToolResults(r) => {
+                r.iter().map(|x| x.tool_call_id.clone()).collect()
+            }
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn drops_leading_orphan_tool_results() {
+        let mut h = vec![
+            ConversationMessage::Chat(ChatMessage::system("sys")),
+            results(&["toolu_01N3UHKgVVhAPPaBtCmgYVHX"]),
+            ConversationMessage::Chat(ChatMessage::user("next")),
+        ];
+        enforce_tool_pairing(&mut h);
+        assert!(
+            !h.iter()
+                .any(|m| matches!(m, ConversationMessage::ToolResults(_))),
+            "leading orphan ToolResults must be dropped"
+        );
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn backfills_unanswered_trailing_call() {
+        let mut h = vec![
+            ConversationMessage::Chat(ChatMessage::user("go")),
+            call("tc1"),
+        ];
+        enforce_tool_pairing(&mut h);
+        assert_eq!(h.len(), 3);
+        assert_eq!(result_ids(&h[2]), vec!["tc1"]);
+        match &h[2] {
+            ConversationMessage::ToolResults(r) => {
+                assert_eq!(r[0].content, MISSING_TOOL_RESULT_STUB)
+            }
+            _ => panic!("expected backfilled ToolResults"),
+        }
+    }
+
+    #[test]
+    fn backfills_partial_results_and_drops_unmatched() {
+        let mut h = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "tc1".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "tc2".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            results(&["tc1", "tc9"]),
+        ];
+        enforce_tool_pairing(&mut h);
+        let ids = result_ids(&h[1]);
+        assert!(ids.contains(&"tc1".to_string()), "matched result kept");
+        assert!(
+            ids.contains(&"tc2".to_string()),
+            "missing result backfilled"
+        );
+        assert!(
+            !ids.contains(&"tc9".to_string()),
+            "unmatched result dropped"
+        );
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn leaves_valid_history_untouched() {
+        let mut h = vec![
+            ConversationMessage::Chat(ChatMessage::system("sys")),
+            ConversationMessage::Chat(ChatMessage::user("q")),
+            call("tc1"),
+            results(&["tc1"]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+        let before = h.len();
+        enforce_tool_pairing(&mut h);
+        assert_eq!(h.len(), before);
+        assert_eq!(result_ids(&h[3]), vec!["tc1"]);
+    }
+
+    #[test]
+    fn empty_is_noop() {
+        let mut h: Vec<ConversationMessage> = vec![];
+        enforce_tool_pairing(&mut h);
+        assert!(h.is_empty());
     }
 }
