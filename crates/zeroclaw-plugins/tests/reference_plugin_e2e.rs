@@ -15,10 +15,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use tokio::sync::Mutex;
+use zeroclaw_api::tool::Tool;
 use zeroclaw_config::schema::Config;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::host::PluginHost;
-use zeroclaw_plugins::runtime;
+use zeroclaw_plugins::wasm_tool::WasmTool;
 use zeroclaw_plugins::{PluginCapability, PluginPermission};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -35,14 +36,19 @@ fn seed_config_dir(dir: &std::path::Path) -> bool {
     };
     let plugin_dir = dir.join("plugins").join("zeroclaw-reference-plugin");
     fs::create_dir_all(&plugin_dir).unwrap();
-    fs::copy(&fixture, plugin_dir.join("reference-plugin.wasm")).unwrap();
+    let installed_wasm = plugin_dir.join("reference-plugin.wasm");
+    fs::copy(&fixture, &installed_wasm).unwrap();
+    let digest = zeroclaw_plugins::signature::sha256_hex(&fs::read(installed_wasm).unwrap());
     fs::write(
         plugin_dir.join("manifest.toml"),
-        "name = \"zeroclaw-reference-plugin\"\n\
+        format!(
+            "name = \"zeroclaw-reference-plugin\"\n\
          version = \"0.1.0\"\n\
          wasm_path = \"reference-plugin.wasm\"\n\
+         wasm_sha256 = \"{digest}\"\n\
          capabilities = [\"tool\"]\n\
-         permissions = [\"config_read\"]\n",
+         permissions = [\"config_read\"]\n"
+        ),
     )
     .unwrap();
 
@@ -89,7 +95,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     let host = PluginHost::from_plugins_dir(&plugins_dir).expect("scan throwaway plugins dir");
     let details = host.tool_plugin_details();
     assert_eq!(details.len(), 1, "exactly the reference tool discovered");
-    let (manifest, wasm_path) = details[0];
+    let (manifest, wasm_path) = &details[0];
     assert_eq!(manifest.name, "zeroclaw-reference-plugin");
     assert!(manifest.capabilities.contains(&PluginCapability::Tool));
     assert!(manifest.permissions.contains(&PluginPermission::ConfigRead));
@@ -105,9 +111,13 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     );
 
     let permissions = manifest.permissions.clone();
-    let mut plugin = runtime::create_plugin(
-        wasm_path,
-        &permissions,
+    let tool = WasmTool::from_wasm_with_digest(
+        wasm_path.to_path_buf(),
+        manifest.wasm_sha256.as_deref(),
+        permissions,
+        manifest.name.clone(),
+        manifest.description.clone().unwrap_or_default(),
+        section,
         PluginLimits {
             call_fuel: 1_000_000_000,
             max_memory_bytes: 256 * 1024 * 1024,
@@ -115,22 +125,15 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
             max_instances: 64,
         },
     )
-    .await
-    .expect("instantiate discovered plugin");
+    .expect("instantiate discovered plugin from verified bytes");
+    assert_eq!(tool.name(), "redact");
 
-    let meta = runtime::call_tool_metadata(&mut plugin)
+    let result = tool
+        .execute(serde_json::json!({
+            "text": "mail bob@corp.com about project-zeus, key sk-abcdef0123456789"
+        }))
         .await
-        .expect("read metadata");
-    assert_eq!(meta.name, "redact");
-
-    let result = runtime::call_execute(
-        &mut plugin,
-        br#"{"text":"mail bob@corp.com about project-zeus, key sk-abcdef0123456789"}"#,
-        &section,
-        &permissions,
-    )
-    .await
-    .expect("execute discovered tool");
+        .expect("execute discovered tool");
 
     // SAFETY: serialized by ENV_LOCK.
     match prev {

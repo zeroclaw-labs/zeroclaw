@@ -253,6 +253,43 @@ every capability except a plugin whose only capability is `skill`, which carries
 no WASM payload and is rejected at discovery if it omits a valid `skills/`
 bundle (`validate_manifest_shape` in `host.rs`).
 
+`name` must begin with an ASCII letter or digit and contain only ASCII letters,
+digits, `.`, `-`, or `_`, so it is one portable filesystem component.
+`wasm_path` must be relative and confined to the plugin directory; absolute,
+parent-traversing, and symlink-escaping paths are rejected. Executable plugins
+may declare `wasm_sha256` as the 64-character hexadecimal SHA-256 of those exact
+component bytes. Strict signature mode requires it.
+
+A novel channel plugin's canonical agent binding is `plugin.<manifest-name>`.
+The name must also exist as a `[[plugins.entries]]` row; that row remains the
+only home for the plugin's config. Once any explicit channel binding exists,
+the runtime instantiates the plugin only when an enabled agent owns that exact
+reference. With no channel bindings anywhere, legacy admission behavior is
+preserved.
+
+A drop-in mirror instead declares `provides = "<channel-type>"`, where the value
+is the snake_case key of a built-in channel config family, such as `telegram` or
+`nextcloud_talk`. The manifest must include the `channel` capability. At runtime,
+ZeroClaw derives one mirror instance per enabled, owned
+`[channels.<type>.<alias>]` entry and passes that typed section to `configure`.
+The manifest must grant `config_read` for any mirror to activate. Credentials,
+enablement, and aliases stay solely in the canonical channel config; a mirror
+does not copy them into `plugins.entries`. The corresponding agent binding is
+`<channel-type>.<alias>`. If a native implementation already claimed that exact
+binding, it wins and the WASM component is not instantiated.
+If more than one installed manifest claims the same `provides` value, the
+identity is ambiguous and every claimant is rejected before any guest export
+or channel credential is reached.
+
+Every novel or mirror channel plugin may declare `sender_match` to describe the
+identity string its guest places in each inbound message's `sender` field. The
+supported values are `exact` (the backward-compatible default),
+`case_insensitive`, `handle` (trim whitespace and an optional leading `@`), and
+`email` (full-address or domain-class matching). This is a guest contract, not a
+platform-name lookup: the host applies the declared representation to the live
+`peer_groups` entries for that channel on every message. The manifest never
+contains or copies the authorized identities themselves.
+
 ### Permissions
 
 `permissions` is a list of `PluginPermission` values, also defined in
@@ -383,10 +420,12 @@ formatted inconsistently and would not reach all of the destinations
 
 **Permission:** `config_read`
 
-A plugin does not read process environment variables. For tool plugins the host
-resolves the plugin's own config section (the per-entry `config` map under the
-`plugins.entries` schema) and injects it into the `execute` input under the
-reserved `__config` key, but only when the manifest grants `config_read`:
+A plugin does not read process environment variables. For tool plugins and
+novel channel plugins, the host resolves the plugin's own config section (the
+per-entry `config` map under the `plugins.entries` schema). It injects tool
+config into the `execute` input under the reserved `__config` key and passes
+novel channel config to `configure`, but only when the manifest grants
+`config_read`:
 
 ```json
 {
@@ -398,14 +437,19 @@ reserved `__config` key, but only when the manifest grants `config_read`:
 `runtime.rs` strips any caller-supplied `__config` before injecting the resolved
 section, so the section cannot be spoofed, and withholds it entirely when the
 permission is absent. Operators populate this section through the configuration
-surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a
-file, with one current exception: a freshly installed plugin has no
-`plugins.entries` entry yet, and `config set` cannot materialize a missing
-natural-key entry, so the first entry must be added to the file by hand
-(tracked in issue #8636). The section's keys are whatever the plugin's schema
-declares. The field is marked secret, so CLI-written values encrypt at rest
-under the adjacent `.secret_key`; hand-written plaintext values are also
-accepted at load. A plugin only ever sees its own section.
+surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a file,
+with one current exception: a freshly installed plugin has no `plugins.entries`
+entry yet, and `config set` cannot materialize a missing natural-key entry, so
+the first entry must be added to the file by hand (tracked in issue #8636). The
+section's keys are whatever the plugin's schema declares. The field is marked
+secret, so CLI-written values encrypt at rest under the adjacent `.secret_key`;
+hand-written plaintext values are also accepted at load.
+
+A channel mirror intentionally expands `config_read` to its selected built-in
+channel alias. After duplicate-provider, enabled-owner, and native-collision
+admission, the host passes exactly that canonical `[channels.<type>.<alias>]`
+section to `configure`. It cannot select another channel family or alias, and
+the value is materialized on demand rather than copied into plugin config.
 
 ## WASI Component Host
 
@@ -478,8 +522,10 @@ plugin boundary as 32-bit by construction.
 Plugin manifests may carry an Ed25519 signature
 (`crates/zeroclaw-plugins/src/signature.rs`). The signature is base64url-encoded
 over the canonical manifest bytes (the TOML with the `signature` and
-`publisher_key` lines stripped); the publisher's public key is hex-encoded. The
-host enforces one of three modes from `plugins.security.signature_mode`:
+`publisher_key` lines stripped); this includes `wasm_path` and `wasm_sha256`, so
+the signature binds the executable payload by digest. The publisher's public
+key is hex-encoded. The host enforces one of three modes from
+`plugins.security.signature_mode`:
 
 | Mode | Unsigned plugin | Untrusted or invalid signature |
 |------|-----------------|--------------------------------|
@@ -489,6 +535,11 @@ host enforces one of three modes from `plugins.security.signature_mode`:
 
 Verification runs at both discovery and install. Discovery skips a plugin that
 fails its policy rather than aborting the whole host; install returns the error.
+Installation parses, verifies, and writes one manifest buffer, and copies the
+same opened payload bytes whose digest it checks. Immediately before component
+loading, every executable adapter identity-checks one open file, checks
+`wasm_sha256`, and compiles or deserializes that same buffer. Replacing a path
+after verification therefore cannot change the component that is executed.
 
 ## Writing a plugin in Rust
 

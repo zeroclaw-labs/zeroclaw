@@ -12,6 +12,15 @@ use crate::media::MediaAttachment;
 /// data (email) can keep this reserved namespace out of inbound subjects.
 pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
+/// Canonical channel type for novel WASM channel plugins.
+pub const PLUGIN_CHANNEL_TYPE: &str = "plugin";
+
+/// Build the canonical agent-binding key for a novel channel plugin.
+#[must_use]
+pub fn plugin_channel_ref(plugin_name: &str) -> String {
+    format!("{PLUGIN_CHANNEL_TYPE}.{plugin_name}")
+}
+
 /// The single authority for the channel-SOP event topic grammar
 /// `channel.alias:event_type`. The producer that lifts a forge/platform event
 /// into SOP ingress builds the topic here; the SOP engine parses it here. The
@@ -120,8 +129,9 @@ pub struct ChannelMessage {
     pub reply_target: String,
     pub content: String,
     pub channel: String,
-    /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`)
-    /// when the platform supports multiple bot instances. Used by
+    /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`,
+    /// or the manifest name in a `plugin.<name>` binding) when the platform
+    /// supports multiple instances. Used by
     /// session_key construction so two bots on the same platform compute
     /// distinct session IDs and don't share conversation history. `None`
     /// for channels that don't have an alias concept yet (webhook, cli).

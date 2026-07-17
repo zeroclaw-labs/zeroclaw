@@ -393,6 +393,9 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         with:
           toolchain: 1.96.1
+      - name: Install channel plugin fixture target
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.changed.outputs.run == 'true'
         with:
@@ -401,6 +404,11 @@ jobs:
       - name: Check
         if: steps.changed.outputs.run == 'true'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
+      - name: Run channel plugin component test
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: |
+          cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+          cargo test --locked --features plugins-wasm-cranelift --test integration channel_plugin_shadow -- --nocapture
 
   check-32bit:
     name: Check (32-bit)

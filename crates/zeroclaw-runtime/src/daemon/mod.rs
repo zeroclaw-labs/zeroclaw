@@ -1782,12 +1782,13 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    // Check that at least one channel entry has `enabled = true`.
+    // Native channels come from typed config; WASM channels come from the
+    // enabled plugin directory's verified manifests. Resolve both canonical
+    // sources before deciding whether the supervisor has work to do.
     // A config with only `enabled = false` entries (e.g. partially-configured
-    // or intentionally disabled bots) must not start the supervisor — the
-    // channels component would find nothing to listen on, return Ok(()), and
-    // the daemon supervisor would restart it in a tight loop.
-    config.channels.has_any_enabled()
+    // or intentionally disabled bots) must not start channel/provider setup
+    // just to settle into the orchestrator's no-active-channels reload wait.
+    config.channels.has_any_enabled() || crate::plugin_channels::has_channel_plugins(config)
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
@@ -2100,13 +2101,68 @@ mod tests {
         assert!(!has_supervised_channels(&config));
     }
 
+    #[cfg(feature = "plugins-wasm")]
+    fn write_test_plugin(tmp: &TempDir, name: &str, capability: &str) -> PathBuf {
+        let plugins_dir = tmp.path().join("plugins");
+        let plugin_dir = plugins_dir.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\n\
+                 capabilities = [\"{capability}\"]\nwasm_path = \"plugin.wasm\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        plugins_dir
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_only_config_is_supervised() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_dir = write_test_plugin(&tmp, "fixture-channel", "channel");
+
+        let mut config = Config::default();
+        config.plugins.plugins_dir = plugins_dir.display().to_string();
+
+        assert!(!has_supervised_channels(&config));
+
+        config.plugins.enabled = true;
+
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn tool_only_plugin_does_not_start_channel_supervisor() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_dir = write_test_plugin(&tmp, "fixture-tool", "tool");
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.plugins.plugins_dir = plugins_dir.display().to_string();
+
+        assert!(!has_supervised_channels(&config));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn strict_mode_does_not_supervise_unsigned_channel_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_dir = write_test_plugin(&tmp, "fixture-channel", "channel");
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.plugins.plugins_dir = plugins_dir.display().to_string();
+        config.plugins.security.signature_mode = "strict".to_string();
+
+        assert!(!has_supervised_channels(&config));
+    }
+
     #[test]
     fn all_disabled_channels_not_supervised() {
-        // Regression test: a config with channel entries that all have
-        // `enabled = false` must not start the channels supervisor.
-        // Previously, has_supervised_channels only checked map non-emptiness,
-        // causing the supervisor to start, find nothing to listen on, return
-        // Ok(()), and restart in a tight loop.
+        // A config whose native channel entries are all disabled does not
+        // contain supervisor work.
         let mut config = Config::default();
         config.channels.discord.insert(
             "clamps".to_string(),

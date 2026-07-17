@@ -8,7 +8,7 @@ use crate::component::bindings::memory::exports::zeroclaw::plugin::memory::{
     MemoryCategory as WitMemoryCategory, MemoryEntry as WitMemoryEntry,
     ProceduralMessage as WitProceduralMessage,
 };
-use crate::component::{PluginState, call_plugin, engine, load_component, wt};
+use crate::component::{PluginState, call_plugin, engine, load_component_with_digest, wt};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
@@ -60,7 +60,18 @@ impl WasmMemory {
         wasm_path: &Path,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
-        let component = load_component(wasm_path)?;
+        Self::from_wasm_with_digest(alias, wasm_path, None, limits).await
+    }
+
+    /// Compile and instantiate a memory plugin from the exact bytes bound by
+    /// an optional verified-manifest digest.
+    pub async fn from_wasm_with_digest(
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
+        let component = load_component_with_digest(wasm_path, expected_sha256)?;
         let linker = linker()?;
         let mut store = crate::component::new_store(&[], limits);
         let bindings = wt(

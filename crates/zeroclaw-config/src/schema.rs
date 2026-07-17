@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -3500,8 +3500,9 @@ pub struct AliasedAgentConfig {
     #[tab(General)]
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Channel aliases this agent handles (e.g. `["telegram.<alias>", "discord.<alias>"]`).
-    /// Each entry is a `ChannelRef` resolving through `[channels.<type>.<alias>]`;
+    /// Channel aliases this agent handles (e.g. `["telegram.<alias>", "plugin.<name>"]`).
+    /// Native entries resolve through `[channels.<type>.<alias>]`; novel WASM
+    /// plugin entries resolve through `[[plugins.entries]]` by manifest name.
     /// `Config::validate()` fails loud on dangling references.
     #[tab(Channels)]
     #[serde(default)]
@@ -3688,6 +3689,71 @@ pub struct AliasedAgentConfig {
     pub a2a: crate::multi_agent::AgentA2aConfig,
 }
 
+/// On-demand view of channel bindings declared by enabled and disabled agents.
+///
+/// The canonical state remains [`Config::agents`]. This materialized view keeps
+/// the legacy fallback and disabled-owner policy identical for native and plugin
+/// channel admission without storing a second configuration snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveChannelAliases {
+    enabled_bindings: HashSet<String>,
+    all_known_bindings: HashSet<String>,
+}
+
+impl ActiveChannelAliases {
+    /// Materialize the active-binding view from the current config.
+    #[must_use]
+    pub fn compute(config: &Config) -> Self {
+        Self {
+            enabled_bindings: config
+                .agents
+                .values()
+                .filter(|agent| agent.enabled)
+                .flat_map(|agent| {
+                    agent
+                        .channels
+                        .iter()
+                        .map(|binding| binding.as_str().to_string())
+                })
+                .collect(),
+            all_known_bindings: config
+                .agents
+                .values()
+                .flat_map(|agent| {
+                    agent
+                        .channels
+                        .iter()
+                        .map(|binding| binding.as_str().to_string())
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether an exact binding has an enabled owner, or legacy mode applies.
+    #[must_use]
+    pub fn contains(&self, channel_ref: &str) -> bool {
+        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+    }
+
+    /// Whether bindings exist but every declared owner is disabled.
+    #[must_use]
+    pub fn disabled_owners_exist(&self) -> bool {
+        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
+    }
+
+    /// Exact bindings owned by enabled agents.
+    #[must_use]
+    pub fn enabled_bindings(&self) -> &HashSet<String> {
+        &self.enabled_bindings
+    }
+
+    /// Exact bindings declared by all agents, including disabled agents.
+    #[must_use]
+    pub fn all_known_bindings(&self) -> &HashSet<String> {
+        &self.all_known_bindings
+    }
+}
+
 impl Default for AliasedAgentConfig {
     fn default() -> Self {
         Self {
@@ -3774,7 +3840,16 @@ impl Config {
                     }
                 }
             }
+            if section == "channels" {
+                out.extend(
+                    self.plugins
+                        .entries
+                        .iter()
+                        .map(|entry| zeroclaw_api::channel::plugin_channel_ref(&entry.name)),
+                );
+            }
             out.sort();
+            out.dedup();
             out
         } else {
             let mut out = self.get_map_keys(section).unwrap_or_default();
@@ -19773,14 +19848,24 @@ impl Config {
                 ),
             }
 
-            // channels: each entry is a dotted `<type>.<inner>` ref into
-            // channels.<type>.<inner>. Empty list is valid (delegate-only agent).
-            // Uses the schema-derived `get_map_keys` so new channel types
-            // surface here automatically — no per-type match arm.
+            // channels: each entry is a dotted `<type>.<inner>` ref. Native
+            // references resolve into channels.<type>.<inner>; `plugin.<name>`
+            // resolves into the existing plugins.entries natural-key list.
+            // Empty is valid for delegate-only agents.
             for (i, ch) in agent.channels.iter().enumerate() {
                 let trimmed = ch.trim();
                 match trimmed.split_once('.') {
                     Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                        if ty == zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE {
+                            if self.plugins.entry_config(inner).is_none() {
+                                validation_bail!(
+                                    DanglingReference,
+                                    format!("agents.{alias}.channels[{i}]"),
+                                    "agents.{alias}.channels[{i}] = {trimmed:?} but [[plugins.entries]] has no entry named {inner:?}",
+                                );
+                            }
+                            continue;
+                        }
                         // `get_map_keys` stores section names using the raw
                         // field ident (snake), the same dotted form the
                         // operator sees in TOML (`gmail_push`, `voice_call`,
@@ -19799,7 +19884,7 @@ impl Config {
                     _ => validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.channels[{i}]"),
-                        "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
+                        "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` or `plugin.<name>` (got {trimmed:?})",
                     ),
                 }
             }
@@ -32638,6 +32723,80 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn validate_accepts_plugin_channel_ref_from_existing_plugin_entry() {
+        let mut config = multi_agent_test_config();
+        config.plugins.entries.push(PluginEntryConfig {
+            name: "weather-alerts".to_string(),
+            config: HashMap::new(),
+        });
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("test agent")
+            .channels
+            .push(crate::providers::ChannelRef::new(
+                zeroclaw_api::channel::plugin_channel_ref("weather-alerts"),
+            ));
+
+        config
+            .validate()
+            .expect("plugin channel ref resolves through plugins.entries");
+        assert!(
+            config
+                .resolve_alias_source(crate::traits::AliasSource::Channels)
+                .contains(&zeroclaw_api::channel::plugin_channel_ref("weather-alerts")),
+            "channel-reference pickers expose the same canonical plugin entry"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_plugin_channel_ref_without_plugin_entry() {
+        let mut config = multi_agent_test_config();
+        config.agents.get_mut("alpha").expect("test agent").channels =
+            vec![crate::providers::ChannelRef::new(
+                zeroclaw_api::channel::plugin_channel_ref("missing"),
+            )];
+
+        let err = config
+            .validate()
+            .expect_err("plugin channel ref must name plugins.entries row");
+        let message = err.to_string();
+        assert!(message.contains("agents.alpha.channels[0]"));
+        assert!(message.contains("plugins.entries"));
+    }
+
+    #[test]
+    async fn plugin_channel_binding_requires_enabled_owner_outside_legacy_mode() {
+        let mut config = multi_agent_test_config();
+        let plugin_ref = zeroclaw_api::channel::plugin_channel_ref("weather-alerts");
+
+        assert!(
+            !ActiveChannelAliases::compute(&config).contains(&plugin_ref),
+            "a native-only explicit binding disables legacy plugin admission"
+        );
+
+        let alpha = config.agents.get_mut("alpha").expect("test agent");
+        alpha
+            .channels
+            .push(crate::providers::ChannelRef::new(plugin_ref.clone()));
+        assert!(ActiveChannelAliases::compute(&config).contains(&plugin_ref));
+
+        config.agents.get_mut("alpha").expect("test agent").enabled = false;
+        assert!(!ActiveChannelAliases::compute(&config).contains(&plugin_ref));
+
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("test agent")
+            .channels
+            .clear();
+        assert!(
+            ActiveChannelAliases::compute(&config).contains(&plugin_ref),
+            "no declared bindings preserves legacy admission"
+        );
     }
 
     #[test]
