@@ -1317,6 +1317,19 @@ impl ModelProvider for ReliableModelProvider {
         )
     }
 
+    fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+        // Delegate to the same inner `supports_vision()`/`supports_native_tools()`
+        // report from (the first, primary provider), so the wrapped surface's
+        // `capabilities().vision` stays consistent with `supports_vision()` when
+        // an inner capability decorator (e.g. the config `vision` override) has
+        // patched it. Without this, `capabilities()` would fall back to the trait
+        // default and disagree with the delegated `supports_vision()`.
+        self.model_providers
+            .first()
+            .map(|entry| entry.provider.capabilities())
+            .unwrap_or_default()
+    }
+
     fn supports_native_tools(&self) -> bool {
         self.model_providers
             .first()
@@ -4505,6 +4518,58 @@ mod tests {
         );
 
         assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn capabilities_vision_matches_supports_vision_on_final_wrapped_reliable() {
+        // Regression: the final wrapped ReliableModelProvider must report the SAME
+        // `vision` on `capabilities().vision` and `supports_vision()`. Wrap the
+        // config `vision` decorator forcing vision ON over a non-vision inner; the
+        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // delegated to the primary, the outer returned the trait default
+        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        struct PlainMock;
+        #[async_trait]
+        impl ModelProvider for PlainMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PlainMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainMock"
+            }
+        }
+
+        let inner = crate::vision_override::VisionOverrideProvider::new(
+            Box::new(PlainMock) as Box<dyn ModelProvider>,
+            true,
+        );
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![("primary".into(), Box::new(inner) as Box<dyn ModelProvider>)],
+            0,
+            0,
+        );
+        assert!(provider.supports_vision());
+        assert!(
+            provider.capabilities().vision,
+            "outer capabilities().vision must match the delegated supports_vision()"
+        );
+        assert_eq!(provider.capabilities().vision, provider.supports_vision());
     }
 
     #[tokio::test]

@@ -194,6 +194,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 hooks: None,
                 activated_tools: None,
                 model_switch_callback: None,

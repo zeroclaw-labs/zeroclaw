@@ -94,6 +94,11 @@ pub struct ResolvedAgentExecution<'a> {
     pub approval: Option<&'a ApprovalManager>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config, for resolving the configured `vision_model_provider`'s
+    /// alias-specific runtime options (the `vision` override, endpoint URI,
+    /// credentials) on the vision route. `None` on configless (test) paths,
+    /// where the route falls back to the legacy factory.
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     /// Agentic loop iteration cap.
     pub max_tool_iterations: usize,
     /// Lifecycle hooks; `None` when unconfigured.
@@ -132,6 +137,9 @@ pub struct ResolvedIo<'a> {
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config for vision-route provider-alias resolution; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::config`].
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     pub hooks: Option<&'a HookRunner>,
     pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,
     pub model_switch_callback: Option<ModelSwitchCallback>,
@@ -173,6 +181,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             silent: io.silent,
             approval: io.approval,
             multimodal_config: io.multimodal_config,
+            config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,
             hooks: io.hooks,
             excluded_tools: runtime.excluded_tools,

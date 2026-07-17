@@ -1,7 +1,7 @@
 //! Vision model-provider routing and per-iteration message preparation.
 
 use anyhow::Result;
-use zeroclaw_config::schema::MultimodalConfig;
+use zeroclaw_config::schema::{Config, MultimodalConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderCapabilityError, multimodal};
 
 /// Resolve the vision route for this iteration.
@@ -10,6 +10,7 @@ use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderCapabilityError, mu
 /// the `degrade_strip_images` flag. The active (provider, name, model) triple
 /// derivation stays inline in the loop (RUN_SHEET `turn.vision_route`).
 pub(crate) fn resolve_vision_provider(
+    config: Option<&Config>,
     model_provider: &dyn ModelProvider,
     history: &[ChatMessage],
     multimodal_config: &MultimodalConfig,
@@ -40,7 +41,19 @@ pub(crate) fn resolve_vision_provider(
         && !model_provider.supports_vision()
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
-            let vp_instance = zeroclaw_providers::create_model_provider(vp, None).map_err(|e| {
+            // Resolve the configured vision provider through the alias-aware
+            // factory so its per-alias `vision` override and typed config
+            // (endpoint URI, credentials) are honored - the legacy
+            // `create_model_provider(vp, None)` passed `config = None` and could
+            // not see them, so a text-family alias forced to `vision = true`
+            // for this route would have been ignored. `config` is `None` only on
+            // configless (test-builder) agents - every production agent/loop path
+            // threads `Some`; that fallback keeps the prior legacy behavior.
+            let vp_instance = match config {
+                Some(config) => zeroclaw_providers::create_model_provider_from_ref(config, vp),
+                None => zeroclaw_providers::create_model_provider(vp, None),
+            }
+            .map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -284,6 +297,147 @@ mod tests {
         assert!(
             err.to_string().contains("no user turn"),
             "expected a no-user-turn fail-closed error, got: {err}"
+        );
+    }
+
+    /// Regression: the dedicated vision route must resolve the configured
+    /// `vision_model_provider`'s alias-specific `vision` override. The primary
+    /// lacks vision and a `vision_model_provider` on a vision-capable family
+    /// (llama.cpp) is forced `vision = false` on its alias. With config threaded,
+    /// the route builds it through the alias-aware factory, so the forced-off
+    /// provider is honored as non-vision and the capability error surfaces -
+    /// proving the alias flag is read (the legacy `create_model_provider(vp,
+    /// None)` path ignored it entirely).
+    #[test]
+    fn resolve_vision_provider_honors_configured_alias_vision_override() {
+        use zeroclaw_config::schema::{Config, MultimodalConfig};
+
+        struct NonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionPrimary"
+            }
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.llamacpp.forced_off]
+model = "qwen3-4b"
+vision = false
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("llamacpp.forced_off".to_string()),
+            ..Default::default()
+        };
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        // `.err()` discards the Ok value (`Box<dyn ModelProvider>` is not `Debug`,
+        // so `expect_err` will not compile).
+        let err = resolve_vision_provider(
+            Some(&config),
+            &NonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+        )
+        .err()
+        .expect("a forced-off vision route must surface a capability error once its alias vision override is honored");
+        assert!(
+            err.to_string().contains("does not support vision"),
+            "expected the vision-route capability error, got: {err}"
+        );
+    }
+
+    /// Success-path companion to the error-branch test above: when the primary
+    /// lacks vision and a configured `vision_model_provider` resolves to a
+    /// vision-capable alias, the route builds it through the alias-aware factory
+    /// and returns it for this iteration (no degrade).
+    #[test]
+    fn resolve_vision_provider_builds_configured_vision_capable_alias() {
+        use zeroclaw_config::schema::{Config, MultimodalConfig};
+
+        struct NonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionPrimary"
+            }
+        }
+
+        // A custom (OpenAI-compatible) alias defaults vision-capable; giving it a
+        // URI makes it constructible without network access.
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.myvision]
+uri = "http://127.0.0.1:9999/v1"
+model = "vision-model"
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("custom.myvision".to_string()),
+            ..Default::default()
+        };
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let (vision_provider, degrade) = resolve_vision_provider(
+            Some(&config),
+            &NonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+        )
+        .expect("a configured vision-capable alias must build");
+        let vision_provider =
+            vision_provider.expect("the configured vision_model_provider must be returned");
+        assert!(
+            vision_provider.supports_vision(),
+            "the resolved vision-route provider must support vision"
+        );
+        assert!(
+            !degrade,
+            "a live vision route must not degrade/strip images"
         );
     }
 }

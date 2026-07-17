@@ -357,6 +357,18 @@ impl ModelProvider for RouterModelProvider {
         )
     }
 
+    fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+        // Mirror `supports_vision()`'s delegation to the default provider so the
+        // wrapped surface's `capabilities().vision` stays consistent with
+        // `supports_vision()` when an inner capability decorator (e.g. the config
+        // `vision` override) has patched it. Without this, `capabilities()` would
+        // fall back to the trait default and disagree with `supports_vision()`.
+        self.model_providers
+            .get(self.default_index)
+            .map(|(_, p)| p.capabilities())
+            .unwrap_or_default()
+    }
+
     fn supports_vision(&self) -> bool {
         self.model_providers
             .get(self.default_index)
@@ -1399,5 +1411,35 @@ mod tests {
         );
 
         assert!(router.supports_vision());
+    }
+
+    #[test]
+    fn capabilities_vision_matches_supports_vision_on_final_wrapped_router() {
+        // Regression: the final wrapped RouterModelProvider must report the SAME
+        // `vision` on `capabilities().vision` and `supports_vision()`. The default
+        // provider carries the config `vision` decorator forcing vision ON; the
+        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // delegated to the default provider, the outer returned the trait default
+        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        let default_provider = crate::vision_override::VisionOverrideProvider::new(
+            Box::new(MockModelProvider::new("forced").with_vision(false)) as Box<dyn ModelProvider>,
+            true,
+        );
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "default".into(),
+                Box::new(default_provider) as Box<dyn ModelProvider>,
+            )],
+            vec![],
+            "default-model".into(),
+        );
+
+        assert!(router.supports_vision());
+        assert!(
+            router.capabilities().vision,
+            "outer capabilities().vision must match the delegated supports_vision()"
+        );
+        assert_eq!(router.capabilities().vision, router.supports_vision());
     }
 }

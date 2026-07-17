@@ -1605,6 +1605,60 @@ pub fn create_resilient_model_provider_from_ref(
     )
 }
 
+/// Build a **bare** (non-resilient) provider named by `name` - a bare family
+/// (`"llamacpp"`), a dotted alias (`"llamacpp.text_model"`), or a `custom:<url>`
+/// ref - resolving its alias-specific runtime options from `config`: the
+/// `vision` capability override, the endpoint URI, and per-alias credentials
+/// from `[providers.models.<family>.<alias>]`.
+///
+/// Unlike the legacy `create_model_provider(name, None)` (which passes
+/// `config = None` and `ModelProviderRuntimeOptions::default()`, so it cannot see
+/// any per-alias config), this honors the alias's `vision` override and typed
+/// config while returning an un-wrapped provider - the shape the dedicated
+/// vision route needs so its configured `[multimodal] vision_model_provider`
+/// respects a per-alias `vision = true/false`.
+pub fn create_model_provider_from_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    // A dotted `<family>.<alias>` that names a REAL configured entry resolves
+    // through the alias factory (honoring the alias's `vision` override, endpoint
+    // URI and credentials). Two exclusions keep the intact name flowing to the
+    // factory instead:
+    //   * a `custom:<url>` / `anthropic-custom:<url>` colon ref whose host carries
+    //     dots (the pre-dot segment holds the scheme colon, e.g. `custom:https://api`
+    //     from `custom:https://api.example.com/v1`) - splitting would truncate it;
+    //   * a dotted ref to a NON-existent alias - splitting it and building the bare
+    //     family would silently fall OPEN to a family-default provider (e.g. a
+    //     typoed `vision_model_provider = "llamacpp.typo"` would route images to a
+    //     default llama.cpp instead of erroring).
+    // In both cases the intact name reaches `create_model_provider_inner`, which
+    // applies family defaults or errors on an unknown provider - keeping a bad ref
+    // fail-closed, exactly as the legacy `create_model_provider(vp, None)` did.
+    if let Some((family, alias)) = name.split_once('.')
+        && !family.contains(':')
+        && let Some(entry) = config.providers.models.find(family, alias)
+    {
+        let options = provider_runtime_options_for_alias(config, family, alias);
+        return create_model_provider_inner(
+            Some(config),
+            family,
+            alias,
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
+            &options,
+        );
+    }
+    create_model_provider_inner(
+        None,
+        name,
+        "default",
+        None,
+        None,
+        &ModelProviderRuntimeOptions::default(),
+    )
+}
+
 fn create_resilient_model_provider_from_ref_with_model_override(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -3155,6 +3209,46 @@ mod tests {
                 panic!("Expected error when custom model model_provider has no URI configured")
             }
         }
+    }
+
+    #[test]
+    fn create_model_provider_from_ref_preserves_custom_url_with_dotted_host() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::Config;
+        // A `custom:<url>` vision route whose host contains dots (e.g. 127.0.0.1)
+        // must NOT be split on '.' into a bogus `<family>.<alias>` - the whole ref
+        // must reach the factory intact, exactly as the legacy
+        // `create_model_provider(vp, None)` did. Regression for the alias-aware ref
+        // factory added for the dedicated vision route.
+        let config = Config::default();
+        let url = "custom:http://127.0.0.1:9999/v1";
+        let via_ref =
+            create_model_provider_from_ref(&config, url).expect("ref factory builds custom URL");
+        let via_legacy =
+            create_model_provider(url, None).expect("legacy factory builds custom URL");
+        assert_eq!(
+            via_ref.alias(),
+            via_legacy.alias(),
+            "custom:<url> with a dotted host must build identically to the legacy \
+             factory (not be mis-split into a bogus family/alias)"
+        );
+    }
+
+    #[test]
+    fn create_model_provider_from_ref_fails_closed_on_nonexistent_dotted_alias() {
+        use zeroclaw_config::schema::Config;
+        // A dotted `vision_model_provider` that names no configured alias (e.g. a
+        // typo) must fail CLOSED - an error the operator sees - not silently fall
+        // open to a family-default provider. `llamacpp` builds a default endpoint
+        // for a bare family, so without the entry-exists guard `llamacpp.typo`
+        // would (wrongly) succeed and route images to a default llama.cpp.
+        let config = Config::default();
+        assert!(
+            create_model_provider_from_ref(&config, "llamacpp.typo").is_err(),
+            "a dotted ref to a non-existent alias must fail closed, not fall open to a default provider"
+        );
+        // Same fail-closed behavior as the legacy factory the vision route used.
+        assert!(create_model_provider("llamacpp.typo", None).is_err());
     }
 
     // ── Error cases ──────────────────────────────────────────

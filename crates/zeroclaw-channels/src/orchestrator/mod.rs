@@ -5598,6 +5598,11 @@ async fn process_channel_message_body(
                         silent: true,
                         approval: Some(&*ctx.approval_manager),
                         multimodal_config: &ctx.multimodal,
+                        // Full config for the vision route to resolve the
+                        // configured `vision_model_provider`'s alias options - the
+                        // same canonical `prompt_config` snapshot this path already
+                        // uses for provider construction.
+                        config: Some(ctx.prompt_config.as_ref()),
                         hooks: ctx.hooks.as_deref(),
                         activated_tools: ctx.activated_tools.as_ref(),
                         model_switch_callback: Some(model_switch_callback.clone()),

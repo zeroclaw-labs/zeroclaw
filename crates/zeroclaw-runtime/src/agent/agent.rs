@@ -972,6 +972,19 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    /// The full `Config` the agent was constructed from, when available. Sourced
+    /// from `provider_switch_config` - the single canonical config snapshot the
+    /// agent already carries for provider-alias resolution. `None` only on
+    /// configless (test-builder) agents; every production construction path
+    /// (`from_config` / `from_config_with_tui_env`) populates it. Used by the
+    /// vision route to resolve the configured `vision_model_provider`'s
+    /// alias-specific options (the `vision` override, endpoint URI, credentials).
+    fn full_config(&self) -> Option<&zeroclaw_config::schema::Config> {
+        self.provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.config.as_deref())
+    }
+
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
         if let Ok(Some(context)) =
             crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(Clone::clone)
@@ -2373,6 +2386,7 @@ impl Agent {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 crate::agent::turn::resolve_vision_provider(
+                    self.full_config(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
@@ -2450,6 +2464,12 @@ impl Agent {
                                 silent: false,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 model_switch_callback: None,
@@ -2680,6 +2700,7 @@ impl Agent {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 crate::agent::turn::resolve_vision_provider(
+                    self.full_config(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
@@ -2815,6 +2836,12 @@ impl Agent {
                                     silent: true,
                                     approval: self.approval_manager.as_deref(),
                                     multimodal_config: &self.multimodal_config,
+                                    // Inlined `full_config()` (per-field borrow) so it coexists with
+                                    // the `&mut self.image_cache` in this same ToolLoop expression.
+                                    config: self
+                                        .provider_switch_config
+                                        .as_ref()
+                                        .and_then(|c| c.config.as_deref()),
                                     hooks: self.hook_runner.as_deref(),
                                     activated_tools: self.activated_tools.as_ref(),
                                     // Wire the `model_switch` tool through the

@@ -279,6 +279,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         silent,
         approval,
         multimodal_config,
+        config,
         max_tool_iterations,
         hooks,
         excluded_tools,
@@ -609,8 +610,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (vision_model_provider_box, degrade_strip_images) =
-            resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
+        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
+            config,
+            model_provider,
+            history,
+            multimodal_config,
+            provider_name,
+        )?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,
@@ -1165,6 +1171,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 silent,
                 approval,
                 multimodal_config,
+                config,
                 max_tool_iterations,
                 hooks,
                 excluded_tools,
@@ -1320,6 +1327,9 @@ async fn drive_live_sop_actions(
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    // Full config so the live-SOP sub-turn's vision route resolves the configured
+    // `vision_model_provider`'s alias options, exactly as the enclosing turn does.
+    config: Option<&zeroclaw_config::schema::Config>,
     max_tool_iterations: usize,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
@@ -1389,6 +1399,7 @@ async fn drive_live_sop_actions(
                                     silent,
                                     approval,
                                     multimodal_config,
+                                    config,
                                     hooks,
                                     activated_tools,
                                     model_switch_callback: model_switch_callback.clone(),
