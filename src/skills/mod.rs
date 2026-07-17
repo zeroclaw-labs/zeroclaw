@@ -105,7 +105,7 @@ pub async fn handle_command(
                 // Full inventory: every bundle, then the agent-agnostic sources
                 // (global dir + open-skills + plugins). `load_skills_with_config`
                 // is the same loader the old `list` used, so those rows are
-                // preserved (#8334 review).
+                // preservedreview).
                 for alias in config.skill_bundles.keys() {
                     if let Ok(dir) = zeroclaw_config::skill_bundles::resolve_directory(
                         config,
@@ -554,11 +554,6 @@ pub async fn handle_command(
     }
 }
 
-/// Where `skills install` writes, and where `list`/`remove`/`audit`/`test`
-/// look. A [`SkillLocation::Bundle`] directory is loaded by every agent that
-/// lists its alias in `skill_bundles`; the [`SkillLocation::Global`] directory
-/// (`<install>/data/skills/`) is NOT loaded by any agent until the skill is
-/// assigned to a bundle — installing there prints a note saying so (#8334).
 enum SkillLocation {
     Bundle { alias: String, dir: PathBuf },
     Global { dir: PathBuf },
@@ -769,7 +764,7 @@ fn handle_add(
         version: Some(version.unwrap_or_else(|| "0.1.0".to_string())),
         category,
         // Scaffold creates a tagless skill; tags (including the `slash` opt-in
-        // for #7490 slash commands) are managed in the dashboard skills editor.
+        // slash commands) are managed in the dashboard skills editor.
         tags: Vec::new(),
         // Slash options are authored in the dashboard editor, not at scaffold time.
         slash_options: Vec::new(),
@@ -1388,10 +1383,6 @@ mod install_location_tests {
         .unwrap();
     }
 
-    /// Boundary test for #8334: a skill placed at the install destination that
-    /// `resolve_install_location` picks for the default agent is actually loaded
-    /// by the runtime loader, while a skill left in the old `data/skills/` dir
-    /// is NOT — proving install now lands somewhere agents read.
     #[test]
     fn default_install_destination_is_loaded_by_the_runtime() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1436,10 +1427,6 @@ mod install_location_tests {
         );
     }
 
-    /// End-to-end #8334 (requested in review): drive the *real* `skills install`
-    /// command handler with a local skill source, then assert the runtime loader
-    /// the agent boot/loop uses actually returns it — covering the full
-    /// install → read path, not just the resolved destination.
     #[tokio::test]
     async fn install_command_then_runtime_loads_the_skill() {
         let tmp = tempfile::TempDir::new().unwrap();

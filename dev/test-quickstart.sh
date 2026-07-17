@@ -4,9 +4,6 @@
 # Usage:
 #   ./dev/test-quickstart.sh          # dev build (faster compile)
 #   ./dev/test-quickstart.sh release  # release build (optimized)
-#
-# Replaces the older test-tui-onboarding.sh, which drove the deleted
-# `zeroclaw onboard` wizard (removed in #6848).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

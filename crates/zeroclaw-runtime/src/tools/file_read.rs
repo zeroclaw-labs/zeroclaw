@@ -9,11 +9,6 @@ const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// Read file contents with workspace sandboxing.
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
-    /// Whether the workspace is host-persistent. `false` on an ephemeral
-    /// runtime (Docker tmpfs / no volume mount), where reads can return stale
-    /// or empty data that does not reflect the host filesystem. When `false`,
-    /// successful text reads carry a loud ephemeral-workspace warning so the
-    /// agent doesn't trust the contents as host-backed. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -35,11 +30,6 @@ impl FileReadTool {
         }
     }
 
-    /// Resolve a caller-supplied path to an absolute candidate. Reject
-    /// only path-shape attacks (null byte, `..` traversal); the
-    /// allowlist gate is `SecurityPolicy::is_resolved_path_readable`
-    /// after canonicalize, which already unions `allowed_roots` and
-    /// `allowed_roots_read_only`.
     fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
         if path.contains('\0') {
             anyhow::bail!("Path not allowed: contains null byte");
@@ -95,7 +85,7 @@ impl Tool for FileReadTool {
         // Base64 reads return a verbatim payload the caller decodes, so they
         // must NOT be annotated — a prepended banner would corrupt decoding.
         // Text reads on an ephemeral runtime may return stale/empty data, so
-        // they carry the loud warning instead (issue #4627).
+        // they carry the loud warning instead
         let is_base64 = args.get("encoding").and_then(|v| v.as_str()) == Some("base64");
         let mut result = self.read_path(args).await?;
         if !self.persistent_writes && result.success && !is_base64 {
@@ -120,19 +110,6 @@ impl FileReadTool {
 
             anyhow::Error::msg("Missing 'path' parameter")
         })?;
-
-        // Cross-cutting rate limiting and path-allowlist checks live in the
-        // RateLimitedTool + PathGuardedTool wrappers at registration time
-        // (see zeroclaw-runtime::tools::mod).  Successful reads consume one
-        // budget slot via the outer RateLimitedTool.
-        //
-        // Read-tool exception: post-`PathGuardedTool` resolve/canonicalize
-        // failures (path-traversal that slipped through allowlist, missing
-        // file) also consume one budget slot, charged here, so that callers
-        // cannot probe path existence for free.  The outer wrapper only
-        // records on `success: true`, so calling `record_action()` on these
-        // failure paths charges exactly one slot per attempt — matching the
-        // pre-wrapper semantics where every attempted read cost one slot.
 
         // Validate and build candidate path using workspace_dir directly.
         let full_path = match self.resolve_candidate(path) {
@@ -304,7 +281,7 @@ impl FileReadTool {
                     anyhow::Error::msg(format!("Failed to read file: {e}"))
                 })?;
 
-                // PDF text extraction was removed with the `rag-pdf` feature (#8519).
+                // PDF text extraction was removed with the `rag-pdf` feature
                 // Bytes still flow to the binary detection below.
 
                 // Reject confident binary instead of returning lossy garbage.
@@ -348,18 +325,6 @@ impl FileReadTool {
     }
 }
 
-/// Detect a common raster-image container by its file-header magic bytes.
-/// Returns the format name when recognized so `file_read` can reject images
-/// with guidance to use the `image_info` tool instead of emitting lossy text.
-/// Only consulted on the non-UTF-8 read path, so an ASCII string that merely
-/// starts with one of these markers (and is therefore valid UTF-8) is unaffected.
-///
-/// PNG/JPEG/GIF magics carry non-ASCII/control bytes and are collision-free, and
-/// WEBP is anchored by the `RIFF…WEBP` container, so the raw magic is enough. The
-/// BMP marker is just the two printable ASCII letters `BM`, which a non-UTF-8
-/// legacy-text file can legitimately start with (a name, "BMW dealer notes", …),
-/// so it is validated against the rest of the BITMAPFILEHEADER instead of trusted
-/// on the magic alone — otherwise the legacy-text carve-out below is defeated.
 fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("png")
@@ -376,12 +341,6 @@ fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Validate a BMP `BITMAPFILEHEADER` beyond the weak `BM` magic. Real BMPs set
-/// the two reserved words (offset 6..10) to zero and point `bfOffBits`
-/// (offset 10..14, the pixel-array offset) inside the file. Non-UTF-8 text that
-/// merely starts with `BM` carries printable bytes in the reserved field, so it
-/// fails this check and falls through to the lenient lossy read. `bfSize`
-/// (offset 2..6) is deliberately not checked: some encoders write 0 there.
 fn is_bmp_header(bytes: &[u8]) -> bool {
     if bytes.len() < 14 || !bytes.starts_with(b"BM") {
         return false;
@@ -393,11 +352,6 @@ fn is_bmp_header(bytes: &[u8]) -> bool {
     (14..=bytes.len() as u32).contains(&off_bits)
 }
 
-/// Heuristic binary classifier for the non-UTF-8 read path. A NUL byte (which
-/// text essentially never contains) or a high density of non-text control
-/// characters marks the content as binary. Legacy single-byte text encodings
-/// (e.g. cp1251, Latin-1) have neither, so they are deliberately NOT classified
-/// as binary here — they fall through to the lenient lossy read.
 fn looks_binary(bytes: &[u8]) -> bool {
     // Sample a prefix so very large files stay cheap.
     let sample = &bytes[..bytes.len().min(8192)];
@@ -620,10 +574,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+    // ── Ephemeral-workspace warning────────────────
 
-    /// On an ephemeral runtime a successful text read may reflect stale/empty
-    /// data; the output carries a loud warning while preserving the contents.
     #[tokio::test]
     async fn file_read_warns_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral");
@@ -651,8 +603,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// base64 reads return a verbatim payload the caller decodes; prepending a
-    /// banner would corrupt decoding, so base64 reads must stay un-annotated.
     #[tokio::test]
     async fn file_read_base64_not_warned_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral_b64");
@@ -681,8 +631,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// A failed read returns no file data — not data loss — so no banner is
-    /// attached to either field.
     #[tokio::test]
     async fn file_read_failure_not_warned_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral_fail");
@@ -704,7 +652,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// On a persistent runtime (the default) no warning is attached.
     #[tokio::test]
     async fn file_read_no_warning_when_persistent() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_persistent");
@@ -1007,7 +954,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Confident binary (NUL byte) is rejected, not returned as lossy text.
     #[tokio::test]
     async fn file_read_rejects_binary_file() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_binary");
@@ -1046,8 +992,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PDF files are now rejected as binary (rag-pdf feature removed in #8519).
-    /// They can still be read raw with encoding="base64".
     #[tokio::test]
     async fn file_read_rejects_pdf_without_rag_pdf() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_pdf");
@@ -1090,7 +1034,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PNG images are rejected with guidance toward the image_info tool.
     #[tokio::test]
     async fn file_read_rejects_png_image() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_png");
@@ -1121,7 +1064,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// JPEG images are rejected too.
     #[tokio::test]
     async fn file_read_rejects_jpeg_image() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_jpeg");
@@ -1148,8 +1090,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// A real BMP (valid BITMAPFILEHEADER, not just the `BM` magic) is still
-    /// rejected as an image and steered to `image_info`.
     #[tokio::test]
     async fn file_read_rejects_bmp_image() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_bmp");
@@ -1184,10 +1124,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Non-UTF-8 legacy text that happens to start with the `BM` letters must
-    /// NOT be misread as a BMP image: the reserved-field validation in
-    /// `is_bmp_header` rejects it, so it falls through to the lenient lossy read.
-    /// Regression for the false positive the bare `BM` magic reintroduced.
     #[tokio::test]
     async fn file_read_reads_non_utf8_bm_text_lossy() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_bm_text");
@@ -1214,9 +1150,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Non-UTF-8 *text* (a legacy single-byte encoding) must NOT be classified
-    /// as binary: no NUL, no control glut, no image magic. It still reads
-    /// leniently (lossy) until proper charset decoding lands as a follow-up.
     #[tokio::test]
     async fn file_read_reads_non_utf8_text_lossy() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_legacy_text");
@@ -1329,8 +1262,6 @@ mod tests {
         }
     }
 
-    /// End-to-end test: agent calls `file_read` on a binary file and gets a
-    /// binary-rejection error in the tool result (no lossy replacement output).
     #[tokio::test]
     async fn e2e_agent_file_read_rejects_binary() {
         use crate::agent::agent::Agent;
@@ -1504,9 +1435,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
-    /// Anti-probing regression: a caller cannot probe file existence for free.
-    /// Both `resolve_candidate` failures and `canonicalize` failures must
-    /// consume one action-budget slot, so repeated probes hit the rate limit.
     #[tokio::test]
     async fn file_read_nonexistent_consumes_rate_limit_budget() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
@@ -1535,19 +1463,9 @@ mod tests {
                 .contains("Failed to resolve")
         );
 
-        // Third attempt: budget is now exhausted.  The inner tool still
-        // charges, but `record_action()` returns false; the failure error
-        // is unchanged from the caller's perspective (probing failed),
-        // and the budget is observably full (a subsequent allowed read
-        // would have to wait for the window to reset).
         let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
         assert!(!r3.success);
 
-        // Verify the budget is actually full by attempting a real read,
-        // which must now report rate-limit exhaustion when wrapped, or at
-        // minimum fail.  Here we use the inner-only tool, so we just
-        // assert that record_action returns false (budget already at cap).
-        // The inner tool's own retry would consume nothing more.
         assert!(!tool.security.record_action(), "budget must be exhausted");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

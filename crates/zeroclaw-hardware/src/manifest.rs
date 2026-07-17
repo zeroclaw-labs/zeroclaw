@@ -1,35 +1,4 @@
 //! Plugin manifest — `~/.zeroclaw/tools/<name>/tool.toml` schema.
-//!
-//! Each user plugin lives in its own subdirectory and carries a `tool.toml`
-//! that describes the tool, how to invoke it, and what parameters it accepts.
-//!
-//! Example `tool.toml`:
-//! ```toml
-//! [tool]
-//! name        = "i2c_scan"
-//! version     = "1.0.0"
-//! description = "Scan the I2C bus for connected devices"
-//!
-//! [exec]
-//! binary = "i2c_scan.py"
-//!
-//! [transport]
-//! preferred       = "serial"
-//! device_required = true
-//!
-//! [[parameters]]
-//! name        = "device"
-//! type        = "string"
-//! description = "Device alias e.g. pico0"
-//! required    = true
-//!
-//! [[parameters]]
-//! name        = "bus"
-//! type        = "integer"
-//! description = "I2C bus number (default 0)"
-//! required    = false
-//! default     = 0
-//! ```
 
 use serde::Deserialize;
 
@@ -62,14 +31,12 @@ pub struct ToolMeta {
 #[derive(Debug, Deserialize)]
 pub struct ExecConfig {
     /// Path to the binary, relative to the plugin directory.
-    ///
     /// Can be a Python script (`"tool.py"`), a shell script (`"run.sh"`),
     /// a compiled binary (`"i2c_scan"`), or any executable.
     pub binary: String,
 }
 
 /// Optional transport hint for the tool.
-///
 /// When present, ZeroClaw will prefer the named transport kind
 /// and can enforce device presence before calling the tool.
 #[derive(Debug, Deserialize)]
