@@ -92,8 +92,7 @@ impl Tool for GoalResumeTool {
                 )),
             });
         }
-
-        let admission = admit_goal_command(
+        let admission = match admit_goal_command(
             ctx,
             GoalCommand {
                 action: GoalCommandAction::Resume,
@@ -105,7 +104,17 @@ impl Tool for GoalResumeTool {
             self.config.as_ref(),
             self.config.agent(&self.agent_alias),
         )
-        .await?;
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
         if admission.continue_goal {
             crate::agent::cost::enable_current_tool_loop_goal_attribution();
             crate::control_plane::mark_current_goal_turn_for_evaluation();
@@ -236,6 +245,90 @@ mod tests {
             marker.load(Ordering::Acquire),
             "continued model goal_resume admission must mark this tool loop for goal evaluation"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_resume_fails_for_already_running_goal() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        ensure_control_plane();
+        let control_plane = control_plane().unwrap();
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        control_plane
+            .goal_store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent.clone(),
+                    status: TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route.clone()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal.clone()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "keep working".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.goal.allowed_channel_types = vec!["test-channel".into()];
+        let tool = GoalResumeTool::new(agent.clone(), std::sync::Arc::new(config));
+        let owner = GoalAdmissionContext::new(agent)
+            .with_channel_type(Some("test-channel".into()))
+            .with_originator_route(Some(route))
+            .with_principal_id(Some(principal));
+        let marker = Arc::new(AtomicBool::new(true));
+
+        let result = scope_goal_turn_evaluation_marker(
+            Some(Arc::clone(&marker)),
+            scope_goal_admission_context(
+                Some(owner),
+                tool.execute(serde_json::json!({
+                    "reason": "Continue prompt received while already admitted."
+                })),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already running")),
+            "{result:?}"
+        );
+        assert!(result.output.is_empty());
+        let task = control_plane.store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        let goal = control_plane
+            .goal_store
+            .get_goal_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.pause_reason, None);
+        assert!(goal.blockers.is_empty());
     }
 
     #[test]
