@@ -1173,9 +1173,38 @@ fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTest
 /// When `Some`, the worker drops the registry on exit and the MCP
 /// stdio children are reaped cleanly via
 /// `tokio::process::Child::kill_on_drop(true)`.
+/// Compute the subset of `granted` that is missing or dead in `current` --
+/// i.e. the servers that actually need a fresh connection. A name with a
+/// healthy handle in `current` is never included, so calling this
+/// repeatedly while that handle stays healthy keeps excluding it instead
+/// of re-including it on every heartbeat tick (the partial-outage churn
+/// #5903's retry path still had: a granted list of {A, B} with A healthy
+/// and B down previously caused every tick to reconnect BOTH A and B via
+/// `McpRegistry::connect_all`, even though A never needed it).
+fn missing_or_dead_servers(
+    granted: Vec<zeroclaw_config::schema::McpServerConfig>,
+    current: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
+) -> Vec<zeroclaw_config::schema::McpServerConfig> {
+    let Some(cur) = current else {
+        return granted;
+    };
+    let dead: std::collections::HashSet<String> = cur.health_check_all().into_iter().collect();
+    let healthy_names: std::collections::HashSet<String> = cur
+        .server_handles()
+        .into_iter()
+        .filter(|(name, _)| !dead.contains(name))
+        .map(|(name, _)| name)
+        .collect();
+    granted
+        .into_iter()
+        .filter(|s| !healthy_names.contains(&s.name))
+        .collect()
+}
+
 async fn connect_heartbeat_mcp_registry(
     config: &Config,
     agent_alias: &str,
+    current: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
 ) -> Result<Option<std::sync::Arc<crate::tools::McpRegistry>>> {
     #[cfg(test)]
     if let Some(hook) = current_heartbeat_mcp_registry_test_hook() {
@@ -1186,8 +1215,20 @@ async fn connect_heartbeat_mcp_registry(
     if !config.mcp.enabled {
         return Ok(None);
     }
-    let servers = config.mcp_servers_for_agent(agent_alias);
+    let granted = config.mcp_servers_for_agent(agent_alias);
+    if granted.is_empty() {
+        return Ok(None);
+    }
+    // Only (re)connect what `current` doesn't already have healthy --
+    // a healthy server must never be respawned/re-handshaked just
+    // because a sibling grant is missing or dead (see
+    // `missing_or_dead_servers`). `current` is `None` at worker boot,
+    // where every granted server is by definition missing.
+    let servers = missing_or_dead_servers(granted, current);
     if servers.is_empty() {
+        // Nothing is missing/dead. `reconcile_heartbeat_mcp_registry`
+        // treats `fresh = None` as "keep current unchanged", so the
+        // caller's existing registry is left exactly as it was.
         return Ok(None);
     }
     // Fail-open, mirroring the per-run `agent::run` MCP path: a
@@ -1416,7 +1457,7 @@ async fn retry_heartbeat_mcp_registry(
         {
             let _dead = reg.kill_dead_connections().await;
         }
-        let fresh = connect_heartbeat_mcp_registry(config, agent_alias).await?;
+        let fresh = connect_heartbeat_mcp_registry(config, agent_alias, shared.as_ref()).await?;
         // Let the additive reconciler decide whether the live registry
         // needs to be replaced; it returns `None` when the healthy
         // current handles are sufficient (preserves the #5903
@@ -1451,7 +1492,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     // granted.len()` the call is a no-op and the Arc pointer survives
     // across ticks — the no-churn steady state is preserved.
     let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
-        connect_heartbeat_mcp_registry(&config, &agent_alias).await?;
+        connect_heartbeat_mcp_registry(&config, &agent_alias, None).await?;
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -3432,7 +3473,7 @@ mod tests {
 
         // (a) Simulate worker boot: the daemon calls
         //     `connect_heartbeat_mcp_registry` exactly once.
-        let shared = connect_heartbeat_mcp_registry(&config, agent_alias)
+        let shared = connect_heartbeat_mcp_registry(&config, agent_alias, None)
             .await
             .expect("connect_heartbeat_mcp_registry succeeds")
             .expect("test config has MCP enabled so the shared registry is Some");
@@ -3626,7 +3667,7 @@ mod tests {
         //     mirrors `run_heartbeat_worker`'s pre-loop call. The
         //     registry's `connect_all` will spawn one node child via
         //     `tokio::process::Command::new("npx")...spawn()`.
-        let shared = connect_heartbeat_mcp_registry(&config, "ops")
+        let shared = connect_heartbeat_mcp_registry(&config, "ops", None)
             .await
             .expect("connect_heartbeat_mcp_registry succeeds on the real path")
             .expect("registry present: mcp.enabled = true and 'ops' has one granted stdio server");
@@ -3769,7 +3810,7 @@ mod tests {
                 Arc::clone(&shared_for_hook_clone)
             }));
 
-        let worker_shared = connect_heartbeat_mcp_registry(&config, agent_alias)
+        let worker_shared = connect_heartbeat_mcp_registry(&config, agent_alias, None)
             .await
             .expect("connect_heartbeat_mcp_registry succeeds")
             .expect("registry present");
@@ -3854,7 +3895,7 @@ mod tests {
         // Mirrors `run_heartbeat_worker`'s pre-loop call. The fix
         // hoists this out of the tick loop so stdio children live
         // for the daemon's lifetime.
-        let shared = connect_heartbeat_mcp_registry(&config, agent_alias)
+        let shared = connect_heartbeat_mcp_registry(&config, agent_alias, None)
             .await
             .expect("connect_heartbeat_mcp_registry succeeds")
             .expect("registry present");
@@ -3965,7 +4006,7 @@ mod tests {
         let mut returned_ptrs: Vec<*const crate::tools::McpRegistry> =
             Vec::with_capacity(INVOCATIONS);
         for _ in 0..INVOCATIONS {
-            let r = connect_heartbeat_mcp_registry(&config, agent_alias)
+            let r = connect_heartbeat_mcp_registry(&config, agent_alias, None)
                 .await
                 .expect("connect_heartbeat_mcp_registry succeeds")
                 .expect("registry present");
@@ -4052,6 +4093,107 @@ mod tests {
     /// + cloning an existing handle achieves.
     fn make_test_server_handle(name: &str) -> crate::tools::McpServer {
         crate::tools::McpRegistry::for_test_make_stub_server(name)
+    }
+
+    // ── missing_or_dead_servers / connect_heartbeat_mcp_registry partial-retry ──
+
+    fn test_server_config(name: &str) -> zeroclaw_config::schema::McpServerConfig {
+        zeroclaw_config::schema::McpServerConfig {
+            name: name.to_string(),
+            transport: zeroclaw_config::schema::McpTransport::Stdio,
+            command: "true".to_string(),
+            ..zeroclaw_config::schema::McpServerConfig::default()
+        }
+    }
+
+    /// FAIL-ON-OLD guard for the #8866 partial-retry fix: granted = {A, B},
+    /// current has a healthy A. `missing_or_dead_servers` must return only
+    /// B -- A must never be re-included while its current handle is
+    /// healthy. Repeated calls (simulating repeated heartbeat ticks while
+    /// B stays down) must keep excluding A every time; a pre-fix caller
+    /// that instead passed the *whole* granted list to
+    /// `McpRegistry::connect_all` on every tick would have respawned and
+    /// re-handshaked A on each one of these calls too.
+    #[test]
+    fn missing_or_dead_servers_excludes_healthy_current_across_repeated_calls() {
+        let a_handle = make_test_server_handle("server-a");
+        let current = std::sync::Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
+            vec![("server-a".to_string(), a_handle)],
+        ));
+        let granted = vec![
+            test_server_config("server-a"),
+            test_server_config("server-b"),
+        ];
+
+        const TICKS: usize = 5;
+        for tick in 0..TICKS {
+            let to_connect = missing_or_dead_servers(granted.clone(), Some(&current));
+            let names: Vec<&str> = to_connect.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["server-b"],
+                "tick {tick}: only the down server (B) may be reconnected;                  healthy A must be excluded on every tick, not just the first"
+            );
+        }
+    }
+
+    /// When `current` is `None` (worker boot), every granted server is
+    /// missing by definition -- the full-connect boot path must be
+    /// unaffected by this fix.
+    #[test]
+    fn missing_or_dead_servers_returns_everything_when_current_is_none() {
+        let granted = vec![
+            test_server_config("server-a"),
+            test_server_config("server-b"),
+        ];
+        let to_connect = missing_or_dead_servers(granted, None);
+        let names: Vec<&str> = to_connect.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["server-a", "server-b"]);
+    }
+
+    /// When every granted server already has a healthy current handle,
+    /// nothing is missing -- `connect_heartbeat_mcp_registry` must return
+    /// `Ok(None)` rather than issuing a no-op `connect_all([])`, and must
+    /// NOT attempt to actually spawn/handshake the already-healthy server
+    /// (this test uses `command: "true"`, so a spawn attempt for
+    /// "server-a" would not by itself fail the test on its own -- the
+    /// real assertion is that no reconnect was even attempted, i.e. the
+    /// filtered set was empty and the function short-circuited).
+    #[tokio::test]
+    async fn connect_heartbeat_mcp_registry_returns_none_when_all_healthy() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
+
+        let a_handle = make_test_server_handle("server-a");
+        let current = std::sync::Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
+            vec![("server-a".to_string(), a_handle)],
+        ));
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.mcp.enabled = true;
+        config.mcp.servers.push(test_server_config("server-a"));
+        config.mcp_bundles.insert(
+            "b".to_string(),
+            McpBundleConfig {
+                servers: vec!["server-a".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["b".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let result = connect_heartbeat_mcp_registry(&config, "ops", Some(&current))
+            .await
+            .expect("must not error");
+        assert!(
+            result.is_none(),
+            "nothing was missing/dead, so there is nothing to (re)connect"
+        );
     }
 
     // ── reconcile_heartbeat_mcp_registry unit tests ──────────────────────
@@ -4339,7 +4481,7 @@ done
 
         // ── 3. Connect (boot) — no test hook, real stdio child ─────────
         let mut shared_mcp_registry: Option<std::sync::Arc<crate::tools::McpRegistry>> =
-            connect_heartbeat_mcp_registry(&config, &agent_alias)
+            connect_heartbeat_mcp_registry(&config, &agent_alias, None)
                 .await
                 .expect("connect_heartbeat_mcp_registry succeeds");
         assert!(shared_mcp_registry.is_some(), "registry must be Some");
@@ -4438,7 +4580,7 @@ done
 
         // (1) Worker boot — single pre-loop call.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
-            connect_heartbeat_mcp_registry(&config, &agent_alias)
+            connect_heartbeat_mcp_registry(&config, &agent_alias, None)
                 .await
                 .expect("connect_heartbeat_mcp_registry succeeds");
         assert!(
@@ -4616,7 +4758,7 @@ done
         // (1) Worker boot — single pre-loop call. Hook returns the
         //     EMPTY registry (call #0).
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
-            connect_heartbeat_mcp_registry(&config, &agent_alias)
+            connect_heartbeat_mcp_registry(&config, &agent_alias, None)
                 .await
                 .expect("connect_heartbeat_mcp_registry succeeds");
         assert!(shared_mcp_registry.is_some(), "hook returns Some",);
@@ -4904,7 +5046,7 @@ done
 
         // Boot — hook call #0 returns the empty registry.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
-            connect_heartbeat_mcp_registry(&config, &agent_alias)
+            connect_heartbeat_mcp_registry(&config, &agent_alias, None)
                 .await
                 .expect("connect_heartbeat_mcp_registry succeeds");
         assert!(shared_mcp_registry.is_some(), "hook returns Some");
