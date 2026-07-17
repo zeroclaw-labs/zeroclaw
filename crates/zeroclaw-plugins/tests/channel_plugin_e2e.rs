@@ -17,14 +17,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::error::PluginError;
-use zeroclaw_plugins::wasm_channel::WasmChannel;
+use zeroclaw_plugins::wasm_channel::{SenderAuthorizer, WasmChannel};
+
+fn allow_all() -> SenderAuthorizer {
+    Arc::new(|_| true)
+}
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -96,6 +100,7 @@ async fn channel_plugin_runs_end_to_end() {
         &[PluginPermission::ConfigRead],
         &config,
         test_limits(),
+        allow_all(),
     )
     .await
     .expect("channel plugin instantiates (configure + get-channel-capabilities)");
@@ -112,6 +117,7 @@ async fn channel_plugin_runs_end_to_end() {
         &[PluginPermission::ConfigRead],
         &config,
         test_limits(),
+        allow_all(),
     )
     .await
     .err()
@@ -155,6 +161,42 @@ async fn channel_plugin_runs_end_to_end() {
         !listener.is_finished(),
         "listen must own the polling loop until its caller cancels it"
     );
+    listener.abort();
+    let err = listener
+        .await
+        .expect_err("aborting the listener should cancel the polling loop");
+    assert!(err.is_cancelled());
+}
+
+#[tokio::test]
+async fn unauthorized_poll_sender_is_not_forwarded() {
+    let wasm = fixture();
+    let config: HashMap<String, String> = HashMap::new();
+    let deny_fixture_sender: SenderAuthorizer = Arc::new(|sender| sender != "tester");
+    let channel = WasmChannel::from_wasm(
+        "echo-channel",
+        &wasm,
+        &[PluginPermission::ConfigRead],
+        &config,
+        test_limits(),
+        deny_fixture_sender,
+    )
+    .await
+    .expect("channel plugin instantiates");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "the fixture's denied sender must not reach the agent queue"
+    );
+    assert!(
+        !listener.is_finished(),
+        "dropping one denied message must not stop the channel listener"
+    );
+
     listener.abort();
     let err = listener
         .await

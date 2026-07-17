@@ -12,8 +12,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::Config;
+#[cfg(feature = "plugins-wasm")]
+use zeroclaw_plugins::wasm_channel::SenderAuthorizer;
 
 #[cfg(feature = "plugins-wasm")]
 fn load_plugin_host(config: &Config) -> Option<zeroclaw_plugins::host::PluginHost> {
@@ -86,10 +89,16 @@ pub(crate) fn has_channel_plugins(_config: &Config) -> bool {
 /// for builds with no WASM engine, so the call site compiles unconditionally.
 #[cfg(feature = "plugins-wasm")]
 pub async fn build_channel_plugins(
-    config: &Config,
+    config: &Arc<RwLock<Config>>,
     native_channel_ids: &HashSet<String>,
 ) -> Vec<(String, Arc<dyn Channel>)> {
-    let Some(host) = load_plugin_host(config) else {
+    // Build-time plugin settings are a per-call materialized view. The sender
+    // authorizer below retains the shared handle and resolves peer membership
+    // from it on every message.
+    let config_handle = Arc::clone(config);
+    let config = config.read().clone();
+
+    let Some(host) = load_plugin_host(&config) else {
         return Vec::new();
     };
 
@@ -105,7 +114,7 @@ pub async fn build_channel_plugins(
     };
 
     let mut built: Vec<(String, Arc<dyn Channel>)> = Vec::new();
-    let active = zeroclaw_config::schema::ActiveChannelAliases::compute(config);
+    let active = zeroclaw_config::schema::ActiveChannelAliases::compute(&config);
     for (manifest, wasm_path) in host.channel_plugin_details() {
         if !should_build_channel_plugin(&manifest.name, native_channel_ids) {
             ::zeroclaw_log::record!(
@@ -145,6 +154,8 @@ pub async fn build_channel_plugins(
             .entry_config(&manifest.name)
             .cloned()
             .unwrap_or_default();
+        let authorizer = channel_authorizer(&config_handle, &manifest.name, "");
+        note_if_no_allowlist(&config, &manifest.name, "", &manifest.name);
         match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_digest(
             manifest.name.clone(),
             &wasm_path,
@@ -152,6 +163,7 @@ pub async fn build_channel_plugins(
             &manifest.permissions,
             &plugin_config,
             limits,
+            authorizer,
         )
         .await
         {
@@ -179,10 +191,58 @@ pub async fn build_channel_plugins(
 /// channels are contributed. Keeps the orchestrator call site feature-agnostic.
 #[cfg(not(feature = "plugins-wasm"))]
 pub async fn build_channel_plugins(
-    _config: &Config,
+    _config: &Arc<RwLock<Config>>,
     _native_channel_ids: &HashSet<String>,
 ) -> Vec<(String, Arc<dyn Channel>)> {
     Vec::new()
+}
+
+/// Build a default-deny sender gate for one plugin channel.
+///
+/// Novel plugins in this lower stack use exact sender identities. Mirror
+/// plugins add their platform-specific matcher when the `provides` contract is
+/// introduced. In both cases the peer list is resolved live from the same
+/// `Config::peer_groups` state native channels consult.
+#[cfg(feature = "plugins-wasm")]
+fn channel_authorizer(
+    config: &Arc<RwLock<Config>>,
+    channel_type: &str,
+    alias: &str,
+) -> SenderAuthorizer {
+    let config = Arc::clone(config);
+    let channel_type = channel_type.to_string();
+    let alias = alias.to_string();
+
+    Arc::new(move |sender: &str| {
+        let peers = config.read().channel_external_peers(&channel_type, &alias);
+        zeroclaw_config::allowlist::is_user_allowed(
+            &peers,
+            sender,
+            zeroclaw_config::allowlist::Match::Sensitive,
+        )
+    })
+}
+
+/// Surface the default-deny state once at startup while leaving the actual
+/// decision to the live resolver.
+#[cfg(feature = "plugins-wasm")]
+fn note_if_no_allowlist(config: &Config, channel_type: &str, alias: &str, plugin: &str) {
+    if config
+        .channel_external_peers(channel_type, alias)
+        .is_empty()
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "plugin": plugin,
+                    "channel": channel_type,
+                    "alias": alias,
+                })
+            ),
+            "Channel plugin has an empty sender allowlist; it will accept no inbound until a peer group authorizes senders (or \"*\" for anyone)"
+        );
+    }
 }
 
 #[cfg(any(test, feature = "plugins-wasm"))]
@@ -193,6 +253,47 @@ fn should_build_channel_plugin(plugin_name: &str, native_channel_ids: &HashSet<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "plugins-wasm")]
+    use zeroclaw_config::multi_agent::PeerGroupConfig;
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn sender_authorizer_resolves_peer_groups_live() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let authorizer = channel_authorizer(&config, "fixture", "");
+
+        assert!(!authorizer("tester"), "empty peer groups deny by default");
+
+        config.write().peer_groups.insert(
+            "fixture-peers".to_string(),
+            PeerGroupConfig {
+                channel: "fixture".into(),
+                external_peers: vec!["tester".into()],
+                ..Default::default()
+            },
+        );
+        assert!(authorizer("tester"), "new canonical peer is visible live");
+
+        config
+            .write()
+            .peer_groups
+            .get_mut("fixture-peers")
+            .expect("fixture peer group")
+            .external_peers = vec!["someone-else".into()];
+        assert!(
+            !authorizer("tester"),
+            "removing a canonical peer takes effect without rebuilding the channel"
+        );
+
+        config
+            .write()
+            .peer_groups
+            .get_mut("fixture-peers")
+            .expect("fixture peer group")
+            .external_peers = vec!["*".into()];
+        assert!(authorizer("tester"), "wildcard uses shared semantics");
+    }
 
     #[test]
     fn shadowed_plugins_are_filtered_before_instantiation() {

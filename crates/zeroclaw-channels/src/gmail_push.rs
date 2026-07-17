@@ -402,16 +402,7 @@ impl GmailPushChannel {
     /// `crate::allowlist::is_user_allowed_by` matcher with `email_channel`;
     /// domain-class matching is the per-entry comparison.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
-        crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
-            let email_lower = email.to_lowercase();
-            if allowed.starts_with('@') {
-                email_lower.ends_with(&allowed.to_lowercase())
-            } else if allowed.contains('@') {
-                allowed.eq_ignore_ascii_case(email)
-            } else {
-                email_lower.ends_with(&format!("@{}", allowed.to_lowercase()))
-            }
-        })
+        crate::allowlist::is_user_allowed_by(peers, email, crate::allowlist::email_match)
     }
 
     /// Process a Pub/Sub push notification and dispatch new messages to the agent.

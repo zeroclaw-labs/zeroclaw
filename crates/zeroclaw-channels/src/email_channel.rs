@@ -104,19 +104,7 @@ impl EmailChannel {
     /// comparison runs through `crate::allowlist::is_user_allowed_by`. `peers`
     /// is the caller's freshly-resolved list; no allowlist state is cached.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
-        crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
-            let email_lower = email.to_lowercase();
-            if allowed.starts_with('@') {
-                // Domain match with @ prefix: "@example.com"
-                email_lower.ends_with(&allowed.to_lowercase())
-            } else if allowed.contains('@') {
-                // Full email address match
-                allowed.eq_ignore_ascii_case(email)
-            } else {
-                // Domain match without @ prefix: "example.com"
-                email_lower.ends_with(&format!("@{}", allowed.to_lowercase()))
-            }
-        })
+        crate::allowlist::is_user_allowed_by(peers, email, crate::allowlist::email_match)
     }
 
     /// Strip HTML tags from content (basic)

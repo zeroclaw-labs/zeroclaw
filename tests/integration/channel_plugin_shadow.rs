@@ -14,9 +14,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use parking_lot::RwLock;
 use serde_json::Value;
 use tempfile::tempdir;
 use zeroclaw_config::schema::Config;
@@ -24,6 +25,17 @@ use zeroclaw_config::schema::Config;
 const PLUGIN_NAME: &str = "shadow-probe";
 const CONFIGURE_MARKER: &str = "channel-fixture configure export invoked";
 const POLL_MARKER: &str = "channel-fixture poll-message export invoked";
+
+fn authorize_fixture_sender(config: &mut Config) {
+    config.peer_groups.insert(
+        "channel-plugin-fixture".to_string(),
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            channel: PLUGIN_NAME.into(),
+            external_peers: vec!["tester".into()],
+            ..Default::default()
+        },
+    );
+}
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -129,6 +141,7 @@ async fn shadowed_channel_plugin_never_runs_configure() {
     let mut config = Config::default();
     config.plugins.enabled = true;
     config.plugins.plugins_dir = plugins_dir.to_string_lossy().into_owned();
+    let config = Arc::new(RwLock::new(config));
 
     // Serialize against other tests that install or clear the process-wide log
     // hook. The fixture's imported logging call is our host-visible proof that
@@ -177,6 +190,8 @@ async fn supervised_wasm_listener_cancels_its_only_poll_generation() {
     let mut config = Config::default();
     config.plugins.enabled = true;
     config.plugins.plugins_dir = plugins_dir.to_string_lossy().into_owned();
+    authorize_fixture_sender(&mut config);
+    let config = Arc::new(RwLock::new(config));
 
     let _writer_guard = zeroclaw_log::__private_test_writer_lock();
     let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -296,6 +311,7 @@ async fn disabled_plugin_owner_blocks_guest_startup_before_configure() {
     config
         .validate()
         .expect("explicit native and plugin ownership is a valid daemon config");
+    let config = Arc::new(RwLock::new(config));
 
     let _writer_guard = zeroclaw_log::__private_test_writer_lock();
     let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -311,11 +327,13 @@ async fn disabled_plugin_owner_blocks_guest_startup_before_configure() {
     while logs.try_recv().is_ok() {}
 
     config
+        .write()
         .agents
         .get_mut("plugin-owner")
         .expect("plugin owner")
         .enabled = false;
     config
+        .read()
         .validate()
         .expect("disabling the plugin owner preserves a valid daemon config");
     let built =

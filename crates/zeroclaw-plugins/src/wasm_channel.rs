@@ -29,6 +29,13 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_api::media::MediaAttachment;
 
+/// Host-supplied sender authorization for normalized inbound messages.
+///
+/// The runtime builds this resolver over the live canonical configuration. It
+/// is intentionally a closure rather than an allowlist snapshot, so a channel
+/// never owns a second copy of authorization state.
+pub type SenderAuthorizer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
     alias: String,
@@ -39,6 +46,9 @@ pub struct WasmChannel {
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
     poll_healthy: Arc<AtomicBool>,
+    /// Applied at the final host boundary before any inbound transport can
+    /// forward a normalized message to the agent.
+    authorizer: SenderAuthorizer,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -110,8 +120,18 @@ impl WasmChannel {
         permissions: &[PluginPermission],
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
     ) -> Result<Self> {
-        Self::from_wasm_with_digest(alias, wasm_path, None, permissions, config, limits).await
+        Self::from_wasm_with_digest(
+            alias,
+            wasm_path,
+            None,
+            permissions,
+            config,
+            limits,
+            authorizer,
+        )
+        .await
     }
 
     /// Instantiate a channel plugin while binding the compiled component to
@@ -123,6 +143,7 @@ impl WasmChannel {
         permissions: &[PluginPermission],
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
     ) -> Result<Self> {
         let component = load_component_with_digest(wasm_path, expected_sha256)?;
         let inbound = InboundQueue::default();
@@ -190,6 +211,7 @@ impl WasmChannel {
             cached_self_addressed_mention,
             cached_multi_message_delay_ms,
             poll_healthy: Arc::new(AtomicBool::new(true)),
+            authorizer,
         })
     }
 
@@ -247,6 +269,35 @@ fn from_wit_inbound(msg: WitInboundMessage, channel_name: &str) -> ChannelMessag
     }
 }
 
+/// Forward a normalized inbound message only when its sender is currently
+/// authorized by the host.
+///
+/// Keeping this check at the final host-to-agent boundary makes the same gate
+/// reusable by polling today and by later host-fed transports without trusting
+/// a guest to enforce operator policy.
+async fn forward_if_authorized(
+    tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    authorizer: &SenderAuthorizer,
+    channel_alias: &str,
+    msg: ChannelMessage,
+) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMessage>> {
+    if !authorizer(&msg.sender) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "channel_alias": channel_alias,
+                    "sender": msg.sender.as_str(),
+                })),
+            "ignoring channel-plugin inbound from unauthorized sender"
+        );
+        return Ok(());
+    }
+
+    tx.send(msg).await
+}
+
 fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
     WitApprovalRequest {
         tool_name: req.tool_name.clone(),
@@ -291,6 +342,7 @@ impl Channel for WasmChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         let channel_name = self.alias.clone();
+        let authorizer = Arc::clone(&self.authorizer);
         const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
         const MAX_BACKOFF: Duration = Duration::from_millis(500);
         let mut backoff = INITIAL_BACKOFF;
@@ -309,10 +361,14 @@ impl Channel for WasmChannel {
                 Ok(Some(wit_msg)) => {
                     mark_poll_healthy(&self.poll_healthy, true);
                     backoff = INITIAL_BACKOFF;
-                    if tx
-                        .send(from_wit_inbound(wit_msg, &channel_name))
-                        .await
-                        .is_err()
+                    if forward_if_authorized(
+                        &tx,
+                        &authorizer,
+                        &channel_name,
+                        from_wit_inbound(wit_msg, &channel_name),
+                    )
+                    .await
+                    .is_err()
                     {
                         return Ok(());
                     }

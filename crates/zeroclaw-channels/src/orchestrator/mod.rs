@@ -10606,7 +10606,7 @@ pub async fn start_channels(
                 .map(|cc| cc.channel.name().to_string())
                 .collect();
             for (id, channel) in zeroclaw_runtime::plugin_channels::build_channel_plugins(
-                &config,
+                &config_arc,
                 &native_channel_ids,
             )
             .await
