@@ -117,6 +117,7 @@ pub struct ResolvedAgentExecution<'a> {
     pub max_tool_result_chars: usize,
     /// History-pruning token threshold.
     pub context_token_budget: usize,
+    pub model_context_window: usize,
     /// Tool-receipt tracer; `None` when receipts are off.
     pub receipt_generator: Option<&'a ReceiptGenerator>,
     /// Fine-grained loop behavior flags.
@@ -150,6 +151,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
     pub context_token_budget: usize,
+    pub model_context_window: usize,
     pub knobs: &'a LoopKnobs,
 }
 
@@ -184,6 +186,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
             context_token_budget: runtime.context_token_budget,
+            model_context_window: runtime.model_context_window,
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
         }

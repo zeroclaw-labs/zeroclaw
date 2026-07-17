@@ -25,6 +25,17 @@ pub fn sanitize_session_key(key: &str) -> String {
         .collect()
 }
 
+/// Canonical session key for a CLI turn backed by `session_state_file`.
+/// Sole source of truth for the `cli:<path>` shape; the memory `session_id`
+/// filter and the scope-span `session_key` must agree, so both derive here.
+pub fn cli_session_key(session_state_file: Option<&std::path::Path>) -> Option<String> {
+    let raw = session_state_file?.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(sanitize_session_key(&format!("cli:{raw}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +70,21 @@ mod tests {
     fn preserves_unicode_alphanumeric() {
         // is_alphanumeric() treats unicode letters/digits as alphanumeric.
         assert_eq!(sanitize_session_key("user_Алиса"), "user_Алиса");
+    }
+
+    #[test]
+    fn cli_session_key_derives_sanitized_cli_prefix() {
+        let p = std::path::PathBuf::from("/var/run/sess a.jsonl");
+        assert_eq!(
+            super::cli_session_key(Some(&p)),
+            Some("cli__var_run_sess_a_jsonl".to_string())
+        );
+    }
+
+    #[test]
+    fn cli_session_key_none_for_missing_or_empty() {
+        assert_eq!(super::cli_session_key(None), None);
+        let empty = std::path::PathBuf::from("   ");
+        assert_eq!(super::cli_session_key(Some(&empty)), None);
     }
 }

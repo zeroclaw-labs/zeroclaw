@@ -927,12 +927,9 @@ async fn run_agent_job(
                 // pollute future recall and cause context snowball. Routes
                 // through the cron-owning agent's per-agent memory wrapper
                 // so the purge stays scoped to the agent that wrote them.
-                // Sanitize the session key so it matches what the runtime
-                // writes via the orchestrator session-key sanitizer.
-                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                    "cli:{}",
-                    session_path.display()
-                ));
+                let mem_session_key =
+                    zeroclaw_api::session_keys::cli_session_key(Some(session_path.as_path()))
+                        .unwrap_or_default();
                 if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
                     config,
                     agent_alias,
