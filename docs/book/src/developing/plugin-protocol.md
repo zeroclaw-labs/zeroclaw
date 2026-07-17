@@ -422,6 +422,14 @@ instantiation, configuration, and `parse-webhook`; queue admission is
 nonblocking. A timeout or dropped handler discards that request's store, leaving
 the channel's warm polling/outbound store available for later work.
 
+The host deduplicates non-empty parsed message IDs only after guest
+authentication succeeds. Those IDs are namespaced by the declared webhook path
+in the gateway's canonical bounded idempotency store, and a reservation is
+rolled back if normalized channel delivery fails. Caller-provided headers are
+not allowed to consume an idempotency key before authentication. Multiple
+enabled instances that return the same webhook path are all rejected rather
+than selecting one alias from manifest iteration order.
+
 ### `logging`
 
 `wit/v0/logging.wit` is imported by all three worlds. Plugins call `log-record`

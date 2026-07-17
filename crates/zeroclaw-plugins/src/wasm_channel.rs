@@ -697,6 +697,7 @@ impl Channel for WasmChannel {
                 headers,
                 body,
                 cancellation,
+                idempotency,
                 reply,
             }) = webhook_rx.recv().await
             {
@@ -709,6 +710,30 @@ impl Channel for WasmChannel {
                     Some(Ok(Ok(messages))) => {
                         let mut delivery_failed = false;
                         for message in messages {
+                            let message_id = message.id.trim().to_string();
+                            let reservation =
+                                if message_id.is_empty() {
+                                    None
+                                } else if let Some(idempotency) = idempotency.as_ref() {
+                                    if !idempotency.reserve(&message_id) {
+                                        ::zeroclaw_log::record!(
+                                            INFO,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_attrs(::serde_json::json!({
+                                                "channel_ref": webhook_channel_ref,
+                                                "error_key": "plugin_webhook_duplicate",
+                                            })),
+                                            "duplicate plugin webhook message ignored"
+                                        );
+                                        continue;
+                                    }
+                                    Some((idempotency.clone(), message_id))
+                                } else {
+                                    None
+                                };
                             let message = from_wit_inbound(message, &webhook_channel_ref);
                             let sent = tokio::select! {
                                 biased;
@@ -723,10 +748,18 @@ impl Channel for WasmChannel {
                             match sent {
                                 Some(Ok(())) => {}
                                 Some(Err(_)) => {
+                                    if let Some((idempotency, message_id)) = reservation.as_ref() {
+                                        idempotency.rollback(message_id);
+                                    }
                                     delivery_failed = true;
                                     break;
                                 }
-                                None => break,
+                                None => {
+                                    if let Some((idempotency, message_id)) = reservation.as_ref() {
+                                        idempotency.rollback(message_id);
+                                    }
+                                    break;
+                                }
                             }
                         }
                         let response = if cancellation.is_cancelled() {

@@ -17,6 +17,41 @@ use tokio::sync::{mpsc, oneshot};
 /// Cancellation signal for one gateway-owned plugin webhook request.
 pub type WebhookCancellation = tokio_util::sync::CancellationToken;
 
+/// A live handle to the gateway's canonical idempotency store.
+///
+/// The plugin worker calls [`Self::reserve`] only after the guest has
+/// authenticated and parsed a stable message ID. A reservation remains in the
+/// gateway store after successful channel delivery and is rolled back when
+/// delivery fails or the request is cancelled before handoff.
+#[derive(Clone)]
+pub struct WebhookIdempotency {
+    reserve: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    rollback: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl WebhookIdempotency {
+    pub fn new(
+        reserve: impl Fn(&str) -> bool + Send + Sync + 'static,
+        rollback: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            reserve: Arc::new(reserve),
+            rollback: Arc::new(rollback),
+        }
+    }
+
+    /// Reserve a parsed stable message ID. Returns `false` for a duplicate.
+    #[must_use]
+    pub fn reserve(&self, message_id: &str) -> bool {
+        (self.reserve)(message_id)
+    }
+
+    /// Remove a reservation whose message never reached the channel queue.
+    pub fn rollback(&self, message_id: &str) {
+        (self.rollback)(message_id);
+    }
+}
+
 /// A raw inbound webhook the gateway received on `/plugin/<path>`, plus a
 /// one-shot the plugin side resolves so the HTTP handler can pick a status code.
 pub struct RawWebhook {
@@ -29,6 +64,10 @@ pub struct RawWebhook {
     /// executing `parse-webhook`, so an HTTP timeout or dropped handler cancels
     /// the actual component call instead of only abandoning its reply.
     pub cancellation: WebhookCancellation,
+    /// Resolver callbacks into the gateway's canonical idempotency store. The
+    /// plugin worker uses the authenticated, parsed message ID; it never trusts
+    /// a caller-supplied idempotency header before guest authentication.
+    pub idempotency: Option<WebhookIdempotency>,
     /// Resolved once the plugin has decoded (or rejected) the webhook: `Ok` →
     /// 200, `Err(reject)` → the reject's status.
     pub reply: oneshot::Sender<Result<(), WebhookReject>>,

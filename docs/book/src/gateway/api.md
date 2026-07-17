@@ -40,6 +40,13 @@ logged internally and never reflected to an unauthenticated caller. Request
 cancellation reaches the component parser itself; timed-out parser stores are
 discarded so a later webhook cannot be blocked by the prior request.
 
+After successful guest authentication and parsing, non-empty provider message
+IDs use the gateway's existing bounded idempotency store. The reservation is
+kept only after the normalized message reaches the channel queue, so an invalid,
+timed-out, or undeliverable request does not consume its retry identity. If two
+enabled plugin instances declare the same webhook path, every claimant is
+withheld; startup iteration order never chooses an alias implicitly.
+
 ## Discovering the surface
 
 Two endpoints answer the question "what can I do here?":

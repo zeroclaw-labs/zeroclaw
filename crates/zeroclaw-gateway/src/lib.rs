@@ -395,6 +395,41 @@ impl IdempotencyStore {
         keys.insert(key.to_owned(), now);
         true
     }
+
+    /// Remove a reservation when the associated message did not reach its
+    /// channel queue. Plugin webhook workers call this only for keys they just
+    /// reserved through [`Self::record_if_new`].
+    fn rollback(&self, key: &str) {
+        self.keys.lock().remove(key);
+    }
+}
+
+fn plugin_webhook_idempotency_key(path: &str, message_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"zeroclaw-plugin-webhook\0");
+    digest.update(path.as_bytes());
+    digest.update(b"\0");
+    digest.update(message_id.as_bytes());
+    format!("plugin-webhook:{}", hex::encode(digest.finalize()))
+}
+
+fn plugin_webhook_idempotency(
+    store: Arc<IdempotencyStore>,
+    path: &str,
+) -> zeroclaw_api::webhook::WebhookIdempotency {
+    let reserve_store = Arc::clone(&store);
+    let reserve_path = path.to_string();
+    let rollback_path = path.to_string();
+    zeroclaw_api::webhook::WebhookIdempotency::new(
+        move |message_id| {
+            reserve_store.record_if_new(&plugin_webhook_idempotency_key(&reserve_path, message_id))
+        },
+        move |message_id| {
+            store.rollback(&plugin_webhook_idempotency_key(&rollback_path, message_id));
+        },
+    )
 }
 
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
@@ -2801,6 +2836,10 @@ async fn handle_plugin_webhook(
         headers: header_pairs,
         body: body.to_vec(),
         cancellation,
+        idempotency: Some(plugin_webhook_idempotency(
+            Arc::clone(&state.idempotency_store),
+            &path,
+        )),
         reply: reply_tx,
     };
     match sink.try_send(raw) {
@@ -5043,6 +5082,7 @@ mod tests {
                 headers: Vec::new(),
                 body: Vec::new(),
                 cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
+                idempotency: None,
                 reply: prefill_reply,
             })
             .expect("prefill bounded queue");
@@ -6056,6 +6096,26 @@ mod tests {
         assert!(store.record_if_new("req-1"));
         assert!(!store.record_if_new("req-1"));
         assert!(store.record_if_new("req-2"));
+    }
+
+    #[test]
+    fn plugin_webhook_idempotency_is_namespaced_and_rolls_back_failed_delivery() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(30), 10));
+        let alpha = plugin_webhook_idempotency(Arc::clone(&store), "alpha");
+        let beta = plugin_webhook_idempotency(Arc::clone(&store), "beta");
+
+        assert!(alpha.reserve("provider-event-1"));
+        assert!(!alpha.reserve("provider-event-1"));
+        assert!(
+            beta.reserve("provider-event-1"),
+            "different plugin routes have independent event namespaces"
+        );
+
+        alpha.rollback("provider-event-1");
+        assert!(
+            alpha.reserve("provider-event-1"),
+            "failed channel delivery releases its reservation"
+        );
     }
 
     #[test]

@@ -640,3 +640,36 @@ async fn mirror_builder_admits_only_one_owned_unshadowed_provider() {
         "neither duplicate claimant invokes configure"
     );
 }
+
+#[tokio::test]
+async fn mirror_webhook_aliases_with_one_path_fail_closed() {
+    let wasm = fixture();
+    let tmp = tempdir().expect("create duplicate webhook path root");
+    let plugins_dir = tmp.path().join("plugins");
+    install_fixture_as(
+        &wasm,
+        &plugins_dir,
+        "telegram-webhook-mirror",
+        Some("telegram"),
+        true,
+    );
+    let config = mirror_config(&plugins_dir, true);
+    let registry = zeroclaw_api::webhook::PluginWebhookRegistry::new();
+
+    let built = zeroclaw_runtime::plugin_channels::build_channel_plugins(
+        &config,
+        config_resolver(&config),
+        &HashSet::new(),
+        Some(&registry),
+    )
+    .await;
+
+    assert!(
+        built.is_empty(),
+        "aliases that claim one webhook path are all rejected"
+    );
+    assert!(
+        registry.get("fixture").is_none(),
+        "ambiguous aliases must not leave an iteration-order winner"
+    );
+}

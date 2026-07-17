@@ -11,7 +11,7 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::webhook::{RawWebhook, WebhookCancellation, WebhookReject};
+use zeroclaw_api::webhook::{RawWebhook, WebhookCancellation, WebhookIdempotency, WebhookReject};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::error::PluginError;
@@ -316,6 +316,7 @@ async fn webhook_ingress_delivers_inbound() {
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"hello from webhook".to_vec(),
             cancellation: WebhookCancellation::new(),
+            idempotency: None,
             reply: reply_tx,
         })
         .await
@@ -350,6 +351,7 @@ async fn webhook_ingress_delivers_inbound() {
             headers: vec![("x-fixture-secret".to_string(), "wrong".to_string())],
             body: b"nope".to_vec(),
             cancellation: WebhookCancellation::new(),
+            idempotency: None,
             reply: reply_tx2,
         })
         .await
@@ -367,6 +369,7 @@ async fn webhook_ingress_delivers_inbound() {
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: vec![0xff],
             cancellation: WebhookCancellation::new(),
+            idempotency: None,
             reply: reply_tx3,
         })
         .await
@@ -416,6 +419,7 @@ async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"stall-parse".to_vec(),
             cancellation,
+            idempotency: None,
             reply: stalled_reply_tx,
         })
         .await
@@ -444,6 +448,7 @@ async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"after-timeout".to_vec(),
             cancellation: WebhookCancellation::new(),
+            idempotency: None,
             reply: recovery_reply_tx,
         })
         .await
@@ -474,6 +479,95 @@ async fn cancelled_webhook_parse_releases_warm_store_for_next_call() {
     })
     .await
     .expect("poll health recovers after the cancelled parse");
+
+    listener.abort();
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
+}
+
+#[tokio::test]
+async fn authenticated_webhook_message_ids_are_idempotent() {
+    let wasm = fixture();
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror(
+            "fixture",
+            "default",
+            &wasm,
+            &[PluginPermission::ConfigRead],
+            "test-secret",
+            test_limits(),
+        )
+        .await
+        .expect("fixture instantiates"),
+    );
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    // Drain the fixture's one-shot configure echo before webhook assertions.
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("fixture emits configure echo")
+        .expect("listener remains active");
+
+    let keys = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+    let reserve_keys = Arc::clone(&keys);
+    let rollback_keys = Arc::clone(&keys);
+    let idempotency = WebhookIdempotency::new(
+        move |message_id| {
+            reserve_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(message_id.to_string())
+        },
+        move |message_id| {
+            rollback_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(message_id);
+        },
+    );
+
+    for (body, expected_delivery) in [
+        (b"first delivery".as_slice(), true),
+        (b"provider retry".as_slice(), false),
+    ] {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        sink_tx
+            .send(RawWebhook {
+                headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+                body: body.to_vec(),
+                cancellation: WebhookCancellation::new(),
+                idempotency: Some(idempotency.clone()),
+                reply: reply_tx,
+            })
+            .await
+            .expect("sink accepts authenticated webhook");
+        assert!(
+            matches!(reply_rx.await, Ok(Ok(()))),
+            "valid delivery and an authenticated retry are both acknowledged"
+        );
+        if expected_delivery {
+            let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("first stable message ID is delivered")
+                .expect("listener remains active");
+            assert_eq!(message.content, "first delivery");
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                    .await
+                    .is_err(),
+                "a retry with the same parsed stable ID is not delivered twice"
+            );
+        }
+    }
 
     listener.abort();
     assert!(
