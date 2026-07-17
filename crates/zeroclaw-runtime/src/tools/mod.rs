@@ -1455,7 +1455,8 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let count = details.len();
+                    let discovered_count = details.len();
+                    let mut registered_count = 0_usize;
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1472,20 +1473,53 @@ pub fn all_tools_with_runtime(
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                            wasm_path.to_path_buf(),
-                            manifest.permissions.clone(),
-                            manifest.name.clone(),
-                            manifest.description.clone().unwrap_or_default(),
-                            plugin_config,
-                            plugin_limits,
-                        )));
+                        let tool = (|| -> anyhow::Result<_> {
+                            let scope =
+                                zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+                                    manifest,
+                                    zeroclaw_plugins::PluginCapability::Tool,
+                                    manifest.name.clone(),
+                                    manifest.permissions.iter().copied(),
+                                )?;
+                            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                                wasm_path.to_path_buf(),
+                                scope,
+                                plugin_config,
+                                plugin_limits,
+                            )
+                        })();
+                        match tool {
+                            Ok(tool) => {
+                                tool_arcs.push(Arc::new(tool));
+                                registered_count += 1;
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Load
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": manifest.name,
+                                            "error": format!("{e:#}"),
+                                        })
+                                    ),
+                                    "Failed to register WASM plugin tool"
+                                );
+                            }
+                        }
                     }
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
-                        "Loaded  WASM plugin tools"
+                            .with_attrs(::serde_json::json!({
+                                "discovered": discovered_count,
+                                "registered": registered_count,
+                            })),
+                        "Registered WASM plugin tools"
                     );
                 }
                 Err(e) => {

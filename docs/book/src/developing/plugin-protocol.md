@@ -239,6 +239,8 @@ skills and between bundles.
 
 ## Manifest format
 
+{{#include ../_snippets/plugin-manifest-fields.md}}
+
 ### Capabilities
 
 `capabilities` is a non-empty list of `PluginCapability` values, defined in
