@@ -445,6 +445,30 @@ pub fn record_event(event: LogEvent) {
     }
 }
 
+/// True when a broadcast frame was stamped with [`EPHEMERAL_BROADCAST_MARKER`]
+/// by [`record_event`] — i.e. it carries broadcast-only pairing secrets (QR
+/// payloads, pair codes) deep-merged into `attributes`.
+///
+/// Every consumer of the shared broadcast bus (the gateway SSE stream, the RPC
+/// `logs/subscribe` forwarder) uses this to fail closed on the credential
+/// unless it can prove its subscriber is authenticated.
+pub fn frame_carries_ephemeral_credentials(value: &Value) -> bool {
+    value
+        .get(EPHEMERAL_BROADCAST_MARKER)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Strip the internal [`EPHEMERAL_BROADCAST_MARKER`] from a broadcast frame
+/// before it is delivered to a consumer, so the public event shape is
+/// unchanged. Returns whether the marker was present.
+pub fn strip_ephemeral_broadcast_marker(value: &mut Value) -> bool {
+    value
+        .as_object_mut()
+        .and_then(|obj| obj.remove(EPHEMERAL_BROADCAST_MARKER))
+        .is_some()
+}
+
 /// Deep-merge the event's `ephemeral_attributes` into the broadcast
 /// value's `attributes` object. Ephemeral keys win on conflict (they are
 /// the fresher, call-site-provided data). Only object-into-object merges

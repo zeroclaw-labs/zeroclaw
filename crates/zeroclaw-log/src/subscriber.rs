@@ -86,53 +86,85 @@ impl<'writer> FormatFields<'writer> for RedactEphemeralFields {
 }
 
 /// Visitor wrapper that forwards every field to the default visitor except
-/// the ephemeral-attributes transport field, which it swallows. The
-/// credential arrives via `%Display` (recorded through `record_debug`); the
-/// `record_str` guard is defense-in-depth in case the transport ever changes.
+/// the ephemeral-attributes transport field, which it swallows. The current
+/// transport records the credential via `%Display` (`record_debug`), but the
+/// guard is applied uniformly across *every* visitor method so the redaction
+/// stays fail-closed if the field's recorded representation ever changes
+/// (numeric, boolean, error, str) — a leak must not reappear just because the
+/// call site swapped `%` for `?` or a typed value.
 struct RedactEphemeralVisitor<'a> {
     inner: DefaultVisitor<'a>,
 }
 
+impl RedactEphemeralVisitor<'_> {
+    /// True when the field is the ephemeral-attributes transport field and
+    /// must therefore be dropped from the human-readable stderr rendering.
+    fn is_ephemeral(field: &Field) -> bool {
+        field.name() == F_EPHEMERAL_ATTRS
+    }
+}
+
 impl Visit for RedactEphemeralVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == F_EPHEMERAL_ATTRS {
+        if Self::is_ephemeral(field) {
             return;
         }
         self.inner.record_debug(field, value);
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == F_EPHEMERAL_ATTRS {
+        if Self::is_ephemeral(field) {
             return;
         }
         self.inner.record_str(field, value);
     }
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_error(field, value);
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_f64(field, value);
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_i64(field, value);
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_u64(field, value);
     }
 
     fn record_i128(&mut self, field: &Field, value: i128) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_i128(field, value);
     }
 
     fn record_u128(&mut self, field: &Field, value: u128) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_u128(field, value);
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
+        if Self::is_ephemeral(field) {
+            return;
+        }
         self.inner.record_bool(field, value);
     }
 }
@@ -253,6 +285,58 @@ mod tests {
         assert!(
             !out.contains(F_EPHEMERAL_ATTRS),
             "the ephemeral transport field must be dropped entirely: {out:?}"
+        );
+    }
+
+    /// Fail-closed across representations: even if the ephemeral transport
+    /// field were ever recorded as a typed value (str / integer / bool) rather
+    /// than the current `%Display` debug form, the redactor must still drop it.
+    /// Guards against a future call-site change silently reintroducing the
+    /// leak through an unguarded visitor method.
+    #[test]
+    fn verbose_terminal_output_redacts_ephemeral_across_representations() {
+        fn render_with<F: FnOnce()>(emit: F) -> String {
+            let buf = BufMakeWriter::default();
+            let fmt_layer = fmt::layer()
+                .fmt_fields(RedactEphemeralFields)
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .event_format(AgentAliasFormatter::new());
+            let subscriber = tracing_subscriber::registry().with(fmt_layer);
+            tracing::subscriber::with_default(subscriber, emit);
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+        }
+
+        // str representation (record_str)
+        let out = render_with(|| {
+            tracing::info!(zc_ephemeral_attrs = "SECRET-STR-MARKER", "str ephemeral");
+        });
+        assert!(out.contains("str ephemeral"), "event still logged: {out:?}");
+        assert!(
+            !out.contains("SECRET-STR-MARKER"),
+            "str-recorded ephemeral field leaked: {out:?}"
+        );
+        assert!(!out.contains(F_EPHEMERAL_ATTRS), "field name leaked: {out:?}");
+
+        // integer representation (record_i64)
+        let out = render_with(|| {
+            tracing::info!(zc_ephemeral_attrs = 424242i64, "int ephemeral");
+        });
+        assert!(out.contains("int ephemeral"), "event still logged: {out:?}");
+        assert!(
+            !out.contains("424242"),
+            "integer-recorded ephemeral field leaked: {out:?}"
+        );
+        assert!(!out.contains(F_EPHEMERAL_ATTRS), "field name leaked: {out:?}");
+
+        // bool representation (record_bool)
+        let out = render_with(|| {
+            tracing::info!(zc_ephemeral_attrs = true, "bool ephemeral");
+        });
+        assert!(out.contains("bool ephemeral"), "event still logged: {out:?}");
+        assert!(
+            !out.contains(F_EPHEMERAL_ATTRS),
+            "bool-recorded ephemeral field leaked: {out:?}"
         );
     }
 }

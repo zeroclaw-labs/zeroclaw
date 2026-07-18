@@ -46,7 +46,16 @@ impl EventBuffer {
     }
 }
 
-/// GET /api/events — SSE event stream
+/// GET /api/events — SSE event stream.
+///
+/// Pairing credentials (QR payloads, one-shot pair codes) are **broadcast-only
+/// and delivery-once**: they ride the live `event_tx` fan-out and are never
+/// written to the history buffer or the persisted JSONL. A subscriber must be
+/// connected *before* pairing to observe them; a client that connects late,
+/// reconnects, or lags past the broadcast ring (the discarded
+/// `BroadcastStreamRecvError` below) deliberately cannot recover the credential
+/// — that is the non-persistent boundary, not a bug. Recovery would require
+/// buffering the secret, which the credential boundary forbids.
 pub async fn handle_sse_events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -109,22 +118,14 @@ fn sse_frame_for_stream(
     if !is_public_sse_event(&value) {
         return None;
     }
-    if frame_carries_ephemeral_credentials(&value) && !auth_enforced {
+    if zeroclaw_log::frame_carries_ephemeral_credentials(&value) && !auth_enforced {
         return None;
     }
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER);
-    }
+    // Strip the internal marker so the delivered public shape is unchanged.
+    // Shared with every other broadcast consumer (RPC `logs/subscribe`) so the
+    // credential boundary is enforced identically across the bus.
+    zeroclaw_log::strip_ephemeral_broadcast_marker(&mut value);
     Some(value)
-}
-
-/// True when a broadcast frame was stamped by the log layer as carrying
-/// broadcast-only pairing secrets.
-fn frame_carries_ephemeral_credentials(event: &serde_json::Value) -> bool {
-    event
-        .get(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// GET /api/events/history — return buffered recent events as JSON.
@@ -143,6 +144,13 @@ fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
         .snapshot()
         .into_iter()
         .filter(is_public_sse_event)
+        // Pairing credentials are broadcast-only and delivery-once: they are
+        // never replayed from history, so a client that connects after pairing
+        // cannot recover the QR payload / pair code. Login events bypass the
+        // observer that fills this buffer, so a marked frame should never be
+        // here in the first place — this filter fails closed as defense in
+        // depth for the non-persistent credential boundary.
+        .filter(|event| !zeroclaw_log::frame_carries_ephemeral_credentials(event))
         .collect();
     serde_json::json!({ "events": events })
 }
@@ -773,5 +781,214 @@ mod tests {
         }
 
         zeroclaw_runtime::observability::clear_broadcast_hook();
+    }
+
+    /// Warning follow-up (non-persistent boundary): even if a credential-marked
+    /// login frame reached the replay buffer, `/api/events/history` must
+    /// withhold it. Pairing secrets are delivery-once — a client that connects
+    /// after pairing cannot recover them from history.
+    #[test]
+    fn history_payload_never_recovers_pairing_credentials() {
+        let buffer = EventBuffer::new(8);
+        buffer.push(credential_login_frame());
+        buffer.push(serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model_provider": "test",
+            "model": "test-model",
+        }));
+
+        let payload = history_events_payload(&buffer);
+        let events = payload["events"].as_array().expect("events array");
+        assert_eq!(
+            events.len(),
+            1,
+            "credential-bearing frame must be withheld from history: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "agent_start");
+        let dump = payload.to_string();
+        assert!(
+            !dump.contains("SECRET-QR-PAYLOAD"),
+            "history must not expose a pairing secret: {dump}"
+        );
+        assert!(!dump.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER));
+    }
+
+    // ── Route-level `/api/events` credential-boundary regressions ─────────
+    //
+    // These drive the real axum handler through the router — PairingGuard,
+    // bearer parsing, the early 401, subscription wiring, and the routed SSE
+    // response — rather than calling `sse_frame_for_stream` in isolation, so
+    // they catch the auth check being removed or disconnected from the filter.
+
+    fn events_app(state: AppState) -> axum::Router {
+        axum::Router::new()
+            .route("/api/events", axum::routing::get(handle_sse_events))
+            .with_state(state)
+    }
+
+    /// Drive the SSE response body, accumulating delivered bytes until `needle`
+    /// is seen or the budget elapses (avoids blocking on the keep-alive).
+    async fn read_stream_until(
+        body: axum::body::Body,
+        needle: &str,
+        budget: std::time::Duration,
+    ) -> String {
+        use http_body_util::BodyExt;
+        let mut body = body;
+        let mut acc = String::new();
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, body.frame()).await {
+                Ok(Some(Ok(frame))) => {
+                    if let Ok(bytes) = frame.into_data() {
+                        acc.push_str(&String::from_utf8_lossy(&bytes));
+                        if acc.contains(needle) {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        acc
+    }
+
+    fn pairing_guard(require: bool, tokens: &[&str]) -> Arc<zeroclaw_runtime::security::pairing::PairingGuard> {
+        let owned: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+        Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+            require, &owned,
+        ))
+    }
+
+    /// Pairing disabled ⇒ the handler skips the bearer check, so the stream is
+    /// unauthenticated. A credential frame must be withheld end-to-end while a
+    /// credential-free frame still flows (proving the stream is live).
+    #[tokio::test]
+    async fn route_withholds_credential_frame_on_unauthenticated_events_stream() {
+        use tower::ServiceExt as _;
+
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = pairing_guard(false, &[]);
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        state.event_tx = tx.clone();
+
+        let response = events_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let _ = tx.send(credential_login_frame());
+        let _ = tx.send(serde_json::json!({
+            "source": "observability",
+            "type": "tool_call",
+            "tool": "SENTINEL-LIVE",
+        }));
+
+        let body = read_stream_until(
+            response.into_body(),
+            "SENTINEL-LIVE",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            body.contains("SENTINEL-LIVE"),
+            "the stream must stay live for non-secret frames: {body:?}"
+        );
+        assert!(
+            !body.contains("SECRET-QR-PAYLOAD"),
+            "pairing secret must never reach an unauthenticated /api/events client: {body:?}"
+        );
+    }
+
+    /// Pairing enabled ⇒ the handler enforces the bearer check and returns 401
+    /// before any subscription for a missing or bad token.
+    #[tokio::test]
+    async fn route_returns_401_when_pairing_enabled_without_valid_token() {
+        use tower::ServiceExt as _;
+
+        // No token.
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = pairing_guard(true, &["valid-token"]);
+        let response = events_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Bad token.
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = pairing_guard(true, &["valid-token"]);
+        let response = events_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/events")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Pairing enabled + valid bearer ⇒ every subscriber is authenticated, so
+    /// the credential is delivered — with the internal marker stripped.
+    #[tokio::test]
+    async fn route_delivers_credential_without_marker_to_authenticated_client() {
+        use tower::ServiceExt as _;
+
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = pairing_guard(true, &["valid-token"]);
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        state.event_tx = tx.clone();
+
+        let response = events_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/events")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer valid-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let _ = tx.send(credential_login_frame());
+
+        let body = read_stream_until(
+            response.into_body(),
+            "SECRET-QR-PAYLOAD",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            body.contains("SECRET-QR-PAYLOAD"),
+            "an authenticated client should receive the QR payload: {body:?}"
+        );
+        assert!(
+            !body.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
+            "the internal fail-closed marker must be stripped before delivery: {body:?}"
+        );
     }
 }
