@@ -1629,9 +1629,9 @@ mod tests {
 
     #[test]
     fn openai_dispatch_missing_entry_stays_on_chat_wire() {
-        // Blocking-review regression (#9021): the new responses default must apply
-        // to *persisted slot creation* only. An implicit dispatch with no config
-        // entry — a bare `model_provider = "openai"` ref or a dangling alias —
+        // The responses default applies only to persisted slot creation. An implicit
+        // dispatch with no config entry — a bare `model_provider = "openai"` ref or
+        // a dangling alias —
         // must keep the historical chat-completions wire and prompt-guided tools,
         // so existing installs don't silently flip wire + tool-calling on upgrade.
         let provider = dispatch_family_factory(
