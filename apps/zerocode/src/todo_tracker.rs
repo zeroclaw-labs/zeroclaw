@@ -1,9 +1,4 @@
 //! Read-only TodoWrite tracker widget for the Code pane.
-//!
-//! Holds the last authoritative plan (whole-list replace) and owns the
-//! show/hide state machine: auto-pop once on the first plan of a
-//! session, after which the user's toggle is authoritative; a master
-//! `enabled` flag hard-gates all rendering.
 
 use crate::wire::{ConfigFieldEntry, PlanEntry, PlanStatus};
 
@@ -54,12 +49,6 @@ impl Default for TodoTrackerSettings {
 }
 
 impl TodoTrackerSettings {
-    /// Build settings from `config/list` field entries (prefix
-    /// `todotracker`). Each field is keyed by its dotted `path`
-    /// (`todotracker.enabled`, …); absent or unparseable fields keep the
-    /// schema default. The daemon is the source of truth for defaults,
-    /// but we re-apply them here so a partial/failed fetch degrades
-    /// gracefully.
     #[allow(dead_code)]
     pub(crate) fn from_config_fields(fields: &[ConfigFieldEntry]) -> Self {
         let mut s = Self::default();
@@ -130,8 +119,6 @@ impl TodoTracker {
         }
     }
 
-    /// Test-only convenience constructor: builds settings from the three
-    /// behavioral flags with default width/max_height.
     #[cfg(test)]
     pub(crate) fn new(location: TodoLocation, enabled: bool, enabled_at_start: bool) -> Self {
         Self::from_settings(TodoTrackerSettings {

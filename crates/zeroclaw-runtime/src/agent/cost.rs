@@ -8,12 +8,6 @@ use zeroclaw_providers::pricing::ModelRates;
 
 // ── Cost tracking via task-local ──
 
-/// Per-provider pricing snapshot consumed by the cost tracker.
-///
-/// Outer key: model provider alias (e.g. `openrouter`, `anthropic`,
-/// `azure-openai`). Inner key: user-defined model identifier, optionally
-/// suffixed with `.input` / `.output` to encode pricing dimension. Values
-/// are USD per 1M tokens.
 pub type ModelProviderPricing = HashMap<String, HashMap<String, f64>>;
 
 /// Per-scope token/cost accumulator derived from the usage events emitted
@@ -23,12 +17,6 @@ pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
-    /// Last provider-reported prompt token count (absolute, not accumulated).
-    /// Matches zerocode's pattern: the LLM's usage.input_tokens already
-    /// includes the full prompt (history + tools + system), so the last value
-    /// is the accurate "how full is the context window" measure. This replaces
-    /// rather than accumulates, avoiding the double-counting bug where
-    /// successive tool-call rounds summed their overlapping prompt sizes.
     pub last_input_tokens: u64,
 }
 
@@ -82,18 +70,6 @@ pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProvider
     pricing
 }
 
-/// Resolve the per-model pricing map for a provider reference.
-///
-/// `model_provider_name` usually arrives as the composite `<type>.<alias>`,
-/// but the outer pricing map may be keyed either way depending on which
-/// builder populated it: the CLI / gateway / cron agent loop uses
-/// `build_model_provider_pricing` (alias-keyed), while the channel
-/// orchestrator uses `build_type_level_model_provider_pricing` (type-keyed).
-/// Three-level fallback:
-/// 1. Exact match on the full `<type>.<alias>`.
-/// 2. Bare `<type>` (for type-keyed maps from the channels path).
-/// 3. Prefix match when only the bare type is known and exactly one alias
-///    entry exists (keeps pricing deterministic).
 pub fn provider_pricing<'a>(
     pricing: &'a ModelProviderPricing,
     model_provider_name: &str,
@@ -180,12 +156,6 @@ impl ToolLoopCostTrackingContext {
         }
     }
 
-    /// Accumulation-only context: snapshots per-turn token usage without a
-    /// backing tracker. `record_tool_loop_cost_usage` skips persistence and
-    /// the missing-pricing warning (there is no cost enforcement to be
-    /// silently inert); `check_tool_loop_budget` reports no budget. Lets
-    /// wrappers that never tracked costs (e.g. `Agent::turn`) read summed
-    /// token totals out of the loop for observer events.
     pub fn usage_only() -> Self {
         Self {
             tracker: None,
@@ -203,12 +173,6 @@ impl ToolLoopCostTrackingContext {
         self
     }
 
-    /// Snapshot the per-scope usage. Wrapping code calls this after the
-    /// scoped future completes to populate observer-event annotations.
-    ///
-    /// Prefers the caller-scoped `TOOL_LOOP_TURN_USAGE` task-local (ws.rs
-    /// gateway path), falling back to the context's own `turn_usage` field
-    /// (Agent::turn_streamed path).
     pub fn snapshot_turn_usage(&self) -> TurnUsage {
         TOOL_LOOP_TURN_USAGE
             .try_with(|turn_usage| turn_usage.as_ref().map(|u| *u.lock()).unwrap_or_default())
@@ -224,21 +188,6 @@ tokio::task_local! {
     pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
-/// Resolve `(input, output, cached_input)` per-1M-token rates for a given
-/// model on a model provider's pricing map. Lookup order:
-///
-/// 1. Dimension-specific keys: `{model}.input` / `{model}.output` /
-///    `{model}.cached_input`.
-/// 2. Bare model key as a flat fallback applied to whichever dimension
-///    didn't match in step 1.
-/// 3. The model alias path's last segment (`.../suffix`) tried under the
-///    same rules.
-///
-/// Each dimension is `None` when nothing matched (so the caller can tell
-/// "configured absent" from a configured `Some(0.0)` and fill only the gaps
-/// from the live-price fallback). A zero `cached_input` rate means "no
-/// discount": the per-token caller bills the cached subset at the standard
-/// input rate.
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> Option<ModelRates> {
         let input = pricing.get(&format!("{key}.input")).copied();
@@ -261,12 +210,6 @@ fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates 
         .unwrap_or_default()
 }
 
-/// Live-price fallback for one `(model_provider_name, model)`. Reads the
-/// process-global price snapshot (non-blocking, never fetches). The snapshot is
-/// keyed by provider family (`<type>`); `pricing::lookup` resolves the
-/// `model_provider_name` this path receives (bare family, or `<type>.<alias>`
-/// via a bare-family fallback) and probes model-id candidate forms. `None` when
-/// live pricing is disabled (empty snapshot) or unmatched.
 fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates> {
     let snapshot = zeroclaw_providers::pricing::current_snapshot();
     zeroclaw_providers::pricing::lookup(&snapshot, model_provider_name, model).copied()
@@ -323,12 +266,6 @@ pub fn record_tool_loop_cost_usage(
     let (mut input_rate, mut output_rate, mut cached_rate) =
         merge_config_and_live_rates(config_rates, live);
 
-    // Global catalog fallback: when the operator never hand-priced this model
-    // in config, consult the daemon-wide pricing catalog
-    // (`<data_dir>/pricing.json`, fed by the public LiteLLM/OpenRouter feed).
-    // Exact id matching keeps provider-qualified self-hosted ids — absent from
-    // the public catalog — at $0, so only billed cloud models get a non-zero
-    // rate here.
     let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
         if let Some((cat_in, cat_out, cat_cached)) =
             crate::agent::pricing_catalog::global_pricing_rates(model)
@@ -356,17 +293,6 @@ pub fn record_tool_loop_cost_usage(
         output_rate,
     );
 
-    // Promote first sighting of (model_provider, model) without pricing to a WARN
-    // so operators notice the silent zero-cost record before they need to
-    // grep DEBUG logs. Subsequent sightings stay at DEBUG so the warn
-    // stream doesn't get spammy. Fires when a cost tracker is active, the global
-    // catalog fallback did not price the model, and both config and the live
-    // fallback left input and output at zero. A model the live snapshot or the
-    // catalog just filled won't warn; a model deliberately priced at 0.0 still
-    // trips the one-shot warn (indistinguishable from unpriced here). The
-    // post-fallback rate check supersedes HEAD's `pricing.is_none()` clause,
-    // which would have warned even for live-filled models whose config pricing
-    // map was absent.
     if ctx.tracker.is_some() && !priced_from_catalog && input_rate == 0.0 && output_rate == 0.0 {
         warn_once_missing_pricing(model_provider_name, model);
     }
@@ -423,15 +349,6 @@ fn missing_pricing_first_sighting(
         .insert((model_provider.to_string(), model.to_string()))
 }
 
-/// First-time WARN, subsequent DEBUG, per `(model_provider, model)` pair.
-///
-/// The default pricing catalog has no entries for most non-OpenAI/Anthropic/
-/// Google models. Operators only realize their cost-tracking surface is
-/// reporting zero when they happen to enable DEBUG logging — a pure-DEBUG
-/// signal is too quiet for "your cost enforcement is silently inert" to
-/// register. Promote the first sighting per-pair to WARN with a config-path
-/// pointer; all subsequent same-pair occurrences stay at DEBUG so the warn
-/// stream doesn't get spammy.
 fn warn_once_missing_pricing(model_provider: &str, model: &str) {
     static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));

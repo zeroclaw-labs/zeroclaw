@@ -1,12 +1,4 @@
 //! LLM-driven memory consolidation.
-//!
-//! After each conversation turn, extracts structured information:
-//! - `history_entry`: A timestamped summary for the daily conversation log.
-//! - `memory_update`: New facts, preferences, or decisions worth remembering
-//!   long-term (or `null` if nothing new was learned).
-//!
-//! This two-phase approach replaces the naive raw-message auto-save with
-//! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
 use crate::conflict;
 use crate::dedup::{self, DedupAction};
@@ -41,15 +33,6 @@ const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engi
 Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null}
 Do not include any text outside the JSON object."#;
 
-/// Run two-phase LLM-driven consolidation on a conversation turn.
-///
-/// Phase 1: Write a history entry to the Daily memory category.
-/// Phase 2: Write a memory update to the Core category (if the LLM identified new facts).
-///
-/// This function is designed to be called fire-and-forget via `zeroclaw_spawn::spawn!`.
-/// Strip channel media markers (e.g. `[IMAGE:/local/path]`, `[DOCUMENT:...]`)
-/// that contain local filesystem paths.  These must never be forwarded to
-/// upstream model_provider APIs — they would leak local paths and cause API errors.
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
