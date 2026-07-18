@@ -2228,19 +2228,14 @@ fn load_cached_model_preview(
 
     // Check the shared cache location first (written by `zeroclaw models refresh`),
     // then fall back to the agent workspace for backward compatibility.
-    let shared_path = install_root_dir
-        .join("state")
-        .join(MODEL_CACHE_FILE);
-    let agent_path = agent_workspace_dir
-        .join("state")
-        .join(MODEL_CACHE_FILE);
+    let shared_path = install_root_dir.join("state").join(MODEL_CACHE_FILE);
+    let agent_path = agent_workspace_dir.join("state").join(MODEL_CACHE_FILE);
 
     for cache_path in [&shared_path, &agent_path] {
         let Ok(raw) = std::fs::read_to_string(cache_path) else {
             continue;
         };
-        let Ok(state) =
-            serde_json::from_str::<zeroclaw_config::schema::ModelCacheState>(&raw)
+        let Ok(state) = serde_json::from_str::<zeroclaw_config::schema::ModelCacheState>(&raw)
         else {
             continue;
         };
@@ -2425,8 +2420,11 @@ fn build_models_help_response(
         }
     }
 
-    let cached_models =
-        load_cached_model_preview(install_root_dir, agent_workspace_dir, &current.model_provider);
+    let cached_models = load_cached_model_preview(
+        install_root_dir,
+        agent_workspace_dir,
+        &current.model_provider,
+    );
     if cached_models.is_empty() {
         response.push('\n');
         response.push_str(&channel_runtime_cli_string_with_args(
@@ -2554,8 +2552,11 @@ fn build_config_block_kit(
         })
         .collect();
 
-    let cached =
-        load_cached_model_preview(install_root_dir, agent_workspace_dir, &current.model_provider);
+    let cached = load_cached_model_preview(
+        install_root_dir,
+        agent_workspace_dir,
+        &current.model_provider,
+    );
     for model_id in cached {
         if !model_options.iter().any(|o| {
             o.get("value")
