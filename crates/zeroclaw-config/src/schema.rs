@@ -14072,10 +14072,6 @@ pub struct MSTeamsConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: Option<bool>,
-    /// Sender allowlist (Entra AAD object IDs or UPNs). Empty = allow all.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub allow_from: Vec<String>,
     /// Streaming mode for progressive response delivery. `partial` uses
     /// Teams' native streaming protocol (the gray in-progress bubble) in
     /// personal chats and message edits in group chats/channels.
@@ -14128,7 +14124,6 @@ impl Default for MSTeamsConfig {
             path: default_msteams_path(),
             allow_dms: true,
             mention_only: None,
-            allow_from: Vec::new(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
