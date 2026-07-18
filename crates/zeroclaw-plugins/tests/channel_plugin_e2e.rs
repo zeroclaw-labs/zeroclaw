@@ -71,33 +71,10 @@ fn limits() -> PluginLimits {
 }
 
 fn manifest() -> PluginManifest {
-    PluginManifest {
-        name: "channel-fixture".to_string(),
-        version: "0.0.0".to_string(),
-        description: None,
-        author: None,
-        wasm_path: Some("channel-fixture.wasm".to_string()),
-        wasm_sha256: None,
-        capabilities: vec![PluginCapability::Channel],
-        permissions: vec![
-            PluginPermission::ConfigRead,
-            PluginPermission::StateRead,
-            PluginPermission::StateWrite,
-        ],
-        config_schema: Some(serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "required": ["retry_count", "credential_epoch", "api_token"],
-            "additionalProperties": false,
-            "properties": {
-                "retry_count": {"type": "integer", "minimum": 1},
-                "credential_epoch": {"type": "string", "minLength": 1},
-                "api_token": {"type": "string", "minLength": 1, "x-secret": true}
-            }
-        })),
-        signature: None,
-        publisher_key: None,
-    }
+    toml::from_str(include_str!(
+        "fixtures/channel-fixture/plugin-manifest.toml"
+    ))
+    .expect("parse canonical channel fixture manifest")
 }
 
 type InstanceConfig = HashMap<String, String>;
