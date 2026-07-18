@@ -16411,10 +16411,11 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn passive_context_records_history_without_channel_or_model_side_effects() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
-        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        Box::pin(async {
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+            let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             provider,
@@ -16500,6 +16501,8 @@ BTC is currently around $65,000 based on latest tool output."#
             user_history.contains("[Current WhatsApp group message from alice]"),
             "active group turn should preserve current sender attribution, got: {user_history}"
         );
+        })
+        .await;
     }
 
     #[tokio::test]
