@@ -1515,7 +1515,7 @@ fn apply_channels(
                         usable_quickstart_value(value).map(|value| (key, value))
                     })
                     .collect();
-                fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+                fields.sort_by_key(|(left, _)| *left);
 
                 let mut failed = false;
                 for (key, value) in fields {
