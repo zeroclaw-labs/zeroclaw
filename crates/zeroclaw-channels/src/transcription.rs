@@ -1027,19 +1027,15 @@ impl TranscriptionManager {
                     transcription_providers.insert(dotted, provider);
                 }
                 Err(e) => {
-                    let message = if family == "local_whisper" {
-                        "typed local_whisper config invalid, provider skipped"
-                    } else {
-                        "typed transcription provider skipped (config error)"
-                    };
+                    let config_path = format!("[providers.transcription.{dotted}]");
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "provider": dotted})
+                                ::serde_json::json!({"error": e.to_string(), "config_path": config_path})
                             ),
-                        message
+                        "typed transcription provider skipped (config error)"
                     );
                 }
             }
@@ -1513,46 +1509,39 @@ mod tests {
 
         let assert_events = |entry_point: &str, events: Vec<serde_json::Value>| {
             let expected = [
-                (
-                    "groq.invalid",
-                    "typed transcription provider skipped (config error)",
-                    "[providers.transcription.groq.invalid]",
-                ),
-                (
-                    "openai.invalid",
-                    "typed transcription provider skipped (config error)",
-                    "[providers.transcription.openai.invalid]",
-                ),
+                ("groq.invalid", "[providers.transcription.groq.invalid]"),
+                ("openai.invalid", "[providers.transcription.openai.invalid]"),
                 (
                     "deepgram.invalid",
-                    "typed transcription provider skipped (config error)",
                     "[providers.transcription.deepgram.invalid]",
                 ),
                 (
                     "assemblyai.invalid",
-                    "typed transcription provider skipped (config error)",
                     "[providers.transcription.assemblyai.invalid]",
                 ),
-                (
-                    "google.invalid",
-                    "typed transcription provider skipped (config error)",
-                    "[providers.transcription.google.invalid]",
-                ),
+                ("google.invalid", "[providers.transcription.google.invalid]"),
                 (
                     "local_whisper.invalid",
-                    "typed local_whisper config invalid, provider skipped",
                     "local_whisper: `url` must not be empty",
                 ),
             ];
 
-            for (provider, message, error_fragment) in expected {
+            for (provider, error_fragment) in expected {
+                let config_path = format!("[providers.transcription.{provider}]");
                 let event = events
                     .iter()
-                    .find(|value| value["attributes"]["provider"] == provider)
+                    .find(|value| value["attributes"]["config_path"] == config_path)
                     .unwrap_or_else(|| {
                         panic!("{entry_point} should log a warning for {provider}: {events:?}")
                     });
-                assert_eq!(event["message"], message, "provider: {provider}");
+                assert_eq!(
+                    event["message"], "typed transcription provider skipped (config error)",
+                    "provider: {provider}"
+                );
+                assert!(
+                    event["attributes"].get("provider").is_none(),
+                    "{entry_point} must not emit provider attribution as a call-site attribute: {event}"
+                );
                 assert!(
                     event["attributes"]["error"]
                         .as_str()
