@@ -4537,7 +4537,7 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
-                model_context_window,
+            model_context_window,
         },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
