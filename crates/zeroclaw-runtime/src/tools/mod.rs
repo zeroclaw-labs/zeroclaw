@@ -637,7 +637,7 @@ fn resolved_plugin_egress_policy(
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn plugin_host_services(
+pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
@@ -1600,112 +1600,118 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_path = config.plugins.resolved_plugins_dir();
-
-        if plugin_path.exists() && config.plugins.enabled {
-            let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
-                &config.plugins.security.signature_mode,
-            );
-            let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
-                &plugin_path,
-                signature_mode,
-                trusted_publisher_keys,
-            ) {
+        if config.plugins.enabled && config.plugins.auto_discover {
+            match crate::plugin_runtime::plugin_host(&config) {
                 Ok(host) => {
                     let host = Arc::new(host);
-                    let host_services = plugin_host_services(
-                        Arc::clone(&host),
-                        Arc::clone(&config),
-                        live_config.clone(),
-                    );
-                    let mut details = host.tool_plugin_details();
-                    details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
-                    let discovered_count = details.len();
-                    let mut registered_count = 0_usize;
-                    let mut registered_names: std::collections::HashSet<String> = tool_arcs
-                        .iter()
-                        .map(|tool| tool.name().to_string())
-                        .collect();
-                    if root_config.pipeline.enabled {
-                        registered_names.insert(PipelineTool::NAME.to_string());
-                    }
-                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
-                        call_fuel: config.plugins.limits.call_fuel,
-                        max_memory_bytes: config
-                            .plugins
-                            .limits
-                            .max_memory_mb
-                            .saturating_mul(1024 * 1024),
-                        max_table_elements: config.plugins.limits.max_table_elements,
-                        max_instances: config.plugins.limits.max_instances,
-                    };
-                    for (manifest, component) in details {
-                        let tool = (|| -> anyhow::Result<_> {
-                            let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
-                                manifest,
-                                zeroclaw_plugins::PluginCapability::Tool,
-                                manifest.permissions.iter().copied(),
-                            )?;
-                            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                                component.clone(),
-                                scope,
-                                host_services.clone(),
-                                plugin_limits,
-                            )
-                        })();
-                        match tool {
-                            Ok(tool) => {
-                                if !claim_plugin_tool_name(&mut registered_names, tool.name()) {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Load
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(
-                                            ::serde_json::json!({
-                                                "plugin": manifest.name,
-                                                "tool": tool.name(),
-                                                "error_key": "plugin_tool_name_conflict",
-                                            })
-                                        ),
-                                        "Plugin tool conflicts with an already registered tool"
-                                    );
-                                    continue;
-                                }
-                                tool_arcs.push(Arc::new(tool));
-                                registered_count += 1;
-                            }
-                            Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Load
+                    match crate::plugin_runtime::PluginActivationPlan::build(&config, &host) {
+                        Ok(plan) => {
+                            let mut details = host.tool_plugin_details();
+                            details.sort_unstable_by(|(left, _), (right, _)| {
+                                left.name.cmp(&right.name)
+                            });
+                            let discovered_count = details.len();
+                            let admitted: Vec<_> = details
+                                .into_iter()
+                                .filter_map(|(manifest, component)| {
+                                    plan.scope(
+                                        &manifest.name,
+                                        zeroclaw_plugins::PluginCapability::Tool,
+                                        &manifest.name,
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "plugin": manifest.name,
-                                            "error": format!("{e:#}"),
-                                        })
-                                    ),
-                                    "Failed to register WASM plugin tool"
-                                );
+                                    .map(|scope| (manifest, component, scope))
+                                })
+                                .collect();
+                            let admitted_count = admitted.len();
+                            let host_services = plugin_host_services(
+                                Arc::clone(&host),
+                                Arc::clone(&config),
+                                live_config.clone(),
+                            );
+                            let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
+                            let mut registered_count = 0_usize;
+                            let mut registered_names: std::collections::HashSet<String> = tool_arcs
+                                .iter()
+                                .map(|tool| tool.name().to_string())
+                                .collect();
+                            if root_config.pipeline.enabled {
+                                registered_names.insert(PipelineTool::NAME.to_string());
                             }
+                            for (manifest, component, scope) in admitted {
+                                match zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                                    component.clone(),
+                                    scope,
+                                    host_services.clone(),
+                                    plugin_limits,
+                                ) {
+                                    Ok(tool) => {
+                                        if !claim_plugin_tool_name(
+                                            &mut registered_names,
+                                            tool.name(),
+                                        ) {
+                                            ::zeroclaw_log::record!(
+                                                WARN,
+                                                ::zeroclaw_log::Event::new(
+                                                    module_path!(),
+                                                    ::zeroclaw_log::Action::Load
+                                                )
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                                .with_attrs(::serde_json::json!({
+                                                    "plugin": manifest.name,
+                                                    "tool": tool.name(),
+                                                    "error_key": "plugin_tool_name_conflict",
+                                                })),
+                                                "Plugin tool conflicts with an already registered tool"
+                                            );
+                                            continue;
+                                        }
+                                        tool_arcs.push(Arc::new(tool));
+                                        registered_count += 1;
+                                    }
+                                    Err(e) => {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Load
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "plugin": manifest.name,
+                                                "error": format!("{e:#}"),
+                                            })),
+                                            "Failed to register WASM plugin tool"
+                                        );
+                                    }
+                                }
+                            }
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "discovered": discovered_count,
+                                    "admitted": admitted_count,
+                                    "registered": registered_count,
+                                })),
+                                "Registered WASM plugin tools"
+                            );
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Load
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                                "Failed to admit logical plugin instances"
+                            );
                         }
                     }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "discovered": discovered_count,
-                                "registered": registered_count,
-                            })),
-                        "Registered WASM plugin tools"
-                    );
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -1985,6 +1991,7 @@ const = true
 
         let mut config = test_config(&tmp);
         config.plugins.enabled = true;
+        config.plugins.auto_discover = true;
         config.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
         let security = Arc::new(SecurityPolicy::default());
         let memory: Arc<dyn Memory> = Arc::from(
