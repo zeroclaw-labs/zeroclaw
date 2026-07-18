@@ -452,7 +452,7 @@ jobs:
           set +e
           cargo_log="${RUNNER_TEMP}/cargo-bench.log"
           SECONDS=0
-          cargo bench --no-run --locked 2>&1 | tee "$cargo_log"
+          cargo bench --bench agent_benchmarks --no-run --locked --no-default-features --features agent-runtime 2>&1 | tee "$cargo_log"
           cargo_status=${PIPESTATUS[0]}
           duration_seconds=$SECONDS
           set -e
