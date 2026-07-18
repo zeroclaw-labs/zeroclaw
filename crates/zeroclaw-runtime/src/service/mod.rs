@@ -44,12 +44,6 @@ impl FromStr for InitSystem {
 }
 
 impl InitSystem {
-    /// Resolve auto-detection to a concrete init system
-    ///
-    /// Detection order (deny-by-default):
-    /// 1. `/run/systemd/system` exists → Systemd
-    /// 2. `/run/openrc` exists AND OpenRC binary present → OpenRC
-    /// 3. else → Error (unknown init system)
     #[cfg(target_os = "linux")]
     pub fn resolve(self) -> Result<Self> {
         match self {
@@ -68,7 +62,6 @@ impl InitSystem {
 }
 
 /// Detect the active init system on Linux
-///
 /// Checks for systemd and OpenRC in order, returning the first match.
 /// Returns an error if neither is detected.
 #[cfg(target_os = "linux")]
@@ -688,12 +681,6 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     Ok(())
 }
 
-/// Detect if the executable lives under a Homebrew prefix and return the
-/// corresponding `var/zeroclaw` directory.
-///
-/// Homebrew installs binaries into `<prefix>/Cellar/<formula>/<version>/bin/`
-/// and symlinks them through `<prefix>/bin/` and `<prefix>/opt/<formula>/`.
-/// The canonical `var` directory is `<prefix>/var`.
 pub fn homebrew_var_dir_from_exe(exe: &Path) -> Option<PathBuf> {
     let resolved = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let exe = resolved.as_path();
@@ -1526,12 +1513,6 @@ fn install_windows(config: &Config) -> Result<()> {
         .args(["/Delete", "/TN", task_name, "/F"])
         .output();
 
-    // Run at the invoking user's normal privilege (LIMITED), not HIGHEST.
-    // This is a per-user ONLOGON task driving a user-level daemon; running it
-    // elevated makes the daemon's RPC pipe owned by an elevated token, so a
-    // non-elevated `zerocode` can't connect unless it too is run as admin.
-    // Matching the user's standard token keeps the pipe reachable from the
-    // normal desktop session.
     run_checked(Command::new("schtasks").args([
         "/Create",
         "/TN",

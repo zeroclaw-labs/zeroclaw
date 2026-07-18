@@ -1,7 +1,7 @@
 ---
 type: architecture
 status: accepted
-last-reviewed: 2026-07-04
+last-reviewed: 2026-07-14
 relates-to:
   - docs/book/src/foundations/fnd-002-documentation-standards.md
 ---
@@ -24,21 +24,15 @@ ADR and mark the old one as superseded rather than rewriting history.
 | [ADR-002](./ADR-002-trait-driven-extensibility.md) | accepted | First-party extension surfaces use explicit trait contracts. |
 | [ADR-003](./ADR-003-wasm-plugin-model.md) | superseded by [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | WASM plugins initially used Extism as the execution bridge. |
 | [ADR-004](./ADR-004-tool-shared-state-ownership.md) | accepted | Tool-held shared state follows daemon-owned identity, handle ownership, isolation, and reload rules. |
+| [ADR-005](./ADR-005-pluggable-memory-backends.md) | accepted | Memory storage uses a backend-neutral contract with SQLite as the default. |
+| [ADR-008](./ADR-008-goal-mode-control-plane-and-usage-accounting.md) | accepted | Goal mode uses the durable task control plane and canonical usage ledger. |
 | [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | accepted | WIT components and direct `wasmtime` replace the Extism plugin bridge. |
 
-## Planned Retroactive ADRs
+## Planned Architecture Decisions
 
-[FND-002](../../foundations/fnd-002-documentation-standards.md)
-identifies additional retroactive decisions that still need full ADRs:
+[FND-002](../../foundations/fnd-002-documentation-standards.md) also reserves two implementation-gated roadmap decisions:
 
-- ADR-005: SQLite and Markdown memory backends
-- ADR-006: CLI as the only built-in channel
+- ADR-006: migration from compiled optional channels to runtime plugins
 - ADR-007: Gateway extraction as a separate optional binary
 
-ADR-009 is intentionally present while ADR-005 through ADR-007 remain
-planned because it supersedes the historical ADR-003 plugin bridge. ADR
-numbers do not have to be contiguous; missing entries remain reserved for
-reviewed decision records.
-
-Those entries are intentionally not placeholder files. An ADR should be
-a reviewed decision record, not an empty slot in the sequence.
+ADR-009 is intentionally present because it supersedes the historical ADR-003 plugin bridge. ADR numbers do not have to be contiguous. Planned entries have no placeholder files because an ADR must contain a reviewed decision record.
