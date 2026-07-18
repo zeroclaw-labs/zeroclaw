@@ -43,6 +43,7 @@ fn build_linker(state: &PluginState) -> Result<Linker<PluginState>> {
     let mut options = crate::component::bindings::tool::LinkOptions::default();
     options.plugins_wit_v0(true);
     options.plugins_wit_v0_sockets(state.permission_enabled(PluginPermission::SocketClient));
+    options.plugins_wit_v0_websocket(state.permission_enabled(PluginPermission::WebSocketClient));
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -56,10 +57,10 @@ fn build_linker(state: &PluginState) -> Result<Linker<PluginState>> {
 
 /// Compile and instantiate a tool plugin under one host-issued scope.
 ///
-/// The scope decides whether the store carries an outbound-HTTP context and
-/// whether the linker exposes `wasi:http`; deriving both from the same scope
-/// prevents authority from drifting between instantiation and execution. The
-/// required service bundle resolves canonical live config for that same scope.
+/// The scope decides whether the store/linker expose outbound HTTP, WebSocket,
+/// and socket imports. Deriving them from the same admission prevents authority
+/// from drifting between instantiation and execution. The required service
+/// bundle resolves canonical live config for that same scope.
 pub async fn create_plugin(
     component: &AdmittedComponent,
     scope: &PluginInstanceScope,

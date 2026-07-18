@@ -47,10 +47,10 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and only
-  when the manifest grants `http_client` and that capability adapter explicitly
-  enables its tested HTTP boundary. Tool and channel adapters do; memory does
-  not yet.
+  more. Outbound HTTP, WebSockets, and TCP/TLS/STARTTLS are available only
+  through host-mediated imports, their corresponding manifest grants, and a
+  capability adapter that enables the tested boundary. Tool and channel
+  adapters provide those network surfaces; memory does not yet.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -60,27 +60,26 @@ These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
 - **`logging`, typed config, instance-scoped secrets and durable state,
-  `http_client`, `socket_client`, and host-fed inbound are wired.** Of the
-  permissions a
-  manifest can declare, `config_read` exposes the plugin's own schema-validated
-  public config. A tool or channel schema can designate secrets withheld from
-  public config and resolved in authorized service calls. `state_read` and
-  `state_write` gate encrypted, compare-and-swap state owned by the exact
-  admitted instance. An `http_client` grant is necessary for outbound
-  `wasi:http`, but the capability adapter must also opt into that host surface.
-  Tool and channel adapters opt in; memory intentionally remains HTTP-free.
-  `socket_client` exposes host-mediated TCP, direct TLS, and STARTTLS to tool
-  and channel worlds. Filesystem and memory-access permissions remain inert
-  until their host functions are registered. See Permissions and Host imports
-  below.
+  `http_client`, `websocket_client`, `socket_client`, and host-fed inbound are
+  wired.** Of the permissions a manifest can declare, `config_read` exposes the
+  plugin's own schema-validated public config. A tool or channel schema can
+  designate secrets withheld from public config and resolved in authorized
+  service calls. `state_read` and `state_write` gate encrypted,
+  compare-and-swap state owned by the exact admitted instance. `http_client`
+  grants outbound `wasi:http` when the capability adapter opts in,
+  `websocket_client` exposes a bounded WebSocket resource, and `socket_client`
+  exposes host-mediated TCP, direct TLS, and STARTTLS to tool and channel
+  worlds. Memory intentionally remains network-free. Filesystem and
+  memory-access permissions remain inert until their host functions are
+  registered. See Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open WASI sockets or read host files
-  through ambient WASI. Tool and channel adapters with an `http_client` grant
-  get outbound `wasi:http`; those with `socket_client` can use the typed,
-  host-mediated TCP/TLS/STARTTLS resource described below. Neither can listen.
-  Channel plugins that must receive inbound traffic do not open a listener
-  themselves: the host runs the listener and feeds messages through the
-  `inbound` import, which the plugin drains from its `poll-message` export.
+  through ambient WASI. A granted tool or channel plugin may use outbound
+  `wasi:http`, WebSocket, or TCP/TLS/STARTTLS host resources, but it cannot
+  bypass their shared egress policy or listen. Channel plugins that must
+  receive inbound traffic do not open a listener themselves: the host runs the
+  listener and feeds messages through the `inbound` import, which the plugin
+  drains from its `poll-message` export.
 - **A 32-bit boundary.** The target is `wasm32-wasip2`. Guest memory is a 32-bit
   address space and the component ABI lowers offsets as 32-bit regardless of
   host word size. Large values (for example a channel attachment's raw bytes)
@@ -109,8 +108,9 @@ surface into each world's linker. Per-store host state (`PluginState`) carries a
 requires, its host-issued scope, and typed live service handles. Every world
 imports `logging`; tool imports `secrets`, while channel imports `config`,
 `secrets`, and `inbound`. A granted `http_client` permission additionally
-attaches and links `wasi:http`. Tool and channel stores with an effective
-`socket_client` grant link the typed `sockets` host interface.
+attaches and links `wasi:http`; a granted `websocket_client` permission exposes
+the optional `websocket` resource import, while an effective `socket_client`
+grant links the typed `sockets` host interface in tool and channel worlds.
 The world declarations and the admitted scope remain the canonical contracts
 for that surface (see Host imports).
 
@@ -276,8 +276,8 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read`, `http_client`, `socket_client`, `state_read`, and `state_write`
-have behavioral effect.
+`config_read`, `http_client`, `websocket_client`, `socket_client`, `state_read`,
+and `state_write` have behavioral effect.
 Requesting `config_read` requires a `config_schema`, and declaring that schema
 without the permission is also rejected. Before a tool or channel component is
 used, the host resolves its effective grant, materializes the plugin's operator
@@ -292,22 +292,26 @@ unavailable. `http_client` is a necessary grant, not a complete authority
 decision: the capability adapter must also construct the HTTP context and link
 `wasi:http`. Tool and channel adapters opt in after grant validation. The
 memory adapter deliberately does not, so granting `http_client` to a memory
-scope alone adds no network surface. The state permissions independently gate
-the `state.get` and `state.put`/`delete`
+scope alone adds no network surface. `websocket_client` links a host-owned
+connection resource that uses the shared egress policy, pinned DNS results,
+named TLS profiles, and a shared per-instance connection ceiling. Without the
+corresponding permission, the import is absent from the linker. The state
+permissions independently gate the `state.get` and `state.put`/`delete`
 imports for tool and channel service frames. Package, capability, and binding
 come only from the admitted host scope; a guest supplies no namespace. The
-`socket_client` permission links the host-mediated `sockets` interface for tool and channel
-worlds and applies the shared egress policy at every connect. Other permission
-variants (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted
-by the manifest schema but grant nothing until their host import is wired (see
-Host imports below).
+`socket_client` permission links the host-mediated `sockets` interface for tool
+and channel worlds and applies the shared egress policy at every connect. Other
+permission variants (`file_read`, `file_write`, `memory_read`, `memory_write`)
+are accepted by the manifest schema but grant nothing until their host import
+is wired (see Host imports below).
 
 ## WIT interfaces
 
 The plugin contract is the set of WIT files in `wit/v0/`, package
-`zeroclaw:plugin@0.1.0`. Every item is gated behind
-`@unstable(feature = plugins-wit-v0)` until the package stabilizes. The optional
-socket imports additionally require `plugins-wit-v0-sockets`; see
+`zeroclaw:plugin@0.1.0`. Base-world items are gated behind
+`@unstable(feature = plugins-wit-v0)` until the package stabilizes. Optional
+imports use their own world-level feature gates,
+`plugins-wit-v0-websocket` and `plugins-wit-v0-sockets`; see
 `wit/VERSIONING.md` for the compatibility rules. The interfaces below are
 summarized for orientation; the `.wit` files are authoritative for the exact
 signatures.
@@ -319,7 +323,8 @@ imports `logging` (host) and exports `plugin-info` plus its primary interface:
 `tool-plugin` exports `tool`, `channel-plugin` exports `channel`, and
 `memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
 channel imports `config`, `secrets`, `state`, and `inbound`. Tool and channel
-optionally import `sockets` under `plugins-wit-v0-sockets`. The required
+optionally import `websocket` and `sockets` under their respective feature
+gates when admitted with `websocket_client` or `socket_client`. The required
 (no-default) exports for each world are listed in the world's doc comment in
 its `.wit` file.
 
@@ -375,13 +380,15 @@ instance-scoped `secrets` service. Channel also imports `config` for its typed
 public object and `inbound` for the host-fed message queue it drains from
 `poll-message`. Tool and channel adapters link outbound `wasi:http` only after
 the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
-and `add_wasi_http` in `component.rs`). Tool and channel worlds link `sockets`
-only when the admitted scope grants `socket_client`. Memory withholds both
-network contexts and linker surfaces. The filesystem and memory-access
-permissions remain inert: the host functions that would gate them are not yet
-wired into the linker. A plugin's ambient authority is the WASI context (no
-preopens, no ambient network) plus exactly the host imports its grants and
-adapter opt-ins jointly enable.
+and `add_wasi_http` in `component.rs`). Tool and channel worlds link
+`websocket` or `sockets` only when the admitted scope grants
+`websocket_client` or `socket_client`, respectively. Their availability is
+derived directly from that admitted scope. Memory withholds every network
+context and linker surface. The filesystem and memory-access permissions remain
+inert: the host functions that would gate them are not yet wired into the
+linker. A plugin's ambient authority is the WASI context (no preopens, no
+ambient network) plus exactly the host imports its grants and adapter opt-ins
+jointly enable.
 
 ZeroClaw-owned imports share a fixed safety budget per host-dispatched service
 frame. The canonical ceiling is `MAX_HOST_CALLS_PER_FRAME` in
@@ -408,6 +415,28 @@ downgrade back to plaintext. Direct TLS and STARTTLS both use the host-selected
 named TLS profile, including its custom CA and client identity references. TLS
 material is resolved through the current instance-scoped secret service rather
 than accepted from the guest.
+
+### `websocket`
+
+`wit/v0/websocket.wit` is an optional import in the tool and channel worlds. A
+plugin admitted with `websocket_client` may connect to `ws` or `wss`, add
+non-reserved upgrade headers, offer subprotocols, and exchange complete typed
+text or binary messages through a Component Model `connection` resource.
+Receiving is non-blocking so a warm channel store never holds its mutex while
+waiting on the network.
+
+The guest owns the application protocol. The host owns URL/header validation,
+DNS resolution and pinning, destination and plaintext policy, named TLS
+profiles, the upgrade handshake, fixed message and inbound-frame ceilings,
+bounded queues, timeouts, and cleanup. The adapter consumes the shared egress
+service's per-instance connection budget rather than maintaining a
+protocol-local count. A WebSocket resource retains its budget lease until the
+guest drops it or its Wasmtime store is destroyed, including after a terminal
+event has been drained.
+
+The WIT interface returns stable typed outcomes without exposing resolver, TLS,
+or operating-system error details to guest code. It does not expose a listener:
+inbound platform traffic still enters through the host-owned `inbound` path.
 
 ### `inbound`
 

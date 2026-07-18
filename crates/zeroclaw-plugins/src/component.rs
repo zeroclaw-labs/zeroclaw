@@ -148,10 +148,14 @@ pub mod bindings {
         wasmtime::component::bindgen!({
             world: "tool-plugin",
             path: "../../wit/v0",
-            imports: { default: async },
+            imports: {
+                default: async,
+                "zeroclaw:plugin/websocket": async | trappable,
+            },
             exports: { default: async },
             with: {
                 "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+                "zeroclaw:plugin/websocket.connection": crate::component_websocket::WebSocketConnection,
             },
         });
     }
@@ -159,10 +163,14 @@ pub mod bindings {
         wasmtime::component::bindgen!({
             world: "channel-plugin",
             path: "../../wit/v0",
-            imports: { default: async },
+            imports: {
+                default: async,
+                "zeroclaw:plugin/websocket": async | trappable,
+            },
             exports: { default: async },
             with: {
                 "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+                "zeroclaw:plugin/websocket.connection": crate::component_websocket::WebSocketConnection,
             },
         });
     }
@@ -346,6 +354,17 @@ impl PluginState {
                     property: reference.as_str().to_string(),
                 })
         })
+    }
+
+    /// Existing Wasmtime resource table used for host-owned resources.
+    #[must_use]
+    pub(crate) fn resource_table(&self) -> &ResourceTable {
+        &self.table
+    }
+
+    /// Mutable access to the existing Wasmtime resource table.
+    pub(crate) fn resource_table_mut(&mut self) -> &mut ResourceTable {
+        &mut self.table
     }
 
     /// Charge one ZeroClaw-owned host import against the active call budget.
@@ -1135,6 +1154,11 @@ mod tests {
     fn optional_import_coherence_uses_the_admitted_scope() {
         let granted = new_store(spec([PluginPermission::WebSocketClient], 0));
         assert!(
+            granted
+                .data()
+                .permission_enabled(PluginPermission::WebSocketClient)
+        );
+        assert!(
             ensure_permission_coherent(
                 &granted,
                 PluginPermission::WebSocketClient,
@@ -1149,6 +1173,26 @@ mod tests {
                 PluginPermission::WebSocketClient,
                 "zeroclaw:plugin/websocket",
                 false,
+            )
+            .is_err()
+        );
+
+        let plain = new_store(spec([], 0));
+        assert!(
+            ensure_permission_coherent(
+                &plain,
+                PluginPermission::WebSocketClient,
+                "zeroclaw:plugin/websocket",
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_permission_coherent(
+                &plain,
+                PluginPermission::WebSocketClient,
+                "zeroclaw:plugin/websocket",
+                true,
             )
             .is_err()
         );

@@ -74,6 +74,7 @@ fn build_linker(state: &PluginState) -> Result<Linker<PluginState>> {
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
     options.plugins_wit_v0_sockets(state.permission_enabled(PluginPermission::SocketClient));
+    options.plugins_wit_v0_websocket(state.permission_enabled(PluginPermission::WebSocketClient));
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,

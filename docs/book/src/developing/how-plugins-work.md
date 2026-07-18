@@ -20,9 +20,9 @@ Three properties hold at every layer:
 - **Disabled by default.** The plugin system does not load anything unless
   `[plugins] enabled = true`. A default build with no plugin configuration runs
   no plugin code.
-- **Deny by default.** A plugin reaches a host capability (HTTP egress, config,
-  memory) only by declaring the matching permission in its manifest. An
-  undeclared capability is unreachable, not merely unused.
+- **Deny by default.** A plugin reaches a host capability (HTTP or WebSocket
+  egress, config, memory) only by declaring the matching permission in its
+  manifest. An undeclared capability is unreachable, not merely unused.
 - **Verified by policy.** Whether an unsigned or untrusted plugin loads at all
   is the operator's decision, set once in config and enforced uniformly at
   discovery.
@@ -90,16 +90,17 @@ A manifest declares two separate things, and the distinction matters.
   `memory`, `observer`, or `skill`. A `tool` plugin contributes tools the LLM
   can call.
 - **Permissions** are what host services the plugin's code may reach at runtime:
-  HTTP egress, configuration, memory. A permission the manifest does not declare
-  is a host function the plugin cannot reach.
+  HTTP or WebSocket egress, configuration, memory. A permission the manifest
+  does not declare is a host function the plugin cannot reach.
 
 The host grants permissions narrowly: a permission the manifest does not
 declare is a host function the plugin cannot reach. Config is resolved from a
 host-issued instance identity, so a plugin cannot select another package or
 binding and never reads the raw process environment. `http_client` gates the
-outbound `wasi:http` surface; the shared SSRF-guarded egress policy remains
-companion plugin-hardening work. This page covers the signature-policy
-boundary.
+outbound `wasi:http` surface. `websocket_client` gates a host-mediated resource
+whose DNS-pinned destinations, plaintext exceptions, TLS profiles, and
+connection budget are enforced by the shared egress service. This page covers
+the signature-policy boundary.
 
 ## Configuration reference
 
