@@ -16,6 +16,7 @@ use std::fmt;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "plugins-wasmtime")]
 use std::time::Duration;
 
 use zeroclaw_api::plugin_egress::{OutboundHostPattern, is_valid_tls_profile_name};
@@ -32,6 +33,7 @@ use crate::instance::{PluginInstanceId, PluginInstanceScope};
 /// This is host policy rather than operator configuration. Keeping it beside
 /// the shared authorization boundary prevents transport adapters from drifting
 /// to different connection budgets.
+#[cfg(feature = "plugins-wasmtime")]
 pub(crate) const EGRESS_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Protocol family and confidentiality mode requested by a plugin adapter.
