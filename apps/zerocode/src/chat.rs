@@ -5607,7 +5607,7 @@ impl ChatState {
         {
             // Clean completion with no streamed text, no tool calls, and
             // no final content — render a diagnostic so the user knows the
-            // turn finished rather than silently vanishing (#8644).
+            // turn finished rather than silently vanishing.
             self.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
                     "zc-turn-no-output",
@@ -7901,7 +7901,7 @@ mod tests {
 
     /// When a turn completes with no streamed text, no tool calls, and no
     /// final content, commit_turn must render a diagnostic system message
-    /// so the user knows the turn finished (#8644).
+    /// so the user knows the turn finished.
     #[test]
     fn commit_turn_shows_diagnostic_when_no_output_at_all() {
         let mut s = state();
