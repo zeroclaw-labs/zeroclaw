@@ -28,7 +28,11 @@ impl Attributable for WasmTool {
     }
 
     fn alias(&self) -> &str {
-        self.scope.id().binding()
+        // `Role::Tool` writes this value to the canonical `tool` attribution
+        // field. Keep it aligned with the callable export; package/capability/
+        // binding identity remains on the host-issued scope and is emitted by
+        // component logging under distinct plugin attributes.
+        &self.name
     }
 }
 
@@ -134,14 +138,14 @@ mod tests {
     use super::*;
 
     fn tool_scope() -> PluginInstanceScope {
-        crate::instance::test_scope(PluginCapability::Tool, "main", [])
+        crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
     }
 
     #[test]
-    fn new_exposes_metadata_via_tool_accessors() {
+    fn tool_attribution_keeps_callable_and_instance_identities_distinct() {
         let schema = serde_json::json!({"type": "object", "properties": {}});
         let tool = WasmTool::new(
-            "my_tool".to_string(),
+            "redact".to_string(),
             "does things".to_string(),
             schema.clone(),
             PathBuf::from("/tmp/plugin.wasm"),
@@ -150,10 +154,13 @@ mod tests {
             crate::component::test_limits(1_000),
         )
         .expect("tool scope matches adapter");
-        assert_eq!(tool.name(), "my_tool");
+        assert_eq!(tool.name(), "redact");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
-        assert_eq!(tool.alias(), "main");
+        assert_eq!(tool.alias(), "redact");
+        assert_eq!(tool.scope.id().package(), "fixture");
+        assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
+        assert_eq!(tool.scope.id().binding(), "redaction-primary");
     }
 
     #[test]
