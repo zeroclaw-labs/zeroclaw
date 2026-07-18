@@ -25706,8 +25706,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_memory_recall_difference_keeps_system_byte_identical() {
+    async fn assert_memory_recall_difference_keeps_system_byte_identical() {
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
 
         struct QueryAwareMemory;
@@ -25855,6 +25854,25 @@ BTC is currently around $65,000 based on latest tool output."#
             "second turn current user content: {}",
             last_user_turn_1.1
         );
+    }
+
+    #[test]
+    fn process_channel_message_memory_recall_difference_keeps_system_byte_identical() {
+        std::thread::Builder::new()
+            .name("memory-recall-cache-stability".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("memory-recall cache stability runtime should build")
+                    .block_on(Box::pin(
+                        assert_memory_recall_difference_keeps_system_byte_identical(),
+                    ));
+            })
+            .expect("memory-recall cache stability test thread should start")
+            .join()
+            .expect("memory-recall cache stability test thread should complete");
     }
 
     #[tokio::test]
