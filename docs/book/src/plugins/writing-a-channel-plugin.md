@@ -16,10 +16,11 @@ checked against `wit/v0/channel.wit` and the host adapter in
 > **Wiring status.** The host side of channel plugins is complete and
 > unit-covered: `WasmChannel` implements the runtime's `Channel` trait, and
 > `PluginHost::channel_plugin_details()` exposes discovered channel plugins.
-> The remaining seam is orchestrator registration plus the per-vendor host
-> listener; until that lands, a channel plugin loads and passes its contract
-> tests but is not yet constructed by a running daemon. Build against the
-> contract now; the contract is what freezes.
+> The daemon now constructs explicit, enabled `[channels.plugin.<alias>]`
+> bindings owned by enabled agents and supervises them through the shared
+> channel lifecycle. A push/webhook integration still needs a host-owned
+> ingress producer to enqueue vendor traffic; the WASM guest cannot open its
+> own listener.
 
 ## The lifecycle
 
@@ -298,7 +299,10 @@ channels = ["plugin.primary"]
 `channels.plugin.primary` owns only package selection and activation. Put all
 schema values, including secret properties, in the `plugins.entries` row for
 the host-derived `PluginInstanceId`; do not duplicate them in the channel
-declaration.
+declaration. Explicit channel bindings are eligible even when
+`plugins.auto_discover = false`; that switch controls package-scoped tool and
+skill discovery. The binding still requires `plugins.enabled = true`, its own
+`enabled = true`, and an enabled agent that owns `plugin.primary`.
 
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view

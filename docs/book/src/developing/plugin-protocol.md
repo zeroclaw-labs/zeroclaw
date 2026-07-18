@@ -127,14 +127,23 @@ Tool plugins are discovered and registered end to end: the runtime walks
 The channel host adapter (`WasmChannel`, its `wasi:http` gating, point-of-use
 config services, and host-fed `inbound` queue) is complete and unit-covered, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
-to register. Wiring those into the live orchestrator (the discovery-to-channel
-loop in the runtime, plus a per-vendor host listener that drains its transport
-into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice. The memory bridge
-(`WasmMemory`) is in the same position one step earlier: the adapter implements
-the full `Memory` trait against the `memory-plugin` world, but the host does not
-yet expose a memory counterpart to `channel_plugin_details()` and the runtime
-does not yet construct a `WasmMemory` as a configurable backend.
+to register. The runtime admits enabled `[channels.plugin.<alias>]` declarations
+owned by enabled agents, constructs them from the exact component bytes admitted
+by the host, and supervises them in the ordinary channel listener lifecycle.
+Explicit channel declarations do not require `plugins.auto_discover`; that flag
+controls package-scoped tool and skill discovery. One deterministic
+`plugins.max_active_instances` decision covers all three logical capability
+types, with explicit channels admitted before auto-discovered candidates.
+
+The generic host-owned ingress producer that feeds a channel's `inbound` queue
+is a separate transport boundary. A push/webhook plugin cannot open its own
+listener, so receiving real vendor traffic still requires a host ingress
+adapter; registration alone provides the supervised channel lifecycle, outbound
+calls, and queue drain. The memory bridge (`WasmMemory`) is one step earlier:
+the adapter implements the full `Memory` trait against the `memory-plugin`
+world, but the host does not yet expose a memory counterpart to
+`channel_plugin_details()` and the runtime does not yet construct a
+`WasmMemory` as a configurable backend.
 
 ## Plugin structure
 

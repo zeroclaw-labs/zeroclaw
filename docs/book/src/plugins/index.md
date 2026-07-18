@@ -156,9 +156,9 @@ not yet reachable from a running daemon:
 
 | Capability | Host adapter | Runtime wiring |
 |------------|--------------|----------------|
-| `tool` | `WasmTool` | Registered end to end; discovered tool plugins appear in the agent's tool set |
-| `skill` | markdown loader | Registered end to end; skills load namespaced as `plugin:<plugin>/<skill>` |
-| `channel` | `WasmChannel`, complete and unit-covered | Orchestrator registration and the per-vendor host listener are the remaining seam |
+| `tool` | `WasmTool` | Package-scoped instances are admitted when `plugins.auto_discover = true` and appear in the agent's tool set |
+| `skill` | markdown loader | Package-scoped instances are admitted when `plugins.auto_discover = true`; skills load namespaced as `plugin:<plugin>/<skill>` |
+| `channel` | `WasmChannel`, complete and unit-covered | Explicit, enabled, agent-owned bindings are constructed and supervised; push/webhook traffic still needs a host-owned ingress producer |
 | `memory` | `WasmMemory`, implements the full `Memory` trait | The runtime does not yet construct it as a configurable backend |
 | `observer` | none | `PluginCapability::Observer` is reserved; no WIT world or adapter exists yet |
 
@@ -179,6 +179,9 @@ zeroclaw config set plugins.enabled true
 
 # where plugins are discovered (default: ~/.zeroclaw/plugins)
 zeroclaw config set plugins.plugins_dir /srv/zeroclaw/plugins
+
+# admit package-scoped tool and skill plugins on startup
+zeroclaw config set plugins.auto_discover true
 
 # signature policy: disabled | permissive | strict
 zeroclaw config set plugins.security.signature_mode strict
@@ -205,7 +208,9 @@ channels = ["plugin.operations"]
 
 The host derives the channel instance key from `my-platform`, the `channel`
 capability, and `operations`; the declaration never copies credentials or
-other plugin values. Full-identity keys let different packages and capability
+other plugin values. This explicit channel binding is eligible even when
+`plugins.auto_discover = false`; it must be enabled and owned by an enabled
+agent. Full-identity keys let different packages and capability
 worlds safely reuse aliases such as `main` without sharing credentials. The
 canonical operator values are a secret-marked string map and remain encrypted
 at rest (`enc2:…`). A plugin that requests `config_read`
