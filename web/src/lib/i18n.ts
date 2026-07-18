@@ -462,6 +462,33 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   en: {
+    // Plugin package catalog
+    'nav.plugins': "Plugins",
+    'plugins.title': "Plugins",
+    'plugins.subtitle': "Installed packages and packages available in the cached registry.",
+    'plugins.loading': "Loading plugin catalog…",
+    'plugins.load_error': "Failed to load plugin catalog",
+    'plugins.system_enabled': "Plugin execution enabled",
+    'plugins.system_disabled': "Plugin execution disabled",
+    'plugins.system_unavailable': "WASM plugins unavailable",
+    'plugins.wasm_unavailable_hint': "This gateway build does not include WASM plugin support. The catalog endpoint remains available so clients can distinguish this build limitation from an empty installation.",
+    'plugins.partial_title': "Some catalog sources could not be read",
+    'plugins.issue.discovery_failed': "Installed plugin discovery failed. See gateway logs for details.",
+    'plugins.issue.registry_cache_failed': "The cached plugin registry could not be read. See gateway logs for details.",
+    'plugins.issue.unknown': "An unknown catalog source error occurred.",
+    'plugins.filter_label': "Filter plugin packages",
+    'plugins.filter.all': "All",
+    'plugins.filter.installed': "Installed",
+    'plugins.filter.available': "In registry",
+    'plugins.empty': "No plugin packages match this filter.",
+    'plugins.installed': "Installed",
+    'plugins.registry': "Registry",
+    'plugins.no_description': "No description provided.",
+    'plugins.installed_version': "Installed version",
+    'plugins.registry_version': "Registry version",
+    'plugins.capabilities': "Capabilities",
+    'plugins.permissions': "Requested permissions",
+    'plugins.install_source': "Package identity",
     // ── i18n sweep: keys added by the conversion workflow ──
     // Self-review follow-ups: singular forms for Doctor severity pills + the
     // relative-time suffixes used by lib/format.ts formatRelative.
