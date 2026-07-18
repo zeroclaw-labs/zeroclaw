@@ -173,7 +173,7 @@ md5 = { version = "0.8", optional = true }
 # Inkbox channel (optional). Published Rust SDK from crates.io;
 # `tunnels-runtime` pulls in the HTTP/2 reverse-proxy data plane that delivers
 # inbound webhooks + call media over the Inkbox tunnel.
-inkbox = { version = "=0.4.22", default-features = false, features = [
+inkbox = { version = ">=0.4.24, <1.0.0", default-features = false, features = [
   "tunnels-runtime",
 ], optional = true }
 # GitHub App channel - RS256 JWT signing for app authentication. The
