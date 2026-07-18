@@ -946,7 +946,6 @@ jobs:
     uses: ./.github/workflows/docker-publish.yml
     with:
       release_ref: ${{ needs.validate.outputs.tag }}
-    secrets: inherit
     permissions:
       contents: read
       packages: write

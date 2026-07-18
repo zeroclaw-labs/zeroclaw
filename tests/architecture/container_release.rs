@@ -39,7 +39,6 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
         "needs.docker.result == 'success'",
         "uses: ./.github/workflows/docker-publish.yml",
         "release_ref: ${{ needs.validate.outputs.tag }}",
-        "secrets: inherit",
         "contents: read",
         "packages: write",
         "id-token: write",
@@ -50,6 +49,10 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
             "Docker matrix call is missing release invariant: {required}"
         );
     }
+    assert!(
+        !matrix_job.contains("secrets: inherit"),
+        "Docker matrix call must not inherit unrelated release secrets"
+    );
 
     let publisher = workflow("docker-publish.yml");
     assert!(
