@@ -518,6 +518,58 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn plugin_config_values(
+    config: &Config,
+    instance_key: &str,
+    package: &str,
+) -> Result<Option<HashMap<String, String>>, zeroclaw_plugins::error::PluginError> {
+    config
+        .plugins
+        .entry_config(instance_key)
+        .map(|configured| configured.cloned())
+        .map_err(|_| {
+            zeroclaw_plugins::error::PluginError::InvalidConfig(format!(
+                "plugin '{package}' has duplicate config entries for its instance key"
+            ))
+        })
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_config_resolver(
+    host: Arc<zeroclaw_plugins::host::PluginHost>,
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> zeroclaw_plugins::config::PluginConfigResolver {
+    // A live daemon handle and a fallback snapshot are mutually exclusive in
+    // the long-lived service, so the resolver never retains two config sources.
+    let fallback_config = live_config.is_none().then_some(config);
+    zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
+        let package = scope.id().package();
+        let config_entry_key = scope.id().config_entry_key()?;
+        let manifest = host
+            .manifest(package)
+            .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
+        if let Some(live_config) = &live_config {
+            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                // Transient per-call view: schema/grant checks happen before
+                // this access, and the global lock is released before guest
+                // setup.
+                plugin_config_values(&live_config.read(), &config_entry_key, package)
+            })
+        } else {
+            let config = fallback_config.as_ref().ok_or_else(|| {
+                zeroclaw_plugins::error::PluginError::InvalidConfig(
+                    "plugin config source is unavailable".to_string(),
+                )
+            })?;
+            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                plugin_config_values(config, &config_entry_key, package)
+            })
+        }
+    })
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(
     clippy::implicit_hasher,
@@ -1454,8 +1506,15 @@ pub fn all_tools_with_runtime(
                 trusted_publisher_keys,
             ) {
                 Ok(host) => {
+                    let host = Arc::new(host);
+                    let config_resolver = plugin_config_resolver(
+                        Arc::clone(&host),
+                        Arc::clone(&config),
+                        live_config.clone(),
+                    );
                     let details = host.tool_plugin_details();
-                    let count = details.len();
+                    let discovered_count = details.len();
+                    let mut registered_count = 0_usize;
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1467,25 +1526,51 @@ pub fn all_tools_with_runtime(
                         max_instances: config.plugins.limits.max_instances,
                     };
                     for (manifest, wasm_path) in details {
-                        let plugin_config = config
-                            .plugins
-                            .entry_config(&manifest.name)
-                            .cloned()
-                            .unwrap_or_default();
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                            wasm_path.to_path_buf(),
-                            manifest.permissions.clone(),
-                            manifest.name.clone(),
-                            manifest.description.clone().unwrap_or_default(),
-                            plugin_config,
-                            plugin_limits,
-                        )));
+                        let tool = (|| -> anyhow::Result<_> {
+                            let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
+                                manifest,
+                                zeroclaw_plugins::PluginCapability::Tool,
+                                manifest.permissions.iter().copied(),
+                            )?;
+                            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                                wasm_path.to_path_buf(),
+                                scope,
+                                config_resolver.clone(),
+                                plugin_limits,
+                            )
+                        })();
+                        match tool {
+                            Ok(tool) => {
+                                tool_arcs.push(Arc::new(tool));
+                                registered_count += 1;
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Load
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": manifest.name,
+                                            "error": format!("{e:#}"),
+                                        })
+                                    ),
+                                    "Failed to register WASM plugin tool"
+                                );
+                            }
+                        }
                     }
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
-                        "Loaded  WASM plugin tools"
+                            .with_attrs(::serde_json::json!({
+                                "discovered": discovered_count,
+                                "registered": registered_count,
+                            })),
+                        "Registered WASM plugin tools"
                     );
                 }
                 Err(e) => {
@@ -1572,11 +1657,152 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_config_service_uses_live_instance_owned_values() {
+        let plugins_dir = TempDir::new().unwrap();
+        let plugin_dir = plugins_dir.path().join("fixture-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"name = "fixture-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+required = ["enabled"]
+additionalProperties = false
+
+[config_schema.properties.enabled]
+type = "boolean"
+const = true
+"#,
+        )
+        .unwrap();
+        let host = Arc::new(
+            zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins_dir.path()).unwrap(),
+        );
+        let manifest = host.manifest("fixture-plugin").unwrap();
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            "work",
+            [zeroclaw_plugins::PluginPermission::ConfigRead],
+        )
+        .unwrap();
+        let instance_key = scope.id().config_entry_key().unwrap();
+        let entry = |name: &str, enabled: &str| zeroclaw_config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
+        };
+        let mut snapshot = Config::default();
+        snapshot.plugins.entries = vec![entry(&instance_key, "false")];
+        let mut current = Config::default();
+        current.plugins.entries = vec![
+            entry("fixture-plugin", "true"),
+            entry("work", "true"),
+            entry(&instance_key, "true"),
+        ];
+        let live = Arc::new(parking_lot::RwLock::new(current));
+        let resolver = plugin_config_resolver(
+            Arc::clone(&host),
+            Arc::new(snapshot),
+            Some(Arc::clone(&live)),
+        );
+
+        assert!(resolver.resolve(&scope).is_ok());
+        live.write()
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == instance_key)
+            .unwrap()
+            .config
+            .insert("enabled".to_string(), "false".to_string());
+        assert!(
+            resolver.resolve(&scope).is_err(),
+            "a raw package or binding entry must not bypass the canonical key"
+        );
+        live.write()
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == instance_key)
+            .unwrap()
+            .config
+            .insert("enabled".to_string(), "true".to_string());
+        assert!(resolver.resolve(&scope).is_ok());
+    }
+
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn component_with_failed_metadata_probe_is_not_registered() {
+        let tmp = TempDir::new().unwrap();
+        let package_dir = tmp.path().join("plugins").join("metadata-probe");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            "name = \"metadata-probe\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), b"not a component").unwrap();
+
+        let mut config = test_config(&tmp);
+        config.plugins.enabled = true;
+        config.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
+        let security = Arc::new(SecurityPolicy::default());
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "markdown".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+
+        let tools = all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            memory,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        assert!(
+            tools.iter().all(|tool| tool.name() != "metadata-probe"),
+            "a component whose required metadata probe fails must not receive manifest fallback metadata"
+        );
     }
 
     #[test]

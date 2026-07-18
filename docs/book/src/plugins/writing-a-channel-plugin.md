@@ -34,11 +34,12 @@ ways, and each drives a design decision in your code:
    fuel budget per call rather than draining over its lifetime.
 2. **Configuration arrives before anything else.** The host calls your
    `configure` export exactly once, at load, before any other call. The
-   argument is a JSON object of your channel's resolved settings, secrets
-   already decrypted, supplied only when the manifest grants `config_read`
-   (otherwise you receive `{}`, per `resolve_configure_json` in
-   `wasm_channel.rs`). Parse it, validate it, store it in your component's
-   state; return an error string to fail the load if the config is unusable.
+   argument is the typed JSON object materialized and validated against your
+   manifest's `config_schema`, with secrets already decrypted. If the requested
+   `config_read` grant is denied, the host validates `{}` instead; an optional
+   schema receives that object, while required fields make construction fail
+   before guest code runs. Deserialize the object into a typed config struct
+   and store it in your component's state.
 3. **You do not listen; the host feeds you.** The WASI context has no network
    listener capability. Inbound traffic reaches you through the imported
    `inbound` interface: the host runs the actual listener (webhook server,
@@ -54,7 +55,7 @@ Five functions have no Rust trait default and must genuinely work
 | Export | Contract |
 |--------|----------|
 | `name` | Human-readable channel name. |
-| `configure` | Receive the resolved config JSON once at load; error string fails the load. |
+| `configure` | Receive the schema-validated, typed config JSON once at load; deserialize it into guest state. An error string fails the load. |
 | `send` | Deliver a `send-message` (content, recipient, optional subject/thread/attachments) to the platform. |
 | `poll-message` | Non-blocking: return the next inbound message or `none` immediately. Never block; the host's poll bridge handles pacing. |
 | `get-channel-capabilities` | Return the bitmask of optional methods you actually implement. Called once at load. |
@@ -114,14 +115,16 @@ auto-deny. Fail closed.
 
 ## Inbound message shape
 
-Translate platform events into `inbound-message` records faithfully; the
-runtime's session and threading logic keys off these fields
+Translate platform events into `inbound-message` records faithfully. The
+runtime's threading logic keys off the platform payload fields, while routing
+identity comes only from the host-issued endpoint
 (`channel.wit`, `from_wit_inbound` in `wasm_channel.rs`):
 
 - `id`, `sender`, `content`: the basics. `reply-target` is where a response
   should go (channel ID, chat ID, email address).
-- `channel` is the platform type identifier; `channel-alias` distinguishes
-  multiple bot instances of the same platform and feeds distinct session IDs.
+- `channel` and `channel-alias` are legacy hints retained in the v0 record. The
+  host ignores both for routing and stamps the admitted channel type and
+  configured binding, so a plugin cannot select another owner or session.
 - `thread-ts` carries the platform's thread identifier for threaded replies;
   `subject` exists for email threading.
 - `interruption-scope-id` groups messages for interruption/cancellation.
@@ -158,9 +161,22 @@ mod component {
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::inbound::inbound_poll;
 
-    struct State {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ChannelConfig {
         api_token: String,
+        #[serde(default)]
         default_recipient: Option<String>,
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u64,
+    }
+
+    fn default_timeout_secs() -> u64 {
+        10
+    }
+
+    struct State {
+        config: ChannelConfig,
     }
 
     // One warm instance per plugin: interior mutability holds parsed config.
@@ -176,19 +192,10 @@ mod component {
         }
 
         fn configure(config: String) -> Result<(), String> {
-            let parsed: serde_json::Value = serde_json::from_str(&config)
+            let parsed: ChannelConfig = serde_json::from_str(&config)
                 .map_err(|e| format!("invalid config JSON: {e}"))?;
-            let token = parsed["api_token"]
-                .as_str()
-                .ok_or("api_token is required")?
-                .to_string();
             STATE.with(|s| {
-                *s.borrow_mut() = Some(State {
-                    api_token: token,
-                    default_recipient: parsed["default_recipient"]
-                        .as_str()
-                        .map(str::to_string),
-                });
+                *s.borrow_mut() = Some(State { config: parsed });
             });
             Ok(())
         }
@@ -231,9 +238,48 @@ for wit-bindgen guests.
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
 For a channel: `capabilities` containing `channel`, and almost certainly both
-`config_read` (no platform works without credentials) and `http_client` (the
-outbound `wasi:http` surface is the only network you have; without the
-permission, `send` has no way to reach the platform at all).
+`config_read` (no platform works without credentials) and `http_client`. The
+channel adapter implements outbound `wasi:http`, but links it only after that
+grant is validated; without both pieces, `send` has no network path to the
+platform.
+
+Pair `config_read` with the schema consumed by `ChannelConfig`:
+
+```toml
+name = "my-platform"
+version = "0.1.0"
+wasm_path = "my_platform.wasm"
+capabilities = ["channel"]
+permissions = ["config_read", "http_client"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["api_token"]
+
+[config_schema.properties.api_token]
+type = "string"
+minLength = 1
+
+[config_schema.properties.default_recipient]
+type = "string"
+
+[config_schema.properties.timeout_secs]
+type = "integer"
+minimum = 1
+maximum = 120
+```
+
+The operator still stores `timeout_secs` as the encrypted string `"10"`; the
+host turns it into the JSON integer `10` and enforces the range before
+`configure` runs. Arrays and objects use JSON text in operator storage and
+arrive as real arrays and objects. Because `api_token` is required, withholding
+`config_read` fails closed instead of starting a channel with no credentials.
+Each channel instance selects the `plugins.entries` key derived from its full
+package, `channel` capability, and binding identity while reusing this one
+package-owned schema. Identical aliases in different packages therefore remain
+isolated.
 
 ## Build and install
 
@@ -243,10 +289,10 @@ permission, `send` has no way to reach the platform at all).
 
 ## Testing against the host contract
 
-The host adapter's unit tests in `wasm_channel.rs` are the executable
-specification: they cover the configure jail (a plugin without `config_read`
-receives `{}`, never another channel's secrets), the inbound queue handoff,
-capability-gated dispatch, and poll-health accounting.
+The host adapter and config resolver tests are the executable specification:
+they cover typed materialization and schema validation, the denied-grant empty
+object, the inbound queue handoff, capability-gated dispatch, and poll-health
+accounting.
 
 To run your own component under those exact semantics, write an integration
 test that instantiates it through the real host adapter. `zeroclaw-plugins`
@@ -259,11 +305,12 @@ cargo add --dev zeroclaw-plugins \
   --no-default-features --features plugins-wasm-cranelift
 ```
 
-The test then loads your built component through `WasmChannel::from_wasm`
-with a test config, enqueues onto the `InboundQueue` handle it exposes, and
-asserts your `poll-message` drains and translates the message. That is the
-same code path a production daemon will run; passing it is the strongest
-pre-distribution signal you can get without a live host.
+The test then loads your built component through `WasmChannel::from_wasm` with
+a `PluginConfigResolver` backed by the manifest and test operator values,
+enqueues onto the `InboundQueue` handle it exposes, and asserts your
+`poll-message` drains and translates the message. That is the same code path a
+production daemon will run; passing it is the strongest pre-distribution signal
+you can get without a live host.
 
 ## Next
 
