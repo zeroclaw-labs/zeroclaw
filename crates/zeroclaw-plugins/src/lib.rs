@@ -16,6 +16,7 @@ pub mod config;
 pub mod egress;
 pub mod endpoint;
 pub mod error;
+pub mod event;
 pub mod host;
 pub mod instance;
 pub mod registry;
