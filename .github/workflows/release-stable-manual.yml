@@ -202,7 +202,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # 90 min: the x86_64-apple-darwin leg needs ~45-50 min on GitHub's slower
+    # Intel macOS runners (v0.8.3 hit the old 40-min ceiling twice, killing the
+    # cache save each time and compounding the slowdown). Fast legs are
+    # unaffected; this is a ceiling, not an allocation.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -237,7 +241,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: ubuntu-22.04
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
@@ -245,7 +248,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -311,16 +313,11 @@ jobs:
           fi
           # Resolve the feature set from the canonical registry
           # (`cargo generate features`), the single source of truth that
-          # install.sh and packaging surfaces also consume. `dist` is the
-          # full-channel, no-heavyweight distribution set; it is self-contained
-          # (carries the default leaves), so every target builds with
-          # --no-default-features against the explicit list, no implicit drift.
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist)"
-          # skip_prometheus targets (ARMv6/ARMv7) drop observability-prometheus,
-          # which pulls a backtrace path that segfaults on those devices.
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            FEATURES="$(printf '%s' "$FEATURES" | tr ',' '\n' | grep -vx 'observability-prometheus' | paste -sd,)"
-          fi
+          # install.sh and packaging surfaces also consume. `dist` is the lean
+          # standard distribution set and carries the default leaves, so every
+          # target builds with --no-default-features against the explicit list,
+          # with no implicit feature drift.
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           # MUSL targets build via cross-rs (cross-compiled in a container);
           # all other targets use the host cargo toolchain directly.
@@ -340,7 +337,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB cap for standard release builds
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -379,13 +376,18 @@ jobs:
 
   build-desktop:
     name: Build Desktop App (macOS Universal)
-    needs: [validate]
+    needs: [validate, web]
     runs-on: macos-14
     # Two kernel release builds (arm64 + x86_64) feed the universal sidecar,
     # then the universal app build on top.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
@@ -416,7 +418,69 @@ jobs:
           echo "Tauri version set to: $VERSION"
 
       - name: Stage bundled kernel sidecar (universal)
-        run: scripts/desktop/prepare-kernel.sh --target universal-apple-darwin
+        run: scripts/desktop/prepare-kernel.sh --target universal-apple-darwin --features embedded-web
+
+      - name: Smoke test embedded dashboard from an empty directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel="$GITHUB_WORKSPACE/apps/tauri/binaries/zeroclaw-universal-apple-darwin"
+          smoke_root="$RUNNER_TEMP/zeroclaw-desktop-smoke"
+          smoke_cwd="$smoke_root/cwd"
+          smoke_home="$smoke_root/home"
+          xdg_data_home="$smoke_root/xdg-data"
+          config_dir="$smoke_root/config"
+          daemon_log="$smoke_root/daemon.log"
+          host="127.0.0.1"
+          port="42618"
+          origin="http://$host:$port"
+          rm -rf "$smoke_root"
+          mkdir -p "$smoke_cwd" "$smoke_home" "$xdg_data_home" "$config_dir"
+
+          daemon_pid=""
+          cleanup() {
+            exit_code=$?
+            if [[ -n "$daemon_pid" ]]; then
+              kill "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+            fi
+            if [[ "$exit_code" -ne 0 ]]; then
+              echo "::group::Embedded dashboard daemon log"
+              cat "$daemon_log" || true
+              echo "::endgroup::"
+            fi
+            exit "$exit_code"
+          }
+          trap cleanup EXIT
+
+          cd "$smoke_cwd"
+          HOME="$smoke_home" XDG_DATA_HOME="$xdg_data_home" \
+            "$kernel" --config-dir "$config_dir" daemon \
+            --host "$host" --port "$port" >"$daemon_log" 2>&1 &
+          daemon_pid=$!
+
+          dashboard=""
+          ready=false
+          for _ in {1..60}; do
+            if dashboard="$(curl --fail --silent --connect-timeout 1 --max-time 2 "$origin/")"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              echo "::error::Embedded dashboard daemon exited before serving the SPA."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [[ "$ready" != true ]]; then
+            echo "::error::Embedded dashboard did not become ready within 60 seconds."
+            exit 1
+          fi
+          if ! grep -Fq 'id="root"' <<<"$dashboard"; then
+            echo "::error::Gateway root did not return the embedded dashboard."
+            exit 1
+          fi
 
       # Code-signing + notarization are optional: when the APPLE_* secrets are
       # configured the Tauri bundler picks them up from the environment and
@@ -717,7 +781,7 @@ jobs:
               --source-digest "$GITHUB_SHA" \
               --bundle "$tmp_dir/$target" \
               --custom-trusted-root "$tmp_dir/trusted_root.jsonl"
-            printf '`%s` | `%s` | `%s`\n' "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+            printf "\`%s\` | \`%s\` | \`%s\`\n" "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
             bundle_count=$((bundle_count + 1))
           done
 
@@ -726,7 +790,7 @@ jobs:
           mv "$tmp_dir"/* .
 
           echo "--- Attestation bundles ---"
-          ls -lh *.attestation.jsonl trusted_root.jsonl ATTESTATION-BUNDLES.md
+          ls -lh ./*.attestation.jsonl ./trusted_root.jsonl ./ATTESTATION-BUNDLES.md
 
       - name: Write release notes
         env:
@@ -749,27 +813,27 @@ jobs:
           Release artifacts have GitHub artifact provenance attestations.
 
           **Online**
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
             --source-digest ${SOURCE_DIGEST}
-          ```
+          \`\`\`
           VERIFY_EOF
 
             if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
               cat >> release-notes.md <<VERIFY_EOF
 
           **Offline**
-          Download `<artifact>`, `<artifact>.attestation.jsonl`, and `trusted_root.jsonl` from the release assets, then run:
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
-            --source-digest ${SOURCE_DIGEST} \
-            --bundle <artifact>.attestation.jsonl \
+          Download \`<artifact>\`, \`<artifact>.attestation.jsonl\`, and \`trusted_root.jsonl\` from the release assets, then run:
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
+            --source-digest ${SOURCE_DIGEST} \\
+            --bundle <artifact>.attestation.jsonl \\
             --custom-trusted-root trusted_root.jsonl
-          ```
+          \`\`\`
           VERIFY_EOF
             else
               cat >> release-notes.md <<VERIFY_EOF
@@ -835,6 +899,45 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
             -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
+
+  deploy-docs:
+    name: Deploy Versioned Docs
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # workflow_dispatch of docs-deploy.yml
+      contents: read
+    steps:
+      # The release tag (needs.validate.outputs.tag) is created by the publish
+      # job via `gh release create` using GITHUB_TOKEN. GitHub does NOT fire
+      # another workflow run from a GITHUB_TOKEN-created tag push
+      # (https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow),
+      # so docs-deploy.yml's `tags: [v*]` trigger never sees this tag. Dispatch
+      # it explicitly instead: workflow_dispatch IS the documented exception
+      # that runs even when invoked with GITHUB_TOKEN. docs-deploy checks out the
+      # tag input internally and builds /<tag>/ on gh-pages.
+      #
+      # Ordering: the version-bump PR merges BEFORE Release Stable runs, so its
+      # `master` docs deploy normally runs first, while /<tag>/ does not yet
+      # exist; that master deploy therefore defers the stable-pointer flip by
+      # design (see docs-deploy.yml). This job then creates /<tag>/, and a LATER
+      # `master` deploy publishes the flip once /<tag>/ is live. This step only
+      # DISPATCHES the tag build; a green job here means the dispatch was
+      # accepted, not that the downstream docs run finished. To advance the
+      # stable pointer after /<tag>/ is live, re-run docs-deploy.yml with
+      # tag=master (see the release runbook, Step 7).
+      - name: Dispatch docs-deploy for the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching docs-deploy.yml for ${TAG} (ref master)..."
+          gh workflow run docs-deploy.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f tag="$TAG"
 
   docker:
     name: Push Docker Image

@@ -51,11 +51,6 @@ enum MessageContent {
     Parts(Vec<MessagePart>),
 }
 
-/// Marker placed on a content block to opt it into OpenRouter prompt caching.
-///
-/// Currently only `{"type": "ephemeral"}` is defined. OpenRouter forwards this
-/// field to upstream providers that support prompt caching (Anthropic,
-/// DeepSeek, Qwen). Providers without caching ignore the marker.
 #[derive(Debug, Serialize)]
 struct CacheControl {
     #[serde(rename = "type")]
@@ -138,7 +133,7 @@ struct NativeToolFunctionSpec {
     name: String,
     description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
-    /// transparently, never deep-cloned per request (#8642).
+    /// transparently, never deep-cloned per request
     parameters: Arc<serde_json::Value>,
 }
 
@@ -350,13 +345,6 @@ impl OpenRouterModelProvider {
 
     fn to_message_content(role: &str, content: &str) -> MessageContent {
         if role == "system" {
-            // Serialize system messages as a single-text-part array so we can
-            // attach `cache_control: {"type": "ephemeral"}`. OpenRouter forwards
-            // this marker to upstream providers that support prompt caching
-            // (Anthropic, DeepSeek, Qwen); providers without caching ignore
-            // the field. The wire shape is identical to a plain-string system
-            // message for ignoring providers, so this is safe across the
-            // provider fleet.
             return MessageContent::Parts(vec![MessagePart::Text {
                 text: content.to_string(),
                 cache_control: Some(CacheControl {
@@ -559,11 +547,6 @@ impl ModelProvider for OpenRouterModelProvider {
     }
 
     async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        // OpenRouter's public `/models` payload carries a `pricing` object per
-        // model. The default trait impl would discard it (delegates to
-        // `list_models` → `pricing: None`); override to surface pricing so the
-        // cost-rates editor can prefill rates for the first-class `openrouter`
-        // slot, matching the OpenAI-compatible vendor-fallback path.
         crate::openrouter_catalog::list_all_models_with_pricing().await
     }
 
@@ -888,13 +871,6 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         });
 
-        // Bind the task's lifetime to the returned stream so dropping the
-        // stream cancels the in-flight HTTP request. Without this guard the
-        // spawned task keeps reading the response body to completion after
-        // the consumer is gone, holding a connection-pool slot and
-        // consuming OpenRouter quota for a request the caller no longer
-        // wants. `AbortHandle::abort` is a no-op if the task has already
-        // finished, so the happy path is unaffected.
         let guard = AbortOnDrop::new(handle.abort_handle());
 
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
@@ -1895,21 +1871,21 @@ mod tests {
         use zeroclaw_api::tool::ToolSpec;
 
         let tools = vec![
-            ToolSpec {
-                name: "valid_tool".into(),
-                description: "A valid tool".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
-            ToolSpec {
-                name: "mcp:server.bad".into(),
-                description: "Invalid name".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
-            ToolSpec {
-                name: "another-valid".into(),
-                description: "Also valid".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new(
+                "valid_tool",
+                "A valid tool",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "mcp:server.bad",
+                "Invalid name",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "another-valid",
+                "Also valid",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -1918,31 +1894,23 @@ mod tests {
         assert_eq!(result[1].function.name, "another-valid");
     }
 
-    /// Regression: skill tools used to be registered with a `.` separator
-    /// (`{skill}.{tool}`), e.g. `openrouter-spend.check_openrouter_spend`.
-    /// That format silently failed `is_valid_openai_tool_name` and got
-    /// dropped from the function-call spec list sent to OpenAI-compatible
-    /// providers, while still appearing in the system prompt — leaving the
-    /// LLM hallucinating "unknown tool" errors. Skill tools now use the
-    /// `__` separator (matching the MCP `<server>__<tool>` convention),
-    /// which passes the validator and survives `convert_tools`.
     #[test]
     fn convert_tools_preserves_skill_namespaced_names_with_double_underscore() {
         use zeroclaw_api::tool::ToolSpec;
 
         let tools = vec![
             // New format — must pass through.
-            ToolSpec {
-                name: "openrouter-spend__check_openrouter_spend".into(),
-                description: "Skill tool".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new(
+                "openrouter-spend__check_openrouter_spend",
+                "Skill tool",
+                serde_json::json!({"type": "object"}),
+            ),
             // Old format — must still be rejected so the regression stays caught.
-            ToolSpec {
-                name: "openrouter-spend.check_openrouter_spend".into(),
-                description: "Skill tool with legacy dotted name".into(),
-                parameters: serde_json::json!({"type": "object"}).into(),
-            },
+            ToolSpec::new(
+                "openrouter-spend.check_openrouter_spend",
+                "Skill tool with legacy dotted name",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
 
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
@@ -1961,11 +1929,11 @@ mod tests {
     fn convert_tools_returns_none_when_all_invalid() {
         use zeroclaw_api::tool::ToolSpec;
 
-        let tools = vec![ToolSpec {
-            name: "mcp:bad.name".into(),
-            description: "Invalid".into(),
-            parameters: serde_json::json!({"type": "object"}).into(),
-        }];
+        let tools = vec![ToolSpec::new(
+            "mcp:bad.name",
+            "Invalid",
+            serde_json::json!({"type": "object"}),
+        )];
 
         assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
     }
@@ -2088,12 +2056,6 @@ mod tests {
         assert_eq!(prov["allow_fallbacks"], false);
     }
 
-    /// Regression for #5822.
-    ///
-    /// `AbortOnDrop` must cancel the bound tokio task when it is dropped.
-    /// This guards the `stream_chat` invariant that a dropped stream stops
-    /// the in-flight SSE-forwarding task instead of letting it run to
-    /// completion.
     #[tokio::test]
     async fn abort_on_drop_cancels_long_running_task() {
         use std::sync::Arc;

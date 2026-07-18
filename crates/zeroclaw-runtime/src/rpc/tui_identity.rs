@@ -1,9 +1,5 @@
 //! TUI session identity — UID generation, HMAC signing, and live
 //! connection registry.
-//!
-//! **Source of truth** for connected TUI state. The `TuiRegistry` lives
-//! on [`super::context::RpcContext`] and is the single canonical location
-//! for "which TUIs are connected right now." Nothing else stores this.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,7 +30,6 @@ pub struct TuiEntry {
 // ── Registry ─────────────────────────────────────────────────────
 
 /// Daemon-wide registry of connected TUI clients.
-///
 /// **Source of truth** for live TUI connection state. Not persisted —
 /// rebuilt on each daemon start from incoming `initialize` handshakes.
 pub struct TuiRegistry {
@@ -63,7 +58,6 @@ impl TuiRegistry {
         }
     }
 
-    /// Test constructor with no signing key.
     #[cfg(test)]
     pub fn new_unsigned() -> Self {
         Self {

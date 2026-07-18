@@ -1,10 +1,4 @@
 //! Deferred MCP tool loading — stubs and activated-tool tracking.
-//!
-//! When `mcp.deferred_loading` is enabled, MCP tool schemas are NOT eagerly
-//! included in the LLM context window. Instead, only lightweight stubs (name +
-//! description) are exposed in the system prompt. The LLM must call the built-in
-//! `tool_search` tool to fetch full schemas, which moves them into the
-//! [`ActivatedToolSet`] for the current conversation.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -180,11 +174,6 @@ impl ActivatedToolSet {
         self.tools.get(name).cloned()
     }
 
-    /// Resolve an activated tool by exact name first, then by unique MCP suffix.
-    ///
-    /// Some model_providers occasionally strip the `<server>__` prefix when calling a
-    /// deferred MCP tool after `tool_search` activation. When the suffix maps to
-    /// exactly one activated tool, allow that call to proceed.
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
         if let Some(tool) = self.get(name) {
             return Some(tool);
@@ -242,12 +231,6 @@ pub fn build_deferred_tools_section_filtered(
     build_deferred_tools_section_excluding(deferred, policy, &HashSet::new())
 }
 
-/// Like [`build_deferred_tools_section_filtered`], but omits stubs whose
-/// prefixed name is in `exclude`. Used for tools pre-activated at assembly
-/// time via `tool_filter_groups` `mode = "always"` (#6699): those are live
-/// from the first turn, and listing them under "NOT yet loaded / you MUST
-/// first call `tool_search`" would instruct the model to burn the exact
-/// round-trip pre-activation exists to remove.
 pub fn build_deferred_tools_section_excluding(
     deferred: &DeferredMcpToolSet,
     policy: Option<&crate::tool_search::ToolAccessPolicy>,
@@ -322,7 +305,7 @@ mod tests {
     #[test]
     fn activated_set_tracks_activation() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -349,7 +332,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -366,7 +349,7 @@ mod tests {
     #[test]
     fn activated_set_resolves_unique_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -393,7 +376,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -407,7 +390,7 @@ mod tests {
     #[test]
     fn activated_set_rejects_ambiguous_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool(&'static str);
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -434,7 +417,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }

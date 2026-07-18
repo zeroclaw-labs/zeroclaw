@@ -1,9 +1,4 @@
 //! Common OAuth2 utilities shared across model_providers.
-//!
-//! This module contains shared functionality for OAuth2 authentication:
-//! - PKCE (Proof Key for Code Exchange) state generation
-//! - URL encoding/decoding
-//! - Query parameter parsing
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -23,7 +18,6 @@ pub fn code_challenge_for_verifier(code_verifier: &str) -> String {
 }
 
 /// Generate a new PKCE state with cryptographically random values.
-///
 /// Creates a code verifier, derives the S256 code challenge, and generates
 /// a random state parameter for CSRF protection.
 pub fn generate_pkce_state() -> PkceState {
@@ -95,7 +89,6 @@ pub fn url_decode(input: &str) -> String {
 }
 
 /// Parse URL query parameters into a BTreeMap.
-///
 /// Handles URL-encoded keys and values.
 pub fn parse_query_params(input: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();

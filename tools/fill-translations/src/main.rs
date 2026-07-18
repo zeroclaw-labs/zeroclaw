@@ -118,11 +118,6 @@ enum LeakCheck {
     IntroducedLocalPath(String),
 }
 
-/// Detect prompt leaks and local-path leaks before writing a translation.
-///
-/// When a model leaks its instructions it translates them into the target language and
-/// often appends the actual translation at the end. The leak is structural: the response
-/// is far longer than any plausible translation of `source`, or starts with a bullet list.
 fn check_for_leak(source: &str, response: &str) -> LeakCheck {
     if contains_generated_toml_block(source, response) {
         return LeakCheck::Unrecoverable;
@@ -207,11 +202,6 @@ fn translation_for_write(source: &str, response: &str) -> String {
     normalize_translated_text(source, text)
 }
 
-/// Repair entries whose `msgstr` is a prompt-leak or local-path-leak response.
-///
-/// Iterates in reverse so that removing continuation lines doesn't shift
-/// line indices for entries yet to visit. Returns
-/// `(recovered, prompt_blanked, path_blanked, first_path_blanked)`.
 fn repair_leaks(
     lines: &mut Vec<String>,
     entries: &[Entry],
@@ -399,14 +389,6 @@ fn write_po(
     Ok(())
 }
 
-/// Strip wrapping characters the model added that weren't present in the source.
-///
-/// Handles the common failure modes observed in logs: a whole translation wrapped in
-/// backticks, corner brackets (`「」`/`『』`), straight or curly quotes, or the JSON field
-/// leak `t="..."`. Applies each rule only when the wrapper is symmetric AND absent from
-/// the source, so legitimate source-side wrapping is preserved.
-/// Outcome of a translate_batch call. On failure, `raw_response` carries the full model
-/// response (empty if the failure was before we got one — e.g. network) for logging.
 struct BatchFailure {
     err: anyhow::Error,
     raw_response: String,
@@ -486,13 +468,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut entries = parse_po(&lines);
 
-    // Repair entries where the model previously leaked its instructions instead of translating.
-    // Recover the real translation from the response tail when possible, otherwise clear to ""
-    // so the entry gets re-translated on this run.
-    // NB: On master the trailing-\n pre-pass runs AFTER this loop, so there is no stale
-    // translations key to remove — the order-of-operations refactoring already fixes #8312
-    // at the production-code level. The regression test in the test module pins this
-    // invariant (see repair_leaks_drops_stale_translations_key).
     let (leak_recovered, leak_blanked, path_blanked, first_path_blanked) =
         repair_leaks(&mut lines, &entries);
     if leak_recovered + leak_blanked + path_blanked > 0 {
@@ -695,11 +670,6 @@ mod tests {
         assert_eq!(translation_for_write("source\n", "traduit"), "traduit\n");
     }
 
-    /// A leaked msgstr long enough to trip `check_for_leak`'s `too_long` guard
-    /// (threshold = max(4*len(msgid), 120)), with the real translation (`保存`)
-    /// as the final paragraph after a blank line so it is Recovered.
-    /// The msgid ends with `\n` so the trailing-`\n` pre-pass in main() would
-    /// seed `translations[msgstr_line]` — the precondition that fired #8312.
     const RECOVERABLE_LEAK_TRAILING_NEWLINE: &str = concat!(
         "msgid \"Save\\n\"\n",
         "msgstr \"\"\n",
@@ -709,13 +679,6 @@ mod tests {
         "\"保存\"\n",
     );
 
-    /// Regression for #8312: after leak repair + trailing-`\n` pre-pass,
-    /// `write_po` must emit the recovered translation, not the leaked text.
-    ///
-    /// Uses the shared `repair_leaks` helper (so it tests the real production
-    /// code path) and drives `write_po` end-to-end. Mutation check: reverting
-    /// `repair_leaks` to a no-op (bypassing the loop) makes the test fail
-    /// because the pre-pass seeds the unrecovered leaked text.
     #[test]
     fn repair_leaks_drops_stale_translations_key() {
         let raw = RECOVERABLE_LEAK_TRAILING_NEWLINE;
@@ -725,7 +688,7 @@ mod tests {
         let msgstr_line = entries[0].msgstr_line;
 
         // Blank continuation lines belonging to the leaked msgstr block so that
-        // re-parse after repair doesn't re-append them (orthogonal to #8312).
+        // re-parse after repair doesn't re-append them (orthogonal to
         let mut ci = msgstr_line + 1;
         while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
             lines[ci].clear();

@@ -1,14 +1,4 @@
 //! Process-global access to the daemon's [`ControlPlaneHandle`].
-//!
-//! The control-plane is a daemon-wide singleton (one durable store + `boot_id` +
-//! re-entry drain per daemon run), so it is reached through a global `OnceLock` —
-//! the same pattern the health registry uses (`crate::health`) — rather than threaded
-//! through every tool-construction signature.
-//!
-//! It is **optional by construction**: until [`init_control_plane`] runs at daemon
-//! boot, [`control_plane`] returns `None` and every producer call site is a no-op
-//! (tests, one-shot CLI, and any non-daemon context keep today's behavior). This is
-//! what lets the supervision plane be additive and fail-safe.
 
 use std::sync::OnceLock;
 
