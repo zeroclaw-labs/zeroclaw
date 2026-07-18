@@ -15041,9 +15041,7 @@ api_key = "anthropic-key"
 
         let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
-            Arc::new(SlowModelProvider {
-                delay: Duration::from_millis(20),
-            }),
+            Arc::new(DummyModelProvider),
             zeroclaw_config::schema::Config::default(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
