@@ -30,10 +30,11 @@ interface channel {
         sender: string,
         reply-target: string,
         content: string,
-        /// Platform type identifier (e.g. `"telegram"`, `"discord"`).
+        /// Legacy platform hint. The host ignores this for routing and stamps
+        /// the channel type from the admitted logical endpoint.
         channel: string,
-        /// ZeroClaw channel alias, when the platform supports multiple bot
-        /// instances. Used to compute distinct session IDs per bot.
+        /// Legacy alias hint. The host ignores this for routing and stamps the
+        /// alias from the admitted instance binding.
         channel-alias: option<string>,
         /// Unix timestamp in milliseconds.
         timestamp: u64,
@@ -144,14 +145,11 @@ interface channel {
     /// Human-readable channel name.
     name: func() -> string;
 
-    /// Hand the plugin its resolved configuration section once at load time,
-    /// before any other call. `config` is a JSON object of the plugin's own
-    /// `[channels.<type>.<alias>]` settings, including secrets the host has
-    /// already decrypted. It is supplied only when the manifest grants
-    /// `config-read`; otherwise the host passes `"{}"`. This mirrors the
-    /// `__config` injection tool plugins receive, so a channel never has to
-    /// hardcode its field names into a host surface to be configured.
-    configure: func(config: string) -> result<_, string>;
+    /// Complete load-time initialization. Read the current schema-validated
+    /// public object through `config.get` and secret properties through
+    /// `secrets.get`; both imports share one resolved canonical revision for
+    /// this call. Do not retain config-derived values for later operations.
+    configure: func() -> result<_, string>;
 
     /// Send a message through this channel.
     send: func(message: send-message) -> result<_, string>;
@@ -314,6 +312,12 @@ interface channel {
 @unstable(feature = plugins-wit-v0)
 world channel-plugin {
     import logging;
+    /// Read the schema-validated public config object at point of use.
+    import config;
+    /// Read schema-designated secrets from host-dispatched configuration and
+    /// operational calls for this admitted channel instance. Calls during
+    /// instantiation and static metadata discovery return `unavailable`.
+    import secrets;
     import inbound;
     export plugin-info;
     export channel;

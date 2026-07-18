@@ -8,9 +8,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
+use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
+use zeroclaw_plugins::services::PluginHostServices;
+use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
 fn test_limits() -> PluginLimits {
     PluginLimits {
@@ -21,10 +24,49 @@ fn test_limits() -> PluginLimits {
     }
 }
 
+fn context(
+    grants: impl IntoIterator<Item = PluginPermission>,
+) -> (PluginManifest, PluginInstanceScope) {
+    let manifest = PluginManifest {
+        name: "zeroclaw-reference-plugin".to_string(),
+        version: "0.1.0".to_string(),
+        description: None,
+        author: None,
+        wasm_path: Some("reference-plugin.wasm".to_string()),
+        capabilities: vec![PluginCapability::Tool],
+        permissions: vec![PluginPermission::ConfigRead],
+        config_schema: Some(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "replacement": {"type": "string"},
+                "patterns": {"type": "string"},
+                "redact_emails": {"type": "string"}
+            }
+        })),
+        signature: None,
+        publisher_key: None,
+    };
+    let scope =
+        PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, "main", grants)
+            .expect("reference manifest admits its effective grants");
+    (manifest, scope)
+}
+
 fn fixture() -> Option<PathBuf> {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference-plugin.wasm");
     path.exists().then_some(path)
+}
+
+fn host_services(
+    manifest: PluginManifest,
+    configured: Option<HashMap<String, String>>,
+) -> PluginHostServices {
+    PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        resolve_plugin_config(&manifest, scope, configured.as_ref())
+    }))
 }
 
 #[tokio::test]
@@ -33,7 +75,9 @@ async fn reference_plugin_reports_metadata() {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
-    let mut plugin = runtime::create_plugin(&fixture, &[], test_limits())
+    let (manifest, scope) = context([]);
+    let services = host_services(manifest, None);
+    let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
         .await
         .expect("instantiate reference plugin");
     let meta = runtime::call_tool_metadata(&mut plugin)
@@ -49,19 +93,18 @@ async fn reference_plugin_redacts_with_config() {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
-    let mut plugin =
-        runtime::create_plugin(&fixture, &[PluginPermission::ConfigRead], test_limits())
-            .await
-            .expect("instantiate reference plugin");
+    let (manifest, scope) = context([PluginPermission::ConfigRead]);
     let config = HashMap::from([
         ("replacement".to_string(), "<X>".to_string()),
         ("patterns".to_string(), "swordfish".to_string()),
     ]);
+    let services = host_services(manifest, Some(config));
+    let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
+        .await
+        .expect("instantiate reference plugin");
     let result = runtime::call_execute(
         &mut plugin,
         br#"{"text":"ping me at a@b.com, pass is swordfish"}"#,
-        &config,
-        &[PluginPermission::ConfigRead],
     )
     .await
     .expect("execute redact tool");
@@ -77,18 +120,15 @@ async fn reference_plugin_jails_config_without_grant() {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
-    let mut plugin = runtime::create_plugin(&fixture, &[], test_limits())
+    let (manifest, scope) = context([]);
+    let config = HashMap::from([("patterns".to_string(), "swordfish".to_string())]);
+    let services = host_services(manifest, Some(config));
+    let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
         .await
         .expect("instantiate reference plugin");
-    let config = HashMap::from([("patterns".to_string(), "swordfish".to_string())]);
-    let result = runtime::call_execute(
-        &mut plugin,
-        br#"{"text":"pass is swordfish"}"#,
-        &config,
-        &[],
-    )
-    .await
-    .expect("execute redact tool");
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"pass is swordfish"}"#)
+        .await
+        .expect("execute redact tool");
     assert!(result.success);
     assert!(result.output.contains("swordfish"));
 }
@@ -99,18 +139,14 @@ async fn reference_plugin_masks_token_by_default() {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
-    let mut plugin =
-        runtime::create_plugin(&fixture, &[PluginPermission::ConfigRead], test_limits())
-            .await
-            .expect("instantiate reference plugin");
-    let result = runtime::call_execute(
-        &mut plugin,
-        br#"{"text":"token sk-abcdef0123456789"}"#,
-        &HashMap::new(),
-        &[PluginPermission::ConfigRead],
-    )
-    .await
-    .expect("execute redact tool");
+    let (manifest, scope) = context([PluginPermission::ConfigRead]);
+    let services = host_services(manifest, None);
+    let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
+        .await
+        .expect("instantiate reference plugin");
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"token sk-abcdef0123456789"}"#)
+        .await
+        .expect("execute redact tool");
     assert!(result.success);
     assert!(!result.output.contains("sk-abcdef0123456789"));
 }
@@ -127,11 +163,12 @@ async fn reference_plugin_traps_when_fuel_exhausted() {
         max_table_elements: 100_000,
         max_instances: 64,
     };
-    let mut plugin = runtime::create_plugin(&fixture, &[], starved)
+    let (manifest, scope) = context([]);
+    let services = host_services(manifest, None);
+    let mut plugin = runtime::create_plugin(&fixture, &scope, &services, starved)
         .await
         .expect("instantiate reference plugin");
-    let result =
-        runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#, &HashMap::new(), &[]).await;
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#).await;
     assert!(
         result.is_err(),
         "a 1-unit fuel budget must trap the call, got {result:?}"
@@ -150,7 +187,9 @@ async fn reference_plugin_traps_when_memory_capped() {
         max_table_elements: 100_000,
         max_instances: 64,
     };
-    let outcome = runtime::create_plugin(&fixture, &[], capped).await;
+    let (manifest, scope) = context([]);
+    let services = host_services(manifest, None);
+    let outcome = runtime::create_plugin(&fixture, &scope, &services, capped).await;
     assert!(
         outcome.is_err(),
         "a 1-byte memory cap must reject instantiation, got ok"

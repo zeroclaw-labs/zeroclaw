@@ -5,12 +5,21 @@
 #[cfg(feature = "plugins-wasmtime")]
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
+mod component_config;
+#[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_secrets;
+pub mod config;
+pub mod endpoint;
 pub mod error;
 pub mod host;
+pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod services;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
@@ -43,6 +52,14 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Draft 2020-12 JSON Schema for this plugin's private config object.
+    /// Required exactly when `config_read` is requested.
+    /// Direct top-level string properties marked `x-secret: true` are withheld
+    /// from public config and served through the scoped secrets import during
+    /// tool execution or channel service calls. Channel calls obtain the
+    /// remaining typed public object through the scoped config import.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -53,7 +70,7 @@ pub struct PluginManifest {
 }
 
 /// What a plugin can do.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCapability {
     /// Provides one or more tools
@@ -69,7 +86,7 @@ pub enum PluginCapability {
 }
 
 /// Permissions a plugin may request.
-#[derive(Debug, Clone, Hash, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermission {
     /// Can make HTTP requests

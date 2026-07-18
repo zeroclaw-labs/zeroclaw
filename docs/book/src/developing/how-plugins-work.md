@@ -88,14 +88,13 @@ A manifest declares two separate things, and the distinction matters.
   HTTP egress, configuration, memory. A permission the manifest does not declare
   is a host function the plugin cannot reach.
 
-The host grants permissions narrowly: a permission the manifest does not declare
-is a host function the plugin cannot reach. The HTTP-egress and per-plugin
-configuration boundaries (SSRF-guarded egress that cannot reach loopback,
-private, link-local, or cloud-metadata addresses or redirect into one; config
-injected per-alias so a plugin reads only its own resolved values and never the
-raw process environment or another plugin's secrets) are delivered by the
-companion plugin-hardening work and are documented alongside those changes. This
-page covers the signature-policy boundary.
+The host grants permissions narrowly: a permission the manifest does not
+declare is a host function the plugin cannot reach. Config is resolved from a
+host-issued instance identity, so a plugin cannot select another package or
+binding and never reads the raw process environment. `http_client` gates the
+outbound `wasi:http` surface; the shared SSRF-guarded egress policy remains
+companion plugin-hardening work. This page covers the signature-policy
+boundary.
 
 ## Configuration reference
 
@@ -129,13 +128,20 @@ Even with every permission granted, the sandbox bounds a plugin:
   the filesystem outside its rooted workspace. Network egress is gated by the
   HTTP permission; the SSRF-guarded egress boundary itself is delivered by the
   companion plugin-hardening work.
-- Secret-value isolation at the egress boundary (the host injecting credentials
-  so the plugin learns only that a secret exists, never its value) is part of
-  that same companion work; this PR does not add it.
+- A trusted tool or channel plugin can read a schema-designated secret's
+  plaintext through its scoped `secrets.get` import during an authorized
+  service call. Tools receive access during `execute`. Channels receive
+  `config.get` and `secrets.get` during `configure` and operational calls; reads
+  within one call use one canonical revision, so a same-binding public/secret
+  rotation is available on the next operation. Instantiation and static
+  metadata discovery cannot use either import. The host prevents public config
+  injection and cross-instance selection, but a plaintext-returning import
+  cannot prevent a malicious guest from retaining what it reads. Compliant
+  channel plugins must resolve config and credentials at each point of use.
 - It cannot displace a built-in tool: the built-ins register first and tool
   dispatch resolves names first-match, so a colliding plugin tool is simply
   never selected.
 
-These bounds hold regardless of what the plugin's own code attempts, which is
-what makes it safe to load a plugin you did not write, provided your signature
-policy says you trust whoever published it.
+The sandbox and namespace bounds hold regardless of what plugin code attempts.
+The no-retention rule is instead part of the trusted channel-plugin contract,
+which is why publisher review and signature policy still matter.
