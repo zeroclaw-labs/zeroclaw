@@ -1,21 +1,4 @@
 //! ACP (Agent Control Protocol) Server — JSON-RPC 2.0 over stdio.
-//!
-//! Provides an IDE-friendly interface for spawning and managing isolated agent
-//! sessions. Each session wraps an [`Agent`] built from the global config with
-//! streaming support via JSON-RPC notifications.
-//!
-//! ## Protocol
-//!
-//! Requests and responses are newline-delimited JSON objects on stdin/stdout.
-//!
-//! | Method            | Description                              |
-//! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel when configured) |
-//! | `session/new`     | Create an isolated agent session          |
-//! | `session/prompt`  | Send a prompt, stream back `session/update` events |
-//! | `session/stop`    | Gracefully terminate a session            |
-//! | `session/cancel`  | Abort an in-flight `session/prompt` turn  |
-//! | `session/update`  | Streaming events and bidirectional events |
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -34,6 +17,7 @@ use zeroclaw_api::jsonrpc::{
     ACP_PROTOCOL_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
 use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
@@ -87,16 +71,6 @@ pub struct AcpServer {
     /// Receiver for the writer task. Pulled out (replaced with `None`) the
     /// first time `run()` starts the writer loop.
     writer_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
-    /// Per-session cancellation tokens for aborting in-flight `session/prompt`
-    /// turns. Lives outside `Session`'s inner `Mutex` so `session/cancel` can
-    /// fire the token without waiting for the turn to release the inner lock.
-    ///
-    /// **Single-turn-per-session invariant:** this map holds at most one token
-    /// per `session_id` because the ACP protocol does not pipeline multiple
-    /// `session/prompt` calls on the same session — each prompt must complete
-    /// (or be cancelled) before the next one is sent. A second prompt is
-    /// rejected before it can overwrite the active turn's token. If pipelining
-    /// is needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Tracks session IDs currently being loaded/resumed (between the initial
     /// check and the final insert into `sessions`). Used to prevent duplicate
@@ -113,12 +87,6 @@ pub struct AcpServer {
     /// build their own engine from config.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    /// Most-recently-seen `clientCapabilities.elicitation` block from
-    /// `initialize`. ACP `initialize` happens once per connection,
-    /// before any `session/new`, but some clients legally re-send
-    /// `initialize`; `RwLock` honours "1 writer (initialize), N readers
-    /// (session/new)" with last-write-wins, and matches the
-    /// `std::sync::*` family used elsewhere in this file.
     client_elicitation_caps: std::sync::RwLock<ElicitationCapabilities>,
 }
 
@@ -310,12 +278,6 @@ impl AcpServer {
         Ok(())
     }
 
-    /// Run the ACP server against an already-framed line source.
-    ///
-    /// This is used by the gateway WebSocket bridge, where inbound WebSocket
-    /// text messages are already complete JSON-RPC frames and outbound frames
-    /// are supplied by the writer channel passed to [`Self::new_with_writer`]
-    /// or [`Self::new_with_writer_and_store`].
     pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -364,13 +326,6 @@ impl AcpServer {
                     }
                     return;
                 }
-                // Spawn so a long-running session/prompt doesn't block the
-                // read loop — outbound RPC responses (e.g. for
-                // session/request_permission) need to be processable
-                // while a prompt turn is in flight. Once `handle_request`
-                // resolves session/agent context and attaches an
-                // attribution scope, every log record emitted from this
-                // task lands attributed in the TUI instead of orphaning.
                 let server = Arc::clone(self);
                 ::zeroclaw_spawn::spawn!(async move {
                     server.handle_request(request).await;
@@ -557,11 +512,6 @@ impl AcpServer {
 
         let session_id = Uuid::new_v4().to_string();
 
-        // Atomically check the session limit and reserve a loading slot, then
-        // release the locks before building the agent. Agent construction can
-        // perform opt-in MCP startup (`[agents.<alias>].acp_enable_mcp`), which
-        // may block on external server timeouts; holding `self.sessions` across
-        // it would stall unrelated session ops. Mirrors `session/load`.
         {
             let sessions = self.sessions.lock().await;
             let mut loading = self.loading_sessions.lock().await;
@@ -590,14 +540,6 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        // Build agent from global config, with the session's cwd pinned as
-        // the file/shell sandbox boundary. The agent's data directory
-        // (identity, scheduled tasks) still lives under `config.data_dir`.
-        // ACP sessions exclude persistent memory — context comes from the
-        // persisted session history, not the agent's long-term memory store.
-        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
-        // by default to keep `session/new` prompt; on to load this agent's
-        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
         let enable_mcp = self
             .config
             .agent(&agent_alias)
@@ -1123,6 +1065,20 @@ impl AcpServer {
             .model_provider_for_agent(&restore_alias)
             .and_then(|mp| mp.model.clone())
             .unwrap_or_default();
+
+        // Replay the durable TodoWrite plan so the resuming client's tracker
+        // repopulates without a model round-trip — parity with the daemon RPC
+        // ACP bridge. Best-effort: a load failure or empty plan emits nothing.
+        if let Some(store) = self.store.as_ref() {
+            let entries = store.get_plan(&session_id).unwrap_or_default();
+            if !entries.is_empty()
+                && let Some(notification) =
+                    notification_for_turn_event(&session_id, &TurnEvent::Plan { entries })
+            {
+                self.write_notification(&notification).await;
+            }
+        }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
@@ -1138,15 +1094,6 @@ impl AcpServer {
         );
         Ok(serde_json::json!({}))
     }
-
-    /// Handle `session/close` requests (ACP spec §Session Management).
-    ///
-    /// Closes a session: fires the cancel token to interrupt any in-flight turn,
-    /// removes the session from the in-memory map, and unregisters the ACP channel.
-    /// The session record in the persistent store is NOT deleted.
-    ///
-    /// Returns an empty object on success, or SESSION_NOT_FOUND if the session
-    /// is not in the in-memory map (it may still exist in the store).
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1262,13 +1209,6 @@ impl AcpServer {
             }
         };
 
-        // Instrument the rest of the turn so every record! inside lands in
-        // the Attribution section of the log viewer with agent_alias,
-        // model_provider, and session_key populated.
-        // scope! wraps the body with .instrument() internally — no EnteredSpan
-        // held across .await points, so the future stays Send.
-        // Clone before the macro so the owned values remain available inside
-        // the async move block.
         let session_id_s = session_id.clone();
         let agent_alias_s = agent_alias.clone();
         let model_provider_s = model_provider.clone();
@@ -1290,21 +1230,10 @@ impl AcpServer {
             "ACP session/prompt turn starting"
         );
 
-        // Create a cancellation token for this turn and register it so that a
-        // concurrent `session/cancel` notification can fire it without waiting
-        // for the inner session lock (which is held for the full turn duration).
-        // The lock can never be poisoned — all critical sections guarded by this
-        // mutex are short, infallible HashMap operations (insert/remove/get)
-        // that never call user code, panic, or block on I/O.
         let cancel_token = tokio_util::sync::CancellationToken::new();
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
-        // Cost-tracking inputs, resolved before the spawn while `self.config`
-        // is in scope. `turn_streamed` reuses the outer cost scope set below;
-        // without it the turn falls back to a tracker-less `usage_only` context
-        // and model cost is silently dropped (#5221). Mirrors the gateway WS
-        // path. The process-global tracker is shared with the gateway/daemon.
         let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
             self.config.cost.clone(),
             &self.config.data_dir,
@@ -1359,31 +1288,14 @@ impl AcpServer {
             // guard drops here, releasing the inner lock
         });
 
-        // Forward events as they arrive. Use standard ACP `session/update`
-        // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
-        // `tool_call_update` for completion (status + rawOutput/content). This enables
-        // proper pending→completed flow in ACP clients.
-        // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
         let mut tool_call_count: u32 = 0;
+        // Latest whole-list plan emitted this turn (TodoWrite). Persisted
+        // durably after the turn so external ACP clients get the same
+        // resume/restart replay the daemon RPC bridge already provides.
+        let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
-            // ACP has no `session/update` shape for token-usage events; the
-            // task-local cost tracker records them out-of-band. We DO use the
-            // event to update the per-session `token_count` so the TUI ctx
-            // bar resumes accurately. Then skip before dispatching to the
-            // notification builder so the helper match can stay exhaustive
-            // on the four UI-relevant variants.
             if let TurnEvent::Usage { input_tokens, .. } = &event {
-                // Token-count persistence is best-effort UI bookkeeping (it
-                // restores the TUI ctx bar on resume). It must never gate the
-                // draining of `event_rx`: this loop is the sole consumer of the
-                // turn's bounded `event_tx` (capacity 100). The session store
-                // wraps a single SQLite connection behind one process-wide
-                // mutex, so a concurrent session mid-`append_turn` transaction
-                // can stall this write. Awaiting it here would stop draining,
-                // fill `event_tx`, and block the agent's unguarded
-                // `event_tx.send(...).await` — wedging the turn on "working"
-                // with no cancel path. Fire-and-forget keeps the consumer live.
                 if let (Some(store), Some(it)) = (&self.store, input_tokens) {
                     let store = store.clone();
                     let sid = session_id.clone();
@@ -1446,6 +1358,11 @@ impl AcpServer {
                 }
                 TurnEvent::Chunk { delta } => {
                     accumulated_text.push_str(delta);
+                }
+                TurnEvent::Plan { entries } => {
+                    // Whole-list replace: keep only the latest plan for
+                    // post-turn durable persistence.
+                    latest_plan = Some(entries.clone());
                 }
                 _ => {}
             }
@@ -1527,6 +1444,34 @@ impl AcpServer {
                             "error": detail,
                         })),
                     "Failed to persist turn; session continues in memory"
+                );
+            }
+        }
+
+        // Durably persist the latest TodoWrite plan for this turn so it
+        // replays on session/resume (best-effort; the live emission above
+        // already reached the client). Whole-list replace, including an
+        // empty list (a cleared plan).
+        if let Some(store) = &self.store
+            && let Some(entries) = latest_plan
+        {
+            let store = store.clone();
+            let sid = session_id.clone();
+            let persisted =
+                tokio::task::spawn_blocking(move || store.set_plan(&sid, &entries)).await;
+            let error = match persisted {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(join) => Some(join.to_string()),
+            };
+            if let Some(detail) = error {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": detail })),
+                    "Failed to persist TodoWrite plan; session continues in memory"
                 );
             }
         }
@@ -1716,18 +1661,6 @@ impl AcpServer {
         }))
     }
 
-    /// Handle `session/cancel` notifications (ACP spec §Cancellation).
-    ///
-    /// Fires the cancellation token for the named session's active turn, if
-    /// one is running. Idempotent — silently succeeds when there is no active
-    /// turn. The return value is ignored for notifications.
-    ///
-    /// Cancel-vs-stop interaction: if `session/cancel` and `session/stop` fire
-    /// nearly simultaneously, both handlers race — cancel fires the token
-    /// (which may or may not interrupt the turn), and stop sets
-    /// `session.stopped = true` and awaits the turn handle. The net effect is
-    /// harmless: either the turn sees the cancellation token or it doesn't, and
-    /// stop always waits for the turn to finish.
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1760,12 +1693,6 @@ impl AcpServer {
         Ok(serde_json::json!({}))
     }
 
-    /// Handle incoming `session/update` (or legacy `session/event`) notifications.
-    ///
-    /// This processes bidirectional events for an active session (e.g. tool results,
-    /// status updates, or client-side events). Currently updates session activity
-    /// to prevent premature reaping; future extensions can route specific event
-    /// types into the Agent.
     async fn handle_session_event(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1918,13 +1845,6 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
     }
 }
 
-/// Translate tool args into the ACP `rawInput` shape.
-///
-/// For file-editing tools, the ACP Diff schema uses `oldText`/`newText` (camelCase).
-/// ZeroClaw's internal tool args use `old_string`/`new_string` (snake_case) for
-/// `file_edit` and `content` for `file_write`. Without this translation, ACP clients
-/// (Toad, Zed) cannot recognise the Diff shape and fall back to rendering the raw JSON
-/// fields as giant strings.
 fn to_acp_raw_input(name: &str, args: &Value) -> Value {
     match name {
         "file_edit" => {
@@ -1942,12 +1862,6 @@ fn to_acp_raw_input(name: &str, args: &Value) -> Value {
     }
 }
 
-/// Build the ACP `content` array for a tool call notification.
-///
-/// Zed and Toad render tool call content from the `content` array. For
-/// file-editing tools, emit an ACP Diff content item (`{ "type": "diff", ... }`)
-/// so clients show a side-by-side diff editor. Non-edit tools return an empty
-/// array — their `rawInput` is displayed via the standard `raw_input` fallback.
 fn to_acp_content(name: &str, args: &Value) -> Value {
     match name {
         "file_edit" => {
@@ -1996,7 +1910,6 @@ fn map_tool_kind(name: &str) -> &'static str {
         | "microsoft365"
         | "model_routing_config"
         | "model_switch"
-        | "pdf_read"
         | "project_intel"
         | "proxy_config"
         | "read_skill"
@@ -2097,11 +2010,6 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
-        // ACP has its own approval mechanism via `session/request_permission`
-        // routed through the channel's `request_choice` impl. The agent only
-        // emits ApprovalRequest events when a back-channel like the gateway
-        // WS is registered to handle them; on ACP-only sessions they should
-        // not arrive here.
         TurnEvent::ApprovalRequest { .. } => return None,
         TurnEvent::HistoryTrimmed {
             dropped_messages,
@@ -2117,6 +2025,21 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                     "droppedMessages": dropped_messages,
                     "keptTurns": kept_turns,
                     "reason": reason,
+                }
+            }),
+        },
+        TurnEvent::Plan { entries } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "plan",
+                    // PlanEntry serializes to the ACP-faithful
+                    // { content, priority, status } shape (+ additive
+                    // activeForm when present, which strict ACP clients
+                    // ignore). Whole-list replace per the ACP plan spec.
+                    "entries": entries,
                 }
             }),
         },
@@ -2486,7 +2409,7 @@ mod tests {
     /// Spin up a wiremock server speaking the minimum MCP HTTP handshake
     /// (`initialize` → `notifications/initialized` → `tools/list`) advertising a
     /// single tool. HTTP transport keeps the test cross-platform (no stdio
-    /// scripts). Mirrors the runtime crate's #8193 helper.
+    /// scripts). Mirrors the runtime crate'shelper.
     async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2572,10 +2495,6 @@ mod tests {
         );
     }
 
-    /// By default (`acp_enable_mcp = false` on the agent) an ACP session must
-    /// NOT touch the servers granted by the agent's mcp_bundles — preserving
-    /// the prompt-`session/new` contract (#8193). The granted MCP server
-    /// records zero requests.
     #[tokio::test]
     async fn session_new_skips_mcp_by_default() {
         let cwd = tempfile::tempdir().unwrap();
@@ -2601,11 +2520,6 @@ mod tests {
         );
     }
 
-    /// With the agent's `acp_enable_mcp = true` an ACP session connects to the
-    /// servers granted by that agent's mcp_bundles (the same eager wiring used
-    /// by gateway/daemon sessions), so the agent can call those tools. The
-    /// granted MCP server receives the `tools/list` handshake during
-    /// `session/new`.
     #[tokio::test]
     async fn session_new_loads_mcp_bundles_when_agent_opts_in() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3184,13 +3098,48 @@ mod tests {
         );
     }
 
-    /// `session/stop` must succeed while a `session/prompt` turn is in flight.
-    ///
-    /// The session entry lives in the outer map for its entire lifetime.
-    /// The inner `Arc<Mutex<Session>>` serialises access: the prompt turn holds
-    /// the inner lock while running; `session/stop` removes the outer entry
-    /// then waits for the inner lock before cleaning up.  It must never see
-    /// SESSION_NOT_FOUND just because a turn happens to be running.
+    #[test]
+    fn plan_event_projects_to_acp_plan_update() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let event = TurnEvent::Plan {
+            entries: vec![
+                PlanEntry {
+                    content: "Analyze the existing codebase structure".to_string(),
+                    status: PlanStatus::Pending,
+                    priority: PlanPriority::High,
+                    active_form: None,
+                },
+                PlanEntry {
+                    content: "Create unit tests".to_string(),
+                    status: PlanStatus::InProgress,
+                    priority: PlanPriority::Medium,
+                    active_form: Some("Creating unit tests".to_string()),
+                },
+            ],
+        };
+        let notif =
+            notification_for_turn_event("sess_abc", &event).expect("plan yields a notification");
+        let v = serde_json::to_value(&notif).unwrap();
+
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["sessionId"], "sess_abc");
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
+        let entries = v["params"]["update"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]["content"],
+            "Analyze the existing codebase structure"
+        );
+        assert_eq!(entries[0]["priority"], "high");
+        assert_eq!(entries[0]["status"], "pending");
+        // ACP-required fields always present on every entry:
+        assert!(entries[1]["priority"].is_string());
+        assert_eq!(entries[1]["status"], "in_progress");
+        // ZeroClaw extension carried but additive:
+        assert_eq!(entries[1]["activeForm"], "Creating unit tests");
+    }
+
     #[tokio::test]
     async fn session_stop_finds_session_during_active_prompt_turn() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3342,7 +3291,6 @@ mod tests {
         cfg
     }
 
-    /// `session/cancel` on an idle session (no active turn) must succeed silently.
     #[tokio::test]
     async fn session_cancel_idle_session_is_noop() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3367,8 +3315,6 @@ mod tests {
         assert!(result.is_ok(), "idle cancel must succeed: {result:?}");
     }
 
-    /// `session/cancel` for an unknown session ID must succeed silently (notification
-    /// semantics: no response, no error propagation).
     #[tokio::test]
     async fn session_cancel_unknown_session_is_noop() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3408,8 +3354,6 @@ mod tests {
         assert!(active_token.is_cancelled());
     }
 
-    /// A second prompt for the same session must fail before it can overwrite
-    /// the active turn's cancellation token.
     #[tokio::test]
     async fn register_cancel_token_rejects_concurrent_prompt_for_session() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3488,10 +3432,6 @@ mod tests {
         assert!(active_token.is_cancelled());
     }
 
-    /// Verify that inserting and removing a cancel token from the map works
-    /// correctly. This tests map mechanics directly rather than the
-    /// `handle_session_prompt` lifecycle, so a regression in the production
-    /// path's cleanup wouldn't be caught by this test.
     #[tokio::test]
     async fn cancel_tokens_map_remove_works() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3649,11 +3589,6 @@ mod tests {
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
-    /// `make_mcp_granting_test_config`, reshaped so the MCP-opted-in agent is
-    /// NOT the ACP default. `finance` owns the granted `b1` bundle and sets
-    /// `acp_enable_mcp = true`; the ACP default `test-agent` has neither. A
-    /// restored session owned by `finance` therefore loads MCP only if restore
-    /// resolves the stored alias rather than `acp.default_agent`.
     fn make_cross_agent_restore_config(cwd: &std::path::Path, mock_uri: String) -> Config {
         let mut cfg = make_mcp_granting_test_config(cwd, mock_uri);
         // ACP default agent: no bundle, MCP off.
@@ -3677,12 +3612,6 @@ mod tests {
         cfg
     }
 
-    /// A restored session must rebuild under the agent it was CREATED with
-    /// (`AcpSessionData.agent_alias`), not `acp.default_agent`, and apply that
-    /// agent's `acp_enable_mcp`. Here the owner `finance` opts into MCP while
-    /// the ACP default `test-agent` does not, so a correct restore means the
-    /// granted MCP server receives the `tools/list` handshake. Regression for
-    /// the restore-path review on #8237.
     #[tokio::test]
     async fn session_load_restores_owning_agent_and_its_mcp_optin() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3726,9 +3655,6 @@ mod tests {
         );
     }
 
-    /// Same restore-alias contract as the load test, exercised through
-    /// `session/resume` (which shares the restore path). Regression for the
-    /// restore-path review on #8237.
     #[tokio::test]
     async fn session_resume_restores_owning_agent_and_its_mcp_optin() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3826,11 +3752,63 @@ mod tests {
         // Session must be in memory
         assert!(server.sessions.lock().await.contains_key(session_id));
 
-        // No notifications must have been emitted
+        // A resume with no stored plan must not emit notifications (transcript
+        // is seeded into the agent, not replayed to the client as updates).
         assert!(
             writer_rx.try_recv().is_err(),
-            "session/resume must not emit session/update notifications"
+            "session/resume with no plan must not emit session/update notifications"
         );
+    }
+
+    #[tokio::test]
+    async fn session_resume_replays_stored_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-plan";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        // A durable plan exists from a prior turn.
+        store
+            .set_plan(
+                session_id,
+                &[PlanEntry {
+                    content: "Resume me".to_string(),
+                    status: PlanStatus::InProgress,
+                    priority: PlanPriority::High,
+                    active_form: Some("Resuming".to_string()),
+                }],
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        // The stored plan must be replayed as a native ACP `plan` update.
+        let raw = writer_rx
+            .try_recv()
+            .expect("resume must emit a plan session/update");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
+        assert_eq!(v["params"]["update"]["entries"][0]["content"], "Resume me");
+        assert_eq!(v["params"]["update"]["entries"][0]["status"], "in_progress");
     }
 
     #[tokio::test]
@@ -3885,9 +3863,6 @@ mod tests {
         assert_eq!(err.code, SESSION_NOT_FOUND);
     }
 
-    /// `session/new` must return SESSION_LIMIT_REACHED when `max_sessions` is
-    /// already reached. Guards the reservation/limit check that moved out from
-    /// under the long-held sessions lock so MCP startup no longer blocks it.
     #[tokio::test]
     async fn session_new_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3921,8 +3896,6 @@ mod tests {
         );
     }
 
-    /// `session/load` must return SESSION_LIMIT_REACHED when `max_sessions` is
-    /// already reached by an active session created via `session/new`.
     #[tokio::test]
     async fn session_load_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3967,8 +3940,6 @@ mod tests {
         );
     }
 
-    /// `session/resume` must return SESSION_LIMIT_REACHED when `max_sessions` is
-    /// already reached by an active session created via `session/new`.
     #[tokio::test]
     async fn session_resume_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4013,8 +3984,6 @@ mod tests {
         );
     }
 
-    /// A SQLite error during `store.load_session` must release the `loading_sessions`
-    /// reservation so a subsequent restore attempt is not permanently blocked.
     #[tokio::test]
     async fn session_load_releases_reservation_on_store_error() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4072,8 +4041,6 @@ mod tests {
         );
     }
 
-    /// Same coverage as `session_load_releases_reservation_on_store_error` but
-    /// for the `session/resume` path.
     #[tokio::test]
     async fn session_resume_releases_reservation_on_store_error() {
         let cwd = tempfile::tempdir().unwrap();

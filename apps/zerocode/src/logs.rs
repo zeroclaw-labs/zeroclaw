@@ -53,11 +53,6 @@ fn severity_label(num: u8) -> &'static str {
 
 // ── Log entry ────────────────────────────────────────────────────
 
-/// Preview row stored in `LogsPane.events`. Query-loaded rows carry
-/// only the fields rendered in the left-side list. Push-delivered live
-/// rows may also retain their full event as a bounded fallback until
-/// they age out of the in-memory log buffer; this keeps detail useful
-/// while `logs/get` races the persistent writer.
 struct LogEntry {
     /// Stable event id from the persistent log store. Used to lazy-fetch
     /// the full payload via `logs/get { id }` when the detail pane opens.
@@ -70,24 +65,10 @@ struct LogEntry {
     live_detail_fallback: Option<Value>,
 }
 
-/// Full event payload — usually populated by `logs/get` when the
-/// detail pane opens, or built from a push-delivered live fallback
-/// when persistence has not caught up yet. Holds the raw `Value` (with
-/// trace ids, attribution map, attributes JSON, …) so the renderer can
-/// read every field on demand.
 pub(crate) struct LogDetail {
     raw: Value,
 }
 
-/// Three-state lifecycle for the detail pane body. `logs/get` can
-/// legitimately fail — events that arrive via the `logs/event` push
-/// before the daemon's writer has flushed them carry a fallback id
-/// (the timestamp) that the persistent store cannot resolve. Without
-/// a distinct failed state the renderer cannot tell an in-flight
-/// fetch from a resolved-but-empty one, and the pane sticks on
-/// "Loading…" forever. `Ready` carries the persisted full payload, a
-/// full live fallback, or a preview-only fallback built from the list
-/// row. Closing the pane drops this active detail state.
 pub(crate) enum DetailState {
     /// `logs/get` is in flight (or the pane just opened).
     Loading,
@@ -107,11 +88,6 @@ impl LogEntry {
     }
 
     fn from_value_with_fallback(v: &Value, live_detail_fallback: Option<Value>) -> Option<Self> {
-        // Prefer the persistent id from the log store. Fall back to
-        // `(timestamp, span_id)` for events arriving via the
-        // `logs/event` push notification before a persistent id is
-        // assigned — those rows lazy-fetch full detail via
-        // `logs/get { id }` once the daemon's writer has flushed them.
         let timestamp = v.get("@timestamp")?.as_str()?.to_string();
         let id = v
             .get("id")
@@ -488,11 +464,6 @@ pub(crate) struct Logs {
     min_severity: u8,
     subscribed: bool,
     detail_open: bool,
-    /// Lazy-loaded full event payload, tracked as a three-state
-    /// machine so the renderer can tell a fetch still in flight
-    /// apart from one that resolved with no payload. Closing the
-    /// pane resets this to `Loading` so long sessions never
-    /// accumulate detail bodies for events scrolled past.
     detail: DetailState,
     /// Id of the event whose detail is currently being fetched
     /// or shown. Used to ignore stale `logs/get` responses when
@@ -504,12 +475,6 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
-    // Pagination — prefer the byte-offset cursor (`next_cursor_line_offset`)
-    // because it is independent of event id ordering and avoids the
-    // legacy `(until_ts, until_id)` tie-break that can drop
-    // earlier-written events when ids are written in non-lexicographic
-    // order (UUID v4 in practice). The legacy cursor stays as a fallback
-    // for daemons that haven't been upgraded to expose the byte offset.
     next_cursor_offset: Option<u64>,
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
@@ -886,11 +851,6 @@ impl Logs {
             return;
         };
 
-        // Detail body is lazy-loaded via `logs/get` when the pane
-        // opens (see `sync_detail_to_selection`). While the daemon is
-        // still answering, show a placeholder; once the fetch resolves
-        // — with the full payload or a preview-only fallback — render
-        // the fields so the pane never sticks on "Loading…".
         let lines = match &self.detail {
             DetailState::Ready(d) => d.detail_lines(),
             DetailState::Loading => {

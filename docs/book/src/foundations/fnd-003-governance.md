@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 5
+> Starting v0.7.0 · Type: Governance · Rev. 6
 >
-> **Canonical reference** · Ratified by the team · Rev. 5
+> **Canonical reference** · Ratified by the team · Rev. 6
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -23,6 +23,7 @@
 | 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
 | 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
 | 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
+| 6 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source (#8989) |
 
 ---
 
@@ -74,7 +75,7 @@ These are three distinct concerns. Conflating them, putting everything in one bo
 |---|---|---|
 | Work pipeline (backlog → release) | **GitHub Projects v2** | Custom fields, multiple views, Kanban + roadmap, built-in automation, milestone tracking |
 | Community discussion and idea incubation | **GitHub Discussions** | Community-visible, no PR required, separates early conversation from committed work, promotes concrete outcomes into the owning tracked surface |
-| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Already partially established via `docs/proposals/`; needs formalization and close loop |
+| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Established through RFC issues, foundation docs, and CODEOWNERS; needs formalization and close loop |
 
 The key principle: **the Project board contains only work the team has committed to thinking about.** Early community discussion, ideas, Q&A, and showcases can live in Discussions when the lane is maintained. Work that has been evaluated, accepted, and scoped lives in the Project. This distinction is what keeps the board useful.
 
@@ -387,7 +388,7 @@ Create `.github/CODEOWNERS`:
 ```
 # CODEOWNERS — Automatic review routing by risk tier
 # See AGENTS.md for risk tier definitions.
-# See docs/proposals/project-governance.md for team tier definitions.
+# See the governance foundation doc and RFC issue template for team tier definitions.
 
 # ── High Risk: requires Core Team approval ──────────────────────────────────
 
@@ -407,8 +408,8 @@ deny.toml                       @zeroclaw-labs/zeroclaw-core
 
 # ── Architecture documents: requires Core Team review ───────────────────────
 
-docs/proposals/**               @zeroclaw-labs/zeroclaw-core
-docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+docs/book/src/foundations/**    @zeroclaw-labs/zeroclaw-core
+docs/book/src/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
 AGENTS.md                       @zeroclaw-labs/zeroclaw-core
 
 # ── Default: any Contributor or Core Team member can review ─────────────────
@@ -528,18 +529,14 @@ The RFC process was established in the documentation RFC and the architecture RF
 ### 8.1 The Full RFC Lifecycle
 
 ```
-1. AUTHOR writes proposal → docs/proposals/<slug>.md
+1. AUTHOR opens an RFC issue using the RFC issue template
+   with the proposal and any supporting PR or document links
            ↓
-2. AUTHOR opens PR with the proposal document
-           ↓
-3. AUTHOR opens RFC issue using the RFC issue template
-   linking to the PR
-           ↓
-4. DISCUSSION PERIOD — minimum 7 days
+2. DISCUSSION PERIOD — minimum 7 days
    Anyone can comment. Core Team members engage substantively.
-   Discussions happen on the issue, not the PR.
+   Discussions happen on the issue.
            ↓
-5. CORE TEAM VOTE on the issue
+3. CORE TEAM VOTE on the issue
    Format: comment with one of:
      ✅ APPROVE — with brief rationale
      ❌ REJECT — with specific objections
@@ -549,7 +546,7 @@ The RFC process was established in the documentation RFC and the architecture RF
    │  RFC is accepted                                          │
    │  PR is merged                                            │
    │  Issue labeled rfc:accepted                              │
-   │  Author writes ADR(s) in docs/architecture/decisions/    │
+   │  Author writes ADR(s) under docs/book/src/architecture/decisions/ │
    │  ADR issue(s) linked back to RFC issue                   │
    │  RFC issue closed                                        │
    └──────────────────────────────────────────────────────────┘
@@ -567,7 +564,7 @@ The RFC process was established in the documentation RFC and the architecture RF
    │  Issue labeled rfc:revision-requested                    │
    │  Author revises proposal document                        │
    │  Author re-requests review via issue comment             │
-   │  Process returns to step 4                               │
+   │  Process returns to step 2                               │
    └──────────────────────────────────────────────────────────┘
 ```
 
@@ -587,15 +584,16 @@ Every accepted RFC must produce at least one ADR before the corresponding implem
 
 RFCs are proposals. ADRs are decisions. Both are necessary. Neither replaces the other.
 
-### 8.4 Existing RFCs in This Repository
+### 8.4 Foundational RFCs
 
-The following RFCs have been filed as of this writing and should be converted to formal RFC issues immediately:
+The early proposal documents have since been represented as RFC issues
+and foundation documents:
 
-| RFC Document | Issue to create | Priority |
+| RFC issue | Current durable surface | Priority |
 |---|---|---|
-| `docs/proposals/microkernel-architecture.md` | Microkernel Architecture RFC (v0.7.0+) | High |
-| `docs/proposals/documentation-standards.md` | Documentation Standards and i18n RFC | High |
-| `docs/proposals/project-governance.md` | Team Organization and Governance RFC | Medium |
+| [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) | [FND-001: Intentional architecture](./fnd-001-intentional-architecture.md) | High |
+| [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576) | [FND-002: Documentation standards](./fnd-002-documentation-standards.md) | High |
+| [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577) | [FND-003: Governance](./fnd-003-governance.md) | Medium |
 
 ---
 
@@ -661,7 +659,7 @@ This table records governance intent and historical taxonomy shape. For current 
 | `status:accepted` | `#0e8a16` Green | RFC or work item ratified; not stale-exempt by itself |
 | `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
 | `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
-| `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
+| `status:stale` | `#e4e669` Yellow | Issue is in the response window defined by the [maintainer label guide](../maintainers/labels.md#issue-stale-policy) |
 | `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and visible routing evidence in the operational source |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
@@ -741,9 +739,9 @@ The active path labeler applies scope labels to PRs based on changed files. Risk
 
 GitHub enforces CODEOWNERS automatically when the file exists and branch protection requires it. No Action required.
 
-**Stale issue management (`.github/workflows/stale.yml`):**
+**Stale issue management (maintainer-run):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
+No GitHub Actions stale workflow is currently configured in the repository. Maintainers run stale passes to prevent inactive issues from accumulating while preserving a defined response window for the affected community. The [issue stale policy](../maintainers/labels.md#issue-stale-policy) is the sole operational source for timing, qualifying activity, exclusions, and re-engagement; the issue-triage protocol carries only the execution mechanics.
 
 **PR size labeling (future/optional):**
 

@@ -2,7 +2,6 @@
 //! wasmtime host path. The fixture is built from the standalone reference-plugin
 //! app against `wit/v0`; loading it here proves the host instantiates and calls a
 //! real component, the config jail injects only the plugin's own section, and the
-//! redaction policy is driven by that section.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 

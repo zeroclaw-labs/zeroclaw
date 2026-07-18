@@ -7,11 +7,6 @@ use std::str::FromStr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-/// A single keystroke pattern.
-///
-/// On darwin, most `CONTROL` chords are translated to `SUPER` at match time so
-/// Linux's `Ctrl+K` and macOS's `⌘K` resolve to the same chord. `Ctrl+C` stays
-/// distinct so the system copy chord (`⌘C`) does not trigger Quit.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Chord {
     pub code: KeyCode,
@@ -74,11 +69,6 @@ impl Chord {
         }
     }
 
-    /// OS-independent canonical wire form used for persistence:
-    /// lowercase, `+`-joined modifiers then key, e.g. `ctrl+k`,
-    /// `shift+up`, `ctrl+shift+down`, `f5`, `pageup`. Never uses the
-    /// darwin glyphs — a config written on macOS loads identically on
-    /// Linux. Round-trips with [`Chord::from_str`].
     pub fn wire(&self) -> String {
         let mut out = String::new();
         // Modifier tokens walk the canonical registry so render and
@@ -230,7 +220,7 @@ impl<'de> Deserialize<'de> for Chord {
 
 #[cfg(target_os = "macos")]
 fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
-    if m.contains(KeyModifiers::CONTROL) && !is_copy_quit_chord(&code) {
+    if m.contains(KeyModifiers::CONTROL) && !is_host_reserved_chord(&code) {
         m.remove(KeyModifiers::CONTROL);
         m.insert(KeyModifiers::SUPER);
     }
@@ -238,13 +228,16 @@ fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
 }
 
 #[cfg(target_os = "macos")]
-fn is_copy_quit_chord(code: &KeyCode) -> bool {
-    matches!(code, KeyCode::Char('c' | 'C'))
+fn is_host_reserved_chord(code: &KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Char('c' | 'C' | 'n' | 'N' | 's' | 'S') | KeyCode::F(1)
+    )
 }
 
 #[cfg(target_os = "macos")]
 fn control_display_label(code: &KeyCode) -> &'static str {
-    if is_copy_quit_chord(code) {
+    if is_host_reserved_chord(code) {
         "Ctrl"
     } else {
         "⌘"
@@ -261,14 +254,6 @@ fn normalise_mods(code: KeyCode, m: KeyModifiers) -> KeyModifiers {
     strip_redundant_shift(code, m)
 }
 
-/// Drop the SHIFT bit for character keys. A shifted character (`?`,
-/// `G`, `:`) already encodes its shift in the glyph itself, but
-/// platforms disagree on whether SHIFT is *also* reported alongside
-/// it: Unix terminals strip it, the Windows console keeps it. Comparing
-/// it would make `?` (the default Help chord) only match on platforms
-/// that strip SHIFT, forcing Windows users to hand-bind `shift+?`.
-/// Modifier keys that genuinely change the keystroke (Ctrl/Alt/Super)
-/// are left untouched.
 fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
     if matches!(code, KeyCode::Char(_)) {
         m.remove(KeyModifiers::SHIFT);
@@ -385,6 +370,25 @@ mod tests {
 
         assert!(!chord.matches(&copy));
         assert!(chord.matches(&quit));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_chords_stay_terminal_safe_ctrl_on_darwin() {
+        for c in ['n', 's'] {
+            let chord = Chord::ctrl(c);
+            let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            let cmd = KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER);
+            assert!(
+                chord.matches(&ctrl),
+                "Ctrl+{c} must match the terminal-safe Control event"
+            );
+            assert!(
+                !chord.matches(&cmd),
+                "Ctrl+{c} must not bind the host-reserved Command event"
+            );
+            assert_eq!(chord.display(), format!("Ctrl+{c}"));
+        }
     }
 
     #[test]

@@ -1,17 +1,6 @@
 //! Observer bridge — projects [`crate::LogEvent`]s onto the typed
 //! [`zeroclaw_api::observability_traits::ObserverEvent`] variants when a
 //! bound observer is installed.
-//!
-//! Lets metrics backends (Prometheus, OTel) consume the same single
-//! emission stream as the JSONL log and the SSE broadcast. The
-//! projection is bounded: only the actions that map to a known variant
-//! get forwarded, and only the metric-relevant subset of fields
-//! crosses the boundary (the high-cardinality content like message body
-//! and attributes does not).
-//!
-//! Install via [`set_observer_bridge`]; bridge is invoked once per event
-//! by `writer::record_event`. Missing observer = no-op; unmapped action
-//! = no-op.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

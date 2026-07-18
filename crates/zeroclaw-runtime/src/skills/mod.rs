@@ -95,7 +95,7 @@ pub struct Skill {
 
 /// Why the audited resolver dropped a candidate skill directory/file.
 /// Carries the human-readable detail the loader already logs, so the
-/// dashboard can show the same reason without re-running the audit. (#7963)
+/// dashboard can show the same reason without re-running the audit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillDropReason {
     /// `audit_*` returned Ok(report) with findings. `summary` = report.summary();
@@ -108,16 +108,9 @@ pub enum SkillDropReason {
     },
     /// `audit_*` returned Err (unauditable); String = error message.
     AuditError(String),
-    /// Audit passed but SKILL.toml/manifest.toml failed to parse.
     ManifestParseError(String),
 }
 
-/// A candidate skill the resolver loaded-then-dropped. Name is inferred from
-/// the directory/file stem (the manifest may be unreadable). `location` is the
-/// on-disk path for operator debugging. `origin_hint` mirrors the loader that
-/// produced it (workspace/open-skills/plugin/bundle) — a *string tag*, not the
-/// `SkillOrigin` enum, because a dropped skill has no resolved `location`-based
-/// origin to derive from. (#7963)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DroppedSkill {
     pub name: String,
@@ -129,13 +122,120 @@ pub struct DroppedSkill {
 
 /// One lower-precedence skill that lost its name to an earlier (higher-priority)
 /// source during the agent's effective-skill dedup. Recorded for the dashboard
-/// so operators can see why an assigned bundle skill is being overridden. (#7963)
+/// so operators can see why an assigned bundle skill is being overridden.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShadowedSkill {
     /// The name shared with (and won by) the higher-precedence skill.
     pub name: String,
     /// Origin of the LOSER: `"open-skills"` | `"plugin"` | `"bundle"`.
     pub origin_hint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlashOptionKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    User,
+    Channel,
+    Role,
+    Mentionable,
+}
+
+impl SlashOptionKind {
+    /// Every kind, in the order surfaces should offer them. Walked (not
+    /// restated) by every registry consumer.
+    pub const ALL: [Self; 8] = [
+        Self::String,
+        Self::Integer,
+        Self::Number,
+        Self::Boolean,
+        Self::User,
+        Self::Channel,
+        Self::Role,
+        Self::Mentionable,
+    ];
+
+    /// The canonical `type` token written in frontmatter.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::User => "user",
+            Self::Channel => "channel",
+            Self::Role => "role",
+            Self::Mentionable => "mentionable",
+        }
+    }
+
+    /// Predefined `choices` apply only to string/integer/number options.
+    pub fn supports_choices(self) -> bool {
+        match self {
+            Self::String | Self::Integer | Self::Number => true,
+            Self::Boolean | Self::User | Self::Channel | Self::Role | Self::Mentionable => false,
+        }
+    }
+
+    /// `min`/`max` numeric bounds apply only to integer/number options.
+    pub fn supports_numeric_bounds(self) -> bool {
+        match self {
+            Self::Integer | Self::Number => true,
+            Self::String
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// `min_length`/`max_length` bounds apply only to string options.
+    pub fn supports_length_bounds(self) -> bool {
+        match self {
+            Self::String => true,
+            Self::Integer
+            | Self::Number
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// The wire-facing capability row for this kind, consumed by API surfaces.
+    pub fn descriptor(self) -> SlashOptionKindDescriptor {
+        SlashOptionKindDescriptor {
+            manifest_name: self.manifest_name().to_string(),
+            supports_choices: self.supports_choices(),
+            supports_numeric_bounds: self.supports_numeric_bounds(),
+            supports_length_bounds: self.supports_length_bounds(),
+        }
+    }
+}
+
+/// Serialized capability row for one [`SlashOptionKind`], as published to
+/// surfaces (the web dashboard mirrors this shape). Built by walking
+/// [`SlashOptionKind::ALL`]; never hand-authored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindDescriptor {
+    pub manifest_name: String,
+    pub supports_choices: bool,
+    pub supports_numeric_bounds: bool,
+    pub supports_length_bounds: bool,
+}
+
+/// The full registry, produced by exhaustively walking [`SlashOptionKind::ALL`].
+pub fn slash_option_kinds() -> Vec<SlashOptionKindDescriptor> {
+    SlashOptionKind::ALL
+        .into_iter()
+        .map(SlashOptionKind::descriptor)
+        .collect()
 }
 
 /// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
@@ -206,12 +306,6 @@ pub struct SkillTool {
     /// (e.g. `images__generate`).
     #[serde(default)]
     pub target: Option<String>,
-    /// For `kind = "builtin"` / `kind = "mcp"`: arguments fixed by the skill
-    /// manifest. These are **locked** — they are applied on top of the
-    /// caller-supplied args and cannot be overridden by the model. This is
-    /// what scopes a delegated tool (e.g. `target = "composio"` +
-    /// `locked_args = { action_name = "TEXT_TO_PDF" }` exposes exactly one
-    /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
     /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
@@ -226,11 +320,6 @@ pub struct SkillTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillManifest {
     skill: SkillMeta,
-    /// SkillForge-emitted provenance metadata. Lives in a top-level `[forge]`
-    /// table so that `SkillMeta` (the canonical skill-identity contract) is
-    /// not coupled to the SkillForge integrator's emit format. Hand-authored
-    /// SKILL.toml files omit this; auto-integrated skills carry it. See
-    /// #6210 for the architectural rationale (FND-001 §4.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forge: Option<ForgeMetadata>,
     #[serde(default)]
@@ -258,12 +347,6 @@ struct SkillMeta {
     slash_options: Vec<SkillSlashOption>,
 }
 
-/// Provenance metadata emitted by the SkillForge integrator (see
-/// `crates/zeroclaw-runtime/src/skillforge/integrate.rs`). Lives at the
-/// top level of SKILL.toml under `[forge]`, kept separate from
-/// `[skill]` so the canonical skill identity stays decoupled from the
-/// integrator's emit format. Strict by design: a typo here is just as
-/// bad as a typo in `[skill]` (silent misconfiguration of provenance).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForgeMetadata {
@@ -289,12 +372,6 @@ struct ForgeMetadata {
     /// Runtime/version requirements declared by the integrator.
     #[serde(default)]
     requirements: BTreeMap<String, toml::Value>,
-    /// Free-form integrator metadata (e.g. `auto_integrated`,
-    /// `forge_timestamp`). **This is the intended extension point** for
-    /// future SkillForge metadata: prefer adding new keys under
-    /// `[forge.metadata.X]` over new top-level `[forge]` fields, which
-    /// would require a coordinated `ForgeMetadata` schema bump and break
-    /// strict parsing for anyone running an older runtime.
     #[serde(default)]
     metadata: BTreeMap<String, toml::Value>,
 }
@@ -317,19 +394,6 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
-/// Trust tier of a skill listed in the `zeroclaw-skills` registry.
-///
-/// Derived from the `tags` array in `registry.json`. `Unknown` is used as the
-/// "no recognized tier tag" fallback and is treated like `Community` for trust
-/// purposes when displaying the install banner.
-///
-/// `Featured` is intentionally kept as a distinct variant even though it
-/// renders identically to `Community` today: the registry's `Featured` tag is
-/// a separate curation signal (zeroclaw-labs hand-picked, but still authored
-/// outside zeroclaw-labs) and we expect to render it differently later — e.g.
-/// "Featured — community-curated by zeroclaw-labs but not maintained by us".
-/// Keeping the variant now avoids a churn-y enum extension once that copy
-/// lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillTier {
     Official,
@@ -383,12 +447,6 @@ pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier
     (tier_from_tags(&entry.tags), entry.version)
 }
 
-/// Build the install-time tier banner. `Official` skills get a single
-/// informational line; everything else (including `Featured` and the
-/// missing-tag fallback) gets the Community warn block.
-/// Pure: the Fluent key for a tier's install banner. Split out so tests can
-/// resolve it against the English catalogue without depending on the process
-/// locale.
 fn install_tier_banner_key(tier: SkillTier) -> &'static str {
     match tier {
         SkillTier::Official => "cli-skills-install-tier-official",
@@ -511,7 +569,7 @@ pub fn load_skills_with_config(
 }
 
 /// Like [`load_skills_with_config`] but also returns the audit-dropped
-/// candidates the resolver skipped, so the dashboard can surface them (#7963).
+/// candidates the resolver skipped, so the dashboard can surface them
 pub fn load_skills_with_config_audited(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
@@ -534,14 +592,6 @@ pub fn load_skills_with_config_audited(
     (skills, dropped)
 }
 
-/// Per-agent skill discovery. Walks `[agents.<agent_alias>].skill_bundles`,
-/// resolves each bundle's directory via the shared
-/// [`zeroclaw_config::skill_bundles::resolve_directory`] helper, and unions
-/// the skills under each bundle with whatever
-/// [`load_skills_with_config`] would return for the install (workspace
-/// skills, open-skills, plugin skills). Empty `skill_bundles` falls back
-/// to the install-wide set — keeps freshly-migrated agents working until
-/// the operator assigns a bundle.
 pub fn load_skills_for_agent(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
@@ -550,17 +600,6 @@ pub fn load_skills_for_agent(
     load_skills_for_agent_audited(workspace_dir, config, agent_alias).0
 }
 
-/// Origin tag for a pre-bundle skill, mirroring [`super::service`]'s
-/// `derive_origin` discriminators minus the bundle-dir match (a pre-bundle
-/// skill is never bundle-origin). Used to seed the dedup winner map so the
-/// shadow record can name the winner's source. (#7963)
-///
-/// This is a best-effort, display-only attribution for the shadow badge: the
-/// tag-based heuristic can misclassify a workspace skill whose `tags` happen to
-/// contain `"open-skills"` (or a `plugin:`-prefixed tag). That is acceptable
-/// because the hint never affects which skills load or their precedence — it
-/// only labels the source that already won the dedup. Not an authoritative
-/// origin resolver; use [`super::service`]'s `derive_origin` for that.
 fn origin_hint_of(skill: &Skill) -> &'static str {
     if skill.tags.iter().any(|t| t == "open-skills") {
         "open-skills"
@@ -575,7 +614,7 @@ fn origin_hint_of(skill: &Skill) -> &'static str {
 
 /// [`load_skills_for_agent`] plus the audit-dropped and shadowed candidates the
 /// resolver skipped, so the dashboard can surface them without re-auditing or
-/// re-walking (#7963).
+/// re-walking
 pub fn load_skills_for_agent_audited(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
@@ -631,7 +670,7 @@ pub fn load_skills_for_agent_audited(
             if seen.contains_key(&skill.name) {
                 // This bundle skill lost the name to an earlier source.
                 // Record the loser keyed to the winner's name so the
-                // dashboard can badge the winning skill. (#7963)
+                // dashboard can badge the winning skill.
                 shadows.push(ShadowedSkill {
                     name: skill.name.clone(),
                     origin_hint: "bundle".into(),
@@ -645,14 +684,6 @@ pub fn load_skills_for_agent_audited(
     (skills, dropped, shadows)
 }
 
-/// Production helper: loads skills for an agent using the correct per-agent
-/// workspace directory. This is the single call site that all runtime paths
-/// (agent boot, message processing, WebSocket/daemon) must use to ensure
-/// skills are loaded from `<install>/agents/<alias>/workspace/skills/`
-/// rather than `config.data_dir`.
-///
-/// Source of truth for the workspace directory is `config.agent_workspace_dir(agent_alias)`;
-/// this helper resolves it on every call so config reloads take effect.
 pub fn load_skills_for_agent_from_config(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -662,7 +693,7 @@ pub fn load_skills_for_agent_from_config(
 
 /// [`load_skills_for_agent_from_config`] plus the audit-dropped and shadowed
 /// candidates the resolver skipped — the dashboard's source for the
-/// skipped-audit banner and shadow badges (#7963).
+/// skipped-audit banner and shadow badges
 pub fn load_skills_for_agent_from_config_audited(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -1573,6 +1604,20 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     )
 }
 
+fn is_registered_skill_tool_kind(kind: &str) -> bool {
+    matches!(kind, "shell" | "script" | "http" | "builtin" | "mcp")
+}
+
+fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
+    if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+        return false;
+    }
+    match tool.kind.as_str() {
+        "builtin" | "mcp" => tool.target.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        _ => true,
+    }
+}
+
 /// Build the "Available Skills" system prompt section with configurable verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
@@ -1631,18 +1676,15 @@ pub fn skills_to_prompt_with_mode(
         }
 
         if !skill.tools.is_empty() {
-            // Tools with known kinds (shell, script, http) are registered as
-            // callable tool specs and can be invoked directly via function calling.
-            // We note them here for context but mark them as callable.
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| skill_tool_is_prompt_callable(t))
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| !skill_tool_is_prompt_callable(t))
                 .collect();
 
             if !registered.is_empty() {
@@ -1658,7 +1700,7 @@ pub fn skills_to_prompt_with_mode(
                         "name",
                         // Must match the registered tool spec's name exactly
                         // (same sanitizer), or the model is told to call a name
-                        // that no tool exposes (#6678).
+                        // that no tool exposes
                         &crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
@@ -1687,16 +1729,6 @@ pub fn skills_to_prompt_with_mode(
     prompt
 }
 
-/// Convert skill tools into callable `Tool` trait objects.
-///
-/// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
-/// (for `shell`/`script` kinds), `SkillHttpTool` (for `http` kind), or
-/// `SkillBuiltinTool` (for `builtin` kind), enabling them to appear as
-/// first-class callable tool specs rather than only as XML in the system
-/// prompt.
-///
-/// The `builtin` kind requires the unfiltered tool registry. Use
-/// [`skills_to_tools_with_context`] to register that kind.
 pub fn skills_to_tools(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
@@ -1704,17 +1736,6 @@ pub fn skills_to_tools(
     skills_to_tools_with_context(skills, security, &[])
 }
 
-/// Convert skill tools into callable `Tool` trait objects with full context.
-///
-/// `unfiltered_registry` provides the pre-policy tool list for `builtin`
-/// delegation.
-/// Resolve a skill elevation tool (`kind = "builtin"` or `kind = "mcp"`).
-///
-/// Both kinds delegate to a tool resolved by name from `resolution_registry`
-/// (built-in tools + MCP tool wrappers). The only difference is `kind_label`,
-/// used for diagnostics. Returns `None` (after a WARN) when the `target` is
-/// missing or not resolvable, so a misconfigured manifest is skipped, never
-/// fatal.
 fn resolve_elevated_tool(
     skill_name: &str,
     tool: &SkillTool,
@@ -1779,6 +1800,18 @@ pub fn skills_to_tools_with_context_and_runtime(
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
+            if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        tool.kind, skill.name, tool.name
+                    )
+                );
+                continue;
+            }
             match tool.kind.as_str() {
                 "shell" | "script" => {
                     let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
@@ -1812,17 +1845,9 @@ pub fn skills_to_tools_with_context_and_runtime(
                         tools.push(t);
                     }
                 }
-                other => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!(
-                            "Unknown skill tool kind '{}' for {}.{}, skipping",
-                            other, skill.name, tool.name
-                        )
-                    );
-                }
+                // `is_registered_skill_tool_kind` above admits only the kinds
+                // dispatched here, so any other kind was already skipped.
+                other => unreachable!("registered skill kind '{other}' not dispatched"),
             }
         }
     }
@@ -2789,12 +2814,6 @@ pub fn install_extra_registry_skill_source(
 
 // ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
 
-/// Load skills from skill-capable plugins discovered by the plugin host.
-///
-/// Each plugin's `skills/` directory is fed to the existing skill loader, and
-/// every loaded skill is renamed to `plugin:<plugin>/<skill>` to avoid
-/// collisions with user-authored skills and between bundles. The `plugin:<name>`
-/// tag is also added so prompts can distinguish plugin skills.
 #[cfg(feature = "plugins-wasm")]
 pub fn load_plugin_skills_from_config(
     config: &zeroclaw_config::schema::Config,
@@ -2860,6 +2879,46 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 mod registry_tests {
     use super::*;
     use std::io::{self, Write};
+
+    #[test]
+    fn slash_option_kinds_registry_is_walked_from_the_enum() {
+        // The published registry is exactly `SlashOptionKind::ALL` walked into
+        // descriptors, in order. No hand-authored rows: adding a variant to the
+        // enum extends this without touching the builder.
+        let registry = slash_option_kinds();
+        assert_eq!(registry.len(), SlashOptionKind::ALL.len());
+        for (descriptor, kind) in registry.iter().zip(SlashOptionKind::ALL) {
+            assert_eq!(descriptor.manifest_name, kind.manifest_name());
+            assert_eq!(descriptor.supports_choices, kind.supports_choices());
+            assert_eq!(
+                descriptor.supports_numeric_bounds,
+                kind.supports_numeric_bounds()
+            );
+            assert_eq!(
+                descriptor.supports_length_bounds,
+                kind.supports_length_bounds()
+            );
+        }
+    }
+
+    #[test]
+    fn only_scalar_kinds_carry_bounds_and_choices() {
+        // Capability invariants the surfaces depend on: numeric bounds imply a
+        // scalar with choices; length bounds are string-only.
+        for kind in SlashOptionKind::ALL {
+            if kind.supports_numeric_bounds() || kind.supports_length_bounds() {
+                assert!(
+                    kind.supports_choices(),
+                    "{:?} carries bounds but is not choiceable",
+                    kind.manifest_name()
+                );
+            }
+        }
+        assert!(SlashOptionKind::String.supports_length_bounds());
+        assert!(!SlashOptionKind::String.supports_numeric_bounds());
+        assert!(SlashOptionKind::Integer.supports_numeric_bounds());
+        assert!(!SlashOptionKind::Integer.supports_length_bounds());
+    }
 
     struct CountingWriter {
         written: usize,
@@ -3175,9 +3234,6 @@ mod registry_tests {
         assert!(!dest.exists(), "dest must not be created for rejected zip");
     }
 
-    /// Regression: an entry whose central directory understates the real
-    /// uncompressed size must be rejected during extraction, not silently
-    /// truncated on disk.
     #[test]
     fn test_extract_zip_secure_rejects_lying_declared_size() {
         // 60 MiB payload, but we patch the central directory to claim 1 byte.
@@ -3199,9 +3255,6 @@ mod registry_tests {
         );
     }
 
-    /// Regression: multiple entries can each declare a small uncompressed size
-    /// while their actual payloads collectively exceed the cap. The cumulative
-    /// guard must count bytes actually extracted, not declared sizes.
     #[test]
     fn test_extract_zip_secure_rejects_multi_entry_lying_declared_size() {
         const ENTRY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB each
@@ -3687,10 +3740,6 @@ descriptin = "oops"
         );
     }
 
-    /// Positive control covering the new field × strictness intersection:
-    /// after the rebase onto master (which added `prompts: Vec<String>`
-    /// to `SkillMeta` per #5972), the field must continue to parse cleanly
-    /// under `#[serde(deny_unknown_fields)]`.
     #[test]
     fn accepts_prompts_in_skill_block_with_strictness() {
         let toml_str = r#"
@@ -3707,8 +3756,6 @@ prompts = ["one", "two"]
         );
     }
 
-    /// Hand-authored skills that don't carry SkillForge provenance must parse
-    /// without error — `forge` is `Option<ForgeMetadata>` with `default`.
     #[test]
     fn parses_skill_without_forge_block() {
         let toml_str = r#"
@@ -3725,9 +3772,6 @@ description = "no forge block"
         assert_eq!(manifest.skill.name, "hand-authored");
     }
 
-    /// Happy path: a SkillForge-emitted manifest with a fully populated
-    /// `[forge]` table, including the nested `[forge.requirements]` and
-    /// `[forge.metadata]` sub-tables.
     #[test]
     fn parses_skill_with_forge_block() {
         let toml_str = r#"
@@ -3777,9 +3821,6 @@ forge_timestamp = "2026-04-30T12:00:00Z"
         );
     }
 
-    /// `ForgeMetadata` carries `#[serde(deny_unknown_fields)]` — a typo at
-    /// the `[forge]` level (e.g. `licence` next to `license`) must surface
-    /// loudly the same way a typo in `[skill]` does.
     #[test]
     fn rejects_unknown_field_in_forge_block() {
         let toml_str = r#"
@@ -3800,11 +3841,6 @@ licence = true
         );
     }
 
-    /// Round-trip guard: the SkillForge integrator must emit `[forge]` keys
-    /// at the top level (sibling to `[skill]`), not inside `[skill]`. If a
-    /// future refactor moves these back, this test fails because the parsed
-    /// manifest's `forge` field would be `None` (and `SkillMeta` would
-    /// reject the unknown keys via `deny_unknown_fields`).
     #[test]
     fn integrate_round_trip_emits_top_level_forge() {
         use crate::skillforge::scout::{ScoutResult, ScoutSource};
@@ -3848,24 +3884,10 @@ licence = true
                 .is_some_and(|s| s.contains("round-trip")),
             "forge.source should carry the upstream URL"
         );
-        // Crucial guard: none of the provenance keys leaked into [skill].
-        // A failure here means generate_toml regressed and is putting forge
-        // keys back inside `[skill]` — `deny_unknown_fields` on `SkillMeta`
-        // would have caught that already as a parse error, but assert
-        // explicitly so the failure is unambiguous in CI output.
         assert_eq!(manifest.skill.name, "round-trip");
         assert_eq!(manifest.skill.description, "round-trip test");
     }
 
-    /// Behavioral assertion for the swallow-site fix: a SKILL.toml whose
-    /// `[skill]` block has a typo causes `load_skill_toml` to return `Err`,
-    /// and `load_skills_from_directory` skips it without panicking and
-    /// without including it in the loaded set. The accompanying
-    /// `tracing::warn!` call (with structured `path` and `err` fields) is
-    /// verified by source inspection — the codebase does not currently
-    /// pull in a `tracing-subscriber` test harness, and adding one purely
-    /// for this assertion would violate the AGENTS.md anti-pattern of
-    /// adding dependencies for minor convenience.
     #[test]
     fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
@@ -3911,7 +3933,7 @@ description = "fine"
             !names.contains(&"bad"),
             "bad skill must be skipped, not silently accepted; got: {names:?}"
         );
-        // #7963: the skipped skill is surfaced as an audit drop, not silently lost.
+        // the skipped skill is surfaced as an audit drop, not silently lost.
         assert_eq!(dropped.len(), 1, "the bad TOML skill must be reported");
         assert_eq!(dropped[0].origin_hint, "workspace");
         assert!(matches!(
@@ -3920,11 +3942,6 @@ description = "fine"
         ));
     }
 
-    /// #7861: a workspace skill bundling a shell script under the secure
-    /// default (`allow_scripts = false`) is dropped as an audit finding whose
-    /// summary carries the scripts-blocked marker, and is absent from the
-    /// loaded set. Flipping `allow_scripts = true` loads it and empties the
-    /// dropped set. This is what `zeroclaw skills list` surfaces as "Skipped".
     #[test]
     fn workspace_script_bundling_skill_reported_as_scripts_blocked_drop() {
         use tempfile::TempDir;
@@ -4042,10 +4059,6 @@ mod prompt_callable_name_tests {
         }
     }
 
-    /// The skills prompt must advertise the exact same callable name the tool
-    /// spec registers (both via `composed_tool_name`). A plugin-namespaced skill
-    /// with a dotted tool name would otherwise render a raw `skill__tool` the
-    /// model cannot invoke, which is the prompt half of #6678.
     #[test]
     fn prompt_callable_name_matches_registered_tool_name() {
         let skill = Skill {
@@ -4077,6 +4090,143 @@ mod prompt_callable_name_tests {
         assert!(
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+
+    fn tool_with_target(name: &str, kind: &str, target: &str) -> SkillTool {
+        SkillTool {
+            target: Some(target.to_string()),
+            ..tool(name, kind)
+        }
+    }
+
+    #[test]
+    fn prompt_callable_predicate_matches_registration_preconditions() {
+        // shell/script/http always register -> always prompt-callable.
+        assert!(skill_tool_is_prompt_callable(&tool("run", "shell")));
+        assert!(skill_tool_is_prompt_callable(&tool("run", "script")));
+        assert!(skill_tool_is_prompt_callable(&tool("fetch", "http")));
+        // builtin/mcp are elevation wrappers: callable only WITH a target.
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "gen",
+            "mcp",
+            "images__generate"
+        )));
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "sh", "builtin", "shell"
+        )));
+        // ... and NOT callable without one (the converter's resolve_elevated_tool
+        // would return None, so advertising them callable lies to the model).
+        assert!(!skill_tool_is_prompt_callable(&tool("gen", "mcp")));
+        assert!(!skill_tool_is_prompt_callable(&tool("sh", "builtin")));
+        // A whitespace-only target is as good as absent.
+        assert!(!skill_tool_is_prompt_callable(&tool_with_target(
+            "gen", "mcp", "   "
+        )));
+        // unknown kinds are never callable.
+        assert!(!skill_tool_is_prompt_callable(&tool("x", "weird")));
+    }
+
+    #[test]
+    fn converter_skips_targetless_elevation_matching_the_prompt_predicate() {
+        // The end-to-end invariant the renderer relies on: the registry converter
+        // registers exactly the tools `skill_tool_is_prompt_callable` marks callable
+        // (for what is statically decidable). A target-less builtin/mcp elevation
+        // tool is skipped by the converter, so it must not be advertised callable.
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool("run", "shell"),  // always registers
+                tool("orphan", "mcp"), // no target -> skipped
+                tool("sh", "builtin"), // no target -> skipped
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let registered: Vec<String> =
+            crate::skills::skills_to_tools(std::slice::from_ref(&skill), security)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+
+        // shell registers; the target-less elevation tools do not - matching the
+        // prompt predicate for each.
+        for t in &skill.tools {
+            let composed = crate::tools::skill_tool::composed_tool_name(&skill.name, &t.name);
+            let in_registry = registered.iter().any(|n| n == &composed);
+            assert_eq!(
+                in_registry,
+                skill_tool_is_prompt_callable(t),
+                "prompt-callable and registry-registered must agree for {} ({}): registry={in_registry}",
+                t.name,
+                t.kind,
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_lists_mcp_with_target_as_callable_and_targetless_as_not() {
+        let skill = Skill {
+            name: "imagegen".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool_with_target("generate", "mcp", "images__generate"),
+                tool("orphan", "mcp"), // no target -> not registered
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        // The callable block comes first, the unregistered <tools> block after.
+        let callable_idx = prompt
+            .find("<callable_tools")
+            .expect("callable_tools block");
+        let tools_at = prompt
+            .find("<tools>")
+            .expect("unregistered <tools> block present for the target-less mcp tool");
+        assert!(
+            callable_idx < tools_at,
+            "callable block precedes unregistered block"
+        );
+
+        // The targeted mcp tool is advertised as callable (composed name, under
+        // <callable_tools>, before the unregistered block).
+        let callable = crate::tools::skill_tool::composed_tool_name(&skill.name, "generate");
+        let callable_at = prompt
+            .find(&format!("<name>{callable}</name>"))
+            .expect("targeted mcp skill tool must be present as a callable name");
+        assert!(
+            callable_at > callable_idx && callable_at < tools_at,
+            "targeted mcp skill tool must render under <callable_tools>:\n{prompt}"
+        );
+
+        // The target-less mcp tool renders under the unregistered <tools> block
+        // (raw name, after the callable block) - the converter would skip it.
+        let orphan_at = prompt
+            .find("<name>orphan</name>")
+            .expect("target-less mcp skill tool must be present under <tools>");
+        assert!(
+            orphan_at > tools_at,
+            "target-less mcp skill tool must render as unregistered, not callable:\n{prompt}"
         );
     }
 }
@@ -4126,9 +4276,6 @@ version = "0.1.0"
         .unwrap();
     }
 
-    /// #7963: `load_skills_for_agent_from_config_audited` returns the loaded
-    /// skills *and* the audit-dropped candidates, so the dashboard can surface
-    /// the latter. One clean + one parse-broken workspace skill → 1 + 1.
     #[test]
     fn load_skills_for_agent_from_config_audited_returns_dropped() {
         let install_root = TempDir::new().unwrap();
@@ -4167,21 +4314,6 @@ version = "0.1.0"
         ));
     }
 
-    /// Regression test for #7236: `load_skills_for_agent_from_config` must
-    /// load skills from the per-agent workspace directory, not from `data_dir`.
-    ///
-    /// The bug: three call sites passed `&config.data_dir` instead of
-    /// `&config.agent_workspace_dir(agent_alias)`, causing skills placed in
-    /// `<install>/agents/<alias>/workspace/skills/` to be silently ignored.
-    ///
-    /// This test constructs a config where `data_dir` and
-    /// `agent_workspace_dir(agent_alias)` are distinct paths, places a skill
-    /// only in the agent workspace, and verifies:
-    /// 1. `load_skills_for_agent_from_config` finds the skill (correct behavior)
-    /// 2. Calling `load_skills_for_agent` with `data_dir` does NOT find the skill (the bug)
-    ///
-    /// The test would fail if `load_skills_for_agent_from_config` reverted to
-    /// using `config.data_dir` instead of `config.agent_workspace_dir(agent_alias)`.
     #[test]
     fn load_skills_for_agent_from_config_uses_workspace_dir_not_data_dir() {
         let install_root = TempDir::new().unwrap();
@@ -4232,10 +4364,6 @@ version = "0.1.0"
         );
     }
 
-    /// Verifies that `load_skills_for_agent_from_config` with an empty
-    /// `skill_bundles` list falls back to the install-wide skill set from
-    /// the workspace dir. This pins the contract that the helper resolves
-    /// the correct workspace directory regardless of bundle configuration.
     #[test]
     fn load_skills_for_agent_from_config_empty_bundles_uses_workspace_dir() {
         let install_root = TempDir::new().unwrap();

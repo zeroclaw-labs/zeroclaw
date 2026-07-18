@@ -1,5 +1,22 @@
 use async_trait::async_trait;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingIdentity {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+}
+
+impl std::fmt::Display for EmbeddingIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} ({} dims)",
+            self.provider, self.model, self.dimensions
+        )
+    }
+}
+
 /// Trait for embedding model_providers — convert text to vectors
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {

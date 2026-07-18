@@ -4,40 +4,20 @@ use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 mod registry;
 pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-/// Why the daemon's main loop returned.
-///
-/// `Shutdown`: process exits cleanly. `Reload`: caller (typically `src/main.rs`)
-/// re-reads the config from disk and calls `daemon::run` again. The PID stays
-/// the same; only the in-process subsystems get torn down and re-instantiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonExit {
     Shutdown,
     Reload,
 }
 
-/// Wait for either a shutdown signal (SIGINT / SIGTERM / Ctrl+C) or an
-/// in-process reload signal (the gateway's `/admin/reload` writes `true`
-/// on the watch channel). Returns the reason so the outer loop can decide
-/// whether to re-init or exit. SIGHUP is ignored on Unix so the daemon
-/// survives terminal / SSH disconnects.
-///
-/// The reload trigger is a tokio watch channel (not an OS signal) so it
-/// works identically on Linux, macOS, and Windows. The Sender is owned by
-/// the daemon (created in `run`) and cloned to the gateway for AppState.
-/// Default grace period (seconds) before ephemeral shutdown after last client disconnects.
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
-/// Test-only sentinel for the scheduler cooperative-shutdown path through
-/// `daemon::run`. `spawn_component_supervisor` sets this to `true` only when
-/// the scheduler component takes the cancel-aware clean-return branch. The
-/// daemon-boundary regression test in `#[cfg(test)]` resets and asserts it.
 #[cfg(test)]
 static SCHEDULER_CLEAN_SHUTDOWN_OBSERVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -139,11 +119,19 @@ async fn wait_for_exit_signal(
 
     #[cfg(not(unix))]
     {
+        // In-process shutdown trigger (no SIGTERM on Windows): the gateway fires
+        // this to request a graceful exit, e.g. for post-upgrade self-respawn.
+        let respawn_shutdown = crate::restart::shutdown_notify().notified();
+        tokio::pin!(respawn_shutdown);
         loop {
             tokio::select! {
                 res = tokio::signal::ctrl_c() => {
                     res?;
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received Ctrl+C, shutting down...");
+                    return Ok(DaemonExit::Shutdown);
+                }
+                _ = &mut respawn_shutdown => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "In-process shutdown requested, shutting down...");
                     return Ok(DaemonExit::Shutdown);
                 }
                 changed = reload_rx.changed() => {
@@ -189,18 +177,6 @@ async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::Atom
     }
 }
 
-/// How the daemon should treat the configured gateway address before it starts
-/// its own supervised gateway (#7895).
-///
-/// The daemon's gateway shares an in-process event bus, canvas store, and
-/// reload channel with the daemon's other subsystems. A separately started
-/// `zeroclaw gateway start` is a *different process* that shares none of that —
-/// its `/admin/reload` even returns 503 ("no daemon supervisor"). The daemon
-/// therefore cannot adopt an external gateway as its own without an attachment
-/// / IPC design that is out of scope here. So the actionable outcomes are to
-/// start fresh on a free address or to fail fast on an occupied one — the
-/// issue's "reuse intentionally or fail fast with a clear decision". We take
-/// the fail-fast branch and only vary the *message* by who holds the port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayBindMode {
     /// Address is free (or an ephemeral port): start and supervise our own gateway.
@@ -244,13 +220,6 @@ fn gateway_health_probe_url(config: &Config, host: &str, port: u16) -> String {
     )
 }
 
-/// Best-effort: does a ZeroClaw gateway answer `/health` on the configured
-/// address? Used *only* to choose the fail-fast message — never to decide
-/// whether the port is free (the bind probe owns that). Redirects are disabled
-/// so an occupant cannot bounce the probe elsewhere, and a strong ZeroClaw
-/// identity is required: a bare `{"status":"ok"}` from an unrelated service is
-/// deliberately not enough (the public `/health` contract also carries
-/// `require_pairing` and `runtime` — see `handle_health` in `zeroclaw-gateway`).
 async fn zeroclaw_gateway_responds(config: &Config, host: &str, port: u16) -> bool {
     let url = gateway_health_probe_url(config, host, port);
     let Ok(client) = reqwest::Client::builder()
@@ -277,19 +246,6 @@ async fn zeroclaw_gateway_responds(config: &Config, host: &str, port: u16) -> bo
     )
 }
 
-/// Decide how the daemon should handle the configured gateway address before
-/// starting its own supervised gateway (#7895).
-///
-/// The throwaway bind targets the *configured* address through the same parser
-/// the gateway uses (`parse_gateway_bind_socket_addr`), so it is a faithful
-/// dry-run of the real bind: if the probe binds, the gateway will; if it
-/// cannot, the gateway would otherwise have entered a supervisor retry loop.
-/// Only when the bind fails do we probe `/health`, purely to tell an existing
-/// ZeroClaw gateway apart from a foreign occupant in the error message.
-///
-/// Best-effort pre-check: the supervised gateway's own bind stays the authority
-/// on a genuine conflict, covering the narrow TOCTOU window after the probe
-/// bind is dropped.
 pub async fn detect_gateway_bind_mode(config: &Config, host: &str, port: u16) -> GatewayBindMode {
     // Port 0 is a kernel-assigned ephemeral port: it cannot already be bound,
     // so always start fresh.
@@ -313,20 +269,6 @@ pub async fn detect_gateway_bind_mode(config: &Config, host: &str, port: u16) ->
     .await
 }
 
-/// Map the throwaway bind result to a `GatewayBindMode`.
-///
-/// Only `AddrInUse` is a genuine conflict worth failing fast over. Any other
-/// bind error — e.g. `EACCES`/`PermissionDenied` on a privileged port (<1024)
-/// when the daemon is not root — is *not* a "port occupied" condition: the
-/// address may well be free. Treating it as occupied would misreport the cause
-/// (and `zeroclaw_gateway_responds` would return `false` since nothing is
-/// listening, yielding the wrong "another process" message). For those we defer
-/// to the supervised gateway's own bind to surface the real error, which
-/// restores the pre-#7895 behaviour for that case.
-///
-/// Split out from `detect_gateway_bind_mode` so the non-`AddrInUse` branch is
-/// unit-testable without having to provoke a real privileged-port bind failure
-/// (which is environment-dependent: it succeeds as root, fails as non-root).
 async fn classify_gateway_bind_outcome(
     bind: std::io::Result<tokio::net::TcpListener>,
     config: &Config,
@@ -373,11 +315,6 @@ pub async fn run(
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
-    // Wire the log broadcast hook so every record!() emission reaches the
-    // RPC logs/subscribe stream. Without this, tool calls and agent events
-    // logged via record!() are invisible to the zerocode Logs pane when
-    // connected over the Unix socket (the gateway wires this separately for
-    // its own event_tx; the daemon's RPC event_tx must be wired here).
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
     if config.heartbeat.enabled
@@ -389,12 +326,6 @@ pub async fn run(
         .await;
     }
 
-    // Consume the pricing catalog (`<data_dir>/pricing.json`) if present so the
-    // cost engine can price models the operator never hand-priced in config.
-    // This is consumption only and vendor-neutral: a typical build populates the
-    // file from a public price feed, while an air-gapped build may ship no file
-    // (self-hosted/free models then stay $0). Refreshing the file is a CLI +
-    // scheduler concern, never a public-feed fetch inside this shared daemon.
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
@@ -403,11 +334,6 @@ pub async fn run(
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
 
-    // Shared shutdown signal for every supervised component. Hoisted
-    // here (before any `spawn_component_supervisor` call) so the
-    // gateway supervisor — which is the first to spawn — can also
-    // receive a clone. Firing once in the shutdown sequence cancels
-    // every component in a single atomic step.
     let channels_cancel = tokio_util::sync::CancellationToken::new();
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
@@ -453,17 +379,6 @@ pub async fn run(
         ));
     }
 
-    // EPIC-A supervision: bring up (or, on reload, REUSE) the durable run/task
-    // control-plane, then recover prior-boot orphan tasks and start the reaper. Inits
-    // before channels so a delegating turn finds the plane live. Best-effort and
-    // additive: on failure the plane stays absent and every producer runs as today.
-    //
-    // `daemon::run` is re-entered on every reload. The handle is installed ONCE (an
-    // OnceLock), so producers and the reaper always agree on one `boot_id`. We therefore
-    // only START on first boot; on reload we reuse the installed handle and just respawn
-    // the reaper (the prior iteration's reaper was cancelled when the old `channels_cancel`
-    // fired). Spawning a fresh handle each reload would mint a new boot_id whose reaper
-    // would then reap the daemon's OWN live tasks as "prior-boot orphans".
     if crate::control_plane::control_plane().is_none()
         && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
             .await
@@ -521,7 +436,7 @@ pub async fn run(
         );
     }
 
-    // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
+    // RPC transports: Unix socketand WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
@@ -638,7 +553,7 @@ pub async fn run(
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel
             // supervisor. Without this the RPC/zerocode-TUI turn path has no
-            // tracker to record into and model cost is silently dropped (#5221).
+            // tracker to record into and model cost is silently dropped
             cost_tracker: crate::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
                 &config.data_dir,
@@ -758,11 +673,6 @@ pub async fn run(
     if config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
-        // Reuse the daemon's `channels_cancel` token so the scheduler
-        // receives the same shutdown signal as every other supervised
-        // component. See `daemon/mod.rs:584` — the token is cancelled
-        // before the supervisor's `.abort()` fallback, so the scheduler
-        // returns `Ok(())` cleanly via its own `select!` arm.
         let scheduler_cancel = channels_cancel.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -797,27 +707,8 @@ pub async fn run(
         },
     );
 
-    // Fire channel cancellation before aborting supervisors so listener tasks
-    // get a chance to drop their `Arc<dyn Channel>` (and the matrix-sdk SQLite
-    // pools the Arc transitively pins). The supervisor itself observes the
-    // same `cancel` token (see `spawn_component_supervisor`); cooperative
-    // components like the cron scheduler (#8465) return `Ok(())` cleanly on
-    // their cancellation arm and the supervisor exits the restart loop.
-    // Components that abort their async work before a forced abort will
-    // still get `handle.abort()` called, but the tokio abort on an already-
-    // completed task is a no-op, so the `handle.await` below resolves
-    // immediately rather than waiting for a yield point.
     channels_cancel.cancel();
 
-    // Grace window: cooperative components (e.g. the cron scheduler)
-    // get a bounded window to observe the cancellation token and exit
-    // cleanly before forced abort. Without this the abort wins the race
-    // against the supervisor's `cancel.is_cancelled()` check. The
-    // `select!` uses biased priority so an already-finished handle is
-    // drained immediately even before the deadline fires.
-    // Handles that complete during the grace window are dropped; only
-    // handles that must be force-aborted go into `remaining` for
-    // a final bounded await.
     const GRACE_WINDOW: Duration = Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
     let mut remaining: Vec<JoinHandle<()>> = Vec::new();
@@ -912,18 +803,6 @@ where
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
-        // A run is only treated as "stable" (and therefore allowed to reset
-        // the backoff) if the component stayed up for at least this long. A
-        // component that returns almost immediately — whether `Ok(())` or
-        // `Err` — is a fast-fail: resetting the backoff on those makes the
-        // supervisor hot-loop at `initial_backoff` forever.
-        //
-        // That hot loop is the root cause of #5542: on WSL2, glibc's malloc
-        // retains freed arenas per worker thread rather than returning them to
-        // the OS, so a ~1/sec restart storm churns allocations that never get
-        // reclaimed and RSS climbs until the kernel OOM-kills the process. A
-        // component that exits promptly must therefore back off exponentially,
-        // exactly like an erroring one, instead of spinning.
         let stable_run = Duration::from_secs(initial_backoff_secs.max(1).saturating_mul(5));
 
         loop {
@@ -933,13 +812,6 @@ where
             let ran_for = run_started.elapsed();
             match outcome {
                 Ok(()) => {
-                    // Distinguish cooperative shutdown (cancel signal
-                    // fired) from an unexpected `Ok(())` early return.
-                    // Without this check, every cooperative shutdown
-                    // was misclassified as "exited unexpectedly" and
-                    // looped forever, blocking the daemon's
-                    // `for handle in handles { handle.await }` wait at
-                    // shutdown.
                     if cancel.is_cancelled() {
                         crate::health::mark_component_ok(name);
                         #[cfg(test)]
@@ -972,11 +844,6 @@ where
                             })),
                         &format!("Daemon component '{name}' exited unexpectedly")
                     );
-                    // Only reset the backoff if the component actually stayed
-                    // up for a meaningful stretch. A component that returns
-                    // `Ok(())` almost immediately is a fast-fail restart storm,
-                    // not a healthy run — resetting here would pin the backoff
-                    // at `initial_backoff` and hot-loop the supervisor (#5542).
                     if ran_for >= stable_run {
                         backoff = initial_backoff_secs.max(1);
                     }
@@ -1005,11 +872,6 @@ where
             }
 
             crate::health::bump_component_restart(name);
-            // Return any arena pages the just-exited component freed back to
-            // the kernel before we sleep. On WSL2 with glibc, freed allocations
-            // linger in per-thread arenas and keep RSS pinned; without this a
-            // restart loop's transient allocations accumulate into an OOM
-            // (#5542). No-op off Linux/glibc.
             crate::util::release_freed_heap();
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
@@ -1172,6 +1034,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
@@ -1253,11 +1116,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
-        // Create memory once per tick for recall + consolidation. Use the
-        // routes-aware factory with the provider catalog so `[[embedding_routes]]`
-        // (and dotted `model_provider` refs) resolve here exactly as on the
-        // gateway/RPC paths — otherwise heartbeat recall would silently fall
-        // back to keyword-only for hint-routed embeddings.
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
             zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
@@ -1276,42 +1134,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let task_start = std::time::Instant::now();
             let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
 
-            // Recall relevant memories so heartbeat tasks have context awareness.
-            // Exclude `Conversation` memories to prevent chat context from
-            // leaking into scheduled executions.
-            let memory_context = if let Some(ref mem) = heartbeat_memory {
-                match mem.recall(&task.text, 5, None, None, None).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        let ctx: String = entries
-                            .iter()
-                            .filter(|e| {
-                                !matches!(
-                                    e.category,
-                                    zeroclaw_memory::traits::MemoryCategory::Conversation
-                                )
-                            })
-                            .map(|e| format!("- {}: {}", e.key, e.content))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if ctx.is_empty() {
-                            None
-                        } else {
-                            Some(format!(
-                                "{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n"
-                            ))
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let prompt = match (&session_context, &memory_context) {
-                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
-                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
-                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
-                (None, None) => task_prompt,
+            // Memory context is injected once in the engine, keyed on the
+            // Daemon origin (agent::memory_inject): Conversation entries are
+            // excluded for scheduled origins. `heartbeat_memory` stays for
+            // the post-run auto-save consolidation below.
+            let prompt = match &session_context {
+                Some(sc) => format!("{sc}\n\n{task_prompt}"),
+                None => task_prompt,
             };
             let temp: Option<f64> = config
                 .model_provider_for_agent(&agent_alias)
@@ -1327,6 +1156,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
@@ -1408,14 +1238,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         output
                     };
-                    // Skip delivery when the heartbeat agent signalled "nothing
-                    // to report" via the quiet NO_REPLY sentinel. Without this
-                    // guard the literal sentinel string is announced to the
-                    // channel (zeroclaw-labs/zeroclaw#2128). The empty-output
-                    // branch above never produces the sentinel, so checking the
-                    // final announcement is sufficient. Failure/refusal kinds
-                    // (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are delivered, not
-                    // suppressed — they carry operator-visible meaning.
                     let suppress_delivery =
                         !crate::cron::scheduler::announce_delivery_decision(&announcement)
                             .should_deliver();
@@ -1566,15 +1388,6 @@ fn resolve_heartbeat_delivery(config: &Config) -> Result<Option<(String, String)
     }
 }
 
-/// Load recent conversation history for the heartbeat's delivery target and
-/// format it as a text preamble to inject into the task prompt.
-///
-/// Scans `{workspace}/sessions/` for JSONL files whose name starts with
-/// `{channel}_` and ends with `_{to}.jsonl` (or exactly `{channel}_{to}.jsonl`),
-/// then picks the most recently modified match. This handles session key
-/// formats such as `telegram_diskiller.jsonl` and
-/// `telegram_5673725398_diskiller.jsonl`.
-/// Returns `None` when `target`/`to` are not configured or no session exists.
 const HEARTBEAT_SESSION_CONTEXT_MESSAGES: usize = 20;
 
 fn load_heartbeat_session_context(config: &Config) -> Option<String> {
@@ -1810,11 +1623,6 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    // Check that at least one channel entry has `enabled = true`.
-    // A config with only `enabled = false` entries (e.g. partially-configured
-    // or intentionally disabled bots) must not start the supervisor — the
-    // channels component would find nothing to listen on, return Ok(()), and
-    // the daemon supervisor would restart it in a tight loop.
     config.channels.has_any_enabled()
 }
 
@@ -2023,18 +1831,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_clean_shutdown_when_cancel_fires() {
-        // Regression for #8465: a component that returns `Ok(())` on
-        // its cancellation arm (e.g. the cron scheduler after the
-        // `CancellationToken` was threaded through) must be classified
-        // as a clean shutdown, not an unexpected exit. Without this
-        // distinction, the daemon's "exited unexpectedly" log path
-        // misclassifies every cooperative shutdown.
         let cancel = tokio_util::sync::CancellationToken::new();
-        // `spawn_component_supervisor` requires `FnMut` so the closure
-        // can be re-invoked on every component restart. `CancellationToken`
-        // is not `Copy`, so the outer closure must hold it by `Arc` to
-        // share it across invocations; the inner async block takes a
-        // reference to the same `Arc<CancellationToken>` on each call.
         let cancel_arc = std::sync::Arc::new(cancel.clone());
         let handle = spawn_component_supervisor("daemon-test-cancel", 1, 1, cancel.clone(), {
             let cancel_arc = std::sync::Arc::clone(&cancel_arc);
@@ -2083,15 +1880,6 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_backs_off_on_fast_ok_exit_loop() {
-        // Regression for #5542: a component that returns `Ok(())` almost
-        // immediately must NOT hot-loop at `initial_backoff` forever. Before
-        // the fix, every unexpected `Ok(())` reset the backoff, so the
-        // supervisor restarted ~1/sec indefinitely — on WSL2 that restart
-        // storm churned glibc arena allocations into an OOM.
-        //
-        // With exponential backoff applied to fast-fail `Ok(())` exits, the
-        // restart count over a fixed window is bounded: 1s + 2s + 4s ... means
-        // only a couple of restarts fit into a few seconds, not dozens.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2130,11 +1918,6 @@ mod tests {
 
     #[test]
     fn all_disabled_channels_not_supervised() {
-        // Regression test: a config with channel entries that all have
-        // `enabled = false` must not start the channels supervisor.
-        // Previously, has_supervised_channels only checked map non-emptiness,
-        // causing the supervisor to start, find nothing to listen on, return
-        // Ok(()), and restart in a tight loop.
         let mut config = Config::default();
         config.channels.discord.insert(
             "clamps".to_string(),
@@ -2210,6 +1993,7 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -2377,7 +2161,7 @@ mod tests {
 
     #[test]
     fn resolve_delivery_rejects_configured_but_undeliverable_channel() {
-        // #7681 review: a configured input-only channel (mqtt is a fan-in
+        // review: a configured input-only channel (mqtt is a fan-in
         // listener whose Channel::send is a no-op) must not pass heartbeat
         // validation just because its table exists. Otherwise the validator
         // claims a target the delivery surface silently drops.
@@ -2398,7 +2182,7 @@ mod tests {
 
     #[test]
     fn resolve_delivery_rejects_voice_duplex_target() {
-        // #7680 review: voice_duplex has a configured table and a WebSocket
+        // review: voice_duplex has a configured table and a WebSocket
         // event protocol but no Channel::send outbound path, so a heartbeat
         // target pointing at it must be rejected like the other input-only
         // transports rather than falling through to the dotted-ref error.
@@ -2450,6 +2234,7 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
 
@@ -2478,6 +2263,7 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.
@@ -2506,8 +2292,6 @@ mod tests {
         assert!(target.is_none());
     }
 
-    /// Verify that SIGHUP does not cause shutdown — the daemon should ignore it
-    /// and only terminate on SIGINT or SIGTERM.
     #[cfg(unix)]
     #[tokio::test]
     async fn sighup_does_not_shut_down_daemon() {
@@ -2532,8 +2316,6 @@ mod tests {
         );
     }
 
-    /// In-process reload channel returns DaemonExit::Reload so the outer
-    /// loop can re-init. Cross-platform — works on Linux, macOS, Windows.
     #[tokio::test]
     async fn reload_channel_returns_reload() {
         use tokio::time::{Duration, timeout};
@@ -2619,35 +2401,6 @@ mod tests {
         assert!(has_tui_registry);
     }
 
-    /// Daemon-boundary evidence for #8465: the cooperative scheduler
-    /// shutdown must be observable through the real `daemon::run`
-    /// shutdown loop, not only the `spawn_component_supervisor` helper
-    /// in isolation (see `supervisor_marks_clean_shutdown_when_cancel_fires`).
-    ///
-    /// The earlier two-patch series proved that the supervisor's
-    /// `cancel.is_cancelled()` branch classifies a cooperative `Ok(())`
-    /// as clean, and that the daemon's bounded 500ms grace window lets
-    /// the scheduler's `cancel.cancelled()` arm fire before the abort
-    /// fallback. This test proves the *combined* path through the real
-    /// `daemon::run` reload flow rather than a hand-rolled supervisor
-    /// call: the scheduler is enabled in config, spawned by the daemon,
-    /// observes the same `channels_cancel` token, takes its cancel arm,
-    /// returns `Ok(())`, and the supervisor takes the clean-shutdown
-    /// return path.
-    ///
-    /// The reviewer asked specifically for evidence that the supervisor's
-    /// `cancel.is_cancelled()` branch runs through the real daemon
-    /// shutdown loop. The health snapshot alone (`status == "ok"`,
-    /// `restart_count == 0`, `last_error == null`) is not sufficient,
-    /// because aborting the supervisor task before it observes the
-    /// component's `Ok(())` leaves the pre-await health state unchanged.
-    ///
-    /// To prove the clean-return branch actually ran, this test uses a
-    /// test-only sentinel that `spawn_component_supervisor` sets only
-    /// when the scheduler component reaches the cancel-aware `return`.
-    /// If the grace window is removed, or if the supervisor handle is
-    /// aborted before the scheduler returns `Ok(())`, the sentinel stays
-    /// `false` and the test fails.
     #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
@@ -2655,11 +2408,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;
-        // First `tokio::time::interval` tick fires immediately; the
-        // scheduler then parks at `select! { interval.tick(), cancel.cancelled() }`
-        // waiting for the next tick (5s, the MIN_POLL_SECONDS floor).
-        // We trigger reload well within that window so the cancel arm
-        // wins deterministically.
 
         reset_scheduler_clean_shutdown_observed();
 
@@ -2688,11 +2436,6 @@ mod tests {
         .expect("daemon run should succeed");
         assert_eq!(exit, DaemonExit::Reload);
 
-        // The scheduler's cooperative cancel arm must have fired
-        // through the real `daemon::run` shutdown loop, and the
-        // supervisor must have observed the resulting `Ok(())` and
-        // taken the cancel-aware clean-return branch. The sentinel is
-        // only set in that specific branch.
         assert!(
             scheduler_clean_shutdown_observed(),
             "scheduler supervisor must take the cancel-aware clean-return branch; \
@@ -2796,7 +2539,7 @@ mod tests {
         assert_eq!(result, DaemonExit::Shutdown);
     }
 
-    // ── #7895: daemon gateway bind-mode detection (fail-fast) ────────────────
+    // ── daemon gateway bind-mode detection (fail-fast) ────────────────
 
     /// Raw HTTP/1.1 `/health` body a real ZeroClaw gateway returns (shape
     /// mirrors `handle_health` in `zeroclaw-gateway`): `status: ok` plus the
@@ -2963,12 +2706,6 @@ mod tests {
 
     #[tokio::test]
     async fn detect_gateway_bind_mode_defers_on_non_addr_in_use_error() {
-        // A non-AddrInUse bind failure (e.g. EACCES on a privileged port when
-        // the daemon is not root) is NOT a "port occupied" condition: the
-        // address may be free. Classify it as StartFresh so the supervised
-        // gateway's own bind surfaces the real error, rather than misreporting
-        // the port as in use by another process. Injected directly because the
-        // error is environment-dependent (it would succeed as root in CI).
         let outcome = classify_gateway_bind_outcome(
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
             &Config::default(),

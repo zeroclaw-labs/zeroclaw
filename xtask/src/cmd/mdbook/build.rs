@@ -44,15 +44,11 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     crate::cmd::mdbook::themes::run(root)?;
     crate::cmd::mdbook::keymap::run(root)?;
     crate::cmd::mdbook::hardware::run(root)?;
+    crate::cmd::mdbook::feature_matrix::run(root)?;
     crate::cmd::mdbook::plugins::run(root)?;
     let mdbook = mdbook_program()?;
     let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
-    // Search is enabled only for the primary locale. Per-locale searchindex is
-    // high-entropy (~6-7 MB raw each) and does not delta-compress across
-    // versions, so building it for every locale dominates gh-pages clone size.
-    // The primary locale (first in locales.toml, English) keeps full search;
-    // translated locales build without a search index or search box.
     let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
         let dest = format!("book/{}/{}", tag_dir, entry.code);
@@ -71,12 +67,6 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
-/// Render `theme/lang-switcher.js.tpl` into `theme/lang-switcher.js` with the
-/// `LOCALES` array filled from `locales.toml`. The `.js` output is gitignored
-/// (every locale add/remove rewrites it); the `.tpl` source is the tracked
-/// truth. Errors loudly when the template is missing — silently skipping
-/// would let mdBook fail later with a confusing "missing additional-js"
-/// message.
 pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
     let tpl_path = book.join("theme/lang-switcher.js.tpl");
     let js_path = book.join("theme/lang-switcher.js");
@@ -207,11 +197,6 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
         return Ok(());
     }
 
-    // Map each hashed chrome file (path relative to the locale dir, e.g.
-    // `theme/custom-abc12345.css`) to its unhashed `_shared`-relative path
-    // (e.g. `theme/custom.css`). The `../` prefix is applied per HTML file
-    // below, because a page's correct depth to the version root — and thus to
-    // `_shared` at the gh-pages root — depends on how deep the page sits.
     let mut replacements = Vec::new();
     let prefixes = [
         "css/chrome",
@@ -265,13 +250,6 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
     for entry in locale_entries() {
         let loc_dir = version_dir.join(&entry.code);
         for file in walk_dir(&loc_dir) {
-            // Depth of this HTML file below the locale dir. mdBook emits chrome
-            // refs as `<../ × (locale_depth + page_depth)>theme/foo-HASH.css`
-            // for an HTML page `page_depth` levels under the locale dir; the
-            // matching `_shared` ref needs the same total `../` count plus one
-            // to clear the version dir up to the gh-pages root where `_shared`
-            // lives. Concretely: page directly in `<tag>/<locale>/` -> `../../`,
-            // one level deeper -> `../../../`, and so on.
             let page_depth = file
                 .strip_prefix(&loc_dir)
                 .ok()

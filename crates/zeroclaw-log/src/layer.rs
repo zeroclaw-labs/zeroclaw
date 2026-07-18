@@ -2,21 +2,6 @@
 //! `attribution_span!` spans, assembling alias-bound `LogEvent`s and
 //! routing them to JSONL persistence, the broadcast hook, and the
 //! Observer bridge.
-//!
-//! Two recognized span/event shapes:
-//!
-//! 1. `attribution_span!(thing)` — opens a span with `target =
-//!    "zeroclaw_log_internal_attribution"` carrying `zc_role_family`,
-//!    `zc_role_type`, `zc_attribution_field`, `zc_composite_prefix`,
-//!    `zc_default_category`, and `zc_alias`. The layer stashes a
-//!    `ZeroclawAttribution` snapshot in the span's extensions; no
-//!    LogEvent is emitted for the span itself.
-//! 2. `record!(LEVEL, Event::new(...), "msg")` — emits an event with
-//!    `target = "zeroclaw_log_event"` carrying `zc_name`, `zc_action`,
-//!    `zc_outcome`, `zc_category`, `zc_attrs`, `zc_has_duration`,
-//!    `zc_duration_ms`, and `message`. The layer walks the span scope
-//!    leaf→root, merges every attribution snapshot it finds, and
-//!    writes a fully populated `LogEvent`.
 
 use std::fmt::Write;
 
@@ -227,12 +212,6 @@ where
             }
         }
 
-        // Promote a recognized `trace_id` from the assembled attributes into
-        // the native OTel field so `?trace_id=` filters (reader.rs +
-        // gateway api_logs.rs) match. The id rode in via the call site's
-        // `with_attrs(json!({"trace_id": ..}))` or a `scope!(trace_id: ..)`
-        // ScopeExtra merge above. COPY (not move): the attributes mirror is
-        // still read by observer_bridge.rs, so leave it in place.
         if log_event.trace_id.is_none()
             && let Some(tid) = log_event.attributes.get("trace_id").and_then(Value::as_str)
         {
@@ -459,11 +438,6 @@ impl AttributionSpanCollector {
     }
 }
 
-/// Carries ad-hoc per-scope context (sender id, message id, turn id,
-/// etc.) emitted via [`crate::scope!`]. Recognized attribution fields
-/// land in `attribution`; any free-form keys land in `extra`. Both
-/// stashes ride on the span's extensions and are merged onto every
-/// descendant event by the layer's scope walk.
 #[derive(Default)]
 struct ScopeExtra {
     extra: JsonMap<String, Value>,
@@ -608,6 +582,21 @@ mod e2e_tests {
         }
     }
 
+    /// Synthetic `Role::System` fixture standing in for config
+    /// load/migration attribution.
+    struct FakeSystemSurface {
+        alias: String,
+    }
+
+    impl Attributable for FakeSystemSurface {
+        fn role(&self) -> Role {
+            Role::System
+        }
+        fn alias(&self) -> &str {
+            &self.alias
+        }
+    }
+
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[allow(clippy::await_holding_lock)]
@@ -647,11 +636,6 @@ mod e2e_tests {
             .await;
         }
 
-        // Drain captured events and find ours. `recv` is awaited inside a
-        // deadline so the receiver can recover from `Lagged` errors caused
-        // by other workspace tests firing `record!` into the same global
-        // broadcast hook in parallel; a single Lagged would otherwise abort
-        // the search prematurely.
         let mut found = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !found && std::time::Instant::now() < deadline {
@@ -696,10 +680,70 @@ mod e2e_tests {
         crate::clear_broadcast_hook();
     }
 
-    /// A `trace_id` carried in the call site's `with_attrs` payload must be
-    /// promoted by the layer into the native top-level `trace_id` field (so
-    /// `?trace_id=` filters match), while ALSO remaining inside `attributes`
-    /// for the observer bridge.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn system_role_span_populates_system_alias() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let thing = FakeSystemSurface {
+            alias: "config".into(),
+        };
+
+        {
+            use zeroclaw_log::Instrument;
+            async {
+                zeroclaw_log::record!(
+                    INFO,
+                    Event::new(module_path!(), Action::Note).with_outcome(EventOutcome::Success),
+                    "system-role attribution e2e test"
+                );
+            }
+            .instrument(zeroclaw_log::attribution_span!(&thing))
+            .await;
+        }
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("system-role attribution e2e test"))
+                        .unwrap_or(false)
+                    {
+                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                        assert_eq!(
+                            zc.get("system_alias").and_then(|v| v.as_str()),
+                            Some("config"),
+                            "expected system_alias, got: {zc:?}"
+                        );
+                        assert_eq!(zc.get("zc_role").and_then(|v| v.as_str()), Some("system"),);
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found,
+            "did not find the test event with system_alias attribution",
+        );
+
+        crate::clear_broadcast_hook();
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn with_attrs_trace_id_promoted_to_native_field() {

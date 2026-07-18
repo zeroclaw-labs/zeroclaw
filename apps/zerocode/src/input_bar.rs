@@ -1,8 +1,5 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
-//!
-//! Embedded by both Chat and ACP panes — each pane owns its own
-//! `InputBarState` instance with independent state.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -391,6 +388,35 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
+fn is_word_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn previous_word_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let mut chars = text[..cursor].char_indices().rev();
+
+    let mut target_is_word = None;
+    for (_, character) in chars.by_ref() {
+        if character.is_whitespace() {
+            continue;
+        }
+        target_is_word = Some(is_word_character(character));
+        break;
+    }
+
+    let Some(target_is_word) = target_is_word else {
+        return (cursor > 0).then_some(0);
+    };
+
+    for (index, character) in chars {
+        if character.is_whitespace() || is_word_character(character) != target_is_word {
+            return Some(index + character.len_utf8());
+        }
+    }
+
+    Some(0)
+}
+
 /// Decide which overflow arrows to show for `(up, down)` given the total
 /// content rows, the visible window, and the current scroll offset. Arrows
 /// only appear when content exceeds the window.
@@ -726,11 +752,6 @@ impl InputBarState {
         self.cursor = self.input.len();
     }
 
-    /// Enter pressed while the autocomplete popup is open: accept the
-    /// highlighted match. A command completion that still expects an argument
-    /// (`/model `, `/model-provider `) only fills the input so the user can keep
-    /// typing or pick from the argument popup; any other accepted completion is
-    /// a runnable line, so submit it in the same keystroke.
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
         let Some(idx) = self.autocomplete_index else {
             return self.handle_enter();
@@ -776,6 +797,20 @@ impl InputBarState {
             self.cursor = prev_start;
             self.update_autocomplete();
         }
+    }
+
+    pub fn delete_previous_word(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            self.update_autocomplete();
+            return;
+        }
+        let Some(delete_from) = previous_word_boundary(&self.input, self.cursor) else {
+            return;
+        };
+        self.input.replace_range(delete_from..self.cursor, "");
+        self.cursor = delete_from;
+        self.update_autocomplete();
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -1065,6 +1100,10 @@ impl InputBarState {
                 self.pop_input_char();
                 return InputBarAction::Consumed;
             }
+            Some(IbWidgetAction::DeletePreviousWord) => {
+                self.delete_previous_word();
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::ClearInput) => {
                 self.clear_input();
                 return InputBarAction::Consumed;
@@ -1346,11 +1385,6 @@ impl InputBarState {
         }
     }
 
-    /// Fallback paste path: insert clipboard text directly. Used when Ctrl+V
-    /// finds no image, and as the only paste route on terminals that don't
-    /// emit bracketed paste (`Event::Paste`) — e.g. the legacy Windows
-    /// console. Routes through `handle_paste` so a pasted file path is still
-    /// auto-attached, matching bracketed-paste behaviour.
     fn paste_clipboard_text(&mut self) -> InputBarAction {
         match clipboard::read_clipboard_text() {
             Some(text) => {
@@ -1367,12 +1401,6 @@ impl InputBarState {
 
     // ── Selection rendering helper ───────────────────────────
 
-    /// Build styled lines for the input text, pre-wrapped using the same
-    /// `wrap_visual_lines` logic that drives cursor positioning.
-    ///
-    /// Each returned `Line` corresponds to exactly one visual row so the
-    /// `Paragraph` must be rendered **without** `Wrap` — otherwise ratatui
-    /// would re-wrap with its own algorithm and the cursor would drift.
     fn build_input_lines(&self, width: u16) -> Vec<Line<'_>> {
         let sel_style = Style::default()
             .bg(theme::selection_bg())
@@ -1426,18 +1454,6 @@ impl InputBarState {
 
     // ── Rendering ────────────────────────────────────────────
 
-    /// Render the input bar (attachment bar + input box) at the bottom of `area`.
-    ///
-    /// Returns the remaining `Rect` above the input bar for the parent to
-    /// render conversation content into.
-    ///
-    /// `show_cursor` controls whether the terminal cursor is positioned in the
-    /// input box (false when an approval overlay is active).
-    ///
-    /// `turn_status` drives the title-bar label (verb + animated dots); it is
-    /// always `Idle` when no turn is in flight. `turn_started_at` is the
-    /// animation anchor — pass the `Instant` recorded when the turn began so
-    /// the dots cycle deterministically across redraws.
     pub fn render(
         &mut self,
         f: &mut Frame,
@@ -1497,12 +1513,6 @@ impl InputBarState {
             f.render_widget(bar, att_rect);
         }
 
-        // Input box.
-        //
-        // Title comes from `TurnStatus::label`, which encodes both the verb
-        // and the dot-pulse animation (anchored to `turn_started_at` so paints
-        // within the same animation phase render identically). When idle, the
-        // status is `Idle` and the label is the plain " > " prompt.
         let label_owned = turn_status.label(turn_started_at);
         let label: &str = &label_owned;
         let block = Block::default()
@@ -1538,11 +1548,6 @@ impl InputBarState {
             f.render_widget(p, input_area);
         }
 
-        // Terminal owns cursor blinking; a software blink that skips
-        // set_cursor_position can latch the cursor hidden. The cursor shows
-        // whenever the input box is editable — including while a turn is in
-        // flight, since the user can type a queued message then. Only an
-        // approval overlay (show_cursor=false) or the file browser suppress it.
         if show_cursor && inner_width > 0 && self.file_explorer.is_none() {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 
@@ -1676,7 +1681,15 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>())
+        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>()).with_child(
+            HelpNode::titled(
+                crate::i18n::t("zc-input-help-slash-commands"),
+                SLASH_COMMANDS
+                    .iter()
+                    .map(|cmd| E::key(*cmd, String::new()))
+                    .collect(),
+            ),
+        )
     }
 }
 
@@ -1716,6 +1729,81 @@ mod tests {
         let act = bar.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(matches!(act, InputBarAction::Consumed));
         assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_trailing_space_and_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world   ");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello brave world");
+        for _ in 0..5 {
+            bar.move_cursor_left();
+        }
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello world");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_punctuation_run_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world...");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello world");
+        assert_eq!(bar.cursor(), 11);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_after_punctuation_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello-world");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello-");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_only_whitespace_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("   ");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
     }
 
     #[test]
@@ -2063,6 +2151,27 @@ mod tests {
         let mut expected = action_key_labels(Ib::Submit);
         expected.extend(action_key_labels(Ib::AutocompleteAccept));
         assert_eq!(accept.keys, expected);
+    }
+
+    #[test]
+    fn help_context_lists_slash_commands_from_canonical_source() {
+        use crate::widgets::HelpContext;
+        let bar = InputBarState::new();
+        let node = bar.help_context();
+        let title = crate::i18n::t("zc-input-help-slash-commands");
+        let section = node
+            .children
+            .iter()
+            .find(|c| c.title.as_deref() == Some(title.as_str()))
+            .expect("slash-commands section present");
+        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
+        for cmd in SLASH_COMMANDS {
+            assert!(
+                listed.iter().any(|k| k == cmd),
+                "slash command {cmd} must appear in the help section"
+            );
+        }
+        assert_eq!(listed.len(), SLASH_COMMANDS.len());
     }
 
     #[test]

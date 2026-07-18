@@ -11,8 +11,9 @@ use ratatui::{
 use std::sync::Arc;
 
 use crate::client::{
-    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
-    MessageEntry, OrgCost, RpcClient, SessionEntry, StatusResult, TuiListEntry,
+    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
+    CronTriggerResult, MemoryEntryResult, MessageEntry, OrgCost, RpcClient, SessionEntry,
+    StatusResult, TuiListEntry,
 };
 use crate::mouse;
 use crate::theme;
@@ -28,6 +29,13 @@ const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
 
 pub(crate) enum DashboardMouseAction {
     OpenAgentConfig(String),
+}
+
+struct CronTriggerUpdate {
+    job_id: String,
+    result: Result<CronTriggerResult, String>,
+    jobs: Option<Vec<CronJobEntry>>,
+    runs: Option<Result<Vec<CronRunEntry>, String>>,
 }
 
 // ── Tab enum ─────────────────────────────────────────────────────
@@ -89,24 +97,19 @@ pub(crate) struct Dashboard {
     /// daemon has an `org_cost.json` (an integrator's external sync); `None`
     /// otherwise, so the organization row is simply omitted.
     cost_org: Option<OrgCost>,
-    /// Set when the `cost/org` RPC returns an error (a present-but-broken
-    /// `org_cost.json` — unreadable or invalid). Distinct from an absent
-    /// snapshot (`cost_org == None` with no error): an absent snapshot hides
-    /// the org row, but a broken one is surfaced on the Cost tab so the
-    /// operator fixes the billing cache instead of seeing org billing
-    /// silently vanish as if unconfigured.
     cost_org_error: Option<String>,
     cron_jobs: Vec<CronJobEntry>,
+    cron_runs: Vec<CronRunEntry>,
+    cron_runs_job_id: Option<String>,
+    cron_runs_error: Option<String>,
+    cron_trigger_job_id: Option<String>,
+    cron_trigger_message: Option<String>,
+    cron_trigger_inflight_job_id: Option<String>,
+    cron_trigger_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CronTriggerUpdate>>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
     cost_error: Option<String>,
     sessions_loaded: bool,
-    /// Lazy-loaded full payload for the currently-open Memory detail
-    /// row. Fetched via `memory/get` on selection (the list rows store
-    /// only previews, with `content` truncated to ~200 bytes by the
-    /// daemon). `None` whenever the Memory tab isn't focused or no
-    /// row is selected — long browsing sessions never accumulate
-    /// full-content bodies for entries the user has scrolled past.
     memory_detail: Option<MemoryEntryResult>,
     /// Key of the entry whose detail is currently being fetched or
     /// shown. Used to drop stale `memory/get` responses when the
@@ -164,6 +167,13 @@ impl Dashboard {
             cost_org: None,
             cost_org_error: None,
             cron_jobs: Vec::new(),
+            cron_runs: Vec::new(),
+            cron_runs_job_id: None,
+            cron_runs_error: None,
+            cron_trigger_job_id: None,
+            cron_trigger_message: None,
+            cron_trigger_inflight_job_id: None,
+            cron_trigger_rx: None,
             memories: Vec::new(),
             memory_error: None,
             cost_error: None,
@@ -320,11 +330,6 @@ impl Dashboard {
                     }
                 }
                 self.cost_periods = periods;
-                // Org-level billed snapshot. An absent snapshot (`Ok(None)`,
-                // the daemon returns JSON null for a missing org_cost.json) is
-                // normal and just hides the org row; a present-but-broken
-                // snapshot returns an RPC error, which we surface rather than
-                // collapse to absent (preserves the cost/org #8482 contract).
                 match self.rpc.cost_org().await {
                     Ok(org) => {
                         self.cost_org = org;
@@ -339,6 +344,9 @@ impl Dashboard {
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
+                    if self.detail_open {
+                        self.load_cron_runs().await;
+                    }
                 }
             }
         }
@@ -373,6 +381,8 @@ impl Dashboard {
     // ── Drawing ──────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.drain_cron_trigger_updates();
+
         // Clear stale data when disconnected so panels don't show
         // ghost entries from a previous daemon lifetime.
         if matches!(
@@ -1130,11 +1140,6 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Prefer the lazy-loaded full body when present (populated by
-        // `memory/get` on detail-open via `load_memory_detail`). When
-        // it's still loading, render the truncated preview from
-        // `memories[idx]` so the pane isn't blank for the first frame
-        // before the daemon round-trip lands.
         let m: &MemoryEntryResult = match (&self.memory_detail, self.selected_memory_index()) {
             (Some(detail), _) => detail,
             (None, Some(idx)) => &self.memories[idx],
@@ -1692,6 +1697,10 @@ impl Dashboard {
                 &crate::i18n::t("zc-dashboard-detail-last-status"),
                 j.last_status.as_deref().unwrap_or("\u{2014}"),
             ),
+            detail_line(
+                &crate::i18n::t("zc-dashboard-actions"),
+                &self.cron_action_hint(),
+            ),
         ];
 
         if !j.command.is_empty() {
@@ -1722,6 +1731,94 @@ impl Dashboard {
             )));
             for l in output.lines() {
                 lines.push(Line::from(Span::styled(l.to_string(), theme::body_style())));
+            }
+        }
+
+        if self.cron_trigger_job_id.as_deref() == Some(j.id.as_str())
+            && let Some(message) = &self.cron_trigger_message
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-section-manual-run"),
+                theme::heading_style(),
+            )));
+            for l in message.lines() {
+                lines.push(Line::from(Span::styled(l.to_string(), theme::body_style())));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            crate::i18n::t("zc-dashboard-section-recent-runs"),
+            theme::heading_style(),
+        )));
+        if self.cron_runs_job_id.as_deref() != Some(j.id.as_str()) {
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-loading-runs"),
+                theme::dim_style(),
+            )));
+        } else if let Some(error) = &self.cron_runs_error {
+            lines.push(Line::from(Span::styled(
+                format!("{}: {error}", crate::i18n::t("zc-dashboard-runs-error")),
+                theme::error_style(),
+            )));
+        } else if self.cron_runs.is_empty()
+            && self.cron_trigger_inflight_job_id.as_deref() != Some(j.id.as_str())
+        {
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-no-runs"),
+                theme::dim_style(),
+            )));
+        } else {
+            if self.cron_trigger_inflight_job_id.as_deref() == Some(j.id.as_str()) {
+                lines.push(Line::from(vec![
+                    Span::styled("#... ", theme::dim_style()),
+                    Span::styled(format!("{} ", truncate(&j.id, 24)), theme::dim_style()),
+                    Span::styled(
+                        format!("{:<10}", crate::i18n::t("zc-dashboard-run-pending-status")),
+                        theme::warn_style(),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}  {}",
+                            crate::i18n::t("zc-dashboard-run-pending-window"),
+                            format_duration_ms(None)
+                        ),
+                        theme::dim_style(),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", crate::i18n::t("zc-dashboard-run-pending-output")),
+                    theme::dim_style(),
+                )));
+            }
+            for run in &self.cron_runs {
+                let status_style = cron_run_status_style(&run.status);
+                let run_window = if run.finished_at.trim().is_empty() {
+                    run.started_at.clone()
+                } else {
+                    format!("{} -> {}", run.started_at, run.finished_at)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("#{} ", run.id), theme::dim_style()),
+                    Span::styled(
+                        format!("{} ", truncate(&run.job_id, 24)),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(format!("{:<10}", run.status), status_style),
+                    Span::styled(
+                        format!("{}  {}", run_window, format_duration_ms(run.duration_ms)),
+                        theme::dim_style(),
+                    ),
+                ]));
+                if let Some(output) = run.output.as_deref().filter(|s| !s.trim().is_empty()) {
+                    for l in output.lines().take(3) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", truncate(l, 96)),
+                            theme::body_style(),
+                        )));
+                    }
+                }
             }
         }
 
@@ -1814,6 +1911,11 @@ impl Dashboard {
                 self.memory_detail_key = None;
                 self.session_messages.clear();
                 self.session_messages_id = None;
+                self.cron_runs.clear();
+                self.cron_runs_job_id = None;
+                self.cron_runs_error = None;
+                self.cron_trigger_job_id = None;
+                self.cron_trigger_message = None;
             }
             // Shift+J / Shift+K scroll the detail pane
             Some(DashboardTabAction::DetailScrollDown) => {
@@ -1867,6 +1969,9 @@ impl Dashboard {
                     self.last_poll = None;
                 }
             }
+            Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
+                self.trigger_selected_cron();
+            }
             _ => {}
         }
         false
@@ -1907,6 +2012,9 @@ impl Dashboard {
             }
             Some(DashboardTabAction::Refresh) => {
                 self.poll_data().await;
+            }
+            Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
+                self.trigger_selected_cron();
             }
             Some(DashboardTabAction::JumpEnd) => self.jump_to_end(),
             Some(DashboardTabAction::JumpStart) => self.jump_to_start(),
@@ -1949,6 +2057,136 @@ impl Dashboard {
         }
         if self.tab == Tab::Memories && self.detail_open {
             self.load_memory_detail().await;
+        }
+        if self.tab == Tab::Cron && self.detail_open {
+            self.load_cron_runs().await;
+        }
+    }
+
+    async fn load_cron_runs(&mut self) {
+        let Some(idx) = self.selected_cron_index() else {
+            self.cron_runs.clear();
+            self.cron_runs_job_id = None;
+            self.cron_runs_error = None;
+            return;
+        };
+        let job_id = self.cron_jobs[idx].id.clone();
+        self.cron_runs_job_id = Some(job_id.clone());
+        match self.rpc.cron_runs(&job_id, Some(20)).await {
+            Ok(res) => {
+                if self.cron_runs_job_id.as_deref() == Some(job_id.as_str()) {
+                    self.cron_runs = res.runs;
+                    self.cron_runs_error = None;
+                }
+            }
+            Err(e) => {
+                if self.cron_runs_job_id.as_deref() == Some(job_id.as_str()) {
+                    self.cron_runs.clear();
+                    self.cron_runs_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn trigger_selected_cron(&mut self) {
+        let Some(idx) = self.selected_cron_index() else {
+            self.cron_trigger_job_id = None;
+            self.cron_trigger_message = Some(crate::i18n::t("zc-dashboard-no-job"));
+            return;
+        };
+        let job_id = self.cron_jobs[idx].id.clone();
+        if let Some(inflight_id) = self.cron_trigger_inflight_job_id.as_deref() {
+            self.cron_trigger_message = Some(crate::i18n::t_args(
+                "zc-dashboard-run-already-running",
+                &[("id", inflight_id)],
+            ));
+            return;
+        }
+
+        self.cron_trigger_job_id = Some(job_id.clone());
+        self.cron_trigger_message = Some(crate::i18n::t_args(
+            "zc-dashboard-run-running",
+            &[("id", &job_id)],
+        ));
+        self.cron_trigger_inflight_job_id = Some(job_id.clone());
+
+        let rpc = Arc::clone(&self.rpc);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.cron_trigger_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = rpc.cron_trigger(&job_id).await.map_err(|e| e.to_string());
+            let jobs = rpc.cron_list().await.ok().map(|c| c.jobs);
+            let runs = Some(
+                rpc.cron_runs(&job_id, Some(20))
+                    .await
+                    .map(|r| r.runs)
+                    .map_err(|e| e.to_string()),
+            );
+            let _ = tx.send(CronTriggerUpdate {
+                job_id,
+                result,
+                jobs,
+                runs,
+            });
+        });
+        self.last_poll = None;
+    }
+
+    fn drain_cron_trigger_updates(&mut self) {
+        let Some(mut rx) = self.cron_trigger_rx.take() else {
+            return;
+        };
+        while let Ok(update) = rx.try_recv() {
+            if self.cron_trigger_inflight_job_id.as_deref() == Some(update.job_id.as_str()) {
+                self.cron_trigger_inflight_job_id = None;
+            }
+            self.cron_trigger_job_id = Some(update.job_id.clone());
+            match update.result {
+                Ok(result) => {
+                    let status = if result.success {
+                        crate::i18n::t("zc-dashboard-run-succeeded")
+                    } else {
+                        crate::i18n::t("zc-dashboard-run-failed")
+                    };
+                    let output = result.output.trim();
+                    self.cron_trigger_message = Some(if output.is_empty() {
+                        format!("{status}: {}", result.id)
+                    } else {
+                        format!("{status}: {}\n{}", result.id, output)
+                    });
+                }
+                Err(e) => {
+                    self.cron_trigger_message = Some(format!(
+                        "{}: {e}",
+                        crate::i18n::t("zc-dashboard-run-failed")
+                    ));
+                }
+            }
+            if let Some(jobs) = update.jobs {
+                self.cron_jobs = jobs;
+            }
+            let selected_matches = self
+                .selected_cron_index()
+                .and_then(|idx| self.cron_jobs.get(idx))
+                .is_some_and(|job| job.id == update.job_id);
+            if selected_matches || self.cron_runs_job_id.as_deref() == Some(update.job_id.as_str())
+            {
+                self.cron_runs_job_id = Some(update.job_id.clone());
+                match update.runs {
+                    Some(Ok(runs)) => {
+                        self.cron_runs = runs;
+                        self.cron_runs_error = None;
+                    }
+                    Some(Err(e)) => {
+                        self.cron_runs_error = Some(e);
+                    }
+                    None => {}
+                }
+            }
+            self.last_poll = None;
+        }
+        if self.cron_trigger_inflight_job_id.is_some() {
+            self.cron_trigger_rx = Some(rx);
         }
     }
 
@@ -2080,6 +2318,11 @@ impl Dashboard {
         self.detail_scroll = 0;
         self.health_scroll = 0;
         self.cost_scroll = 0;
+        self.cron_runs.clear();
+        self.cron_runs_job_id = None;
+        self.cron_runs_error = None;
+        self.cron_trigger_job_id = None;
+        self.cron_trigger_message = None;
         // Force immediate data fetch for new tab
         self.last_poll = None;
     }
@@ -2088,6 +2331,17 @@ impl Dashboard {
         matches!(
             self.tab,
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron
+        )
+    }
+
+    fn cron_action_hint(&self) -> String {
+        use crate::keymap::{DashboardTabAction as D, action_key_labels};
+
+        let run = action_key_labels(D::TriggerCron).join("/");
+        let refresh = action_key_labels(D::Refresh).join("/");
+        crate::i18n::t_args(
+            "zc-dashboard-cron-action-hint",
+            &[("run", &run), ("refresh", &refresh)],
         )
     }
 
@@ -2156,11 +2410,6 @@ impl Dashboard {
         self.search_active
     }
 
-    /// Route a bracketed-paste payload into the search buffer when the
-    /// search bar is open. Mirrors the char-insertion path in
-    /// `handle_search_key`, including the live-filter refresh for
-    /// client-side tabs; server-side tabs (sessions, memories) still
-    /// wait for Enter. Ignored when search isn't active.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         if !self.search_active {
             return;
@@ -2202,6 +2451,8 @@ impl crate::widgets::HelpContext for Dashboard {
             ];
             if self.tab == Tab::Sessions {
                 detail.push(D::KillSession);
+            } else if self.tab == Tab::Cron {
+                detail.push(D::TriggerCron);
             }
             return HelpNode::entries(entries_for(detail));
         }
@@ -2222,6 +2473,9 @@ impl crate::widgets::HelpContext for Dashboard {
                     D::OpenDetail,
                     D::BeginSearch,
                 ]));
+                if self.tab == Tab::Cron {
+                    entries.extend(entries_for([D::TriggerCron]));
+                }
             }
         }
         HelpNode::entries(entries)
@@ -2236,6 +2490,31 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
         Span::styled(format!("{label}{}", " ".repeat(pad)), theme::dim_style()),
         Span::styled(value.to_string(), theme::body_style()),
     ])
+}
+
+fn cron_run_status_style(status: &str) -> Style {
+    if status.eq_ignore_ascii_case("ok") || status.eq_ignore_ascii_case("success") {
+        Style::default().fg(Color::Green)
+    } else if status.eq_ignore_ascii_case("error") || status.eq_ignore_ascii_case("failed") {
+        theme::error_style()
+    } else if status.eq_ignore_ascii_case("degraded") || status.eq_ignore_ascii_case("warning") {
+        theme::warn_style()
+    } else {
+        theme::body_style()
+    }
+}
+
+fn format_duration_ms(duration_ms: Option<i64>) -> String {
+    let Some(ms) = duration_ms else {
+        return "-".to_string();
+    };
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2327,21 +2606,6 @@ fn cost_period_windows() -> Vec<(String, String, String)> {
     ]
 }
 
-/// One organization/personal billed-scope row:
-/// `label  YTD $X (N tok)  proj/yr $Y`.
-///
-/// The projection prefers a run-rate (last FULL calendar month × 12, which
-/// captures acceleration); it falls back to linearly scaling YTD by the
-/// fraction of the year elapsed when fewer than two months are present. This
-/// mirrors the CLI report's projection.
-/// Build the organization-billing section for the Cost tab, appended after
-/// the local engine usage. The three states are deliberately distinct so a
-/// broken snapshot never renders identically to an absent one (the cost/org
-/// #8482 contract):
-/// - present (`org = Some`): billed org/personal rows + the FY note;
-/// - broken (`org = None`, `err = Some`): a warning line so the operator
-///   repairs `org_cost.json` instead of seeing the section silently vanish;
-/// - absent (`org = None`, `err = None`): no lines (the org row is omitted).
 fn org_section_lines(
     org: Option<&crate::client::OrgCost>,
     err: Option<&str>,
@@ -2568,5 +2832,13 @@ mod tests {
     #[test]
     fn truncate_uses_first_line_only() {
         assert_eq!(truncate("first\nsecond", 40), "first");
+    }
+
+    #[test]
+    fn format_duration_ms_scales_units() {
+        assert_eq!(format_duration_ms(None), "-");
+        assert_eq!(format_duration_ms(Some(42)), "42ms");
+        assert_eq!(format_duration_ms(Some(1_500)), "1.5s");
+        assert_eq!(format_duration_ms(Some(90_000)), "1.5m");
     }
 }

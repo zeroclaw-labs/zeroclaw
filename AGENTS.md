@@ -97,7 +97,7 @@ Core architecture is trait-driven and modular. Extend by implementing traits and
 
 Key extension points:
 
-- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
+- `crates/zeroclaw-api/src/model_provider.rs` (`ModelProvider`)
 - `crates/zeroclaw-api/src/channel.rs` (`Channel`)
 - `crates/zeroclaw-api/src/tool.rs` (`Tool`)
 - `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
@@ -117,6 +117,7 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-providers` | Beta | — |
 | `zeroclaw-memory` | Beta | — |
 | `zeroclaw-infra` | Beta | — |
+| `zeroclaw-commands` | Experimental | Built-in command catalogue and metadata |
 | `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
 | `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
@@ -139,7 +140,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 
 - `src/main.rs` — CLI entrypoint and command routing
 - `src/lib.rs` — module re-exports and CLI command enum definitions
-- `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
+- `crates/zeroclaw-api/` — public trait definitions (ModelProvider, Channel, Tool, Memory, Observer, Peripheral)
 - `crates/zeroclaw-config/` — schema, config loading/merging
 - `crates/zeroclaw-log/` — unified log surface (record! macro, LogEvent schema, JSONL persistence, broadcast hook, Observer bridge)
 - `crates/zeroclaw-macros/` — Configurable derive macro

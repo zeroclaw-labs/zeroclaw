@@ -1,8 +1,4 @@
 //! Unified SOP event dispatch helpers.
-//!
-//! All event sources (MQTT, webhook, cron, peripheral) route through
-//! `dispatch_sop_event` so that locking, audit, and health bookkeeping
-//! happen in exactly one place.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,10 +12,6 @@ use crate::security::{ContentSafety, ScanOutcome, ScreenVerdict};
 /// Outcome of attempting to dispatch an event to the SOP engine.
 #[derive(Debug, Clone)]
 pub enum DispatchResult {
-    /// A new SOP run was started. `action` carries the next step the runtime
-    /// must execute (or wait for approval on). Callers that cannot act on the
-    /// action (e.g. headless fan-in) must still audit/log it — never silently
-    /// drop.
     Started {
         run_id: String,
         sop_name: String,
@@ -66,16 +58,31 @@ fn action_label(action: &SopRunAction) -> &'static str {
 
 // ── Core dispatch ───────────────────────────────────────────────
 
-/// Dispatch an incoming event to the SOP engine.
-///
-/// Pattern (batch lock — exactly 2 acquisitions):
-/// 1. Lock → `match_trigger` → collect SOP names → drop lock
-/// 2. Lock → for each name: `start_run` → collect results → drop lock
-/// 3. Async (no lock): audit each started run
 pub async fn dispatch_sop_event(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
     event: SopEvent,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(engine, audit, event, None).await
+}
+
+/// Dispatch an incoming event to one named SOP, after normal trigger matching.
+/// This is useful for channel routers that already selected a configured SOP
+/// name, while still requiring that SOP to declare a matching trigger.
+pub async fn dispatch_sop_event_to(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop)).await
+}
+
+async fn dispatch_sop_event_filtered(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: Option<&str>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -115,7 +122,7 @@ pub async fn dispatch_sop_event(
         }
         ScreenVerdict::Block { reason } => {
             if let Err(e) = audit
-                .log_blocked_unsafe(None, event.source, event.topic.as_deref(), &reason)
+                .log_blocked_unsafe(target_sop, event.source, event.topic.as_deref(), &reason)
                 .await
             {
                 ::zeroclaw_log::record!(
@@ -127,7 +134,7 @@ pub async fn dispatch_sop_event(
                 );
             }
             return vec![DispatchResult::BlockedUnsafe {
-                sop_name: None,
+                sop_name: target_sop.map(str::to_string),
                 reason,
             }];
         }
@@ -139,6 +146,7 @@ pub async fn dispatch_sop_event(
             .match_trigger(&event)
             .iter()
             .map(|s| s.name.clone())
+            .filter(|name| target_sop.is_none_or(|target| name == target))
             .collect(),
         Err(e) => {
             crate::health::mark_component_error("sop_dispatch", format!("lock poisoned: {e}"));
@@ -156,7 +164,8 @@ pub async fn dispatch_sop_event(
     if matched_names.is_empty() {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"target_sop": target_sop})),
             "SOP dispatch: no match for event"
         );
         return vec![DispatchResult::NoMatch];
@@ -198,12 +207,6 @@ pub async fn dispatch_sop_event(
                     // Extract run_id from the action (authoritative source)
                     let run_id = extract_run_id_from_action(&action).to_string();
 
-                    // Headless deterministic runs have no agent loop to execute
-                    // steps. Left as-is, the run sits in active_runs as Running
-                    // forever and its max_concurrent slot never frees, so every
-                    // later event from the same SOP is skipped. Drive it to a
-                    // terminal state here so the slot frees and the SOP can fire
-                    // again on the next event.
                     let is_deterministic = eng
                         .get_sop(sop_name)
                         .is_some_and(|s| s.execution_mode == SopExecutionMode::Deterministic);
@@ -286,13 +289,6 @@ pub async fn dispatch_sop_event(
 
 // ── Headless result processing ──────────────────────────────────
 
-/// Process dispatch results in headless (non-agent-loop) callers.
-///
-/// This handles audit and logging for fan-in callers (MQTT, webhook, cron)
-/// that cannot execute SOP steps interactively. For `WaitApproval` actions,
-/// approval timeout polling in the scheduler handles progression.
-/// For `ExecuteStep` actions, the run is started in the engine but steps
-/// cannot be executed without an agent loop — this is logged as a warning.
 pub fn process_headless_results(results: &[DispatchResult]) {
     for result in results {
         match result {
@@ -392,10 +388,78 @@ pub fn process_headless_results(results: &[DispatchResult]) {
     }
 }
 
+/// Headless fan-in chokepoint for untrusted external events (channel
+/// messages, AMQP deliveries, ...): caps oversized topic/payload at the
+/// configured `untrusted_payload_max_bytes` (with an explicit truncation
+/// marker), stamps the event, dispatches it against loaded SOP triggers,
+/// and audits the results. Callers should gate on
+/// `SopEngine::wants_source` first to skip the work when no SOP listens.
+pub async fn dispatch_untrusted_fan_in(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+) -> Vec<DispatchResult> {
+    let max_bytes = match engine.lock() {
+        Ok(eng) => eng.config().untrusted_payload_max_bytes,
+        Err(e) => {
+            crate::health::mark_component_error(
+                "sop_dispatch",
+                format!("SOP engine lock poisoned: {e}"),
+            );
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e), "source": source.to_string()})),
+                "SOP fan-in: engine lock poisoned while reading SOP safety config"
+            );
+            return vec![];
+        }
+    };
+    let (topic, topic_truncated) = match topic {
+        Some(t) => {
+            let (capped, truncated) = crate::security::cap_untrusted(t, max_bytes);
+            (Some(capped), truncated)
+        }
+        None => (None, false),
+    };
+    let (payload, payload_truncated) = match payload {
+        Some(p) => {
+            let (capped, truncated) = crate::security::cap_untrusted(p, max_bytes);
+            (Some(capped), truncated)
+        }
+        None => (None, false),
+    };
+    if topic_truncated || payload_truncated {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "source": source.to_string(),
+                    "topic_truncated": topic_truncated,
+                    "payload_truncated": payload_truncated,
+                    "max_bytes": max_bytes,
+                })),
+            "SOP fan-in: capped oversized untrusted event"
+        );
+    }
+    let event = SopEvent {
+        source,
+        topic,
+        payload,
+        timestamp: now_iso8601(),
+    };
+    let results = dispatch_sop_event(engine, audit, event).await;
+    process_headless_results(&results);
+    results
+}
+
 // ── Peripheral signal helper ────────────────────────────────────
 
 /// Convenience wrapper for peripheral hardware callbacks.
-///
 /// Builds a `SopEvent` with source `Peripheral` and topic `"{board}/{signal}"`
 /// then dispatches it through the standard path.
 pub async fn dispatch_peripheral_signal(
@@ -417,7 +481,6 @@ pub async fn dispatch_peripheral_signal(
 // ── Cron SOP cache + check ──────────────────────────────────────
 
 /// Pre-parsed cron schedules for SOP triggers.
-///
 /// Built once at daemon startup to avoid re-parsing cron expressions
 /// on every scheduler tick.
 #[derive(Clone)]
@@ -428,7 +491,6 @@ pub struct SopCronCache {
 
 impl SopCronCache {
     /// Build cache from the current engine state.
-    ///
     /// Locks the engine once, iterates SOPs, parses Cron trigger expressions.
     /// Invalid expressions are logged and skipped (fail-closed).
     pub fn from_engine(engine: &Arc<Mutex<SopEngine>>) -> Self {
@@ -500,7 +562,6 @@ impl SopCronCache {
         Self { schedules }
     }
 
-    /// Return the cached schedules (for testing).
     #[cfg(test)]
     pub fn schedules(&self) -> &[(String, String, cron::Schedule)] {
         &self.schedules
@@ -509,7 +570,6 @@ impl SopCronCache {
 
 /// Check all cached cron SOP triggers for firings in the window
 /// `(last_check, now]` and dispatch events for each.
-///
 /// Uses window-based evaluation so ticks between polls are never missed.
 pub async fn check_sop_cron_triggers(
     engine: &Arc<Mutex<SopEngine>>,
@@ -583,6 +643,7 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -793,6 +854,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_to_named_sop_filters_matching_channel_triggers() {
+        let channel_trigger = SopTrigger::Channel {
+            channel: "git".into(),
+            alias: Some("main".into()),
+            condition: None,
+        };
+        let engine = test_engine(vec![
+            test_sop("pr-triage", vec![channel_trigger.clone()]),
+            test_sop("other-handler", vec![channel_trigger]),
+        ]);
+        let audit = test_audit();
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"sop":"pr-triage"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+
+        let results = dispatch_sop_event_to(&engine, &audit, event.clone(), "pr-triage").await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], DispatchResult::Started { sop_name, .. } if sop_name == "pr-triage")
+        );
+
+        let results = dispatch_sop_event_to(&engine, &audit, event, "missing-sop").await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::NoMatch));
+    }
+
+    #[tokio::test]
     async fn dispatch_skips_when_cooldown_active() {
         let mut sop = test_sop("cooldown-sop", vec![SopTrigger::Manual]);
         sop.cooldown_secs = 3600;
@@ -824,6 +916,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -858,6 +951,77 @@ mod tests {
         let results = dispatch_sop_event(&engine, &audit, event).await;
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], DispatchResult::NoMatch));
+    }
+
+    #[tokio::test]
+    async fn untrusted_fan_in_caps_oversized_topic_and_payload() {
+        let config = SopConfig {
+            untrusted_payload_max_bytes: 16,
+            ..SopConfig::default()
+        };
+        let engine = test_engine_with_config(
+            vec![test_sop(
+                "channel-sop",
+                vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+            )],
+            config,
+        );
+        let audit = test_audit();
+
+        let long_payload = "x".repeat(64);
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Channel,
+            Some("telegram"),
+            Some(&long_payload),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::Started { .. }));
+        let eng = engine.lock().unwrap();
+        let run = eng.active_runs().values().next().unwrap();
+        let payload = run.trigger_event.payload.as_deref().unwrap();
+        assert!(
+            payload.starts_with(&"x".repeat(16)),
+            "capped payload must preserve the leading max_bytes: {payload}"
+        );
+        assert!(
+            payload.contains("...[truncated"),
+            "capped payload must carry the truncation marker: {payload}"
+        );
+        assert!(!payload.contains(&"x".repeat(17)));
+        assert_eq!(run.trigger_event.topic.as_deref(), Some("telegram"));
+        assert_eq!(run.trigger_event.source, SopTriggerSource::Channel);
+    }
+
+    #[tokio::test]
+    async fn untrusted_fan_in_no_match_for_unwanted_source() {
+        let engine = test_engine(vec![test_sop(
+            "webhook-sop",
+            vec![SopTrigger::Webhook {
+                path: "/hook".into(),
+            }],
+        )]);
+        let audit = test_audit();
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Channel,
+            Some("telegram"),
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::NoMatch));
+        assert!(engine.lock().unwrap().active_runs().is_empty());
     }
 
     #[tokio::test]
@@ -965,8 +1129,6 @@ mod tests {
         assert_eq!(started_count, 2);
     }
 
-    /// B1 DoD: prove that the action returned by `start_run` is captured in
-    /// `DispatchResult::Started` — not silently dropped.
     #[tokio::test]
     async fn dispatch_captures_action_for_wait_approval() {
         // Supervised mode → WaitApproval on step 1
@@ -1008,7 +1170,6 @@ mod tests {
         }
     }
 
-    /// B1 DoD: Auto-mode SOP returns ExecuteStep action in dispatch result.
     #[tokio::test]
     async fn dispatch_captures_action_for_execute_step() {
         let engine = test_engine(vec![test_sop("auto-sop", vec![SopTrigger::Manual])]);

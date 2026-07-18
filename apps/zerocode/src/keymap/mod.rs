@@ -1,11 +1,4 @@
 //! Keymap abstraction for zerocode.
-//!
-//! Each leaf action enum carries its own default bindings inline.
-//! Consumers call `ChatTabAction::from_chord(&key)` directly — no
-//! `Keymap` struct, no plumbed argument.
-//!
-//! On darwin, `Chord::matches` translates the `CTRL` modifier to
-//! `SUPER` so Linux's `Ctrl+K` and macOS's `⌘K` resolve identically.
 
 pub mod actions;
 mod chord;
@@ -16,6 +9,13 @@ pub use actions::*;
 pub use chord::Chord;
 
 use crossterm::event::KeyEvent;
+
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    GlobalAction::Help
+        .resolved()
+        .iter()
+        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+}
 
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
@@ -79,6 +79,16 @@ mod tests {
     }
 
     #[test]
+    fn global_help_resolves_from_question_mark_and_f1() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
+        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
+    }
+
+    #[test]
     fn input_bar_enter_is_submit() {
         let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
@@ -112,9 +122,6 @@ mod tests {
         assert_eq!(action, back);
     }
 
-    /// Every action enum's binding table must have no duplicate chord
-    /// keys (one chord → one action per enum). Runs as a unit test so
-    /// the rejection is loud and reproducible in CI.
     #[test]
     fn no_intra_enum_chord_conflicts() {
         fn check<A: Copy + std::fmt::Debug>(label: &str, table: Vec<(Chord, A)>) {
@@ -134,6 +141,7 @@ mod tests {
         check(ConfigTabAction::TAG, ConfigTabAction::bindings());
         check(DoctorTabAction::TAG, DoctorTabAction::bindings());
         check(QuickstartTabAction::TAG, QuickstartTabAction::bindings());
+        check(SopTabAction::TAG, SopTabAction::bindings());
         check(InputBarAction::TAG, InputBarAction::bindings());
         check(ModalAction::TAG, ModalAction::bindings());
         check(CaptureAction::TAG, CaptureAction::bindings());
@@ -189,6 +197,13 @@ mod tests {
                     .map(|(c, _)| c)
                     .collect(),
             ),
+            (
+                "sop",
+                SopTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
         ];
         for (gc, ga) in &global {
             for (label, chords) in panes {
@@ -202,9 +217,6 @@ mod tests {
         }
     }
 
-    /// Every rebindable enum's TAG and serialized variant names must be
-    /// snake_case — the action-key wire form (`"<tag>.<variant>"`) is
-    /// only valid snake_case, and kebab-case is banned project-wide.
     #[test]
     fn tags_and_variant_names_are_snake_case() {
         fn ok(s: &str) -> bool {
@@ -228,6 +240,7 @@ mod tests {
         check::<DashboardTabAction>();
         check::<ConfigTabAction>();
         check::<QuickstartTabAction>();
+        check::<SopTabAction>();
         check::<InputBarAction>();
         check::<FileExplorerAction>();
     }

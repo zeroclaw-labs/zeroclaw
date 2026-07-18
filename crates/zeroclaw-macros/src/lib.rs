@@ -21,13 +21,6 @@ fn has_serde_skip(field: &syn::Field) -> bool {
     has_serde_meta(field, "skip")
 }
 
-/// Check if any `#[serde(...)]` attribute on the field contains `flatten`.
-///
-/// A `#[serde(flatten)]` struct field has its inner fields appear at the same
-/// TOML level as the wrapper. The Configurable derive treats such a field as
-/// inheritance: the wrapper's `prop_fields` / `get_prop` / `set_prop` /
-/// `secret_fields` / `prop_is_secret` delegate to the flattened struct after
-/// translating the wrapper's prefix into the flattened struct's own prefix.
 fn has_serde_flatten(field: &syn::Field) -> bool {
     has_serde_meta(field, "flatten")
 }
@@ -58,6 +51,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
+/// - `#[multiline]` on a string field hints surfaces to render a multi-line
+///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
 /// # Generated methods
 ///
@@ -129,7 +124,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         credential_class,
         natural_key,
         tab,
-        group
+        group,
+        multiline
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -190,12 +186,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut dynamic_secret_map_prop_is_secret = Vec::new();
     let mut init_defaults_ops = Vec::new();
 
-    // ── Map-key (HashMap<String, T>) and List (Vec<T:Configurable>) section
-    //    accumulators. Both surface a "+ Add entry" affordance in the
-    //    dashboard / CLI; both are auto-discovered from #[nested] fields
-    //    whose type is a container. The dispatch table at the gateway
-    //    `handle_map_key` walks `Config::map_key_sections()` and matches
-    //    on the path string — no hand-maintained list anywhere.
     let mut map_key_section_entries: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut get_map_keys_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -207,36 +197,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut delete_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut rename_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
 
-    // ── Nested-Option enumeration ──
-    // One entry per `#[nested] Option<T>` field, surfacing the schema's
-    // own field name plus an `is_some()` snapshot. Consumers (e.g. the
-    // integrations registry) iterate this list so adding a new
-    // `pub foo: Option<FooConfig>` to a Configurable struct surfaces
-    // automatically — no hand-maintained mirror list anywhere.
     let mut nested_option_entry_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
 
-    // Per `#[nested]` field, a `<kebab-name> => <field-level-doc>` arm so
-    // `nested_section_help` can answer the dashboard sidebar's
-    // "what is this section?" lookup without any hand-curated parallel
-    // table. Field-level doc beats struct-level doc here because the
-    // schema's `///` on `pub gateway: GatewayConfig` describes the
-    // section's role in this Config, which is what the operator needs.
     let mut nested_section_help_arms: Vec<proc_macro2::TokenStream> = Vec::new();
-    // Parallel to `nested_section_help_arms`: each `#[nested]` field that
-    // carries a `#[group = "..."]` annotation contributes one arm to the
-    // generated `nested_section_group(name)` lookup. This is what lets
-    // the section explorer resolve a top-level config root's display
-    // group from the schema itself instead of a hand-maintained table.
     let mut nested_section_group_arms: Vec<proc_macro2::TokenStream> = Vec::new();
 
-    // Static enumeration of every `#[secret]` field's terminal name
-    // reachable from this Configurable type. Direct `#[secret]` fields
-    // push their own snake-case ident; `#[nested]` fields push a
-    // recursive call into the inner type's `secret_field_terminals()`.
-    // The migration crate's raw-TOML encrypt walker uses this allowlist
-    // so map-shaped `#[secret]` fields (e.g. `mcp.servers[*].headers`)
-    // get the same coverage as scalar ones — `prop_fields()` skips
-    // compound types and is not a safe source for that allowlist.
     let mut secret_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut secret_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
 
@@ -248,6 +213,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let is_multiline = has_attr(field, "multiline");
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
@@ -258,18 +224,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             None => quote! { crate::config::ConfigTab::None },
         };
 
-        // ── Secret handling ──
-        //
-        // mask / restore / encrypt / decrypt / is_set are dispatched through
-        // `crate::traits::SecretField`. Each supported shape (`String`,
-        // `Option<String>`, `Vec<String>`, `HashMap<String, String>`,
-        // `Option<HashMap<String, String>>`) lives as a trait impl in
-        // `crates/zeroclaw-config/src/traits.rs` — adding a new shape is a
-        // single impl block, not a new branch here.
-        //
-        // `set_secret(name, value)` only makes sense for string-shaped fields
-        // (the public API takes `String`), so only `String` and `Option<String>`
-        // push to `set_arms`. Container shapes are read-only through that path.
         if is_secret {
             let field_name_kebab = snake_to_kebab(&field_ident.to_string());
             let full_name = if prefix.is_empty() {
@@ -319,12 +273,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 )?;
             });
 
-            // Only string-shaped fields wire into `set_secret` — the
-            // container shapes have no single-string set semantics. Look
-            // through `Option<...>` when checking shape so an annotation
-            // like `Option<HashMap<String, String>> #[secret]` doesn't fall
-            // through to a `self.field = Some(value: String)` arm that
-            // wouldn't type-check.
             let is_option = is_option_type(&field.ty);
             let shape_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
             let is_vec_string = extract_vec_inner(shape_ty)
@@ -382,6 +330,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 credential_class: #credential_class_expr,
                                 tab: #tab_token,
                                 alias_source: None,
+                                multiline: false,
                             });
                         }
                     }
@@ -454,11 +403,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
 
                 if double_value_ty.is_none() {
-                    // Single-level `HashMap<String, T: Configurable>` only.
-                    // The double-nested branch below emits its own
-                    // `route_double_hashmap_path` based dispatch and does
-                    // not need the single-level `route_hashmap_path` ops
-                    // (they wouldn't typecheck against the inner HashMap).
                     nested_set.push(quote! {
                         for inner in self.#field_ident.values_mut() {
                             if let Ok(()) = inner.set_secret(name, value.clone()) {
@@ -476,20 +420,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             inner.decrypt_secrets(store)?;
                         }
                     });
-                    // Path routing through HashMap<String, T>: the one parser
-                    // lives in `crate::config::route_hashmap_path` so get/set
-                    // don't duplicate it. Paths look like
-                    // `<my_prefix>.<field>.<key>.<inner_suffix>`; keys may contain
-                    // dots/URLs, so the shared parser preserves the runtime key and
-                    // splits on the final field separator. On a hit the dispatch is
-                    // forwarded to the value type's own get_prop / set_prop via its
-                    // `configurable_prefix()`.
-                    // `prop_is_secret` is a static dispatch (no `&self`), so
-                    // there's no live HashMap to scan. Iterate every plausible
-                    // left-split of `rest` so the secret-marker path matches
-                    // any inner key shape the runtime might have. Longest
-                    // split tried first to keep dotted-URL keys winning over
-                    // their shorter siblings.
                     nested_prop_is_secret.push(quote! {
                         {
                             let key_prefix = if Self::configurable_prefix().is_empty() {
@@ -593,17 +523,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // Outer-key disambiguation for double-nested HashMaps:
-                    // outer keys may legitimately contain dots (URL-keyed
-                    // custom provider types like `custom:https://example/v1`),
-                    // so a left-to-right `split_once('.')` would mis-route.
-                    // For instance-aware paths (get/set), match against the
-                    // actual map keys present and pick the longest match.
-                    // For prop_is_secret (type-only, no instance), iterate
-                    // every plausible `<outer>.<alias>.<suffix>` split where
-                    // `<alias>` passes alias validation, and OR the
-                    // T::prop_is_secret answers — false negatives here mean
-                    // a secret leak through encryption-skip.
                     nested_prop_is_secret.push(quote! {
                         {
                             let path_prefix = if Self::configurable_prefix().is_empty() {
@@ -779,6 +698,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             // incremental writer needs no natural-key hint
                             // to descend through it.
                             natural_key: None,
+                            resource_key: #is_resource_key,
                         });
                     });
 
@@ -931,18 +851,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             inner.decrypt_secrets(store)?;
                         }
                     });
-                    // Path routing through HashMap<String, T>: the one parser
-                    // lives in `crate::config::route_hashmap_path` so get/set
-                    // don't duplicate it. Paths look like
-                    // `<my_prefix>.<field>.<key>.<inner_suffix>`; on a hit the
-                    // dispatch is forwarded to the value type's own get_prop /
-                    // set_prop via its `configurable_prefix()`.
-                    // `prop_is_secret` is a static dispatch (no `&self`), so
-                    // there's no live HashMap to scan. Iterate every plausible
-                    // left-split of `rest` so the secret-marker path matches
-                    // any inner key shape the runtime might have. Longest
-                    // split tried first to keep dotted-URL keys winning over
-                    // their shorter siblings.
                     nested_prop_is_secret.push(quote! {
                         {
                             let key_prefix = if Self::configurable_prefix().is_empty() {
@@ -1004,12 +912,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // Enumerate every HashMap entry and inject its runtime key
-                    // into the child's static field paths: a child field named
-                    // `<inner_prefix>.api-key` becomes
-                    // `<my_prefix>.<field>.<hm_key>.api-key`. Without this, prop_fields()
-                    // never surfaces e.g. `model_providers.anthropic.default.api-key`,
-                    // so onboard has no way to prompt for it.
                     nested_prop_fields.push(quote! {
                         {
                             let inner_prefix = <#value_ty>::configurable_prefix();
@@ -1065,6 +967,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             // HashMap arm above — the alias IS the TOML
                             // key, no natural-key hint needed.
                             natural_key: None,
+                            resource_key: #is_resource_key,
                         });
                     });
                     let validate_create = if is_resource_key {
@@ -1236,7 +1139,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // We need to know the inner type at compile time
                 });
 
-                // For Option<T> nested, extract inner type for Default::default()
+                // For Option<T> nested, extract inner type for Default::default
                 if let Some(inner_ty) = extract_option_inner(&field.ty) {
                     let inner_ty_tokens = quote! { #inner_ty };
                     init_defaults_ops.push(quote! {
@@ -1283,31 +1186,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     });
                 }
             } else if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
-                // ── Nested Vec<T> ──
-                // Vec doesn't implement Configurable, so we cannot blindly
-                // delegate get_prop / set_prop / prop_fields / init_defaults
-                // to the field directly — those address an element by name
-                // and a Vec carries no name index of its own. The list-section
-                // emission below handles `+ Add` and per-entry creation.
-                //
-                // Bulk-walk operations (encrypt / decrypt / mask / restore /
-                // secret_fields / set_secret) only need to iterate the Vec
-                // and dispatch on each element's own `T` method — they don't
-                // address by name. Those always push here, mirroring the
-                // single-level `HashMap<String, T>` traversal above.
-                //
-                // Per-element property routing (prop_fields, get_prop,
-                // set_prop, prop_is_secret) is gated on an explicit
-                // `#[natural_key = "<field>"]` attribute on the Vec field
-                // (see schema.rs `mcp.servers` for the canonical use). When
-                // the attribute is present the derive also emits
-                // get_map_keys / delete_map_key / rename_map_key arms so
-                // the section behaves like a `HashMap<String, T>` from the
-                // dashboard / TUI's point of view. Without it, the Vec stays
-                // in the legacy `ObjectArray` whole-array round-trip mode —
-                // unchanged from prior behaviour, so unrelated schema
-                // sections (peripheral.boards, classification rules, …)
-                // are not affected by this commit.
                 nested_collect.push(quote! {
                     for inner in self.#field_ident.iter() {
                         fields.extend(inner.secret_fields());
@@ -1346,12 +1224,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
                 let field_doc = extract_doc(&field.attrs);
                 let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
-                // Bridge the `#[natural_key = "<f>"]` attribute (extracted
-                // far above as `natural_key_field`) into the
-                // `MapKeySection.natural_key` constant. Some/None decides
-                // whether the incremental TOML writer treats this Vec as a
-                // natural-key array of tables or as a legacy whole-array
-                // round-trip section.
                 let vec_natural_key_token = match &natural_key_field {
                     Some(name) => quote! { Some(#name) },
                     None => quote! { None },
@@ -1380,49 +1252,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         kind: crate::config::MapKeyKind::List,
                         value_type: #vec_inner_name,
                         description: #field_doc,
-                        // `#[natural_key = "<f>"]` Vec sections (currently
-                        // `mcp.servers`) need this hint so the incremental
-                        // TOML writer can walk a `<section>.<alias>.<inner>`
-                        // dirty path through the `[[mcp.servers]]` array
-                        // of tables. Plain Vec sections without the
-                        // attribute go through the legacy whole-array
-                        // `ObjectArray` round-trip and don't need
-                        // per-element addressing.
                         natural_key: #vec_natural_key_token,
+                        resource_key: #is_resource_key,
                     });
                 });
-                // `create_map_key` on a Vec section. Two flavours:
-                //
-                //   * `#[natural_key = "<field>"]` Vec — idempotent, like a
-                //     HashMap section: if an element already carries the
-                //     requested natural key, return `Ok(false)` without
-                //     mutating state. Otherwise append + seed the natural
-                //     key from `map_key`. This is essential: the rest of
-                //     the natural-key surface (per-element `get_prop` /
-                //     `set_prop` / `rename_map_key`) treats duplicate
-                //     natural keys as `VecRoute::Ambiguous` and refuses to
-                //     mutate; an always-append create path would drop the
-                //     editor into that invalid state on a UI retry or a
-                //     repeat add. Matches `HashMap<String, T>` semantics
-                //     (`contains_key` → `Ok(false)`).
-                //
-                //   * Plain `Vec<T>` without `#[natural_key]` — legacy
-                //     always-append behaviour. No natural key exists yet
-                //     to check against, and the section's editor surface
-                //     is the whole-array `ObjectArray` `set_prop` path
-                //     (not per-element). Behaviour unchanged from before
-                //     the natural-key opt-in shipped, so the other seven
-                //     `Vec<T> + #[nested]` schema fields keep their
-                //     existing semantics.
                 let create_dup_check = if let Some(nk_field) = &natural_key_field {
                     let nk_field_lit = nk_field.clone();
                     quote! {
-                        // Idempotency check: walk the live Vec and ask
-                        // each element for its natural-key field via the
-                        // inner type's own `get_prop`. If any element
-                        // already reports `map_key`, return `Ok(false)`
-                        // without pushing — same contract as the
-                        // `HashMap<String, T>` arm.
                         let inner_prefix = <#vec_inner_ty>::configurable_prefix();
                         let nk_path = if inner_prefix.is_empty() {
                             #nk_field_lit.to_string()
@@ -1469,28 +1305,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
 
-                // ── Per-element routing for `#[natural_key = "..."]` Vecs ──
-                // Gated on the explicit field attribute: Vec sections without
-                // a declared natural-key field keep the legacy behaviour
-                // (whole-array round-trip through `ObjectArray` `set_prop`),
-                // so unrelated schema sections (peripheral.boards,
-                // classification rules, …) don't change shape under this commit.
-                //
-                // The single source of truth for "what is this Vec's natural
-                // key field" lives at the field site in `schema.rs`, e.g.
-                //   #[natural_key = "name"]
-                //   pub servers: Vec<McpServerConfig>,
-                // The derive forwards property paths of the form
-                // `<my_prefix>.<field>.<natural_key>.<inner_suffix>` to the
-                // matched element's own `get_prop` / `set_prop`, using the
-                // `route_vec_path` helper for the parsing + ambiguity check.
-                //
-                // The `name` (or whichever natural-key) field is treated
-                // as read-only via per-element routing: callers that need
-                // to rename use `config_map_key_rename`, which mutates the
-                // natural key through `rename_map_key` arms (see below).
-                // This keeps the natural key stable from the routing
-                // function's point of view during in-flight edits.
                 if let Some(nk_field) = &natural_key_field {
                     let nk_field_lit = nk_field.clone();
                     // get_map_keys: enumerate live natural keys. Order
@@ -1521,13 +1335,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // delete_map_key: remove the first element whose
-                    // natural key matches. Duplicate-key configs are
-                    // already a validator-rejected state; the routing
-                    // surface refuses to silently pick one duplicate
-                    // (see VecRoute::Ambiguous), so here we delete the
-                    // first match and let the operator re-invoke for
-                    // the rest. Returns Ok(false) when no element matches.
                     delete_map_key_arms.push(quote! {
                         {
                             let prefix = Self::configurable_prefix();
@@ -1555,11 +1362,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // rename_map_key: validate new key, ensure it isn't
-                    // already taken, then mutate the matched element's
-                    // natural-key field via its own set_prop. Refuses
-                    // when the source key is ambiguous (two elements
-                    // share it) — operator must repair first.
                     rename_map_key_arms.push(quote! {
                         {
                             let prefix = Self::configurable_prefix();
@@ -1615,18 +1417,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // prop_fields: enumerate each element's own
-                    // prop_fields, prefix child paths as
-                    // `<outer>.<natural_key>.<leaf>`. Elements whose
-                    // natural key is empty (half-created entries) are
-                    // emitted with an `<unnamed-N>` placeholder so the
-                    // TUI still shows them — otherwise an empty-name
-                    // entry would silently vanish from the alias list.
-                    //
-                    // The natural-key field itself is filtered out of
-                    // the per-element prop list: it is not editable
-                    // through `set_prop` (use rename_map_key), so the
-                    // TUI must not surface it as an editable row.
                     nested_prop_fields.push(quote! {
                         {
                             let inner_prefix = <#vec_inner_ty>::configurable_prefix();
@@ -1672,13 +1462,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // get_prop: dispatch via `route_vec_path`. On a Hit
-                    // the path is unambiguously ours, so we return the
-                    // inner result directly — even on failure — rather
-                    // than falling through to the next nested field,
-                    // which would mask actionable errors (read-only
-                    // natural key, unknown inner property) as
-                    // "Unknown property" at the outer fallback.
                     nested_get_prop.push(quote! {
                         {
                             let inner_prefix = <#vec_inner_ty>::configurable_prefix();
@@ -1764,12 +1547,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // prop_is_secret: static dispatch (no &self), so we
-                    // can't consult live natural keys. Iterate every
-                    // dot-split of `rest` and ask the inner type — same
-                    // shape as the HashMap arm. False negatives here
-                    // mean a secret leak through encryption-skip, so
-                    // bias toward over-marking.
                     nested_prop_is_secret.push(quote! {
                         {
                             let key_prefix = if Self::configurable_prefix().is_empty() {
@@ -1841,15 +1618,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     self.#field_ident.restore_secrets_from(&current.#field_ident);
                 });
 
-                // For `#[serde(flatten)]` struct fields, the inner struct's
-                // fields appear at the same TOML level as the wrapper. Generate
-                // prefix-translating delegation: prop_fields rename inner names
-                // from inner-prefix to wrapper-prefix; get_prop/set_prop strip
-                // wrapper-prefix and re-add inner-prefix before delegating.
-                // Without this, paths look like
-                // `<wrapper-prefix>.<inner-field-name>` from prop_fields() but
-                // `<inner-prefix>.<inner-field-name>` from inner.get_prop() —
-                // the two never agree and routing fails.
                 let field_ty = &field.ty;
                 if is_serde_flatten {
                     nested_prop_fields.push(quote! {
@@ -1984,23 +1752,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                // When the path prefix matches this
-                                // nested field, the nested type is the
-                                // only authority for the path: every
-                                // top-level field has a distinct prefix
-                                // (confirmed by the prefix-uniqueness
-                                // tests in `nested_section_help`-shaped
-                                // surfaces) so there is no other
-                                // nested field that could also claim
-                                // this path. Falling through on Err
-                                // would mask actionable errors (e.g.
-                                // the natural-key arm's "read-only" /
-                                // "ambiguous" messages, or a deeper
-                                // routing error inside a HashMap entry)
-                                // as the outer Config's generic
-                                // "Unknown property" fallback. Return
-                                // the inner result directly so the
-                                // caller sees what actually happened.
                                 return self.#field_ident.get_prop(&inner_name);
                             }
                         }
@@ -2022,11 +1773,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                // See the matching comment on
-                                // `nested_get_prop` above: return the
-                                // inner result directly rather than
-                                // swallowing Err so actionable
-                                // messages reach the caller.
                                 return self.#field_ident.set_prop(&inner_name, value_str);
                             }
                         }
@@ -2076,12 +1822,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 create_map_key_recurse.push(quote! {
-                    // Propagate explicit errors from the inner type
-                    // (validation, duplicates, etc.) so callers see
-                    // actionable messages. Only the inner type's
-                    // "no map-keyed/list section at ..." sentinel
-                    // means "this isn't my path"; treat that as a
-                    // fall-through and try the next nested field.
                     match self.#field_ident.create_map_key(section_path, map_key) {
                         Ok(created) => return Ok(created),
                         Err(e) if e.starts_with("no map-keyed/list section at ") => {}
@@ -2121,15 +1861,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_option = is_option_type(&field.ty);
         let inner_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
 
-        // Skip HashMap and PathBuf compound types (handled by other
-        // paths or omitted from the prop surface). `Vec<T>` is
-        // surfaced as a single prop field; both kind classification
-        // and value rendering route through `<Vec<T> as HasPropKind>`,
-        // the single source of truth for "is this a chip-editor field
-        // or a per-row sub-form field". Every `Vec<T>` field type
-        // used in a `#[derive(Configurable)]` struct needs an
-        // explicit `impl HasPropKind for Vec<T>` in `traits.rs`; a
-        // missing impl is a compile error pointing at the field site.
         let vec_inner = extract_vec_inner(inner_ty);
         let is_vec = vec_inner.is_some();
         if is_compound_type(inner_ty) && !is_vec {
@@ -2151,13 +1882,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let description = extract_doc(&field.attrs);
         let description_lit = description.as_str();
 
-        // PropKind resolved at compile time via HasPropKind trait.
-        // All field types must implement HasPropKind — scalars and
-        // transparent-string newtypes in traits.rs, config enums in
-        // schema.rs via impl_enum_prop_kind!, and every `Vec<T>` field
-        // type via the `Vec<T>: HasPropKind` family of impls (also in
-        // traits.rs). A missing impl is a compile error pointing at
-        // the field site — fix by adding the impl alongside the type.
         let kind_token = quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND };
         // Vec<T> fields are never enums (their inner type might be, but
         // the Vec itself isn't); short-circuit the enum-variants probe
@@ -2175,12 +1899,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 crate::config::enum_variants::<#inner_ty>()
                                     .split(", ")
                                     .map(str::to_string)
-                                    // Defensive: the helper returns a placeholder
-                                    // string ("(unknown variants)") when schemars
-                                    // can't enumerate variants for the type. Drop
-                                    // empties and the placeholder so the dashboard
-                                    // form falls back to a text input instead of
-                                    // rendering a one-option dropdown of garbage.
                                     .filter(|v| !v.is_empty() && v != "(unknown variants)")
                                     .collect()
                             })
@@ -2215,25 +1933,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         prop_is_option_flags.push(is_option);
 
         if is_vec {
-            // Vec fields: rendering format follows the same trait
-            // (`HasPropKind`) that classifies the field's kind, so
-            // there is one source of truth driving both axes. The
-            // runtime `match` on PROP_KIND is monomorphized — the
-            // compiler dead-strips the unselected arm because
-            // PROP_KIND is a `const` associated item.
-            //
-            // - ObjectArray: JSON-serialize the field. TOML inline
-            //   tables (e.g. `[{username = "x"}]`) are not valid JSON,
-            //   so the dashboard's per-row editor needs explicit JSON.
-            // - Otherwise (StringArray / fallback): use the TOML
-            //   inline-array display. It's valid JSON for string-only
-            //   arrays and matches the `make_prop_field` round-trip
-            //   shape that `set_prop`/`get_prop` produce, keeping the
-            //   prop-accessibility audit gates green.
-            //
-            // `Option<Vec<T>>` is unwrapped before the empty check:
-            // `None` and `Some(empty)` both render as `<unset>`;
-            // `Some(non_empty)` follows the kind-based branch above.
             let inner_value_expr = if is_option {
                 quote! { self.#field_ident.as_ref() }
             } else {
@@ -2270,6 +1969,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         credential_class: #credential_class_expr,
                         tab: #tab_token,
                         alias_source: #alias_source_expr,
+                        multiline: #is_multiline,
                     }
                 }
             });
@@ -2290,6 +1990,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #tab_token,
                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
                     #alias_source_expr,
+                    #is_multiline,
                 )
             });
         }
@@ -2313,17 +2014,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 fields
             }
 
-            /// Static enumeration of every `#[secret]` field's terminal name
-            /// (snake_case, matching the on-disk TOML key) reachable from
-            /// this type via `#[nested]` traversal. Unlike `secret_fields()`,
-            /// this requires no instance — the per-struct codegen literals
-            /// are joined at call time with recursive calls into the inner
-            /// types' own `secret_field_terminals()`.
-            ///
-            /// Used by the migration crate's raw-TOML encrypt walker as the
-            /// secret-key allowlist. `prop_fields()`-derived allowlists skip
-            /// compound (non-Vec) `#[secret]` fields, so this method is the
-            /// authoritative source.
             pub fn secret_field_terminals() -> Vec<&'static str> {
                 let mut out: Vec<&'static str> = Vec::new();
                 #(#secret_terminal_pushes)*
@@ -2445,13 +2135,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
             }
 
-            /// Display-group label for a `#[nested]` field on this struct,
-            /// sourced from its `#[group = "..."]` annotation. Returns
-            /// `None` for fields without the annotation (and for unknown
-            /// names) so callers can fall through to a different lookup —
-            /// the section explorer uses this to resolve a top-level
-            /// config root's group from the schema rather than a
-            /// hand-maintained table.
             #[must_use]
             pub fn nested_section_group(name: &str) -> Option<&'static str> {
                 match name {
@@ -2468,28 +2151,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 None
             }
 
-            /// Snapshot of every `#[nested] Option<T>` field on this struct
-            /// as `(field_name, is_some)` tuples, in declaration order.
-            ///
-            /// `field_name` is the raw Rust ident (snake_case) — consumers
-            /// can map to display names via their own table. The schema
-            /// is the single source of truth: adding a new
-            /// `pub foo: Option<FooConfig>` field with `#[nested]` surfaces
-            /// here without touching any caller.
             pub fn nested_option_entries(&self) -> Vec<crate::config::NestedOptionEntry> {
                 let mut out: Vec<crate::config::NestedOptionEntry> = Vec::new();
                 #(#nested_option_entry_pushes)*
                 out
             }
 
-            /// Insert a default-valued entry under a map-keyed section, or
-            /// append to a list-shaped one, with `map_key` as the new entry's
-            /// natural identifier (HashMap key for Map sections; identifier
-            /// field for List sections).
-            ///
-            /// Returns `Ok(true)` if a new entry was created, `Ok(false)` if
-            /// the entry already existed (idempotent), or `Err(reason)` if
-            /// the section path doesn't resolve to a Map/List in this tree.
             pub fn create_map_key(
                 &mut self,
                 section_path: &str,
@@ -2504,12 +2171,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 ))
             }
 
-            /// Remove the entry identified by `map_key` from the map-keyed
-            /// section at `section_path`.
-            ///
-            /// Returns `Ok(true)` if the entry existed and was removed,
-            /// `Ok(false)` if it didn't exist, or `Err(reason)` if the
-            /// section path doesn't resolve.
             pub fn delete_map_key(
                 &mut self,
                 section_path: &str,
@@ -2524,12 +2185,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 ))
             }
 
-            /// Rename `map_key` to `new_key` within the map-keyed section at
-            /// `section_path`, preserving the entry's value.
-            ///
-            /// Returns `Ok(true)` if renamed, `Ok(false)` if `map_key` didn't
-            /// exist, or `Err(reason)` if `new_key` already exists or the
-            /// section path doesn't resolve.
             pub fn rename_map_key(
                 &mut self,
                 section_path: &str,
@@ -2557,6 +2212,244 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Derive `field_specs(&self) -> Vec<TriggerField>` for a trigger enum, so the
+/// authoring registry never hand-lists a source's fields. Field kind is
+/// inferred by convention from each variant's fields:
+///
+/// - a field named `condition` becomes an expression field;
+/// - a `Vec<T>` whose element type ends in `Kind` becomes a multi-select
+///   options field populated from `T::iter()`;
+/// - any other `Vec<_>` becomes a plain list field;
+/// - everything else becomes a text field.
+///
+/// A variant marked `#[trigger(config_derived)]` yields no fields: its options
+/// depend on live config and the registry supplies them separately. Add a
+/// variant and its field spec is generated automatically - there is no second
+/// place to edit.
+#[proc_macro_derive(TriggerFields, attributes(trigger))]
+pub fn derive_trigger_fields(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(&input, "TriggerFields can only be derived for enums")
+            .to_compile_error()
+            .into();
+    };
+
+    for variant in &data.variants {
+        if matches!(variant.fields, Fields::Unnamed(_)) {
+            return syn::Error::new_spanned(
+                variant,
+                "TriggerFields does not support tuple variants",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
+    let source_arms: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .map(|variant| {
+            let vident = &variant.ident;
+            let config_derived = variant
+                .attrs
+                .iter()
+                .any(|a| trigger_attr_has_flag(a, "config_derived"));
+            let field_exprs: Vec<proc_macro2::TokenStream> = if config_derived {
+                Vec::new()
+            } else {
+                match &variant.fields {
+                    Fields::Named(named) => {
+                        named.named.iter().filter_map(trigger_field_expr).collect()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            quote! { SopTriggerSource::#vident => vec![ #(#field_exprs),* ], }
+        })
+        .collect();
+
+    let display_arms: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .map(|variant| {
+            let vident = &variant.ident;
+            let is_unit = matches!(variant.fields, Fields::Unit);
+            let disp = parse_trigger_display(variant);
+
+            let mut binds: Vec<proc_macro2::TokenStream> = Vec::new();
+            for fname in disp.fields.iter().chain(disp.opt.iter()) {
+                let fident = syn::Ident::new(fname, proc_macro2::Span::call_site());
+                binds.push(quote! { #fident });
+            }
+            let pattern = if is_unit {
+                quote! { Self::#vident }
+            } else if binds.is_empty() {
+                quote! { Self::#vident { .. } }
+            } else {
+                quote! { Self::#vident { #(#binds),* , .. } }
+            };
+
+            let body = if disp.fields.is_empty() {
+                quote! { write!(f, "{source}") }
+            } else {
+                let field_idents: Vec<syn::Ident> = disp
+                    .fields
+                    .iter()
+                    .map(|n| syn::Ident::new(n, proc_macro2::Span::call_site()))
+                    .collect();
+                let joined = field_idents
+                    .iter()
+                    .map(|id| quote! { #id })
+                    .collect::<Vec<_>>();
+                let base = {
+                    let mut parts = Vec::new();
+                    for (i, id) in joined.iter().enumerate() {
+                        if i > 0 {
+                            parts.push(quote! { write!(f, "/")?; });
+                        }
+                        parts.push(quote! { write!(f, "{}", #id)?; });
+                    }
+                    parts
+                };
+                match &disp.opt {
+                    Some(opt) => {
+                        let opt_ident = syn::Ident::new(opt, proc_macro2::Span::call_site());
+                        quote! {
+                            write!(f, "{source}:")?;
+                            #(#base)*
+                            if let ::core::option::Option::Some(v) = #opt_ident {
+                                write!(f, "/{}", v)?;
+                            }
+                            Ok(())
+                        }
+                    }
+                    None => quote! {
+                        write!(f, "{source}:")?;
+                        #(#base)*
+                        Ok(())
+                    },
+                }
+            };
+
+            quote! { #pattern => { #body } }
+        })
+        .collect();
+
+    let expanded = quote! {
+        impl #name {
+            pub(crate) fn field_specs(&self) -> ::std::vec::Vec<crate::sop::trigger_registry::TriggerField> {
+                self.source().field_specs()
+            }
+        }
+
+        impl ::core::fmt::Display for #name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let source = self.source();
+                match self {
+                    #(#display_arms)*
+                }
+            }
+        }
+
+        impl crate::sop::types::SopTriggerSource {
+            /// Editable field specs for this trigger source, generated from the
+            /// `SopTrigger` variant's fields. The single source of truth the
+            /// authoring registry reads.
+            pub(crate) fn field_specs(self) -> ::std::vec::Vec<crate::sop::trigger_registry::TriggerField> {
+                use crate::sop::trigger_registry::TriggerField;
+                use crate::sop::types::SopTriggerSource;
+                #[allow(unused_imports)]
+                use ::strum::IntoEnumIterator;
+                match self {
+                    #(#source_arms)*
+                }
+            }
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+fn trigger_attr_has_flag(attr: &syn::Attribute, flag: &str) -> bool {
+    if !attr.path().is_ident("trigger") {
+        return false;
+    }
+    let mut found = false;
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident(flag) {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Parsed `#[trigger(display = "...", opt = "...")]` for one variant.
+struct TriggerDisplay {
+    /// Field names rendered as the `:`-suffix, joined by `/`. Empty means the
+    /// variant renders as the bare source with no suffix.
+    fields: Vec<String>,
+    /// Optional trailing field rendered as `/{field}` only when it is `Some`.
+    opt: Option<String>,
+}
+
+fn parse_trigger_display(variant: &syn::Variant) -> TriggerDisplay {
+    let mut display = TriggerDisplay {
+        fields: Vec::new(),
+        opt: None,
+    };
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("trigger") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("display") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                display.fields = lit.value().split('/').map(str::to_string).collect();
+            } else if meta.path.is_ident("opt") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                display.opt = Some(lit.value());
+            }
+            Ok(())
+        });
+    }
+    display
+}
+
+/// Build the `TriggerField` constructor call for one named field, or `None`
+/// for fields that carry no authoring input (currently none are dropped, but
+/// serde-skipped internal fields could be here).
+fn trigger_field_expr(field: &syn::Field) -> Option<proc_macro2::TokenStream> {
+    let ident = field.ident.as_ref()?;
+    let name = ident.to_string();
+    if name == "condition" {
+        return Some(quote! { TriggerField::expression(#name) });
+    }
+    if let Some(inner) = extract_vec_inner(&field.ty) {
+        if let syn::Type::Path(p) = inner
+            && p.path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident.to_string().ends_with("Kind"))
+        {
+            let elem = inner;
+            return Some(quote! {
+                TriggerField::options(
+                    #name,
+                    <#elem as ::strum::IntoEnumIterator>::iter()
+                        .map(|k| <&'static str>::from(k).to_string())
+                        .collect(),
+                )
+            });
+        }
+        return Some(quote! { TriggerField::list(#name) });
+    }
+    Some(quote! { TriggerField::text(#name) })
 }
 
 #[proc_macro_derive(ConfigEnum)]
@@ -2706,11 +2599,6 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
     })
 }
 
-/// Build the `pub fn integration_descriptor(&self) -> IntegrationDescriptor`
-/// method body when the struct carries
-/// `#[integration(category = "...", display_name = "...", description = "...", status_field = "...")]`.
-/// Returns an empty `TokenStream` when the attribute is absent so structs
-/// without it don't get the method.
 fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
     let mut category: Option<String> = None;
     let mut display_name: Option<String> = None;

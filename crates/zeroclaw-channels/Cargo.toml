@@ -63,7 +63,7 @@ lettre = { version = "0.11.22", default-features = false, features = [
   "rustls-tls",
   "smtp-transport",
 ], optional = true }
-pulldown-cmark = { version = "0.13", optional = true }
+pulldown-cmark = "0.13"
 mail-parser = { version = "0.11.2", optional = true }
 matrix-sdk = { version = "0.18", optional = true, default-features = false, features = [
   "e2e-encryption",
@@ -122,6 +122,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 urlencoding = "2.1"
+url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["std", "v4"] }
 hex = "0.4"
 nanohtml2text = "0.2"
@@ -129,19 +130,8 @@ rand = "0.10"
 webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
-# WhatsApp Web (optional)
-# Upstream crates from oxidezap/whatsapp-rust, pinned to commit cbcdd2a.
-# Pinning via a plain `git` source (not `[patch.crates-io]`) keeps the
-# workspace buildable until oxidezap publishes the fix as 0.6.1, at which
-# point this block reverts to versioned crates.io deps.
-#
-# Commit history:
-# - 9734fb2: MSRV fix for `if let` guard (wacore/src/history_sync.rs:93)
-#            stable only on Rust 1.94+; ZeroClaw CI pins 1.93.0.
-#            Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
-# - cbcdd2a: PR #636 fix for LID namespace conversion. Fixes ACK 400
-#            "server requires all participants to share the same JID
-#            namespace" error when sending DMs to LID-addressed recipients.
+# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ cbcdd2a
+# until upstream ships 0.6.1 to crates.io.
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false, features = [
   "tokio-runtime",
 ] }
@@ -168,6 +158,17 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
+# GitHub App channel - RS256 JWT signing for app authentication. The
+# `aws_lc_rs` backend is required to avoid jsonwebtoken's `rust_crypto`
+# path, which pulls the unmaintained `rsa` crate (RUSTSEC-2023-0071,
+# Marvin Attack, no fixed release) and fails `cargo audit`. aws-lc-rs is
+# already in the workspace lockfile, so this adds no new heavy dependency.
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = [
+  "aws_lc_rs",
+  "use_pem",
+] }
+thiserror = { version = "2.0", optional = true }
+
 [features]
 default = ["default-channels"]
 default-channels = [
@@ -183,9 +184,11 @@ channels-full = [
   "channel-clawdtalk",
   "channel-dingtalk",
   "channel-discord",
+  "channel-git",
   "channel-imessage",
   "channel-irc",
   "channel-lark",
+  "channel-line",
   "channel-linq",
   "channel-mattermost",
   "channel-mochat",
@@ -211,11 +214,16 @@ channel-email = [
   "dep:async-imap",
   "dep:lettre",
   "dep:mail-parser",
-  "dep:pulldown-cmark",
 ]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
+channel-git = ["provider-github", "provider-gitea"]
+# Forge providers for the git channel. `provider-github` (GitHub Apps) and
+# `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
+# future forges (e.g. `provider-gitlab`) add their own sub-feature and deps here.
+provider-github = ["dep:jsonwebtoken", "dep:thiserror"]
+provider-gitea = []
 channel-line = []
 channel-nostr = ["dep:nostr-sdk"]
 whatsapp-web = [

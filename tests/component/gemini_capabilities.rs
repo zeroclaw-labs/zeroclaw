@@ -1,8 +1,4 @@
 //! Gemini model_provider capabilities and contract tests.
-//!
-//! Validates that the Gemini model_provider correctly declares its capabilities
-//! through the public ModelProvider trait, ensuring the agent loop selects the
-//! right tool-calling strategy (prompt-guided, not native).
 
 use zeroclaw::providers::create_model_provider_with_url;
 use zeroclaw::providers::traits::ModelProvider;
@@ -58,10 +54,10 @@ fn gemini_convert_tools_returns_prompt_guided() {
     use zeroclaw::tools::ToolSpec;
 
     let model_provider = gemini_model_provider();
-    let tools = vec![ToolSpec {
-        name: "memory_store".to_string(),
-        description: "Store a value in memory".to_string(),
-        parameters: serde_json::json!({
+    let tools = vec![ToolSpec::new(
+        "memory_store".to_string(),
+        "Store a value in memory".to_string(),
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "key": {"type": "string"},
@@ -69,7 +65,7 @@ fn gemini_convert_tools_returns_prompt_guided() {
             },
             "required": ["key", "value"]
         }),
-    }];
+    )];
 
     let payload = model_provider.convert_tools(&tools);
     assert!(

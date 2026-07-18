@@ -1,35 +1,11 @@
 //! Comprehensive agent-loop test suite.
-//!
-//! Tests exercise the full `Agent.turn()` cycle with mock model_providers and tools,
-//! covering every edge case an agentic tool loop must handle:
-//!
-//!   1. Simple text response (no tools)
-//!   2. Single tool call → final response
-//!   3. Multi-step tool chain (tool A → tool B → response)
-//!   4. Max-iteration bailout
-//!   5. Unknown tool name recovery
-//!   6. Tool execution failure recovery
-//!   7. Parallel tool dispatch
-//!   8. History trimming during long conversations
-//!   9. Memory auto-save round-trip
-//!  10. Native vs XML dispatcher integration
-//!  11. Empty / whitespace-only LLM responses
-//!  12. Mixed text + tool call responses
-//!  13. Multi-tool batch in a single response
-//!  14. System prompt generation & tool instructions
-//!  15. Context enrichment from memory loader
-//!  16. ConversationMessage serialization round-trip
-//!  17. Tool call with stringified JSON arguments
-//!  18. Conversation history fidelity (tool call → tool result → assistant)
-//!  19. Builder validation (missing required fields)
-//!  20. Idempotent system prompt insertion
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::observability::{NoopObserver, Observer};
-use crate::tools::{Tool, ToolResult};
+use crate::tools::{Tool, ToolOutput, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -170,7 +146,7 @@ impl Tool for EchoTool {
             .to_string();
         Ok(ToolResult {
             success: true,
-            output: msg,
+            output: msg.into(),
             error: None,
         })
     }
@@ -196,7 +172,7 @@ impl Tool for FailingTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("intentional failure".into()),
         })
     }
@@ -260,7 +236,7 @@ impl Tool for CountingTool {
         *c += 1;
         Ok(ToolResult {
             success: true,
-            output: format!("call #{}", *c),
+            output: format!("call #{}", *c).into(),
             error: None,
         })
     }
@@ -1079,12 +1055,6 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 
     let _ = agent.turn("test").await.unwrap();
 
-    // Expected history entries:
-    //   0: system prompt
-    //   1: user message "test"
-    //   2: AssistantToolCalls
-    //   3: ToolResults
-    //   4: assistant "final answer"
     let history = agent.history();
     assert!(
         history.len() >= 5,
