@@ -129,7 +129,7 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
         })?;
         resolve_plugin_config(&manifest, scope, Some(values))
     });
-    PluginHostServices::new(resolver, state_service())
+    PluginHostServices::new(resolver, state_service(), support::egress_service())
 }
 
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {

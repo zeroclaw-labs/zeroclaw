@@ -74,6 +74,7 @@ fn host_services(
             resolve_plugin_config(&manifest, scope, configured.as_ref())
         }),
         state_service(),
+        support::egress_service(),
     )
 }
 

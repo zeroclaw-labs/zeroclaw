@@ -8150,8 +8150,9 @@ fn default_linkedin_api_version() -> String {
 pub struct DuplicatePluginConfigEntry;
 
 /// Per-instance plugin config keyed by the host-derived `PluginInstanceId`
-/// config-entry key; values are secret so they encrypt at rest under the same
-/// adjacent `.secret_key` as every other secret.
+/// config-entry key. The `config` values are secret and encrypt at rest under
+/// the same adjacent `.secret_key` as every other secret; policy contains only
+/// non-secret references and host patterns.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.entries"]
@@ -8162,6 +8163,11 @@ pub struct PluginEntryConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
+    /// Outbound-network exceptions and TLS profiles owned by this exact
+    /// host-derived plugin instance.
+    #[serde(default, skip_serializing_if = "PluginEgressConfig::is_empty")]
+    #[nested]
+    pub egress: PluginEgressConfig,
 }
 
 /// Plugin system configuration.
@@ -8185,7 +8191,7 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
-    /// Per-call WASM execution limits
+    /// WASM execution and host-resource limits
     #[serde(default)]
     #[nested]
     pub limits: PluginLimitsConfig,
@@ -8196,19 +8202,28 @@ pub struct PluginsConfig {
 }
 
 impl PluginsConfig {
-    pub fn entry_config(
+    /// Find the one canonical row for a host-derived plugin instance key.
+    pub fn entry(
         &self,
         instance_key: &str,
-    ) -> Result<Option<&HashMap<String, String>>, DuplicatePluginConfigEntry> {
+    ) -> Result<Option<&PluginEntryConfig>, DuplicatePluginConfigEntry> {
         let mut matches = self
             .entries
             .iter()
             .filter(|entry| entry.name == instance_key);
-        let first = matches.next().map(|entry| &entry.config);
+        let first = matches.next();
         if matches.next().is_some() {
             return Err(DuplicatePluginConfigEntry);
         }
         Ok(first)
+    }
+
+    pub fn entry_config(
+        &self,
+        instance_key: &str,
+    ) -> Result<Option<&HashMap<String, String>>, DuplicatePluginConfigEntry> {
+        self.entry(instance_key)
+            .map(|entry| entry.map(|entry| &entry.config))
     }
 }
 
@@ -8243,6 +8258,72 @@ pub struct PluginSecurityConfig {
     pub trusted_publisher_keys: Vec<String>,
 }
 
+/// Per-instance plugin egress exceptions and named TLS profiles
+/// (`[[plugins.entries]]` followed by `[plugins.entries.egress]`).
+///
+/// Public encrypted destinations are allowed when the plugin has the matching
+/// manifest permission. Private/local and permanently plaintext destinations
+/// require an explicit host pattern on that exact canonical instance row.
+/// Cloud metadata remains denied.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[prefix = "plugins.entries.egress"]
+pub struct PluginEgressConfig {
+    /// Hosts allowed to resolve entirely to private/local address space.
+    /// Entries are exact hosts, `*.example.com`, or the explicit `*` wildcard.
+    #[serde(default)]
+    pub private_network_hosts: Vec<String>,
+    /// Hosts allowed to use permanently plaintext HTTP, WebSocket, or TCP.
+    /// STARTTLS uses a host-mediated no-downgrade state machine instead.
+    #[serde(default)]
+    pub plaintext_hosts: Vec<String>,
+    /// Reusable TLS trust and optional mTLS identity profiles.
+    #[serde(default)]
+    #[nested]
+    #[natural_key = "name"]
+    pub tls_profiles: Vec<PluginTlsProfileConfig>,
+}
+
+impl PluginEgressConfig {
+    fn is_empty(&self) -> bool {
+        self.private_network_hosts.is_empty()
+            && self.plaintext_hosts.is_empty()
+            && self.tls_profiles.is_empty()
+    }
+}
+
+/// One named plugin TLS profile (`[[plugins.entries.egress.tls_profiles]]`).
+///
+/// Every `*_secret` value names a direct top-level `x-secret: true` property in
+/// the requesting plugin instance's manifest schema. These fields are
+/// references, not certificate/key material, and are therefore not secret
+/// config themselves.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[prefix = "plugins.entries.egress.tls_profiles"]
+pub struct PluginTlsProfileConfig {
+    /// Lowercase profile slug selected by a plugin egress request.
+    #[serde(default)]
+    pub name: String,
+    /// Destinations for which this trust/client-identity profile may be used.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Include platform/system trust roots.
+    #[serde(default = "default_true")]
+    pub system_roots: bool,
+    /// Optional secret property containing one or more PEM CA certificates.
+    #[serde(default)]
+    pub custom_ca_secret: Option<String>,
+    /// Optional secret property containing a PEM client certificate chain.
+    #[serde(default)]
+    pub client_certificate_secret: Option<String>,
+    /// Optional secret property containing the matching PEM client private key.
+    #[serde(default)]
+    pub client_private_key_secret: Option<String>,
+}
+
 fn default_signature_mode() -> String {
     "disabled".to_string()
 }
@@ -8256,12 +8337,14 @@ impl Default for PluginSecurityConfig {
     }
 }
 
-/// Per-call WASM execution limits (`[plugins.limits]`).
+/// Plugin execution and host-resource limits (`[plugins.limits]`).
 ///
 /// Bounds a single plugin call so a runaway or malicious component traps
 /// instead of hanging the host or exhausting memory. `call_fuel` caps
 /// instructions per call; the memory, table, and instance ceilings bound a
-/// store's growth. Every value is operator-tunable and validated as non-zero.
+/// store's growth. The connection ceiling spans calls and stores for one
+/// logical plugin instance. Every value is operator-tunable and validated as
+/// non-zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.limits"]
@@ -8278,6 +8361,10 @@ pub struct PluginLimitsConfig {
     /// Maximum component instances a plugin store may create.
     #[serde(default = "default_plugin_max_instances")]
     pub max_instances: usize,
+    /// Maximum live host-owned network connections per logical plugin instance,
+    /// shared across HTTP, WebSocket, TCP, TLS, and STARTTLS.
+    #[serde(default = "default_plugin_max_connections_per_instance")]
+    pub max_connections_per_instance: usize,
 }
 
 fn default_plugin_call_fuel() -> u64 {
@@ -8296,6 +8383,10 @@ fn default_plugin_max_instances() -> usize {
     64
 }
 
+fn default_plugin_max_connections_per_instance() -> usize {
+    16
+}
+
 impl Default for PluginLimitsConfig {
     fn default() -> Self {
         Self {
@@ -8303,6 +8394,7 @@ impl Default for PluginLimitsConfig {
             max_memory_mb: default_plugin_max_memory_mb(),
             max_table_elements: default_plugin_max_table_elements(),
             max_instances: default_plugin_max_instances(),
+            max_connections_per_instance: default_plugin_max_connections_per_instance(),
         }
     }
 }
@@ -9401,6 +9493,81 @@ fn validate_plugin_entries(config: &PluginsConfig) -> Result<()> {
         }
         if !seen.insert(instance_key) {
             anyhow::bail!("plugins.entries contains a duplicate instance key");
+        }
+        validate_plugin_egress(&entry.egress, &format!("plugins.entries[{index}].egress"))?;
+    }
+    Ok(())
+}
+
+fn validate_plugin_egress(config: &PluginEgressConfig, path: &str) -> Result<()> {
+    for (field, patterns) in [
+        ("private_network_hosts", &config.private_network_hosts),
+        ("plaintext_hosts", &config.plaintext_hosts),
+    ] {
+        validate_plugin_host_patterns(patterns, &format!("{path}.{field}"))?;
+    }
+
+    let mut profiles = std::collections::HashSet::new();
+    for (index, profile) in config.tls_profiles.iter().enumerate() {
+        if !zeroclaw_api::plugin_egress::is_valid_tls_profile_name(&profile.name) {
+            anyhow::bail!("{path}.tls_profiles[{index}].name must be a 1-64 byte lowercase slug");
+        }
+        if !profiles.insert(profile.name.as_str()) {
+            anyhow::bail!("{path}.tls_profiles contains a duplicate name");
+        }
+        if profile.hosts.is_empty() {
+            anyhow::bail!("{path}.tls_profiles[{index}].hosts must not be empty");
+        }
+        validate_plugin_host_patterns(
+            &profile.hosts,
+            &format!("{path}.tls_profiles[{index}].hosts"),
+        )?;
+        if !profile.system_roots && profile.custom_ca_secret.is_none() {
+            anyhow::bail!(
+                "{path}.tls_profiles[{index}] must enable system_roots or reference a custom CA secret"
+            );
+        }
+        for (field, secret) in [
+            ("custom_ca_secret", profile.custom_ca_secret.as_deref()),
+            (
+                "client_certificate_secret",
+                profile.client_certificate_secret.as_deref(),
+            ),
+            (
+                "client_private_key_secret",
+                profile.client_private_key_secret.as_deref(),
+            ),
+        ] {
+            if secret.is_some_and(|secret| {
+                zeroclaw_api::plugin_key::SecretPropertyRef::parse(secret.to_owned()).is_err()
+            }) {
+                anyhow::bail!(
+                    "{path}.tls_profiles[{index}].{field} must name a portable top-level secret property"
+                );
+            }
+        }
+        if profile.client_certificate_secret.is_some()
+            != profile.client_private_key_secret.is_some()
+        {
+            anyhow::bail!(
+                "{path}.tls_profiles[{index}] must configure both client_certificate_secret and client_private_key_secret"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_host_patterns(patterns: &[String], path: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (index, pattern) in patterns.iter().enumerate() {
+        let canonical = zeroclaw_api::plugin_egress::OutboundHostPattern::parse(pattern)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "{path}[{index}] must be an exact DNS host/IP, '*.example.com', or '*'"
+                ))
+            })?;
+        if !seen.insert(canonical) {
+            anyhow::bail!("{path} contains a duplicate host pattern");
         }
     }
     Ok(())
@@ -20208,6 +20375,13 @@ impl Config {
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
             );
         }
+        if self.plugins.limits.max_connections_per_instance == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_connections_per_instance",
+                "plugins.limits.max_connections_per_instance must be greater than 0; a zero ceiling rejects every plugin network connection"
+            );
+        }
 
         Ok(())
     }
@@ -21772,10 +21946,12 @@ max_height = 8
         plugins.entries.push(super::PluginEntryConfig {
             name: "image_gen_fal".into(),
             config: std::collections::HashMap::from([("api_key".into(), "secret-a".into())]),
+            ..Default::default()
         });
         plugins.entries.push(super::PluginEntryConfig {
             name: "sd_webui".into(),
             config: std::collections::HashMap::from([("base_url".into(), "http://host".into())]),
+            ..Default::default()
         });
 
         let fal = plugins.entry_config("image_gen_fal").unwrap().unwrap();
@@ -21791,6 +21967,7 @@ max_height = 8
         plugins.entries.push(super::PluginEntryConfig {
             name: "image_gen_fal".into(),
             config: std::collections::HashMap::new(),
+            ..Default::default()
         });
         assert_eq!(
             plugins.entry_config("image_gen_fal"),
@@ -21806,10 +21983,12 @@ max_height = 8
             super::PluginEntryConfig {
                 name: "zpi1_same".into(),
                 config: std::collections::HashMap::new(),
+                ..Default::default()
             },
             super::PluginEntryConfig {
                 name: "zpi1_same".into(),
                 config: std::collections::HashMap::new(),
+                ..Default::default()
             },
         ];
 
@@ -21817,6 +21996,95 @@ max_height = 8
             .validate()
             .expect_err("duplicate plugin instance keys must invalidate config");
         assert!(error.to_string().contains("duplicate instance key"));
+    }
+
+    #[test]
+    async fn plugin_egress_config_is_strict_and_secret_reference_only() {
+        let parsed: super::PluginEntryConfig = toml::from_str(
+            r#"
+name = "zpi1_canonical"
+
+[egress]
+private_network_hosts = ["*.internal.example"]
+plaintext_hosts = ["irc.example.com"]
+
+[[egress.tls_profiles]]
+name = "corporate-mtls"
+hosts = ["api.corporate.example"]
+system_roots = false
+custom_ca_secret = "corporate_ca_pem"
+client_certificate_secret = "client_cert_pem"
+client_private_key_secret = "client_key_pem"
+"#,
+        )
+        .expect("generic egress policy must deserialize");
+        let profile = &parsed.egress.tls_profiles[0];
+        assert_eq!(profile.name, "corporate-mtls");
+        assert_eq!(
+            profile.custom_ca_secret.as_deref(),
+            Some("corporate_ca_pem")
+        );
+
+        let unknown = toml::from_str::<super::PluginEntryConfig>(
+            "[egress]\nplugin_specific_tls_escape = true\n",
+        );
+        assert!(unknown.is_err(), "unknown one-off fields must be rejected");
+    }
+
+    #[test]
+    async fn plugin_egress_validation_rejects_incoherent_tls_profiles() {
+        let mut config = Config::default();
+        let mut entry = super::PluginEntryConfig {
+            name: "zpi1_canonical".to_string(),
+            ..Default::default()
+        };
+        entry
+            .egress
+            .tls_profiles
+            .push(super::PluginTlsProfileConfig {
+                name: "broken-mtls".to_string(),
+                hosts: vec!["api.example.com".to_string()],
+                system_roots: false,
+                custom_ca_secret: None,
+                client_certificate_secret: Some("client_cert_pem".to_string()),
+                client_private_key_secret: None,
+            });
+        config.plugins.entries.push(entry);
+        let error = config
+            .validate()
+            .expect_err("missing trust roots and half an identity must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must enable system_roots or reference a custom CA")
+        );
+
+        let profile = &mut config.plugins.entries[0].egress.tls_profiles[0];
+        profile.hosts.clear();
+        profile.system_roots = true;
+        profile.client_private_key_secret = Some("client_key_pem".to_string());
+        let error = config
+            .validate()
+            .expect_err("a reusable TLS identity without a destination binding must be rejected");
+        assert!(error.to_string().contains("hosts must not be empty"));
+    }
+
+    #[test]
+    async fn plugin_egress_validation_rejects_duplicate_normalized_patterns() {
+        let mut config = Config::default();
+        let mut entry = super::PluginEntryConfig {
+            name: "zpi1_canonical".to_string(),
+            ..Default::default()
+        };
+        entry.egress.private_network_hosts = vec![
+            "Internal.Example".to_string(),
+            "internal.example.".to_string(),
+        ];
+        config.plugins.entries.push(entry);
+        let error = config
+            .validate()
+            .expect_err("normalized duplicate patterns must be rejected");
+        assert!(error.to_string().contains("duplicate host pattern"));
     }
 
     #[test]
@@ -22881,6 +23149,20 @@ enabled = true
             .expect_err("zero max_instances must be rejected");
         assert!(
             err.to_string().contains("plugins.limits.max_instances"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_connections_per_instance() {
+        let mut config = Config::default();
+        config.plugins.limits.max_connections_per_instance = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_connections_per_instance must be rejected");
+        assert!(
+            err.to_string()
+                .contains("plugins.limits.max_connections_per_instance"),
             "error must name the offending path; got: {err}"
         );
     }

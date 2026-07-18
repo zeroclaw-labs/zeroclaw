@@ -103,7 +103,7 @@ async fn execute(binding: &str, grant_state: bool) -> String {
     let resolver = PluginConfigResolver::new(move |scope| {
         resolve_plugin_config(&manifest, scope, Some(&configured))
     });
-    let services = PluginHostServices::new(resolver, state_service());
+    let services = PluginHostServices::new(resolver, state_service(), support::egress_service());
     let mut plugin = runtime::create_plugin(&component, &scope, &services, limits())
         .await
         .expect("instantiate fixture tool");

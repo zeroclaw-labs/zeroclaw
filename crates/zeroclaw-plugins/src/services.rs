@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::PluginPermission;
 use crate::config::{PluginConfigResolver, ResolvedPluginConfig};
+use crate::egress::EgressHostService;
 use crate::error::PluginError;
 use crate::instance::PluginInstanceScope;
 
@@ -26,6 +27,7 @@ use crate::instance::PluginInstanceScope;
 pub struct PluginHostServices {
     config: PluginConfigResolver,
     state: PluginStateService,
+    egress: EgressHostService,
 }
 
 /// One coherent, transient bundle of schema-designated instance secrets.
@@ -307,8 +309,16 @@ pub(crate) enum ConfigLookupError {
 impl PluginHostServices {
     /// Build the complete required host-service bundle.
     #[must_use]
-    pub fn new(config: PluginConfigResolver, state: PluginStateService) -> Self {
-        Self { config, state }
+    pub fn new(
+        config: PluginConfigResolver,
+        state: PluginStateService,
+        egress: EgressHostService,
+    ) -> Self {
+        Self {
+            config,
+            state,
+            egress,
+        }
     }
 
     /// Resolve a typed, validated config view from canonical host state.
@@ -357,6 +367,12 @@ impl PluginHostServices {
     pub(crate) fn state(&self) -> &PluginStateService {
         &self.state
     }
+
+    /// Shared live-policy egress boundary for every plugin transport.
+    #[must_use]
+    pub fn egress(&self) -> &EgressHostService {
+        &self.egress
+    }
 }
 
 /// Empty config service for store-plumbing tests. Production callers must
@@ -392,7 +408,20 @@ pub(crate) fn test_host_services() -> PluginHostServices {
 /// Complete test bundle around a test-owned config resolver.
 #[cfg(test)]
 pub(crate) fn test_services(config: PluginConfigResolver) -> PluginHostServices {
-    PluginHostServices::new(config, PluginStateService::new(UnavailableState))
+    PluginHostServices::new(
+        config,
+        PluginStateService::new(UnavailableState),
+        test_egress_service(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_egress_service() -> EgressHostService {
+    use crate::egress::{EgressPolicy, EgressPolicyResolver};
+
+    EgressHostService::new(EgressPolicyResolver::new(|_| {
+        EgressPolicy::new([], [], [], 16)
+    }))
 }
 
 #[cfg(test)]

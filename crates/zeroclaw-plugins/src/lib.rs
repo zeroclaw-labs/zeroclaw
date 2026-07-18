@@ -13,6 +13,7 @@ mod component_secrets;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_state;
 pub mod config;
+pub mod egress;
 pub mod endpoint;
 pub mod error;
 pub mod host;
@@ -97,6 +98,11 @@ pub enum PluginCapability {
 pub enum PluginPermission {
     /// Can make HTTP requests
     HttpClient,
+    /// Can open host-mediated outbound WebSocket connections.
+    #[serde(rename = "websocket_client")]
+    WebSocketClient,
+    /// Can open host-mediated outbound TCP, TLS, and STARTTLS connections.
+    SocketClient,
     /// Can read from the filesystem (within sandbox)
     FileRead,
     /// Can write to the filesystem (within sandbox)

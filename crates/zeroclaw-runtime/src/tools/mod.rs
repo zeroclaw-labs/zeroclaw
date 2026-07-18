@@ -536,6 +536,107 @@ fn plugin_config_values(
 }
 
 #[cfg(feature = "plugins-wasm")]
+#[derive(Clone)]
+enum PluginConfigSource {
+    Live(Arc<parking_lot::RwLock<Config>>),
+    Fixed(Arc<Config>),
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl PluginConfigSource {
+    fn new(config: Arc<Config>, live: Option<Arc<parking_lot::RwLock<Config>>>) -> Self {
+        live.map_or(Self::Fixed(config), Self::Live)
+    }
+
+    fn with<T>(&self, use_config: impl FnOnce(&Config) -> T) -> T {
+        match self {
+            Self::Live(config) => use_config(&config.read()),
+            Self::Fixed(config) => use_config(config),
+        }
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn parse_plugin_secret_reference(
+    property: String,
+) -> Result<zeroclaw_api::plugin_key::SecretPropertyRef, zeroclaw_plugins::egress::EgressError> {
+    zeroclaw_api::plugin_key::SecretPropertyRef::parse(property.clone())
+        .map_err(|_| zeroclaw_plugins::egress::EgressError::InvalidSecretReference(property))
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn resolved_plugin_egress_policy(
+    config: &Config,
+    scope: &zeroclaw_plugins::instance::PluginInstanceScope,
+) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    use zeroclaw_plugins::egress::{
+        EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
+    };
+
+    let instance_key = scope.id().config_entry_key().map_err(|error| {
+        EgressError::PolicyUnavailable(format!(
+            "failed to derive the requesting instance's config key: {error}"
+        ))
+    })?;
+    let entry = config.plugins.entry(&instance_key).map_err(|_| {
+        EgressError::PolicyUnavailable(
+            "duplicate config rows for the requesting plugin instance".to_string(),
+        )
+    })?;
+    let Some(egress) = entry.map(|entry| &entry.egress) else {
+        return EgressPolicy::new(
+            [],
+            [],
+            [],
+            config.plugins.limits.max_connections_per_instance,
+        );
+    };
+    let profiles = egress
+        .tls_profiles
+        .iter()
+        .map(|profile| {
+            let name = TlsProfileName::new(profile.name.clone())?;
+            let custom_ca = profile
+                .custom_ca_secret
+                .clone()
+                .map(parse_plugin_secret_reference)
+                .transpose()?;
+            let client_identity = match (
+                profile.client_certificate_secret.clone(),
+                profile.client_private_key_secret.clone(),
+            ) {
+                (Some(certificate), Some(private_key)) => Some(TlsClientIdentity::new(
+                    parse_plugin_secret_reference(certificate)?,
+                    parse_plugin_secret_reference(private_key)?,
+                )),
+                (None, None) => None,
+                _ => {
+                    return Err(EgressError::InvalidTlsProfile {
+                        profile: profile.name.clone(),
+                        reason: "client certificate and private key references must be configured together"
+                            .to_string(),
+                    });
+                }
+            };
+            TlsProfile::new(
+                name,
+                profile.hosts.clone(),
+                profile.system_roots,
+                custom_ca,
+                client_identity,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    EgressPolicy::new(
+        egress.private_network_hosts.clone(),
+        egress.plaintext_hosts.clone(),
+        profiles,
+        config.plugins.limits.max_connections_per_instance,
+    )
+}
+
+#[cfg(feature = "plugins-wasm")]
 fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
@@ -547,37 +648,33 @@ fn plugin_host_services(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    // A live daemon handle and a fallback snapshot are mutually exclusive in
-    // the long-lived service, so the resolver never retains two config sources.
-    let fallback_config = live_config.is_none().then_some(config);
+    // One canonical source handle is shared by both resolvers. A daemon uses
+    // the live handle; a one-shot caller uses its fixed command config.
+    let source = PluginConfigSource::new(config, live_config);
+    let config_source = source.clone();
     let config = zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
         let package = scope.id().package();
         let config_entry_key = scope.id().config_entry_key()?;
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        if let Some(live_config) = &live_config {
+        config_source.with(|config| {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
-                // this access, and the global lock is released before guest
-                // setup.
-                plugin_config_values(&live_config.read(), &config_entry_key, package)
-            })
-        } else {
-            let config = fallback_config.as_ref().ok_or_else(|| {
-                zeroclaw_plugins::error::PluginError::InvalidConfig(
-                    "plugin config source is unavailable".to_string(),
-                )
-            })?;
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                // guest setup.
                 plugin_config_values(config, &config_entry_key, package)
             })
-        }
+        })
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
     );
-    zeroclaw_plugins::services::PluginHostServices::new(config, state)
+    let egress = zeroclaw_plugins::egress::EgressHostService::new(
+        zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
+            source.with(|config| resolved_plugin_egress_policy(config, scope))
+        }),
+    );
+    zeroclaw_plugins::services::PluginHostServices::new(config, state, egress)
 }
 
 /// Create full tool registry including memory tools and optional Composio.
@@ -1680,7 +1777,7 @@ mod tests {
 version = "0.1.0"
 wasm_path = "plugin.wasm"
 capabilities = ["tool"]
-permissions = ["config_read"]
+permissions = ["config_read", "http_client", "socket_client"]
 
 [config_schema]
 type = "object"
@@ -1701,14 +1798,22 @@ const = true
             manifest,
             zeroclaw_plugins::PluginCapability::Tool,
             "work",
-            [zeroclaw_plugins::PluginPermission::ConfigRead],
+            [
+                zeroclaw_plugins::PluginPermission::ConfigRead,
+                zeroclaw_plugins::PluginPermission::HttpClient,
+                zeroclaw_plugins::PluginPermission::SocketClient,
+            ],
         )
         .unwrap();
         let backup_scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
             manifest,
             zeroclaw_plugins::PluginCapability::Tool,
             "backup",
-            [zeroclaw_plugins::PluginPermission::ConfigRead],
+            [
+                zeroclaw_plugins::PluginPermission::ConfigRead,
+                zeroclaw_plugins::PluginPermission::HttpClient,
+                zeroclaw_plugins::PluginPermission::SocketClient,
+            ],
         )
         .unwrap();
         let instance_key = scope.id().config_entry_key().unwrap();
@@ -1716,6 +1821,7 @@ const = true
         let entry = |name: &str, enabled: &str| zeroclaw_config::schema::PluginEntryConfig {
             name: name.to_string(),
             config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
+            ..Default::default()
         };
         let mut snapshot = Config::default();
         snapshot.plugins.entries = vec![
@@ -1730,6 +1836,17 @@ const = true
             entry(&instance_key, "true"),
             entry(&backup_instance_key, "false"),
         ];
+        for key in ["backup", instance_key.as_str()] {
+            current
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .unwrap()
+                .egress
+                .private_network_hosts
+                .push("private.example".to_string());
+        }
         let live = Arc::new(parking_lot::RwLock::new(current));
         let services = plugin_host_services(
             Arc::clone(&host),
@@ -1741,6 +1858,36 @@ const = true
         assert!(
             services.resolve_config(&backup_scope).is_err(),
             "backup must use its invalid canonical entry, not a valid raw-name decoy"
+        );
+        let private_request = |scope| {
+            zeroclaw_plugins::egress::EgressRequest::new(
+                scope,
+                zeroclaw_plugins::egress::EgressTransport::Tls,
+                "private.example",
+                443,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(
+            services
+                .egress()
+                .authorize_addresses(
+                    private_request(scope.clone()),
+                    ["10.0.0.2:443".parse().unwrap()],
+                )
+                .is_ok(),
+            "work must resolve policy from its exact canonical entry"
+        );
+        assert!(
+            services
+                .egress()
+                .authorize_addresses(
+                    private_request(backup_scope.clone()),
+                    ["10.0.0.2:443".parse().unwrap()],
+                )
+                .is_err(),
+            "backup must not borrow the private-network exception from work or its raw-name decoy"
         );
         for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
             live.write()
@@ -1759,6 +1906,25 @@ const = true
         assert!(
             services.resolve_config(&backup_scope).is_ok(),
             "backup must resolve independently through the shared service"
+        );
+        live.write()
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == backup_instance_key)
+            .unwrap()
+            .egress
+            .private_network_hosts
+            .push("private.example".to_string());
+        assert!(
+            services
+                .egress()
+                .authorize_addresses(
+                    private_request(backup_scope),
+                    ["10.0.0.2:443".parse().unwrap()],
+                )
+                .is_ok(),
+            "backup must observe a live update to its own canonical egress policy"
         );
     }
 

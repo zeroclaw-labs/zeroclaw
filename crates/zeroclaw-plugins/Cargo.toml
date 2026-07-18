@@ -26,7 +26,7 @@ same-file = "1.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "net", "rt", "time"] }
 toml = "1.0"
 toml_edit = "0.25"
 wasmtime = { version = "45.0.3", default-features = false, features = [

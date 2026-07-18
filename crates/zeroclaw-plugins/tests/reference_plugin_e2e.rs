@@ -5,6 +5,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/egress.rs"]
+mod egress_support;
 #[path = "support/state.rs"]
 mod state_support;
 
@@ -135,6 +137,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
             resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
         }),
         state_service(),
+        egress_support::egress_service(),
     );
     let mut plugin = runtime::create_plugin(
         component,

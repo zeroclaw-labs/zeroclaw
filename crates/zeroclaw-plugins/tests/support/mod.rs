@@ -4,7 +4,9 @@ use tempfile::tempdir;
 use zeroclaw_plugins::host::{AdmittedComponent, PluginHost};
 use zeroclaw_plugins::{PluginCapability, PluginManifest};
 
+mod egress;
 mod state;
+pub use egress::egress_service;
 pub use state::state_service;
 
 pub fn admit_fixture(path: &Path, manifest: &PluginManifest) -> AdmittedComponent {
