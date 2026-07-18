@@ -1,6 +1,6 @@
 //! Minimal tool component used by the plugin-host integration tests.
 
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", not(feature = "socket-e2e")))]
 mod component {
     wit_bindgen::generate!({
         path: "../../../../../wit/v0",
@@ -97,4 +97,87 @@ mod component {
     }
 
     export!(FixtureTool);
+}
+
+#[cfg(all(target_family = "wasm", feature = "socket-e2e"))]
+mod socket_component {
+    wit_bindgen::generate!({
+        path: "../../../../../wit/v0",
+        world: "tool-plugin",
+        features: ["plugins-wit-v0", "plugins-wit-v0-sockets"],
+    });
+
+    use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
+    use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
+    use zeroclaw::plugin::sockets::{ConnectMode, ConnectRequest, ReceiveEvent, connect};
+
+    struct SocketFixtureTool;
+
+    impl PluginInfo for SocketFixtureTool {
+        fn plugin_name() -> String {
+            "socket-tool-fixture".to_string()
+        }
+
+        fn plugin_version() -> String {
+            "0.0.0".to_string()
+        }
+    }
+
+    impl Tool for SocketFixtureTool {
+        fn name() -> String {
+            "socket-round-trip".to_string()
+        }
+
+        fn description() -> String {
+            "Exercises the typed socket resource".to_string()
+        }
+
+        fn parameters_schema() -> String {
+            r#"{"type":"object","additionalProperties":false}"#.to_string()
+        }
+
+        fn execute(args: String) -> Result<ToolResult, String> {
+            let args: serde_json::Value =
+                serde_json::from_str(&args).map_err(|_| "args-invalid".to_string())?;
+            let config = args
+                .get("__config")
+                .ok_or_else(|| "config-missing".to_string())?;
+            let host = config
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "host-missing".to_string())?;
+            let port = config
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .ok_or_else(|| "port-invalid".to_string())?;
+            let connection = connect(&ConnectRequest {
+                host: host.to_string(),
+                port,
+                mode: ConnectMode::Plaintext,
+                tls_profile: None,
+            })
+            .map_err(|error| format!("{error:?}"))?;
+            connection
+                .send(b"tool-component-ping")
+                .map_err(|error| format!("{error:?}"))?;
+            for _ in 0..900 {
+                match connection.receive() {
+                    Ok(ReceiveEvent::Data(bytes)) => {
+                        return Ok(ToolResult {
+                            success: true,
+                            output: String::from_utf8_lossy(&bytes).into_owned(),
+                            error: None,
+                        });
+                    }
+                    Ok(ReceiveEvent::Idle) => {}
+                    Ok(ReceiveEvent::Closed(_)) => return Err("closed".to_string()),
+                    Err(error) => return Err(format!("{error:?}")),
+                }
+            }
+            Err("echo-timeout".to_string())
+        }
+    }
+
+    export!(SocketFixtureTool);
 }

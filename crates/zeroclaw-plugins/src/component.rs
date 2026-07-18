@@ -257,12 +257,6 @@ impl PluginState {
         &self.scope
     }
 
-    /// Shared point-of-use egress authority for transport imports.
-    #[must_use]
-    pub(crate) fn egress(&self) -> &crate::egress::EgressHostService {
-        self.services.egress()
-    }
-
     /// Existing Wasmtime resource table used for host-owned socket resources.
     #[must_use]
     pub(crate) fn resource_table(&self) -> &ResourceTable {

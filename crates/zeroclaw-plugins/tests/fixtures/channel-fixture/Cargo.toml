@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+socket-e2e = []
+
 [lib]
 crate-type = ["cdylib"]
 doc = false
