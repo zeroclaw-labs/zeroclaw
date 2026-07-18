@@ -18,8 +18,8 @@
 //! failed message id; transient failures are excluded (the transport's own
 //! retries handle those — waking the agent would double-send).
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use inkbox::{ApiErrorDetail, InkboxError};
@@ -106,7 +106,7 @@ impl FailureTracker {
     /// Install the inbound sink wake-ups are enqueued into. Called by
     /// `listen`, which owns the orchestrator's sender.
     pub(super) fn set_sender(&self, tx: mpsc::Sender<ChannelMessage>) {
-        *self.tx.lock().unwrap() = Some(tx);
+        *self.tx.lock() = Some(tx);
     }
 
     /// Remember the sender label an inbound message carried, keyed by its
@@ -115,7 +115,7 @@ impl FailureTracker {
         if reply_target.is_empty() || sender.is_empty() {
             return;
         }
-        let mut labels = self.labels.lock().unwrap();
+        let mut labels = self.labels.lock();
         // Bound the map; losing a label only costs session continuity.
         if labels.len() > BUDGET_PRUNE_LEN {
             labels.clear();
@@ -128,7 +128,7 @@ impl FailureTracker {
     /// back under every key — so a failure keyed by conversation and a later
     /// one keyed by number still share one budget.
     fn record(&self, keys: &[String]) -> u32 {
-        let mut store = self.budget.lock().unwrap();
+        let mut store = self.budget.lock();
         let now = Instant::now();
         let mut attempts = 0;
         for key in keys {
@@ -164,7 +164,7 @@ impl FailureTracker {
         if let Some(chat) = chat_id.map(str::trim).filter(|c| !c.is_empty()) {
             keys.push(format!("{mode}:chat:{chat}"));
         }
-        let mut store = self.budget.lock().unwrap();
+        let mut store = self.budget.lock();
         for key in &keys {
             store.remove(key);
         }
@@ -173,7 +173,7 @@ impl FailureTracker {
     /// True if this failed-message id was already handled inside the dedup
     /// window (webhook replay); otherwise mark it handled.
     fn dedup_seen(&self, key: &str) -> bool {
-        let mut seen = self.dedup.lock().unwrap();
+        let mut seen = self.dedup.lock();
         let now = Instant::now();
         seen.retain(|_, at| now.duration_since(*at) <= DEDUP_TTL);
         if seen.contains_key(key) {
@@ -245,7 +245,6 @@ impl FailureTracker {
         let sender_label = self
             .labels
             .lock()
-            .unwrap()
             .get(&note.reply_target)
             .cloned()
             .unwrap_or_else(|| who.to_string());
@@ -265,7 +264,7 @@ impl FailureTracker {
         cm.channel_alias = Some(self.alias.clone());
         cm.subject = note.subject.clone();
 
-        let tx = self.tx.lock().unwrap().clone();
+        let tx = self.tx.lock().clone();
         match tx {
             Some(tx) => {
                 if let Err(e) = tx.try_send(cm) {
