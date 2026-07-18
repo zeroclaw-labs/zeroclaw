@@ -9,7 +9,17 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+plugins-wasmtime = [
+  "dep:wasmtime",
+  "dep:wasmtime-wasi",
+  "dep:wasmtime-wasi-http",
+  "dep:rustls",
+  "dep:rustls-pemfile",
+  "dep:tokio-rustls",
+  "dep:webpki-roots",
+  "dep:zeroclaw-spawn",
+  "tokio/io-util",
+]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -17,16 +27,26 @@ plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-spawn.workspace = true
+zeroclaw-spawn = { workspace = true, optional = true }
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
+jsonschema = { version = "0.48", default-features = false }
 ring = "0.17"
+same-file = "1.0"
+rustls = { version = "0.23", default-features = false, optional = true, features = [
+  "logging",
+  "ring",
+  "std",
+  "tls12",
+] }
+rustls-pemfile = { version = "2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "net", "rt", "time"] }
 toml = "1.0"
+toml_edit = "0.25"
 wasmtime = { version = "45.0.3", default-features = false, features = [
   "component-model",
   "runtime",
@@ -40,7 +60,15 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
   "p2",
   "default-send-request",
 ], optional = true }
+zeroize.workspace = true
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+  "logging",
+  "tls12",
+  "ring",
+], optional = true }
+webpki-roots = { version = "1.0.6", optional = true }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3.26"
 zeroclaw-config = { path = "../zeroclaw-config" }

@@ -10,13 +10,22 @@ pub enum PluginError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("invalid plugin config: {0}")]
+    InvalidConfig(String),
+
+    #[error("invalid plugin instance identity: {0}")]
+    InvalidInstanceId(String),
+
+    #[error("invalid plugin endpoint: {0}")]
+    InvalidEndpoint(String),
+
     #[error("failed to load WASM module: {0}")]
     LoadFailed(String),
 
     #[error("plugin execution failed: {0}")]
     ExecutionFailed(String),
 
-    #[error("permission denied: plugin '{plugin}' requires '{permission}'")]
+    #[error("permission denied: plugin '{plugin}' is not authorized for '{permission}'")]
     PermissionDenied { plugin: String, permission: String },
 
     #[error("plugin '{0}' is already loaded")]
@@ -36,6 +45,15 @@ pub enum PluginError {
 
     #[error("invalid plugin signature: {0}")]
     SignatureInvalid(String),
+
+    #[error("plugin '{0}' must declare signed wasm_sha256 in strict mode")]
+    PayloadDigestRequired(String),
+
+    #[error("invalid WASM payload SHA-256: {0}")]
+    PayloadDigestInvalid(String),
+
+    #[error("WASM payload digest mismatch (expected {expected}, got {actual})")]
+    PayloadDigestMismatch { expected: String, actual: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
