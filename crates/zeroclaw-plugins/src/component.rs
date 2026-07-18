@@ -10,6 +10,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
+use crate::egress::EgressHostService;
+use crate::egress::{AuthorizedEgress, EgressError, build_tls_client_config};
 use crate::error::PluginError;
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
@@ -288,6 +290,45 @@ impl PluginState {
     /// Resolve public configuration lazily for the active service frame.
     pub(crate) fn public_config(&mut self) -> Result<serde_json::Value, PluginError> {
         self.with_call_config(|config| config.public_json().clone())
+    }
+
+    /// Shared live egress authority. Clones retain the same canonical resolver
+    /// and cross-transport connection accounting.
+    #[must_use]
+    pub fn egress_service(&self) -> EgressHostService {
+        self.services.egress().clone()
+    }
+
+    /// Build TLS client state for one authorization from the active canonical
+    /// config revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError`] for an authorization issued to another store,
+    /// unavailable referenced secrets, or invalid trust/identity material.
+    pub fn tls_client_config(
+        &mut self,
+        authorized: &AuthorizedEgress,
+    ) -> Result<Arc<rustls::ClientConfig>, EgressError> {
+        if authorized.request().instance_id() != self.scope.id() {
+            return Err(EgressError::AuthorizationScopeMismatch);
+        }
+        let profile_name = authorized
+            .tls_profile()
+            .map(|profile| profile.name().as_str())
+            .unwrap_or("system-roots")
+            .to_string();
+        build_tls_client_config(authorized.tls_profile(), |reference| {
+            self.with_call_config(|config| config.secret(reference.as_str()).map(ToOwned::to_owned))
+                .map_err(|_| EgressError::TlsSecretUnavailable {
+                    profile: profile_name.clone(),
+                    property: reference.as_str().to_string(),
+                })?
+                .ok_or_else(|| EgressError::TlsSecretUnavailable {
+                    profile: profile_name.clone(),
+                    property: reference.as_str().to_string(),
+                })
+        })
     }
 
     /// Charge one ZeroClaw-owned host import against the active call budget.
