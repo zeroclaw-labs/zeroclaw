@@ -296,6 +296,8 @@ zc-quickstart-risk-yolo-desc = Full autonomy. No approval gates. Use on disposab
 
 zc-quickstart-runtime-tight = Tight
 zc-quickstart-runtime-tight-desc = Low ceilings on iterations and tokens.
+zc-quickstart-runtime-local-small = Local Small
+zc-quickstart-runtime-local-small-desc = Compact limits for smaller local models with structured tool calls.
 zc-quickstart-runtime-balanced = Balanced
 zc-quickstart-runtime-balanced-desc = Sensible ceilings. Recommended.
 zc-quickstart-runtime-unbounded = Unbounded

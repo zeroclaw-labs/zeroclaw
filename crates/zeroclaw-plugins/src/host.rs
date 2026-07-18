@@ -75,11 +75,6 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Parse the signature mode string from config into a `SignatureMode`.
-    /// Parse a `[plugins.security] signature_mode` config string into a
-    /// [`SignatureMode`]. Returns `None` for any unrecognized value so the
-    /// caller can surface the misconfiguration under its attribution span
-    /// instead of silently degrading to the weakest posture. Case-insensitive.
     pub fn parse_signature_mode(mode: &str) -> Option<SignatureMode> {
         match mode.to_lowercase().as_str() {
             "strict" => Some(SignatureMode::Strict),
@@ -89,11 +84,6 @@ impl PluginHost {
         }
     }
 
-    /// Resolve a `[plugins.security] signature_mode` config string into a
-    /// [`SignatureMode`], failing safe to [`SignatureMode::Strict`] on any
-    /// unrecognized value. The misconfiguration WARN is emitted under a
-    /// plugin-role attribution span so the record carries role context even
-    /// from context-free config call sites.
     #[must_use]
     pub fn resolve_signature_mode(mode: &str) -> SignatureMode {
         Self::parse_signature_mode(mode).unwrap_or_else(|| {
@@ -330,11 +320,6 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get channel-capable plugins with their resolved WASM file paths.
-    /// Returns `(manifest, resolved_wasm_path)` tuples for building
-    /// `WasmChannel`s, mirroring [`Self::tool_plugin_details`]. Channel plugins
-    /// without a `wasm_path` are skipped, so a manifest that declares the
-    /// capability but ships no component is never registered as a live channel.
     pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
         self.loaded
             .values()
@@ -352,12 +337,6 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get skill-capable plugins paired with the absolute path to their `skills/`
-    /// directory. Plugins without an existing `skills/` subdirectory are skipped.
-    ///
-    /// Callers (typically the runtime skill loader) should pass each `skills_dir`
-    /// to `load_skills_from_directory` and then re-namespace the resulting skill
-    /// names as `plugin:<plugin>/<skill>` to avoid collisions with user skills.
     pub fn skill_plugin_details(&self) -> Vec<(&PluginManifest, PathBuf)> {
         self.loaded
             .values()
@@ -539,14 +518,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// Move every plugin (a subdirectory containing a `manifest.toml`) from `from`
-/// into `to`, returning the number moved.
-///
-/// Uses `rename`, falling back to a recursive copy + remove when the source and
-/// destination live on different filesystems. An existing `to/<name>` is never
-/// overwritten — that plugin is skipped. A missing or empty `from` is a no-op.
-/// Used by `zeroclaw plugin migrate` to relocate plugins stranded in legacy
-/// install directories into the configured one.
 pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError> {
     let Ok(entries) = std::fs::read_dir(from) else {
         return Ok(0);
@@ -665,7 +636,7 @@ capabilities = ["tool"]
 
     #[test]
     fn install_then_discover_round_trip_uses_same_dir() {
-        // Regression for the install/discovery path divergence (issue #6254):
+        // Regression for the install/discovery path divergence
         // a plugin installed into a resolved plugins dir must be discoverable
         // by a fresh host pointed at the *same* dir.
         let src = tempdir().unwrap();

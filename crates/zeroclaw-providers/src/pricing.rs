@@ -2,26 +2,6 @@
 //! fetched from providers' own `/models` listings (with the models.dev catalog
 //! as a secondary source for models the gateway doesn't price), used as a
 //! FALLBACK beneath the operator's `[cost.rates]` config.
-//!
-//! Single source of truth (AGENTS.md): the snapshot here is the only place
-//! live prices live. It is a materialized view of an EXTERNAL source (each
-//! gateway's `/models` endpoint), resolved on demand by the cost path. Nothing
-//! is copied into `Config`, the cost-tracking context, or any second struct;
-//! the endpoint URL and credentials are read from the existing provider config
-//! at build time and never re-declared.
-//!
-//! Hot-path contract: [`current_snapshot`] + [`lookup`] are synchronous,
-//! non-blocking, and never fetch. Fetching happens only in the background
-//! refresher spawned by [`spawn_refresher`], which the cost-recording path
-//! never awaits.
-//!
-//! Why the models.dev fallback lives here and not inside each provider's
-//! `list_models_with_pricing()`: that listing surface intentionally reports
-//! `pricing: None` for models.dev entries (`ModelPricing` carries per-token
-//! strings, models.dev serves per-MTok floats; see
-//! `compatible.rs::models_dev_to_model_info`), and enriching it would change
-//! what onboarding and the web rates editor display. Merging at snapshot
-//! assembly scopes live prices to cost tracking only.
 
 use crate::traits::{ModelInfo, ModelPricing};
 use futures_util::future::join_all;
@@ -31,11 +11,6 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 
-/// Normalized per-1M-token token rates: the cost path's view of a live price.
-///
-/// Distinct from the provider-facing [`ModelPricing`] (raw per-token decimal
-/// *strings* as a `/models` listing reports them): the refresher normalizes the
-/// latter into this so the cost path only ever sees clean USD-per-MTok numbers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ModelRates {
     pub input_per_mtok: Option<f64>,
@@ -81,21 +56,10 @@ impl ModelRates {
 /// absurd value (which would otherwise bill a fortune).
 const MAX_SANE_PER_MTOK: f64 = 1_000_000.0;
 
-/// Accept a per-1M-token rate only when it lands in `0.0..=MAX_SANE_PER_MTOK`.
-/// The range check also rejects non-finite values (NaN and the infinities fall
-/// outside the bounds), so a rejected dimension is treated as unpriced: it
-/// falls back to the other source, or stays `$0`, rather than billing an
-/// absurd cost.
 pub(crate) fn sane_mtok(rate: f64) -> Option<f64> {
     (0.0..=MAX_SANE_PER_MTOK).contains(&rate).then_some(rate)
 }
 
-/// Parse one per-token decimal string (e.g. `"0.000003"`) to USD per 1M tokens.
-/// `None` for absent/empty/unparseable/non-finite/negative/implausible values.
-///
-/// The web rates editor prefill applies the same per-token → per-MTok
-/// convention in `web/src/components/sections/CostRatesEditor.tsx`; if the
-/// wire unit ever changes, both must move together.
 fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
     let parsed: f64 = value.as_deref()?.trim().parse().ok()?;
     sane_mtok(parsed * 1_000_000.0)
@@ -112,12 +76,6 @@ pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
     }
 }
 
-/// Snapshot layout: outer key is either a composite alias `"<type>.<alias>"`
-/// (for opted-in aliases, so per-alias rates are preserved) or a bare provider
-/// family `"<type>"` (added only when ALL aliases for that family opted in,
-/// preserving backward compat with the bare-family cost path). Inner key:
-/// gateway-reported model id. Nested `&str`-probeable maps so the per-call
-/// cost path looks up without allocating.
 pub type PriceSnapshot = HashMap<String, HashMap<String, ModelRates>>;
 
 /// How often the background task re-fetches prices.
@@ -127,12 +85,6 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 static LIVE_PRICES: LazyLock<RwLock<Arc<PriceSnapshot>>> =
     LazyLock::new(|| RwLock::new(Arc::new(HashMap::new())));
 
-/// The config handle the refresher reads each cycle. Re-bound on every
-/// [`spawn_refresher`] call: the daemon reload loop re-instantiates subsystems
-/// with a fresh `Arc<RwLock<Config>>` per iteration, so a once-captured handle
-/// would go stale after the first reload and silently ignore later config
-/// edits. Holding a pointer to the canonical config (not a copy of it) keeps
-/// this within the single-source-of-truth rule.
 static CONFIG_HANDLE: LazyLock<RwLock<Option<Arc<RwLock<Config>>>>> =
     LazyLock::new(|| RwLock::new(None));
 
@@ -156,11 +108,6 @@ pub fn model_id_candidates(model_id: &str) -> impl Iterator<Item = &str> {
     std::iter::once(model_id).chain(model_id.rsplit_once('/').map(|(_, suffix)| suffix))
 }
 
-/// Pure lookup of one `(provider_ref, model_id)` against a snapshot. The
-/// snapshot may be keyed by composite alias `"<type>.<alias>"` or bare family
-/// `"<type>"`; `provider_ref` is tried verbatim first, then the bare family is
-/// tried when `provider_ref` arrives as `"<type>.<alias>"` (parity with
-/// `provider_pricing`). The model id is probed through [`model_id_candidates`].
 #[must_use]
 pub fn lookup<'a>(
     snapshot: &'a PriceSnapshot,
@@ -240,14 +187,6 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
             let cfg = handle.read().clone();
             let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
             if groups.is_empty() {
-                // Every provider opted back out (e.g. via reload): clear the
-                // snapshot once, on the transition to empty, so stale prices
-                // stop filling. Skip the rewrite when it is already empty so an
-                // idle refresher does not churn a fresh Arc every cycle. The
-                // loop stays alive (it does not break) so a later reload that
-                // re-enables a provider is picked up without a restart. A
-                // deliberate opt-out is not a failed refresh; only the latter
-                // keeps old data.
                 if !current_snapshot().is_empty() {
                     store_snapshot(PriceSnapshot::new());
                 }
@@ -283,15 +222,6 @@ struct GatewayGroup {
     wanted: Vec<WantedModel>,
 }
 
-/// Build one pollable group per distinct gateway among the providers that set
-/// `live_pricing = true`. Aliases sharing a gateway (same explicit `uri`, or
-/// the same family default when no `uri` is set) are deduped to a single
-/// `/models` call. Reuses the existing factory + each provider's own configured
-/// credentials/endpoint, so no endpoint URL or key is duplicated.
-///
-/// Also returns the total alias count per provider family (across all aliases,
-/// not just opted-in ones) so `assemble_snapshot` can decide whether to add a
-/// bare-family fallback entry.
 fn enabled_pricing_groups(
     config: &zeroclaw_config::schema::Config,
 ) -> (Vec<GatewayGroup>, HashMap<String, usize>) {
@@ -417,22 +347,6 @@ fn rates_catalog(models: Vec<ModelInfo>) -> HashMap<String, ModelRates> {
         .collect()
 }
 
-/// Assemble the price snapshot from the per-gateway catalogs and the models.dev
-/// catalogs. Pure (no I/O) so the precedence + fallback logic is unit-tested.
-///
-/// For each flagged model the gateway's price wins per dimension, and the
-/// models.dev price for that provider's catalog key backfills only the
-/// dimensions the gateway left unset, so a gateway that prices input+output
-/// but not `cache_read` still gets `cache_read` from models.dev. A model
-/// neither source prices is simply absent (cost recording leaves it at $0, as
-/// before).
-///
-/// Each opted-in alias is keyed by its composite `"<type>.<alias>"` so per-alias
-/// rates are preserved and a non-opted-in alias cannot inherit prices via the
-/// bare-family fallback in `lookup`. Additionally, when ALL aliases for a family
-/// opted in (opted-in count == `total_aliases_per_family[family]`), a bare
-/// `"<type>"` entry is added so the existing bare-family cost path (which
-/// currently records the provider family, not the alias) still finds prices.
 fn assemble_snapshot(
     gateway_results: &[(&[WantedModel], HashMap<String, ModelRates>)],
     models_dev: &HashMap<String, HashMap<String, ModelRates>>,
@@ -476,16 +390,6 @@ fn assemble_snapshot(
         }
     }
 
-    // Add a bare-family entry (e.g. "kilo") only when ALL aliases of that
-    // family opted in. This entry is a per-dimension merge of all opted-in
-    // aliases' rates (first alias to provide a dimension wins). Without it,
-    // a bare-family cost-path query ("kilo") would find nothing when no alias
-    // keyed the snapshot by bare family; with it, single-alias or all-opted-in
-    // families still work correctly via the existing lookup fallback.
-    //
-    // When only SOME aliases opted in, no bare entry is added: a non-opted-in
-    // alias querying by bare family (or via the split_once fallback from its
-    // composite key) correctly finds nothing.
     for (family, opted_in_count) in &opted_in_per_family {
         let total = total_aliases_per_family.get(family).copied().unwrap_or(0);
         if *opted_in_count < total {

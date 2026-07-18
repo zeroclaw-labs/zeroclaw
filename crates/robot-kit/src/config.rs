@@ -215,3 +215,47 @@ impl RobotConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_safety_limits_are_conservative() {
+        let c = RobotConfig::default();
+        // Safety-critical defaults the robot falls back to with no config file.
+        assert!((c.safety.min_obstacle_distance - 0.3).abs() < f64::EPSILON);
+        assert_eq!(c.safety.max_drive_duration, 30);
+        assert_eq!(c.safety.estop_pin, Some(4));
+        assert_eq!(c.safety.sensor_timeout_secs, 5);
+        assert!(!c.safety.confirm_movement);
+        assert!(c.safety.predict_collisions);
+        // Default drive backend is "mock" — no real motors until configured.
+        assert_eq!(c.drive.backend, "mock");
+    }
+
+    #[test]
+    fn save_then_load_round_trips_via_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("robot.toml");
+
+        let mut original = RobotConfig::default();
+        original.drive.max_speed = 1.25;
+        original.camera.width = 1280;
+        original.safety.min_obstacle_distance = 0.5;
+        original.save(&path).unwrap();
+
+        let loaded = RobotConfig::load(&path).unwrap();
+        assert!((loaded.drive.max_speed - 1.25).abs() < f64::EPSILON);
+        assert_eq!(loaded.camera.width, 1280);
+        assert!((loaded.safety.min_obstacle_distance - 0.5).abs() < f64::EPSILON);
+        assert_eq!(loaded.drive.backend, "mock");
+    }
+
+    #[test]
+    fn load_missing_file_is_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.toml");
+        assert!(RobotConfig::load(&missing).is_err());
+    }
+}

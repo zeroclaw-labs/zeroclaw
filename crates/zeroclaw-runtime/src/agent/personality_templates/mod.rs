@@ -1,21 +1,4 @@
 //! Default starter templates for the per-workspace personality files.
-//!
-//! Recovered verbatim from the pre-#5951 onboarding wizard's
-//! `scaffold_workspace()` (commit `0c622e607^:crates/zeroclaw-runtime/src/onboard/wizard.rs`).
-//! The wizard rewrite shipped without a workspace-scaffolder, so
-//! these templates were dormant in git history. They are restored here
-//! for the dashboard's Personality onboarding step (#6175 follow-up) and
-//! exposed via `GET /api/personality/templates`.
-//!
-//! Each `*.md` file in this directory is the literal template; they
-//! get embedded via `include_str!` and substituted with values from
-//! [`TemplateContext`] at render time. `AGENTS.md` has two variants
-//! (regular and `no-memory`) since it's the only file whose body
-//! changes based on whether persistent memory is enabled.
-//!
-//! Placeholders: `{agent}`, `{user}`, `{tz}`, `{comm_style}`. They
-//! render harmlessly as plain text if a `.md` file is previewed in
-//! GitHub.
 
 use super::personality::EDITABLE_PERSONALITY_FILES;
 use std::path::Path;
@@ -65,14 +48,6 @@ fn substitute(template: &str, ctx: &TemplateContext) -> String {
         .replace("{comm_style}", &ctx.communication_style)
 }
 
-/// Render one personality file from the default preset, or `None` when
-/// the filename is outside the editable allowlist (or when MEMORY.md
-/// is requested with `include_memory = false`).
-///
-/// `BOOTSTRAP.md` is intentionally not rendered — it's a first-run
-/// scaffold the agent reads once and deletes; the dashboard editor
-/// doesn't expose it. The original wizard owned BOOTSTRAP.md
-/// generation directly during workspace scaffolding.
 #[must_use]
 pub fn render(filename: &str, ctx: &TemplateContext) -> Option<String> {
     let raw = match filename {
@@ -104,21 +79,6 @@ pub fn render_preset_default(ctx: &TemplateContext) -> Vec<(&'static str, String
         .collect()
 }
 
-/// Materialize the default personality preset into `workspace_dir`.
-///
-/// Each file produced by [`render_preset_default`] is written **only when it is
-/// absent or blank** (whitespace-only). Files that already hold real content are
-/// never overwritten, so user edits and prior customization survive.
-///
-/// Blank files are (re)seeded on purpose: the runtime treats an empty
-/// personality file as missing (see
-/// [`crate::agent::personality::load_personality_files`]), so a stray 0-byte
-/// file would otherwise leave the agent with no identity *and* could never be
-/// healed by an existence-only guard. Treating empty as missing here closes
-/// that trap.
-///
-/// Returns the filenames written on this call (empty when everything was
-/// already populated).
 pub async fn ensure_personality_preset(
     workspace_dir: &Path,
     ctx: &TemplateContext,
