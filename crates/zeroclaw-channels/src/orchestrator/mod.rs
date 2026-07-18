@@ -39,6 +39,8 @@ pub use crate::linq::LinqChannel;
 pub use crate::mattermost::MattermostChannel;
 #[cfg(feature = "channel-mochat")]
 pub use crate::mochat::MochatChannel;
+#[cfg(feature = "channel-msteams")]
+pub use crate::msteams::MsTeamsChannel;
 #[cfg(feature = "channel-nextcloud")]
 pub use crate::nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
@@ -379,6 +381,7 @@ struct InterruptOnNewMessageConfig {
     slack: bool,
     discord: bool,
     mattermost: bool,
+    msteams: bool,
     matrix: bool,
     whatsapp: bool,
 }
@@ -390,6 +393,7 @@ impl InterruptOnNewMessageConfig {
             "slack" => self.slack,
             "discord" => self.discord,
             "mattermost" => self.mattermost,
+            "msteams" => self.msteams,
             "matrix" => self.matrix,
             "whatsapp" => self.whatsapp,
             _ => false,
@@ -417,6 +421,10 @@ fn interrupt_on_new_message_config(
             .mattermost
             .get("default")
             .is_some_and(|mm| mm.interrupt_on_new_message),
+        msteams: channels
+            .msteams
+            .get("default")
+            .is_some_and(|ms| ms.interrupt_on_new_message),
         matrix: channels
             .matrix
             .get("default")
@@ -7446,6 +7454,34 @@ fn build_channel_by_id(
         "mattermost" => {
             anyhow::bail!("Mattermost channel requires the `channel-mattermost` feature");
         }
+        #[cfg(feature = "channel-msteams")]
+        "msteams" => {
+            config
+                .channels
+                .msteams
+                .get("default")
+                .context("Microsoft Teams channel is not configured")?;
+            let alias = "default".to_string();
+            let config_resolver: crate::msteams::ConfigResolver = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channels.msteams.get(&alias).cloned())
+            };
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("msteams", &alias))
+            };
+            Ok(Arc::new(MsTeamsChannel::new(
+                alias,
+                config_resolver,
+                peer_resolver,
+            )))
+        }
+        #[cfg(not(feature = "channel-msteams"))]
+        "msteams" => {
+            anyhow::bail!("Microsoft Teams channel requires the `channel-msteams` feature");
+        }
         #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
@@ -8079,9 +8115,9 @@ fn build_channel_by_id(
             }
         }
         other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, msteams, \
+            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
+            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -8692,6 +8728,49 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Mattermost channel is configured but this build was compiled without \
              `channel-mattermost`; skipping Mattermost."
+        );
+    }
+
+    #[cfg(feature = "channel-msteams")]
+    for (alias, ms) in &config.channels.msteams {
+        if !active_channel_aliases.contains(&format!("msteams.{alias}")) {
+            continue;
+        }
+        if !ms.enabled {
+            continue;
+        }
+        let config_resolver: crate::msteams::ConfigResolver = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channels.msteams.get(&alias).cloned())
+        };
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("msteams", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Microsoft Teams",
+            alias: Some(alias.clone()),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(MsTeamsChannel::new(
+                    alias.clone(),
+                    config_resolver,
+                    peer_resolver,
+                )),
+                ms,
+            ),
+        });
+    }
+
+    #[cfg(not(feature = "channel-msteams"))]
+    if !config.channels.msteams.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Microsoft Teams channel is configured but this build was compiled without \
+             `channel-msteams`; skipping Microsoft Teams."
         );
     }
 
@@ -11497,6 +11576,7 @@ fn concurrent_persist_lock_serialization() {
             slack: false,
             discord: false,
             mattermost: false,
+            msteams: false,
             matrix: false,
             whatsapp: false,
         },
@@ -12004,6 +12084,7 @@ temperature = 0.3
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -12628,6 +12709,7 @@ temperature = 0.3
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -13103,6 +13185,7 @@ api_key = "anthropic-key"
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -13200,6 +13283,7 @@ api_key = "anthropic-key"
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -13315,6 +13399,7 @@ api_key = "anthropic-key"
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -13434,6 +13519,7 @@ api_key = "anthropic-key"
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -14013,6 +14099,7 @@ api_key = "anthropic-key"
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -15851,6 +15938,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -15936,6 +16024,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16055,6 +16144,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16169,6 +16259,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16320,6 +16411,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16443,6 +16535,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16588,6 +16681,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16716,6 +16810,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16829,6 +16924,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -16962,6 +17058,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -17119,6 +17216,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -17305,6 +17403,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -17787,6 +17886,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -17895,6 +17995,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -18013,6 +18114,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -18381,6 +18483,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -18525,6 +18628,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -18684,6 +18788,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: true,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -18998,6 +19103,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -19132,6 +19238,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -19245,6 +19352,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -19372,6 +19480,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -19547,6 +19656,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -21767,6 +21877,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -21942,6 +22053,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -22330,6 +22442,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -22820,6 +22933,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -22973,6 +23087,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -24723,6 +24838,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -24843,6 +24959,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -25005,6 +25122,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -25240,6 +25358,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -25393,6 +25512,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -25538,6 +25658,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -25703,6 +25824,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },
@@ -26079,6 +26201,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: true,
+            msteams: false,
             matrix: false,
             whatsapp: false,
         };
@@ -26092,6 +26215,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            msteams: false,
             matrix: false,
             whatsapp: false,
         };
@@ -26105,6 +26229,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: true,
             mattermost: false,
+            msteams: false,
             matrix: false,
             whatsapp: false,
         };
@@ -26118,6 +26243,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            msteams: false,
             matrix: false,
             whatsapp: true,
         };
@@ -26149,6 +26275,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            msteams: false,
             matrix: false,
             whatsapp: false,
         };
@@ -26268,6 +26395,7 @@ This is an example JSON object for profile settings."#;
                 slack: true,
                 discord: false,
                 mattermost: false,
+                msteams: false,
                 matrix: false,
                 whatsapp: false,
             },

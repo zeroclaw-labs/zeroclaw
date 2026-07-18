@@ -314,7 +314,7 @@ channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
     "channel-line",
     "channel-slack", "channel-signal",
-    "channel-mattermost", "channel-irc", "channel-imessage",
+    "channel-mattermost", "channel-msteams", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-wati", "channel-nextcloud",
@@ -341,6 +341,7 @@ channel-discord = ["zeroclaw-channels/channel-discord"]
 channel-slack = ["zeroclaw-channels/channel-slack"]
 channel-signal = ["zeroclaw-channels/channel-signal"]
 channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
+channel-msteams = ["zeroclaw-channels/channel-msteams"]
 channel-irc = ["zeroclaw-channels/channel-irc"]
 channel-twitch = ["zeroclaw-channels/channel-twitch"]
 channel-imessage = ["zeroclaw-channels/channel-imessage"]
