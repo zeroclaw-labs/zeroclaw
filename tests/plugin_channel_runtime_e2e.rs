@@ -113,6 +113,7 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
             ("credential_epoch".to_string(), "v1".to_string()),
             ("api_token".to_string(), "token-operations".to_string()),
         ]),
+        ..PluginEntryConfig::default()
     });
 
     let channels =
