@@ -62,10 +62,9 @@ pub(super) fn speak_to_call(conn_id: &str, text: &str) -> bool {
     }
 }
 
-/// Accept-window for the signed upgrade timestamp. Mirrors the Inkbox
-/// server's own webhook tolerance; the SDK verifier checks the HMAC but not
-/// freshness, so the channel enforces it.
-const UPGRADE_TIMESTAMP_TOLERANCE_SECS: i64 = 300;
+/// Accept-window for the signed upgrade timestamp, shared with the webhook
+/// handlers so every signed surface enforces the same freshness contract.
+const UPGRADE_TIMESTAMP_TOLERANCE_SECS: i64 = super::inbound::SIGNED_REQUEST_TOLERANCE_SECS;
 
 /// One accepted upgrade per call: Inkbox opens exactly one media socket per
 /// call and never reconnects it, so a second upgrade presenting the same
@@ -420,6 +419,7 @@ mod tests {
             signing_key: KEY.to_string(),
             alias: "zc".to_string(),
             public_host: "example.test".to_string(),
+            request_dedup: std::sync::Arc::default(),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await

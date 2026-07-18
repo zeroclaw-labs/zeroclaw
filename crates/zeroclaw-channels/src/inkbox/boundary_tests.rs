@@ -1,9 +1,11 @@
-//! Boundary tests: the real signed webhook handler over HTTP, the real
-//! channel `send()` through the real (blocking) SDK, against a mocked Inkbox
-//! API. Only the agent's model turn is scripted — every boundary the channel
-//! owns (signature verification, HTTP routing, SDK wire calls) is crossed for
-//! real, so these prove the delivery-failure loop and the per-surface
-//! round-trips end to end without a live account.
+//! Channel-boundary tests: the real signed webhook handler over HTTP and the
+//! real channel `send()` through the real (blocking) SDK, against a mocked
+//! Inkbox API. These tests drive the channel's own surfaces directly (they
+//! read the inbound receiver and call `send()` themselves — no orchestrator
+//! turn runs here); the runtime turn path is covered separately by the
+//! orchestrator test `inkbox_delivery_failure_recovers_through_the_real_turn_path`,
+//! which routes the same loop through `process_channel_message` with a
+//! scripted model.
 
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
@@ -100,6 +102,7 @@ async fn start_stack() -> Stack {
         signing_key: KEY.to_string(),
         alias: "zc".to_string(),
         public_host: "example.test".to_string(),
+        request_dedup: std::sync::Arc::default(),
     });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -121,9 +124,19 @@ impl Stack {
     /// Inkbox server signs webhooks: HMAC over `"{request_id}.{timestamp}."`
     /// plus the raw body.
     async fn post_signed(&self, event: &Value) -> u16 {
+        self.post_signed_as(
+            event,
+            &uuid::Uuid::new_v4().to_string(),
+            super::now_secs() as i64,
+        )
+        .await
+    }
+
+    /// Like [`Self::post_signed`], with the caller choosing the request id
+    /// and timestamp so replay and staleness can be exercised.
+    async fn post_signed_as(&self, event: &Value, request_id: &str, timestamp: i64) -> u16 {
         let body = event.to_string();
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let timestamp = super::now_secs().to_string();
+        let timestamp = timestamp.to_string();
         let mut mac = Hmac::<Sha256>::new_from_slice(KEY.as_bytes()).unwrap();
         mac.update(format!("{request_id}.{timestamp}.").as_bytes());
         mac.update(body.as_bytes());
@@ -433,5 +446,80 @@ async fn email_and_imessage_round_trip_and_unsigned_webhooks_are_dropped() {
             .await
             .is_err(),
         "unsigned events enqueue nothing"
+    );
+}
+
+/// Freshness and replay protection on the ordinary webhook surface: a stale
+/// signed request is rejected outright, and a repeated valid request id is
+/// acked without reaching the inbound queue or the delivery-failure observer
+/// a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_and_replayed_signed_webhooks_never_process_twice() {
+    let mut stack = start_stack().await;
+
+    let inbound_sms = json!({
+        "event_type": "text.received",
+        "data": { "text_message": {
+            "id": "t-fresh", "direction": "inbound",
+            "conversation_id": "c5", "remote_phone_number": "+15550004444",
+            "text": "hello"
+        } }
+    });
+
+    // A validly signed but stale request is rejected before any processing.
+    let stale = stack
+        .post_signed_as(
+            &inbound_sms,
+            "req-stale",
+            super::now_secs() as i64 - super::inbound::SIGNED_REQUEST_TOLERANCE_SECS - 60,
+        )
+        .await;
+    assert_eq!(stale, 401, "stale signed request is rejected");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), stack.rx.recv())
+            .await
+            .is_err(),
+        "a stale request must not reach the inbound queue"
+    );
+
+    // A fresh request processes once; replaying its request id acks without
+    // a second delivery.
+    let now = super::now_secs() as i64;
+    assert_eq!(
+        stack.post_signed_as(&inbound_sms, "req-once", now).await,
+        200
+    );
+    let first = stack.recv().await;
+    assert_eq!(first.reply_target, "sms:c5");
+    assert_eq!(
+        stack.post_signed_as(&inbound_sms, "req-once", now).await,
+        200
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), stack.rx.recv())
+            .await
+            .is_err(),
+        "a replayed request id must not enqueue a second message"
+    );
+
+    // The replay also never re-touched the delivery-failure observer: a
+    // delivery failure replayed under one request id wakes exactly once.
+    let failure = json!({
+        "event_type": "text.delivery_failed",
+        "data": { "text_message": {
+            "id": "t-replay-fail", "direction": "outbound",
+            "conversation_id": "c5", "remote_phone_number": "+15550004444",
+            "text": "x", "error_code": "40002"
+        } }
+    });
+    assert_eq!(stack.post_signed_as(&failure, "req-fail", now).await, 200);
+    let wake = stack.recv().await;
+    assert!(wake.content.contains("attempt=1/3"));
+    assert_eq!(stack.post_signed_as(&failure, "req-fail", now).await, 200);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), stack.rx.recv())
+            .await
+            .is_err(),
+        "the replayed failure must not wake the agent again"
     );
 }

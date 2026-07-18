@@ -6,6 +6,8 @@
 //! `reply_target` the channel's `send` understands.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -13,9 +15,21 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::ChannelMessage;
+
+/// Accept-window for signed inbound requests. Inkbox's webhook contract
+/// requires rejecting timestamps outside five minutes; the SDK verifier
+/// checks the HMAC but not freshness, so the channel enforces it on every
+/// signed surface (webhooks, incoming-call, call-media upgrade).
+pub(super) const SIGNED_REQUEST_TOLERANCE_SECS: i64 = 300;
+
+/// Recently accepted `X-Inkbox-Request-Id` values, for replay rejection
+/// within the freshness window. Shared by the webhook + incoming-call
+/// handlers; entries only need to outlive the timestamp window.
+pub(super) type RequestDedup = Arc<Mutex<HashMap<String, Instant>>>;
 
 /// Shared handler state. Cloned per request by axum's `State` extractor, so
 /// every field is cheap to clone (the `tx` is an mpsc sender).
@@ -33,6 +47,65 @@ pub struct AppState {
     /// Tunnel public host (e.g. `abc.inkbox.ai`), used to build the call-media
     /// WS URL we hand back from the incoming-call webhook with `?call_id=`.
     pub public_host: String,
+    /// Replay guard for signed requests (`X-Inkbox-Request-Id` dedup).
+    pub request_dedup: RequestDedup,
+}
+
+/// Outcome of authenticating one signed inbound request.
+pub(super) enum SignedRequest {
+    /// Signature valid, timestamp fresh, request id first-seen.
+    Fresh,
+    /// Signature valid but the request id was already accepted inside the
+    /// window: a delivery retry or a captured-request replay. Ack without
+    /// processing so the sender does not retry, and nothing runs twice.
+    Duplicate,
+    /// Missing/invalid signature or stale/missing timestamp.
+    Rejected(&'static str),
+}
+
+/// Authenticate a signed inbound request: HMAC over the body, timestamp
+/// freshness, and request-id replay dedup, in that order. Every check runs
+/// BEFORE the event is observed or mapped, so a stale or replayed request
+/// never reaches the inbound queue or the delivery-failure observer.
+pub(super) fn verify_signed_request(
+    header_map: &HashMap<String, String>,
+    body: &[u8],
+    signing_key: &str,
+    dedup: &RequestDedup,
+) -> SignedRequest {
+    if !matches!(
+        inkbox::signing_keys::verify_webhook(body, header_map, signing_key),
+        Ok(true)
+    ) {
+        return SignedRequest::Rejected("invalid or missing signature");
+    }
+    // The timestamp is covered by the HMAC; enforce freshness so captured
+    // requests age out.
+    let ts = header_map
+        .get("x-inkbox-timestamp")
+        .and_then(|t| t.parse::<i64>().ok());
+    let now = i64::try_from(super::now_secs()).unwrap_or(i64::MAX);
+    match ts {
+        Some(ts) if (now - ts).abs() <= SIGNED_REQUEST_TOLERANCE_SECS => {}
+        _ => return SignedRequest::Rejected("stale or missing timestamp"),
+    }
+    // Replay: each signed request carries a unique id; one acceptance each.
+    let Some(request_id) = header_map
+        .get("x-inkbox-request-id")
+        .filter(|r| !r.is_empty())
+    else {
+        return SignedRequest::Rejected("missing request id");
+    };
+    let mut seen = dedup.lock();
+    let now = Instant::now();
+    seen.retain(|_, at| {
+        now.duration_since(*at) <= Duration::from_secs(2 * SIGNED_REQUEST_TOLERANCE_SECS as u64)
+    });
+    if seen.contains_key(request_id) {
+        return SignedRequest::Duplicate;
+    }
+    seen.insert(request_id.clone(), now);
+    SignedRequest::Fresh
 }
 
 /// Build the loopback router: the call-media WebSocket on its fixed path, and
@@ -64,17 +137,27 @@ async fn incoming_call(State(state): State<AppState>, headers: HeaderMap, body: 
             header_map.insert(k.as_str().to_string(), s.to_string());
         }
     }
-    if !matches!(
-        inkbox::signing_keys::verify_webhook(&body, &header_map, &state.signing_key),
-        Ok(true)
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-            "[inkbox] rejecting incoming-call webhook with invalid or missing signature",
-        );
-        return StatusCode::UNAUTHORIZED.into_response();
+    match verify_signed_request(&header_map, &body, &state.signing_key, &state.request_dedup) {
+        SignedRequest::Fresh => {}
+        // An answered call cannot be answered twice; ack a replay quietly so
+        // the sender does not retry, and never open a second leg for it.
+        SignedRequest::Duplicate => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "[inkbox] ignoring replayed incoming-call webhook (duplicate request id)",
+            );
+            return StatusCode::OK.into_response();
+        }
+        SignedRequest::Rejected(why) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                format!("[inkbox] rejecting incoming-call webhook: {why}"),
+            );
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
 
     let payload: Value = match serde_json::from_slice(&body) {
@@ -129,15 +212,26 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         }
     }
 
-    // Drop anything that does not carry a valid Inkbox signature.
-    match inkbox::signing_keys::verify_webhook(&body, &header_map, &state.signing_key) {
-        Ok(true) => {}
-        _ => {
+    // Drop anything unsigned, forged, stale, or replayed BEFORE any
+    // processing: a stale or duplicate signed request must never reach the
+    // inbound queue or the delivery-failure observer.
+    match verify_signed_request(&header_map, &body, &state.signing_key, &state.request_dedup) {
+        SignedRequest::Fresh => {}
+        // Ack duplicates so the sender's delivery retries stop; process nothing.
+        SignedRequest::Duplicate => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "[inkbox] ignoring replayed webhook (duplicate request id)",
+            );
+            return StatusCode::OK;
+        }
+        SignedRequest::Rejected(why) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "[inkbox] dropping webhook with invalid or missing signature",
+                format!("[inkbox] dropping webhook: {why}"),
             );
             return StatusCode::UNAUTHORIZED;
         }
