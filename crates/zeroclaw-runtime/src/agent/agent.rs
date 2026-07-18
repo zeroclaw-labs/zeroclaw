@@ -2699,7 +2699,7 @@ impl Agent {
                     });
                 }
                 Err(error) => {
-                    // Model switch requested mid-turn (#6173): the unified loop
+                    // Model switch requested mid-turn: the unified loop
                     // signals a pending `model_switch` by returning
                     // `ModelSwitchRequested` without clearing the request. The
                     // round's tool call + result are already replayed into
