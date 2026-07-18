@@ -2174,8 +2174,26 @@ mod inbound {
             );
             anyhow::Error::msg(format!("read {}: {e}", path.display()))
         })?;
-        let manager = TranscriptionManager::new(config)?;
+        let manager = build_transcription_manager(config)?;
         manager.transcribe(&bytes, file_name).await
+    }
+
+    /// Build the channel-internal `TranscriptionManager`, binding the sole
+    /// registered provider as the agent alias when exactly one is configured.
+    /// Multi-provider setups keep the alias empty and still require explicit
+    /// `agent.<alias>.transcription_provider` routing through the orchestrator.
+    pub(super) fn build_transcription_manager(
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<TranscriptionManager> {
+        let manager = TranscriptionManager::new(config)?;
+        let sole_provider = match manager.available_providers().as_slice() {
+            [only] => Some((*only).to_string()),
+            _ => None,
+        };
+        Ok(match sole_provider {
+            Some(alias) => manager.with_agent_transcription_provider(alias),
+            None => manager,
+        })
     }
 }
 
@@ -3779,6 +3797,88 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    mod transcription_provider_resolution {
+        use super::super::inbound::build_transcription_manager;
+        use zeroclaw_config::schema::TranscriptionConfig;
+
+        // Loopback fixture URL matching the existing `transcription.rs` tests;
+        // these tests never open a socket, so the host is a placeholder only.
+        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
+            zeroclaw_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        #[tokio::test]
+        async fn binds_alias_when_exactly_one_provider_is_configured() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = build_transcription_manager(&config).unwrap();
+            assert_eq!(
+                manager.available_providers(),
+                vec!["local_whisper"],
+                "fixture must register exactly one provider"
+            );
+
+            // The alias field is private to `transcription`, so observe the
+            // behaviour it gates: with the sole provider bound, `transcribe`
+            // dispatches to the provider and reaches audio validation, which
+            // rejects the unsupported extension -- rather than bailing early on
+            // an empty alias. An unsupported format fails before any network
+            // call, keeping the test hermetic.
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                api_key: Some("test-groq-key".to_string()),
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = build_transcription_manager(&config).unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            // Ambiguous: explicit `agent.<alias>.transcription_provider`
+            // routing stays required, so the empty-alias bail must still fire.
+            // The bail short-circuits before any format check or network call.
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.ogg")
+                .await
+                .expect_err("an unbound alias must fail");
+            assert!(
+                err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected the empty-alias bail, got: {err}"
+            );
+        }
+    }
+
     mod markers {
         use super::super::markers::{MarkerKind, parse};
 
