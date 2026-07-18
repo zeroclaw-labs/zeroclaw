@@ -1,8 +1,8 @@
 # FND-002: Intentional Documentation: Standards, Structure, and i18n Strategy
 
-> Starting v0.7.0 · Type: Documentation · Rev. 1
+> Starting v0.7.0 · Type: Documentation · Rev. 2
 >
-> **Canonical reference** · Ratified by the team · Rev. 1
+> **Canonical reference** · Ratified by the team · Rev. 2
 > Discussion thread and full revision history: [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)
 
 ---
@@ -26,6 +26,15 @@
 9. [The Replacement docs-contract](#9-the-replacement-docs-contract)
 10. [Standards We Should Adopt](#10-standards-we-should-adopt)
 11. [Phased Roadmap](#11-phased-roadmap)
+
+---
+
+## Revision History
+
+| Rev | Date | Summary |
+|---|---|---|
+| 1 | 2026-04-20 | Initial ratified documentation standard |
+| 2 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions |
 
 ---
 
@@ -82,7 +91,7 @@ When this RFC was written, the project had two Architecture Decision Records in 
 - The choice of Rust over TypeScript
 - The trait-driven extensibility model
 - The WASM plugin system design
-- The choice of SQLite and Markdown as the two memory backends
+- The backend-neutral memory storage contract and SQLite default
 - The security model (pairing codes, autonomy levels, sandbox layers)
 
 Without these records, every new contributor must rediscover the reasoning through code archaeology. Every AI coding assistant that reads the codebase gets the *what* but not the *why*. This is one of the most expensive forms of undocumented technical debt.
@@ -294,19 +303,21 @@ Links to the relevant code files, issues, and external resources.
 - **ADRs live in `docs/book/src/architecture/decisions/`.** They are named `ADR-NNN-short-slug.md`.
 - **Significant architectural changes require an ADR.** "Significant" means: a decision that would be surprising to a new contributor, a decision that constrains future choices, or a decision that involves a non-obvious tradeoff.
 
-### 6.3 Retroactive ADRs
+<a id="63-retroactive-adrs"></a>
 
-The following key decisions should be documented retroactively. They represent the foundational reasoning a new contributor or AI tool needs to understand the codebase:
+### 6.3 Foundational ADR Backlog
 
-| Proposed ADR | Decision to record |
-|---|---|
-| ADR-001 | Rust as the implementation language (replacing TypeScript/OpenClaw) |
-| ADR-002 | Trait-driven extensibility as the primary architectural pattern |
-| ADR-003 | Extism as the initial WASM plugin execution bridge |
-| ADR-004 | Tool shared state ownership contract |
-| ADR-005 | SQLite + Markdown as the two memory backends |
-| ADR-006 | CLI as the only built-in channel; all others as plugins |
-| ADR-007 | Gateway extraction as a separate optional binary |
+The following foundational decisions and roadmap targets need durable ADRs. ADR-001 through ADR-005 are retroactive records of architecture that already exists. ADR-006 and ADR-007 describe implementation-gated targets from FND-001 and should remain proposed until their corresponding boundaries ship.
+
+| ADR | Decision to record | Classification |
+|---|---|---|
+| ADR-001 | Rust as the implementation language (replacing TypeScript/OpenClaw) | Retroactive; accepted |
+| ADR-002 | Trait-driven extensibility as the primary architectural pattern | Retroactive; accepted |
+| ADR-003 | Extism as the initial WASM plugin execution bridge | Retroactive; superseded by ADR-009 |
+| ADR-004 | Tool shared state ownership contract | Retroactive; accepted |
+| ADR-005 | Backend-neutral memory storage with SQLite as the default | Retroactive; accepted |
+| ADR-006 | Migrate optional channels from compiled feature gates to runtime plugins | Roadmap target; proposed until shipped |
+| ADR-007 | Extract the gateway as a separate optional binary | Roadmap target; proposed until shipped |
 
 Retroactive ADRs should be marked with a note:
 
@@ -425,8 +436,8 @@ Implementations are registered by the binary crate, not by the kernel.
 
 ## Related ADRs
 - ADR-002: Trait-driven extensibility
-- ADR-006: CLI as the only built-in channel
-- ADR-007: Gateway extraction
+- ADR-006: Optional channels migrate to runtime plugins
+- ADR-007: Gateway extraction into a separate optional binary
 ```
 
 ### 7.4 The AGENTS.md Hierarchy
@@ -453,8 +464,8 @@ docs/book/src/
 │   │   ├── ADR-002-trait-driven-extensibility.md
 │   │   ├── ADR-003-wasm-plugin-model.md
 │   │   ├── ADR-004-tool-shared-state-ownership.md
-│   │   ├── ADR-005-memory-backends.md
-│   │   ├── ADR-006-cli-only-built-in-channel.md
+│   │   ├── ADR-005-pluggable-memory-backends.md
+│   │   ├── ADR-006-runtime-channel-plugins.md
 │   │   ├── ADR-007-gateway-extraction.md
 │   │   └── ADR-009-wit-wasmtime-plugin-execution.md
 │   └── diagrams/
@@ -665,7 +676,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Deliverables:**
 
-- [ ] Write ADR-005 through ADR-007 (retroactive, see Section 6.3)
+- [x] Write ADR-005 as a retroactive record of the current memory storage contract
+- [ ] Write proposed ADR-006 and ADR-007 records for the implementation-gated FND-001 targets
 - [ ] Add a Vale configuration (`.vale.ini` + style rules) and CI check
 - [ ] Replace `docs-contract.md` in full with the version specified in Section 9
 - [ ] Migrate `docs/setup-guides/` content to the GitHub Wiki
@@ -674,7 +686,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 - [ ] Write root-level `AGENTS.md` for `crates/zeroclaw-api` (in anticipation of extraction)
 
 **Success metrics:**
-- ADR-001 through ADR-007 exist with accepted or superseded status as appropriate
+- ADR-001 through ADR-007 exist with accepted, proposed, or superseded status as appropriate
 - ADR-009 records the WIT/wasmtime decision that supersedes ADR-003
 - Vale CI check passes on all docs
 - Wiki has complete content for all migrated sections
@@ -704,7 +716,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Deliverables:**
 
-- [ ] Mark ADR-005 through ADR-007 as `accepted` (not `proposed`) once the corresponding code is shipped
+- [ ] Mark ADR-006 and ADR-007 as `accepted` once the corresponding code is shipped
 - [ ] Version the kernel IPC API documentation at `v1` with a stability guarantee
 - [ ] Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)
 - [ ] Publish the plugin SDK as a standalone document site (from `docs/book/src/developing/plugin-sdk.md`)

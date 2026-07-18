@@ -218,13 +218,6 @@ fn parse_event_kinds(events: &[String]) -> Vec<FilesystemEventKind> {
         .collect()
 }
 
-/// Platform-agnostic classification of a raw `notify` event.
-///
-/// `notify` normalizes the OS backends (inotify, FSEvents, ReadDirectoryChangesW)
-/// to a common `EventKind`, but rename reporting still differs by platform:
-/// inotify emits one `Both` event carrying `[from, to]`; FSEvents and
-/// ReadDirectoryChangesW emit split `From` and `To` events with one path each.
-/// This enum collapses all three into a uniform outcome the loop can act on.
 enum Classified {
     Event {
         kind: FilesystemEventKind,

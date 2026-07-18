@@ -1,10 +1,5 @@
 //! Routines engine — event-triggered automation with pattern matching and
 //! cooldown enforcement.
-//!
-//! A **routine** is a lightweight automation rule: when an event matches one of
-//! its patterns, the associated action fires (provided cooldown has elapsed).
-//! The engine bridges channel messages, cron ticks, webhooks, and system events
-//! into the existing SOP pipeline.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -127,7 +122,6 @@ impl RoutinesEngine {
     }
 
     /// Dispatch an event to all matching routines.
-    ///
     /// Returns a result for each matching routine (fired, cooldown, or
     /// disabled).  If no routine matches, returns `[NoMatch]`.
     pub fn dispatch(&mut self, event: &RoutineEvent) -> Vec<RoutineDispatchResult> {

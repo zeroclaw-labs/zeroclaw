@@ -1,9 +1,4 @@
 //! Response cache — avoid burning tokens on repeated prompts.
-//!
-//! Stores LLM responses in a separate SQLite table keyed by a SHA-256 hash of
-//! `(model, system_prompt_hash, user_prompt)`. Entries expire after a
-//! configurable TTL (default: 1 hour). The cache is optional and disabled by
-//! default — users opt in via `[memory] response_cache_enabled = true`.
 
 use anyhow::Result;
 use chrono::{Duration, Local};
@@ -21,11 +16,6 @@ struct InMemoryEntry {
     accessed_at: std::time::Instant,
 }
 
-/// Two-tier response cache: in-memory LRU (hot) + SQLite (warm).
-///
-/// The hot cache avoids SQLite round-trips for frequently repeated prompts.
-/// On miss from hot cache, falls through to SQLite. On hit from SQLite,
-/// the entry is promoted to the hot cache.
 pub struct ResponseCache {
     conn: Mutex<Connection>,
     ttl_minutes: i64,
@@ -97,7 +87,6 @@ impl ResponseCache {
     }
 
     /// Look up a cached response. Returns `None` on miss or expired entry.
-    ///
     /// Two-tier lookup: checks the in-memory hot cache first, then falls
     /// through to SQLite. On a SQLite hit the entry is promoted to hot cache.
     #[allow(clippy::cast_sign_loss)]

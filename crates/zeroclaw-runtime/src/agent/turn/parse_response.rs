@@ -82,19 +82,6 @@ pub(crate) fn resolve_display_text(
     }
 }
 
-/// Narration to relay after the live stream, given what was already forwarded.
-/// Returns the suffix of `display_text` past `streamed_visible_text` when the
-/// latter is a genuine prefix. `display_text` is a whitespace-trimmed
-/// rendering (`strip_think_tags` trims) of the same buffer the stream
-/// forwarded byte-exact, so when the exact prefix fails only the leading edge
-/// of the streamed text is normalized before retrying — trailing whitespace on
-/// a partial prefix is a real, already-forwarded interior byte, and trimming
-/// it would re-relay that byte and double it at the join. Trailing whitespace
-/// only matters in the fully-streamed case (a trailing `\n\n` before a tool
-/// call must not re-relay the whole turn), so the both-edge trim is used
-/// solely as a whole-string equality check. On genuine divergence the whole
-/// `display_text` is relayed: duplicate output is recoverable noise, a dropped
-/// tail is permanent loss, so the total function never truncates.
 pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
@@ -159,11 +146,6 @@ pub(crate) async fn interpret_chat_response(
         messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
     });
 
-    // Record cost via the task-local tracker (no-op when not scoped) and keep
-    // the per-call USD so both the Usage event and the llm_response log line
-    // can carry it. `None` = untracked (no cost scope or no usage);
-    // `Some(0.0)` = tracked but unpriced (the missing-pricing WARN fires
-    // inside record_tool_loop_cost_usage in that case).
     let call_cost_usd = resp
         .usage
         .as_ref()
@@ -360,9 +342,6 @@ mod tests {
 
     #[test]
     fn returns_empty_when_streamed_text_has_trailing_whitespace() {
-        // display_text is the trimmed rendering of the same buffer the live
-        // stream forwarded; a trailing "\n\n" before a tool call must not
-        // re-relay (and thus duplicate) the whole narration.
         assert_eq!(
             unforwarded_narration("Checking the data.", "Checking the data.\n\n"),
             ""
@@ -371,8 +350,6 @@ mod tests {
 
     #[test]
     fn returns_empty_when_streamed_text_has_leading_whitespace() {
-        // Leading whitespace survives the incremental think-tag stripper but
-        // is trimmed from display_text.
         assert_eq!(
             unforwarded_narration("Checking the data.", "\n\nChecking the data."),
             ""
@@ -389,8 +366,6 @@ mod tests {
 
     #[test]
     fn returns_suffix_past_the_whitespace_trimmed_streamed_prefix() {
-        // Stream cut short after "\nAbout to"; display_text is the trimmed
-        // full turn. Only the unseen tail is relayed.
         assert_eq!(
             unforwarded_narration("About to check.", "\nAbout to"),
             " check."
@@ -399,9 +374,6 @@ mod tests {
 
     #[test]
     fn preserves_trailing_prefix_space_when_only_the_leading_edge_diverges() {
-        // The leading newline is the trim mismatch; the trailing space is a
-        // real, already-forwarded interior byte of the partial prefix.
-        // Relaying " check." would double the space at the join.
         assert_eq!(
             unforwarded_narration("About to check.", "\nAbout to "),
             "check."
@@ -416,17 +388,6 @@ mod cost_usd_regression_tests {
     use std::sync::Arc;
     use zeroclaw_providers::traits::TokenUsage;
 
-    /// Regression guard for the per-call USD that
-    /// `record_tool_loop_cost_usage` returns and `interpret_chat_response`
-    /// threads into BOTH the `TurnEvent::Usage { cost_usd }` event and the
-    /// `cost_usd` attribute of the `llm_response` log record. The test fails
-    /// if either path drops the cost.
-    ///
-    /// Pricing/usage are picked so the expected cost is an exact f64:
-    ///   input  = 2_000_000 tokens @ 1.5 / 1e6  = 3.0
-    ///   output = 1_000_000 tokens @ 3.0 / 1e6  = 3.0
-    ///   cached = 0 tokens                       = 0.0
-    ///   expected total                          = 6.0
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cost_usd_flows_to_usage_event_and_llm_response() {
