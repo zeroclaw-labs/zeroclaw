@@ -166,6 +166,10 @@ zeroclaw plugin install team-calendar --registry https://example.invalid/registr
 plugin names and descriptions. It does not install, enable, or execute plugin
 code.
 
+The fetched index is cached. `zeroclaw plugin list` reads that cache and shows
+one package row alongside the host-admitted installed record, without fetching
+or treating registry metadata as proof that code was installed.
+
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
 the archive, and then hands the extracted plugin directory to the existing

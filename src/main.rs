@@ -362,6 +362,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -2663,7 +2665,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -6030,20 +6032,7 @@ async fn main() -> Result<()> {
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
