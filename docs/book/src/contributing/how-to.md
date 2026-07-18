@@ -54,7 +54,7 @@ For the full five-level taxonomy (unit / component / integration / system / live
 
 - Prose changes go in `docs/book/src/**/*.md` (this mdBook)
 - Rustdoc (`///`) changes update the API reference automatically on deploy
-- Reference pages (`docs/book/src/reference/cli.md`, `config.md`) are generated; don't hand-edit. Run `cargo mdbook refs` and commit the output
+- Reference pages (`docs/book/src/reference/cli.md`, `config.md`) are ignored generated outputs; don't hand-edit or commit them. Run `cargo mdbook refs` to preview changes from the owning CLI/config source.
 - Localisation: English markdown is the source of truth. Routine English docs PRs may omit broad generated `.po` churn; use the standard PR-body note in [Building the docs locally](../developing/building-docs.md).
 - Translation-cache PRs, release translation passes, and new locales should run `cargo mdbook sync`, commit the resulting `.po` files, and validate them with `cargo mdbook check`
 

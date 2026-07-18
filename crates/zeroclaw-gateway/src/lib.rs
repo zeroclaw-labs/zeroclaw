@@ -1794,6 +1794,10 @@ pub async fn run_gateway(
             "/api/channels/bind",
             post(api_config::handle_api_channel_bind),
         )
+        .route(
+            "/api/channels/{channel}/relink",
+            post(api::handle_api_channel_relink),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
