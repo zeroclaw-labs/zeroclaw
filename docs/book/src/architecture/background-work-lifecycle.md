@@ -21,7 +21,7 @@ Cron combines declarative membership with a SQLite execution store. Runtime-crea
 
 The scheduler polls for due, enabled, unclaimed rows. Claiming a row prevents duplicate selection while it is in flight. Completion records bounded output, then reschedules a recurring job, deletes a successful auto-delete one-shot, or disables another one-shot. If the process exits before releasing a claim, the next scheduler startup clears the stale lock.
 
-Startup behavior is explicit. With catch-up enabled, overdue jobs are considered for execution. Otherwise an overdue one-shot is disabled with a skipped result, while a recurring job advances to its next future occurrence without recording a run result. The scheduler's cancellation token stops future polling, but cancelling the scheduler is not a promise that an already-dispatched external side effect can be rolled back.
+Startup behavior is explicit. With catch-up enabled, overdue jobs are considered for execution. Otherwise an overdue one-shot is disabled with a skipped result, while a recurring job advances to its next future occurrence without recording a run result. The scheduler checks its cancellation token between polling iterations, so shutdown waits for the current due-job batch to finish before the loop exits. Cancelling the scheduler is not a promise that an already-dispatched external side effect can be rolled back.
 
 ## SOP runs
 
@@ -36,6 +36,8 @@ Approval and checkpoint states are durable control states only when the run stor
 ## Delegation and subagents
 
 Subagents inherit their parent's effective security boundary. Policy and memory overrides may narrow the parent envelope but cannot widen it, and child action accounting uses the parent's tracker so spawning children cannot bypass the parent's action budget.
+
+The `spawn_subagent` path is synchronous: the parent waits for the child run to finish, and this path has no local timeout or background cancellation handle.
 
 The delegate tool can run synchronously or start a background task and return a UUID. Background results are written atomically under the workspace passed to the tool and can be checked, listed, awaited in a batch, or cancelled. A live cancellation registry maps task IDs to process-local tokens; cancellation updates the persisted result and signals the running task when that live token is still available.
 
