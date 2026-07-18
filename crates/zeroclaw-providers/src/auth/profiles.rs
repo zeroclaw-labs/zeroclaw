@@ -168,13 +168,6 @@ impl AuthProfilesStore {
         self.load_locked().await
     }
 
-    /// Read-only listing of persisted profile IDs.
-    ///
-    /// Reads and parses the on-disk store under the shared lock but never
-    /// decrypts token fields and never migrates or writes the payload back.
-    /// Diagnostics that only need to know which profile IDs exist must use
-    /// this instead of `load()`, whose decrypt-and-migrate path can rewrite the
-    /// store as a side effect and can fail on an unrelated undecryptable value.
     pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
         let _lock = self.acquire_lock().await?;
         let persisted = self.read_persisted_locked().await?;

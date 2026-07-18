@@ -2,7 +2,6 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 
 /// Explicit no-op memory backend.
-///
 /// This backend is used when `memory.backend = "none"` to disable persistence
 /// while keeping the runtime wiring stable.
 #[derive(Debug, Default, Clone)]

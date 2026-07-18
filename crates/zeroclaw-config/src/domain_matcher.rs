@@ -265,4 +265,12 @@ mod tests {
         assert!(matcher.is_gated(" HTTPS://Accounts.Google.Com:443/login "));
         assert!(matcher.is_gated("accounts.google.com:8443"));
     }
+
+    #[test]
+    fn matching_normalizes_full_url_userinfo_query_and_trailing_dot() {
+        let matcher =
+            DomainMatcher::new(&["accounts.google.com".to_string()], &[] as &[String]).unwrap();
+
+        assert!(matcher.is_gated("https://user:pass@Accounts.Google.Com.:443?continue=1#section"));
+    }
 }

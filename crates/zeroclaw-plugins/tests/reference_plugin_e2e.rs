@@ -2,12 +2,6 @@
 //! against a throwaway config dir. The test seeds a disposable `ZEROCLAW_CONFIG_DIR`
 //! with the README's install layout, loads the real `Config`, discovers the plugin
 //! through the real `PluginHost`, resolves the plugin's own config section through
-//! the real loader, and executes the tool live. Nothing here is hand-rolled: the
-//! config resolution and discovery are the same code paths the daemon runs.
-//!
-//! The plugin component is provisioned out of band as a build artifact (a clean
-//! `cargo build --target wasm32-wasip2` of the published reference repo), not
-//! committed to the tree. When the fixture is absent, this test skips.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 

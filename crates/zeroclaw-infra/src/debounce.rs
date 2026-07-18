@@ -1,9 +1,4 @@
 //! Inbound message debouncing for rapid senders.
-//!
-//! When users type fast and send multiple messages in quick succession, each
-//! message would normally trigger a separate LLM call. [`MessageDebouncer`]
-//! accumulates rapid messages per sender within a configurable time window and
-//! emits them as a single concatenated message, reducing unnecessary agent runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +46,7 @@ impl MessageDebouncer {
         !self.window.is_zero()
     }
 
-    /// Submit a message for debouncing.
+    /// Submit a message for debouncing using the debouncer's default window.
     ///
     /// - If the window is zero, returns [`DebounceResult::Passthrough`] immediately.
     /// - Otherwise, accumulates the message under `sender_key` and returns
@@ -61,31 +56,47 @@ impl MessageDebouncer {
     /// Each new message resets the timer. When the timer fires it concatenates all
     /// accumulated messages with `"\n"` and sends them through the oneshot channel.
     pub async fn debounce(&self, sender_key: &str, message: &str) -> DebounceResult {
-        if !self.enabled() {
+        self.debounce_inner(sender_key, message, self.window).await
+    }
+
+    /// Submit a message for debouncing with an explicit per-call window.
+    ///
+    /// Behaves identically to [`debounce`](Self::debounce) but uses the provided
+    /// `window` instead of the debouncer's default. This is used by channels that
+    /// override the global debounce window (e.g., per-alias Telegram config).
+    pub async fn debounce_with_window(
+        &self,
+        sender_key: &str,
+        message: &str,
+        window: Duration,
+    ) -> DebounceResult {
+        self.debounce_inner(sender_key, message, window).await
+    }
+
+    async fn debounce_inner(
+        &self,
+        sender_key: &str,
+        message: &str,
+        window: Duration,
+    ) -> DebounceResult {
+        if window.is_zero() {
             return DebounceResult::Passthrough(message.to_owned());
         }
 
         let mut entries = self.entries.lock().await;
         let entries_ref = Arc::clone(&self.entries);
         let key = sender_key.to_owned();
-        let window = self.window;
 
         if let Some(entry) = entries.get_mut(&key) {
-            // Cancel the previous timer — we'll start a fresh one.
             entry.timer_handle.abort();
             entry.messages.push(message.to_owned());
 
-            // Replace the oneshot so the *new* caller gets the result.
-            // The previous caller's receiver will see a `RecvError` (dropped sender),
-            // which the dispatch loop interprets as "superseded — do nothing".
             let (tx, rx) = tokio::sync::oneshot::channel();
             entry.result_tx = Some(tx);
 
-            // Spawn a new timer.
-            let key_clone = key.clone();
             entry.timer_handle = zeroclaw_spawn::spawn!(async move {
                 tokio::time::sleep(window).await;
-                fire_debounced(&entries_ref, &key_clone).await;
+                fire_debounced(&entries_ref, &key).await;
             });
 
             DebounceResult::Pending(rx)
@@ -154,20 +165,17 @@ mod tests {
     async fn multiple_messages_concatenated() {
         let debouncer = MessageDebouncer::new(Duration::from_millis(100));
 
-        // First message
         let _rx1 = match debouncer.debounce("user1", "hello").await {
             DebounceResult::Pending(rx) => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
 
-        // Second message within window (resets timer)
         tokio::time::sleep(Duration::from_millis(30)).await;
         let rx2 = match debouncer.debounce("user1", "world").await {
             DebounceResult::Pending(rx) => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
 
-        // The first receiver is dropped (superseded), second gets the combined result
         let combined = rx2.await.unwrap();
         assert_eq!(combined, "hello\nworld");
     }
@@ -187,5 +195,32 @@ mod tests {
 
         assert_eq!(rx_a.await.unwrap(), "hi alice");
         assert_eq!(rx_b.await.unwrap(), "hi bob");
+    }
+
+    #[tokio::test]
+    async fn debounce_with_window_passthrough_when_zero() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(100));
+        assert!(debouncer.enabled());
+        match debouncer
+            .debounce_with_window("user1", "hello", Duration::ZERO)
+            .await
+        {
+            DebounceResult::Passthrough(msg) => assert_eq!(msg, "hello"),
+            DebounceResult::Pending(_) => panic!("expected Passthrough"),
+        }
+    }
+
+    #[tokio::test]
+    async fn debounce_with_window_overrides_default() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(5000)); // long default
+        let rx = match debouncer
+            .debounce_with_window("user1", "fast", Duration::from_millis(50))
+            .await
+        {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        let combined = rx.await.unwrap();
+        assert_eq!(combined, "fast");
     }
 }

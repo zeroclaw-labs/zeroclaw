@@ -161,13 +161,13 @@ impl SecretStore {
 
         let plaintext_bytes = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| {
-                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string()})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
+            .map_err(|e| {
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string(), "error": format!("{e}")})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
                      Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
                      Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw quickstart`.");
-                anyhow::Error::msg(
-                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)"
-                )
+                anyhow::Error::msg(format!(
+                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext): {e}"
+                ))
             })?;
 
         String::from_utf8(plaintext_bytes)
@@ -244,7 +244,7 @@ impl SecretStore {
 
                 // First, ensure the current user owns the file. Without this,
                 // Windows may assign an invalid SID as owner, making the file
-                // unreadable for subsequent commands. (See issue #4532.)
+                // unreadable for subsequent commands.
                 match std::process::Command::new("takeown")
                     .arg("/F")
                     .arg(&self.key_path)
