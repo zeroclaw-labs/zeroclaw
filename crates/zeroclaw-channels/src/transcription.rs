@@ -1877,6 +1877,66 @@ mod tests {
     }
 
     #[test]
+    fn typed_local_whisper_default_uses_serde_defaults_not_rust_zero() {
+        // Round-2: same shape bug existed on the typed provider surface
+        // (`[providers.transcription.local_whisper.<alias>]`). The
+        // `Configurable` macro emits `<T as Default>::default()` for newly
+        // scaffolded `create_map_key(...)` entries, so a regression to
+        // `#[derive(Default)]` here would let `max_audio_bytes = 0` /
+        // `timeout_secs = 0` leak through into a typed map entry the same
+        // way it did through the legacy `Default::default()` path.
+        let cfg = zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig::default();
+        assert_eq!(
+            cfg.max_audio_bytes,
+            25 * 1024 * 1024,
+            "typed provider default must reuse the serde-default value (25 MB); got {}",
+            cfg.max_audio_bytes
+        );
+        assert_eq!(
+            cfg.timeout_secs, 300,
+            "typed provider default must reuse the serde-default value (300 s); got {}",
+            cfg.timeout_secs
+        );
+        assert!(
+            cfg.uri.is_empty(),
+            "uri stays empty (no working endpoint at config-init time)"
+        );
+        assert_eq!(
+            cfg.bearer_token, None,
+            "bearer_token stays None by default (unauthenticated local endpoint)"
+        );
+        assert_eq!(
+            cfg.language, None,
+            "language stays None (operator opts in per-deployment)"
+        );
+    }
+
+    #[test]
+    fn typed_local_whisper_provider_accepts_default_after_uri_and_token_filled() {
+        // Round-2: a freshly scaffolded `[providers.transcription.local_whisper.<alias>]`
+        // map entry — what the `Configurable` macro writes when `create_map_key`
+        // opens a new alias — must already pass `LocalWhisperProvider::from_typed_config`
+        // once the operator fills `uri` and `bearer_token`. Before this fix,
+        // `Default::default()` produced `max_audio_bytes = 0` and
+        // `timeout_secs = 0`; the typed-config bridge forwarded those zeros
+        // into `LocalWhisperProvider::from_config`, which rejected them at
+        // load, and the alias landed in `dropped_config: providers.transcription.local_whisper`.
+        let cfg = zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+            uri: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+            bearer_token: Some("test-token".to_string()),
+            ..zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig::default()
+        };
+
+        let provider = LocalWhisperProvider::from_typed_config("local_whisper", &cfg).expect(
+            "typed provider config-init default must be loadable once uri + bearer_token are set",
+        );
+        assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
+        assert_eq!(provider.timeout_secs, 300);
+        assert_eq!(provider.url, "http://127.0.0.1:9999/v1/transcribe");
+        assert_eq!(provider.bearer_token, "test-token");
+    }
+
+    #[test]
     fn local_whisper_registered_when_config_present() {
         let config = TranscriptionConfig {
             local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
