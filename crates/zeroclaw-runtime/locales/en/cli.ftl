@@ -49,7 +49,40 @@ cli-channel-start-about = Start all configured channels
 cli-channel-doctor-about = Run health checks for configured channels
 cli-channel-add-about = Add a new channel configuration
 cli-channel-remove-about = Remove a channel configuration
+cli-channel-bind-wechat-about = Bind a WeChat identity into the allowlist
+cli-channel-bind-wechat-long-about =
+    Bind a WeChat identity into the allowlist.
+
+    Adds a WeChat user ID to the channel allowlist so the agent will respond to messages from that identity.
+
+    Use --alias to target a non-default WeChat channel. The alias must match a configured channels.wechat.<alias> section.
+
+    Examples:
+      zeroclaw channel bind-wechat wx_user_123
+      zeroclaw channel bind-wechat wx_user_123 --alias support
+cli-channel-bind-line-about = Bind a LINE identity into the allowlist
+cli-channel-bind-line-long-about =
+    Bind a LINE identity into the allowlist.
+
+    Adds a LINE user ID to the channel allowlist so the agent will respond to messages from that identity.
+
+    Use --alias to target a non-default LINE channel. The alias must match a configured channels.line.<alias> section.
+
+    Examples:
+      zeroclaw channel bind-line U1234567890abcdef
+      zeroclaw channel bind-line U1234567890abcdef --alias support
 cli-channel-send-about = Send a one-off message to a configured channel
+cli-channel-bind-unsupported = Channel type `{$channel}` does not support identity binding (supported: telegram, wechat, line).
+cli-channel-bind-empty-identity = {$channel} identity cannot be empty
+cli-channel-bind-alias-not-configured = {$channel} channel alias `{$alias}` is not configured. Configure the [{$section}] section first (see docs/book/src/channels/overview.md for its required fields).
+cli-channel-bind-already-bound = ✅ {$channel} identity already bound to {$channel_ref}: {$identity}
+cli-channel-bind-success = ✅ Bound {$channel} identity {$identity} to {$channel_ref}
+cli-channel-bind-saved = {"   "}Saved to {$path}
+cli-channel-bind-daemon-reloaded = 🔄 Detected running managed daemon service; reloaded automatically.
+cli-channel-bind-daemon-not-running = ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist.
+cli-channel-bind-daemon-reload-failed =
+    ⚠️ Allowlist saved, but failed to reload daemon service automatically: {$error}
+    Restart service manually with `zeroclaw service stop && zeroclaw service start`.
 cli-wechat-pairing-required = 🔐 WeChat pairing required. One-time bind code: {$code}
 cli-wechat-send-bind-command = Send `{$command} <code>` from your WeChat.
 cli-wechat-qr-login = 📱 WeChat QR Login ({$attempt}/{$max})
@@ -1050,4 +1083,3 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
-

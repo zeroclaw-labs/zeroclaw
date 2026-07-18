@@ -1,3 +1,4 @@
+mod channel_bind_cli;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
