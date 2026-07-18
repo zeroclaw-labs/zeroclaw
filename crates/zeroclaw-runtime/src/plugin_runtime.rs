@@ -10,6 +10,12 @@ use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::Config;
 
+/// Whether this build can execute WASM plugins.
+///
+/// Consumers use this value instead of duplicating the runtime crate's feature
+/// decision in their own feature tables.
+pub const WASM_PLUGIN_SUPPORT_COMPILED: bool = cfg!(feature = "plugins-wasm");
+
 #[cfg(feature = "plugins-wasm")]
 use zeroclaw_plugins::PluginCapability;
 #[cfg(feature = "plugins-wasm")]
