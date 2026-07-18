@@ -182,7 +182,6 @@ impl PluginInstanceScope {
     ///
     /// Returns [`PluginError::InvalidInstanceId`] when the instance capability
     /// does not equal `expected`.
-    #[cfg(any(feature = "plugins-wasmtime", test))]
     pub(crate) fn require_capability(&self, expected: PluginCapability) -> Result<(), PluginError> {
         if self.id().capability() != expected {
             return Err(PluginError::InvalidInstanceId(format!(
