@@ -5,11 +5,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
 
-/// Reserved `ChannelMessage.subject` prefix that the git/forge channel uses
-/// to label SOP-ingress events for human-readable logs and reply threading.
-/// Routing is NOT keyed on this (see `ChannelMessage::internal_sop_event`);
-/// it lives here so any channel that fills `subject` from user-controlled
-/// data (email) can keep this reserved namespace out of inbound subjects.
+/// Reserved `ChannelMessage.subject` prefix the git/forge channel uses to
+/// label SOP-ingress events. Routing is NOT keyed on this (see
+/// `ChannelMessage::internal_sop_event`); it exists so channels that fill
+/// `subject` from user-controlled data (email) can keep this reserved
+/// namespace out of inbound subjects.
 pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
 /// The single authority for the channel-SOP event topic grammar
@@ -88,14 +88,11 @@ pub enum ChannelApprovalResponse {
 
 /// An approval response together with the back-channel that produced it.
 ///
-/// When a channel fans a single approval request out to several registered
-/// back-channels (the agent's approval bridge does this so an ACP editor and a
-/// WebSocket dashboard can both answer), `decided_by` names the back-channel
-/// that actually answered, so the approval audit trail can attribute the
-/// decision to the deciding surface. Because the attribution travels with the
-/// returned decision, concurrent approvals on the same channel instance cannot
-/// cross-wire it. Ordinary single channels leave it `None` — their own
-/// [`Channel::name`] already identifies the surface.
+/// When a channel fans one approval request out to several back-channels,
+/// `decided_by` names the back-channel that actually answered, so the audit
+/// trail attributes the decision to the deciding surface. The attribution
+/// travels with the returned decision, so concurrent approvals on the same
+/// channel instance cannot cross-wire it. Single channels leave it `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributedApprovalResponse {
     pub response: ChannelApprovalResponse,
@@ -121,10 +118,10 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`)
-    /// when the platform supports multiple bot instances. Used by
-    /// session_key construction so two bots on the same platform compute
+    /// when the platform supports multiple bot instances. Session-key
+    /// construction uses this so two bots on the same platform compute
     /// distinct session IDs and don't share conversation history. `None`
-    /// for channels that don't have an alias concept yet (webhook, cli).
+    /// for channels without an alias concept (webhook, cli).
     pub channel_alias: Option<String>,
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
@@ -145,8 +142,7 @@ pub struct ChannelMessage {
     /// git/forge channel producer. The orchestrator routes a message into the
     /// SOP engine when (and only when) this is `Some`, so the decision can
     /// never be driven by user-controlled fields like `subject` or `content`.
-    /// `None` for every inbound conversational message. Not part of any wire
-    /// format - this never round-trips through serde.
+    /// Never round-trips through serde.
     pub internal_sop_event: Option<String>,
     /// When true, the orchestrator records this as context only and must not
     /// start an agent turn or emit visible channel side effects.
@@ -337,12 +333,6 @@ impl ChannelMessage {
 }
 
 impl SendMessage {
-    /// Build a reply `SendMessage` from an inbound `ChannelMessage`.
-    ///
-    /// Sets `recipient` from `msg.reply_target`, threads via `in_reply_to` and
-    /// `thread_ts`, and prepends `Re:` to the subject when the inbound message
-    /// carried one. Safe to call from any channel handler; the `in_reply_to`
-    /// field is silently ignored by channels that don't support it.
     pub fn reply_to(msg: &ChannelMessage, content: impl Into<String>) -> Self {
         let mut sm = Self::new(content, &msg.reply_target)
             .in_thread(msg.thread_ts.clone())
@@ -384,8 +374,8 @@ pub struct ForgeApiResponse {
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
-/// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
-/// inherit `channel = <type>.<alias>` from the trait object's role + alias.
+/// `attribution_span!(&*ch)` so log emissions from within `listen()` /
+/// `send()` inherit `channel = <type>.<alias>`.
 #[async_trait]
 pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
@@ -476,58 +466,35 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Self-loop guard for multi-agent runs.
+    /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
+    /// this channel, so the orchestrator can drop inbound events whose
+    /// `sender` matches. A bot must never respond to its own messages, even
+    /// if a misconfigured peer group lists the bot's handle as an external
+    /// peer.
     ///
-    /// Returns the bot's own handle/identity on this channel
-    /// (e.g. `@my_bot` for Telegram, the bot's user ID for Discord)
-    /// when known, so the orchestrator can drop inbound events whose
-    /// `sender` matches: a bot must never respond to its own
-    /// messages, even if a misconfigured peer group lists the bot's
-    /// handle as an external peer.
-    ///
-    /// **Channels that handle inbound traffic must override this.**
-    /// The default `None` makes both layers of the orchestrator's
-    /// self-loop guard (the SDK-side `drop_self_messages` here, and
-    /// the agent-loop fallback `peers::should_drop_self_loop`) into
-    /// no-ops — both layers consult the same `self_handle`, so a
-    /// channel that returns `None` has no protection from looping on
-    /// its own outbound. Outbound-only channels (webhook, gmail-push,
-    /// voice-call) never see inbound and can keep the default. The
-    /// in-tree overrides currently cover Telegram (`bot_username`
-    /// cache), IRC (configured nickname), Discord (decoded from token),
-    /// Slack (cached `auth.test` user_id); other inbound channels
-    /// remain on the default and rely on per-impl filtering instead
-    /// of the shared guard.
+    /// **Channels that handle inbound traffic must override this.** The
+    /// default `None` disables both layers of the self-loop guard
+    /// (`drop_self_messages` here and the agent-loop fallback), leaving the
+    /// channel unprotected from looping on its own outbound. Outbound-only
+    /// channels can keep the default.
     fn self_handle(&self) -> Option<String> {
         None
     }
 
-    /// The exact form the bot expects to see when addressed by users on
-    /// this channel. Discord wraps the snowflake as `<@1088...>`,
-    /// Telegram presents `@bot_username`, Matrix presents
-    /// `@bot:server`, Slack wraps the user ID as `<@U02...>`. Returned
-    /// verbatim into the per-channel system prompt so the agent
-    /// recognizes its own mention without guessing, and uses the same
-    /// form to tag itself or peers in outbound replies.
-    ///
-    /// Default `None` for channels that have no inbound mention
-    /// concept (CLI, webhook, hardware, ACP elicitation). Channels
-    /// that override `self_handle` should usually override this too,
-    /// applying their platform-native mention wrapper to the handle.
+    /// The exact form the bot expects when addressed by users on this channel
+    /// (e.g. Discord `<@snowflake>`, Telegram `@bot_username`). Returned
+    /// verbatim into the per-channel system prompt. Default `None` for
+    /// channels with no inbound mention concept. Channels that override
+    /// `self_handle` should usually override this too.
     fn self_addressed_mention(&self) -> Option<String> {
         None
     }
 
     /// Whether the orchestrator should drop an inbound message as
-    /// self-authored (multi-agent self-loop guard).
-    ///
-    /// Default implementation compares `msg.sender` against
-    /// [`Self::self_handle`] case-insensitively, after stripping a
-    /// leading `@` from each side so Telegram-style handles match
-    /// regardless of which form the SDK delivers. Override only for
-    /// platforms whose identity comparison is non-string (e.g. a
-    /// numeric Discord user ID is `as_str` already; this default
-    /// works there too).
+    /// self-authored (multi-agent self-loop guard). Default compares
+    /// `msg.sender` against [`Self::self_handle`] case-insensitively after
+    /// stripping a leading `@` from each side. Override only for platforms
+    /// whose identity comparison is non-string.
     fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
         let Some(handle) = self.self_handle() else {
             return false;
@@ -537,14 +504,6 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
-    /// Perform a low-level, provider-relative forge API call through this
-    /// channel's forge, when supported. The single transport seam every
-    /// higher-level forge operation (the `git_forge` tool's resource/action
-    /// grid and its `raw` catch-all) is built on: forge-backed channels (the
-    /// git channel) override this and delegate to their provider; all other
-    /// channels return the default unsupported error. Non-2xx responses are
-    /// returned in `ForgeApiResponse`, not raised, so the caller inspects the
-    /// forge's own error envelope.
     async fn forge_request(&self, _request: ForgeApiRequest) -> anyhow::Result<ForgeApiResponse> {
         anyhow::bail!(
             "channel '{}' does not support forge API requests",
@@ -552,15 +511,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         )
     }
 
-    /// Whether an inbound message is a direct, one-to-one conversation
-    /// with the bot (a DM/IM), as opposed to a group or broadcast
-    /// channel. A direct message is definitionally addressed to the
-    /// bot, so the orchestrator skips the reply-intent classifier and
-    /// goes straight to the tool-capable agent turn.
-    ///
-    /// Default `false`: channels that cannot prove a one-to-one context
-    /// keep the classifier precheck. Channels that distinguish DMs from
-    /// group traffic override this.
+    /// Whether an inbound message is a direct one-to-one conversation with
+    /// the bot. A DM is definitionally addressed to the bot, so the
+    /// orchestrator skips the reply-intent classifier and goes straight to
+    /// the tool-capable agent turn. Default `false`: channels that cannot
+    /// prove a one-to-one context keep the classifier precheck.
     fn is_direct_message(&self, _msg: &ChannelMessage) -> bool {
         false
     }
@@ -670,18 +625,10 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Request interactive tool-call approval from the channel operator.
     ///
     /// Returns `Ok(Some(response))` when the operator answers within the
-    /// channel's configured `approval_timeout_secs`; timeouts are surfaced
-    /// as `Deny`. Returns `Ok(None)` only for channels that do not implement
-    /// the prompt at all — the caller should fall back to its default policy
+    /// channel's configured `approval_timeout_secs`; timeouts surface as
+    /// `Deny`. Returns `Ok(None)` only for channels that do not implement
+    /// the prompt at all — the caller falls back to its default policy
     /// (typically auto-deny).
-    ///
-    /// Surface varies by channel:
-    /// - **Telegram** uses inline keyboard buttons.
-    /// - **Slack** Socket Mode uses Block Kit buttons; webhook fallback and
-    ///   non–Socket Mode deployments use a token text reply.
-    /// - **Discord, Signal, Matrix, WhatsApp** embed a 6-character
-    ///   alphanumeric token in the prompt and wait for a
-    ///   `<token> approve|deny|always` reply on the same conversation.
     async fn request_approval(
         &self,
         _recipient: &str,
@@ -690,17 +637,10 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
-    /// Like [`Channel::request_approval`], but also reports which back-channel
-    /// produced the decision when this channel fans the request out to several
-    /// registered back-channels (the agent's approval bridge does this so an
-    /// ACP editor and a WebSocket dashboard can both answer). The attribution
-    /// travels with the returned decision, so concurrent approvals on the same
-    /// channel instance cannot cross-wire it.
-    ///
-    /// The default implementation delegates to [`Channel::request_approval`]
-    /// and reports no specific back-channel (`decided_by: None`), which keeps
-    /// the deciding surface as the channel's own [`Channel::name`]. Only a
-    /// fan-out bridge needs to override this.
+    /// Like [`Channel::request_approval`], but also reports which
+    /// back-channel produced the decision when this channel fans the request
+    /// out. Default delegates to [`Channel::request_approval`] with
+    /// `decided_by: None`; only a fan-out bridge needs to override.
     async fn request_approval_attributed(
         &self,
         recipient: &str,
@@ -715,19 +655,6 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             }))
     }
 
-    /// Ask the user a multiple-choice question and return the chosen option's text.
-    ///
-    /// Returns `Ok(Some(answer))` if the channel handled the question natively
-    /// (e.g. ACP `elicitation/create` with a single-select enum schema, or
-    /// the legacy `session/request_permission` fallback for older ACP clients;
-    /// Telegram inline keyboard; etc.). Returns `Ok(None)` to signal the
-    /// caller should fall back to the generic `send` + `listen` flow.
-    /// Default impl returns `None`.
-    ///
-    /// Free-form (no-choices) questions are not modeled by this method.
-    /// Multiple-choice support landed via ACP `elicitation/create` (see
-    /// the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>);
-    /// free-form text is tracked under that spec's Phase 2.
     async fn request_choice(
         &self,
         _question: &str,
@@ -737,16 +664,6 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
-    /// Ask the user a multi-select multiple-choice question and return the
-    /// chosen options' text.
-    ///
-    /// Returns `Ok(Some(answers))` if the channel handled it natively (e.g.
-    /// ACP `elicitation/create` with a `type: array` schema). Returns
-    /// `Ok(None)` to signal the caller should fall back to a non-native
-    /// path (formatted text + reactions, etc.). Default impl returns `None`.
-    ///
-    /// `min_items` and `max_items` map to JSON Schema's `minItems` /
-    /// `maxItems` — clients enforce the bound before submitting.
     async fn request_multi_choice(
         &self,
         _question: &str,
@@ -759,14 +676,9 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Whether this channel can answer free-form (no-choices) `ask_user`
-    /// questions via the standard `send` + `listen` flow.
-    ///
-    /// Channels that can only handle structured choices (e.g. ACP in Phase 1
-    /// of the elicitation rollout — see
-    /// the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>)
-    /// should return `false` so callers can fail fast with a useful error
-    /// instead of timing out on `listen`. Free-form text support flips this
-    /// to `true` in Phase 2.
+    /// questions via the standard `send` + `listen` flow. Channels that only
+    /// handle structured choices return `false` so callers fail fast with a
+    /// useful error instead of timing out on `listen`.
     fn supports_free_form_ask(&self) -> bool {
         true
     }

@@ -1,16 +1,4 @@
 //! Automatic media understanding pipeline for inbound channel messages.
-//!
-//! Pre-processes media attachments (audio, images, video) before the agent sees
-//! the message, enriching the text with human-readable annotations:
-//!
-//! - **Audio**: transcribed via the existing [`super::transcription`] infrastructure,
-//!   prepended as `[Audio transcription: ...]`.
-//! - **Images**: when a vision-capable model_provider is active, described as `[Image: <description>]`.
-//!   Falls back to `[Image: attached]` when vision is unavailable.
-//! - **Video**: summarised as `[Video summary: ...]` when an API is available,
-//!   otherwise `[Video: attached]`.
-//!
-//! The pipeline is **opt-in** via `[media_pipeline] enabled = true` in config.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
@@ -22,7 +10,6 @@ use super::super::transcription::TranscriptionManager;
 pub use zeroclaw_api::media::{MediaAttachment, MediaKind};
 
 /// The media understanding pipeline.
-///
 /// Consumes a message's text and attachments, returning enriched text with
 /// media annotations prepended.
 pub struct MediaPipeline<'a> {
@@ -49,7 +36,6 @@ impl<'a> MediaPipeline<'a> {
     }
 
     /// Process a message's attachments and return enriched text.
-    ///
     /// If the pipeline is disabled via config, returns `original_text` unchanged.
     pub async fn process(&self, original_text: &str, attachments: &[MediaAttachment]) -> String {
         if !self.config.enabled || attachments.is_empty() {
@@ -122,11 +108,6 @@ impl<'a> MediaPipeline<'a> {
         }
     }
 
-    /// Describe an image attachment.
-    ///
-    /// When vision is available, the image will be passed through to the
-    /// model_provider as an `[IMAGE:]` marker and described by the model in the
-    /// normal flow.
     fn process_image(&self, attachment: &MediaAttachment) -> String {
         if self.vision_available {
             let (mime, data) = image_payload_for_vision(attachment);
@@ -141,7 +122,6 @@ impl<'a> MediaPipeline<'a> {
     }
 
     /// Summarize a video attachment.
-    ///
     /// Video analysis requires external APIs not currently integrated.
     /// For now we add a placeholder annotation.
     fn process_video(&self, attachment: &MediaAttachment) -> String {

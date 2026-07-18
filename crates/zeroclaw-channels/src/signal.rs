@@ -16,12 +16,6 @@ use zeroclaw_api::channel::{
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
-/// How many recent inbound messages we remember for the purpose of
-/// addressing outbound reactions back at them. signal-cli's `sendReaction`
-/// is keyed on `(targetAuthor, targetTimestamp)`, but we don't want those
-/// values to leak into the generic `ChannelMessage.id` (which flows into
-/// logs, memory keys, thread roots, and tool args). Instead we mint an
-/// opaque id and remember the mapping channel-locally.
 const RECENT_TARGETS_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,11 +32,6 @@ struct ReactionTarget {
     timestamp_ms: u64,
 }
 
-/// Signal channel using signal-cli daemon's native JSON-RPC + SSE API.
-///
-/// Connects to a running `signal-cli daemon --http <host:port>`.
-/// Listens via SSE at `/api/v1/events` and sends via JSON-RPC at
-/// `/api/v1/rpc`.
 #[derive(Clone)]
 pub struct SignalChannel {
     http_url: String,
@@ -242,15 +231,6 @@ impl SignalChannel {
         }
     }
 
-    /// Build the JSON-RPC params for signal-cli's `sendReaction` method.
-    ///
-    /// `targetAuthor` and `targetTimestamp` are recovered from
-    /// `recent_targets` rather than parsed out of `message_id`, so the
-    /// generic id stays opaque and the Signal sender never leaks into
-    /// the surfaces that consume `ChannelMessage.id`.
-    ///
-    /// Extracted from `add_reaction` / `remove_reaction` so the wire
-    /// shape is unit-testable without a live daemon.
     fn build_reaction_params(
         &self,
         channel_id: &str,
@@ -318,12 +298,6 @@ impl SignalChannel {
         }
     }
 
-    /// Check whether the message passes the group/DM filter.
-    ///
-    /// - `dm_only = true`: only DMs accepted; all group messages rejected.
-    /// - `dm_only = false`, `group_ids` empty: accept all (DMs and any group).
-    /// - `dm_only = false`, `group_ids` non-empty: accept DMs and listed
-    ///   groups only.
     fn matches_group(&self, data_msg: &DataMessage) -> bool {
         let incoming_group = data_msg
             .group_info
@@ -502,7 +476,6 @@ impl SignalChannel {
                 .map(|t| vec![t.to_string()])
                 .unwrap_or_default()
         };
-
         contents
             .into_iter()
             .enumerate()

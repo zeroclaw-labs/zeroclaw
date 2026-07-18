@@ -1,8 +1,4 @@
 //! ZeroClaw ESP32 UI firmware scaffold.
-//!
-//! This binary initializes ESP-IDF, boots a minimal Slint UI, and keeps
-//! architecture boundaries explicit so hardware integrations can be added
-//! incrementally.
 
 use anyhow::Context;
 use log::info;

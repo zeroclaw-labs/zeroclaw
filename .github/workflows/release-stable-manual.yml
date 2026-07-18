@@ -376,13 +376,18 @@ jobs:
 
   build-desktop:
     name: Build Desktop App (macOS Universal)
-    needs: [validate]
+    needs: [validate, web]
     runs-on: macos-14
     # Two kernel release builds (arm64 + x86_64) feed the universal sidecar,
     # then the universal app build on top.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
@@ -413,7 +418,69 @@ jobs:
           echo "Tauri version set to: $VERSION"
 
       - name: Stage bundled kernel sidecar (universal)
-        run: scripts/desktop/prepare-kernel.sh --target universal-apple-darwin
+        run: scripts/desktop/prepare-kernel.sh --target universal-apple-darwin --features embedded-web
+
+      - name: Smoke test embedded dashboard from an empty directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel="$GITHUB_WORKSPACE/apps/tauri/binaries/zeroclaw-universal-apple-darwin"
+          smoke_root="$RUNNER_TEMP/zeroclaw-desktop-smoke"
+          smoke_cwd="$smoke_root/cwd"
+          smoke_home="$smoke_root/home"
+          xdg_data_home="$smoke_root/xdg-data"
+          config_dir="$smoke_root/config"
+          daemon_log="$smoke_root/daemon.log"
+          host="127.0.0.1"
+          port="42618"
+          origin="http://$host:$port"
+          rm -rf "$smoke_root"
+          mkdir -p "$smoke_cwd" "$smoke_home" "$xdg_data_home" "$config_dir"
+
+          daemon_pid=""
+          cleanup() {
+            exit_code=$?
+            if [[ -n "$daemon_pid" ]]; then
+              kill "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+            fi
+            if [[ "$exit_code" -ne 0 ]]; then
+              echo "::group::Embedded dashboard daemon log"
+              cat "$daemon_log" || true
+              echo "::endgroup::"
+            fi
+            exit "$exit_code"
+          }
+          trap cleanup EXIT
+
+          cd "$smoke_cwd"
+          HOME="$smoke_home" XDG_DATA_HOME="$xdg_data_home" \
+            "$kernel" --config-dir "$config_dir" daemon \
+            --host "$host" --port "$port" >"$daemon_log" 2>&1 &
+          daemon_pid=$!
+
+          dashboard=""
+          ready=false
+          for _ in {1..60}; do
+            if dashboard="$(curl --fail --silent --connect-timeout 1 --max-time 2 "$origin/")"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              echo "::error::Embedded dashboard daemon exited before serving the SPA."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [[ "$ready" != true ]]; then
+            echo "::error::Embedded dashboard did not become ready within 60 seconds."
+            exit 1
+          fi
+          if ! grep -Fq 'id="root"' <<<"$dashboard"; then
+            echo "::error::Gateway root did not return the embedded dashboard."
+            exit 1
+          fi
 
       # Code-signing + notarization are optional: when the APPLE_* secrets are
       # configured the Tauri bundler picks them up from the environment and
