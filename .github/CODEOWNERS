@@ -161,8 +161,9 @@
 # Governance, release, CI (high-risk)
 # Listed before the security section so narrower /.github/codeql/** and
 # /.github/dependabot.yml rules below can override the broader /.github/**.
-# Review-routing control paths stay paired so no single owner can change
-# who reviews future changes.
+# Review-routing control paths stay paired for review-request continuity.
+# Note: CODEOWNERS itself accepts any one listed owner's approval; the
+# required-approval count is enforced by branch protection, not by pairing.
 # ---------------------------------------------------------------------------
 /.github/**             @Audacity88 @JordanTheJet
 /.github/CODEOWNERS     @Audacity88 @JordanTheJet
