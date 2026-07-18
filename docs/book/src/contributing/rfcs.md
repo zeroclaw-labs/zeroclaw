@@ -98,7 +98,7 @@ These shape everything else. Read them before proposing cross-cutting changes:
 
 RFC authorship by AI assistants (with a human sponsor) is explicitly permitted per RFC #5615. If an RFC was drafted with AI help:
 
-- Mark it clearly in the body ("drafted with Claude, reviewed by @singlerider")
+- Mark it clearly in the body ("drafted with Claude, reviewed by @maintainer")
 - The sponsoring human is responsible for accuracy and for responding to review
 - The human takes the ratification vote, not the AI
 

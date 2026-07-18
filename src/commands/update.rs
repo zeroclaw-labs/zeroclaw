@@ -115,7 +115,6 @@ pub struct UpdateInfo {
 }
 
 /// Check for available updates without downloading.
-///
 /// If `target_version` is `Some`, fetch that specific release tag instead of latest.
 pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -177,11 +176,6 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     })
 }
 
-/// Run the full 6-phase update pipeline.
-///
-/// If `target_version` is `Some`, fetch that specific version instead of latest.
-/// When `force` is set, install the target even if it is not newer than the
-/// current version (reinstall, or downgrade/pin to a specific `--version`).
 pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
@@ -385,11 +379,6 @@ fn is_installable_release_asset(name: &str, target: &str) -> bool {
     false
 }
 
-/// Return the exact Rust target triple for the current platform.
-///
-/// Using full triples (e.g. `aarch64-unknown-linux-gnu` instead of the
-/// shorter `aarch64-unknown-linux`) prevents substring matches from
-/// selecting the wrong asset (e.g. an Android binary on a GNU/Linux host).
 fn current_target_triple() -> Option<&'static str> {
     target_triple_for(
         std::env::consts::OS,
@@ -738,12 +727,6 @@ async fn validate_binary(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the binary header and verify its architecture matches the host.
-///
-/// On Linux/FreeBSD this reads the ELF header, on macOS the Mach-O header, and
-/// on Windows the PE/COFF header. If the binary is for a different architecture,
-/// returns a descriptive error instead of the opaque "Exec format error
-/// (os error 8)" (Unix) or its Windows equivalent.
 async fn check_binary_arch(path: &Path) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
@@ -778,12 +761,6 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Detect the CPU architecture from an ELF, Mach-O, or PE binary header.
-///
-/// Returns `None` when the container format or its machine type is not
-/// recognized, so callers treat "can't tell" as "skip the check" rather than a
-/// mismatch (returning a placeholder string here would make a known host arch
-/// compare unequal and falsely report an architecture mismatch).
 fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
     // ELF magic: 0x7f 'E' 'L' 'F'
     if header.len() >= 20 && header[0..4] == [0x7f, b'E', b'L', b'F'] {
@@ -848,11 +825,6 @@ fn host_architecture() -> Option<&'static str> {
     }
 }
 
-/// Verify the directory containing the executable is writable, so the update
-/// fails fast with an actionable message instead of downloading a binary and
-/// only then erroring during backup or swap. System-wide installs (e.g.
-/// `/usr/local/bin`, `/usr/bin`, or `Program Files`) typically require elevated
-/// privileges.
 async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
     let dir = exe
         .parent()
@@ -870,20 +842,6 @@ async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
     }
 }
 
-/// Replace the running executable at `target` with the freshly downloaded
-/// binary at `new`.
-///
-/// The mechanism differs by platform because each OS treats the file backing a
-/// running process differently:
-///
-/// * Unix — the kernel keeps the inode alive while the process runs, so the old
-///   path can be unlinked and the new binary copied into the now-free path
-///   (this avoids `ETXTBSY`).
-/// * Windows — the OS locks the image of a running process and refuses to delete
-///   it, but it *does* allow renaming. So the running exe is moved aside to a
-///   `.old` sidecar and the new binary is copied into the original path. The
-///   sidecar usually cannot be removed until the old process exits, so its
-///   deletion is best-effort and any leftover is swept on the next update run.
 #[cfg(not(windows))]
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
     tokio::fs::remove_file(target)
@@ -2044,7 +2002,7 @@ mod tests {
         zip_buf
     }
 
-    /// Regression: #7509 — verify the zip unpacker writes the zeroclaw.exe
+    /// Regression: verify the zip unpacker writes the zeroclaw.exe
     /// binary bytes from a minimal Windows ZIP release asset.
     #[test]
     fn unpack_zip_writes_zeroclaw_exe() {

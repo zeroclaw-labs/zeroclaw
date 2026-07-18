@@ -1,12 +1,4 @@
 //! Quickstart apply path.
-//!
-//! Single entry point both surfaces (web gateway, zerocode RPC, CLI)
-//! call to land a [`BuilderSubmission`] into the live [`Config`]. The
-//! runtime never enumerates channel types, provider types, or storage
-//! backends itself — every write goes through `Config::set_prop_persistent`,
-//! which dispatches through the schema-derived `Configurable` tree.
-//! Adding a new channel / provider / storage backend to the schema
-//! lights up in the Quickstart for free.
 
 use serde::{Deserialize, Serialize};
 
@@ -396,11 +388,6 @@ pub async fn apply_with_surface(
     Ok(applied)
 }
 
-/// Record a `dismissed` event for a run that exited without a
-/// Create. Surfaces call this when the user closes the Quickstart
-/// page / leaves the modal stack before submitting. `last_step` is
-/// optional and names whichever selector the user got furthest with;
-/// pass `None` for "didn't progress past the first selector."
 pub fn record_dismissed(run_id: &str, surface: Surface, last_step: Option<QuickstartStep>) {
     let last_step_str = last_step
         .map(|s| match s {
@@ -434,12 +421,6 @@ pub fn should_auto_launch(config: &Config) -> bool {
     !config.onboard_state.quickstart_completed && config.agents.is_empty()
 }
 
-/// Snapshot of the bits of `Config` the Quickstart UI needs to render
-/// each step's "Use existing" section without pulling the entire config.
-///
-/// Shared by every surface — the gateway's `GET /api/quickstart/state`
-/// and the RPC `quickstart/state` method both build the response from
-/// this one function, so the two transports cannot drift.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct QuickstartState {
@@ -453,30 +434,11 @@ pub struct QuickstartState {
     pub model_providers: Vec<String>,
     /// `<channel_type>.<alias>` refs.
     pub channels: Vec<String>,
-    /// Subset of `channels` that is not yet bound to any agent's
-    /// `agents.<alias>.channels` field. Surfaces use this for "Use
-    /// existing" pickers so they cannot let the user accidentally
-    /// reassign a channel that's still owned by another agent
-    /// (the schema invariant is one channel → one agent).
     #[serde(default)]
     pub unassigned_channels: Vec<String>,
     /// `<storage_type>.<alias>` refs.
     pub storage: Vec<String>,
-    /// Available model-provider types the Quickstart "Create new"
-    /// picker can offer. Derived at request time from the canonical
-    /// registry in `zeroclaw_providers::list_model_providers()` — the
-    /// same source the CLI catalog and gateway sections route use.
-    /// Surfaces render this list as-is; they do not maintain their own.
     pub model_provider_types: Vec<QuickstartTypeOption>,
-    /// Available channel kinds the Quickstart "Create new" picker can
-    /// offer. Derived at request time from
-    /// [`zeroclaw_config::schema::ChannelsConfig::channels`] — the
-    /// schema-side single source of truth for "what channel kinds the
-    /// config schema knows about." Compile-time gating of channel
-    /// implementations (via `zeroclaw-channels` features) is enforced
-    /// later, at apply time; the picker shows every kind the schema
-    /// can represent so users get a consistent option list across
-    /// builds.
     pub channel_types: Vec<QuickstartTypeOption>,
     /// Risk presets from `zeroclaw_config::presets::RISK_PRESETS`.
     pub risk_presets: &'static [zeroclaw_config::presets::RiskPreset],
@@ -489,10 +451,6 @@ pub struct QuickstartState {
     pub personality_files: &'static [&'static str],
 }
 
-/// One row in the Quickstart "Create new …" picker, sourced from a
-/// schema- or registry-level inventory so neither the TUI nor the web
-/// surface needs its own list. `kind` is the canonical kebab-case
-/// identifier written into config; `display_name` is the picker label.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct QuickstartTypeOption {
@@ -559,16 +517,6 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
                 .map(|preset| preset.preset_name.to_string()),
         })
         .collect();
-    // Channel kinds come from the schema-side inventory. The
-    // serde-shaped `ChannelsConfig` is an object whose top-level
-    // keys are the kebab-case channel kinds (`telegram`, `discord`,
-    // `wecom-ws`, …). We walk that shape — same technique
-    // `collect_aliased_refs` uses below — so adding a new channel
-    // family in the schema lights up here for free. Display names
-    // are looked up from `ChannelsConfig::channels()` by index so we
-    // don't drift between the two views; if `channels()` returns
-    // fewer rows than the schema has top-level keys, the missing
-    // ones fall back to their kebab-case kind for display.
     let channel_types = build_channel_type_options(&cfg.channels);
     QuickstartState {
         quickstart_completed: cfg.onboard_state.quickstart_completed,
@@ -585,11 +533,6 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
             .map(|(family, alias, _)| format!("{family}.{alias}"))
             .collect(),
         channels: collect_aliased_refs(&cfg.channels),
-        // Channel refs that are not yet bound to any agent. The
-        // schema enforces one-channel-one-agent; surfacing already-
-        // owned channels in a "Use existing" picker would silently
-        // break that invariant. Surfaces should always present this
-        // list (not the raw `channels` list) when offering reuse.
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()
             .filter(|ch| cfg.agent_for_channel(ch).is_none())
@@ -633,12 +576,6 @@ fn memory_kind_keys() -> Vec<String> {
     .collect()
 }
 
-/// Build the Quickstart channel-type picker rows directly from the
-/// schema's curated `ChannelsConfig::channels()` list. Each entry
-/// already carries its canonical kebab-case `kind` and human label,
-/// so the surface never re-derives them from serde introspection
-/// (which loses unconfigured channels because of
-/// `#[serde(skip_serializing_if = "HashMap::is_empty")]`).
 fn build_channel_type_options(
     channels_cfg: &zeroclaw_config::schema::ChannelsConfig,
 ) -> Vec<QuickstartTypeOption> {
@@ -685,13 +622,6 @@ pub enum FieldSection {
     PeerGroup,
 }
 
-/// One renderable input the TUI / web modal must draw.
-///
-/// Shape is derived from `prop_fields()` filtered by the relevant
-/// schema prefix, then trimmed to the "greatest hits" required for
-/// Quickstart per [`field_shape`]. Surfaces never invent fields —
-/// adding a provider or channel kind to the schema lights up here
-/// automatically.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FieldDescriptor {
@@ -724,12 +654,6 @@ pub struct FieldDescriptor {
 /// one default-instantiated entry under the requested type, then
 /// filters to the per-section "essential" allowlist.
 pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor> {
-    // Probe alias for the synthetic field-shape lookup. Must satisfy
-    // `validate_alias_key` (lowercase alphanumeric + underscore, can't
-    // start/end with `_`, no `__`) — otherwise `create_map_key` returns
-    // an alias-validation Err that the recurse arms in the Configurable
-    // derive mask as "no map-keyed/list section", and field_shape
-    // silently returns an empty Vec.
     const SYNTHETIC_ALIAS: &str = "qs0probe";
     let (section_path, essentials, codex_auth_preselected) = match section {
         FieldSection::ModelProvider => {
@@ -768,13 +692,6 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
         if !essentials.contains(&field_path) {
             continue;
         }
-        // `display_value` already masks secrets as `****`; we want
-        // ghost-text defaults for plain fields only. `<unset>` is the
-        // placeholder for an unset Option, not a real value — emitting
-        // it as a default makes every surface (CLI, TUI, web) echo it
-        // back into the submission, where the daemon then validates
-        // `<unset>` against the field's true type (e.g. a bool, which
-        // fails with "length 7"). Treat it like an empty default.
         let default = if info.is_secret {
             None
         } else {
@@ -1441,12 +1358,6 @@ fn apply_memory(
             Some(reference.clone())
         }
         SelectorChoice::Fresh(kind) => {
-            // The schema's `MemoryBackendKind::serialize` rename
-            // (`#[serde(rename_all = "snake_case")]`) gives us the
-            // canonical TOML kebab-case spelling without any
-            // surface-side mapping table. `None` writes `"none"`,
-            // every other backend creates a `[storage.<kind>.<kind>]`
-            // table and points `memory.backend` at it.
             let kind_name = serde_json::to_value(kind)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
@@ -1962,11 +1873,6 @@ fn split_ref(reference: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Probe whether `<prefix>.<family>.<alias>` resolves to a populated
-/// entry. Uses the schema's own `get_prop` dispatch — no per-family
-/// list. We probe a path the entry's own struct must have if it
-/// exists (`enabled` or `model`); the schema bubbles an error for
-/// unknown families which we treat as "not present".
 fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -> bool {
     for probe_field in ["enabled", "model", "uri"] {
         let probe = format!("{prefix}.{family}.{alias}.{probe_field}");
@@ -1983,17 +1889,6 @@ fn storage_has_ref(config: &Config, reference: &str) -> bool {
         .any(|configured| configured == reference)
 }
 
-/// Live model catalog for a provider type. `(models, pricing, live)`:
-/// `live=true` means surfaces should render a picker; `live=false`
-/// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
-/// first, then the family catalog table (no pricing for fallbacks).
-///
-/// Credential-blind: builds the provider with no API key, so OpenAI-compatible
-/// families (xai, groq, deepseek, …) whose native `/models` endpoint requires
-/// auth fall back to the models.dev / OpenRouter catalog. Brand-new native-only
-/// models therefore do not appear until those public catalogs catch up. Callers
-/// with config in scope should prefer [`model_catalog_with_config`], which
-/// resolves the alias credential and lets the native endpoint list appear.
 pub async fn model_catalog(
     model_provider: &str,
 ) -> (
@@ -2004,17 +1899,6 @@ pub async fn model_catalog(
     model_catalog_with_config(None, model_provider).await
 }
 
-/// Config-aware variant of [`model_catalog`]. When `config` is supplied and
-/// `model_provider` resolves to a configured alias (`<family>.<alias>` or a
-/// bare alias), the alias's `api_key` is threaded into provider construction.
-/// That lets credentialed OpenAI-compatible families (xai/grok, groq, deepseek,
-/// …) hit their native `/models` endpoint — which returns models the models.dev
-/// snapshot may not carry yet (e.g. a freshly released Grok) — instead of
-/// silently falling back to the public catalog.
-///
-/// The raw (possibly encrypted) `api_key` is passed straight through; the
-/// factory's `resolve_model_provider_credential` performs any secret
-/// decryption, matching the inference path in `main.rs`.
 pub async fn model_catalog_with_config(
     config: Option<&Config>,
     model_provider: &str,
@@ -2023,13 +1907,6 @@ pub async fn model_catalog_with_config(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 ) {
-    // Resolve the configured alias credential when config is available so the
-    // native /models endpoint (which needs auth for most compat families) is
-    // reachable. `model_provider` may be a bare family (`xai`) or a
-    // `<family>.<alias>` ref (`xai.default`); `find_by_name` accepts both and
-    // yields the canonical family plus the alias's config, whose api_key we
-    // thread into provider construction. Falls back to `None` for
-    // unconfigured / unknown providers.
     let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
     let api_key = resolved
         .as_ref()
@@ -2119,16 +1996,6 @@ mod tests {
     };
     use zeroclaw_config::schema::Config;
 
-    /// Regression: every channel kind the schema enumerates in
-    /// `ChannelsConfig::channels()` must appear in the Quickstart
-    /// `channel_types` picker. The previous implementation walked the
-    /// serialized form of `ChannelsConfig`, which hid every empty
-    /// channel HashMap because of
-    /// `#[serde(skip_serializing_if = "HashMap::is_empty")]` — that
-    /// silently truncated the picker to whatever channels happened
-    /// to have a configured alias on the live config (~9 instead of
-    /// 32). Drive the picker from the schema's curated list so the
-    /// picker matches what the schema knows about.
     #[test]
     fn channel_type_options_cover_every_schema_channel() {
         let cfg = Config::default();
@@ -2575,14 +2442,6 @@ mod tests {
         }
     }
 
-    /// Regression for the silent empty-form bug: `field_shape(ModelProvider,
-    /// <type>)` must return at least the model + api-key rows for every
-    /// known model provider type. Before fix, the synthetic probe alias
-    /// failed `validate_alias_key`, the recurse arms in the Configurable
-    /// derive masked it as "no map-keyed/list section", and field_shape
-    /// silently returned an empty Vec — leaving the TUI form with zero
-    /// editable rows and the CLI wizard dumped to a manual `Model id for X:`
-    /// fallback.
     #[test]
     fn field_shape_returns_model_provider_rows_for_canonical_types() {
         for kind in ["anthropic", "openai", "ollama", "openrouter", "groq"] {
@@ -2846,12 +2705,6 @@ mod tests {
         assert_eq!(group.external_peers, vec!["*".to_string()]);
     }
 
-    /// Regression for the missing-Grok-in-dropdown bug: when a configured
-    /// OpenAI-compatible alias carries an `api_key` (and here a custom `uri`),
-    /// `model_catalog_with_config` must reach the provider's **native**
-    /// `/models` endpoint — surfacing brand-new models the models.dev snapshot
-    /// does not carry yet — instead of the credential-blind models.dev fallback
-    /// that `model_catalog` uses.
     #[tokio::test]
     async fn model_catalog_with_config_uses_native_endpoint_when_credentialed() {
         use wiremock::matchers::{method, path};
@@ -2894,10 +2747,6 @@ mod tests {
         );
     }
 
-    /// A dotted `<family>.<alias>` selector must resolve **that specific
-    /// alias's** credential + endpoint (not a bare-family guess), so multi-alias
-    /// setups list from the intended account. Guards the `find_by_name` dotted
-    /// path that the RPC/gateway/CLI call sites actually pass.
     #[tokio::test]
     async fn model_catalog_with_config_resolves_named_alias_endpoint() {
         use wiremock::matchers::{method, path};

@@ -22,23 +22,6 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
     }
 }
 
-/// Validate a configured native shell before it is installed as the runtime
-/// shell, so a bad value fails fast at startup with an actionable message
-/// instead of breaking every `tool:shell` invocation later.
-///
-/// Bare names (e.g. `"sh"`, `"bash"`) are resolved against `PATH`; absolute
-/// paths (e.g. `"/bin/zsh"`) are checked directly. The resolved binary must
-/// exist and be executable.
-///
-/// Relative paths with separators (e.g. `"./myshell"`, `"bin/sh"`) are
-/// rejected: validation runs from the process working directory, but the
-/// runtime executes commands with `current_dir` set to the workspace, so a
-/// relative value could validate against one directory and execute against
-/// another (or resolve to a different workspace-local binary). Requiring a
-/// bare PATH name or an absolute path keeps selection workspace-independent.
-///
-/// Unix-only: Windows ignores `runtime.shell` (always `cmd.exe`), so the call
-/// is `#[cfg(unix)]`-gated; Android (always `/system/bin/sh`) is skipped below.
 #[cfg(unix)]
 fn validate_shell(shell: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -255,9 +238,6 @@ mod tests {
 
     // ── End-to-end: the configured shell actually runs the command ──
 
-    /// Wire a recording shim through the config factory and prove the command
-    /// executes under *that* shell with the expected `<shell> -c <command>`
-    /// boundary — not merely that the shell name appears in a debug string.
     #[cfg(unix)]
     #[tokio::test]
     async fn factory_executes_command_under_configured_shell() {

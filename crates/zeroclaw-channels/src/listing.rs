@@ -1,9 +1,4 @@
 //! Enumerate the channel types compiled into this binary.
-//!
-//! Use [`compiled_channels`] in display commands that should only mention
-//! channels that can actually be started. Use
-//! [`configured_uncompiled_channels`] when an operator-facing surface must show
-//! configured channels that this binary cannot run.
 
 use zeroclaw_config::schema::ChannelsConfig;
 use zeroclaw_config::traits::ChannelInfo;
@@ -217,12 +212,6 @@ fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
         .filter_map(|spec| spec.schema_name)
 }
 
-/// Returns one entry per channel type compiled into this binary.
-///
-/// Filters the canonical channel list from [`zeroclaw_config::schema::ChannelsConfig::channels`] down to
-/// only those enabled at compile time via `channel-*` / `voice-wake` feature
-/// flags. Name, desc, and configured status come from the config crate's single
-/// source of truth; this function contributes only the compile-time filter.
 pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
     cfg.channels()
         .into_iter()
@@ -230,11 +219,6 @@ pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
         .collect()
 }
 
-/// Returns configured channel types that exist in config but are not compiled.
-///
-/// This is an on-demand view over the config crate's canonical channel
-/// inventory plus this module's compile-spec table. It does not introduce a
-/// second channel list.
 pub fn configured_uncompiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
     cfg.channels()
         .into_iter()
@@ -243,7 +227,6 @@ pub fn configured_uncompiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> 
 }
 
 /// Returns whether a schema channel type key is compiled into this binary.
-///
 /// Accepts both kebab-case keys emitted by the config schema and legacy
 /// underscore spellings used in channel references.
 pub fn is_channel_type_compiled(channel_type: &str) -> bool {

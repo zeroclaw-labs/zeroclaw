@@ -1,11 +1,4 @@
 //! Keymap abstraction for zerocode.
-//!
-//! Each leaf action enum carries its own default bindings inline.
-//! Consumers call `ChatTabAction::from_chord(&key)` directly — no
-//! `Keymap` struct, no plumbed argument.
-//!
-//! On darwin, `Chord::matches` translates the `CTRL` modifier to
-//! `SUPER` so Linux's `Ctrl+K` and macOS's `⌘K` resolve identically.
 
 pub mod actions;
 mod chord;
@@ -129,9 +122,6 @@ mod tests {
         assert_eq!(action, back);
     }
 
-    /// Every action enum's binding table must have no duplicate chord
-    /// keys (one chord → one action per enum). Runs as a unit test so
-    /// the rejection is loud and reproducible in CI.
     #[test]
     fn no_intra_enum_chord_conflicts() {
         fn check<A: Copy + std::fmt::Debug>(label: &str, table: Vec<(Chord, A)>) {
@@ -227,9 +217,6 @@ mod tests {
         }
     }
 
-    /// Every rebindable enum's TAG and serialized variant names must be
-    /// snake_case — the action-key wire form (`"<tag>.<variant>"`) is
-    /// only valid snake_case, and kebab-case is banned project-wide.
     #[test]
     fn tags_and_variant_names_are_snake_case() {
         fn ok(s: &str) -> bool {

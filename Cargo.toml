@@ -35,10 +35,7 @@ sys-locale = "0.3"
 
 [package]
 name = "zeroclawlabs"
-# Publishing blocked during microkernel workspace transition — see #5811.
-# All 14 workspace sub-crates are publish = false and therefore unresolvable
-# on crates.io. Flip or remove this once the multi-crate publish topology is
-# designed per RFC #5579.
+# Workspace crates are publish = false during microkernel transition.
 publish = false
 default-run = "zeroclaw"
 version.workspace = true
@@ -312,8 +309,7 @@ default-channels = [
     "channel-filesystem",
 ]
 
-# Historical broad channel bundle. Use this for builds that should preserve the
-# pre-#6895 default channel surface.
+# Historical broad channel bundle. Preserves the older default channel surface.
 channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
     "channel-line",

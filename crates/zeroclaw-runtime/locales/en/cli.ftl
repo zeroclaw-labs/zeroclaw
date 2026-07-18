@@ -890,6 +890,9 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Shown at the end of agent output when the tool call loop exhausted its
+# iteration budget and the agent cannot continue without exceeding limits.
+turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
