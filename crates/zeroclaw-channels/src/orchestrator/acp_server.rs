@@ -153,9 +153,9 @@ impl AcpServer {
     }
 
     /// Set the connection-scoped default agent alias (`?agent=` query param
-    /// on the gateway ACP endpoint, #8958). Blank values are treated as
-    /// absent. The alias is validated at `session/new` with the same
-    /// dispatchable-agent checks as an explicit `agentAlias`.
+    /// on the gateway ACP endpoint). Blank values are treated as absent. The
+    /// alias is validated at `session/new` with the same dispatchable-agent
+    /// checks as an explicit `agentAlias`. Restore paths ignore this value.
     pub fn with_connection_default_agent(mut self, alias: Option<String>) -> Self {
         self.connection_default_agent = alias
             .as_deref()
@@ -489,7 +489,7 @@ impl AcpServer {
     }
 
     /// Shared validation for explicit `agentAlias`, `?agent=`, config defaults,
-    /// and sole-agent auto-select (#8958 / #9026).
+    /// and sole-agent auto-select.
     fn validate_dispatchable_agent_alias(&self, agent_alias: &str) -> Result<(), RpcError> {
         match self.config.agent(agent_alias) {
             None => Err(RpcError {
@@ -509,15 +509,13 @@ impl AcpServer {
     }
 
     /// Restore alias precedence: persisted owner (when still dispatchable) →
-    /// connection default → `[acp].default_agent` → sole configured agent →
-    /// `"default"`.
+    /// `[acp].default_agent` → sole configured agent → `"default"`.
+    ///
+    /// The connection-scoped `?agent=` default is intentionally omitted: restore
+    /// accepts only a session ID and must not let transport input rebind a
+    /// persisted workspace/history to a different agent.
     fn resolve_restore_agent_alias(&self, persisted_agent_alias: &str) -> String {
         self.alias_if_dispatchable(persisted_agent_alias)
-            .or_else(|| {
-                self.connection_default_agent
-                    .as_ref()
-                    .and_then(|alias| self.alias_if_dispatchable(alias))
-            })
             .or_else(|| {
                 self.config
                     .acp
@@ -556,7 +554,7 @@ impl AcpServer {
 
         // Every ACP session is bound to an explicit agent alias.
         // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
-        // then the connection-scoped default (`?agent=`, #8958), then
+        // then the connection-scoped default (`?agent=`), then
         // `[acp].default_agent`. When all are absent and exactly one agent
         // is configured, auto-select it so single-agent setups work without
         // extra config.
@@ -836,10 +834,9 @@ impl AcpServer {
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
         // Restore the agent the session was created with — its alias is
-        // persisted on the session row. Fall back to the connection default
-        // (`?agent=`, #8958), then the ACP default (or sole agent, or
-        // "default") only when the persisted owner is missing or not
-        // dispatchable, so a deleted/disabled owner degrades gracefully.
+        // persisted on the session row. Fall back to the operator-controlled
+        // ACP default (or sole agent, or "default") only when the persisted
+        // owner is missing or not dispatchable. `?agent=` is not consulted.
         let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
@@ -1037,10 +1034,9 @@ impl AcpServer {
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
         // Restore the agent the session was created with — its alias is
-        // persisted on the session row. Fall back to the connection default
-        // (`?agent=`, #8958), then the ACP default (or sole agent, or
-        // "default") only when the persisted owner is missing or not
-        // dispatchable, so a deleted/disabled owner degrades gracefully.
+        // persisted on the session row. Fall back to the operator-controlled
+        // ACP default (or sole agent, or "default") only when the persisted
+        // owner is missing or not dispatchable. `?agent=` is not consulted.
         let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
@@ -2798,7 +2794,7 @@ mod tests {
     }
 
     /// `make_test_config` plus `agent-alpha`/`agent-beta`, for exercising the
-    /// connection-default slot of the alias precedence chain (#8958).
+    /// connection-default slot of the `session/new` alias precedence chain.
     fn dispatchable_test_agent(
         model_provider: &str,
     ) -> zeroclaw_config::schema::AliasedAgentConfig {
@@ -2934,12 +2930,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_load_restore_prefers_connection_default_when_persisted_agent_deleted() {
+    async fn session_load_restore_ignores_connection_default_when_persisted_agent_deleted() {
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
 
-        let session_id = "sess-restore-conn-default";
+        let session_id = "sess-restore-ignores-conn-default";
         store
             .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
             .unwrap();
@@ -2963,7 +2959,11 @@ mod tests {
             .await
             .expect("session/load must succeed for a deleted persisted agent");
 
-        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+        // Operator `[acp].default_agent` wins; `?agent=` must not rebind restore.
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
     }
 
     #[tokio::test]
@@ -3011,27 +3011,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_load_restore_skips_disabled_connection_default() {
+    async fn session_load_restore_skips_missing_config_default_to_sole_agent() {
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
 
-        let session_id = "sess-restore-disabled-conn-default";
+        let session_id = "sess-restore-missing-config-default";
         store
             .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
-        let mut config = two_agent_config(cwd.path());
+        let mut config = make_test_config(cwd.path());
+        config.agents.clear();
+        config.agents.insert(
+            "agent-beta".to_string(),
+            dispatchable_test_agent("anthropic.default"),
+        );
+        // Missing config default is skipped; sole configured agent applies.
+        // Connection default stays out of the restore chain.
         config.acp.default_agent = Some("agent-alpha".to_string());
-        config.agents.get_mut("agent-beta").unwrap().enabled = false;
         let server = AcpServer::new_with_writer_and_store(
             config,
             AcpServerConfig::default(),
             writer_tx,
             Arc::clone(&store),
         )
-        .with_connection_default_agent(Some("agent-beta".to_string()));
+        .with_connection_default_agent(Some("ghost".to_string()));
 
         server
             .handle_session_load(&serde_json::json!({
@@ -3039,12 +3045,9 @@ mod tests {
                 "cwd": cwd.path().to_string_lossy()
             }))
             .await
-            .expect("session/load must skip a disabled connection default");
+            .expect("session/load must skip a missing config default");
 
-        assert_eq!(
-            session_agent_alias(&server, session_id).await,
-            "agent-alpha"
-        );
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
     }
 
     #[tokio::test]
@@ -3060,7 +3063,46 @@ mod tests {
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let mut config = two_agent_config(cwd.path());
+        config.agents.insert(
+            "agent-gamma".to_string(),
+            dispatchable_test_agent("anthropic.default"),
+        );
         config.agents.get_mut("agent-alpha").unwrap().enabled = false;
+        config.acp.default_agent = Some("agent-beta".to_string());
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        // Tempting transport rebind — must lose to operator default.
+        .with_connection_default_agent(Some("agent-gamma".to_string()));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must skip a disabled persisted owner");
+
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_resume_restore_ignores_connection_default_when_persisted_agent_deleted() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-ignores-conn-default";
+        store
+            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new_with_writer_and_store(
             config,
             AcpServerConfig::default(),
@@ -3075,9 +3117,12 @@ mod tests {
                 "cwd": cwd.path().to_string_lossy()
             }))
             .await
-            .expect("session/resume must skip a disabled persisted owner");
+            .expect("session/resume must succeed for a deleted persisted agent");
 
-        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
     }
 
     #[test]

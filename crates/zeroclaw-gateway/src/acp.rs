@@ -21,10 +21,10 @@ const ACP_WS_PROTOCOL: &str = "zeroclaw.acp.v1";
 #[derive(Debug, Deserialize)]
 pub struct AcpQuery {
     token: Option<String>,
-    /// Connection-scoped default agent alias (#8958). Used when `session/new`
-    /// omits `agentAlias`, so spec-vanilla one-agent-per-endpoint ACP clients
-    /// can address each configured agent via its own URL. Validated exactly
-    /// like an explicit `agentAlias` — at `session/new`.
+    /// Connection-scoped default agent alias. Used when `session/new` omits
+    /// `agentAlias`, so spec-vanilla one-agent-per-endpoint ACP clients can
+    /// address each configured agent via its own URL. Validated exactly like
+    /// an explicit `agentAlias` at `session/new`; ignored by session restore.
     agent: Option<String>,
 }
 

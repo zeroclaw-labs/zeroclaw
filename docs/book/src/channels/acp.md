@@ -248,7 +248,7 @@ Restore a previously persisted session with **full history replay**. The server 
 
 After `session/load` returns, the session is active and ready to accept `session/prompt` calls.
 
-When restoring a persisted session, the server reuses the stored owner alias only if that agent is still dispatchable. Otherwise it falls back through the same connection default → `[acp].default_agent` → sole-agent chain used by `session/new`, skipping any disabled aliases along the way.
+When restoring a persisted session, the server reuses the stored owner alias only if that agent is still dispatchable. Otherwise it falls back through the operator-controlled `[acp].default_agent` → sole-agent chain, skipping any disabled aliases along the way. Gateway `?agent=` is a `session/new` default only and does not rebind restore.
 
 `session_id` is accepted as a snake_case alias for `sessionId`.
 
