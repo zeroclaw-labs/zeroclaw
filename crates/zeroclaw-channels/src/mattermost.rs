@@ -1151,8 +1151,6 @@ impl MattermostChannel {
     }
 }
 
-// listen_polling and listen_websocket helpers moved out of the Channel
-// trait impl so they can be tested and reviewed in isolation.
 impl MattermostChannel {
     #[allow(clippy::too_many_arguments)]
     async fn process_inbound_post(
@@ -3325,6 +3323,84 @@ mod tests {
         )
         .await
         .expect_err("a silent server must fail the handshake deadline");
+
+        assert!(error.to_string().contains("handshake timed out"));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_times_out_without_hello() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            server
+                .next()
+                .await
+                .expect("auth frame should arrive")
+                .unwrap();
+            server
+                .send(WsMessage::Text(
+                    json!({"status": "OK", "seq_reply": 5}).to_string().into(),
+                ))
+                .await
+                .expect("server should send auth response");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let error = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "test-token",
+            5,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("auth without hello must fail the handshake deadline");
+
+        assert!(error.to_string().contains("handshake timed out"));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_times_out_without_auth_response() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            server
+                .next()
+                .await
+                .expect("auth frame should arrive")
+                .unwrap();
+            server
+                .send(WsMessage::Text(
+                    json!({"event": "hello", "data": {"server_version": "10.8.0"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("server should send hello");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let error = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "test-token",
+            6,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("hello without auth response must fail the handshake deadline");
 
         assert!(error.to_string().contains("handshake timed out"));
         server_task.abort();
