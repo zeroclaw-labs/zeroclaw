@@ -1,8 +1,4 @@
 //! Heuristic importance scorer for non-LLM paths.
-//!
-//! Assigns importance scores (0.0–1.0) based on memory category and keyword
-//! signals. Used when LLM-based consolidation is unavailable or as a fast
-//! first-pass scorer.
 
 use super::traits::MemoryCategory;
 
@@ -48,11 +44,6 @@ pub fn compute_importance(content: &str, category: &MemoryCategory) -> f64 {
     (base + boost).min(1.0)
 }
 
-/// Compute final retrieval score incorporating importance and recency.
-///
-/// `hybrid_score`: raw retrieval score from FTS/vector (0.0–1.0)
-/// `importance`: importance score (0.0–1.0)
-/// `recency_decay`: recency factor (0.0–1.0, 1.0 = very recent)
 pub fn weighted_final_score(hybrid_score: f64, importance: f64, recency_decay: f64) -> f64 {
     hybrid_score * 0.7 + importance * 0.2 + recency_decay * 0.1
 }

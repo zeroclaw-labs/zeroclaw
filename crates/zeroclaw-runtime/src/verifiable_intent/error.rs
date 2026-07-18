@@ -1,8 +1,4 @@
 //! Machine-readable error taxonomy for Verifiable Intent operations.
-//!
-//! Every VI error carries a [`ViErrorKind`] discriminant so policy engines and
-//! tool gates can branch deterministically on failure reason without parsing
-//! human-readable messages.
 
 use std::fmt;
 

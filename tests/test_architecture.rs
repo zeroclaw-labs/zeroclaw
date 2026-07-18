@@ -14,3 +14,6 @@ mod release_workflow;
 
 #[path = "architecture/cli_fluent_coverage.rs"]
 mod cli_fluent_coverage;
+
+#[path = "architecture/desktop_release.rs"]
+mod desktop_release;

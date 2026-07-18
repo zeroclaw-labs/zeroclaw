@@ -280,7 +280,7 @@ impl LucidMemory {
     }
 
     /// Dimensions of the underlying local SQLite embedder (0 = Noop). Lets
-    /// callers confirm a live embedder refresh reached the local backend (#8359).
+    /// callers confirm a live embedder refresh reached the local backend
     pub fn embedder_dimensions(&self) -> usize {
         self.local.embedder_dimensions()
     }
@@ -300,7 +300,7 @@ impl Memory for LucidMemory {
         dimensions: usize,
     ) {
         // Lucid delegates all local storage/embedding to the wrapped SQLite
-        // backend, so forward the refresh there (#8359). Without this, a
+        // backend, so forward the refresh there Without this, a
         // Lucid-backed handle (including the install-wide RPC handle when
         // `backend = lucid`) would keep a stale embedder.
         self.local
@@ -531,8 +531,6 @@ impl Memory for LucidMemory {
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
-        // Lucid's remote daemon has no agents table; the local SQLite
-        // mirror is the canonical agents-table store.
         self.local.ensure_agent_uuid(alias).await
     }
 }
@@ -544,9 +542,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
-    /// Lucid must forward `refresh_embedder` to its wrapped local SQLite so a
-    /// Lucid-backed handle (including the install-wide RPC handle when
-    /// `backend = lucid`) picks up a provider-profile change (#8359).
     #[test]
     fn refresh_embedder_forwards_to_local_sqlite() {
         let tmp = TempDir::new().unwrap();
