@@ -13732,6 +13732,8 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "url",
+ "zeroclaw-api",
 ]
 
 [[package]]

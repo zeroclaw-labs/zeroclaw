@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use zeroclaw_config::schema::{Config, RuntimeConfigKind};
+use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -24,6 +24,7 @@ use zeroclaw_api::jsonrpc::{
     SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -36,11 +37,11 @@ mod notification {
 struct StatusRuntimeContext {
     config_dir: String,
     config_file: String,
-    config_kind: ConfigKind,
+    config_kind: RuntimeConfigKind,
     local_ipc_endpoint: String,
 }
 
-fn status_runtime_context(config: &Config, config_kind: ConfigKind) -> StatusRuntimeContext {
+fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
     let config_file = config.config_path.display().to_string();
     let config_dir = config
         .config_path
@@ -54,14 +55,6 @@ fn status_runtime_context(config: &Config, config_kind: ConfigKind) -> StatusRun
         config_file,
         config_kind,
         local_ipc_endpoint,
-    }
-}
-
-fn config_kind_from_runtime(kind: RuntimeConfigKind) -> ConfigKind {
-    match kind {
-        RuntimeConfigKind::Default => ConfigKind::Default,
-        RuntimeConfigKind::Custom => ConfigKind::Custom,
-        RuntimeConfigKind::Temporary => ConfigKind::Temporary,
     }
 }
 
@@ -881,9 +874,7 @@ impl RpcDispatcher {
     async fn handle_status(&self) -> RpcResult {
         let ids = self.ctx.sessions.list_ids().await;
         let config_path = self.ctx.config.read().config_path.clone();
-        let config_kind = config_kind_from_runtime(
-            zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await,
-        );
+        let config_kind = zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await;
         let runtime_context = {
             let config = self.ctx.config.read();
             status_runtime_context(&config, config_kind)
@@ -6066,14 +6057,14 @@ mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
 
-        let context = status_runtime_context(&config, ConfigKind::Temporary);
+        let context = status_runtime_context(&config, RuntimeConfigKind::Temporary);
 
         assert_eq!(context.config_dir, tmp.path().display().to_string());
         assert_eq!(
             context.config_file,
             tmp.path().join("config.toml").display().to_string()
         );
-        assert_eq!(context.config_kind, ConfigKind::Temporary);
+        assert_eq!(context.config_kind, RuntimeConfigKind::Temporary);
         assert_eq!(
             context.local_ipc_endpoint,
             crate::rpc::local::socket_path(&config)
@@ -6083,8 +6074,8 @@ mod tests {
 
         config.config_path = std::path::PathBuf::from("/opt/zeroclaw/config.toml");
         assert_eq!(
-            status_runtime_context(&config, ConfigKind::Custom).config_kind,
-            ConfigKind::Custom
+            status_runtime_context(&config, RuntimeConfigKind::Custom).config_kind,
+            RuntimeConfigKind::Custom
         );
     }
 
@@ -6109,7 +6100,7 @@ mod tests {
             status.config_file.as_deref(),
             Some(tmp.path().join("config.toml").to_str().unwrap())
         );
-        assert_eq!(status.config_kind, Some(ConfigKind::Temporary));
+        assert_eq!(status.config_kind, Some(RuntimeConfigKind::Temporary));
         assert_eq!(
             status.local_ipc_endpoint.as_deref(),
             Some(crate::rpc::local::socket_path(&config).to_str().unwrap())

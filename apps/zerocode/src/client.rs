@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
@@ -2712,14 +2713,6 @@ impl ApprovalDecision {
 
 // ── Dashboard types ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigKind {
-    Default,
-    Custom,
-    Temporary,
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct StatusResult {
@@ -2731,7 +2724,7 @@ pub struct StatusResult {
     #[serde(default)]
     pub config_file: Option<String>,
     #[serde(default)]
-    pub config_kind: Option<ConfigKind>,
+    pub config_kind: Option<RuntimeConfigKind>,
     #[serde(default)]
     pub local_ipc_endpoint: Option<String>,
 }
@@ -2759,7 +2752,7 @@ mod dashboard_status_tests {
             status.config_file.as_deref(),
             Some("/tmp/zeroclaw-profile/config.toml")
         );
-        assert_eq!(status.config_kind, Some(ConfigKind::Temporary));
+        assert_eq!(status.config_kind, Some(RuntimeConfigKind::Temporary));
         assert_eq!(
             status.local_ipc_endpoint.as_deref(),
             Some("/tmp/zeroclaw-profile/data/daemon.sock")

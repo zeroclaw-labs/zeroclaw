@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use tokio::sync::mpsc;
 
 use crate::acp;
 use crate::chat;
@@ -86,31 +87,77 @@ enum Mode {
     Sop,
 }
 
-#[derive(Default)]
 struct ChromeStatus {
     status: Option<StatusResult>,
     health: Option<serde_json::Value>,
     last_poll: Option<Instant>,
+    refresh_in_flight: bool,
+    refresh_rx: Option<mpsc::UnboundedReceiver<ChromeStatusSnapshot>>,
+}
+
+struct ChromeStatusSnapshot {
+    status: Option<StatusResult>,
+    health: Option<serde_json::Value>,
+}
+
+impl Default for ChromeStatus {
+    fn default() -> Self {
+        Self {
+            status: None,
+            health: None,
+            last_poll: None,
+            refresh_in_flight: false,
+            refresh_rx: None,
+        }
+    }
 }
 
 impl ChromeStatus {
-    async fn tick(&mut self, rpc: &Arc<RpcClient>) {
+    fn tick(&mut self, rpc: &Arc<RpcClient>) {
+        self.drain_completed_refresh();
         let due = self
             .last_poll
             .map(|t| t.elapsed() >= CHROME_STATUS_POLL_INTERVAL)
             .unwrap_or(true);
-        if due {
-            self.poll(rpc).await;
+        if due && !self.refresh_in_flight {
+            self.start_poll(rpc);
         }
     }
 
-    async fn poll(&mut self, rpc: &Arc<RpcClient>) {
+    fn start_poll(&mut self, rpc: &Arc<RpcClient>) {
         self.last_poll = Some(Instant::now());
-        if let Ok(status) = rpc.status().await {
-            self.status = Some(status);
-        }
-        if let Ok(health) = rpc.health().await {
-            self.health = Some(health);
+        self.refresh_in_flight = true;
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.refresh_rx = Some(rx);
+        let rpc = Arc::clone(rpc);
+        tokio::spawn(async move {
+            let status = rpc.status().await.ok();
+            let health = rpc.health().await.ok();
+            let _ = tx.send(ChromeStatusSnapshot { status, health });
+        });
+    }
+
+    fn drain_completed_refresh(&mut self) {
+        let Some(rx) = self.refresh_rx.as_mut() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(snapshot) => {
+                if let Some(status) = snapshot.status {
+                    self.status = Some(status);
+                }
+                if let Some(health) = snapshot.health {
+                    self.health = Some(health);
+                }
+                self.refresh_in_flight = false;
+                self.refresh_rx = None;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.refresh_in_flight = false;
+                self.refresh_rx = None;
+            }
         }
     }
 
@@ -118,6 +165,8 @@ impl ChromeStatus {
         self.status = None;
         self.health = None;
         self.last_poll = None;
+        self.refresh_in_flight = false;
+        self.refresh_rx = None;
     }
 
     fn summary_line(&self) -> Option<Line<'static>> {
@@ -315,7 +364,7 @@ pub async fn run(
         (None::<String>, None::<String>)
     )?;
     let mut chrome_status = ChromeStatus::default();
-    chrome_status.poll(&rpc).await;
+    chrome_status.tick(&rpc);
 
     loop {
         // Draw
@@ -323,7 +372,7 @@ pub async fn run(
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
             chrome_status.clear();
         } else {
-            chrome_status.tick(&rpc).await;
+            chrome_status.tick(&rpc);
         }
         let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
@@ -530,7 +579,7 @@ pub async fn run(
                                 quickstart = panes.6;
                                 sop_pane = panes.7;
                                 chrome_status.clear();
-                                chrome_status.poll(&rpc).await;
+                                chrome_status.tick(&rpc);
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -1435,6 +1484,34 @@ mod tests {
             process_stats_summary(Some(&health)),
             format!(" {ram}:1.0M(25%) {cpu}:{loading}")
         );
+    }
+
+    #[tokio::test]
+    async fn chrome_status_tick_starts_refresh_without_waiting_for_rpc_response() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chrome_status = ChromeStatus::default();
+
+        let start = Instant::now();
+        chrome_status.tick(&rpc);
+
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "tick must not wait for the status response"
+        );
+        assert!(
+            chrome_status.refresh_in_flight,
+            "tick should record that the background refresh is still pending"
+        );
+
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("status refresh should send a request")
+            .expect("request channel should stay open");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::STATUS);
     }
 
     #[test]

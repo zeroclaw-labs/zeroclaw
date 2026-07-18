@@ -20,6 +20,7 @@ use std::sync::{OnceLock, RwLock};
 use tokio::fs::File;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_macros::Configurable;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -17168,13 +17169,6 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
     }
 
     (data_config_dir.clone(), data_config_dir.join("data"))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeConfigKind {
-    Default,
-    Custom,
-    Temporary,
 }
 
 pub async fn classify_runtime_config_kind(config_path: &Path) -> RuntimeConfigKind {

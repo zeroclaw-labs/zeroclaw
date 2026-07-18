@@ -11,12 +11,13 @@ use ratatui::{
 use std::sync::Arc;
 
 use crate::client::{
-    AgentStatusEntry, ConfigKind, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
+    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
     CronTriggerResult, MemoryEntryResult, MessageEntry, OrgCost, RpcClient, SessionEntry,
     StatusResult, TuiListEntry,
 };
 use crate::mouse;
 use crate::theme;
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -1192,7 +1193,10 @@ impl Dashboard {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
                     let val = if ncpu > 0 {
-                        format!("{cpu:.1}% ({ncpu} cores)")
+                        crate::i18n::t_args(
+                            "zc-dashboard-cpu-with-cores",
+                            &[("cpu", &format!("{cpu:.1}%")), ("cores", &ncpu.to_string())],
+                        )
                     } else {
                         format!("{cpu:.1}%")
                     };
@@ -2663,7 +2667,7 @@ fn overview_status_lines(
                 format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
                 theme::dim_style(),
             ),
-            Span::styled(connect_label.to_string(), theme::body_style()),
+            Span::styled(remote_endpoint_label(connect_label), theme::body_style()),
         ]));
     }
 
@@ -2749,7 +2753,10 @@ fn overview_status_lines(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let val = if ncpu > 0 {
-                format!("{cpu:.1}% ({ncpu} cores)")
+                crate::i18n::t_args(
+                    "zc-dashboard-cpu-with-cores",
+                    &[("cpu", &format!("{cpu:.1}%")), ("cores", &ncpu.to_string())],
+                )
             } else {
                 format!("{cpu:.1}%")
             };
@@ -2766,7 +2773,13 @@ fn overview_status_lines(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let val = if ncpu > 0 {
-                format!("{} ({ncpu} cores)", crate::i18n::t("zc-dashboard-loading"))
+                crate::i18n::t_args(
+                    "zc-dashboard-cpu-with-cores",
+                    &[
+                        ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                        ("cores", &ncpu.to_string()),
+                    ],
+                )
             } else {
                 crate::i18n::t("zc-dashboard-loading")
             };
@@ -2791,29 +2804,29 @@ fn overview_status_lines(
     lines
 }
 
-fn config_kind_label(kind: &ConfigKind) -> String {
+fn config_kind_label(kind: &RuntimeConfigKind) -> String {
     match kind {
-        ConfigKind::Default => crate::i18n::t("zc-dashboard-config-kind-default"),
-        ConfigKind::Custom => crate::i18n::t("zc-dashboard-config-kind-custom"),
-        ConfigKind::Temporary => crate::i18n::t("zc-dashboard-config-kind-temporary"),
+        RuntimeConfigKind::Default => crate::i18n::t("zc-dashboard-config-kind-default"),
+        RuntimeConfigKind::Custom => crate::i18n::t("zc-dashboard-config-kind-custom"),
+        RuntimeConfigKind::Temporary => crate::i18n::t("zc-dashboard-config-kind-temporary"),
     }
 }
 
-fn config_kind_style(kind: &ConfigKind) -> Style {
+fn config_kind_style(kind: &RuntimeConfigKind) -> Style {
     match kind {
-        ConfigKind::Default => theme::body_style(),
-        ConfigKind::Custom => theme::accent_style(),
-        ConfigKind::Temporary => theme::warn_style(),
+        RuntimeConfigKind::Default => theme::body_style(),
+        RuntimeConfigKind::Custom => theme::accent_style(),
+        RuntimeConfigKind::Temporary => theme::warn_style(),
     }
 }
 
-fn daemon_label(connect_label: &str) -> &str {
+fn daemon_label(connect_label: &str) -> String {
     if is_local_connection(connect_label) {
-        "local"
+        crate::i18n::t("zc-dashboard-daemon-local")
     } else if is_remote_connection(connect_label) {
-        "remote"
+        crate::i18n::t("zc-dashboard-daemon-remote")
     } else {
-        connect_label
+        connect_label.to_string()
     }
 }
 
@@ -2827,6 +2840,26 @@ fn is_remote_connection(connect_label: &str) -> bool {
 
 fn local_socket_label(connect_label: &str) -> Option<&str> {
     connect_label.strip_prefix("local:")
+}
+
+fn remote_endpoint_label(connect_label: &str) -> String {
+    let Ok(url) = url::Url::parse(connect_label) else {
+        return connect_label.to_string();
+    };
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return connect_label.to_string();
+    }
+
+    let mut safe = String::from(url.scheme());
+    safe.push_str("://");
+    if let Some(host) = url.host() {
+        safe.push_str(&host.to_string());
+    }
+    if let Some(port) = url.port() {
+        safe.push(':');
+        safe.push_str(&port.to_string());
+    }
+    safe
 }
 
 fn workspace_lines(code_cwd: Option<&str>, chat_cwd: Option<&str>) -> Vec<Line<'static>> {
@@ -2888,7 +2921,7 @@ mod tests {
             active_sessions: 2,
             config_dir: Some("/tmp/zc-profile".into()),
             config_file: Some("/tmp/zc-profile/config.toml".into()),
-            config_kind: Some(ConfigKind::Temporary),
+            config_kind: Some(RuntimeConfigKind::Temporary),
             local_ipc_endpoint: Some("/tmp/zc-profile/data/daemon.sock".into()),
         }
     }
@@ -2905,7 +2938,10 @@ mod tests {
             None,
         ));
 
-        assert!(text.contains("local"), "daemon label: {text}");
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-daemon-local")),
+            "daemon label: {text}"
+        );
         assert!(
             text.contains("/tmp/zc-profile/data/daemon.sock"),
             "local socket: {text}"
@@ -2932,7 +2968,10 @@ mod tests {
             None,
         ));
 
-        assert!(text.contains("remote"), "daemon label: {text}");
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-daemon-remote")),
+            "daemon label: {text}"
+        );
         assert!(
             text.contains("wss://zero.example.test:9781"),
             "remote endpoint: {text}"
@@ -2945,6 +2984,29 @@ mod tests {
             !text.contains("/tmp/zc-profile/data/daemon.sock"),
             "remote view must not label socket as endpoint: {text}"
         );
+    }
+
+    #[test]
+    fn overview_status_lines_redacts_remote_endpoint_credentials() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "wss://user:secret@zero.example.test:9781/rpc?token=abc#frag",
+            false,
+            &status,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(
+            text.contains("wss://zero.example.test:9781"),
+            "safe endpoint: {text}"
+        );
+        assert!(!text.contains("/rpc"), "must redact path: {text}");
+        assert!(!text.contains("user"), "must redact userinfo: {text}");
+        assert!(!text.contains("secret"), "must redact password: {text}");
+        assert!(!text.contains("token"), "must redact query: {text}");
+        assert!(!text.contains("frag"), "must redact fragment: {text}");
     }
 
     #[test]
@@ -3014,8 +3076,14 @@ mod tests {
         assert!(text.contains("1.0M / 4.0M (25.0%)"), "memory: {text}");
         assert!(
             text.contains(&format!(
-                "{} (8 cores)",
-                crate::i18n::t("zc-dashboard-loading")
+                "{}",
+                crate::i18n::t_args(
+                    "zc-dashboard-cpu-with-cores",
+                    &[
+                        ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                        ("cores", "8")
+                    ],
+                )
             )),
             "cpu loading: {text}"
         );
@@ -3039,7 +3107,13 @@ mod tests {
             None,
         ));
 
-        assert!(text.contains("12.3% (8 cores)"), "cpu value: {text}");
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-cpu-with-cores",
+                &[("cpu", "12.3%"), ("cores", "8")],
+            )),
+            "cpu value: {text}"
+        );
     }
 
     #[test]

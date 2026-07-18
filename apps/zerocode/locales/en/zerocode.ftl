@@ -197,6 +197,9 @@ zc-dashboard-label-pid = PID
 zc-dashboard-config-kind-default = default
 zc-dashboard-config-kind-custom = custom
 zc-dashboard-config-kind-temporary = temporary
+zc-dashboard-daemon-local = local
+zc-dashboard-daemon-remote = remote
+zc-dashboard-cpu-with-cores = { $cpu } ({ $cores } cores)
 
 zc-dashboard-no-tuis = No TUIs connected
 zc-dashboard-no-session = No session selected

@@ -19,6 +19,7 @@ name = "zerocode"
 path = "src/main.rs"
 
 [dependencies]
+zeroclaw-api.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
@@ -54,6 +55,7 @@ directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
