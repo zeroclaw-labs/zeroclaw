@@ -178,6 +178,13 @@ pub(crate) async fn finish_after_max_iterations(
     }
     history.push(summary_msg);
     accumulated_display_text.push_str(&text);
+    // Graceful shutdown with a visible reason so the user knows why the
+    // agent stopped making progress.
+    accumulated_display_text.push_str("\n\n");
+    accumulated_display_text.push_str(&crate::i18n::get_required_cli_string_with_args(
+        "turn-max-iterations-reached",
+        &[("max_iterations", &max_iterations.to_string())],
+    ));
     Ok(accumulated_display_text)
 }
 
@@ -281,6 +288,14 @@ mod graceful_summary_metering_tests {
             .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        // The returned display text must carry both the summary and the visible
+        // stop reason — deleting the stop-reason append would leave this green
+        // on `wrap-up summary` alone, so the stop-reason assertion pins the
+        // user-observed contract.
+        assert!(
+            out.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "stop reason with iteration count must reach returned output: {out}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "provider called once");
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
@@ -316,6 +331,27 @@ mod graceful_summary_metering_tests {
             calls.load(Ordering::SeqCst),
             0,
             "budget gate must fire before the provider call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod i18n_message_tests {
+    /// The graceful max-iteration shutdown must include the iteration count in
+    /// the user-visible message so the operator knows why the agent stopped.
+    #[test]
+    fn max_iterations_message_includes_count() {
+        let msg = crate::i18n::get_required_cli_string_with_args(
+            "turn-max-iterations-reached",
+            &[("max_iterations", "42")],
+        );
+        assert!(
+            msg.contains("42"),
+            "message should contain iteration count: {msg}"
+        );
+        assert!(
+            msg.contains("maximum tool iterations"),
+            "message should describe the limit: {msg}"
         );
     }
 }
