@@ -121,7 +121,7 @@ scopeguard = "1.2"
 filetime = "0.2"
 wiremock = "0.6"
 # Test-only registry constructor used by the daemon heartbeat MCP
-# retry-regression tests (#5903 follow-up). Not in default deps so
+# retry-regression tests. Not in default deps so
 # the helper is unreachable from production builds.
 zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
 

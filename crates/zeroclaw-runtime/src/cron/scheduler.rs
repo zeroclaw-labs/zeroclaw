@@ -786,7 +786,7 @@ async fn run_agent_job(
         // Cron runs are short-lived and one-shot — no cross-turn reuse
         // contract, so the per-call `connect_all` path inside
         // `agent::run` is the correct choice. The daemon heartbeat
-        // worker is the only `mcp_registry` supplier (#5903).
+        // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
     };
     let run_result = match job.session_target {

@@ -899,7 +899,7 @@ fn resolve_heartbeat_workspace_dir(config: &Config) -> Result<(String, PathBuf)>
 /// Test-only hook for [`connect_heartbeat_mcp_registry`]. The daemon
 /// heartbeat worker builds an `Arc<McpRegistry>` once at worker start
 /// and shares it across every tick so that stdio MCP children live
-/// for the daemon's lifetime (#5903). Tests inject a hook here to
+/// for the daemon's lifetime. Tests inject a hook here to
 /// count invocations and assert the registry is constructed at most
 /// once for N simulated ticks.
 ///
@@ -923,7 +923,7 @@ static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<Option<HeartbeatMcpReg
     std::sync::Mutex::new(None);
 
 /// Serializes the regression tests for the daemon heartbeat MCP
-/// registry hook (`#5903`). The hook itself is process-global, so a
+/// registry hook. The hook itself is process-global, so a
 /// test that installs the hook, runs assertions, and then resets
 /// cannot safely interleave with another test doing the same: a
 /// concurrent `reset_heartbeat_mcp_registry_test_hook` would clear
@@ -1028,7 +1028,7 @@ fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTest
 /// granted-but-unreachable MCP server must NOT crash the heartbeat
 /// worker under supervisor backoff — the per-run `agent::run` MCP
 /// path itself fails open, so we mirror that here. Because the
-/// connection failed there is no stdio child to spawn, so #5903's
+/// connection failed there is no stdio child to spawn, so the
 /// "construct the registry once per worker" guarantee still holds
 /// whenever the registry IS reachable — the healthy case this
 /// targets).
@@ -1099,7 +1099,7 @@ async fn connect_heartbeat_mcp_registry(
     // failure we log and return `Ok(None)`; each tick then falls
     // back to the per-run path (which itself fails open). Because
     // the connection failed there is no stdio child to spawn, so
-    // #5903's "construct the registry once per worker" guarantee
+    // the "construct the registry once per worker" guarantee
     // still holds whenever the registry IS reachable — the healthy
     // case this targets.
     match crate::tools::McpRegistry::connect_all(&servers).await {
@@ -1122,7 +1122,7 @@ async fn connect_heartbeat_mcp_registry(
 
 /// Additively reconcile the heartbeat worker's MCP registry.
 ///
-/// The heartbeat worker's lifetime invariant (#5903) is that a healthy
+/// The heartbeat worker's lifetime invariant is that a healthy
 /// live `McpServer` connection must NEVER be silently disconnected and
 /// respawned just because a peer's discovery result changed shape. This
 /// function preserves that invariant under all of:
@@ -1322,7 +1322,7 @@ async fn retry_heartbeat_mcp_registry(
         let fresh = connect_heartbeat_mcp_registry(config, agent_alias, shared.as_ref()).await?;
         // Let the additive reconciler decide whether the live registry
         // needs to be replaced; it returns `None` when the healthy
-        // current handles are sufficient (preserves the #5903
+        // current handles are sufficient (preserves the
         // no-churn steady state) and `Some(merged)` when `fresh` adds
         // a recovered server or replaces a dead one.
         if let Some(replaced) =
@@ -1345,7 +1345,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     // Build the daemon-level MCP registry ONCE per worker. With this
     // owner in place, every `agent::run` tick below reuses the same
     // `Arc<McpRegistry>` and the stdio MCP children live for the
-    // worker's whole lifetime (#5903).
+    // worker's whole lifetime.
     //
     // The variable is `mut` so `retry_heartbeat_mcp_registry` below
     // can replace the stored registry with a fresh one when a granted
@@ -1444,7 +1444,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         let tick_start = std::time::Instant::now();
 
-        // ── #5903 retry-while-incomplete ───────────────────────────
+        // ── retry-while-incomplete ───────────────────────────
         // When the registry is incomplete (fewer connected servers than
         // granted) or health checks detect dead connections, this call
         // rebuilds the registry and uses `reconcile_heartbeat_mcp_registry`
@@ -3185,7 +3185,7 @@ mod tests {
         );
     }
 
-    // ── #5903: MCP stdio child process must NOT be re-spawned per
+    // ── MCP stdio child process must NOT be re-spawned per
     //    heartbeat tick — the daemon heartbeat worker owns one
     //    `Arc<McpRegistry>` for its entire lifetime, and every tick's
     //    `agent::run` call receives that same Arc via
@@ -3323,7 +3323,7 @@ mod tests {
         // test can install its own hook.
     }
 
-    // ── #5903: PROVE that the real `connect_all` path spawns the
+    // ── PROVE that the real `connect_all` path spawns the
     //    stdio MCP child ONCE and reuses it across N heartbeat
     //    ticks. The two regressions above cover the path where a
     //    test hook short-circuits `connect_heartbeat_mcp_registry`
@@ -3452,7 +3452,7 @@ mod tests {
         //     construction), records its pointer, and drops the
         //     overrides. The child count MUST stay at 1 and the
         //     Arc pointer MUST stay identical (std::ptr::eq) — the
-        //     exact signal #5903 cares about.
+        //     exact invariant this test protects.
         const N: usize = 8;
         let first_ptr: *const crate::tools::McpRegistry = Arc::as_ptr(&shared);
         for tick in 0..N {
@@ -3523,7 +3523,7 @@ mod tests {
         } else {
             // The Drop impl may not have killed the child on this
             // platform (or the OS has not yet reaped it within the
-            // 3s window). The #5903 regression — "per-tick
+            // 3s window). The regression this guards — "per-tick
             // construction" — is still proven by the in-tick
             // assertions above (child count stayed exactly 1 across
             // N=8 ticks). The only failure here would be the count
@@ -3616,7 +3616,7 @@ mod tests {
         // lock and clearing the global hook for the next test.
     }
 
-    // Direct regression for #5903: simulate the full heartbeat worker's
+    // Direct regression test: simulate the full heartbeat worker's
     // tick loop. The OLD (buggy) daemon constructed a fresh
     // `McpRegistry` (and therefore a fresh stdio child) per
     // `agent::run` call. The fix constructs ONE registry at worker
@@ -3690,7 +3690,7 @@ mod tests {
             // boundary. (Driving a real `agent::run` here would
             // require a scripted model provider; the daemon-level
             // construction-counter assertion is the regression
-            // signal #5903 cares about.)
+            // signal this test protects.)
             assert!(
                 overrides.mcp_registry.is_some(),
                 "tick {tick} overrides must carry the shared registry"
@@ -3804,7 +3804,7 @@ mod tests {
         // and clearing the global hook for the next test.
     }
 
-    // ── #5903 follow-up: REGISTRY RECOVERY on transient startup
+    // ── REGISTRY RECOVERY on transient startup
     //    failures. While incomplete, each tick re-runs the connect
     //    path so a server that comes up later is picked up without
     //    a daemon restart. Once the registry is complete, ticks
@@ -4394,7 +4394,7 @@ done
         );
     }
 
-    // ── #5903 (a): steady-state pin — once complete, no churn.
+    // ── Steady-state pin (a) — once complete, no churn.
     //
     //    The hook returns the SAME complete `Arc<McpRegistry>` on every
     //    call, so the retry block short-circuits after boot and the Arc
@@ -4515,7 +4515,7 @@ done
         // and clearing the global hook for the next test.
     }
 
-    // ── #5903 follow-up (b): REGISTRY RECOVERY. While incomplete,
+    // ── Registry recovery (b): while incomplete,
     //    each tick re-runs `connect_heartbeat_mcp_registry` so a
     //    server that comes up later is picked up. Simulates the
     //    failing-then-recovering path:
@@ -4784,7 +4784,7 @@ done
     }
 
     // ── Partial recovery: A stays healthy across failed B retries, then
-    //    B is admitted without replacing A. The #5903 lifetime
+    //    B is admitted without replacing A. The lifetime
     //    invariant requires that A's `McpServer` Arc identity is
     //    stable across every tick and that B is admitted in a single
     //    tick — without replacing A or forcing both to reconnect.

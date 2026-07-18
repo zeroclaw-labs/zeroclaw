@@ -698,8 +698,8 @@ impl McpRegistry {
     /// (no disconnect, no new stdio child).
     ///
     /// Used by the daemon heartbeat's additive reconciliation layer
-    /// to preserve a healthy live connection across recovery ticks
-    /// (#5903 follow-up): when `current` has a healthy server whose
+    /// to preserve a healthy live connection across recovery ticks:
+    /// when `current` has a healthy server whose
     /// identity still matches `fresh`, the daemon re-uses that
     /// handle instead of forcing `connect_all` to spawn a duplicate
     /// stdio child for the same endpoint.

@@ -990,7 +990,7 @@ pub struct AgentRunOverrides {
     /// worker constructs this once at worker start and shares it across
     /// every tick so that stdio MCP children live for the daemon's
     /// lifetime rather than being orphaned and re-spawned per
-    /// `agent::run` call (#5903). When `Some`, the loop MUST use this
+    /// `agent::run` call. When `Some`, the loop MUST use this
     /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
     /// itself. `None` preserves the legacy per-call connect path
     /// (CLI / one-shot), which is correct for callers that have no
@@ -1250,7 +1250,7 @@ pub async fn run(
             emit_assembly_logs: true,
             // Honor the daemon worker's pre-built shared registry so stdio
             // MCP children live for the daemon's lifetime, not per
-            // `agent::run` call (#5903). CLI/one-shot callers leave
+            // `agent::run` call. CLI/one-shot callers leave
             // `mcp_registry` at its default (`None`) and the seam
             // falls back to the per-call `connect_all`.
             mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),

@@ -79,7 +79,7 @@ pub struct ScopedAssembly<'a> {
     /// worker constructs this once at worker start and shares it across
     /// every tick so that stdio MCP children live for the daemon's
     /// lifetime rather than being orphaned and re-spawned per
-    /// `agent::run` call (#5903). When `Some`, `assemble` MUST use this
+    /// `agent::run` call. When `Some`, `assemble` MUST use this
     /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
     /// itself. `None` preserves the legacy per-call connect path
     /// (CLI / one-shot / process_message), which is correct for
@@ -379,7 +379,7 @@ impl ScopedToolRegistry {
                         let activated = Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
                         activated_handle = Some(Arc::clone(&activated));
                         // Pre-activate `mode = "always"` tool_filter_groups
-                        // entries (#6699) before `ToolSearchTool::new` consumes
+                        // entries before `ToolSearchTool::new` consumes
                         // the stub set, so `always` tools are live on the very
                         // first turn. Groups resolve from the agent's runtime
                         // profile — the same source `Config::resolved_agent_config`

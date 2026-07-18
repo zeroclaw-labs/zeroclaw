@@ -773,7 +773,7 @@ impl DelegateTool {
                 // sessions with no cross-turn reuse contract, so the
                 // per-call `connect_all` is the correct choice. The
                 // daemon heartbeat worker is the only `mcp_registry`
-                // supplier (#5903).
+                // supplier.
                 mcp_registry: None,
             },
         )
