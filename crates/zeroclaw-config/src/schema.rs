@@ -4732,7 +4732,9 @@ pub struct TranscriptionConfig {
     pub enabled: bool,
     /// API key used for transcription requests (Groq transcription provider).
     ///
-    /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
+    /// Use the schema-mirror env grammar (`ZEROCLAW_transcription__api_key=...`)
+    /// for runtime env injection. Legacy `GROQ_API_KEY` constructor fallback was
+    /// removed in v0.8.0.
     #[serde(default)]
     #[secret]
     #[credential_class = "encrypted_secret"]
@@ -10252,21 +10254,22 @@ impl Default for PostgresStorageConfig {
 
 /// Qdrant vector database backend (`[storage.qdrant.<alias>]`).
 ///
-/// URL, collection, and API key all fall back to environment variables
-/// (`QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_API_KEY`) when unset.
+/// URL, collection, and API key are typed config values. Use schema-mirror env
+/// overrides such as `ZEROCLAW_storage__qdrant__<alias>__url=...` for runtime
+/// env injection.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage_qdrant"]
 #[serde(default)]
 pub struct QdrantStorageConfig {
     /// Qdrant server URL (e.g. `"http://localhost:6333"`).
-    /// Falls back to `QDRANT_URL` env var if unset.
+    /// Use `ZEROCLAW_storage__qdrant__<alias>__url=...` for env injection.
     pub url: Option<String>,
     /// Collection name for storing memories.
-    /// Falls back to `QDRANT_COLLECTION` env var, or `"zeroclaw_memories"`.
+    /// Use `ZEROCLAW_storage__qdrant__<alias>__collection=...` for env injection.
     pub collection: String,
     /// API key for Qdrant Cloud or secured instances.
-    /// Falls back to `QDRANT_API_KEY` env var if unset.
+    /// Use `ZEROCLAW_storage__qdrant__<alias>__api_key=...` for env injection.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
