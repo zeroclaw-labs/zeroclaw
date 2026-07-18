@@ -10,7 +10,6 @@ use crate::mcp_protocol::McpToolDef;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
-///
 /// The `prefixed_name` (e.g. `filesystem__read_file`) is what the agent loop
 /// sees. The registry knows how to route it to the correct server.
 pub struct McpToolWrapper {
@@ -21,7 +20,7 @@ pub struct McpToolWrapper {
     description: String,
     /// JSON schema for the tool's input parameters. `Arc`-shared so that
     /// per-iteration spec assembly and per-request provider conversion hand
-    /// out reference counts instead of deep-cloning the tree (#8642).
+    /// out reference counts instead of deep-cloning the tree
     input_schema: Arc<serde_json::Value>,
     /// Shared registry — used to dispatch actual tool calls.
     registry: Arc<McpRegistry>,
@@ -58,7 +57,7 @@ impl Tool for McpToolWrapper {
     /// Override the default: hand out the stored schema by `Arc::clone`
     /// (pointer copy + refcount increment) instead of deep-cloning it.
     /// MCP schemas can be tens of KB and specs are rebuilt every agent-loop
-    /// iteration, so this is the hot path of #8642.
+    /// iteration, so this is the hot path of
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.prefixed_name.clone(),
@@ -70,11 +69,6 @@ impl Tool for McpToolWrapper {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Strip the `approved` field before forwarding to the MCP server.
-        // ZeroClaw's security model injects `approved: bool` into built-in tool
-        // calls for supervised-mode confirmation. MCP servers have no knowledge
-        // of this field and will reject calls that include it as an unexpected
-        // parameter. We strip it here so MCP servers always receive clean args.
         let args = match args {
             serde_json::Value::Object(mut map) => {
                 map.remove("approved");
@@ -171,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn spec_shares_stored_schema_without_cloning() {
-        // #8642 regression guard: spec() must hand out the SAME allocation
+        // Regression guard: spec() must hand out the SAME allocation
         // as the stored schema, not a deep copy. Two consecutive specs must
         // also share with each other.
         let registry = empty_registry().await;
