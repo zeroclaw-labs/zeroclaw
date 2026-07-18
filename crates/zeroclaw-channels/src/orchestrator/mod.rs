@@ -96,7 +96,7 @@ use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
-use serde::Deserialize;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::ops::Range;
@@ -325,16 +325,8 @@ enum ChannelRuntimeCommand {
     InvalidThinking(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheState {
-    entries: Vec<ModelCacheEntry>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheEntry {
-    model_provider: String,
-    models: Vec<String>,
-}
+// ModelCacheState / ModelCacheEntry are defined in zeroclaw-config::schema
+// as the single source of truth for the on-disk cache contract.
 
 #[derive(Debug, Clone)]
 struct ChannelRuntimeDefaults {
@@ -2222,27 +2214,49 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
-fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
-    let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
-    let Ok(raw) = std::fs::read_to_string(cache_path) else {
-        return Vec::new();
-    };
-    let Ok(state) = serde_json::from_str::<ModelCacheState>(&raw) else {
-        return Vec::new();
+fn load_cached_model_preview(
+    install_root_dir: &Path,
+    agent_workspace_dir: &Path,
+    provider_name: &str,
+) -> Vec<String> {
+    // Canonicalize undotted names so lookup matches the cache key.
+    let canonical = if provider_name.contains('.') {
+        provider_name.to_string()
+    } else {
+        format!("{provider_name}.default")
     };
 
-    state
-        .entries
-        .into_iter()
-        .find(|entry| entry.model_provider == provider_name)
-        .map(|entry| {
-            entry
+    // Check the shared cache location first (written by `zeroclaw models refresh`),
+    // then fall back to the agent workspace for backward compatibility.
+    let shared_path = install_root_dir
+        .join("state")
+        .join(MODEL_CACHE_FILE);
+    let agent_path = agent_workspace_dir
+        .join("state")
+        .join(MODEL_CACHE_FILE);
+
+    for cache_path in [&shared_path, &agent_path] {
+        let Ok(raw) = std::fs::read_to_string(cache_path) else {
+            continue;
+        };
+        let Ok(state) =
+            serde_json::from_str::<zeroclaw_config::schema::ModelCacheState>(&raw)
+        else {
+            continue;
+        };
+        if let Some(entry) = state
+            .entries
+            .into_iter()
+            .find(|e| e.model_provider == canonical)
+        {
+            return entry
                 .models
                 .into_iter()
                 .take(MODEL_CACHE_PREVIEW_LIMIT)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// Build a cache key that includes the runtime-defaults generation, the
@@ -2378,7 +2392,8 @@ async fn create_resilient_model_provider_nonblocking(
 
 fn build_models_help_response(
     current: &ChannelRouteSelection,
-    workspace_dir: &Path,
+    install_root_dir: &Path,
+    agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
@@ -2410,7 +2425,8 @@ fn build_models_help_response(
         }
     }
 
-    let cached_models = load_cached_model_preview(workspace_dir, &current.model_provider);
+    let cached_models =
+        load_cached_model_preview(install_root_dir, agent_workspace_dir, &current.model_provider);
     if cached_models.is_empty() {
         response.push('\n');
         response.push_str(&channel_runtime_cli_string_with_args(
@@ -2508,7 +2524,8 @@ fn build_config_text_response(
 /// Build a Slack Block Kit JSON payload for the `/config` interactive UI.
 fn build_config_block_kit(
     current: &ChannelRouteSelection,
-    workspace_dir: &Path,
+    install_root_dir: &Path,
+    agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let provider_options: Vec<serde_json::Value> = zeroclaw_providers::list_model_providers()
@@ -2537,7 +2554,8 @@ fn build_config_block_kit(
         })
         .collect();
 
-    let cached = load_cached_model_preview(workspace_dir, &current.model_provider);
+    let cached =
+        load_cached_model_preview(install_root_dir, agent_workspace_dir, &current.model_provider);
     for model_id in cached {
         if !model_options.iter().any(|o| {
             o.get("value")
@@ -2778,6 +2796,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowModel => {
             let mut resp = build_models_help_response(
                 &current,
+                ctx.prompt_config.install_root_dir().as_path(),
                 ctx.workspace_dir.as_path(),
                 &ctx.model_routes,
             );
@@ -2887,6 +2906,7 @@ async fn handle_runtime_command_if_needed(
             if msg.channel == "slack" {
                 let blocks_json = build_config_block_kit(
                     &current,
+                    ctx.prompt_config.install_root_dir().as_path(),
                     ctx.workspace_dir.as_path(),
                     &ctx.model_routes,
                 );

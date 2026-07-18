@@ -1068,6 +1068,8 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
+cli-doctor-cache-dir-failed = Failed to create state dir for model cache: {$error}
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.

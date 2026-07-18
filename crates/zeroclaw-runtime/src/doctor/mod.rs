@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
@@ -9,6 +9,16 @@ const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
+
+/// Canonicalize a provider reference: undotted names like `openrouter` become
+/// `openrouter.default` so the cache key matches the channel reader's lookup.
+fn canonicalize_provider_ref(provider_name: &str) -> String {
+    if provider_name.contains('.') {
+        provider_name.to_string()
+    } else {
+        format!("{provider_name}.default")
+    }
+}
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
@@ -368,50 +378,47 @@ fn create_doctor_model_provider(
     }
 }
 
-/// Persist the fetched model catalog to `<workspace_dir>/state/models_cache.json`
-/// so that `/model` can display available models without a live probe.
-fn persist_model_cache(workspace_dir: &Path, provider_name: &str, models: &[String]) {
-    let state_dir = workspace_dir.join("state");
-    if let Err(e) = std::fs::create_dir_all(&state_dir) {
-        eprintln!("  ⚠️  Failed to create state dir for model cache: {e}");
-        return;
-    }
+/// Persist the fetched model catalog to the shared cache location so that
+/// `/model` can display available models without a live probe.
+///
+/// The cache is written to `<install_root_dir>/state/models_cache.json` — a
+/// shared location outside any agent workspace. Both the CLI writer and the
+/// channel reader resolve this same path via [`Config::install_root_dir`].
+fn persist_model_cache(
+    config: &Config,
+    provider_name: &str,
+    models: &[String],
+) -> anyhow::Result<()> {
+    let cache_dir = config.install_root_dir().join("state");
+    std::fs::create_dir_all(&cache_dir).context("Failed to create state dir for model cache")?;
 
-    let cache_path = state_dir.join(MODEL_CACHE_FILE);
+    let cache_path = cache_dir.join(MODEL_CACHE_FILE);
 
     // Load existing cache or start fresh.
-    #[derive(Default, serde::Deserialize, serde::Serialize)]
-    struct Cache {
-        entries: Vec<CacheEntry>,
-    }
-    #[derive(Default, serde::Deserialize, serde::Serialize)]
-    struct CacheEntry {
-        model_provider: String,
-        models: Vec<String>,
-    }
-
-    let mut cache: Cache = std::fs::read_to_string(&cache_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let mut cache: zeroclaw_config::schema::ModelCacheState =
+        std::fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
 
     // Replace or insert the entry for this provider.
-    cache.entries.retain(|e| e.model_provider != provider_name);
-    cache.entries.push(CacheEntry {
-        model_provider: provider_name.to_string(),
+    let canonical = canonicalize_provider_ref(provider_name);
+    cache.entries.retain(|e| e.model_provider != canonical);
+    cache.entries.push(zeroclaw_config::schema::ModelCacheEntry {
+        model_provider: canonical,
         models: models.to_vec(),
     });
 
-    match serde_json::to_string_pretty(&cache) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&cache_path, json) {
-                eprintln!("  ⚠️  Failed to write model cache: {e}");
-            }
-        }
-        Err(e) => {
-            eprintln!("  ⚠️  Failed to serialize model cache: {e}");
-        }
-    }
+    let json = serde_json::to_string_pretty(&cache)
+        .context("Failed to serialize model cache")?;
+
+    // Atomic write: write to a temp file then rename to avoid truncated JSON
+    // on process interruption.
+    let tmp_path = cache_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json).context("Failed to write model cache temp file")?;
+    std::fs::rename(&tmp_path, &cache_path).context("Failed to rename model cache temp file")?;
+
+    Ok(())
 }
 
 pub async fn run_models(
@@ -448,8 +455,22 @@ pub async fn run_models(
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
                 // Persist the catalog so `/model` can display it without a live probe.
-                let workspace_dir = config.agent_workspace_dir("default");
-                persist_model_cache(&workspace_dir, provider_name, &models);
+                if let Err(e) = persist_model_cache(config, provider_name, &models) {
+                    error_count += 1;
+                    println!(
+                        "    ⚠️  {}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-cache-write-failed",
+                            &[("error", &e.to_string())],
+                        )
+                    );
+                    matrix_rows.push((
+                        provider_name.clone(),
+                        ModelProbeOutcome::Error,
+                        None,
+                        truncate_for_display(&e.to_string(), 120),
+                    ));
+                }
                 if show_model_names && !models.is_empty() {
                     for m in &models {
                         println!("      • {}", m);
