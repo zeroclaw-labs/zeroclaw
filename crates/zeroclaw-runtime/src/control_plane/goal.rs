@@ -1740,10 +1740,20 @@ async fn update_goal_budget(
     let usage = goal_usage_totals(config, &task_id);
     let budget = goal_budget_summary(updated.goal(), usage.as_ref());
     if let Some(budget_pause) = goal_budget_gate_pause(updated.goal(), usage.as_ref()) {
-        goal_store
-            .pause_goal_task(&task_id, merge_budget_pause(updated.goal(), budget_pause))
+        if !goal_store
+            .pause_goal_task_if_status(
+                &task_id,
+                updated.status(),
+                merge_budget_pause(updated.goal(), budget_pause),
+            )
             .await
-            .with_context(|| msg("goal-command-error-budget-failed", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-budget-failed", &[("task_id", &task_id)]))?
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-budget-failed", &[("task_id", &task_id)])
+            );
+        }
         return Ok(GoalAdmission {
             task_id: Some(task_id.clone()),
             status: TaskStatus::Paused,
@@ -1759,12 +1769,18 @@ async fn update_goal_budget(
     if updated.status() == TaskStatus::Paused && has_budget_pause(updated.goal()) {
         if let Some(pause) = remove_budget_pause(updated.goal()) {
             let blockers = blockers_summary(&pause.blockers);
-            goal_store
-                .pause_goal_task(&task_id, pause)
+            if !goal_store
+                .pause_goal_task_if_status(&task_id, updated.status(), pause)
                 .await
                 .with_context(|| {
                     msg("goal-command-error-budget-failed", &[("task_id", &task_id)])
-                })?;
+                })?
+            {
+                bail!(
+                    "{}",
+                    msg("goal-command-error-budget-failed", &[("task_id", &task_id)])
+                );
+            }
             let message = if let Some(blockers) = blockers {
                 msg(
                     "goal-command-budget-updated-paused-blocked",
@@ -1789,15 +1805,21 @@ async fn update_goal_budget(
             });
         }
 
-        goal_store
-            .resume_goal_task(
+        if !goal_store
+            .resume_paused_goal_task(
                 &task_id,
                 std::process::id(),
                 boot_id,
                 ctx.continuation_context.clone(),
             )
             .await
-            .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-update-failed", &[("task_id", &task_id)])
+            );
+        }
         return Ok(GoalAdmission {
             task_id: Some(task_id.clone()),
             status: TaskStatus::Running,
@@ -1896,10 +1918,16 @@ async fn pause_goal_for_resolved_task_with_budget(
     ensure_goal_not_terminal(task_goal.task())?;
     let task_id = task_goal.task_id().to_string();
     let message_key = goal_pause_message_key(pause.reason);
-    goal_store
-        .pause_goal_task(&task_id, pause)
+    if !goal_store
+        .pause_goal_task_if_status(&task_id, task_goal.status(), pause)
         .await
-        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task_id)]))?;
+        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task_id)]))?
+    {
+        bail!(
+            "{}",
+            msg("goal-command-error-pause-failed", &[("task_id", &task_id)])
+        );
+    }
     Ok(GoalAdmission {
         task_id: Some(task_id.clone()),
         status: TaskStatus::Paused,
@@ -1958,10 +1986,20 @@ async fn resume_goal(
             _ => "goal-command-budget-exhausted",
         };
         let budget = goal_budget_summary(current.goal(), current_usage.as_ref());
-        goal_store
-            .pause_goal_task(&task_id, merge_budget_pause(current.goal(), budget_pause))
+        if !goal_store
+            .pause_goal_task_if_status(
+                &task_id,
+                current.status(),
+                merge_budget_pause(current.goal(), budget_pause),
+            )
             .await
-            .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task_id)]))?
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-resume-failed", &[("task_id", &task_id)])
+            );
+        }
         return Ok(GoalAdmission {
             task_id: Some(task_id.clone()),
             status: TaskStatus::Paused,
@@ -1970,15 +2008,21 @@ async fn resume_goal(
             continue_goal: false,
         });
     }
-    goal_store
-        .resume_goal_task(
+    if !goal_store
+        .resume_paused_goal_task(
             &task_id,
             std::process::id(),
             boot_id,
             ctx.continuation_context.clone(),
         )
         .await
-        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?;
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?
+    {
+        bail!(
+            "{}",
+            msg("goal-command-error-update-failed", &[("task_id", &task_id)])
+        );
+    }
     let budget = goal_budget_summary(current.goal(), current_usage.as_ref());
     Ok(GoalAdmission {
         task_id: Some(task_id.clone()),
@@ -2011,15 +2055,20 @@ async fn cancel_goal(
         );
     }
     let task_id = current.task_id().to_string();
-    store
-        .update_status(
+    if !goal_store
+        .cancel_goal_task_if_status(
             &task_id,
-            TaskStatus::Cancelled,
-            None,
-            Some(msg("goal-terminal-reason-cancelled-by-controller", &[])),
+            current.status(),
+            msg("goal-terminal-reason-cancelled-by-controller", &[]),
         )
         .await
-        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?;
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?
+    {
+        bail!(
+            "{}",
+            msg("goal-command-error-update-failed", &[("task_id", &task_id)])
+        );
+    }
     let usage = goal_usage_totals(config, &task_id);
     let budget = goal_budget_summary(current.goal(), usage.as_ref());
     Ok(GoalAdmission {

@@ -34,10 +34,12 @@ impl ResolvedModelAccess<'_> {
             .await?;
         // Record spend immediately after the call (before any caller-side output
         // validation) so a downstream failure still counts the provider usage.
-        if let Some(usage) = resp.usage.as_ref() {
-            crate::agent::cost::record_tool_loop_cost_usage(self.provider_name, self.model, usage)
-                .await?;
-        }
+        crate::agent::cost::record_tool_loop_cost_usage_optional(
+            self.provider_name,
+            self.model,
+            resp.usage.as_ref(),
+        )
+        .await?;
         Ok(resp)
     }
 }
@@ -150,14 +152,37 @@ mod run_model_query_tests {
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_config::cost::CostTracker;
+    use zeroclaw_config::schema::CostConfig;
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
 
-    /// Provider stub returning a fixed reply WITH token usage, so the seam's
-    /// cost-recording path has something to record.
-    struct UsageProvider;
+    /// Provider stub returning a fixed reply with caller-selected usage, so the
+    /// accounting seam can prove both normal recording and fail-closed goals.
+    struct UsageProvider {
+        usage: Option<TokenUsage>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UsageProvider {
+        fn with_usage(usage: Option<TokenUsage>) -> Self {
+            Self {
+                usage,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn measured() -> Self {
+            Self::with_usage(Some(TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: None,
+            }))
+        }
+    }
 
     #[async_trait]
     impl ModelProvider for UsageProvider {
@@ -179,14 +204,11 @@ mod run_model_query_tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(ChatResponse {
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
-                usage: Some(TokenUsage {
-                    input_tokens: Some(100),
-                    output_tokens: Some(20),
-                    cached_input_tokens: None,
-                }),
+                usage: self.usage.clone(),
                 reasoning_content: None,
             })
         }
@@ -215,7 +237,7 @@ mod run_model_query_tests {
     // response. This is the tests / CLI-without-cost shape.
     #[tokio::test]
     async fn run_model_query_returns_response_and_no_op_meters_when_unscoped() {
-        let provider = UsageProvider;
+        let provider = UsageProvider::measured();
         let messages = [ChatMessage::user("hi")];
         let resp = access(&provider)
             .run_model_query(ChatRequest {
@@ -233,7 +255,7 @@ mod run_model_query_tests {
     // dispatch -> record are wired, not just the dispatch).
     #[tokio::test]
     async fn run_model_query_records_usage_under_cost_scope() {
-        let provider = UsageProvider;
+        let provider = UsageProvider::measured();
         let messages = [ChatMessage::user("hi")];
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
@@ -255,5 +277,65 @@ mod run_model_query_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
         assert_eq!(recorded.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn run_model_query_rejects_missing_usage_for_a_goal_owned_turn() {
+        // The max-iteration summary path uses this seam too, so successful
+        // provider output without usage must fail before it can spend a goal
+        // budget without a durable ledger record.
+        let provider = UsageProvider::with_usage(None);
+        let messages = [ChatMessage::user("hi")];
+        let goal = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_goal_task_id(Some("goal-summary-usage".into()));
+        let workspace = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), workspace.path()).unwrap());
+        let context = ToolLoopCostTrackingContext::new(tracker, Arc::new(Default::default()))
+            .with_goal_admission_context(&goal);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                access(&provider)
+                    .run_model_query(ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    })
+                    .await
+            })
+            .await;
+
+        let error = result.expect_err("goal-owned provider usage must be required");
+        assert!(
+            format!("{error:#}").contains("goal accounting usage unavailable"),
+            "unexpected goal-owned usage error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_model_query_rejects_trackerless_goal_before_provider_dispatch() {
+        // A trackerless goal cannot charge a budget, so preflight must fail
+        // before the provider sees the request rather than wasting a call that
+        // can never be represented in the canonical usage ledger.
+        let provider = UsageProvider::measured();
+        let messages = [ChatMessage::user("hi")];
+        let goal = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_goal_task_id(Some("goal-trackerless".into()));
+        let context = ToolLoopCostTrackingContext::usage_only().with_goal_admission_context(&goal);
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                access(&provider)
+                    .run_model_query(ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    })
+                    .await
+            })
+            .await
+            .expect_err("trackerless goal must fail before provider dispatch");
+        assert!(format!("{error:#}").contains("goal accounting tracker unavailable"));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
     }
 }

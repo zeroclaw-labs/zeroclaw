@@ -201,12 +201,12 @@ async fn recover_prior_boot_running(
         }
         GoalRestartRecovery::Paused => {
             goal_store
-                .pause_goal_task(&rec.id, daemon_restart_pause(rec, boot_id))
-                .await?;
-            Ok(matches!(
-                store.get(&rec.id).await?,
-                Some(task) if task.status == TaskStatus::Paused
-            ))
+                .pause_goal_task_if_status(
+                    &rec.id,
+                    TaskStatus::Running,
+                    daemon_restart_pause(rec, boot_id),
+                )
+                .await
         }
     }
 }

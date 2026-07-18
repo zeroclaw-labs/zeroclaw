@@ -364,8 +364,8 @@ pub trait GoalTaskRegistry: Send + Sync {
     ///
     /// This is for extension-only repairs or tests that already control the
     /// canonical lifecycle row. Runtime pause/resume paths must use
-    /// [`GoalTaskRegistry::pause_goal_task`] or
-    /// [`GoalTaskRegistry::resume_goal_task`] so `tasks.status` and
+    /// [`GoalTaskRegistry::pause_goal_task_if_status`] or
+    /// [`GoalTaskRegistry::resume_paused_goal_task`] so `tasks.status` and
     /// `goal_tasks` cannot diverge.
     async fn update_goal_pause(
         &self,
@@ -373,13 +373,28 @@ pub trait GoalTaskRegistry: Send + Sync {
         pause: Option<GoalPauseState>,
     ) -> anyhow::Result<()>;
 
-    /// Atomically persist a goal pause and the canonical paused lifecycle state.
+    /// Atomically persist a pause only if the canonical task is still in the
+    /// expected lifecycle state.
     ///
-    /// This is goal-specific because the transaction spans the generic `tasks`
-    /// row and the goal extension row. `TaskRegistry` stays generic; callers use
-    /// this when the goal controller needs both source-of-truth rows to move
-    /// together.
-    async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
+    /// A controller command resolves a task before it mutates it. The expected
+    /// state prevents that stale read from overwriting an operator or terminal
+    /// transition that won the race in the meantime.
+    async fn pause_goal_task_if_status(
+        &self,
+        task_id: &str,
+        expected_status: TaskStatus,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<bool>;
+
+    /// Atomically cancel a goal only if its lifecycle state still matches the
+    /// controller's resolved target. A false result means a concurrent state
+    /// transition won and no terminal output or error was written.
+    async fn cancel_goal_task_if_status(
+        &self,
+        task_id: &str,
+        expected_status: TaskStatus,
+        error: String,
+    ) -> anyhow::Result<bool>;
 
     /// Atomically complete exactly a running goal. A false result means a
     /// concurrent pause/cancel/terminal transition won the lifecycle race.
@@ -394,13 +409,13 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// This keeps manual resume, budget-triggered resume, and future recovery
     /// paths from splitting lifecycle and goal-extension updates across
     /// independent writes.
-    async fn resume_goal_task(
+    async fn resume_paused_goal_task(
         &self,
         task_id: &str,
         owner_pid: u32,
         owner_boot_id: &str,
         continuation_context: Option<TaskContinuationContext>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 
     /// Replace or clear the continuation delivery context for a task.
     ///
