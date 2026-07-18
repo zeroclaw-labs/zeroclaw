@@ -2289,6 +2289,56 @@ impl Chat {
                 return;
             }
 
+            // The scrollbar is shared by browse mode and character-level
+            // transcript selection, so handle its drag lifecycle before those
+            // interaction modes diverge.
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(track) = state.scrollbar_track_rect
+                        && mouse::in_rect(col, row, track)
+                    {
+                        state.scrollbar_drag = Some(ScrollbarDrag {
+                            start_scroll: state.scroll_offset,
+                            start_row: row,
+                        });
+                        let max = state
+                            .last_total_rows
+                            .saturating_sub(state.last_inner_height);
+                        if track.height > 0 {
+                            let rel = row.saturating_sub(track.y) as u32;
+                            let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
+                            state.scroll_offset = new_off.min(max);
+                            state.pinned_to_bottom = state.scroll_offset >= max;
+                        }
+                        return;
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(drag) = state.scrollbar_drag {
+                        let max = state
+                            .last_total_rows
+                            .saturating_sub(state.last_inner_height);
+                        let track_h = state
+                            .scrollbar_track_rect
+                            .map(|r| r.height)
+                            .unwrap_or(0)
+                            .max(1);
+                        let dy = row as i32 - drag.start_row as i32;
+                        let scroll_delta = dy * max as i32 / track_h as i32;
+                        let new_off =
+                            (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
+                        state.scroll_offset = new_off as u16;
+                        state.pinned_to_bottom = state.scroll_offset >= max;
+                        return;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) if state.scrollbar_drag.is_some() => {
+                    state.scrollbar_drag = None;
+                    return;
+                }
+                _ => {}
+            }
+
             if !state.in_browse_mode() {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
@@ -2328,24 +2378,6 @@ impl Chat {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(track) = state.scrollbar_track_rect
-                        && mouse::in_rect(col, row, track)
-                    {
-                        state.scrollbar_drag = Some(ScrollbarDrag {
-                            start_scroll: state.scroll_offset,
-                            start_row: row,
-                        });
-                        let max = state
-                            .last_total_rows
-                            .saturating_sub(state.last_inner_height);
-                        if track.height > 0 {
-                            let rel = row.saturating_sub(track.y) as u32;
-                            let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
-                            state.scroll_offset = new_off.min(max);
-                            state.pinned_to_bottom = state.scroll_offset >= max;
-                        }
-                        return;
-                    }
                     if let Some(region) = state
                         .copy_hit_regions
                         .iter()
@@ -2407,22 +2439,7 @@ impl Chat {
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
-                    if let Some(drag) = state.scrollbar_drag {
-                        let max = state
-                            .last_total_rows
-                            .saturating_sub(state.last_inner_height);
-                        let track_h = state
-                            .scrollbar_track_rect
-                            .map(|r| r.height)
-                            .unwrap_or(0)
-                            .max(1);
-                        let dy = row as i32 - drag.start_row as i32;
-                        let scroll_delta = dy * max as i32 / track_h as i32;
-                        let new_off =
-                            (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
-                        state.scroll_offset = new_off as u16;
-                        state.pinned_to_bottom = state.scroll_offset >= max;
-                    } else if let Some(start) = state.mouse_down_entry {
+                    if let Some(start) = state.mouse_down_entry {
                         // Drag extends selection only in browse mode.
                         if state.in_browse_mode() {
                             let hit = state
@@ -2439,7 +2456,6 @@ impl Chat {
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    state.scrollbar_drag = None;
                     // Mouse-up ends a browse-mode drag gesture only. It must
                     // not copy implicitly: users expect dragging transcript
                     // text to be safe while selecting words/lines in the
@@ -6939,6 +6955,62 @@ mod tests {
             Some(CopyFeedback::Transcript { .. })
         ));
         assert!(state.info_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn scrollbar_drag_works_outside_browse_mode() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state.last_total_rows = 100;
+        state.last_inner_height = 20;
+        state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        for (kind, row) in [
+            (MouseEventKind::Down(MouseButton::Left), 4),
+            (MouseEventKind::Drag(MouseButton::Left), 8),
+        ] {
+            chat.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 79,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 80, 20),
+            )
+            .await;
+        }
+
+        {
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert!(state.scrollbar_drag.is_some());
+            assert!(state.scroll_offset > 0);
+            assert_eq!(state.transcript_selection, None);
+        }
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 79,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.scrollbar_drag.is_none());
     }
 
     #[test]
