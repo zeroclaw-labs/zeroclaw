@@ -3101,22 +3101,22 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoReplyKind {
     /// "Got it, no action needed" — informational, social, or
-    /// non-addressed messages. Reaction: 👝.
+    /// non-addressed messages. Reaction: 👍.
     Informational,
     /// "I will not do this" — safety / policy refusals (prompt injection,
     /// blocked tool, disallowed request). Reaction: 🚫.
     Refused,
     /// "I tried but couldn't fulfil" — external failures, missing
-    /// resources, timeouts where the assistant gave up. Reaction: ⚠︝.
+    /// resources, timeouts where the assistant gave up. Reaction: ⚠️.
     Failed,
 }
 
 impl NoReplyKind {
     fn emoji(self) -> &'static str {
         match self {
-            NoReplyKind::Informational => "👝",
+            NoReplyKind::Informational => "👍",
             NoReplyKind::Refused => "🚫",
-            NoReplyKind::Failed => "⚠︝",
+            NoReplyKind::Failed => "⚠️",
         }
     }
 }
@@ -5661,7 +5661,7 @@ async fn process_channel_message_body(
 
     let reaction_done_emoji = match &llm_result {
         LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
-        _ => "\u{26A0}\u{FE0F}",                                // ⚠︝
+        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
     };
 
     match llm_result {
@@ -6098,12 +6098,12 @@ async fn process_channel_message_body(
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
-                    "⚠︝ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
                 } else {
-                    "⚠︝ Context window exceeded for this conversation. Please resend your last message."
+                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
                 eprintln!(
-                    "  ⚠︝ Context window exceeded after {}ms; sender history compacted={}",
+                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
                     compacted
                 );
@@ -6196,7 +6196,7 @@ async fn process_channel_message_body(
                 if let Some(channel) = target_channel.as_ref() {
                     let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
                         .map(str::to_string)
-                        .unwrap_or_else(|| format!("⚠︝ Error: {safe_error}"));
+                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -6266,7 +6266,7 @@ async fn process_channel_message_body(
         }
     }
 
-    // Swap 👀 → ✅ (or ⚠︝ on error) to signal processing is complete. Await the
+    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
     // spawned ack add first so the remove can never race ahead of it.
     if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
@@ -7205,12 +7205,12 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str
         }
         Ok(false) => {
             println!(
-                "ℹ︝ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
             );
         }
         Err(e) => {
             eprintln!(
-                "⚠︝ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
                  Restart service manually with `zeroclaw service stop && zeroclaw service start`."
             );
         }
@@ -10122,13 +10122,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             }
             ChannelHealthState::Timeout => {
                 timeout += 1;
-                println!("  ❱︝  {:<9} timed out (>10s)", configured.display_name);
+                println!("  ⏱️  {:<9} timed out (>10s)", configured.display_name);
             }
         }
     }
 
     if !config_arc.read().channels.webhook.is_empty() {
-        println!("  ℹ︝  Webhook   check via `zeroclaw gateway` then GET /health");
+        println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
     }
 
     println!();
@@ -14734,7 +14734,7 @@ api_key = "anthropic-key"
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(zeroclaw_providers::ChatResponse {
-                    text: Some("Понѝл, запуѝкаю инѝтрумент".to_string()),
+                    text: Some("Понял, запускаю инструмент".to_string()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "call-1".to_string(),
                         name: "mock_price".to_string(),
@@ -14746,7 +14746,7 @@ api_key = "anthropic-key"
                 })
             } else {
                 Ok(zeroclaw_providers::ChatResponse {
-                    text: Some("Инѝтрумент отклонён, завершаю ход.".to_string()),
+                    text: Some("Инструмент отклонён, завершаю ход.".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
@@ -16272,7 +16272,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 id: "msg-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "123".to_string(),
-                content: "Запуѝти инѝтрумент".to_string(),
+                content: "Запусти инструмент".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -16299,7 +16299,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let narration_idx = send_message_bodies
             .iter()
-            .position(|body| body.contains("Понѝл, запуѝкаю инѝтрумент"))
+            .position(|body| body.contains("Понял, запускаю инструмент"))
             .unwrap_or_else(|| {
                 panic!("narration sendMessage missing; bodies: {send_message_bodies:?}")
             });
@@ -18275,7 +18275,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let reply = sent_messages.last().unwrap();
         assert!(reply.starts_with("chat-iter-success:"));
         assert!(reply.contains("Completed after 11 tool iterations."));
-        assert!(!reply.contains("⚠︝ Error:"));
+        assert!(!reply.contains("⚠️ Error:"));
     }
 
     #[tokio::test]
@@ -18397,7 +18397,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // returns as its "summary". The key invariant: the loop terminates and
         // produces a response (not hanging forever).
         assert!(
-            reply.contains("⚠︝ Error: Agent exceeded maximum tool iterations (3)")
+            reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)")
                 || reply.len() > "chat-iter-fail:".len(),
             "Expected either an error message or a graceful summary response"
         );
@@ -20305,7 +20305,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn channel_log_truncation_is_utf8_safe_for_multibyte_text() {
-        let msg = "Hello from ZeroClaw 🌝. Current status is healthy, and café-style UTF-8 text stays safe in logs.";
+        let msg = "Hello from ZeroClaw 🌍. Current status is healthy, and café-style UTF-8 text stays safe in logs.";
 
         // Reproduces the production crash path where channel logs truncate at 80 chars.
         let result =
@@ -25104,7 +25104,7 @@ This is an example JSON object for profile settings."#;
             sent[0]
         );
         assert!(
-            sent[0].contains("⚠︝ Error"),
+            sent[0].contains("⚠️ Error"),
             "reply must start with error prefix, got: {}",
             sent[0]
         );
