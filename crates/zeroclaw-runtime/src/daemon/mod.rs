@@ -1178,7 +1178,7 @@ fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTest
 /// healthy handle in `current` is never included, so calling this
 /// repeatedly while that handle stays healthy keeps excluding it instead
 /// of re-including it on every heartbeat tick (the partial-outage churn
-/// #5903's retry path still had: a granted list of {A, B} with A healthy
+/// the retry path still had: a granted list of {A, B} with A healthy
 /// and B down previously caused every tick to reconnect BOTH A and B via
 /// `McpRegistry::connect_all`, even though A never needed it).
 fn missing_or_dead_servers(
@@ -1206,25 +1206,24 @@ async fn connect_heartbeat_mcp_registry(
     agent_alias: &str,
     current: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
 ) -> Result<Option<std::sync::Arc<crate::tools::McpRegistry>>> {
+    // Only (re)connect what `current` doesn't already have healthy --
+    // a healthy server must never be respawned/re-handshaked just
+    // because a sibling grant is missing or dead (see
+    // `missing_or_dead_servers`). `current` is `None` at worker boot,
+    // where every granted server is by definition missing. Computed
+    // unconditionally (pure, no I/O) so the test hook below observes
+    // the same filtered subset the real connect path would use.
+    let granted = config.mcp_servers_for_agent(agent_alias);
+    let servers = missing_or_dead_servers(granted, current);
+
     #[cfg(test)]
     if let Some(hook) = current_heartbeat_mcp_registry_test_hook() {
-        let servers = config.mcp_servers_for_agent(agent_alias);
         return Ok(Some(hook(agent_alias, &servers)));
     }
 
     if !config.mcp.enabled {
         return Ok(None);
     }
-    let granted = config.mcp_servers_for_agent(agent_alias);
-    if granted.is_empty() {
-        return Ok(None);
-    }
-    // Only (re)connect what `current` doesn't already have healthy --
-    // a healthy server must never be respawned/re-handshaked just
-    // because a sibling grant is missing or dead (see
-    // `missing_or_dead_servers`). `current` is `None` at worker boot,
-    // where every granted server is by definition missing.
-    let servers = missing_or_dead_servers(granted, current);
     if servers.is_empty() {
         // Nothing is missing/dead. `reconcile_heartbeat_mcp_registry`
         // treats `fresh = None` as "keep current unchanged", so the
@@ -4106,7 +4105,7 @@ mod tests {
         }
     }
 
-    /// FAIL-ON-OLD guard for the #8866 partial-retry fix: granted = {A, B},
+    /// FAIL-ON-OLD guard for the partial-retry fix: granted = {A, B},
     /// current has a healthy A. `missing_or_dead_servers` must return only
     /// B -- A must never be re-included while its current handle is
     /// healthy. Repeated calls (simulating repeated heartbeat ticks while
@@ -4149,6 +4148,94 @@ mod tests {
         let to_connect = missing_or_dead_servers(granted, None);
         let names: Vec<&str> = to_connect.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["server-a", "server-b"]);
+    }
+
+    /// PRODUCTION-PATH regression, driven through
+    /// `retry_heartbeat_mcp_registry` itself rather than the pure
+    /// `missing_or_dead_servers` helper in isolation: granted = {A, B}, A
+    /// already healthy in `shared`, B perpetually down. Across N repeated
+    /// ticks, the test hook (now installed *after* filtering, see
+    /// `connect_heartbeat_mcp_registry`) must observe ONLY "server-b" in
+    /// the requested set every time -- "server-a" must never be
+    /// resubmitted for connection while its handle stays healthy. This
+    /// proves what the real retry call site actually passes to the
+    /// connector, closing the gap the pure-helper-only test above could
+    /// not reach on its own.
+    #[tokio::test]
+    async fn retry_heartbeat_mcp_registry_never_resubmits_healthy_peer_across_ticks() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
+
+        let a_handle = make_test_server_handle("server-a");
+        let mut shared: Option<std::sync::Arc<crate::tools::McpRegistry>> = Some(
+            std::sync::Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
+                vec![("server-a".to_string(), a_handle)],
+            )),
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.mcp.enabled = true;
+        config.mcp.servers.push(test_server_config("server-a"));
+        config.mcp.servers.push(test_server_config("server-b"));
+        config.mcp_bundles.insert(
+            "ab".to_string(),
+            McpBundleConfig {
+                servers: vec!["server-a".to_string(), "server-b".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["ab".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        // Hook simulates "B is still down": it never actually connects
+        // anything (returns an empty registry) but records exactly which
+        // server names it was asked to connect on each call.
+        let requested: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requested_for_hook = std::sync::Arc::clone(&requested);
+        let empty_registry: std::sync::Arc<crate::tools::McpRegistry> = std::sync::Arc::new(
+            crate::tools::McpRegistry::connect_all(&[])
+                .await
+                .expect("empty connect_all succeeds"),
+        );
+        let _hook_guard =
+            set_heartbeat_mcp_registry_test_hook(std::sync::Arc::new(move |_alias, servers| {
+                requested_for_hook
+                    .lock()
+                    .unwrap()
+                    .push(servers.iter().map(|s| s.name.clone()).collect());
+                std::sync::Arc::clone(&empty_registry)
+            }));
+
+        const TICKS: usize = 5;
+        for tick in 0..TICKS {
+            retry_heartbeat_mcp_registry(&mut shared, &config, "ops")
+                .await
+                .expect("retry must not error");
+            assert!(
+                shared.is_some(),
+                "tick {tick}: healthy server-a must keep the shared registry populated"
+            );
+        }
+
+        let calls = requested.lock().unwrap();
+        assert_eq!(calls.len(), TICKS, "hook must fire once per tick");
+        for (tick, names) in calls.iter().enumerate() {
+            assert_eq!(
+                names,
+                &vec!["server-b".to_string()],
+                "tick {tick}: only server-b (down) may be requested; \
+                 server-a (healthy) must never be resubmitted"
+            );
+        }
+
+        // `_hook_guard` drops here, releasing the serialising lock and
+        // clearing the global hook for the next test.
     }
 
     /// When every granted server already has a healthy current handle,
