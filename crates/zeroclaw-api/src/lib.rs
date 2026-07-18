@@ -14,6 +14,8 @@ pub mod observability_traits;
 pub mod peripherals_traits;
 pub mod plan;
 pub mod platform;
+pub mod plugin_egress;
+pub mod plugin_key;
 pub mod principal;
 pub mod runtime_traits;
 pub mod schema;

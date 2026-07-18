@@ -17,16 +17,18 @@ plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
+jsonschema = { version = "0.48", default-features = false }
 ring = "0.17"
+same-file = "1.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "net", "rt", "time"] }
 toml = "1.0"
+toml_edit = "0.25"
 wasmtime = { version = "45.0.3", default-features = false, features = [
   "component-model",
   "runtime",
@@ -40,7 +42,9 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
   "p2",
   "default-send-request",
 ], optional = true }
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3.26"
 zeroclaw-config = { path = "../zeroclaw-config" }
+zeroclaw-spawn.workspace = true
