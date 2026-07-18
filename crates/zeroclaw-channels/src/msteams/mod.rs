@@ -10,6 +10,8 @@
 //! JWT validation land in follow-up PRs (see
 //! `docs/msteams-channel-design.md`).
 
+pub mod auth;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
