@@ -1,39 +1,3 @@
-//! Agent-policy parity harness: the cross-path test matrix described
-//! in `docs/book/src/contributing/agent-policy-parity-harness.md`.
-//!
-//! A `#[cfg(test)]` sibling of the `safety_net.rs` turn-engine oracle,
-//! reusing its fixtures. Two layers:
-//!
-//! - **L1 (engine enforcement):** "when setting S reaches `run_tool_call_loop`,
-//!   the engine honors it." Path-independent locks; a refactor of the engine
-//!   cannot silently stop honoring a field.
-//! - **L2 (path resolution parity):** "every construction path, given one agent
-//!   config, hands the engine the same resolved value for S." This is the layer
-//!   that exposes divergence. Where a surface already resolves through one seam,
-//!   its L2 test is a positive parity assertion. Where a confirmed divergence has
-//!   no single seam yet, it ships as an always-running CHARACTERIZATION test that
-//!   pins the divergence as it exists (an `assert_ne!` on the two paths' output);
-//!   when the owning epic unifies the semantic, that assertion fails in the same
-//!   PR, forcing it to be rewritten into the positive parity assertion. No
-//!   `#[ignore]`d specs: a known-failing ignored test never runs in CI and
-//!   protects nothing, so the goal is expressed as a live assertion of the
-//!   current state instead.
-//!
-//! The `MATRIX` below is an INDEX of parity rows, not a grid of hand-written
-//! per-path verdicts. Deliberately so: a static verdict grid would be exactly
-//! the "data that goes stale with nothing noticing" this program exists to end:
-//! a cell asserting a path's state could rot the moment another PR changes that
-//! path, and no test would catch it. So the enforceable claims live ONLY
-//! in the L1/L2 tests below (which fail loudly when the behavior changes); each
-//! matrix row just records its owner epic, a public tracking reference, and its
-//! `evidence` - the in-file test that backs it, or, for a divergence with no
-//! single resolution seam yet, a tracked record pointing at where it is
-//! characterized. The meta-test enforces that bookkeeping (owner + tracking +
-//! evidence present), nothing more. Rows accrete one surface epic at a time;
-//! this scaffold ships the framework plus the tool-surface (Epic A) rows.
-//! Surfaces still under private review accrete their rows when the owning epic
-//! lands. The human-readable (setting x path) grid lives in the docs page.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -92,14 +56,6 @@ const MATRIX: &[ParityRow] = &[
         owner_epic: "A",
         tracking: "gateway + loop_::run + process_message route through assemble(); \
                    remaining sites cut over one PR at a time",
-        // Some production paths mint their registry through the assemble() seam
-        // while from_config, the channels orchestrator, and the delegate
-        // independent-target builder still hand-roll a direct
-        // apply_policy_tool_filter. Until those cut-overs land and the engine
-        // field seals to ScopedToolRegistry, cross-path uniformity is enforced
-        // by discipline, not a single seam, so there is nothing to assert green
-        // here yet: a cross-crate boot path with no in-file seam, each cut-over
-        // carrying its own site test.
         status: RowStatus::TrackedDivergence,
         evidence: "gateway/loop_::run/process_message route through assemble(); \
                    from_config/orchestrator/delegate still hand-roll the same filter, \
@@ -110,22 +66,12 @@ const MATRIX: &[ParityRow] = &[
         setting: "built-in filter semantic uniform (safe-defaults admit)",
         owner_epic: "A",
         tracking: "filter_channel_builtin_tools retired, closing ledger A4",
-        // The process_message-only admit-past-allowed_tools bypass is gone;
-        // every path now applies the same plain apply_policy_tool_filter,
-        // whether directly (orchestrator/from_config/delegate) or through
-        // assemble() (gateway/run/process_message). Backed by an in-file
-        // positive parity test, so a regression changes it only loudly.
         status: RowStatus::Tested,
         evidence: "parity_l2_builtin_filter_semantic_parity \
                    (positive parity assertion; the divergence this row tracked is closed)",
     },
 ];
 
-/// Meta-test: bookkeeping only. Every row must name a surface, a setting, an
-/// owner epic, a public tracking reference, and its `evidence` (an in-file test
-/// or a tracked-divergence record). It intentionally does NOT judge any per-path
-/// verdict - there are none to judge; the enforceable claims are the L1/L2 tests
-/// below, which fail loudly when the behavior they pin changes.
 #[test]
 fn parity_matrix_rows_are_owned_tracked_and_evidenced() {
     for row in MATRIX {
@@ -162,9 +108,6 @@ fn parity_matrix_rows_are_owned_tracked_and_evidenced() {
 
 // ── L1 exemplar: the engine honors excluded_tools ───────────────────────────
 
-/// L1 engine lock: a tool named in `excluded_tools` is never executed, even if
-/// the model calls it anyway. Constructed through `ResolvedAgentExecution::
-/// resolve` - the seam every production path uses.
 #[tokio::test]
 async fn parity_l1_engine_honors_excluded_tools() {
     let exec_count = Arc::new(AtomicUsize::new(0));
@@ -286,21 +229,6 @@ fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
     }
 }
 
-/// L2 positive parity assertion for ledger row A4: the `assemble()` seam
-/// (the `process_message` / `run` / gateway path) and a hand-rolled direct
-/// `apply_policy_tool_filter` call (the orchestrator / `Agent::from_config` /
-/// delegate path, still uncut) now resolve the built-in filter identically.
-///
-/// This used to characterize a real divergence with an always-running
-/// `assert_ne!`: `process_message` filtered built-ins through
-/// `filter_channel_builtin_tools`, which admitted the canonical read-only
-/// default (`web_fetch`) past `allowed_tools` at non-Full autonomy, while the
-/// plain `apply_policy_tool_filter` (every other path) dropped it. That helper
-/// was retired and `process_message` routed through `assemble()`, which applies
-/// the same plain filter `run` and the orchestrator always used, closing the
-/// divergence. Per the no-ignored-specs rule above, a closed divergence is
-/// rewritten into the positive assertion, not left as dead characterization
-/// code.
 #[tokio::test]
 async fn parity_l2_builtin_filter_semantic_parity() {
     let security = a4_policy();

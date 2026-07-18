@@ -1,5 +1,4 @@
 //! Consolidated live model_provider tests.
-//!
 //! All tests in this module require real external API credentials and are
 //! marked with `#[ignore]`. Run with: `cargo test --test live -- --ignored`
 
@@ -11,11 +10,6 @@ use zeroclaw::providers::traits::{ChatMessage, ModelProvider};
 /// required to keep the test stable across runs.
 const RECALL_TEMPERATURE: f64 = 0.0;
 
-/// Sends a real multi-turn conversation to OpenAI Codex and verifies
-/// the model retains context from earlier messages.
-///
-/// Requires valid OAuth credentials in `~/.zeroclaw/`.
-/// Run manually: `cargo test e2e_live_openai_codex_multi_turn -- --ignored`
 #[tokio::test]
 #[ignore = "requires live OpenAI Codex OAuth credentials"]
 async fn e2e_live_openai_codex_multi_turn() {

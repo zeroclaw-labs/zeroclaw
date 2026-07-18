@@ -40,15 +40,18 @@ with nothing pre-installed and get a running agent — bundle the kernel as a
 sidecar:
 
 ```sh
-# 1. Build (or reuse) the kernel and stage it for the bundler.
-scripts/desktop/prepare-kernel.sh                          # host triple
-scripts/desktop/prepare-kernel.sh --target universal-apple-darwin  # mac universal
-# Reuse an existing kernel instead of rebuilding (single-target only):
-ZEROCLAW_KERNEL_PATH=~/.cargo/bin/zeroclaw scripts/desktop/prepare-kernel.sh
+# 1. Build the dashboard, then embed it in the staged kernel.
+cargo web build
+scripts/desktop/prepare-kernel.sh --features embedded-web
+scripts/desktop/prepare-kernel.sh --target universal-apple-darwin --features embedded-web
 
 # 2. Bundle with the sidecar overlay (adds bundle.externalBin).
 cd apps/tauri && cargo tauri build --config tauri.bundled.conf.json
 ```
+
+`ZEROCLAW_KERNEL_PATH` can reuse a prebuilt single-target kernel, but that
+binary must already have been built with `--features embedded-web`; the staging
+script cannot add embedded assets to an existing executable.
 
 The overlay keeps the default config untouched, so `cargo tauri build`
 without the staged kernel keeps working. Tauri places the sidecar next to the
@@ -105,21 +108,19 @@ open /Applications/ZeroClaw.app
 - Quit from the tray → relaunch → splash → dashboard again (tray icon persists
   in the menu bar).
 
-### Agent capabilities still present (not part of setup)
-- `take_screenshot` (gated by the Screen Recording TCC check in
-  `apps/tauri/src/macos/permissions.rs::check_screen_recording`)
-- `run_applescript` (gated by the Automation TCC prompt)
+### Native command boundary
 
-These are invoked by the agent/dashboard at runtime; macOS shows its own native
-permission prompt the first time each is used. There is no in-app wizard for
-them anymore.
+The Rust app still registers `take_screenshot` and `run_applescript`, but the
+gateway-served main window receives no remote Tauri capability and cannot invoke
+them. Exposing either command requires a separate, narrowly scoped approval and
+ACL design.
 
 ## Linux / Windows
 
 The app builds and runs the same splash → gateway → Quickstart flow. Bundle
 targets are unchanged (`.deb`/`.AppImage` on Linux, `.exe`/`.msi` on Windows).
 Screen capture and AppleScript capabilities remain macOS-only; the other
-platforms simply don't register them.
+platforms register stubs that return an unsupported-platform error.
 
 ### How to build
 ```sh
