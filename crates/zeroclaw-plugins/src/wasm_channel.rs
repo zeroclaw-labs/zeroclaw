@@ -63,7 +63,7 @@ impl Attributable for WasmChannel {
     }
 }
 
-fn build_linker(http: bool) -> Result<Linker<PluginState>> {
+fn build_linker(http: bool, sockets: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
     if http {
@@ -71,6 +71,7 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_sockets(sockets);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -98,7 +99,8 @@ impl WasmChannel {
                 .with_inbound(inbound.clone()),
         );
         let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
+        let sockets = store.data().sockets_enabled();
+        let linker = build_linker(http, sockets)?;
         crate::component::ensure_http_coherent(&store, http)?;
         let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
             wt(

@@ -150,6 +150,9 @@ pub mod bindings {
             path: "../../wit/v0",
             imports: { default: async },
             exports: { default: async },
+            with: {
+                "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+            },
         });
     }
     pub mod channel {
@@ -158,6 +161,9 @@ pub mod bindings {
             path: "../../wit/v0",
             imports: { default: async },
             exports: { default: async },
+            with: {
+                "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+            },
         });
     }
     pub mod memory {
@@ -249,6 +255,23 @@ impl PluginState {
     #[must_use]
     pub(crate) fn scope(&self) -> &PluginInstanceScope {
         &self.scope
+    }
+
+    /// Shared point-of-use egress authority for transport imports.
+    #[must_use]
+    pub(crate) fn egress(&self) -> &crate::egress::EgressHostService {
+        self.services.egress()
+    }
+
+    /// Existing Wasmtime resource table used for host-owned socket resources.
+    #[must_use]
+    pub(crate) fn resource_table(&self) -> &ResourceTable {
+        &self.table
+    }
+
+    /// Mutable access to the existing Wasmtime resource table.
+    pub(crate) fn resource_table_mut(&mut self) -> &mut ResourceTable {
+        &mut self.table
     }
 
     fn start_call(&mut self, phase: PluginCallPhase) {
@@ -450,6 +473,11 @@ impl PluginState {
     /// Resolve optional host-import authority from the admitted scope.
     pub(crate) fn permission_enabled(&self, permission: PluginPermission) -> bool {
         self.scope.grants().allows(permission)
+    }
+
+    /// Whether the admitted scope exposes the socket host interface.
+    pub(crate) fn sockets_enabled(&self) -> bool {
+        self.scope.grants().allows(PluginPermission::SocketClient)
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.

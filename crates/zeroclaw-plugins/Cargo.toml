@@ -9,7 +9,13 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+plugins-wasmtime = [
+  "dep:wasmtime",
+  "dep:wasmtime-wasi",
+  "dep:wasmtime-wasi-http",
+  "dep:tokio-rustls",
+  "tokio/io-util",
+]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -17,6 +23,7 @@ plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
+zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
@@ -51,6 +58,11 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
 ], optional = true }
 zeroize.workspace = true
 webpki-roots = "1.0.6"
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+  "logging",
+  "tls12",
+  "ring",
+], optional = true }
 
 [dev-dependencies]
 rcgen = "0.13"

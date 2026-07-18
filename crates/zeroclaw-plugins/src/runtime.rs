@@ -32,11 +32,12 @@ pub struct Plugin {
     state: Arc<Mutex<(Store<PluginState>, ToolPlugin)>>,
 }
 
-fn base_linker() -> Result<Linker<PluginState>> {
+fn base_linker(sockets: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
     let mut options = crate::component::bindings::tool::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_sockets(sockets);
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -52,7 +53,7 @@ fn base_linker() -> Result<Linker<PluginState>> {
 /// world, no network.
 fn tool_linker() -> &'static Linker<PluginState> {
     static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| base_linker().expect("tool linker"))
+    LINKER.get_or_init(|| base_linker(false).expect("tool linker"))
 }
 
 /// Cached linker for `HttpClient` plugins: the base surface plus `wasi:http`.
@@ -60,8 +61,24 @@ fn tool_linker() -> &'static Linker<PluginState> {
 fn tool_linker_http() -> &'static Linker<PluginState> {
     static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
     LINKER.get_or_init(|| {
-        let mut linker = base_linker().expect("tool linker");
+        let mut linker = base_linker(false).expect("tool linker");
         crate::component::add_wasi_http(&mut linker).expect("tool http linker");
+        linker
+    })
+}
+
+/// Cached linker for socket-only tool plugins.
+fn tool_linker_sockets() -> &'static Linker<PluginState> {
+    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
+    LINKER.get_or_init(|| base_linker(true).expect("tool socket linker"))
+}
+
+/// Cached linker for tool plugins granted both HTTP and socket egress.
+fn tool_linker_http_sockets() -> &'static Linker<PluginState> {
+    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
+    LINKER.get_or_init(|| {
+        let mut linker = base_linker(true).expect("tool socket linker");
+        crate::component::add_wasi_http(&mut linker).expect("tool http socket linker");
         linker
     })
 }
@@ -84,10 +101,12 @@ pub async fn create_plugin(
         PluginStoreSpec::new(scope.clone(), services.clone(), limits).with_granted_http(),
     );
     let http = store.data().http_enabled();
-    let linker = if http {
-        tool_linker_http()
-    } else {
-        tool_linker()
+    let sockets = store.data().sockets_enabled();
+    let linker = match (http, sockets) {
+        (false, false) => tool_linker(),
+        (true, false) => tool_linker_http(),
+        (false, true) => tool_linker_sockets(),
+        (true, true) => tool_linker_http_sockets(),
     };
     crate::component::ensure_http_coherent(&store, http)?;
     let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {

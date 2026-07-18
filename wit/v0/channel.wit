@@ -323,6 +323,10 @@ world channel-plugin {
     /// `unavailable`.
     import state;
     import inbound;
+    /// Host-mediated TCP, direct TLS, and STARTTLS. Linked only when the
+    /// admitted instance has the `socket_client` grant.
+    @unstable(feature = plugins-wit-v0-sockets)
+    import sockets;
     export plugin-info;
     export channel;
 }

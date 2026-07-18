@@ -23,6 +23,8 @@ pub mod registry;
 pub mod runtime;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod services;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod sockets;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
