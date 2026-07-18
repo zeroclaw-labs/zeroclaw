@@ -347,7 +347,6 @@ impl ScopedToolRegistry {
                     if list_deferred_mcp_specs {
                         for stub in &deferred_set.stubs {
                             if !eager_mcp_tool_allowed(&stub.prefixed_name, mcp_policy.as_ref()) {
-                                
                                 continue;
                             }
                             let wrapper: Arc<dyn Tool> =
