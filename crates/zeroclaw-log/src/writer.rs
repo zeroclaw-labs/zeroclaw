@@ -18,7 +18,7 @@
 //! because rolling trim and size-based rotation rename the file out
 //! from under an open handle), runs the rotation hooks inline, and
 //! calls `sync_all` on a periodic cadence (every
-//! [`SYNC_EVERY_N_WRITES`] writes or [`SYNC_INTERVAL`] of wall-clock
+//! `SYNC_EVERY_N_WRITES` writes or `SYNC_INTERVAL` of wall-clock
 //! time, whichever comes first). This trades per-event durability
 //! (the prior behaviour was `sync_data` after every write) for bounded
 //! write latency: a process crash may lose up to one sync interval of
@@ -43,11 +43,6 @@ use crate::observer_bridge;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-/// Capacity of the bounded mpsc between `record_event` and the worker.
-/// Sized for high-throughput agent turns (each turn can emit 20-100 events)
-/// while keeping the queue's RSS footprint bounded. When the queue is full
-/// the producer drops the event with a `tracing::warn!` rather than
-/// blocking the async task.
 const QUEUE_CAPACITY: usize = 1024;
 
 /// Worker calls `sync_all` after every N successful writes (in addition
@@ -113,15 +108,6 @@ fn current_state() -> Option<Arc<WriterState>> {
     slot().read().clone()
 }
 
-/// Initialize (or disable) the persistence writer from config. Idempotent.
-/// When enabled, runs a streaming in-place migration of any schema-1 rows
-/// in the existing file before resuming appends, then spawns the disk
-/// worker thread.
-///
-/// Re-init replaces any previously installed writer: the prior worker is
-/// shut down (its channel closed and its exit observed) before the new
-/// policy is installed, so a config reload cannot leave two workers
-/// racing on the same path or leak threads across reloads.
 pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
@@ -211,23 +197,11 @@ fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     }
 }
 
-/// Worker main loop. Re-opens the active log file on every write
-/// (matching the prior single-threaded semantics where each `append_line`
-/// opened the file fresh — required because rolling trim and size-based
-/// rotation both rename the file out from under an open handle). The
-/// real perf win is dropping the per-record `sync_data` and replacing
-/// it with periodic `sync_all` based on either write count or
-/// wall-clock time, whichever fires first.
 fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     let mut writes_since_sync: u64 = 0;
     let mut last_sync = Instant::now();
 
     loop {
-        // Block on the channel with a short timeout so a graceful shutdown
-        // (channel close from dropped senders) is not blocked on an idle
-        // worker. The timeout is NOT used for periodic sync or date-rotation
-        // polling — those are driven by write activity in `write_one` and by
-        // the gated sync check below.
         let job = match rx.recv_timeout(IDLE_TICK) {
             Ok(job) => Some(job),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -263,12 +237,6 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
             }
         }
 
-        // Periodic sync. Only actually syncs when there are unsynced writes.
-        // Write-count and wall-clock cadences are combined: whichever fires
-        // first wins. When the worker has no unsynced writes (e.g. after a
-        // Flush rendezvous or a quiet period), no disk activity occurs —
-        // the sync_all inside `write_one` before every actual write already
-        // covers the burst-driven case.
         if writes_since_sync > 0
             && (writes_since_sync >= SYNC_EVERY_N_WRITES || last_sync.elapsed() >= SYNC_INTERVAL)
         {
@@ -361,17 +329,6 @@ pub fn runtime_trace_path() -> Option<PathBuf> {
     current_state().map(|s| s.policy.path.clone())
 }
 
-/// Synchronously wait for all pending log writes to land on disk.
-///
-/// Sends a `WriterJob::Flush` to the worker and blocks on the
-/// rendezvous ack, so callers can assert on the log file's contents
-/// immediately after `record_event` returns. No-op when no writer is
-/// installed (no worker thread to flush) and short-circuits when the
-/// worker has died (e.g. panicked) to avoid hanging the test.
-///
-/// Callers must be in a context where blocking on the rendezvous is
-/// acceptable (a `#[test]` or a `spawn_blocking` worker). Not part of
-/// the production runtime API.
 pub fn flush_for_test() -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
@@ -403,14 +360,6 @@ pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> 
     })
 }
 
-/// Emit one event. Always fans out to the broadcast hook + tracing event.
-/// If persistence is enabled, hands the serialized value to the disk
-/// worker via a bounded `try_send`. The hot path performs no file I/O.
-///
-/// This is the function the `record!` macro expands into. Direct callers
-/// (the schema migration tool, tests) can invoke it too, but production
-/// code should go through the macro so the `tracing::event!` carries the
-/// correct `file:line` source info.
 pub fn record_event(event: LogEvent) {
     let value = match serde_json::to_value(&event) {
         Ok(v) => v,
@@ -441,11 +390,6 @@ pub fn record_event(event: LogEvent) {
     match state.tx.try_send(job) {
         Ok(()) => {}
         Err(TrySendError::Full(dropped)) => {
-            // Worker is slow or disk is stalled; drop the event rather than
-            // block the async task. A burst of drops shows up as one
-            // `tracing::warn!` per record_event call; high-volume noise is
-            // acceptable because the alternative — blocking the async
-            // executor — is strictly worse.
             let _ = dropped;
             tracing::warn!(
                 target: "zeroclaw_log_internal",
@@ -455,25 +399,11 @@ pub fn record_event(event: LogEvent) {
             );
         }
         Err(TrySendError::Disconnected(_)) => {
-            // Worker thread has exited (panic or normal shutdown). Mark
-            // dead so `flush_for_test` short-circuits. We do NOT fall
-            // through to inline writes — the synchronous path would
-            // re-introduce the very fsync-on-hot-path we just removed,
-            // and the worker will not come back.
             state.worker_dead.store(true, Ordering::Release);
         }
     }
 }
 
-/// Serialize one event as a single JSONL line (terminated with `\n`) to the
-/// provided buffered writer. Pure helper: does not open, flush, or fsync the
-/// file — the caller owns the [`BufWriter`] lifecycle.
-///
-/// Used by the production append path (`append_line`). The rolling trim path
-/// (`trim_to_last_entries`) writes the original JSONL bytes from the
-/// line-buffered reader directly, so it stays inline rather than going
-/// through this helper (re-serializing would risk non-byte-identical output
-/// for non-canonical input, e.g. reordered keys or whitespace).
 fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<()> {
     serde_json::to_writer(&mut *writer, value).context("serializing log line")?;
     writer.write_all(b"\n").context("writing newline")?;
@@ -564,12 +494,6 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
     Ok(n)
 }
 
-// ── Archive rotation (StoragePolicy::Rotating) ───────────────────────
-//
-// Unlike rolling trim (which discards old entries from the active file),
-// rotation renames the active file to a timestamped archive and prunes old
-// archives by count/age, preserving rotated events for later diagnostics.
-
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
 /// or it was last written today.
@@ -623,11 +547,6 @@ fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
     Ok(())
 }
 
-/// Rename the active file to a deterministic, lexically sortable archive name
-/// stamped with `when` (the time of the file's last event), then prune old
-/// archives. Archive names keep the active file's extension so an operator's
-/// `*.jsonl` tooling still matches them, e.g.
-/// `runtime-trace.jsonl` → `runtime-trace.20260624-031500.jsonl`.
 fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     let path = &state.policy.path;
     let archive = archive_path(path, when)?;
@@ -687,12 +606,6 @@ fn is_stamp(s: &str) -> bool {
         && b[9..].iter().all(u8::is_ascii_digit)
 }
 
-/// True when `core` is *exactly* the infix [`archive_path`] places between the
-/// base prefix and the extension: a `YYYYMMDD-HHMMSS` stamp, optionally followed
-/// by `.<digits>` (the same-second collision counter). The match is exact, not a
-/// prefix test, so a foreign sibling that merely *starts* with a stamp (e.g.
-/// `<stamp>.backup` or `<stamp>.notes`) is never treated as an archive and can
-/// never be pruned by retention.
 fn is_archive_core(core: &str) -> bool {
     match core.split_once('.') {
         // `<stamp>.<counter>` — counter must be a non-empty run of digits.
@@ -704,9 +617,6 @@ fn is_archive_core(core: &str) -> bool {
     }
 }
 
-/// List rotated archive files sitting next to the active file: siblings that
-/// share the active file's base and extension but are not the active file
-/// itself. Returns `(path, mtime)` pairs.
 fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
     let dir = active.parent().unwrap_or_else(|| Path::new("."));
     let active_name = active
@@ -735,12 +645,6 @@ fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
         let Some(suffix) = name.strip_prefix(&prefix) else {
             continue;
         };
-        // Archives keep the active file's extension, so strip it (and reject any
-        // same-stem sibling carrying a different one). What remains must be the
-        // *exact* shape `archive_path` generates — `<stamp>` or `<stamp>.<n>` —
-        // so retention never prunes a foreign or crash-orphaned sibling that
-        // merely starts with a stamp (e.g. `<stamp>.backup.jsonl`), even for an
-        // extension-less log path.
         let core = if ext.is_empty() {
             suffix
         } else {
@@ -820,12 +724,6 @@ fn remove_archive(path: &Path) {
     }
 }
 
-/// Shared test-time mutex for tests that mutate the global writer state.
-/// Re-exported `pub(crate)` so `macro::tests` etc. can serialize against
-/// the same lock as `writer::tests`. Always compiled (not gated behind
-/// `#[cfg(test)]`) so peer crates can borrow it via the
-/// `__private_test_writer_lock` helper in `lib.rs`. A `parking_lot::Mutex`
-/// static costs nothing at runtime when untouched.
 pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
@@ -1226,8 +1124,6 @@ mod tests {
         assert!(is_archive_core("20260624-031500")); // <stamp>
         assert!(is_archive_core("20260624-031500.1")); // <stamp>.<counter>
         assert!(is_archive_core("20260624-031500.42"));
-        // Foreign siblings that merely *start* with a stamp must be rejected, so
-        // they are never pruned (this is the boundary the review flagged).
         assert!(!is_archive_core("20260624-031500.backup"));
         assert!(!is_archive_core("20260624-031500.notes"));
         assert!(!is_archive_core("20260624-031500.1.2")); // counter is not multi-segment
@@ -1327,9 +1223,6 @@ mod tests {
         init_from_config(&cfg, tmp.path());
         let path = runtime_trace_path().unwrap();
 
-        // Two foreign siblings that share the base prefix must never be pruned:
-        // one with no stamp, and one that *starts* with a valid stamp but is not
-        // a shape `archive_path` generates (the boundary the review flagged).
         let foreign_plain = tmp.path().join("trace.notes");
         let foreign_stamped = tmp.path().join("trace.20260101-000000.notes");
         fs::write(&foreign_plain, "keep me\n").unwrap();

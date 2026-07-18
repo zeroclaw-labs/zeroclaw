@@ -1,11 +1,4 @@
 //! Multi-stage retrieval pipeline.
-//!
-//! Wraps a `Memory` trait object with staged retrieval:
-//! - **Stage 1 (Hot cache):** In-memory LRU of recent recall results.
-//! - **Stage 2 (FTS):** FTS5 keyword search with optional early-return.
-//! - **Stage 3 (Vector):** Vector similarity search + hybrid merge.
-//!
-//! Configurable via `[memory]` settings: `retrieval_stages`, `fts_early_return_score`.
 
 use super::traits::{Memory, MemoryEntry};
 use parking_lot::Mutex;

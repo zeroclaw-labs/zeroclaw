@@ -2,7 +2,6 @@
 //! Protocol version: 2024-11-05
 //! Adapted from ops-mcp-server/src/protocol.rs for client use.
 //! Both Serialize and Deserialize are derived — the client both sends (Serialize)
-//! and receives (Deserialize) JSON-RPC messages.
 
 use serde::{Deserialize, Serialize};
 

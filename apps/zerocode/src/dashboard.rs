@@ -110,12 +110,6 @@ pub(crate) struct Dashboard {
     /// daemon has an `org_cost.json` (an integrator's external sync); `None`
     /// otherwise, so the organization row is simply omitted.
     cost_org: Option<OrgCost>,
-    /// Set when the `cost/org` RPC returns an error (a present-but-broken
-    /// `org_cost.json` — unreadable or invalid). Distinct from an absent
-    /// snapshot (`cost_org == None` with no error): an absent snapshot hides
-    /// the org row, but a broken one is surfaced on the Cost tab so the
-    /// operator fixes the billing cache instead of seeing org billing
-    /// silently vanish as if unconfigured.
     cost_org_error: Option<String>,
     cron_jobs: Vec<CronJobEntry>,
     cron_runs: Vec<CronRunEntry>,
@@ -129,12 +123,6 @@ pub(crate) struct Dashboard {
     memory_error: Option<String>,
     cost_error: Option<String>,
     sessions_loaded: bool,
-    /// Lazy-loaded full payload for the currently-open Memory detail
-    /// row. Fetched via `memory/get` on selection (the list rows store
-    /// only previews, with `content` truncated to ~200 bytes by the
-    /// daemon). `None` whenever the Memory tab isn't focused or no
-    /// row is selected — long browsing sessions never accumulate
-    /// full-content bodies for entries the user has scrolled past.
     memory_detail: Option<MemoryEntryResult>,
     /// Key of the entry whose detail is currently being fetched or
     /// shown. Used to drop stale `memory/get` responses when the
@@ -367,11 +355,6 @@ impl Dashboard {
                     }
                 }
                 self.cost_periods = periods;
-                // Org-level billed snapshot. An absent snapshot (`Ok(None)`,
-                // the daemon returns JSON null for a missing org_cost.json) is
-                // normal and just hides the org row; a present-but-broken
-                // snapshot returns an RPC error, which we surface rather than
-                // collapse to absent (preserves the cost/org #8482 contract).
                 match self.rpc.cost_org().await {
                     Ok(org) => {
                         self.cost_org = org;
@@ -1246,11 +1229,6 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Prefer the lazy-loaded full body when present (populated by
-        // `memory/get` on detail-open via `load_memory_detail`). When
-        // it's still loading, render the truncated preview from
-        // `memories[idx]` so the pane isn't blank for the first frame
-        // before the daemon round-trip lands.
         let m: &MemoryEntryResult = match (&self.memory_detail, self.selected_memory_index()) {
             (Some(detail), _) => detail,
             (None, Some(idx)) => &self.memories[idx],
@@ -2692,11 +2670,6 @@ impl Dashboard {
         self.search_active || self.agent_rename.is_some()
     }
 
-    /// Route a bracketed-paste payload into the search buffer when the
-    /// search bar is open. Mirrors the char-insertion path in
-    /// `handle_search_key`, including the live-filter refresh for
-    /// client-side tabs; server-side tabs (sessions, memories) still
-    /// wait for Enter. Ignored when search isn't active.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         if let Some(rename) = self.agent_rename.as_mut() {
             rename.buf.push_str(text);
@@ -2920,21 +2893,6 @@ fn cost_period_windows() -> Vec<(String, String, String)> {
     ]
 }
 
-/// One organization/personal billed-scope row:
-/// `label  YTD $X (N tok)  proj/yr $Y`.
-///
-/// The projection prefers a run-rate (last FULL calendar month × 12, which
-/// captures acceleration); it falls back to linearly scaling YTD by the
-/// fraction of the year elapsed when fewer than two months are present. This
-/// mirrors the CLI report's projection.
-/// Build the organization-billing section for the Cost tab, appended after
-/// the local engine usage. The three states are deliberately distinct so a
-/// broken snapshot never renders identically to an absent one (the cost/org
-/// #8482 contract):
-/// - present (`org = Some`): billed org/personal rows + the FY note;
-/// - broken (`org = None`, `err = Some`): a warning line so the operator
-///   repairs `org_cost.json` instead of seeing the section silently vanish;
-/// - absent (`org = None`, `err = None`): no lines (the org row is omitted).
 fn org_section_lines(
     org: Option<&crate::client::OrgCost>,
     err: Option<&str>,

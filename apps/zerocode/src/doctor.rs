@@ -440,10 +440,8 @@ fn visible_entries(result: &DoctorRunResult, filter: DoctorFilter) -> Vec<&Docto
 }
 
 fn filter_hit_rect(inner: Rect, summary: &str, filter_status: &str) -> Option<Rect> {
-    use unicode_width::UnicodeWidthStr;
-
-    let summary_width = UnicodeWidthStr::width(summary) as u16;
-    let filter_width = UnicodeWidthStr::width(filter_status) as u16;
+    let summary_width = crate::display_width::display_width(summary) as u16;
+    let filter_width = crate::display_width::display_width(filter_status) as u16;
     if filter_width == 0 || inner.width == 0 || inner.height == 0 {
         return None;
     }
