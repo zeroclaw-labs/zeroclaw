@@ -7,6 +7,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="${script_dir}/comment_hygiene_gate.sh"
+scanner="${script_dir}/comment_hygiene_gate.py"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -241,6 +242,26 @@ else
     echo "$scanner_out"
     fail_count=$((fail_count + 1))
 fi
+
+printf 'missing.rs\0' > scanner-inputs
+set +e
+parser_out="$(python3 "$scanner" scanner-inputs 2>&1)"
+parser_status=$?
+set -e
+if [ "$parser_status" -eq 0 ]; then
+    echo "PARSER FAILURE NOT PROPAGATED (scanner returned success on a missing source)"
+    fail_count=$((fail_count + 1))
+elif [ "$parser_status" -ne 2 ]; then
+    echo "PARSER FAILURE USED WRONG STATUS (wanted 2, got ${parser_status})"
+    fail_count=$((fail_count + 1))
+elif grep -qF 'FATAL' <<<"$parser_out"; then
+    pass_count=$((pass_count + 1))
+else
+    echo "PARSER FAILED WITHOUT FATAL DIAGNOSTIC"
+    echo "$parser_out"
+    fail_count=$((fail_count + 1))
+fi
+rm -f scanner-inputs
 
 echo
 echo "${pass_count} passed, ${fail_count} failed"
