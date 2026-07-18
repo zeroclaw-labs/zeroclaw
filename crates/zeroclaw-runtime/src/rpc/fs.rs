@@ -1,5 +1,4 @@
 //! Filesystem RPC methods for remote directory browsing (WSS ACP CWD picker).
-//!
 //! These methods are only available to authenticated WSS sessions and are
 //! subject to daemon-side path policy.
 

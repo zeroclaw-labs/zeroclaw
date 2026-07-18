@@ -35,13 +35,6 @@ const REASONING_KEYWORDS: &[&str] = &[
     "pros and cons",
 ];
 
-/// Estimate the complexity of a user message without an LLM call.
-///
-/// Rules (applied in order):
-/// - **Complex**: message > 200 chars, OR contains a code fence, OR ≥ 2
-///   reasoning keywords.
-/// - **Simple**: message < 50 chars AND no reasoning keywords.
-/// - **Standard**: everything else.
 pub fn estimate_complexity(message: &str) -> ComplexityTier {
     let lower = message.to_lowercase();
     let len = message.len();
@@ -67,7 +60,6 @@ pub fn estimate_complexity(message: &str) -> ComplexityTier {
 // ── Auto-classify extension ─────────────────────────────────────
 
 /// Extension trait adding complexity-tier mapping to `AutoClassifyConfig`.
-///
 /// This lives here rather than in `zeroclaw_config` because `ComplexityTier`
 /// is defined in the main crate.
 pub trait AutoClassifyExt {
@@ -120,14 +112,6 @@ const CODE_KEYWORDS: &[&str] = &[
     "refactor",
 ];
 
-/// Evaluate a response against heuristic quality checks. No LLM call.
-///
-/// Checks:
-/// 1. **Non-empty**: response must not be empty.
-/// 2. **Not a cop-out**: response must not be just "I don't know" or similar.
-/// 3. **Sufficient length**: response length should be proportional to query complexity.
-/// 4. **Code presence**: if the query mentions code keywords, the response should
-///    contain a code block.
 pub fn evaluate_response(
     query: &str,
     response: &str,

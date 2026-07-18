@@ -7,11 +7,6 @@ use std::str::FromStr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-/// A single keystroke pattern.
-///
-/// On darwin, most `CONTROL` chords are translated to `SUPER` at match time so
-/// Linux's `Ctrl+K` and macOS's `⌘K` resolve to the same chord. `Ctrl+C` stays
-/// distinct so the system copy chord (`⌘C`) does not trigger Quit.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Chord {
     pub code: KeyCode,
@@ -74,11 +69,6 @@ impl Chord {
         }
     }
 
-    /// OS-independent canonical wire form used for persistence:
-    /// lowercase, `+`-joined modifiers then key, e.g. `ctrl+k`,
-    /// `shift+up`, `ctrl+shift+down`, `f5`, `pageup`. Never uses the
-    /// darwin glyphs — a config written on macOS loads identically on
-    /// Linux. Round-trips with [`Chord::from_str`].
     pub fn wire(&self) -> String {
         let mut out = String::new();
         // Modifier tokens walk the canonical registry so render and
@@ -264,14 +254,6 @@ fn normalise_mods(code: KeyCode, m: KeyModifiers) -> KeyModifiers {
     strip_redundant_shift(code, m)
 }
 
-/// Drop the SHIFT bit for character keys. A shifted character (`?`,
-/// `G`, `:`) already encodes its shift in the glyph itself, but
-/// platforms disagree on whether SHIFT is *also* reported alongside
-/// it: Unix terminals strip it, the Windows console keeps it. Comparing
-/// it would make `?` (the default Help chord) only match on platforms
-/// that strip SHIFT, forcing Windows users to hand-bind `shift+?`.
-/// Modifier keys that genuinely change the keystroke (Ctrl/Alt/Super)
-/// are left untouched.
 fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
     if matches!(code, KeyCode::Char(_)) {
         m.remove(KeyModifiers::SHIFT);
