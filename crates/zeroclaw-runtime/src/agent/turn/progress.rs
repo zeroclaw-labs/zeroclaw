@@ -9,10 +9,9 @@ use crate::util::truncate_with_ellipsis;
 use serde_json::Value;
 
 const MAX_PROGRESS_VALUE_CHARS: usize = 60;
-const TOOL_ARGUMENT_HINT_KEYS: &[&str] = &["command", "path", "action", "query"];
 
 pub(crate) fn render_tool_start_progress(tool: &str, args: &Value) -> String {
-    match tool_argument_hint(args) {
+    match tool_argument_hint(tool, args) {
         Some(hint) => format!("\u{23f3} {tool}: {hint}\n"),
         None => format!("\u{23f3} {tool}\n"),
     }
@@ -20,66 +19,41 @@ pub(crate) fn render_tool_start_progress(tool: &str, args: &Value) -> String {
 
 pub(crate) fn render_tool_completion_progress(
     tool: &str,
-    args: &Value,
+    _args: &Value,
     secs: u64,
     success: bool,
     error_reason: Option<&str>,
 ) -> String {
-    let subject = match tool_argument_hint(args) {
-        Some(hint) => format!("{tool}: {hint}"),
-        None => tool.to_string(),
-    };
-
     if success {
-        format!("\u{2705} {subject} ({secs}s)\n")
+        format!("\u{2705} {tool} ({secs}s)\n")
     } else if let Some(reason) = error_reason {
         format!(
-            "\u{274c} {subject} ({secs}s): {}\n",
+            "\u{274c} {tool} ({secs}s): {}\n",
             truncate_with_ellipsis(&scrub_and_collapse_display(reason), 200)
         )
     } else {
-        format!("\u{274c} {subject} ({secs}s)\n")
+        format!("\u{274c} {tool} ({secs}s)\n")
     }
 }
 
-/// Build a compact, tool-agnostic argument summary from a conservative key
-/// allowlist. This keeps start/completion lines useful without publishing
-/// arbitrary tool arguments into chat-visible progress.
-fn tool_argument_hint(args: &Value) -> Option<String> {
+/// Preserve the historical non-Matrix progress contract: start lines expose
+/// one tool-specific string hint, while completion lines identify only the
+/// finished tool and outcome.
+fn tool_argument_hint(tool: &str, args: &Value) -> Option<String> {
     let Value::Object(map) = args else {
         return None;
     };
 
-    let parts: Vec<String> = TOOL_ARGUMENT_HINT_KEYS
-        .iter()
-        .filter_map(|key| {
-            let value = render_argument_value(map.get(*key)?)?;
-            Some(format!(
-                "{key}={}",
-                truncate_with_ellipsis(&value, MAX_PROGRESS_VALUE_CHARS)
-            ))
-        })
-        .collect();
-
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-/// Convert one JSON argument value to compact display text while scrubbing
-/// credential-shaped data before it reaches the progress stream.
-fn render_argument_value(value: &Value) -> Option<String> {
-    let rendered = match value {
-        Value::Null => return None,
-        Value::String(s) => s.clone(),
-        Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
-        }
+    let value = match tool {
+        "shell" => map.get("command"),
+        "file_read" | "file_write" => map.get("path"),
+        _ => map.get("action").or_else(|| map.get("query")),
+    }?;
+    let Value::String(value) = value else {
+        return None;
     };
-    let rendered = scrub_and_collapse_display(&rendered);
-    if rendered.is_empty() {
-        None
-    } else {
-        Some(rendered)
-    }
+    let value = scrub_and_collapse_display(value);
+    (!value.is_empty()).then(|| truncate_with_ellipsis(&value, MAX_PROGRESS_VALUE_CHARS))
 }
 
 fn scrub_and_collapse_display(value: &str) -> String {
@@ -97,7 +71,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn start_and_completion_progress_share_the_generic_allowlist() {
+    fn legacy_progress_uses_one_tool_specific_start_hint_and_no_completion_hint() {
         let args = json!({
             "command": "pwd",
             "path": "/tmp/file",
@@ -107,13 +81,44 @@ mod tests {
         });
         let start = render_tool_start_progress("delegate", &args);
         let completion = render_tool_completion_progress("delegate", &args, 3, true, None);
+        assert_eq!(start, "\u{23f3} delegate: status\n");
+        assert_eq!(completion, "\u{2705} delegate (3s)\n");
+    }
+
+    #[test]
+    fn legacy_progress_ignores_composite_and_non_applicable_hint_fields() {
+        let args = json!({
+            "command": "deploy",
+            "path": "/private",
+            "query": ["internal"],
+        });
+
         assert_eq!(
-            start,
-            "\u{23f3} delegate: command=pwd, path=/tmp/file, action=status, query=health\n"
+            render_tool_start_progress("custom", &args),
+            "\u{23f3} custom\n"
         );
         assert_eq!(
-            completion,
-            "\u{2705} delegate: command=pwd, path=/tmp/file, action=status, query=health (3s)\n"
+            render_tool_completion_progress("custom", &args, 1, false, None),
+            "\u{274c} custom (1s)\n"
+        );
+    }
+
+    #[test]
+    fn legacy_progress_preserves_shell_and_file_hint_selection() {
+        let args = json!({
+            "command": "pwd",
+            "path": "/private",
+            "action": "status",
+            "query": "health",
+        });
+
+        assert_eq!(
+            render_tool_start_progress("shell", &args),
+            "\u{23f3} shell: pwd\n"
+        );
+        assert_eq!(
+            render_tool_start_progress("file_read", &args),
+            "\u{23f3} file_read: /private\n"
         );
     }
 

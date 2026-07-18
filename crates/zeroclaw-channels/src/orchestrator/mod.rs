@@ -4298,6 +4298,10 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+fn scrub_typing_error(error: &anyhow::Error) -> String {
+    zeroclaw_runtime::security::scrub(&error.to_string())
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -4314,7 +4318,7 @@ fn spawn_scoped_typing_task(
                 () = stop_signal.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(e) = channel.start_typing(&recipient).await {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "failed to start typing");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})), "failed to start typing");
                     }
                 }
             }
@@ -4324,11 +4328,60 @@ fn spawn_scoped_typing_task(
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
                 "failed to stop typing"
             );
         }
     })
+}
+
+/// Matrix `single_message` drafts are externally visible. This carries typing
+/// from accepted input through pre-delivery work and stops it before the draft.
+/// A proper general lifecycle still requires event-subsystem ownership.
+struct MatrixSingleMessageTypingScope {
+    cancellation: CancellationToken,
+    started: tokio::sync::oneshot::Receiver<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+fn start_matrix_single_message_typing_scope(
+    channel: Arc<dyn Channel>,
+    recipient: String,
+) -> MatrixSingleMessageTypingScope {
+    let cancellation = CancellationToken::new();
+    let stop_signal = cancellation.clone();
+    let (started_tx, started) = tokio::sync::oneshot::channel();
+    let handle = zeroclaw_spawn::spawn!(async move {
+        if let Err(e) = channel.start_typing(&recipient).await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                "failed to start typing"
+            );
+        }
+        let _ = started_tx.send(());
+        stop_signal.cancelled().await;
+        if let Err(e) = channel.stop_typing(&recipient).await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                "failed to stop typing"
+            );
+        }
+    });
+    MatrixSingleMessageTypingScope {
+        cancellation,
+        started,
+        handle,
+    }
+}
+
+async fn stop_matrix_single_message_typing_scope(scope: MatrixSingleMessageTypingScope) {
+    let _ = scope.started.await;
+    scope.cancellation.cancel();
+    log_worker_join_result(scope.handle.await);
 }
 
 async fn process_channel_message(
@@ -5667,6 +5720,16 @@ async fn process_channel_message_body(
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
+    let matrix_single_message_streaming =
+        matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
+    let mut matrix_single_message_typing_scope = if matrix_single_message_streaming {
+        target_channel.as_ref().map(|channel| {
+            start_matrix_single_message_typing_scope(Arc::clone(channel), msg.reply_target.clone())
+        })
+    } else {
+        None
+    };
+
     // ── Reply-intent precheck ────────────────────────────────────────
     let direct_message = target_channel
         .as_ref()
@@ -5811,6 +5874,9 @@ async fn process_channel_message_body(
     };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
+        if let Some(scope) = matrix_single_message_typing_scope.take() {
+            stop_matrix_single_message_typing_scope(scope).await;
+        }
         let history_response = AssistantChannelOutcome::NoReply {
             kind,
             reason: reason.clone(),
@@ -5867,8 +5933,6 @@ async fn process_channel_message_body(
     let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
-    let matrix_single_message_streaming =
-        matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
 
     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_target_channel": target_channel.is_some(), "use_draft_streaming": use_draft_streaming})), "Streaming decision");
 
@@ -5883,6 +5947,11 @@ async fn process_channel_message_body(
     // Partial mode: send an initial draft message for progressive editing.
     let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
+            if matrix_single_message_streaming
+                && let Some(scope) = matrix_single_message_typing_scope.take()
+            {
+                stop_matrix_single_message_typing_scope(scope).await;
+            }
             match channel
                 .send_draft(
                     &SendMessage::new(
@@ -6041,20 +6110,19 @@ async fn process_channel_message_body(
         None
     };
 
-    // Preserve the historical Partial-mode typing behavior. Matrix
-    // `single_message` still gets typing until the initial progress draft or
-    // final response is delivered, because that mode uses the draft for
-    // progress only rather than answer replacement.
+    // Preserve the existing typing task placement and lifecycle for all other
+    // modes. Matrix single-message has already completed its short typing
+    // scope before its first visible draft delivery.
     let is_partial_draft = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming())
-        && !matrix_single_message_streaming;
+        || matrix_single_message_streaming;
     let typing_cancellation = if is_partial_draft {
         None
     } else {
         target_channel.as_ref().map(|_| CancellationToken::new())
     };
-    let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
+    let mut typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
         (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
             Arc::clone(channel),
             msg.reply_target.clone(),
@@ -6421,10 +6489,13 @@ async fn process_channel_message_body(
         "LLM call completed"
     );
 
+    if let Some(scope) = matrix_single_message_typing_scope.take() {
+        stop_matrix_single_message_typing_scope(scope).await;
+    }
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
     }
-    if let Some(handle) = typing_task {
+    if let Some(handle) = typing_task.take() {
         log_worker_join_result(handle.await);
     }
 
@@ -14452,21 +14523,36 @@ api_key = "anthropic-key"
     }
 
     struct DraftRecordingChannel {
+        channel_name: &'static str,
+        supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
+        delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
     }
 
     impl DraftRecordingChannel {
         fn new(finalize_should_fail: bool, fallback_send_should_fail: bool) -> Self {
             Self {
+                channel_name: "test-channel",
+                supports_multi_message_streaming: false,
                 finalize_should_fail,
                 fallback_send_should_fail,
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
+                delivery_events: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn matrix(stream_mode: zeroclaw_config::schema::MatrixStreamMode) -> Self {
+            Self {
+                channel_name: "matrix",
+                supports_multi_message_streaming: stream_mode
+                    == zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Self::new(false, false)
             }
         }
     }
@@ -14669,7 +14755,7 @@ api_key = "anthropic-key"
     #[async_trait::async_trait]
     impl Channel for DraftRecordingChannel {
         fn name(&self) -> &str {
-            "test-channel"
+            self.channel_name
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -14694,12 +14780,27 @@ api_key = "anthropic-key"
             true
         }
 
+        fn supports_multi_message_streaming(&self) -> bool {
+            self.supports_multi_message_streaming
+        }
+
         async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.delivery_events.lock().await.push("draft");
             self.draft_messages
                 .lock()
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
             Ok(Some("draft-1".to_string()))
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.delivery_events.lock().await.push("typing-start");
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.delivery_events.lock().await.push("typing-stop");
+            Ok(())
         }
 
         async fn finalize_draft(
@@ -14940,7 +15041,9 @@ api_key = "anthropic-key"
 
         let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
-            Arc::new(DummyModelProvider),
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(20),
+            }),
             zeroclaw_config::schema::Config::default(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
@@ -19531,6 +19634,105 @@ BTC is currently around $65,000 based on latest tool output."#
         let stops = channel_impl.stop_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 1, "start_typing should be called once");
         assert_eq!(stops, 1, "stop_typing should be called once");
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_typing_stops_before_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "typing-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "matrix".into(),
+                channel_alias: Some("single".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            *channel_impl.delivery_events.lock().await,
+            ["typing-start", "typing-stop", "draft"]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_multi_message_preserves_draft_before_typing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "multi".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Default::default()
+            },
+        );
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(20),
+            }),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "multi-typing-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "matrix".into(),
+                channel_alias: Some("multi".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.delivery_events.lock().await;
+        assert_eq!(events.first(), Some(&"draft"));
+        assert!(events.contains(&"typing-start"));
+        assert!(events.contains(&"typing-stop"));
+    }
+
+    #[test]
+    fn typing_error_log_attributes_are_scrubbed() {
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let error = anyhow::Error::msg(format!("typing failed with {token}"));
+        let scrubbed = scrub_typing_error(&error);
+
+        assert!(!scrubbed.contains(token));
     }
 
     #[tokio::test]

@@ -789,7 +789,7 @@ mod streaming {
     /// Truncate a string to a byte budget without splitting a UTF-8 scalar.
     /// Matrix limits are byte-oriented, while Rust string slicing requires a
     /// char boundary.
-    fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    pub(super) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
         if text.len() <= max_bytes {
             return text.to_string();
         }
@@ -2690,6 +2690,9 @@ mod outbound {
         pub reaction_log: &'a Arc<TokioMutex<HashMap<ReactionKey, OwnedEventId>>>,
         pub reply_in_thread: bool,
         pub workspace_dir: Option<&'a Path>,
+        /// Resolved from the canonical Matrix channel config for this send.
+        /// Only single-message mode needs a final-response body budget.
+        pub message_max_bytes: Option<usize>,
     }
 
     /// What `outbound::send` should do once all attachment uploads are done
@@ -2707,6 +2710,15 @@ mod outbound {
         /// Text is empty AND no attachment landed. Caller surfaces an error
         /// to the runtime so it can decide what to do.
         EmptyError,
+    }
+
+    /// Apply the Matrix single-message response budget at the common send
+    /// boundary so direct sends and `finalize_draft` fallbacks share one rule.
+    pub(super) fn bounded_body(text: &str, message_max_bytes: Option<usize>) -> String {
+        message_max_bytes.map_or_else(
+            || text.to_string(),
+            |max_bytes| super::streaming::truncate_utf8_bytes(text, max_bytes),
+        )
     }
 
     /// Decide what `outbound::send` should do given the post-marker-strip
@@ -3217,7 +3229,8 @@ mod outbound {
             }
         }
 
-        let content = RoomMessageEventContent::text_markdown(&delivery.text);
+        let text = bounded_body(&delivery.text, outbox.message_max_bytes);
+        let content = RoomMessageEventContent::text_markdown(&text);
 
         let event_id = if let (true, Some(anchor)) = (
             outbox.reply_in_thread,
@@ -3723,6 +3736,8 @@ impl MatrixChannel {
             reaction_log: &self.reaction_log,
             reply_in_thread: self.config.reply_in_thread,
             workspace_dir: self.workspace_dir.as_deref().map(|p| p.as_path()),
+            message_max_bytes: (self.config.stream_mode == MatrixStreamMode::SingleMessage)
+                .then_some(self.config.message_max_bytes.max(1)),
         }
     }
 
@@ -4913,6 +4928,7 @@ mod tests {
 
     mod streaming {
         use super::super::MatrixChannel;
+        use super::super::outbound;
         use super::super::streaming;
         use super::super::streaming::{
             MultiDraft, PartialDraft, PartialFinalizeAction, SingleDraft,
@@ -4955,6 +4971,12 @@ mod tests {
                 last_text: text.to_string(),
                 last_edit: Instant::now(),
             }
+        }
+
+        #[test]
+        fn single_message_common_send_boundary_is_utf8_budgeted() {
+            assert_eq!(outbound::bounded_body("😀😀", Some(5)), "😀");
+            assert_eq!(outbound::bounded_body("😀😀", None), "😀😀");
         }
 
         fn single_draft(event_id: OwnedEventId) -> SingleDraft {
@@ -5656,7 +5678,9 @@ mod tests {
             }
         }
 
-        async fn assert_single_redact_failure_still_sends_final(stream_draft_delete: bool) {
+        async fn assert_single_redact_failure_still_sends_budgeted_final(
+            stream_draft_delete: bool,
+        ) {
             let server = MockServer::start().await;
             let room_id = "!room:server";
             let draft_id = owned_event_id!("$draft:server");
@@ -5766,7 +5790,7 @@ mod tests {
                     r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
                 ))
                 .and(body_partial_json(serde_json::json!({
-                    "body": "final answer"
+                    "body": "😀"
                 })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "event_id": "$final:server"
@@ -5785,6 +5809,7 @@ mod tests {
                     allowed_rooms: vec![room_id.to_string()],
                     stream_mode: MatrixStreamMode::SingleMessage,
                     stream_draft_delete,
+                    message_max_bytes: 5,
                     reply_in_thread: false,
                     ack_reactions: Some(false),
                     ..MatrixConfig::default()
@@ -5834,7 +5859,7 @@ mod tests {
 
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                channel.finalize_draft(room_id, draft_id.as_str(), "final answer", false),
+                channel.finalize_draft(room_id, draft_id.as_str(), "😀😀", false),
             )
             .await
             {
@@ -5865,13 +5890,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn single_delete_redact_failure_still_sends_final() {
-            assert_single_redact_failure_still_sends_final(true).await;
+        async fn single_delete_redact_failure_still_sends_utf8_budgeted_final() {
+            assert_single_redact_failure_still_sends_budgeted_final(true).await;
         }
 
         #[tokio::test]
-        async fn retained_placeholder_redact_failure_still_sends_final() {
-            assert_single_redact_failure_still_sends_final(false).await;
+        async fn retained_placeholder_redact_failure_still_sends_utf8_budgeted_final() {
+            assert_single_redact_failure_still_sends_budgeted_final(false).await;
         }
 
         #[test]
