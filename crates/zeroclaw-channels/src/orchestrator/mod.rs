@@ -1417,11 +1417,17 @@ fn build_channel_system_prompt_for_message_with_signal(
         ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING
     };
     if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING) {
+        if native_tool_specs_present {
+            return prompt;
+        }
         prompt.replace(
             ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
             want,
         )
     } else if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING) {
+        if !native_tool_specs_present {
+            return prompt;
+        }
         prompt.replace(
             ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
             want,
@@ -1750,6 +1756,10 @@ fn goal_channel_status_updates_enabled(
 }
 
 const GOAL_CONTROLLER_MAX_CONTINUATIONS_PER_MESSAGE: usize = 16;
+// Channel turns construct a trusted `GoalAdmissionContext` per message, so
+// their model registry must include the tools that consume that context.
+const CHANNEL_GOAL_ADMISSION_TOOL_POLICY: tools::GoalAdmissionToolPolicy =
+    tools::GoalAdmissionToolPolicy::Include;
 
 fn goal_continuation_prompt(task_id: &str, prompt: &GoalContinuationPrompt) -> String {
     match prompt {
@@ -8241,7 +8251,10 @@ async fn pause_recovered_goal_continuation_blocked(
     payload: serde_json::Value,
 ) {
     let pause = recovered_goal_continuation_blocked_pause(blocker, payload);
-    if let Err(error) = goal_store.pause_goal_task(&task.id, pause).await {
+    if let Err(error) = goal_store
+        .pause_goal_task_if_status(&task.id, task.status, pause)
+        .await
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -11539,7 +11552,7 @@ pub async fn start_channels(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
-            tools::GoalAdmissionToolPolicy::Omit,
+            CHANNEL_GOAL_ADMISSION_TOOL_POLICY,
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -12793,6 +12806,26 @@ mod tests {
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    fn run_channel_dispatch_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-channel-dispatch-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build channel dispatch test runtime");
+                runtime.block_on(future);
+            })
+            .expect("spawn channel dispatch test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
@@ -14679,6 +14712,22 @@ api_key = "anthropic-key"
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
     }
 
+    /// Test-only channel with the native addressing facts used by the command
+    /// ingress path. Its recorded sends are assertions, not durable state.
+    #[derive(Default)]
+    struct AddressedRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    /// Test-only channel that records the verifier-draft delivery lifecycle.
+    #[derive(Default)]
+    struct GoalDraftRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        draft_messages: tokio::sync::Mutex<Vec<String>>,
+        finalized_drafts: tokio::sync::Mutex<Vec<(String, String, String)>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
     #[derive(Default)]
     struct FailingSendChannel {
         send_calls: AtomicUsize,
@@ -15028,6 +15077,117 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for AddressedRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for AddressedRecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        fn self_addressed_mention(&self) -> Option<String> {
+            Some("@zeroclaw".into())
+        }
+
+        fn is_direct_message(&self, _msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+            true
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GoalDraftRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for GoalDraftRecordingChannel {
+        fn name(&self) -> &str {
+            "goal-draft-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.draft_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(Some("draft-1".into()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            text: &str,
+            _suppress_voice: bool,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push((recipient.to_string(), message_id.to_string()));
+            Ok(())
+        }
+    }
+
     fn test_runtime_ctx_with_config_agent_and_provider_ref(
         channel: Arc<dyn Channel>,
         model_provider: Arc<dyn ModelProvider>,
@@ -15045,6 +15205,32 @@ api_key = "anthropic-key"
             hooks,
             Arc::new(NoopObserver),
         )
+    }
+
+    async fn ensure_test_control_plane() {
+        // The production control plane is intentionally process-global. Keep
+        // this test helper's one-time initialization serialized; tests that
+        // use it must keep their task ids independent of the shared store.
+        static INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _init_guard = INIT_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        if zeroclaw_runtime::control_plane::control_plane().is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("create test control-plane directory");
+        let handle = zeroclaw_runtime::control_plane::ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "test-boot".into(),
+            zeroclaw_config::schema::GoalRestartRecovery::LastState,
+        )
+        .await
+        .expect("start test control plane");
+        assert!(
+            zeroclaw_runtime::control_plane::init_control_plane(handle),
+            "serialized test control-plane initialization must install its handle"
+        );
     }
 
     fn test_runtime_ctx_with_observer(
@@ -16073,11 +16259,13 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut config = zeroclaw_config::schema::Config::default();
         config.goal.allowed_channel_types = vec!["test-channel".into()];
         config.link_enricher.enabled = true;
-        let runtime_ctx = dispatch_test_context(
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             provider,
-            format!("agent-{}", uuid::Uuid::new_v4()),
             config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
         );
 
         let msg = zeroclaw_api::channel::ChannelMessage {
@@ -16126,12 +16314,19 @@ BTC is currently around $65,000 based on latest tool output."#
             let channel: Arc<dyn Channel> = channel_impl.clone();
             let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
             let provider: Arc<dyn ModelProvider> = provider_impl.clone();
-            let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
+            let agent_alias = "test-agent".to_string();
             let mut config = zeroclaw_config::schema::Config::default();
             config.goal.enabled = true;
             config.goal.allowed_channel_types = vec!["test-channel".into()];
             config.goal.verifier.enabled = false;
-            let runtime_ctx = dispatch_test_context(channel, provider, agent_alias.clone(), config);
+            let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel,
+                provider,
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+            );
 
             let task_id = format!("goal-{}", uuid::Uuid::new_v4());
             let msg = zeroclaw_api::channel::ChannelMessage {
@@ -21846,7 +22041,10 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&target),
         )
         .await;
-        assert!(handled, "agent-scope command must be handled by dispatch");
+        assert!(
+            matches!(handled, RuntimeCommandOutcome::Handled),
+            "agent-scope command must be handled by dispatch: {handled:?}"
+        );
 
         let overrides = ctx.scope_overrides.lock().unwrap();
         assert_eq!(
@@ -21876,7 +22074,10 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&target),
         )
         .await;
-        assert!(handled, "command must be handled even when rejected");
+        assert!(
+            matches!(handled, RuntimeCommandOutcome::Handled),
+            "command must be handled even when rejected: {handled:?}"
+        );
 
         let overrides = ctx.scope_overrides.lock().unwrap();
         assert!(
@@ -21904,7 +22105,10 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&target),
         )
         .await;
-        assert!(handled, "user-scope command must be handled");
+        assert!(
+            matches!(handled, RuntimeCommandOutcome::Handled),
+            "user-scope command must be handled: {handled:?}"
+        );
 
         let overrides = ctx.scope_overrides.lock().unwrap();
         assert_eq!(
@@ -21931,7 +22135,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&target),
         )
         .await;
-        assert!(handled);
+        assert!(matches!(handled, RuntimeCommandOutcome::Handled));
 
         let overrides = ctx.scope_overrides.lock().unwrap();
         assert!(
@@ -22008,6 +22212,15 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
         assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
         assert!(!cost_ctx.goal_attribution_enabled());
+    }
+
+    #[test]
+    fn channel_registry_includes_goal_admission_tools() {
+        assert_eq!(
+            CHANNEL_GOAL_ADMISSION_TOOL_POLICY,
+            tools::GoalAdmissionToolPolicy::Include,
+            "channel turns need goal tools to consume their trusted per-message admission context"
+        );
     }
 
     #[test]
@@ -22310,6 +22523,77 @@ BTC is currently around $65,000 based on latest tool output."#
             goal.blockers[0].payload.as_ref().unwrap()["reason_code"],
             "missing_continuation_context"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_goal_enqueue_blocker_does_not_overwrite_terminal_goal() {
+        use zeroclaw_runtime::control_plane::{GoalTaskRegistry as _, TaskRegistry as _};
+
+        let store = zeroclaw_runtime::control_plane::SqliteTaskStore::new_in_memory().unwrap();
+        let task = zeroclaw_runtime::control_plane::TaskRecord {
+            id: "goal-recovered-terminal".into(),
+            kind: zeroclaw_runtime::control_plane::TaskKind::Goal,
+            agent: "agent-a".into(),
+            status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot-new".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("room".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("user".into()),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        store
+            .create_goal(
+                task.clone(),
+                zeroclaw_runtime::control_plane::GoalTaskRecord {
+                    task_id: task.id.clone(),
+                    objective: "finish the restart smoke".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .cancel_goal_task_if_status(
+                    &task.id,
+                    zeroclaw_runtime::control_plane::TaskStatus::Running,
+                    "operator cancelled recovery".into(),
+                )
+                .await
+                .unwrap()
+        );
+
+        pause_recovered_goal_continuation_blocked(
+            &store,
+            &task,
+            RecoveredGoalContinuationBlocker::MissingContinuationContext,
+            serde_json::json!({}),
+        )
+        .await;
+
+        let task = store.get("goal-recovered-terminal").await.unwrap().unwrap();
+        assert_eq!(
+            task.status,
+            zeroclaw_runtime::control_plane::TaskStatus::Cancelled
+        );
+        let goal = store
+            .get_goal_task("goal-recovered-terminal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.pause_reason, None);
+        assert!(goal.blockers.is_empty());
     }
 
     #[test]

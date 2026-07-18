@@ -45,12 +45,12 @@ acknowledgement is therefore not the goal's first worker response.
 
 ## Configuration
 
-Goal mode is enabled by default. The global policy lives under `[goal]`; the
+Goal mode is opt-in and disabled by default. The global policy lives under `[goal]`; the
 per-agent opt-out lives under `[agents.<alias>.goal]`.
 
 ```toml
 [goal]
-enabled = true
+enabled = false
 channel_status_updates = true
 restart_recovery = "last_state"
 allowed_command_surfaces = ["channel"]
