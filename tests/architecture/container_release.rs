@@ -39,10 +39,6 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
         "needs.docker.result == 'success'",
         "uses: ./.github/workflows/docker-publish.yml",
         "release_ref: ${{ needs.validate.outputs.tag }}",
-        "contents: read",
-        "packages: write",
-        "id-token: write",
-        "security-events: write",
     ] {
         assert!(
             matrix_job.contains(required),
@@ -52,6 +48,16 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
     assert!(
         !matrix_job.contains("secrets: inherit"),
         "Docker matrix call must not inherit unrelated release secrets"
+    );
+    let permissions = matrix_job
+        .split_once("\n    permissions:\n")
+        .expect("Docker matrix call must declare scoped permissions")
+        .1
+        .trim();
+    assert_eq!(
+        permissions,
+        "contents: read\n      packages: write\n      id-token: write\n      security-events: write",
+        "Docker matrix call permissions must remain minimal and complete"
     );
 
     let publisher = workflow("docker-publish.yml");
@@ -74,10 +80,11 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
 #[test]
 fn scheduled_trivy_verifies_published_tag_before_scan() {
     let scheduled = workflow("trivy-scheduled.yml");
-    let preflight = scheduled
+    let scan_job = top_level_job(&scheduled, "scan");
+    let preflight = scan_job
         .find("- name: Verify published image exists")
         .expect("scheduled Trivy must contain an image-existence preflight");
-    let scan = scheduled
+    let scan = scan_job
         .find("- name: Scan ${{ matrix.stem }} with Trivy")
         .expect("scheduled Trivy scan step must exist");
 
@@ -92,14 +99,24 @@ fn scheduled_trivy_verifies_published_tag_before_scan() {
         "Expected published image $IMAGE_REF",
         "Image inspection failed",
         "Docker Publish release job",
+        "strategy:\n      fail-fast: false",
+        "- stem: dist\n            floating_tag: dist",
+        "- stem: default-features\n            floating_tag: default-features",
         "- name: Upload Trivy SARIF to GitHub Security tab",
         "category: trivy-${{ matrix.stem }}",
     ] {
         assert!(
-            scheduled.contains(required),
+            scan_job.contains(required),
             "scheduled Trivy preflight is missing invariant: {required}"
         );
     }
+    assert_eq!(
+        scan_job
+            .matches("if: always() && hashFiles('trivy-results.sarif') != ''")
+            .count(),
+        2,
+        "artifact and Security tab SARIF uploads must both be guarded per matrix leg"
+    );
     assert!(
         !scheduled.contains("\n  upload-sarif:\n"),
         "each scan matrix leg must upload its own SARIF result independently"
