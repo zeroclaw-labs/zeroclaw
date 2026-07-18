@@ -1519,8 +1519,7 @@ fn apply_channels(
 
                 let mut failed = false;
                 for (key, value) in fields {
-                    if let Err(err) =
-                        staged.set_prop_persistent(&format!("{prefix}.{key}"), value)
+                    if let Err(err) = staged.set_prop_persistent(&format!("{prefix}.{key}"), value)
                     {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
@@ -2720,16 +2719,8 @@ mod tests {
     async fn multiple_channels_all_bind_to_agent() {
         let mut submission = fresh_submission("bot");
         submission.channels = vec![
-            SelectorChoice::Fresh(fresh_channel(
-                "telegram",
-                "tg",
-                &[("bot_token", "tok-a")],
-            )),
-            SelectorChoice::Fresh(fresh_channel(
-                "discord",
-                "dc",
-                &[("bot_token", "tok-b")],
-            )),
+            SelectorChoice::Fresh(fresh_channel("telegram", "tg", &[("bot_token", "tok-a")])),
+            SelectorChoice::Fresh(fresh_channel("discord", "dc", &[("bot_token", "tok-b")])),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
         let reloaded = reload(&dir);
@@ -2784,14 +2775,17 @@ mod tests {
 
     #[test]
     fn telegram_channel_fields_reject_unusable_bot_token_values() {
-        for value in [None, Some(""), Some("   "), Some(zeroclaw_config::traits::UNSET_DISPLAY)] {
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
             let cfg = Config::default();
             let mut submission = fresh_submission("bot");
             let fields = value.map_or_else(Vec::new, |value| vec![("bot_token", value)]);
             submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
-                "telegram",
-                "ops",
-                &fields,
+                "telegram", "ops", &fields,
             ))];
 
             let errors = validate_only(&submission, &cfg).expect_err("token must be rejected");
@@ -2824,7 +2818,10 @@ mod tests {
             .find(|error| error.field == "channels[0].fields.unknown_secret")
             .expect("structured unknown-field error");
         assert!(!error.message.contains("super-secret-value"));
-        assert_eq!(serde_json::to_value(&cfg).expect("serialize config"), before);
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config"),
+            before
+        );
         assert_eq!(cfg.dirty_paths, before_dirty_paths);
     }
 
@@ -2850,7 +2847,10 @@ mod tests {
             error.field == "channels[0].fields.api_base_url"
                 && error.message.contains("not available in Quickstart")
         }));
-        assert_eq!(serde_json::to_value(&cfg).expect("serialize config"), before);
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config"),
+            before
+        );
     }
 
     #[test]
