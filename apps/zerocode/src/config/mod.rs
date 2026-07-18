@@ -1,5 +1,4 @@
 //! Local zerocode client configuration: theme and keybindings.
-//!
 //! Always read from the local `<config_dir>/zerocode-config.toml`, independent
 //! of the connection target. Layering: defaults -> file -> `ZEROCODE_*` env.
 #![allow(dead_code)]
@@ -160,11 +159,6 @@ impl ZerocodeConfig {
         Ok(theme::theme_by_name(name).unwrap_or_else(theme::fallback_theme))
     }
 
-    /// Resolve the per-agent theme override for `alias`, if one is configured.
-    /// Returns `Ok(None)` when the agent has no override (the pane uses the base
-    /// theme). An override naming an unknown theme falls back to the
-    /// inherit-shell `terminal` theme rather than failing — same graceful
-    /// posture as the global theme.
     pub fn resolve_agent_theme(&self, alias: &str) -> Result<Option<Theme>> {
         let Some(over) = self.theme.agent_override.get(alias) else {
             return Ok(None);
@@ -219,13 +213,6 @@ pub(crate) fn config_path(config_dir: &Path) -> PathBuf {
     config_dir.join(FILE_NAME)
 }
 
-/// Ensure the config dir and file exist, then load + apply env overrides.
-///
-/// Theme and keybindings are loaded independently: a bad `[keybindings]`
-/// table must not blank the user's theme (or vice versa). The whole
-/// document is first parsed as a raw `toml::Table`; each typed section
-/// is then deserialised on its own and falls back to its default on
-/// failure with a stderr warning.
 pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;

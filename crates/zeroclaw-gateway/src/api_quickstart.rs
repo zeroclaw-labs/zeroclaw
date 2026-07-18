@@ -1,14 +1,4 @@
 //! HTTP routes for the Quickstart flow.
-//!
-//! Thin wrapper over `zeroclaw_runtime::quickstart::{validate_only, apply}`.
-//! Routes:
-//!
-//! - `GET  /api/quickstart/state`     — current Quickstart state (completed flag + live-config slices for each step's "Use existing" section).
-//! - `POST /api/quickstart/validate`  — run `validate_only` against the submitted `BuilderSubmission`; returns `{ ok: true }` or `{ ok: false, errors: [...] }`.
-//! - `POST /api/quickstart/apply`     — atomically apply the submission, then signal an in-place daemon reload through the existing `reload_tx` watch channel (same mechanism `/admin/reload` uses); returns the `AppliedAgent` summary or a structured error list.
-//!
-//! All business logic lives in `zeroclaw-runtime`; this module is route
-//! plumbing only.
 
 use axum::{
     Json,
@@ -38,11 +28,6 @@ pub enum ValidateResult {
 pub enum ApplyResult {
     Applied {
         agent: AppliedAgent,
-        /// `true` when the in-place daemon reload was signalled (the
-        /// supervisor will drain and re-init subsystems). `false` means
-        /// apply succeeded but no daemon supervisor is attached (e.g.
-        /// `zeroclaw gateway start` standalone) — the caller must
-        /// restart the process to pick up the change.
         daemon_restarted: bool,
     },
     Errors {
@@ -50,11 +35,6 @@ pub enum ApplyResult {
     },
 }
 
-/// `GET /api/quickstart/state` — minimal payload the Quickstart UI
-/// needs to render every step's "Use existing" section without
-/// pulling the entire config. Response shape is owned by
-/// `zeroclaw_runtime::quickstart::QuickstartState`; both transports
-/// build the body via [`zeroclaw_runtime::quickstart::snapshot_state`] so they cannot drift.
 pub async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -108,11 +88,6 @@ pub async fn handle_validate(
 #[derive(Debug, Deserialize)]
 pub struct DismissRequest {
     pub run_id: String,
-    /// Surface name as emitted in earlier events for this run. Echoed
-    /// into the dismiss event so the SSE stream can correlate the
-    /// dismissal back to the same `(run_id, surface)` pair. Deserialised
-    /// straight into the typed enum (snake_case wire form) — no
-    /// string-literal `match` at the route boundary.
     pub surface: Surface,
     /// Furthest step the user reached. `None` = didn't progress past
     /// the first selector.
@@ -159,11 +134,6 @@ pub async fn handle_apply(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// Signal the in-place daemon reload using the same `reload_tx` watch
-/// channel `/admin/reload` uses. The daemon supervisor reacts by
-/// draining the current gateway/channels/scheduler and bringing them
-/// back up against the new in-memory config — no process kill, no
-/// PID respawn, no service-manager dependency.
 fn signal_daemon_reload(state: &AppState) -> bool {
     let Some(reload_tx) = state.reload_tx.clone() else {
         ::zeroclaw_log::record!(
