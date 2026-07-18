@@ -2,6 +2,11 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/admit.rs"]
+mod admit_support;
+#[path = "support/state.rs"]
+mod state_support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,6 +26,9 @@ use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::wasm_tool::WasmTool;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use admit_support::admit_fixture;
+use state_support::state_service;
 
 fn build_fixture(package: &str, feature: &str, artifact: &str) -> PathBuf {
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -99,6 +107,7 @@ fn manifest(name: &str, capability: PluginCapability) -> PluginManifest {
         description: None,
         author: None,
         wasm_path: Some("fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![capability],
         permissions: vec![PluginPermission::ConfigRead, PluginPermission::SocketClient],
         config_schema: Some(serde_json::json!({
@@ -137,7 +146,7 @@ fn services(
             4,
         )
     }));
-    PluginHostServices::new(config, egress)
+    PluginHostServices::new(config, state_service(), egress)
 }
 
 async fn echo_server() -> std::net::SocketAddr {
@@ -192,7 +201,8 @@ async fn channel_component_round_trips_through_the_socket_resource() {
         "plugin",
     )
     .expect("socket channel endpoint");
-    let channel = WasmChannel::from_wasm(endpoint, &channel_fixture(), &services, limits())
+    let component = admit_fixture(&channel_fixture(), &manifest);
+    let channel = WasmChannel::from_wasm(endpoint, &component, &services, limits())
         .await
         .expect("instantiate socket channel component");
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -212,8 +222,9 @@ async fn tool_component_round_trips_through_the_socket_resource() {
     let address = echo_server().await;
     let manifest = manifest("socket-tool-fixture", PluginCapability::Tool);
     let services = services(manifest.clone(), address, true);
+    let component = admit_fixture(&tool_fixture(), &manifest);
     let tool = WasmTool::from_wasm(
-        tool_fixture(),
+        component,
         scope(&manifest, PluginCapability::Tool, "mail-tool", true),
         services,
         limits(),
@@ -237,7 +248,8 @@ async fn socket_import_is_unlinked_without_the_effective_grant() {
         "plugin",
     )
     .expect("denied endpoint");
-    let result = WasmChannel::from_wasm(endpoint, &channel_fixture(), &services, limits()).await;
+    let component = admit_fixture(&channel_fixture(), &manifest);
+    let result = WasmChannel::from_wasm(endpoint, &component, &services, limits()).await;
     assert!(
         result.is_err(),
         "a component importing sockets must not instantiate without SocketClient"
@@ -254,7 +266,8 @@ async fn component_plaintext_fails_closed_without_shared_policy() {
         "plugin",
     )
     .expect("policy-denied endpoint");
-    let error = WasmChannel::from_wasm(endpoint, &channel_fixture(), &services, limits())
+    let component = admit_fixture(&channel_fixture(), &manifest);
+    let error = WasmChannel::from_wasm(endpoint, &component, &services, limits())
         .await
         .err()
         .expect("plaintext policy denies configure");

@@ -794,11 +794,12 @@ mod tests {
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use zeroclaw_api::plugin_key::SecretPropertyRef;
 
     use super::*;
     use crate::egress::{
-        EgressHostService, EgressPolicy, EgressPolicyResolver, SecretPropertyRef,
-        TlsClientIdentity, TlsProfile, TlsProfileName, build_tls_client_config,
+        EgressHostService, EgressPolicy, EgressPolicyResolver, TlsClientIdentity, TlsProfile,
+        TlsProfileName, build_tls_client_config,
     };
     use crate::{PluginCapability, PluginPermission};
 
@@ -875,10 +876,10 @@ mod tests {
                 TlsProfileName::new("test-mtls").expect("profile name"),
                 ["localhost".to_string()],
                 false,
-                Some(SecretPropertyRef::new("ca_pem").expect("CA reference")),
+                Some(SecretPropertyRef::parse("ca_pem").expect("CA reference")),
                 Some(TlsClientIdentity::new(
-                    SecretPropertyRef::new("client_cert_pem").expect("certificate reference"),
-                    SecretPropertyRef::new("client_key_pem").expect("key reference"),
+                    SecretPropertyRef::parse("client_cert_pem").expect("certificate reference"),
+                    SecretPropertyRef::parse("client_key_pem").expect("key reference"),
                 )),
             )
             .expect("valid mTLS profile")
