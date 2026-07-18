@@ -1,25 +1,7 @@
 //! Per-section field visibility helpers.
-//!
-//! Used by both the CLI wizard (`onboard::offer_advanced_settings`) and the
-//! gateway HTTP endpoints (`/api/config/list` for filtering). One source of
-//! truth so the CLI and dashboard can't disagree about which fields apply.
-//!
-//! Per-provider-family field exclusion is GONE as of #6273 — the typed-family
-//! ModelProviders container only exposes fields that genuinely apply to each
-//! family (every typed `*ModelProviderConfig` carries only its own surface),
-//! so there's nothing to suppress. Memory-backend exclusion stays because the
-//! `[memory]` section is still a single struct carrying every backend's
-//! sub-tables (the typed-family pattern hasn't been applied there).
 
 use crate::schema::Config;
 
-/// Exclude list for the top-level `[memory]` walk based on the active backend.
-///
-/// `MemoryConfig` carries fields and nested subsections for every backend
-/// (sqlite-only knobs, `[memory.qdrant]`, `[memory.postgres]`); only the
-/// active backend's surface is relevant. Each entry is a path SUFFIX after
-/// the `memory.` prefix in `prop_fields()`. Sub-table fields are matched
-/// by leading segment (`qdrant.`, `postgres.`).
 pub fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
     if backend != "sqlite" {
@@ -35,14 +17,6 @@ pub fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
     out
 }
 
-/// Compute the set of full property paths to hide when a client requests
-/// `prefix`. Returns an empty vec for prefixes that don't have visibility
-/// rules (most of the schema).
-///
-/// This is the single entry point the gateway's `/api/config/list` handler
-/// calls — it inspects the requested prefix, looks at the live config to
-/// resolve any state-dependent rules (e.g. `memory.backend`), and returns
-/// the absolute paths to drop from the response.
 pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
     if prefix == "memory" || prefix.is_empty() {
         let backend = if cfg.memory.backend.is_empty() {
@@ -141,7 +115,6 @@ mod tests {
         assert!(path_matches_prefix("agents.aaa", "agents.aaa"));
         assert!(path_matches_prefix("agents.aaa.workspace", "agents.aaa"));
         assert!(path_matches_prefix("agents.aaa.memory.limit", "agents.aaa"));
-        // Sibling aliases sharing a string prefix must NOT match (#7376-class bug).
         assert!(!path_matches_prefix(
             "agents.aaalore.workspace",
             "agents.aaa"

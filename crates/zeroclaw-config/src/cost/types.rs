@@ -1,12 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Provider-reported token usage and the USD price derived for one API call.
-///
-/// This is the atomic usage fact embedded in a [`CostRecord`]. Feature-level
-/// budget code must aggregate these rows from the ledger instead of caching
-/// consumed counters elsewhere. `pricing_available` records whether `cost_usd`
-/// is trustworthy for budget enforcement, so unknown pricing does not silently
-/// become a free call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Model identifier (e.g., "anthropic/claude-sonnet-4-20250514")
@@ -25,13 +18,6 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     /// Calculated cost in USD
     pub cost_usd: f64,
-    /// Whether `cost_usd` was computed from an explicit provider/rate-sheet
-    /// price or known catalog entry.
-    ///
-    /// This is a ledger fact, not a budget counter. Goal mode uses it to
-    /// distinguish truly consumed $0 from "we counted tokens but do not know
-    /// the price", which must pause cost-limited goals instead of treating the
-    /// call as free.
     #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
     pub pricing_available: bool,
     /// Timestamp of the request
@@ -63,12 +49,6 @@ impl TokenUsage {
         self.input_tokens.saturating_sub(self.cached_input_tokens)
     }
 
-    /// Create a new token usage record. Cached input tokens are billed at
-    /// `cached_input_price_per_million`; the rest of `input_tokens` at the
-    /// standard `input_price_per_million`. When `cached_input_price` is 0
-    /// the cached subset bills at the standard rate (no discount), so
-    /// providers that don't surface a cached rate still produce a sane
-    /// total.
     pub fn new(
         model: impl Into<String>,
         input_tokens: u64,
@@ -139,11 +119,6 @@ impl TokenUsage {
     }
 }
 
-/// Time period for cost aggregation and budget checks.
-///
-/// These periods describe the ledger aggregation window, not goal lifecycle
-/// state. Goal budgets use task attribution directly and do not add a new
-/// period variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsagePeriod {
     /// Current tracker session for this daemon lifetime.
@@ -154,13 +129,6 @@ pub enum UsagePeriod {
     Month,
 }
 
-/// A single persisted usage/cost ledger row.
-///
-/// This is the canonical source for consumed tokens and dollars. Goal budgets
-/// store only effective limits; status views derive consumed and remaining
-/// values by aggregating these records by task attribution. Pricing reliability
-/// lives on `usage` so cost-limited features can tell known zero-cost usage from
-/// unknown-cost usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
     /// Unique identifier
@@ -174,12 +142,6 @@ pub struct CostRecord {
     /// attribution, or when `[cost].track_per_agent = false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
-    /// Persisted task-attribution key.
-    ///
-    /// The Rust field is task-generic because any supervised task can use this
-    /// ledger dimension. The serialized key remains `goal_task_id` for JSONL
-    /// compatibility with early goal-mode rows; this is still one ledger fact,
-    /// not a duplicate lifecycle copy.
     #[serde(
         default,
         rename = "goal_task_id",
@@ -233,11 +195,6 @@ impl CostRecord {
     }
 }
 
-/// Result of checking projected cost against configured global limits.
-///
-/// This is a global cost-policy decision. Feature-level budgets, including
-/// goal budgets, may use the same ledger rows but should not overload this
-/// enum with task-specific state.
 #[derive(Debug, Clone)]
 pub enum BudgetCheck {
     /// Within budget; request can proceed.

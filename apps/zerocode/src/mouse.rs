@@ -1,5 +1,4 @@
 //! Reusable mouse interaction helpers for the TUI.
-//!
 //! Pure geometry + timing utilities. No pane-specific logic lives here.
 
 use std::io::Write;
@@ -37,11 +36,6 @@ pub(crate) fn help_hint_click(col: u16, row: u16, content_area: Rect) -> bool {
 
 // ── List helpers ─────────────────────────────────────────────────
 
-/// Map a mouse click row to the item index in a bordered `List` widget.
-///
-/// Returns `None` if the click lands on a border or outside the item
-/// range. `scroll_offset` is `ListState::offset()` (the index of the
-/// first visible item).
 pub(crate) fn list_click_index(
     mouse_row: u16,
     list_area: Rect,
@@ -79,13 +73,6 @@ pub(crate) fn list_scroll(
 
 // ── Tab bar helpers ──────────────────────────────────────────────
 
-/// Map a click column to the tab index in a tab bar.
-///
-/// Each tab is rendered as a span occupying the label's *display width*
-/// (terminal columns), separated by `sep_width` columns (typically
-/// `" │ "` = 3). Display width — not byte length — is what the terminal
-/// lays out, so CJK (double-width) and combining glyphs hit-test correctly
-/// regardless of the locale's label lengths.
 pub(crate) fn tab_click_index(
     mouse_col: u16,
     mouse_row: u16,
@@ -111,12 +98,6 @@ pub(crate) fn tab_click_index(
     None
 }
 
-/// Map a click column to a mode (F-key number 1–5) in the app mode bar.
-///
-/// The mode bar renders each tab as: `key` + `label` + `" "`.
-/// E.g. `"F1"` + `" Dashboard "` + `" "`. Widths are measured in display
-/// columns so non-Latin labels (e.g. localized mode names) hit-test where
-/// they actually render, not where their byte length would put them.
 pub(crate) fn mode_bar_click(
     mouse_col: u16,
     mouse_row: u16,
@@ -180,11 +161,6 @@ impl DoubleClickTracker {
 
 // ── Clipboard (OSC 52) ──────────────────────────────────────────
 
-/// Copy `text` to the system clipboard via OSC 52.
-///
-/// Works in most modern terminals (iTerm2, kitty, alacritty, WezTerm,
-/// foot, tmux with `set-clipboard on`). Terminals that don't support
-/// OSC 52 silently ignore the sequence.
 pub(crate) fn copy_osc52(text: &str) {
     let encoded = base64_encode(text.as_bytes());
     // OSC 52 ; c ; <base64> ST

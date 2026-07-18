@@ -59,7 +59,6 @@ impl GitOperationsTool {
         )
     }
 
-    /// Check if an operation is read-only
     #[cfg(test)]
     fn is_read_only(&self, operation: &str) -> bool {
         matches!(
@@ -476,14 +475,6 @@ impl GitOperationsTool {
                 anyhow::Error::msg("Missing 'message' parameter")
             })?;
 
-        // Sanitize commit message.
-        // Trim trailing whitespace from each line but preserve blank lines —
-        // git uses the blank line between the subject and the body to separate
-        // them, so stripping blank lines collapses the entire message onto one
-        // line in `git log --oneline` and breaks `git log --format=%b`.
-        // We do strip leading blank lines and collapse runs of 3+ consecutive
-        // blank lines down to 2 (one blank line = paragraph break is fine;
-        // more than that is just noise).
         let trimmed_lines: Vec<&str> = message.lines().map(|l| l.trim_end()).collect();
         // Drop leading blank lines.
         let trimmed_lines = trimmed_lines
@@ -639,12 +630,6 @@ impl GitOperationsTool {
 
         let output = match action {
             "push" | "save" => {
-                // Build args: stash push [-m MSG] [-k] [--] [PATHSPEC...]
-                // `keep_index` preserves the staged area inside the working
-                // tree after stashing — needed to stash only unstaged
-                // changes and keep the index intact for the next commit.
-                // `paths` (space-separated) scopes the stash to specific
-                // pathspecs, leaving everything else untouched.
                 let message = args
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -718,12 +703,6 @@ impl GitOperationsTool {
         }
     }
 
-    /// Parse `git worktree list --porcelain` output into structured format.
-    ///
-    /// Porcelain format emits one blank-line-delimited block per worktree:
-    ///   worktree <path>
-    ///   HEAD <hash>
-    ///   branch refs/heads/<name>   (or "detached")
     fn parse_worktree_list(&self, output: &str) -> serde_json::Value {
         let mut worktrees = Vec::new();
         let mut current_path = String::new();
@@ -1394,10 +1373,6 @@ mod tests {
         );
     }
 
-    /// The blank line between the subject and body must be preserved so that
-    /// `git log --format=%b` and `git log --oneline` both work correctly.
-    /// Before the fix, `filter(|l| !l.is_empty())` stripped all blank lines
-    /// and collapsed the whole message onto a single line.
     #[tokio::test]
     async fn commit_message_preserves_blank_line_between_subject_and_body() {
         let tmp = TempDir::new().unwrap();
@@ -1543,11 +1518,6 @@ mod tests {
         );
     }
 
-    /// Helper: bootstrap a usable repo (init + identity + initial commit on
-    /// `master`) so subsequent stash tests have something to stash against.
-    /// `tracked_files` are added & committed so they appear as tracked
-    /// modifications when later edited — `git stash` only handles tracked
-    /// files by default, so all stash test fixtures must use this seam.
     async fn bootstrap_repo(dir: &std::path::Path, tracked_files: &[&str]) {
         git_init_no_sign(dir, &["-b", "master"]);
         std::fs::write(dir.join("README.md"), "hello").unwrap();
@@ -1566,9 +1536,6 @@ mod tests {
             .unwrap();
     }
 
-    /// `stash push` with no extra args stashes everything tracked — staged
-    /// and unstaged. Regression guard: this is the legacy behaviour and
-    /// must keep working when no `keep_index` / `paths` are supplied.
     #[tokio::test]
     async fn stash_push_default_stashes_staged_and_unstaged() {
         let tmp = TempDir::new().unwrap();
@@ -1601,9 +1568,6 @@ mod tests {
         );
     }
 
-    /// `stash push` with `keep_index: true` stashes only unstaged changes
-    /// and leaves the index intact. This is the fix for the tool's
-    /// "stashes everything indiscriminately" bug.
     #[tokio::test]
     async fn stash_push_with_keep_index_preserves_staged() {
         let tmp = TempDir::new().unwrap();
@@ -1646,8 +1610,6 @@ mod tests {
         );
     }
 
-    /// `stash push` with `paths` scopes the stash to specific pathspecs.
-    /// Files outside the pathspec stay in the working tree.
     #[tokio::test]
     async fn stash_push_with_paths_scopes_to_pathspec() {
         let tmp = TempDir::new().unwrap();
@@ -1687,8 +1649,6 @@ mod tests {
         );
     }
 
-    /// `stash push` with a custom `message` records that message instead
-    /// of the default `auto-stash`.
     #[tokio::test]
     async fn stash_push_with_custom_message() {
         let tmp = TempDir::new().unwrap();
@@ -1718,8 +1678,6 @@ mod tests {
         );
     }
 
-    /// `stash push` with `include_untracked: true` also stashes untracked
-    /// files — `git stash` ignores them by default.
     #[tokio::test]
     async fn stash_push_with_include_untracked_captures_new_files() {
         let tmp = TempDir::new().unwrap();
@@ -1779,22 +1737,6 @@ mod tests {
         assert!(out.contains("A  b.txt"), "b.txt not staged: {out:?}");
     }
 
-    /// Regression: calling execute() from a non-repository path must
-    /// return an error message that includes the resolved working
-    /// directory path and recovery guidance keywords.
-    ///
-    /// Before the fix, the error was a bare "Not in a git repository"
-    /// with no path context or actionable hint. The fix routes the
-    /// message through a Fluent key with a `{ $path }` placeholder,
-    /// producing a message like:
-    ///   "Not in a Git repository at '/tmp/xyz'. Choose a path inside
-    ///    a Git worktree, pass 'path' for a repository subdirectory,
-    ///    or initialize a repository before running git_operations."
-    ///
-    /// This test exercises the fixed branch by calling execute() with
-    /// a working directory that is not inside any Git repository and
-    /// asserting that the error message contains both the path and
-    /// recovery keywords.
     #[tokio::test]
     async fn non_repository_error_includes_path_context_and_recovery_hint() {
         let tmp = TempDir::new().unwrap();

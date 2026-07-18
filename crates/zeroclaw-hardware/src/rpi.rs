@@ -1,19 +1,4 @@
 //! Raspberry Pi self-discovery and native GPIO tools.
-//!
-//! Only compiled on Linux with the `peripheral-rpi` feature enabled.
-//!
-//! Provides two capabilities:
-//!
-//! 1. **Board detection** — `RpiModel` / `RpiSystemContext` detect which Pi model
-//!    is running, its IP address, temperature, and GPIO availability.  The result is
-//!    injected into the system prompt so the LLM knows it is running *on* the device.
-//!
-//! 2. **Tool registration** — Four tools are auto-registered when an RPi board is
-//!    detected at boot (no `[[peripherals.boards]]` config entry required):
-//!    - `gpio_rpi_write`  — set a GPIO pin HIGH / LOW
-//!    - `gpio_rpi_read`   — read a GPIO pin value
-//!    - `gpio_rpi_blink`  — blink a GPIO pin N times
-//!    - `rpi_system_info` — return board model, RAM, temp, IP
 
 use async_trait::async_trait;
 use serde_json::{Value, json};

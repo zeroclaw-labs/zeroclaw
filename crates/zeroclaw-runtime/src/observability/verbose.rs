@@ -2,7 +2,6 @@ use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use std::any::Any;
 
 /// Human-readable progress observer for interactive CLI sessions.
-///
 /// This observer prints compact `>` / `<` progress lines without exposing
 /// prompt contents. It is intended to be opt-in (e.g. `--verbose`).
 pub struct VerboseObserver;

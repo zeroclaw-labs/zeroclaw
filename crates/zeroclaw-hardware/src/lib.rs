@@ -1,6 +1,5 @@
 #![allow(clippy::to_string_in_format_args)]
 //! Hardware discovery — USB device enumeration and introspection.
-//!
 //! See `docs/hardware-peripherals-design.md` for the full design.
 
 pub mod catalog;
@@ -83,7 +82,6 @@ pub use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
 
 /// Merge hardware tools from a [`HardwareBootResult`] into an existing tool
 /// registry, deduplicating by name.
-///
 /// Returns a tuple of `(device_summary, added_tool_names)`.
 pub fn merge_hardware_tools(
     tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
@@ -125,16 +123,6 @@ pub struct HardwareBootResult {
     pub context_files_prompt: String,
 }
 
-/// Load hardware context files from `~/.zeroclaw/hardware/` and return them
-/// concatenated as a single markdown string ready for system-prompt injection.
-///
-/// Reads (if they exist):
-/// 1. `~/.zeroclaw/hardware/HARDWARE.md`
-/// 2. `~/.zeroclaw/hardware/devices/<alias>.md` for each discovered alias
-/// 3. All `~/.zeroclaw/hardware/skills/*.md` files (sorted by name)
-///
-/// Missing files are silently skipped. Returns an empty string when no files
-/// are found.
 pub fn load_hardware_context_prompt(aliases: &[&str]) -> String {
     let home = match directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
         Some(h) => h,
@@ -197,13 +185,6 @@ pub fn load_hardware_context_from_dir(hw_dir: &std::path::Path, aliases: &[&str]
     sections.join("\n\n")
 }
 
-/// Inject RPi self-discovery tools and system prompt context into the boot result.
-///
-/// Called from both `boot()` variants when the `peripheral-rpi` feature is active
-/// and the binary is running on Linux. If `/proc/device-tree/model` (or
-/// `/proc/cpuinfo`) identifies a Raspberry Pi, the four built-in GPIO/info
-/// tools are added to `tools` and the board description is appended to
-/// `context_files_prompt` so the LLM knows it is running on the device.
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 fn inject_rpi_context(
     tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
@@ -255,16 +236,6 @@ fn inject_rpi_context(
     }
 }
 
-/// Boot the hardware subsystem: discover devices + load tool registry.
-///
-/// With the `hardware` feature: enumerates USB-serial devices, then
-/// pre-registers any config-specified serial boards not already found by
-/// discovery. [`HardwareSerialTransport`] opens the port lazily per-send,
-/// so this succeeds even when the port doesn't exist at startup.
-///
-/// Without the feature: loads plugin tools from `~/.zeroclaw/tools/` only,
-/// with an empty device registry (GPIO tools will report "no device found"
-/// if called, which is correct).
 #[cfg(feature = "hardware")]
 #[allow(unused_mut)] // tools and context_files_prompt are mutated on Linux+peripheral-rpi
 pub async fn boot(
