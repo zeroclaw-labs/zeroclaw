@@ -9578,15 +9578,16 @@ fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
     aliases.sort_unstable();
     for alias in aliases {
         crate::helpers::validate_alias_key(alias)
-            .map_err(|error| anyhow::anyhow!("channels.plugin.{alias}: {error}"))?;
+            .map_err(|error| anyhow::Error::msg(format!("channels.plugin.{alias}: {error}")))?;
         let package = config.plugin[alias].package.trim();
         if package != config.plugin[alias].package {
             anyhow::bail!(
                 "channels.plugin.{alias}.package must not have leading or trailing whitespace"
             );
         }
-        zeroclaw_api::plugin::validate_plugin_package_name(package)
-            .map_err(|error| anyhow::anyhow!("channels.plugin.{alias}.package: {error}"))?;
+        zeroclaw_api::plugin::validate_plugin_package_name(package).map_err(|error| {
+            anyhow::Error::msg(format!("channels.plugin.{alias}.package: {error}"))
+        })?;
     }
     Ok(())
 }
