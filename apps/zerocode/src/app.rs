@@ -195,12 +195,6 @@ pub async fn run(
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
-    // In-loop reconnection state. `reconnect_last_attempt` throttles
-    // connect tries so the draw/input loop keeps running between them.
-    // `ephemeral_respawn_done` enforces the "owned ephemeral daemon is
-    // respawned at most once" policy; `needs_intervention` latches when
-    // that single respawn fails to come back, stopping auto-respawn while
-    // the UI stays responsive and quittable.
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;

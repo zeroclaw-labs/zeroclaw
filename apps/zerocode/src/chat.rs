@@ -5305,6 +5305,7 @@ impl ChatState {
         }
     }
 
+    #[cfg(test)]
     fn transcript_selected_text(&self) -> Option<String> {
         self.transcript_snapshot
             .as_ref()?
