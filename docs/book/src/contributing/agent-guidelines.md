@@ -49,7 +49,34 @@ Do not maintain another crate or repository inventory here. Use [Crates](../arch
 
 ## Stability And Risk
 
-The stability-tier definitions and versioning policy live in [FND-001](../foundations/fnd-001-intentional-architecture.md#stability-tiers). Verify a component's current tier in its own `AGENTS.md` or plugin registry manifest. Do not infer current tiers from an old aggregate list.
+The stability-tier definitions and versioning policy live in [FND-001](../foundations/fnd-001-intentional-architecture.md#stability-tiers). Component-local `AGENTS.md` files and plugin registry manifests are the target ownership model. Until every component has one, the table below is the canonical source for current assignments; do not copy it into another hand-maintained aggregate.
+
+### Current Stability Assignments
+
+| Component | Tier | Notes |
+| --- | --- | --- |
+| `zeroclaw-api` | Experimental | Stable at v1.0.0 (formal milestone) |
+| `zeroclaw-config` | Beta | Stable at v0.8.0 |
+| `zeroclaw-log` | Beta | Unified log emission, JSONL persistence, and broadcast hook |
+| `zeroclaw-providers` | Beta | |
+| `zeroclaw-memory` | Beta | |
+| `zeroclaw-infra` | Beta | |
+| `zeroclaw-commands` | Experimental | Built-in command catalog and metadata |
+| `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
+| `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
+| `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
+| `zeroclaw-runtime` | Experimental | Agent runtime: agent loop, security, cron, SOP, skills, and observability |
+| `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
+| `zerocode` | Experimental | TUI onboarding wizard |
+| `zeroclaw-plugins` | Experimental | WASM plugin system and foundation for the v1.0.0 plugin ecosystem |
+| `zeroclaw-hardware` | Experimental | USB discovery, peripherals, and serial support |
+| `zeroclaw-macros` | Beta | Tightly coupled to the config schema |
+| `zeroclaw-eval` | Experimental | Agent evaluation harness with deterministic replay of LLM trace fixtures |
+| `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
+| `robot-kit` | Experimental | Robot control toolkit: drive, vision, speech, sensors, and safety |
+| `aardvark-sys` | Experimental | Low-level FFI bindings for the Total Phase Aardvark adapter; the only crate where `unsafe` is permitted |
+
+Stable components follow the breaking-change policy. Beta components may make breaking changes in a MINOR release with changelog notes. Experimental components carry no stability guarantee. Tiers are promoted, never demoted, through deliberate team decision.
 
 Change-risk routing is:
 

@@ -25,11 +25,13 @@ Prefer borrowed config, getters, resolver closures over live config, on-demand m
 1. Read the owning module, factory wiring, adjacent tests, and relevant docs before editing.
 2. For architecture, config, security, workflow, governance, CI, release, or agent-assisted changes, start with `docs/book/src/contributing/architecture-map.md`.
 3. Name the source of truth before introducing state.
-4. Keep one concern per PR and avoid unrelated cleanup.
-5. Add the smallest useful implementation and tests at the real behavior boundary.
-6. Validate at the change's risk level and report commands actually run.
-7. Use a non-`master` branch, open a PR to `master`, and never push directly to `master`.
-8. Use conventional commits and the full PR template. Do not add bot or AI attribution footers.
+4. Keep one concern per PR. Avoid unrelated cleanup and do not mix broad formatting changes with functional changes.
+5. Do not add heavy dependencies for minor convenience, speculative abstractions, or config keys and feature flags without a concrete use case.
+6. Add the smallest useful implementation and tests at the real behavior boundary.
+7. Validate at the change's risk level, report commands actually run, and document behavior, risk, side effects, and rollback.
+8. Use a non-`master` branch, open a PR to `master`, and never push directly to `master`.
+9. Use conventional commits and the full PR template. Prefer small PRs and do not add bot or AI attribution footers.
+10. Declare stacked work with `Depends on #...` and replacement work with `Supersedes #...`.
 
 Subagents must set their working directory to the repository root before shell or filesystem work. Do not assume an inherited working directory.
 
