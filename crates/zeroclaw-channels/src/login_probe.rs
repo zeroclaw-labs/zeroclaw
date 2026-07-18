@@ -86,6 +86,9 @@ pub fn persisted_login(channel: QrPairingChannel, config: &Config, alias: &str) 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use super::*;
+
     #[test]
     fn channels_without_a_probe_resolve_to_no_qr_pairing_key() {
         // "Unsupported" is decided at key-resolution time: channel types

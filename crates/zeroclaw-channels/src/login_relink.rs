@@ -117,6 +117,9 @@ pub fn relink(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use super::*;
+
     #[test]
     fn channels_without_a_relink_hook_resolve_to_no_qr_pairing_key() {
         // "Unsupported" is decided at key-resolution time: channel types
