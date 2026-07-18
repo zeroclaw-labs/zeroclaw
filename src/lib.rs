@@ -297,6 +297,22 @@ Examples:
         #[arg(long, default_value = "default")]
         alias: String,
     },
+    // Help is injected from cli-channel-bind-wechat-{about,long-about} so the
+    // Fluent catalog remains the only source of user-facing prose.
+    #[command(about = None, long_about = None)]
+    BindWechat {
+        identity: String,
+        #[arg(long, default_value = "default")]
+        alias: String,
+    },
+    // Help is injected from cli-channel-bind-line-{about,long-about} so the
+    // Fluent catalog remains the only source of user-facing prose.
+    #[command(about = None, long_about = None)]
+    BindLine {
+        identity: String,
+        #[arg(long, default_value = "default")]
+        alias: String,
+    },
     /// Send a message to a configured channel
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
