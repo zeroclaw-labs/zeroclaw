@@ -1,19 +1,6 @@
 //! Architecture gate: user-facing strings must route through Fluent, not ship
 //! as bare literals. A PR that adds an un-localized user-facing string fails
 //! this test (and therefore CI), so it can never land.
-//!
-//! Two classes are caught in `src/` (the user-facing CLI surface):
-//!   1. `clap` help literals — `about`/`long_about`/`help = "..."` render into
-//!      `--help` output the user reads.
-//!   2. Terminal output macros with a bare string literal as the format arg —
-//!      `println!("Done.")`, `eprint!("error: ...")`, etc. A literal ships
-//!      English in every locale; the text must come from
-//!      `zeroclaw_runtime::i18n` (a `cli-*` Fluent key). `println!("{}", t(..))`
-//!      and `println!()` are fine — the format arg is not a bare literal.
-//!
-//! Doc-comments are out of scope. To exempt a specific line deliberately (a
-//! genuinely non-localized diagnostic, a build directive, etc.), add
-//! `// i18n-exempt: <reason>` on it.
 
 use std::fs;
 use std::path::Path;
@@ -77,11 +64,6 @@ fn is_hardcoded_help(line: &str) -> bool {
     line.contains("about = \"") || line.contains("help = \"")
 }
 
-/// A print/output macro whose format argument is a bare string literal.
-/// `println!("hi")` → true. `println!("{}", t("k"))` is also literal-first, so
-/// it is still flagged — the format string itself is English text the user
-/// sees, so it must be a Fluent key, not an inline literal with `{}` holes.
-/// `println!(value)`, `println!()`, `writeln!(f, ...)` → not flagged here.
 fn is_bare_print_literal(line: &str) -> bool {
     const MACROS: &[&str] = &["println!(", "print!(", "eprintln!(", "eprint!("];
     for m in MACROS {

@@ -1,8 +1,5 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
-//!
-//! Embedded by both Chat and ACP panes — each pane owns its own
-//! `InputBarState` instance with independent state.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -755,11 +752,6 @@ impl InputBarState {
         self.cursor = self.input.len();
     }
 
-    /// Enter pressed while the autocomplete popup is open: accept the
-    /// highlighted match. A command completion that still expects an argument
-    /// (`/model `, `/model-provider `) only fills the input so the user can keep
-    /// typing or pick from the argument popup; any other accepted completion is
-    /// a runnable line, so submit it in the same keystroke.
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
         let Some(idx) = self.autocomplete_index else {
             return self.handle_enter();
@@ -1393,11 +1385,6 @@ impl InputBarState {
         }
     }
 
-    /// Fallback paste path: insert clipboard text directly. Used when Ctrl+V
-    /// finds no image, and as the only paste route on terminals that don't
-    /// emit bracketed paste (`Event::Paste`) — e.g. the legacy Windows
-    /// console. Routes through `handle_paste` so a pasted file path is still
-    /// auto-attached, matching bracketed-paste behaviour.
     fn paste_clipboard_text(&mut self) -> InputBarAction {
         match clipboard::read_clipboard_text() {
             Some(text) => {
@@ -1414,12 +1401,6 @@ impl InputBarState {
 
     // ── Selection rendering helper ───────────────────────────
 
-    /// Build styled lines for the input text, pre-wrapped using the same
-    /// `wrap_visual_lines` logic that drives cursor positioning.
-    ///
-    /// Each returned `Line` corresponds to exactly one visual row so the
-    /// `Paragraph` must be rendered **without** `Wrap` — otherwise ratatui
-    /// would re-wrap with its own algorithm and the cursor would drift.
     fn build_input_lines(&self, width: u16) -> Vec<Line<'_>> {
         let sel_style = Style::default()
             .bg(theme::selection_bg())
@@ -1473,18 +1454,6 @@ impl InputBarState {
 
     // ── Rendering ────────────────────────────────────────────
 
-    /// Render the input bar (attachment bar + input box) at the bottom of `area`.
-    ///
-    /// Returns the remaining `Rect` above the input bar for the parent to
-    /// render conversation content into.
-    ///
-    /// `show_cursor` controls whether the terminal cursor is positioned in the
-    /// input box (false when an approval overlay is active).
-    ///
-    /// `turn_status` drives the title-bar label (verb + animated dots); it is
-    /// always `Idle` when no turn is in flight. `turn_started_at` is the
-    /// animation anchor — pass the `Instant` recorded when the turn began so
-    /// the dots cycle deterministically across redraws.
     pub fn render(
         &mut self,
         f: &mut Frame,
@@ -1544,12 +1513,6 @@ impl InputBarState {
             f.render_widget(bar, att_rect);
         }
 
-        // Input box.
-        //
-        // Title comes from `TurnStatus::label`, which encodes both the verb
-        // and the dot-pulse animation (anchored to `turn_started_at` so paints
-        // within the same animation phase render identically). When idle, the
-        // status is `Idle` and the label is the plain " > " prompt.
         let label_owned = turn_status.label(turn_started_at);
         let label: &str = &label_owned;
         let block = Block::default()
@@ -1585,11 +1548,6 @@ impl InputBarState {
             f.render_widget(p, input_area);
         }
 
-        // Terminal owns cursor blinking; a software blink that skips
-        // set_cursor_position can latch the cursor hidden. The cursor shows
-        // whenever the input box is editable — including while a turn is in
-        // flight, since the user can type a queued message then. Only an
-        // approval overlay (show_cursor=false) or the file browser suppress it.
         if show_cursor && inner_width > 0 && self.file_explorer.is_none() {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 

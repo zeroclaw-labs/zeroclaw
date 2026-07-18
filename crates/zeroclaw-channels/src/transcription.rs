@@ -33,7 +33,6 @@ fn mime_for_audio(extension: &str) -> Option<&'static str> {
 }
 
 /// Normalize audio filename for Whisper-compatible APIs.
-///
 /// Groq validates the filename extension — `.oga` (Opus-in-Ogg) is not in
 /// its accepted list, so we rewrite it to `.ogg`.
 fn normalize_audio_filename(file_name: &str) -> String {
@@ -44,7 +43,6 @@ fn normalize_audio_filename(file_name: &str) -> String {
 }
 
 /// Resolve MIME type and normalize filename from extension.
-///
 /// No size check — callers enforce their own limits.
 fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
     let normalized_name = normalize_audio_filename(file_name);
@@ -69,7 +67,6 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
 }
 
 /// Validate audio data and resolve MIME type from file name.
-///
 /// Enforces the 25 MB cloud API cap. Returns `(normalized_filename, mime_type)` on success.
 fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
     if audio_data.len() > MAX_AUDIO_BYTES {
@@ -116,12 +113,6 @@ pub struct GroqProvider {
 }
 
 impl GroqProvider {
-    /// Build from the existing `TranscriptionConfig` fields.
-    ///
-    /// Credential resolution order:
-    /// Reads `config.api_key` (set via `[transcription].api_key` or the
-    /// schema-mirror env grammar `ZEROCLAW_transcription__api_key=...`).
-    /// The legacy `GROQ_API_KEY` env-var fallback was eradicated in V0.8.0.
     pub fn from_config(alias: &str, config: &TranscriptionConfig) -> Result<Self> {
         let api_key = config
             .api_key
@@ -713,12 +704,6 @@ impl TranscriptionProvider for GoogleSttProvider {
 
 // ── LocalWhisperProvider ────────────────────────────────────────
 
-/// Self-hosted faster-whisper-compatible STT transcription_provider.
-///
-/// POSTs audio as `multipart/form-data` (field name `file`) to a configurable
-/// HTTP endpoint (e.g. `http://localhost:8000` or a private network host). The endpoint
-/// must return `{"text": "..."}`. No cloud API key required. Size limit is
-/// configurable — not constrained by the 25 MB cloud API cap.
 pub struct LocalWhisperProvider {
     alias: String,
     url: String,
@@ -830,11 +815,6 @@ impl TranscriptionProvider for LocalWhisperProvider {
 
 // ── Shared response parsing ─────────────────────────────────────
 
-/// Parse a faster-whisper-compatible JSON response (`{ "text": "..." }`).
-///
-/// Checks HTTP status before attempting JSON parsing so that non-JSON error
-/// bodies (plain text, HTML, empty 5xx) produce a readable status error
-/// rather than a confusing "Failed to parse transcription response".
 async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
     let status = resp.status();
     if !status.is_success() {
@@ -912,14 +892,6 @@ impl TranscriptionManager {
         })
     }
 
-    /// Build a manager bound to a specific agent's dotted
-    /// `transcription_provider` reference.
-    ///
-    /// Current v0.8 config stores STT provider instances under
-    /// `[providers.transcription.<type>.<alias>]`, and agents reference them
-    /// as `<type>.<alias>`. This constructor preserves the legacy
-    /// `TranscriptionConfig` registrations while also registering current
-    /// typed provider instances under their dotted aliases.
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         if matches!(config.transcription.max_audio_bytes, Some(0)) {
             bail!("transcription.max_audio_bytes must be greater than zero");
@@ -1131,12 +1103,6 @@ impl TranscriptionManager {
         }
     }
 
-    /// Register providers from the typed `[providers.transcription.<family>.<alias>]`
-    /// config alongside the legacy ones built by `new()`. Each provider is keyed
-    /// as `"<family>.<alias>"` so that `agent.transcription_provider = "groq.default"`
-    /// resolves correctly. Entries already present (e.g. the bare `"groq"` key from
-    /// the legacy block) are left untouched — legacy config owns bare keys; typed
-    /// config owns dotted keys.
     #[must_use]
     pub fn with_typed_providers(
         mut self,
@@ -1265,12 +1231,6 @@ impl TranscriptionManager {
             .collect()
     }
 }
-
-// `transcribe_audio` (the legacy free function that dispatched against
-// `config.default_transcription_provider`) was deleted in #6273. There is
-// no global default-provider concept anymore; transcription routes through
-// `TranscriptionManager` whose resolved alias comes from the per-agent
-// `transcription_provider` field (`agent.<X>.transcription_provider`).
 
 impl ::zeroclaw_api::attribution::Attributable for GroqProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -1411,7 +1371,7 @@ mod tests {
     }
 
     // Tests for the deleted `transcribe_audio` free function were removed
-    // alongside the function in #6273. Equivalent coverage lives on
+    // alongside the function in Equivalent coverage lives on
     // `TranscriptionManager` (`manager_creation_with_default_config`,
     // `manager_registers_groq_with_key`, `manager_rejects_unconfigured_provider`).
 

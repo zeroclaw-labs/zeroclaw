@@ -1,5 +1,4 @@
 //! Fluent-based i18n for tool descriptions.
-//!
 //! English descriptions are embedded via `include_str!` at compile time.
 //! Non-English locales are loaded from disk and override English per-key.
 
@@ -104,10 +103,6 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
-/// Resolve a CLI string against the embedded English catalogue only, ignoring
-/// the process locale and the filesystem. Used by tests that assert the
-/// canonical English wording without depending on the host's configured
-/// locale (the global `LOCALE` OnceLock would otherwise make them flaky).
 #[cfg(test)]
 pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
     let english = CliFtlSources {
@@ -292,12 +287,6 @@ fn locale_from_system() -> Option<String> {
     pick_locale(sys_locale::get_locales())
 }
 
-/// Pure: take the first candidate that isn't a POSIX "no locale" sentinel.
-/// Split out from `locale_from_system` so it is testable without environment
-/// access. Walks every candidate rather than just the first: `LC_ALL=C`
-/// (common in CI/containers to force deterministic tool output) would
-/// otherwise shadow a perfectly usable `LANG=zh_CN.UTF-8` and we'd give up
-/// instead of trying it.
 fn pick_locale(mut candidates: impl Iterator<Item = String>) -> Option<String> {
     candidates.find_map(|raw| normalized_env_locale(&raw))
 }
@@ -318,12 +307,6 @@ fn normalized_env_locale(raw: &str) -> Option<String> {
 }
 
 fn read_config_table() -> Option<toml::Table> {
-    // An explicit config dir is authoritative: when set, locale detection and
-    // FTL loading resolve only against it and never fall back to the home
-    // config. This keeps the lookup hermetic — tests (and sandboxed runs) point
-    // it at a known dir without the host's real ~/.zeroclaw/config.toml leaking
-    // in. Without this, locale detection reads the developer's own config and
-    // is non-deterministic across machines.
     if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
@@ -608,6 +591,233 @@ mod tests {
     }
 
     #[test]
+    fn channel_runtime_committed_cli_catalogs_format_from_fluent() {
+        let cases = [
+            (
+                "channel-runtime-malformed-tool-output",
+                &[][..],
+                [].as_slice(),
+            ),
+            ("channel-runtime-new-session", &[][..], [].as_slice()),
+            ("channel-runtime-stop-sent", &[][..], [].as_slice()),
+            ("channel-runtime-stop-no-task", &[][..], [].as_slice()),
+            (
+                "channel-runtime-model-empty",
+                &[][..],
+                ["/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-model-switched",
+                &[("model", "gpt-test"), ("provider", "openai.default")][..],
+                ["gpt-test", "openai.default"].as_slice(),
+            ),
+            ("channel-runtime-request-timeout", &[][..], [].as_slice()),
+            (
+                "channel-runtime-current-model-status",
+                &[("provider", "openai.default"), ("model", "gpt-test")][..],
+                ["openai.default", "gpt-test"].as_slice(),
+            ),
+            (
+                "channel-runtime-model-switch-hint",
+                &[][..],
+                ["/model <model-id>", "/model <hint>"].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-switch-hint",
+                &[][..],
+                ["/models <model_provider>"].as_slice(),
+            ),
+            (
+                "channel-runtime-available-providers-header",
+                &[][..],
+                ["model_provider"].as_slice(),
+            ),
+            (
+                "channel-runtime-configured-routes-header",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-no-cached-models",
+                &[("provider", "openai.default")][..],
+                [
+                    "openai.default",
+                    "zeroclaw models refresh --model-provider openai.default",
+                ]
+                .as_slice(),
+            ),
+            (
+                "channel-runtime-cached-model-ids-header",
+                &[("count", "7")][..],
+                ["7"].as_slice(),
+            ),
+            (
+                "channel-runtime-config-switch-hints",
+                &[][..],
+                ["/models <model_provider>", "/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-config-block-title",
+                &[("provider", "openai.default"), ("model", "gpt-test")][..],
+                ["openai.default", "gpt-test"].as_slice(),
+            ),
+            (
+                "channel-runtime-config-select-provider-placeholder",
+                &[][..],
+                ["model_provider"].as_slice(),
+            ),
+            (
+                "channel-runtime-config-select-model-placeholder",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-config-provider-label",
+                &[][..],
+                ["ModelProvider"].as_slice(),
+            ),
+            (
+                "channel-runtime-config-model-label",
+                &[][..],
+                ["*"].as_slice(),
+            ),
+            ("channel-runtime-scope-user", &[][..], [].as_slice()),
+            ("channel-runtime-scope-agent", &[][..], [].as_slice()),
+            (
+                "channel-runtime-scope-overrides-summary",
+                &[
+                    ("user", "`openai.default` / `gpt-user`"),
+                    ("agent", "—"),
+                    ("session", "`openai.default` / `gpt-session`"),
+                    ("default", "`openai.default` / `gpt-default`"),
+                ][..],
+                [
+                    "`openai.default` / `gpt-user`",
+                    "`openai.default` / `gpt-session`",
+                    "`openai.default` / `gpt-default`",
+                    "/model --user|--agent <model-id>",
+                ]
+                .as_slice(),
+            ),
+            (
+                "channel-runtime-set-provider-switched",
+                &[("provider", "openai.default"), ("model", "gpt-test")][..],
+                ["openai.default", "gpt-test", "/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-set-provider-init-failed",
+                &[("provider", "openai.default"), ("error", "bad key")][..],
+                ["openai.default", "bad key"].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-ambiguous",
+                &[("family", "openai"), ("list", "`openai.default`")][..],
+                ["openai", "`openai.default`", "/models openai.<alias>"].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-no-alias",
+                &[("provider", "openai.default")][..],
+                [
+                    "openai.default",
+                    "[providers.models.openai.default]",
+                    "api_key/uri",
+                    "/models",
+                ]
+                .as_slice(),
+            ),
+            (
+                "channel-runtime-provider-unknown",
+                &[("provider", "openai.default")][..],
+                ["openai.default", "/models"].as_slice(),
+            ),
+            (
+                "channel-runtime-scoped-model-empty",
+                &[][..],
+                ["/model --user|--agent <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-scoped-model-switched",
+                &[
+                    ("model", "gpt-test"),
+                    ("provider", "openai.default"),
+                    ("scope", "user"),
+                ][..],
+                ["gpt-test", "openai.default", "user"].as_slice(),
+            ),
+            (
+                "channel-runtime-shadow-note",
+                &[("model", "gpt-test"), ("provider", "openai.default")][..],
+                ["gpt-test", "openai.default", "/model"].as_slice(),
+            ),
+            (
+                "channel-runtime-thinking-set",
+                &[("level", "high")][..],
+                ["high", "/thinking reset"].as_slice(),
+            ),
+            (
+                "channel-runtime-thinking-cleared",
+                &[("default", "medium")][..],
+                ["medium"].as_slice(),
+            ),
+            (
+                "channel-runtime-thinking-default",
+                &[("default", "medium")][..],
+                ["medium", "/thinking high", "/thinking max", "/thinking off"].as_slice(),
+            ),
+            (
+                "channel-runtime-thinking-invalid",
+                &[("raw", "banana")][..],
+                [
+                    "banana",
+                    "/thinking off|minimal|low|medium|high|max",
+                    "/thinking on",
+                    "/thinking reset",
+                ]
+                .as_slice(),
+            ),
+            (
+                "channel-runtime-provider-turn-init-failed",
+                &[("provider", "openai.default"), ("error", "bad key")][..],
+                ["openai.default", "bad key", "/models"].as_slice(),
+            ),
+            (
+                "channel-runtime-fallback-footer",
+                &[
+                    ("requested", "openai.default"),
+                    ("actual", "anthropic.default"),
+                    ("model", "claude-test"),
+                ][..],
+                [
+                    "openai.default",
+                    "anthropic.default",
+                    "claude-test",
+                    "/models",
+                ]
+                .as_slice(),
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn skills_install_cli_strings_format_from_fluent() {
         type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
@@ -709,7 +919,7 @@ mod tests {
 
     #[test]
     fn daemon_gateway_bind_cli_strings_format_from_fluent() {
-        // The daemon gateway-bind pre-flight messages (#7895) are routed through
+        // The daemon gateway-bind pre-flight messagesare routed through
         // Fluent from src/main.rs via `ta(...)`. Guard the key names and their
         // `{$host}`/`{$port}` placeholders so a typo can't silently degrade the
         // operator-facing fail-fast message back to a `{cli-...}` stub.
