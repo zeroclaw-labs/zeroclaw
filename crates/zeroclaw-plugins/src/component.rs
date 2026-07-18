@@ -10,7 +10,16 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
-use crate::PluginPermission;
+use crate::config::ResolvedPluginConfig;
+use crate::error::PluginError;
+use crate::instance::PluginInstanceScope;
+use crate::services::{PluginHostServices, SecretLookupError};
+use crate::{PluginCapability, PluginPermission};
+
+/// Hard safety ceiling for ZeroClaw-owned WIT imports in one service frame.
+///
+/// A fixed limit avoids retaining live operator configuration in warm stores.
+const MAX_HOST_CALLS_PER_FRAME: u64 = 1_000;
 
 #[derive(Clone, Default)]
 pub struct InboundQueue {
@@ -70,6 +79,65 @@ pub struct PluginLimits {
     pub max_instances: usize,
 }
 
+#[cfg(test)]
+pub(crate) fn test_limits(call_fuel: u64) -> PluginLimits {
+    PluginLimits {
+        call_fuel,
+        max_memory_bytes: 1024 * 1024,
+        max_table_elements: 100,
+        max_instances: 10,
+    }
+}
+
+/// Complete host-side inputs for constructing one scoped plugin store.
+///
+/// The immutable instance scope supplies identity and effective grants. Limits
+/// remain a per-store materialized view of canonical host configuration, while
+/// the inbound queue is a process-local resource owned by this store.
+pub(crate) struct PluginStoreSpec {
+    scope: PluginInstanceScope,
+    services: PluginHostServices,
+    limits: PluginLimits,
+    inbound: InboundQueue,
+    http: bool,
+}
+
+impl PluginStoreSpec {
+    /// Create a store specification with no host-fed inbound messages.
+    #[must_use]
+    pub(crate) fn new(
+        scope: PluginInstanceScope,
+        services: PluginHostServices,
+        limits: PluginLimits,
+    ) -> Self {
+        Self {
+            scope,
+            services,
+            limits,
+            inbound: InboundQueue::default(),
+            http: false,
+        }
+    }
+
+    /// Attach HTTP only when this scope was granted `HttpClient`.
+    ///
+    /// Adapters opt into the surface explicitly. This prevents adding a grant
+    /// to a scope from silently widening an adapter that has not implemented
+    /// and tested the corresponding component boundary.
+    #[must_use]
+    pub(crate) fn with_granted_http(mut self) -> Self {
+        self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
+    }
+
+    /// Attach the queue shared with a host-owned inbound listener.
+    #[must_use]
+    pub(crate) fn with_inbound(mut self, inbound: InboundQueue) -> Self {
+        self.inbound = inbound;
+        self
+    }
+}
+
 pub mod bindings {
     pub mod tool {
         wasmtime::component::bindgen!({
@@ -98,6 +166,11 @@ pub mod bindings {
 }
 
 pub struct PluginState {
+    scope: PluginInstanceScope,
+    services: PluginHostServices,
+    call_config: CallConfig,
+    secrets_enabled: bool,
+    host_calls_remaining: u64,
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
@@ -106,43 +179,129 @@ pub struct PluginState {
     fuel_per_call: u64,
 }
 
-impl PluginState {
-    pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
-        Self::with_inbound(permissions, InboundQueue::default(), limits)
-    }
+/// Lazily materialized config for exactly one host-dispatched service frame.
+///
+/// This is a transient view, not another canonical config store. It is cleared
+/// after every frame so live resolvers observe changes on their next invocation
+/// while all reads within one frame share one revision.
+enum CallConfig {
+    Inactive,
+    Unresolved,
+    Resolved(ResolvedPluginConfig),
+    Failed,
+}
 
-    /// Build store state with a caller-supplied inbound queue. A channel plugin
-    /// whose host listener feeds it inbound traffic shares the listener's queue
-    /// handle here, so `inbound-poll` drains what the listener enqueued.
-    pub fn with_inbound(
-        permissions: &[PluginPermission],
-        inbound: InboundQueue,
-        limits: PluginLimits,
-    ) -> Self {
-        let http = permissions
-            .contains(&PluginPermission::HttpClient)
-            .then(WasiHttpCtx::new);
+impl PluginState {
+    /// Build store state from one typed, host-issued specification.
+    /// `HttpClient` is the only grant that can widen the host surface here, and
+    /// only after the adapter calls [`PluginStoreSpec::with_granted_http`]. That
+    /// opt-in attaches a `WasiHttpCtx` so the gated `wasi:http` import can be
+    /// linked. Other grants are consumed by adapters or host services where
+    /// implemented and do not widen ambient WASI.
+    pub(crate) fn new(spec: PluginStoreSpec) -> Self {
+        let http = spec.http.then(WasiHttpCtx::new);
         Self {
+            scope: spec.scope,
+            services: spec.services,
+            call_config: CallConfig::Inactive,
+            secrets_enabled: false,
+            host_calls_remaining: 0,
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
-            inbound,
+            inbound: spec.inbound,
             limits: StoreLimitsBuilder::new()
-                .memory_size(limits.max_memory_bytes)
-                .table_elements(limits.max_table_elements)
-                .instances(limits.max_instances)
+                .memory_size(spec.limits.max_memory_bytes)
+                .table_elements(spec.limits.max_table_elements)
+                .instances(spec.limits.max_instances)
                 .build(),
-            fuel_per_call: limits.call_fuel,
+            fuel_per_call: spec.limits.call_fuel,
         }
     }
 
+    /// Immutable host-owned identity and authority for this store.
+    #[must_use]
+    pub(crate) fn scope(&self) -> &PluginInstanceScope {
+        &self.scope
+    }
+
+    fn start_call(&mut self, secrets_enabled: bool) {
+        self.call_config = CallConfig::Unresolved;
+        self.secrets_enabled = secrets_enabled;
+        self.host_calls_remaining = MAX_HOST_CALLS_PER_FRAME;
+    }
+
+    fn finish_call(&mut self) {
+        self.call_config = CallConfig::Inactive;
+        self.secrets_enabled = false;
+        self.host_calls_remaining = 0;
+    }
+
+    fn with_call_config<T>(
+        &mut self,
+        use_config: impl FnOnce(&ResolvedPluginConfig) -> T,
+    ) -> Result<T, PluginError> {
+        if matches!(self.call_config, CallConfig::Inactive) {
+            return Err(PluginError::InvalidConfig(
+                "plugin host service called outside an active invocation frame".to_string(),
+            ));
+        }
+        if matches!(self.call_config, CallConfig::Unresolved) {
+            match self.services.resolve_config(&self.scope) {
+                Ok(config) => self.call_config = CallConfig::Resolved(config),
+                Err(error) => {
+                    self.call_config = CallConfig::Failed;
+                    return Err(error);
+                }
+            }
+        }
+        match &self.call_config {
+            CallConfig::Resolved(config) => Ok(use_config(config)),
+            CallConfig::Inactive | CallConfig::Unresolved | CallConfig::Failed => Err(
+                PluginError::InvalidConfig("plugin call config could not be resolved".to_string()),
+            ),
+        }
+    }
+
+    /// Resolve public configuration lazily for the active service frame.
+    pub(crate) fn public_config(&mut self) -> Result<serde_json::Value, PluginError> {
+        self.with_call_config(|config| config.public_json().clone())
+    }
+
+    /// Charge one ZeroClaw-owned host import against the active call budget.
+    pub(crate) fn charge_host_call(&mut self) -> bool {
+        if matches!(self.call_config, CallConfig::Inactive) || self.host_calls_remaining == 0 {
+            return false;
+        }
+        self.host_calls_remaining -= 1;
+        true
+    }
+
+    /// Resolve one secret from the same config revision used by this call.
+    pub(crate) fn secret(&mut self, name: &str) -> Result<String, SecretLookupError> {
+        if !self.charge_host_call() {
+            return Err(SecretLookupError::Unavailable);
+        }
+        if !self.secrets_enabled {
+            return Err(SecretLookupError::Unavailable);
+        }
+        if self.scope.id().capability() != PluginCapability::Tool
+            || !self.scope.grants().allows(PluginPermission::ConfigRead)
+        {
+            return Err(SecretLookupError::AccessDenied);
+        }
+        self.with_call_config(|config| config.secret(name).map(ToOwned::to_owned))
+            .map_err(|_| SecretLookupError::Unavailable)?
+            .ok_or(SecretLookupError::NotFound)
+    }
+
     /// Whether this state was built with outbound HTTP attached.
-    pub fn http_enabled(&self) -> bool {
+    pub(crate) fn http_enabled(&self) -> bool {
         self.http.is_some()
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
-    pub fn inbound(&self) -> &InboundQueue {
+    pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
     }
 }
@@ -209,22 +368,13 @@ pub fn engine() -> &'static Engine {
     })
 }
 
-pub fn new_store(permissions: &[PluginPermission], limits: PluginLimits) -> Store<PluginState> {
-    new_store_with_inbound(permissions, InboundQueue::default(), limits)
-}
-
-/// Like [`new_store`], but the resulting state shares `inbound` so a host
-/// listener can enqueue traffic the plugin drains. The limiter and per-call
-/// fuel are wired identically to [`new_store`].
-pub fn new_store_with_inbound(
-    permissions: &[PluginPermission],
-    inbound: InboundQueue,
-    limits: PluginLimits,
-) -> Store<PluginState> {
-    let state = PluginState::with_inbound(permissions, inbound, limits);
+/// Build a Wasmtime store whose imports are derived from one admitted scope.
+pub(crate) fn new_store(spec: PluginStoreSpec) -> Store<PluginState> {
+    let call_fuel = spec.limits.call_fuel;
+    let state = PluginState::new(spec);
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
-    set_call_fuel(&mut store, limits.call_fuel);
+    set_call_fuel(&mut store, call_fuel);
     store
 }
 
@@ -239,6 +389,39 @@ fn set_call_fuel(store: &mut Store<PluginState>, call_fuel: u64) {
 pub fn refuel(store: &mut Store<PluginState>) {
     let call_fuel = store.data().fuel_per_call;
     set_call_fuel(store, call_fuel);
+}
+
+/// Cancellation-safe owner of one active host-service frame.
+pub(crate) struct ActivePluginCall<'a> {
+    store: &'a mut Store<PluginState>,
+}
+
+impl<'a> ActivePluginCall<'a> {
+    /// Start a frame where secrets are unavailable.
+    pub(crate) fn new(store: &'a mut Store<PluginState>) -> Self {
+        Self::start(store, false)
+    }
+
+    /// Start a tool-execute frame where scoped secrets are available.
+    pub(crate) fn with_secrets(store: &'a mut Store<PluginState>) -> Self {
+        Self::start(store, true)
+    }
+
+    fn start(store: &'a mut Store<PluginState>, secrets_enabled: bool) -> Self {
+        refuel(store);
+        store.data_mut().start_call(secrets_enabled);
+        Self { store }
+    }
+
+    pub(crate) fn store_mut(&mut self) -> &mut Store<PluginState> {
+        self.store
+    }
+}
+
+impl Drop for ActivePluginCall<'_> {
+    fn drop(&mut self) {
+        self.store.data_mut().finish_call();
+    }
 }
 
 pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
@@ -264,35 +447,362 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     unsafe { Component::deserialize_file(engine(), wasm_path) }
 }
 
-/// Run an async call against a warm `Arc<Mutex<(Store, bindings)>>` plugin,
+/// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
 /// holding the store lock for the duration of the single component call.
-macro_rules! call_plugin {
-    ($self:expr, $body:expr) => {{
+macro_rules! call_plugin_frame {
+    ($self:expr, $constructor:ident, $body:expr) => {{
         let mut guard = $self.state.lock().await;
         let (ref mut store, ref mut bindings) = *guard;
-        crate::component::refuel(store);
+        let mut active_call = crate::component::ActivePluginCall::$constructor(store);
         let f = $body;
-        f(store, bindings).await
+        let result = f(active_call.store_mut(), bindings).await;
+        drop(active_call);
+        result
     }};
 }
+
+macro_rules! call_plugin {
+    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, new, $body) }};
+}
 pub(crate) use call_plugin;
+
+macro_rules! call_plugin_with_secrets {
+    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, with_secrets, $body) }};
+}
+pub(crate) use call_plugin_frame;
+pub(crate) use call_plugin_with_secrets;
+
+/// Run one direct store call inside the same transient service frame used by
+/// warm adapter calls. The RAII guard drops the transient resolved-config view
+/// on success, error, trap, panic unwinding, or future cancellation.
+macro_rules! call_store {
+    ($store:ident, $body:expr) => {{
+        let mut active_call = crate::component::ActivePluginCall::new(&mut $store);
+        let f = $body;
+        let result = f(active_call.store_mut()).await;
+        drop(active_call);
+        result
+    }};
+}
+pub(crate) use call_store;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{PluginConfigResolver, resolve_plugin_config};
+    use crate::{PluginCapability, PluginManifest};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn limits(call_fuel: u64) -> PluginLimits {
-        PluginLimits {
-            call_fuel,
-            max_memory_bytes: 256 * 1024 * 1024,
-            max_table_elements: 100_000,
-            max_instances: 64,
+    fn scope(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        crate::instance::test_scope(PluginCapability::Tool, binding, grants)
+    }
+
+    fn spec(grants: impl IntoIterator<Item = PluginPermission>, call_fuel: u64) -> PluginStoreSpec {
+        PluginStoreSpec::new(
+            scope("main", grants),
+            crate::services::test_host_services(),
+            test_limits(call_fuel),
+        )
+        .with_granted_http()
+    }
+
+    fn secret_manifest() -> PluginManifest {
+        PluginManifest {
+            name: "fixture".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            wasm_path: Some("fixture.wasm".to_string()),
+            capabilities: vec![PluginCapability::Tool],
+            permissions: vec![PluginPermission::ConfigRead],
+            config_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "revision": {"type": "string"},
+                    "api_key": {"type": "string", "x-secret": true}
+                },
+                "required": ["revision", "api_key"],
+                "additionalProperties": false
+            })),
+            signature: None,
+            publisher_key: None,
         }
+    }
+
+    fn secret_scope(
+        manifest: &PluginManifest,
+        binding: &str,
+        grant_config: bool,
+    ) -> PluginInstanceScope {
+        PluginInstanceScope::from_manifest(
+            manifest,
+            PluginCapability::Tool,
+            binding,
+            grant_config.then_some(PluginPermission::ConfigRead),
+        )
+        .expect("valid secret test scope")
+    }
+
+    fn configured(revision: &str, secret: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("revision".to_string(), revision.to_string()),
+            ("api_key".to_string(), secret.to_string()),
+        ])
+    }
+
+    fn static_services(
+        manifest: PluginManifest,
+        values: HashMap<String, String>,
+    ) -> PluginHostServices {
+        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, Some(&values))
+        }))
+    }
+
+    #[test]
+    fn denied_secret_lookup_never_invokes_the_resolver() {
+        let manifest = secret_manifest();
+        let denied = secret_scope(&manifest, "main", false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("denied lookup must not invoke config resolution")
+        }));
+        let mut state =
+            PluginState::new(PluginStoreSpec::new(denied, services, test_limits(1_000)));
+
+        state.start_call(true);
+        assert_eq!(
+            state.secret("api_key"),
+            Err(SecretLookupError::AccessDenied)
+        );
+        state.finish_call();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn disabled_secret_frame_never_invokes_the_resolver() {
+        let manifest = secret_manifest();
+        let scope = secret_scope(&manifest, "main", true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("disabled secret frame must not invoke config resolution")
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(false);
+        assert_eq!(state.secret("api_key"), Err(SecretLookupError::Unavailable));
+        state.finish_call();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn non_tool_secret_lookup_never_invokes_the_resolver() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Channel,
+            "main",
+            [PluginPermission::ConfigRead],
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("a non-tool store must not resolve secrets")
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(true);
+        assert_eq!(
+            state.secret("api_key"),
+            Err(SecretLookupError::AccessDenied)
+        );
+        state.finish_call();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn secret_lookup_rejects_a_view_from_another_scope_issuance() {
+        let manifest = Arc::new(secret_manifest());
+        let requested = secret_scope(&manifest, "main", true);
+        let issued = secret_scope(&manifest, "backup", true);
+        let resolver_manifest = Arc::clone(&manifest);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let values = configured("one", "backup-token");
+            resolve_plugin_config(&resolver_manifest, &issued, Some(&values))
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(
+            requested,
+            services,
+            test_limits(1_000),
+        ));
+
+        state.start_call(true);
+        assert_eq!(state.secret("api_key"), Err(SecretLookupError::Unavailable));
+        state.finish_call();
+    }
+
+    #[test]
+    fn one_frame_shares_one_live_revision_and_next_frame_refreshes() {
+        let manifest = Arc::new(secret_manifest());
+        let scope = secret_scope(&manifest, "main", true);
+        let values = Arc::new(std::sync::RwLock::new(configured("one", "token-one")));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_manifest = Arc::clone(&manifest);
+        let resolver_values = Arc::clone(&values);
+        let resolver_calls = Arc::clone(&calls);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            let values = resolver_values
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            resolve_plugin_config(&resolver_manifest, scope, Some(&values))
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(true);
+        assert_eq!(
+            state.public_config().expect("public config")["revision"],
+            "one"
+        );
+        *values.write().unwrap_or_else(|error| error.into_inner()) = configured("two", "token-two");
+        assert_eq!(state.secret("api_key"), Ok("token-one".to_string()));
+        assert_eq!(state.secret("api_key"), Ok("token-one".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        state.finish_call();
+
+        state.start_call(true);
+        assert_eq!(
+            state.public_config().expect("public config")["revision"],
+            "two"
+        );
+        assert_eq!(state.secret("api_key"), Ok("token-two".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        state.finish_call();
+    }
+
+    #[test]
+    fn failed_resolution_is_cached_for_the_frame() {
+        let manifest = secret_manifest();
+        let scope = secret_scope(&manifest, "main", true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            Err(PluginError::InvalidConfig("resolver detail".to_string()))
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(true);
+        assert_eq!(state.secret("api_key"), Err(SecretLookupError::Unavailable));
+        assert_eq!(state.secret("api_key"), Err(SecretLookupError::Unavailable));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        state.finish_call();
+    }
+
+    #[test]
+    fn host_call_budget_exhausts_and_resets_per_frame() {
+        let manifest = secret_manifest();
+        let scope = secret_scope(&manifest, "main", true);
+        let services = static_services(manifest, configured("one", "token"));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(true);
+        for _ in 0..MAX_HOST_CALLS_PER_FRAME {
+            assert_eq!(state.secret("api_key"), Ok("token".to_string()));
+        }
+        assert_eq!(state.secret("api_key"), Err(SecretLookupError::Unavailable));
+        state.finish_call();
+
+        state.start_call(true);
+        assert_eq!(state.secret("api_key"), Ok("token".to_string()));
+        state.finish_call();
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_the_active_config_and_budget() {
+        let manifest = secret_manifest();
+        let scope = secret_scope(&manifest, "main", true);
+        let services = static_services(manifest, configured("one", "token"));
+        let mut store = new_store(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(1), async {
+            let mut active_call = ActivePluginCall::new(&mut store);
+            active_call
+                .store_mut()
+                .data_mut()
+                .public_config()
+                .expect("config resolves inside an active frame");
+            std::future::pending::<()>().await;
+            drop(active_call);
+        })
+        .await;
+
+        assert!(cancelled.is_err(), "pending invocation must be cancelled");
+        assert!(store.data_mut().public_config().is_err());
+        assert_eq!(store.data().host_calls_remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn logging_and_inbound_share_the_frame_budget() {
+        use bindings::tool::zeroclaw::plugin::logging::{
+            Host as LoggingHost, LogLevel, PluginAction, PluginEvent,
+        };
+
+        let mut state = PluginState::new(spec([], 1_000));
+        state.inbound().enqueue(sample_inbound("budgeted"));
+        state.start_call(false);
+        state.host_calls_remaining = 1;
+
+        <PluginState as LoggingHost>::log_record(
+            &mut state,
+            LogLevel::Info,
+            PluginEvent {
+                function_name: "fixture::execute".to_string(),
+                action: PluginAction::Note,
+                outcome: None,
+                duration_ms: None,
+                attrs: None,
+                message: "budget test".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(state.host_calls_remaining, 0);
+        assert_eq!(
+            <PluginState as bindings::channel::zeroclaw::plugin::inbound::Host>::inbound_pending(
+                &mut state
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            state.inbound().pending(),
+            1,
+            "exhaustion must not drain data"
+        );
+        state.finish_call();
+
+        state.start_call(false);
+        let message =
+            <PluginState as bindings::channel::zeroclaw::plugin::inbound::Host>::inbound_poll(
+                &mut state,
+            )
+            .await
+            .expect("a fresh frame can reach the queued message");
+        assert_eq!(message.id, "budgeted");
+        state.finish_call();
     }
 
     #[test]
     fn http_absent_without_permission() {
-        let state = PluginState::new(&[], limits(0));
+        let state = PluginState::new(spec([], 0));
         assert!(
             !state.http_enabled(),
             "no HttpClient permission means no outbound HTTP context"
@@ -301,14 +811,14 @@ mod tests {
 
     #[test]
     fn http_absent_for_unrelated_permissions() {
-        let state = PluginState::new(
-            &[
+        let state = PluginState::new(spec(
+            [
                 PluginPermission::ConfigRead,
                 PluginPermission::MemoryRead,
                 PluginPermission::FileRead,
             ],
-            limits(0),
-        );
+            0,
+        ));
         assert!(
             !state.http_enabled(),
             "only HttpClient attaches the HTTP context"
@@ -317,7 +827,7 @@ mod tests {
 
     #[test]
     fn http_present_with_permission() {
-        let state = PluginState::new(&[PluginPermission::HttpClient], limits(0));
+        let state = PluginState::new(spec([PluginPermission::HttpClient], 0));
         assert!(
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
@@ -325,13 +835,28 @@ mod tests {
     }
 
     #[test]
+    fn grant_does_not_enable_http_without_adapter_opt_in() {
+        let granted_scope = scope("main", [PluginPermission::HttpClient]);
+        let state = PluginState::new(PluginStoreSpec::new(
+            granted_scope,
+            crate::services::test_host_services(),
+            test_limits(0),
+        ));
+
+        assert!(
+            !state.http_enabled(),
+            "an adapter must explicitly opt into its tested HTTP boundary"
+        );
+    }
+
+    #[test]
     fn http_coherence_accepts_matching_store_and_linker() {
-        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        let granted = new_store(spec([PluginPermission::HttpClient], 0));
         assert!(
             ensure_http_coherent(&granted, true).is_ok(),
             "granted store paired with an http linker is coherent"
         );
-        let plain = new_store(&[], limits(0));
+        let plain = new_store(spec([], 0));
         assert!(
             ensure_http_coherent(&plain, false).is_ok(),
             "ungranted store paired with a plain linker is coherent"
@@ -343,12 +868,12 @@ mod tests {
         // A registration path that links wasi:http against a store with no
         // HttpClient context (or the reverse) is refused at instantiate time
         // with a named error, not a WasiHttpView::http panic on first call.
-        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        let granted = new_store(spec([PluginPermission::HttpClient], 0));
         assert!(
             ensure_http_coherent(&granted, false).is_err(),
             "granted store with a plain linker cannot back its own permission"
         );
-        let plain = new_store(&[], limits(0));
+        let plain = new_store(spec([], 0));
         assert!(
             ensure_http_coherent(&plain, true).is_err(),
             "plain store with an http linker would panic on first outbound call"
@@ -440,7 +965,7 @@ mod tests {
     #[test]
     fn plugin_state_exposes_its_inbound_queue() {
         let q = InboundQueue::default();
-        let state = PluginState::with_inbound(&[], q.clone(), limits(0));
+        let state = PluginState::new(spec([], 0).with_inbound(q.clone()));
         q.enqueue(sample_inbound("y"));
         assert_eq!(
             state.inbound().pending(),
@@ -451,7 +976,7 @@ mod tests {
 
     #[test]
     fn engine_enables_fuel_metering() {
-        let mut store = Store::new(engine(), PluginState::new(&[], limits(0)));
+        let mut store = Store::new(engine(), PluginState::new(spec([], 0)));
         store
             .set_fuel(123)
             .expect("fuel must be enabled on the shared plugin engine");
@@ -460,13 +985,13 @@ mod tests {
 
     #[test]
     fn new_store_seeds_configured_budget() {
-        let store = new_store(&[], limits(777));
+        let store = new_store(spec([], 777));
         assert_eq!(store.get_fuel().expect("get_fuel"), 777);
     }
 
     #[test]
     fn zero_budget_traps_before_any_work() {
-        let store = new_store(&[], limits(0));
+        let store = new_store(spec([], 0));
         assert_eq!(
             store.get_fuel().expect("get_fuel"),
             0,
@@ -476,7 +1001,7 @@ mod tests {
 
     #[test]
     fn refuel_restores_per_call_budget_on_a_warm_store() {
-        let mut store = new_store(&[], limits(500));
+        let mut store = new_store(spec([], 500));
         store.set_fuel(3).expect("set_fuel");
         assert_eq!(store.get_fuel().expect("get_fuel"), 3);
         refuel(&mut store);
@@ -484,6 +1009,36 @@ mod tests {
             store.get_fuel().expect("get_fuel"),
             500,
             "refuel must reset a drained warm store to the configured per-call budget"
+        );
+    }
+
+    #[test]
+    fn stores_share_only_their_issued_instance_scope() {
+        let primary = scope("primary", []);
+        let primary_store = new_store(PluginStoreSpec::new(
+            primary.clone(),
+            crate::services::test_host_services(),
+            test_limits(0),
+        ));
+        let second_primary_store = new_store(PluginStoreSpec::new(
+            primary,
+            crate::services::test_host_services(),
+            test_limits(0),
+        ));
+        let backup_store = new_store(PluginStoreSpec::new(
+            scope("backup", []),
+            crate::services::test_host_services(),
+            test_limits(0),
+        ));
+
+        assert!(std::ptr::eq(
+            primary_store.data().scope().id(),
+            second_primary_store.data().scope().id()
+        ));
+        assert_ne!(
+            primary_store.data().scope().id(),
+            backup_store.data().scope().id(),
+            "separate bindings must not share a host-service namespace"
         );
     }
 }

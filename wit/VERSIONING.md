@@ -10,6 +10,7 @@ wit/
     memory.wit
     plugin-info.wit
     README.md
+    secrets.wit
     tool.wit
     types.wit
   v1/                 ← (future) breaking changes → zeroclaw:plugin@1.0.0
@@ -75,6 +76,14 @@ declared stable. After it exists:
   addressed before merge.
 
 #### Migration guide for plugin authors
+
+**Current experimental V0:** the tool world now imports the `secrets`
+interface. Rebuild tool components against the current `wit/v0/` definitions
+before installing them on this host. Publish the rebuilt component's new
+registry digest, and re-sign if any signature-covered manifest content changes.
+Prebuilt tool components from the earlier experimental world are not a
+conformance target; this is an intentional pre-stability break while
+`wit/v0/.frozen` is absent. The channel world does not import `secrets`.
 
 **Targeting a minor bump (e.g. 0.1 → 0.2):** recompile. No source changes
 needed for items added via `@since`.

@@ -30,10 +30,11 @@ interface channel {
         sender: string,
         reply-target: string,
         content: string,
-        /// Platform type identifier (e.g. `"telegram"`, `"discord"`).
+        /// Legacy platform hint. The host ignores this for routing and stamps
+        /// the channel type from the admitted logical endpoint.
         channel: string,
-        /// ZeroClaw channel alias, when the platform supports multiple bot
-        /// instances. Used to compute distinct session IDs per bot.
+        /// Legacy alias hint. The host ignores this for routing and stamps the
+        /// alias from the admitted instance binding.
         channel-alias: option<string>,
         /// Unix timestamp in milliseconds.
         timestamp: u64,
@@ -144,13 +145,13 @@ interface channel {
     /// Human-readable channel name.
     name: func() -> string;
 
-    /// Hand the plugin its resolved configuration section once at load time,
-    /// before any other call. `config` is a JSON object of the plugin's own
-    /// `[channels.<type>.<alias>]` settings, including secrets the host has
-    /// already decrypted. It is supplied only when the manifest grants
-    /// `config-read`; otherwise the host passes `"{}"`. This mirrors the
-    /// `__config` injection tool plugins receive, so a channel never has to
-    /// hardcode its field names into a host surface to be configured.
+    /// Hand the plugin its resolved configuration once at load time, before any
+    /// other call. `config` is the admitted instance's schema-validated typed
+    /// JSON object, including credential fields declared as ordinary strings.
+    /// Channel-capable manifests containing `x-secret: true` are rejected: this
+    /// world does not import the scoped secret service yet. If the instance
+    /// lacks the effective `config-read` grant, the host resolves an empty
+    /// object; channel construction fails when that object violates the schema.
     configure: func(config: string) -> result<_, string>;
 
     /// Send a message through this channel.
