@@ -13245,6 +13245,27 @@ impl Default for TelegramConfig {
     }
 }
 
+impl TelegramConfig {
+    /// Validate this alias's bot-token placeholder and enabled-state rules.
+    pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
+        if self.bot_token.trim() == crate::traits::UNSET_DISPLAY {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("channels.telegram.{alias}.bot_token"),
+                "channels.telegram.{alias}.bot_token must not contain the unset display placeholder",
+            );
+        }
+        if self.enabled && crate::traits::is_unset_display_value(&self.bot_token) {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("channels.telegram.{alias}.bot_token"),
+                "channels.telegram.{alias}.bot_token is required when channels.telegram.{alias}.enabled = true",
+            );
+        }
+        Ok(())
+    }
+}
+
 impl ChannelConfig for TelegramConfig {
     fn name() -> &'static str {
         "Telegram"
@@ -18718,6 +18739,7 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
+            tg.validate_bot_token(alias)?;
             validate_http_base_url(
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
@@ -23006,6 +23028,78 @@ api_base_url = "http://127.0.0.1:8081"
             .expect_err("malformed Telegram API base URL must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("channels.telegram.default.api_base_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_telegram_without_bot_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Telegram channel must require a bot token");
+        assert!(
+            err.to_string()
+                .contains("channels.telegram.telegram.bot_token")
+        );
+    }
+
+    #[test]
+    async fn validate_allows_disabled_telegram_without_bot_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: false,
+                bot_token: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Telegram channel may be staged without a bot token");
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_telegram_with_unset_display_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect_err("enabled Telegram channel must reject the display sentinel");
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_telegram_with_unset_display_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: false,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect_err("the unset display sentinel must never become persisted config");
     }
 
     // Regression (fail closed, both PAT-backed forge providers): a Gitea or

@@ -2352,14 +2352,7 @@ async fn run_quickstart_cli(
             } => SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: kind,
                 alias,
-                token: extras
-                    .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
+                fields: extras.into_iter().collect(),
             }),
             ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
         })
