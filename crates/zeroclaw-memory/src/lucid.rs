@@ -1,11 +1,14 @@
 use super::sqlite::SqliteMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -224,31 +227,71 @@ impl LucidMemory {
         timeout_window: Duration,
     ) -> anyhow::Result<String> {
         let mut cmd = Command::new(lucid_cmd);
-        cmd.args(args);
+        cmd.args(args)
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let output = timeout(timeout_window, cmd.output()).await.map_err(|_| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "command": lucid_cmd,
-                        "timeout_ms": timeout_window.as_millis() as u64,
-                    })),
-                "lucid command timed out"
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn lucid command {lucid_cmd:?}"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("lucid command stdout pipe was not captured")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("lucid command stderr pipe was not captured")?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+
+        let output = timeout(timeout_window, async {
+            let (status, stdout_result, stderr_result) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes),
             );
-            anyhow::Error::msg(format!(
-                "lucid command timed out after {}ms",
-                timeout_window.as_millis()
-            ))
-        })??;
+            stdout_result.context("failed to read lucid command stdout")?;
+            stderr_result.context("failed to read lucid command stderr")?;
+            status.context("failed to wait for lucid command")
+        })
+        .await;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let status = match output {
+            Ok(status) => status?,
+            Err(_) => {
+                let cleanup_error = child.kill().await.err().map(|error| error.to_string());
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": lucid_cmd,
+                            "timeout_ms": timeout_window.as_millis() as u64,
+                            "cleanup_error": cleanup_error,
+                        })),
+                    "lucid command timed out"
+                );
+                if let Some(cleanup_error) = cleanup_error {
+                    anyhow::bail!(
+                        "lucid command timed out after {}ms; failed to terminate and reap child: {cleanup_error}",
+                        timeout_window.as_millis()
+                    );
+                }
+                anyhow::bail!(
+                    "lucid command timed out after {}ms",
+                    timeout_window.as_millis()
+                );
+            }
+        };
+
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             anyhow::bail!("lucid command failed: {stderr}");
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::from_utf8_lossy(&stdout_bytes).to_string())
     }
 
     async fn run_lucid_command(
@@ -647,6 +690,26 @@ exit 1
         script_path.display().to_string()
     }
 
+    fn write_timeout_lucid_script(dir: &Path, pid_path: &Path, marker_path: &Path) -> String {
+        let script_path = dir.join("timeout-lucid.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$$" > "{}"
+sleep 1
+printf 'completed\n' > "{}"
+"#,
+            pid_path.display(),
+            marker_path.display()
+        );
+
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        script_path.display().to_string()
+    }
+
     fn write_probe_lucid_script(dir: &Path, marker_path: &Path) -> String {
         let script_path = dir.join("probe-lucid.sh");
         let marker = marker_path.display().to_string();
@@ -782,6 +845,41 @@ exit 1
             entries
                 .iter()
                 .any(|e| e.content.contains("Delayed token refresh guidance"))
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_and_reaps_lucid_child() {
+        let tmp = TempDir::new().unwrap();
+        let pid_path = tmp.path().join("child.pid");
+        let marker_path = tmp.path().join("completed.marker");
+        let cmd = write_timeout_lucid_script(tmp.path(), &pid_path, &marker_path);
+
+        let error = LucidMemory::run_lucid_command_raw(&cmd, &[], Duration::from_millis(200))
+            .await
+            .expect_err("delayed command must time out");
+        assert!(error.to_string().contains("timed out after 200ms"));
+
+        let pid = fs::read_to_string(&pid_path)
+            .expect("fake command must record its PID before the deadline")
+            .trim()
+            .to_string();
+        let still_running = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0 must be available on Unix")
+            .success();
+        assert!(
+            !still_running,
+            "timed-out Lucid child PID {pid} still exists"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            !marker_path.exists(),
+            "timed-out Lucid child continued running and wrote its late marker"
         );
     }
 

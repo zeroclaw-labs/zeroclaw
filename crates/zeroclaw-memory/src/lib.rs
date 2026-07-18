@@ -868,8 +868,14 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::{EmbeddingRouteConfig, LucidStorageConfig};
+    #[cfg(unix)]
+    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::EmbeddingRouteConfig;
 
     #[test]
     fn factory_sqlite() {
@@ -1138,28 +1144,148 @@ mod tests {
         assert_eq!(mem.name(), "lucid");
     }
 
-    #[test]
-    fn factory_lucid_accepts_storage_overrides() {
+    #[cfg(unix)]
+    fn write_factory_lucid_scripts(
+        dir: &Path,
+        selected_log: &Path,
+        decoy_log: &Path,
+    ) -> (String, String) {
+        let selected_path = dir.join("selected-lucid.sh");
+        let selected = format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = "store" ]; then
+  printf 'store-start:%s\n' "${{2:-}}" >> "{}"
+  case "${{2:-}}" in
+    fast_store:*)
+      sleep 0.2
+      printf 'fast-store-complete\n' >> "{}"
+      ;;
+    slow_store:*)
+      sleep 0.5
+      printf 'slow-store-complete\n' >> "{}"
+      ;;
+  esac
+  exit 0
+fi
+if [ "${{1:-}}" = "context" ]; then
+  printf 'context-start\n' >> "{}"
+  sleep 0.2
+  printf 'context-complete\n' >> "{}"
+  cat <<'EOF'
+<lucid-context>
+- [decision] Factory-selected remote result
+</lucid-context>
+EOF
+  exit 0
+fi
+exit 1
+"#,
+            selected_log.display(),
+            selected_log.display(),
+            selected_log.display(),
+            selected_log.display(),
+            selected_log.display(),
+        );
+        fs::write(&selected_path, selected).unwrap();
+        let mut selected_perms = fs::metadata(&selected_path).unwrap().permissions();
+        selected_perms.set_mode(0o755);
+        fs::set_permissions(&selected_path, selected_perms).unwrap();
+
+        let decoy_path = dir.join("decoy-lucid.sh");
+        let decoy = format!(
+            "#!/bin/sh\nprintf 'invoked\\n' >> \"{}\"\nexit 1\n",
+            decoy_log.display()
+        );
+        fs::write(&decoy_path, decoy).unwrap();
+        let mut decoy_perms = fs::metadata(&decoy_path).unwrap().permissions();
+        decoy_perms.set_mode(0o755);
+        fs::set_permissions(&decoy_path, decoy_perms).unwrap();
+
+        (
+            selected_path.display().to_string(),
+            decoy_path.display().to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parsed_lucid_alias_drives_factory_binary_and_distinct_timeouts() {
         let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "lucid".into(),
-            ..MemoryConfig::default()
-        };
-        let lucid_storage = LucidStorageConfig {
-            binary_path: Some("/opt/lucid/bin/lucid".to_string()),
-            recall_timeout_ms: Some(5_000),
-            store_timeout_ms: Some(4_000),
-        };
-        let mem = create_memory_with_storage_and_routes(
-            &cfg,
-            &[],
-            ActiveStorage::Lucid(&lucid_storage),
+        let selected_log = tmp.path().join("selected.log");
+        let decoy_log = tmp.path().join("decoy.log");
+        let (selected_cmd, decoy_cmd) =
+            write_factory_lucid_scripts(tmp.path(), &selected_log, &decoy_log);
+        let raw = format!(
+            r#"
+default_temperature = 0.7
+
+[memory]
+backend = "lucid.selected"
+
+[storage.lucid.selected]
+binary_path = "{selected_cmd}"
+recall_timeout_ms = 100
+store_timeout_ms = 300
+
+[storage.lucid.decoy]
+binary_path = "{decoy_cmd}"
+recall_timeout_ms = 900
+store_timeout_ms = 900
+"#
+        );
+        let config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
+        config.validate().expect("Lucid aliases must validate");
+
+        let memory = create_memory_with_storage_and_routes(
+            &config.memory,
+            &config.embedding_routes,
+            config.resolve_active_storage(),
             tmp.path(),
             None,
-            None,
+            Some(&config.providers.models),
         )
-        .unwrap();
-        assert_eq!(mem.name(), "lucid");
+        .expect("build Lucid memory from parsed alias");
+
+        memory
+            .store(
+                "fast_store",
+                "Fast factory store",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        memory
+            .store(
+                "slow_store",
+                "Slow factory store",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let entries = memory.recall("factory", 5, None, None, None).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
+        assert!(selected_calls.contains("store-start:fast_store:"));
+        assert!(selected_calls.contains("fast-store-complete"));
+        assert!(selected_calls.contains("store-start:slow_store:"));
+        assert!(!selected_calls.contains("slow-store-complete"));
+        assert!(selected_calls.contains("context-start"));
+        assert!(!selected_calls.contains("context-complete"));
+        assert!(!decoy_log.exists(), "unselected Lucid alias was invoked");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.content.contains("factory store"))
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.content.contains("Factory-selected remote result"))
+        );
     }
 
     #[test]
