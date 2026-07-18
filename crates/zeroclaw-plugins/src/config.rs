@@ -13,7 +13,6 @@ use std::sync::Arc;
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use serde_json::Map;
 use serde_json::Value;
-#[cfg(any(feature = "plugins-wasmtime", test))]
 use zeroclaw_api::plugin_key::SecretPropertyRef;
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use zeroize::Zeroizing;
