@@ -87,6 +87,7 @@ enum Mode {
     Sop,
 }
 
+#[derive(Default)]
 struct ChromeStatus {
     status: Option<StatusResult>,
     health: Option<serde_json::Value>,
@@ -98,18 +99,6 @@ struct ChromeStatus {
 struct ChromeStatusSnapshot {
     status: Option<StatusResult>,
     health: Option<serde_json::Value>,
-}
-
-impl Default for ChromeStatus {
-    fn default() -> Self {
-        Self {
-            status: None,
-            health: None,
-            last_poll: None,
-            refresh_in_flight: false,
-            refresh_rx: None,
-        }
-    }
 }
 
 impl ChromeStatus {

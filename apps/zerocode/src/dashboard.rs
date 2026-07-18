@@ -17,7 +17,6 @@ use crate::client::{
 };
 use crate::mouse;
 use crate::theme;
-use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -2804,19 +2803,21 @@ fn overview_status_lines(
     lines
 }
 
-fn config_kind_label(kind: &RuntimeConfigKind) -> String {
+fn config_kind_label(kind: &str) -> String {
     match kind {
-        RuntimeConfigKind::Default => crate::i18n::t("zc-dashboard-config-kind-default"),
-        RuntimeConfigKind::Custom => crate::i18n::t("zc-dashboard-config-kind-custom"),
-        RuntimeConfigKind::Temporary => crate::i18n::t("zc-dashboard-config-kind-temporary"),
+        "default" => crate::i18n::t("zc-dashboard-config-kind-default"),
+        "custom" => crate::i18n::t("zc-dashboard-config-kind-custom"),
+        "temporary" => crate::i18n::t("zc-dashboard-config-kind-temporary"),
+        other => other.to_string(),
     }
 }
 
-fn config_kind_style(kind: &RuntimeConfigKind) -> Style {
+fn config_kind_style(kind: &str) -> Style {
     match kind {
-        RuntimeConfigKind::Default => theme::body_style(),
-        RuntimeConfigKind::Custom => theme::accent_style(),
-        RuntimeConfigKind::Temporary => theme::warn_style(),
+        "default" => theme::body_style(),
+        "custom" => theme::accent_style(),
+        "temporary" => theme::warn_style(),
+        _ => theme::body_style(),
     }
 }
 
@@ -2921,7 +2922,7 @@ mod tests {
             active_sessions: 2,
             config_dir: Some("/tmp/zc-profile".into()),
             config_file: Some("/tmp/zc-profile/config.toml".into()),
-            config_kind: Some(RuntimeConfigKind::Temporary),
+            config_kind: Some("temporary".into()),
             local_ipc_endpoint: Some("/tmp/zc-profile/data/daemon.sock".into()),
         }
     }
@@ -3075,15 +3076,12 @@ mod tests {
 
         assert!(text.contains("1.0M / 4.0M (25.0%)"), "memory: {text}");
         assert!(
-            text.contains(&format!(
-                "{}",
-                crate::i18n::t_args(
-                    "zc-dashboard-cpu-with-cores",
-                    &[
-                        ("cpu", &crate::i18n::t("zc-dashboard-loading")),
-                        ("cores", "8")
-                    ],
-                )
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-cpu-with-cores",
+                &[
+                    ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                    ("cores", "8"),
+                ],
             )),
             "cpu loading: {text}"
         );

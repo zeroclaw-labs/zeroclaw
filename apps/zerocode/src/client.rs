@@ -1,8 +1,7 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
 //!
-//! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
-//! plumbing the daemon uses for bidirectional calls.
+//! Uses local JSON-RPC transport types so `zerocode` stays an RPC-only surface.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,7 +12,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
-use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
@@ -2724,7 +2722,7 @@ pub struct StatusResult {
     #[serde(default)]
     pub config_file: Option<String>,
     #[serde(default)]
-    pub config_kind: Option<RuntimeConfigKind>,
+    pub config_kind: Option<String>,
     #[serde(default)]
     pub local_ipc_endpoint: Option<String>,
 }
@@ -2752,7 +2750,7 @@ mod dashboard_status_tests {
             status.config_file.as_deref(),
             Some("/tmp/zeroclaw-profile/config.toml")
         );
-        assert_eq!(status.config_kind, Some(RuntimeConfigKind::Temporary));
+        assert_eq!(status.config_kind.as_deref(), Some("temporary"));
         assert_eq!(
             status.local_ipc_endpoint.as_deref(),
             Some("/tmp/zeroclaw-profile/data/daemon.sock")
