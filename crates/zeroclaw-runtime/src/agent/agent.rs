@@ -1353,6 +1353,7 @@ impl Agent {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
         agent_alias: &str,
