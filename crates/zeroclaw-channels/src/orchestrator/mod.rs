@@ -26597,6 +26597,249 @@ Done."#;
             "raw agent resolved.parallel_tools should be false (serde-skipped default)"
         );
     }
+
+    /// The delivery-failure loop through the REAL runtime turn path, with only
+    /// the external Inkbox API mocked and the model output scripted: a signed
+    /// webhook enters through the channel's real HTTP handler; the inbound
+    /// message drives a real `process_channel_message` turn (session-keyed
+    /// history, model call, reply dispatch); the dispatched reply is rejected
+    /// by the mocked outbound content policy; the channel wakes the agent; the
+    /// wake drives a second real turn whose history proves it rejoined the
+    /// same session; and the corrected resend crosses the wire exactly once.
+    /// (This test performs the dispatch loop's forwarding step — receiver to
+    /// `process_channel_message` — explicitly, once per message.)
+    #[cfg(feature = "channel-inkbox")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inkbox_delivery_failure_recovers_through_the_real_turn_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SIGNING_KEY: &str = "test-signing-key";
+        const PHONE_ID: &str = "44444444-4444-4444-4444-444444444444";
+        const BAD_REPLY: &str =
+            "\u{1f389}\u{1f389}\u{1f389} **DETAILS** \u{1f389}\u{1f389}\u{1f389}";
+        const FIXED_REPLY: &str = "Sounds good. The details are on their way.";
+
+        // Mocked Inkbox API: identity resolution, one content-policy
+        // rejection, then acceptance.
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/identities/support-bot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "11111111-1111-1111-1111-111111111111",
+                "organization_id": "org_x",
+                "agent_handle": "support-bot",
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:00+00:00",
+                "phone_number": {
+                    "id": PHONE_ID,
+                    "number": "+15550001111",
+                    "type": "local",
+                    "status": "active",
+                    "incoming_call_action": "webhook",
+                    "created_at": "2026-06-01T00:00:00+00:00",
+                    "updated_at": "2026-06-01T00:00:00+00:00"
+                }
+            })))
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/phone/numbers/{PHONE_ID}/texts")))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "detail": {
+                    "error": "message_blocked_spam_filter",
+                    "rule": "emoji_overload",
+                    "message": "too many emoji for carrier delivery"
+                }
+            })))
+            .up_to_n_times(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/phone/numbers/{PHONE_ID}/texts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "66666666-6666-6666-6666-666666666666",
+                "direction": "outbound",
+                "local_phone_number": "+15550001111",
+                "type": "sms",
+                "is_read": false,
+                "created_at": "2026-06-01T00:00:00+00:00",
+                "updated_at": "2026-06-01T00:00:00+00:00"
+            })))
+            .mount(&api)
+            .await;
+
+        // The REAL channel: inbound webhook server + SDK send path.
+        let mut stack = crate::inkbox::test_support::stack(&api.uri(), SIGNING_KEY, "zc").await;
+
+        // Scripted model: first turn writes the undeliverable reply, second
+        // turn the corrected one. Captures the history each turn receives so
+        // session continuity is provable.
+        struct ScriptedModel {
+            calls: std::sync::atomic::AtomicUsize,
+            histories: tokio::sync::Mutex<Vec<Vec<ChatMessage>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for ScriptedModel {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.scripted(&[]).await
+            }
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.scripted(messages).await
+            }
+        }
+        impl ScriptedModel {
+            async fn scripted(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
+                self.histories.lock().await.push(messages.to_vec());
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Script by conversation content, not call order: the turn
+                // path may make auxiliary model calls, so the corrected reply
+                // is produced exactly when the delivery-failure wake is the
+                // latest user turn.
+                let is_wake_turn = messages
+                    .iter()
+                    .rfind(|m| m.role == "user")
+                    .is_some_and(|m| m.content.contains("inkbox:delivery_failure"));
+                Ok(if is_wake_turn { FIXED_REPLY } else { BAD_REPLY }.to_string())
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ScriptedModel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "ScriptedModel"
+            }
+        }
+        let model = Arc::new(ScriptedModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            histories: tokio::sync::Mutex::new(Vec::new()),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            stack.channel.clone() as Arc<dyn Channel>,
+            model.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        // A signed inbound SMS through the channel's real HTTP handler.
+        let inbound_event = serde_json::json!({
+            "event_type": "text.received",
+            "data": { "text_message": {
+                "id": "t1", "direction": "inbound", "conversation_id": "c1",
+                "remote_phone_number": "+15550002222",
+                "text": "can you send me the details?"
+            } }
+        })
+        .to_string();
+        let http = reqwest::Client::new();
+        let mut req = http.post(&stack.webhook_url).body(inbound_event.clone());
+        for (name, value) in
+            crate::inkbox::test_support::signed_headers(&inbound_event, SIGNING_KEY)
+        {
+            req = req.header(name, value);
+        }
+        assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+        let inbound_msg = tokio::time::timeout(std::time::Duration::from_secs(5), stack.rx.recv())
+            .await
+            .expect("inbound within 5s")
+            .expect("channel open");
+        assert_eq!(inbound_msg.reply_target, "sms:c1");
+
+        // Turn 1: the real turn path composes and dispatches the reply, and
+        // the mocked content policy rejects it at the wire.
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            inbound_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        // The rejection woke the agent with the whole story.
+        let wake = tokio::time::timeout(std::time::Duration::from_secs(5), stack.rx.recv())
+            .await
+            .expect("wake within 5s")
+            .expect("channel open");
+        assert!(
+            wake.content
+                .contains("[inkbox:delivery_failure channel=sms stage=send_rejected attempt=1/3"),
+            "wake marker: {}",
+            wake.content
+        );
+        // The orchestrator may normalize formatting before dispatch, so match
+        // on the reply's distinctive content rather than the exact bytes.
+        assert!(
+            wake.content.contains("DETAILS"),
+            "undelivered body echoed: {}",
+            wake.content
+        );
+        assert_eq!(
+            wake.sender, inbound_msg.sender,
+            "wake targets the same sender-scoped session"
+        );
+
+        // Turn 2: the wake drives another REAL turn; the corrected reply
+        // dispatches through the same channel and the API accepts it.
+        process_channel_message(runtime_ctx, wake, CancellationToken::new()).await;
+
+        // Session continuity: the wake turn's history contains the original
+        // inbound utterance, proving the second turn rejoined the first
+        // turn's conversation history rather than starting fresh.
+        let histories = model.histories.lock().await;
+        let wake_turn = histories
+            .iter()
+            .find(|h| {
+                h.iter()
+                    .rfind(|m| m.role == "user")
+                    .is_some_and(|m| m.content.contains("inkbox:delivery_failure"))
+            })
+            .expect("a real model turn ran on the wake");
+        assert!(
+            wake_turn
+                .iter()
+                .any(|m| m.content.contains("can you send me the details?")),
+            "wake turn rejoined the session history"
+        );
+        drop(histories);
+
+        // Exactly two sends crossed the wire: the rejected one and the fix.
+        let sends: Vec<serde_json::Value> = api
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("/texts"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap_or(serde_json::Value::Null))
+            .collect();
+        assert_eq!(sends.len(), 2, "no duplicate sends: {sends:?}");
+        assert!(
+            sends[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("DETAILS"),
+            "first wire send is the rejected reply: {sends:?}"
+        );
+        assert_eq!(sends[1]["text"], FIXED_REPLY);
+        assert_eq!(sends[1]["conversation_id"], "c1");
+    }
 }
 
 #[cfg(test)]

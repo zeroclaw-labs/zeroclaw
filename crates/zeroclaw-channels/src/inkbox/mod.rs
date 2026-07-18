@@ -442,6 +442,7 @@ impl Channel for InkboxChannel {
             signing_key: self.signing_key.clone(),
             alias: self.alias.clone(),
             public_host,
+            request_dedup: std::sync::Arc::default(),
         });
         let server = zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await });
 
@@ -573,5 +574,84 @@ mod tests {
             reply_route("slack:xyz"),
             ReplyRoute::Unknown("slack")
         ));
+    }
+}
+
+/// Test-only plumbing for crate-level tests (the orchestrator's turn-path
+/// test) that need a live Inkbox channel stack: the real inbound webhook
+/// server and the real send path, against a mocked Inkbox API.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+    use zeroclaw_api::channel::ChannelMessage;
+
+    /// A running channel stack: the channel itself, the loopback webhook URL,
+    /// and the orchestrator-side receiver its inbound events land on.
+    pub(crate) struct TestStack {
+        pub channel: Arc<super::InkboxChannel>,
+        pub webhook_url: String,
+        pub rx: mpsc::Receiver<ChannelMessage>,
+    }
+
+    /// Serve the channel's real inbound router on a loopback port, with the
+    /// delivery-failure sink wired the way `listen` wires it.
+    pub(crate) async fn stack(base_url: &str, signing_key: &str, alias: &str) -> TestStack {
+        // The blocking SDK client spins its own runtime; build it off the
+        // test runtime.
+        let base = base_url.to_string();
+        let client = std::thread::spawn(move || {
+            inkbox::Inkbox::builder("ApiKey_test")
+                .base_url(&base)
+                .build()
+                .expect("client builds")
+        })
+        .join()
+        .expect("client thread");
+        let channel = Arc::new(super::InkboxChannel::new(
+            client,
+            "support-bot",
+            signing_key,
+            alias,
+        ));
+        let (tx, rx) = mpsc::channel(16);
+        channel.failure.set_sender(tx.clone());
+        let app = super::inbound::router(super::inbound::AppState {
+            tx,
+            failure: channel.failure.clone(),
+            signing_key: signing_key.to_string(),
+            alias: alias.to_string(),
+            public_host: "example.test".to_string(),
+            request_dedup: Arc::default(),
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
+        zeroclaw_spawn::spawn!(axum::serve(listener, app).into_future());
+        TestStack {
+            channel,
+            webhook_url,
+            rx,
+        }
+    }
+
+    /// Sign a webhook body the way the Inkbox server does: HMAC over
+    /// `"{request_id}.{timestamp}."` plus the raw body.
+    pub(crate) fn signed_headers(body: &str, signing_key: &str) -> [(&'static str, String); 3] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let timestamp = super::now_secs().to_string();
+        let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes()).unwrap();
+        mac.update(format!("{request_id}.{timestamp}.").as_bytes());
+        mac.update(body.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        [
+            ("x-inkbox-request-id", request_id),
+            ("x-inkbox-timestamp", timestamp),
+            ("x-inkbox-signature", format!("sha256={sig}")),
+        ]
     }
 }
