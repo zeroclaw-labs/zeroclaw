@@ -1,10 +1,4 @@
 //! Memory snapshot — export/import core memories as human-readable Markdown.
-//!
-//! **Atomic Soul Export**: dumps `MemoryCategory::Core` from SQLite into
-//! `MEMORY_SNAPSHOT.md` so the agent's "soul" is always Git-visible.
-//!
-//! **Auto-Hydration**: if `brain.db` is missing but `MEMORY_SNAPSHOT.md` exists,
-//! re-indexes all entries back into a fresh SQLite database.
 
 use anyhow::Result;
 use chrono::Local;
@@ -23,7 +17,6 @@ const SNAPSHOT_HEADER: &str = "# 🧠 ZeroClaw Memory Snapshot\n\n\
     > in this workspace and it will auto-hydrate from this file.\n\n";
 
 /// Export all `Core` memories from SQLite → `MEMORY_SNAPSHOT.md`.
-///
 /// Returns the number of entries exported.
 pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let db_path = workspace_dir.join("memory").join("brain.db");
@@ -102,7 +95,6 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 }
 
 /// Import memories from `MEMORY_SNAPSHOT.md` into SQLite.
-///
 /// Called during cold-boot when `brain.db` doesn't exist but the snapshot does.
 /// Returns the number of entries hydrated.
 pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
@@ -204,11 +196,6 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     Ok(hydrated)
 }
 
-/// Check if we should auto-hydrate on startup.
-///
-/// Returns `true` if:
-/// 1. `brain.db` does NOT exist (or is empty)
-/// 2. `MEMORY_SNAPSHOT.md` DOES exist
 pub fn should_hydrate(workspace_dir: &Path) -> bool {
     let db_path = workspace_dir.join("memory").join("brain.db");
     let snapshot = snapshot_path(workspace_dir);

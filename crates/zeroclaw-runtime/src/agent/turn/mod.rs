@@ -1,51 +1,4 @@
 //! The agent turn engine, decomposed into single-purpose step modules.
-//!
-//! Public paths are unchanged: external code keeps importing via
-//! `crate::agent::loop_::*` (re-export block there). Full contract manifest:
-//! `/opt/notes/work/zeroclaw/unification_modular/RUN_SHEET.md` (condensed
-//! copy below) during the #7415 migration.
-//!
-//! # Run sheet (condensed)
-//!
-//! [`run_tool_call_loop`] is the orchestrator: loop control only, no step
-//! logic. [`TurnCtx`] carries shared refs ONLY; every `&mut` the loop owns
-//! (history, loop detector, `seen_tool_signatures` — reset per iteration —
-//! identical-output counters, accumulated display text, malformed-retry
-//! counter) stays a loop local passed as an explicit argument.
-//!
-//! Per-iteration step sequence:
-//!
-//! ```text
-//! preflight_history_maintenance(&mut history)            history_window.rs
-//! → [model-switch check — inline]
-//! → build_iteration_tool_specs(..)                       tool_specs.rs
-//! → resolve_vision_provider(..)                          vision_route.rs
-//! → [active triple derivation — inline]
-//! → prepare_messages_for_iteration(..)                   vision_route.rs
-//! → announce_llm_request(ctx, ..) -> Instant             provider_call.rs
-//! → enforce_tool_loop_budget()                           provider_call.rs
-//! → call_provider(ctx, ..) -> ProviderCallOutcome        provider_call.rs
-//!     [streaming: consume_provider_streaming_response]   stream_consume.rs
-//!     [cancel asymmetry: see ProviderCallOutcome docs]
-//! → Ok:  interpret_chat_response(ctx, ..)                parse_response.rs
-//!   Err: record_llm_failure(..);                         context_recovery.rs
-//!        try_recover_context_overflow(..) -> bool (true ⇒ continue)
-//! → resolve_display_text / [malformed-retry — inline]
-//!   / [no-tool exit — inline, stream_text_posthoc_chunks → events.rs]
-//! → prepare_tool_calls(ctx, &mut seen, ..)               call_prep.rs
-//!     [approval via gate_tool_approval]                  approval_gate.rs
-//! → [execute dispatch — inline → tool_execution::execute_tools_{parallel,sequential}]
-//! → record_executed_outcomes(ctx, .., &mut ordered)      post_exec.rs
-//! → collect_tool_results(..) -> CollectedResults         results_collect.rs
-//! → check_identical_output_abort(.., &mut counters)      results_collect.rs
-//! → append_tool_round_to_history(&mut history, ..)       history_append.rs
-//! [loop exhausted] → finish_after_max_iterations(..)     max_iter.rs
-//! ```
-//!
-//! Leaf/type modules: `context` (TurnCtx), `events` (StreamDelta/DraftEvent,
-//! pacing consts, post-hoc chunker), `outcome` (ToolLoopCancelled,
-//! ModelSwitchRequested), `redact` (scrub_credentials), `stream_guard` +
-//! `protocol_detect` (streaming protocol suppression), `delivery_defaults`.
 
 pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
@@ -133,39 +86,6 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
-// ── Agent Tool-Call Loop ──────────────────────────────────────────────────
-// Core agentic iteration: send conversation to the LLM, parse any tool
-// calls from the response, execute them, append results to history, and
-// repeat until the LLM produces a final text-only answer.
-//
-// Loop invariant: at the start of each iteration, `history` contains the
-// full conversation so far (system prompt + user messages + prior tool
-// results). The loop exits when:
-//   • the LLM returns no tool calls (final answer), or
-//   • max_iterations is reached (runaway safety), or
-//   • the cancellation token fires (external abort).
-
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-///
-/// `new_messages_out` is an append-log: every message the loop adds to
-/// `history` is mirrored into it at push time (a clone taken before any
-/// later in-loop history maintenance), so it is populated on **every** exit
-/// — success, error, and cancellation — and never derived from history
-/// indices, which in-loop pruning can invalidate. Loop-detection system
-/// notes are the one exception (merged into the existing system message;
-/// only reachable when pattern loop detection is enabled, which no
-/// `new_messages_out` consumer turns on).
-/// All parameters of [`run_tool_call_loop`], bundled into one borrowed struct.
-///
-/// Field names and types mirror the loop's former positional arguments
-/// one-for-one (the loop borrows everything for the duration of the turn,
-/// including the `&mut` working sets `history`, `steering`, `new_messages_out`,
-/// and `image_cache`). [`LoopKnobs`] stays a nested sub-bundle in `knobs`.
-///
-/// Callers build this struct literal and pass it by value; the loop
-/// destructures it once at entry, so the body reads exactly as it did when
-/// these were positional parameters.
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -184,12 +104,6 @@ pub struct ToolLoop<'a> {
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
-    /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
-    /// with the turn into the engine, where the universal SOP policy layer
-    /// dispositions it at P1 (turn entry) and P2 (each steering injection).
-    /// Phase-1 callers stamp a per-origin envelope; real per-transport
-    /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
-    /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
     /// The per-turn memory half for unified memory-context injection: the
     /// handle, raw recall query, session scopes, and spawn-site suppression.
@@ -294,13 +208,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
-    // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
-    // RFC #6971: every inbound turn passes the universal SOP policy layer before
-    // a model sees it. The default policy dispositions to `Loop` (run the agent,
-    // today's behavior); the layer is always on, never skipped. `ingress` is
-    // consumed here (passed to `ingress_policy`) so it is never dead code under
-    // `-D warnings`. The text dispositioned at P1 is the trailing user turn —
-    // the most recently appended `user` history message, when present.
     let ingress_policy_cfg = IngressPolicy::default();
     let p1_text = history
         .iter()
@@ -328,13 +235,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
-    // ── Memory-context injection (unified) ──────────────────────────────────
-    // The ONE injection point for the memory preamble, replacing the per-path
-    // inline renderers. The decision is keyed on the ingress origin (sub-turns
-    // never inject; scheduled origins exclude Conversation entries); the
-    // pipeline and its documented uniform behavior live in
-    // `agent::memory_inject`. Injection prepends to the trailing user message
-    // AFTER the P1 policy scan, so policy always sees the caller's own text.
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -420,14 +320,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     };
 
     for iteration in 0..max_iterations {
-        // Steering: fold caller-pushed mid-turn messages into history before
-        // this iteration's provider request.
-        //
-        // ── Ingress policy · P2 (steering drain) ────────────────────────────
-        // RFC #6971: each mid-turn injection passes the same universal policy
-        // layer as P1. The default policy dispositions to `Loop` → append as
-        // today. The envelope (`ingress`) carries the turn's provenance to the
-        // policy for each drained message.
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -481,14 +373,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         preflight_history_maintenance(history);
 
         if iteration == 0 && context_token_budget > 0 {
-            // The system prompt + inlined tool definitions form an irreducible
-            // floor whole-turn trimming can never drop. When that floor alone
-            // meets or exceeds the budget, trimming conversation history can
-            // never bring the request under budget — surface the actionable
-            // root cause once per turn (this block is gated on iteration == 0)
-            // so the misconfiguration is not silent (#5808). Whole-turn
-            // trimming below still runs and is harmless (it keeps the most
-            // recent turn); the model call / reactive recovery proceeds.
             let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
             if system_floor >= context_token_budget {
                 let __zc_floor_span = ::zeroclaw_log::info_span!(
@@ -633,12 +517,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ..
         } = iteration_tool_specs;
 
-        // ── Per-turn system prompt anchor refresh (#8054 Surface 3) ──
-        // The system prompt in `history[0]` was built by
-        // `Agent::build_system_prompt()` against the base provider, and
-        // may not reflect this iteration's `active_model_provider` after
-        // vision routing.  Swap the TASK_FRAMING anchor so the prompt's
-        // tool-availability claim matches the actual `request_tools`.
         refresh_prompt_anchor(history, use_native_tools);
 
         let prepared_messages = prepare_messages_for_iteration(
@@ -934,12 +812,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
             return Ok(accumulated_display_text);
         }
-
-        // Do not accumulate intermediate-turn display text into the final
-        // channel response. Native tool-call providers may emit narration or
-        // scratchpad-like text alongside tool calls; draft-capable channels
-        // can still see it live through `on_delta` below, but the final
-        // delivered response must only contain the final assistant turn.
 
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
@@ -1551,17 +1423,6 @@ async fn drive_live_sop_actions(
     Ok(())
 }
 
-/// Per-turn system prompt TASK_FRAMING anchor refresh (#8054 Surface 3).
-///
-/// The system prompt in `history[0]` was built by
-/// `Agent::build_system_prompt()` against the base provider, and may not
-/// reflect the iteration's `active_model_provider` after vision routing.
-/// This function surgically swaps the `NATIVE_TOOLS_TASK_FRAMING` /
-/// `NO_TOOLS_TASK_FRAMING` anchor so the prompt's tool-availability claim
-/// matches the actual `request_tools` for this iteration.
-///
-/// When neither anchor is present (custom `system_prompt_prefix`), the
-/// function is a no-op — same as the pre-existing behavior.
 fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
     if let Some(first) = history.first_mut()
         && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)

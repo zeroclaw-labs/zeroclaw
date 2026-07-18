@@ -91,7 +91,7 @@ Regardless of approach:
 
 ```sh
 zeroclaw config list                          # loads config; any validation failures print to stderr
-zeroclaw models refresh --provider <type>.<alias>   # list models the endpoint advertises
+zeroclaw models refresh --model-provider <type>.<alias>   # list models the endpoint advertises
 zeroclaw agent -a <alias> -m "hello"          # smoke-test against the agent at `[agents.<alias>]`
 ```
 

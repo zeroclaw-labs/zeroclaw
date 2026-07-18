@@ -3,16 +3,6 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// Custom Tunnel — bring your own tunnel binary.
-///
-/// Provide a `start_command` with `{port}` and `{host}` placeholders.
-/// Optionally provide a `url_pattern` regex to extract the public URL
-/// from stdout, and a `health_url` to poll for liveness.
-///
-/// Examples:
-/// - `bore local {port} --to bore.pub`
-/// - `frp -c /etc/frp/frpc.ini`
-/// - `ssh -R 80:localhost:{port} serveo.net`
 pub struct CustomTunnel {
     start_command: String,
     health_url: Option<String>,
