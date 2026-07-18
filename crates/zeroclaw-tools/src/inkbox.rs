@@ -368,8 +368,7 @@ impl Tool for InkboxPlaceCall {
         json!({
             "type": "object",
             "properties": {
-                "to_number": { "type": "string", "description": "Recipient E.164 number." },
-                "client_websocket_url": { "type": "string", "description": "Optional explicit call-media WS URL; defaults to the agent's tunnel." }
+                "to_number": { "type": "string", "description": "Recipient E.164 number." }
             },
             "required": ["to_number"]
         })
@@ -378,17 +377,18 @@ impl Tool for InkboxPlaceCall {
         let Some(to_number) = str_arg(&args, "to_number") else {
             return Ok(fail("`to_number` is required"));
         };
-        let explicit_ws = str_arg(&args, "client_websocket_url");
         Ok(self
             .ctx
             .run(move |id| {
-                // Default the media leg to this identity's tunnel so the call
-                // bridges through the channel's `/phone/media/ws` handler.
-                let ws = explicit_ws.or_else(|| {
-                    id.tunnel()
-                        .map(|t| t.public_host)
-                        .map(|host| format!("wss://{host}/phone/media/ws"))
-                });
+                // The media leg is ALWAYS this identity's own tunnel, so the
+                // call bridges through the channel's authenticated
+                // `/phone/media/ws` handler. Deliberately not model-settable:
+                // a caller-supplied URL would let a prompted model route live
+                // call audio to an arbitrary endpoint.
+                let ws = id
+                    .tunnel()
+                    .map(|t| t.public_host)
+                    .map(|host| format!("wss://{host}/phone/media/ws"));
                 // Ride this identity's dedicated number; shared-iMessage-line
                 // origination is wired separately.
                 let call = id.place_call(&to_number, CallOrigin::DedicatedNumber, ws.as_deref())?;
