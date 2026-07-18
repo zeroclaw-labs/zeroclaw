@@ -1450,6 +1450,7 @@ impl OllamaModelProvider {
             client
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONNECTION, "close")
                 .body(serialize_hailo_request(&request)?)
         } else {
             client.post(&url).json(&request)
