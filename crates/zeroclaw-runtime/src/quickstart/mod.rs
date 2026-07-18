@@ -591,6 +591,21 @@ fn build_channel_type_options(
         .collect()
 }
 
+fn canonical_channel_config_type(channel_type: &str) -> &str {
+    match channel_type {
+        "whatsapp-web" | "whatsapp_web" => "whatsapp",
+        other => other,
+    }
+}
+
+fn is_whatsapp_web_quickstart_type(channel_type: &str) -> bool {
+    matches!(channel_type, "whatsapp-web" | "whatsapp_web")
+}
+
+fn default_whatsapp_web_session_path(alias: &str) -> String {
+    format!("~/.zeroclaw/state/whatsapp-web/{alias}.db")
+}
+
 /// Walk the serialised form of `value` and yield `<type>.<alias>` refs
 /// for every `HashMap<String, _>`-shaped subsection. Schema-driven —
 /// adding a new channel or storage slot in the schema lights up here
@@ -1447,7 +1462,9 @@ fn apply_channels(
                 }
             }
             SelectorChoice::Fresh(entry) => {
-                if entry.channel_type.trim().is_empty() || entry.alias.trim().is_empty() {
+                let submitted_channel_type = entry.channel_type.trim();
+                let alias = entry.alias.trim();
+                if submitted_channel_type.is_empty() || alias.is_empty() {
                     errors.push(QuickstartError::for_surface(
                         ctx,
                         QuickstartStep::Channels,
@@ -1458,8 +1475,9 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                if channel_exists(config, &entry.channel_type, &entry.alias) {
-                    let alias_ref = format!("{}.{}", entry.channel_type, entry.alias);
+                let config_channel_type = canonical_channel_config_type(submitted_channel_type);
+                if channel_exists(config, config_channel_type, alias) {
+                    let alias_ref = format!("{config_channel_type}.{alias}");
                     errors.push(QuickstartError::for_surface(
                         ctx,
                         QuickstartStep::Channels,
@@ -1471,7 +1489,7 @@ fn apply_channels(
                     continue;
                 }
                 if let Err(err) =
-                    config.create_map_key(&format!("channels.{}", entry.channel_type), &entry.alias)
+                    config.create_map_key(&format!("channels.{config_channel_type}"), alias)
                 {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Channels,
@@ -1480,8 +1498,23 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                let token_path =
-                    format!("channels.{}.{}.bot_token", entry.channel_type, entry.alias);
+                let is_whatsapp_web = is_whatsapp_web_quickstart_type(submitted_channel_type);
+                if is_whatsapp_web {
+                    let session_path =
+                        format!("channels.{config_channel_type}.{alias}.session_path");
+                    if let Err(err) = config.set_prop_persistent(
+                        &session_path,
+                        &default_whatsapp_web_session_path(alias),
+                    ) {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].channel_type"),
+                            err.to_string(),
+                        ));
+                        continue;
+                    }
+                }
+                let token_path = format!("channels.{config_channel_type}.{alias}.bot_token");
                 if let Some(tok) = &entry.token {
                     if let Err(err) = config.set_prop_persistent(&token_path, tok) {
                         errors.push(QuickstartError::new(
@@ -1496,8 +1529,7 @@ fn apply_channels(
                     // record can reference it. Set `enabled = true` as the minimum
                     // schema-recognised field; channels without creds will fail
                     // their own bootstrap loudly, which is the desired behaviour.
-                    let enabled_path =
-                        format!("channels.{}.{}.enabled", entry.channel_type, entry.alias);
+                    let enabled_path = format!("channels.{config_channel_type}.{alias}.enabled");
                     if let Err(err) = config.set_prop_persistent(&enabled_path, "true") {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
@@ -1507,7 +1539,7 @@ fn apply_channels(
                         continue;
                     }
                 }
-                refs.push(format!("{}.{}", entry.channel_type, entry.alias));
+                refs.push(format!("{config_channel_type}.{alias}"));
             }
         }
     }
@@ -2668,6 +2700,49 @@ mod tests {
             "second channel must also be bound; got {bound:?}"
         );
         assert_eq!(bound.len(), 2, "both channels bound, not just the last");
+    }
+
+    #[tokio::test]
+    async fn fresh_whatsapp_web_channel_persists_under_whatsapp_config_family() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "whatsapp-web".into(),
+            alias: "personal".into(),
+            token: None,
+        })];
+
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            raw.contains("[channels.whatsapp.personal]"),
+            "WhatsApp Web quickstart must persist under the canonical WhatsApp config family:\n{raw}"
+        );
+        assert!(
+            !raw.contains("[channels.whatsapp-web.personal]"),
+            "Quickstart must not write a non-schema channels.whatsapp-web table:\n{raw}"
+        );
+
+        let reloaded = reload(&dir);
+        assert!(
+            !reloaded.channels.whatsapp.is_empty(),
+            "WhatsApp Web quickstart must create a WhatsApp config alias"
+        );
+        let whatsapp = reloaded
+            .channels
+            .whatsapp
+            .get("personal")
+            .expect("canonical WhatsApp alias persisted");
+        assert!(
+            whatsapp.is_web_config(),
+            "fresh whatsapp-web quickstart entry must seed a Web selector"
+        );
+        let agent = reloaded.agents.get("bot").expect("agent persisted");
+        let bound: Vec<String> = agent.channels.iter().map(|c| c.to_string()).collect();
+        assert_eq!(
+            bound,
+            vec!["whatsapp.personal".to_string()],
+            "agent must bind the canonical channel ref"
+        );
     }
 
     #[tokio::test]
