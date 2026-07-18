@@ -99,11 +99,6 @@ pub fn build_sop_engine(
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    // Select the run-state backend from config (default: ephemeral in-memory,
-    // unchanged behavior). A backend-open failure must not crash daemon startup,
-    // so fall back to in-memory with a loud log. `workspace_dir` here is the
-    // daemon data dir (every caller passes `config.data_dir`), so a durable store
-    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
     let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,

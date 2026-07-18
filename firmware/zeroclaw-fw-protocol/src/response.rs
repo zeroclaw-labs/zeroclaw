@@ -2,7 +2,6 @@ use core::fmt::Write;
 use heapless::String;
 
 /// Write a successful JSON response into `buf`.
-///
 /// Format: `{"id":"<id>","ok":true,"result":"<result>"}`
 pub fn write_ok<const N: usize>(buf: &mut String<N>, id: &str, result: &str) {
     buf.clear();
@@ -14,7 +13,6 @@ pub fn write_ok<const N: usize>(buf: &mut String<N>, id: &str, result: &str) {
 }
 
 /// Write an error JSON response into `buf`.
-///
 /// Format: `{"id":"<id>","ok":false,"result":"","error":"<error>"}`
 pub fn write_err<const N: usize>(buf: &mut String<N>, id: &str, error: &str) {
     buf.clear();

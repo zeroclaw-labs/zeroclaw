@@ -1,13 +1,4 @@
 //! PostgreSQL-backed memory implementation.
-//!
-//! Compiled in only when the crate is built with `--features memory-postgres`.
-//! Selected at runtime by setting `[memory].backend = "postgres"` and
-//! supplying `db_url` under `[storage.model_provider.config]`. Optional pgvector
-//! support is enabled via `[memory.postgres].vector_enabled`.
-//!
-//! Designed for multi-instance deployments where several agents need to share
-//! a single durable memory store with concurrent writes — the SQLite backend
-//! cannot serve that use case.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use anyhow::{Context, Result};
@@ -24,12 +15,6 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
-/// Drops its inner value on a background OS thread.
-///
-/// `postgres::Client::drop` calls `Runtime::block_on` internally to send a
-/// clean-shutdown message. That panics if called from inside an existing Tokio
-/// runtime. Wrapping the `Arc<Mutex<Client>>` in this type ensures the final
-/// drop always happens on a plain OS thread.
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
 impl<T: Send + 'static> DropOnThread<T> {
@@ -67,12 +52,6 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
     }
 }
 
-/// PostgreSQL-backed persistent memory.
-///
-/// Reliable CRUD and keyword recall via SQL. Hybrid keyword + vector recall
-/// is available when pgvector is installed and `vector_enabled = true`;
-/// otherwise the backend falls back to keyword-only recall and logs a
-/// warning at construction.
 pub struct PostgresMemory {
     alias: String,
     client: DropOnThread<Arc<Mutex<Client>>>,
@@ -211,15 +190,6 @@ impl PostgresMemory {
         Ok(())
     }
 
-    /// One-shot, idempotent normalization of `memories.session_id`.
-    ///
-    /// Mirrors the SQLite path: the orchestrator sanitizes session keys at
-    /// the source so the runtime HashMap, on-disk JSONL filename, and the
-    /// `session_id` filter for recall all agree. Rows written before that
-    /// fix retained the raw, un-sanitized form (e.g. `slack_C123_1.2_user one`)
-    /// and would be invisible to the new sanitized recall filter. Rewrite
-    /// them once at startup; later runs find nothing to update because
-    /// `sanitize_session_key` is idempotent.
     fn migrate_session_ids_to_sanitized(client: &mut Client, qualified_table: &str) -> Result<()> {
         let select = format!(
             "SELECT DISTINCT session_id FROM {qualified_table} WHERE session_id IS NOT NULL"
@@ -332,11 +302,6 @@ impl PostgresMemory {
     }
 }
 
-/// Run a blocking closure on a plain OS thread to avoid nested Tokio runtime
-/// panics. The sync `postgres` crate internally calls `Runtime::block_on()`,
-/// which conflicts with `tokio::task::spawn_blocking` threads that are still
-/// associated with the Tokio runtime's blocking pool. Plain OS threads have no
-/// runtime context, so the nested `block_on` succeeds.
 async fn run_on_os_thread<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -403,12 +368,6 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        // Trait-level `store` has no agent context. Route through
-        // `store_with_agent` so the row is attributed to the default
-        // agent (the NOT NULL FK on `agent_id` rejects unattributed
-        // inserts; un-attributed callers like the heartbeat memory
-        // path land under the synthesized `default` agent rather than
-        // surfacing a constraint violation).
         self.store_with_agent(key, content, category, session_id, None, None, None)
             .await
     }
@@ -659,12 +618,6 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(move || -> Result<usize> {
             let mut client = client.lock();
-            // Memory rows ride `agent_id` (FK → agents.id); only the alias moves.
-            // Collision-safety (see the SQLite impl): `agents.alias` is UNIQUE and
-            // delete leaves an orphan agents row, so a bare UPDATE onto a
-            // previously-used-then-deleted `to` alias would violate the
-            // constraint. Run inside a transaction: refuse if `to` still owns
-            // memory rows (a real conflict), else drop the orphan `to` row first.
             let mut tx = client.transaction()?;
             let to_rows: i64 = tx
                 .query_one(
@@ -755,11 +708,6 @@ impl Memory for PostgresMemory {
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
-            // `agent_id = COALESCE($8, default-agent-uuid)` so callers
-            // without an agent context still satisfy the NOT NULL FK
-            // by attributing to the synthesized default agent. The
-            // subquery is indexed (UNIQUE alias) so the lookup is
-            // metadata-cached after the first call.
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
@@ -815,12 +763,6 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            // The agent_id filter lives in the WHERE clause so the
-            // backend never returns a foreign-agent row to the caller;
-            // post-fetch attribution lookups in earlier impls were the
-            // privacy escape Audacity flagged. The NOT NULL FK on
-            // `memories.agent_id` means there are no legacy
-            // unattributed rows to special-case.
             let time_filter: String = match (since_ref, until_ref) {
                 (Some(_), Some(_)) => {
                     " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ".into()
@@ -942,13 +884,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn drop_on_thread_drops_value_on_plain_os_thread() {
-        // Regression for the nested-runtime drop path: DropOnThread must ensure
-        // its wrapped value's destructor runs on a plain OS thread, not on the
-        // Tokio runtime thread, even when dropped from within a runtime context.
-        //
-        // Before this patch, PostgresMemory::drop released the Arc<Mutex<Client>>
-        // inline, which called postgres::Client::drop → Runtime::block_on and
-        // panicked. This test fails on that old behavior and passes with DropOnThread.
         let (tx, rx) = oneshot::channel::<bool>();
 
         struct DropGuard(Option<oneshot::Sender<bool>>);
@@ -992,15 +927,6 @@ mod tests {
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
     }
-
-    // ── session_id migration ──────────────────────────────────────
-    //
-    // End-to-end migration coverage requires a live PostgreSQL instance, and
-    // the crate's existing Postgres test suite does not run one in CI. The
-    // unit tests below exercise the rewrite plan against the same
-    // `sanitize_session_key` helper used by the migration SQL, which is
-    // sufficient to verify the contract that `migrate_session_ids_to_sanitized`
-    // relies on: which values change, which stay, and idempotence on re-run.
 
     #[test]
     fn rewrites_only_values_that_change_under_sanitization() {

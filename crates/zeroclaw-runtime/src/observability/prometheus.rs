@@ -277,14 +277,6 @@ impl PrometheusObserver {
         String::from_utf8(buf).unwrap_or_default()
     }
 
-    /// Process-wide singleton handle. All call sites that obtain a Prometheus
-    /// observer through this function share the same `Registry` and the same
-    /// underlying counters, so events recorded by the channel orchestrator and
-    /// events recorded by the gateway accumulate into the same time series and
-    /// are visible on a single `/metrics` scrape.
-    ///
-    /// `PrometheusObserver::new()` still returns a fresh, isolated instance —
-    /// kept for tests so parallel test cases don't see each other's counts.
     pub fn shared() -> Arc<Self> {
         static SINGLETON: OnceLock<Arc<PrometheusObserver>> = OnceLock::new();
         SINGLETON.get_or_init(|| Arc::new(Self::new())).clone()
