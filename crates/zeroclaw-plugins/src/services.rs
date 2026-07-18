@@ -26,6 +26,13 @@ pub(crate) enum SecretLookupError {
     Unavailable,
 }
 
+/// Detail-free result for the guest-facing public-config service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigLookupError {
+    AccessDenied,
+    Unavailable,
+}
+
 impl PluginHostServices {
     /// Build the complete required host-service bundle.
     #[must_use]

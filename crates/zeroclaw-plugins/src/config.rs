@@ -217,12 +217,15 @@ fn compile_manifest_config(
             )));
         }
     }
-    if properties.values().any(is_secret_property)
-        && (!manifest.capabilities.contains(&PluginCapability::Tool)
-            || manifest.capabilities.contains(&PluginCapability::Channel))
-    {
+    let has_secret_consumer = manifest.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            PluginCapability::Tool | PluginCapability::Channel
+        )
+    });
+    if properties.values().any(is_secret_property) && !has_secret_consumer {
         return Err(invalid_manifest(format!(
-            "plugin '{}' config_schema uses x-secret, which is currently supported only by manifests whose executable config consumer is the tool world",
+            "plugin '{}' config_schema uses x-secret without a tool or channel config consumer",
             manifest.name
         )));
     }
@@ -757,31 +760,31 @@ x-secret = true
     }
 
     #[test]
-    fn secret_annotations_reject_worlds_without_a_safe_secret_lifecycle() {
+    fn secret_annotations_require_a_tool_or_channel_consumer() {
         let schema = object_schema(json!({
             "api_key": {"type": "string", "x-secret": true}
         }));
 
         let mut channel = manifest(Some(schema.clone()), true);
         channel.capabilities = vec![PluginCapability::Channel];
-        assert!(matches!(
-            validate_manifest_config(&channel),
-            Err(PluginError::InvalidManifest(_))
-        ));
+        validate_manifest_config(&channel).expect("channel may consume scoped secrets");
 
         let mut mixed = manifest(Some(schema.clone()), true);
         mixed.capabilities = vec![PluginCapability::Tool, PluginCapability::Channel];
-        assert!(matches!(
-            validate_manifest_config(&mixed),
-            Err(PluginError::InvalidManifest(_))
-        ));
+        validate_manifest_config(&mixed).expect("mixed tool/channel manifest is supported");
 
-        let mut memory = manifest(Some(schema), true);
-        memory.capabilities = vec![PluginCapability::Memory];
-        assert!(matches!(
-            validate_manifest_config(&memory),
-            Err(PluginError::InvalidManifest(_))
-        ));
+        for capability in [
+            PluginCapability::Memory,
+            PluginCapability::Observer,
+            PluginCapability::Skill,
+        ] {
+            let mut unsupported = manifest(Some(schema.clone()), true);
+            unsupported.capabilities = vec![capability];
+            assert!(matches!(
+                validate_manifest_config(&unsupported),
+                Err(PluginError::InvalidManifest(_))
+            ));
+        }
     }
 
     #[test]

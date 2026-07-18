@@ -28,22 +28,27 @@ ways, and each drives a design decision in your code:
 
 1. **One warm store for the plugin's lifetime.** The host instantiates your
    component once (`WasmChannel::from_wasm`) and holds the store behind an
-   async mutex. Your component keeps state between calls: connection handles,
-   caches, sequence counters. The store is refueled before every call
-   (`call_plugin!` in `component.rs`), so a long-lived channel gets a fresh
-   fuel budget per call rather than draining over its lifetime.
-2. **Configuration arrives before anything else.** The host calls your
-   `configure` export exactly once, at load, before any other call. The
-   argument is the typed JSON object materialized and validated against your
-   manifest's `config_schema`, including credential fields the schema treats
-   as ordinary strings. If the requested `config_read` grant is denied, the
-   host validates `{}` instead; an optional
-   schema receives that object, while required fields make construction fail
-   before guest code runs. Deserialize the object into a typed config struct
-   and store it in your component's state. The channel world does not import
-   the scoped secret service yet, so admission rejects channel-capable
-   manifests containing `x-secret` until the host has a coherent warm-store
-   secret lifecycle.
+   async mutex. The component may keep guest-owned protocol state between
+   calls, but operator config remains host-owned. A compliant plugin **must**
+   call `config.get` and `secrets.get` in every operation that needs them and
+   must not copy their results into warm guest state. The host drops its
+   materialized view after each call, but it cannot stop malicious guest code
+   from retaining returned JSON or plaintext. The store is refueled before
+   every call (`call_channel!` in `component.rs`), so a long-lived channel gets
+   a fresh fuel budget per call rather than draining over its lifetime.
+2. **Configuration is requested at point of use.** The host calls your
+   no-argument `configure` export exactly once, at load, before any other
+   export. Call `config.get` for the typed public JSON object validated against
+   your manifest's `config_schema`; properties marked `x-secret = true` are
+   omitted and must be read through `secrets.get`. Public and secret reads in
+   `configure`, or in any later operational export, share one resolved config
+   revision. A same-binding public config plus credential rotation is therefore
+   visible together on the next operation. Calls during instantiation and
+   static discovery return `unavailable` without resolving config. Static
+   discovery includes `name`, `plugin-info`, `get-channel-capabilities`,
+   `self-handle`, `self-addressed-mention`, and `multi-message-delay-ms`;
+   changing bot/account identity or other static metadata requires channel
+   lifecycle reconstruction.
 3. **You do not listen; the host feeds you.** The WASI context has no network
    listener capability. Inbound traffic reaches you through the imported
    `inbound` interface: the host runs the actual listener (webhook server,
@@ -59,7 +64,7 @@ Five functions have no Rust trait default and must genuinely work
 | Export | Contract |
 |--------|----------|
 | `name` | Human-readable channel name. |
-| `configure` | Receive the schema-validated, typed config JSON once at load; deserialize it into guest state. An error string fails the load. |
+| `configure` | Complete load-time initialization. It takes no arguments; call `config.get` and `secrets.get` for one current revision. An error string fails the load. |
 | `send` | Deliver a `send-message` (content, recipient, optional subject/thread/attachments) to the platform. |
 | `poll-message` | Non-blocking: return the next inbound message or `none` immediately. Never block; the host's poll bridge handles pacing. |
 | `get-channel-capabilities` | Return the bitmask of optional methods you actually implement. Called once at load. |
@@ -156,36 +161,33 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::cell::RefCell;
-
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities,
         Guest as Channel, InboundMessage, SendMessage,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
+    use zeroclaw::plugin::config::get as config_get;
     use zeroclaw::plugin::inbound::inbound_poll;
+    use zeroclaw::plugin::secrets::get as secret_get;
 
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ChannelConfig {
-        api_token: String,
-        #[serde(default)]
-        default_recipient: Option<String>,
-        #[serde(default = "default_timeout_secs")]
-        timeout_secs: u64,
+        api_base: String,
     }
 
-    fn default_timeout_secs() -> u64 {
-        10
+    fn current_config() -> Result<ChannelConfig, String> {
+        let json = config_get().map_err(|_| "public config is unavailable".to_string())?;
+        serde_json::from_str(&json).map_err(|e| format!("invalid config JSON: {e}"))
     }
 
-    struct State {
-        config: ChannelConfig,
+    fn current_api_token() -> Result<String, String> {
+        secret_get("api_token").map_err(|_| "api_token is unavailable".to_string())
     }
 
-    // One warm instance per plugin: interior mutability holds parsed config.
-    thread_local! {
-        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    fn current_inputs() -> Result<(ChannelConfig, String), String> {
+        // Both imports in this export share one resolved canonical revision.
+        Ok((current_config()?, current_api_token()?))
     }
 
     struct MyChannel;
@@ -195,20 +197,17 @@ mod component {
             "my-platform".to_string()
         }
 
-        fn configure(config: String) -> Result<(), String> {
-            let parsed: ChannelConfig = serde_json::from_str(&config)
-                .map_err(|e| format!("invalid config JSON: {e}"))?;
-            STATE.with(|s| {
-                *s.borrow_mut() = Some(State { config: parsed });
-            });
-            Ok(())
+        fn configure() -> Result<(), String> {
+            let (config, api_token) = current_inputs()?;
+            validate_configuration(&config.api_base, &api_token)
         }
 
         fn send(message: SendMessage) -> Result<(), String> {
+            let (config, api_token) = current_inputs()?;
             // Outbound platform delivery via wasi:http
-            // (requires the http_client permission in the manifest).
-            // ...
-            Ok(())
+            // (requires the http_client permission in the manifest). Build the
+            // request from this call's values; never retain a second copy.
+            send_to_platform(&config.api_base, &api_token, message)
         }
 
         fn poll_message() -> Option<InboundMessage> {
@@ -221,7 +220,7 @@ mod component {
         }
 
         fn health_check() -> bool {
-            STATE.with(|s| s.borrow().is_some())
+            current_inputs().is_ok()
         }
 
         // Every other method: a stub returning the WIT-documented default.
@@ -233,9 +232,12 @@ mod component {
 }
 ```
 
-The `thread_local` + `RefCell` pattern is how a component holds state without
-`static mut`: wasm components are single-threaded, so this is safe and idiom
-for wit-bindgen guests.
+`current_inputs` is deliberately called at point of use. The host binds both
+imports to this admitted package, `channel` capability, and alias; reads in one
+export share one resolved config revision, while the next export can observe a
+same-binding public config plus credential rotation. `ChannelConfig` is a
+per-call typed view and is dropped with the token. Do not add a `thread_local`
+config or credential cache.
 
 ## Manifest and permissions
 
@@ -260,37 +262,42 @@ permissions = ["config_read", "http_client"]
 "$schema" = "https://json-schema.org/draft/2020-12/schema"
 type = "object"
 additionalProperties = false
-required = ["api_token"]
+required = ["api_base", "api_token"]
+
+[config_schema.properties.api_base]
+type = "string"
+minLength = 1
 
 [config_schema.properties.api_token]
 type = "string"
 minLength = 1
-
-[config_schema.properties.default_recipient]
-type = "string"
-
-[config_schema.properties.timeout_secs]
-type = "integer"
-minimum = 1
-maximum = 120
+x-secret = true
 ```
 
-The operator still stores `timeout_secs` as the encrypted string `"10"`; the
-host turns it into the JSON integer `10` and enforces the range before
-`configure` runs. Arrays and objects use JSON text in operator storage and
-arrive as real arrays and objects. Because `api_token` is required, withholding
-`config_read` fails closed instead of starting a channel with no credentials.
+The host validates both properties as one object. `config.get` returns typed
+JSON containing `api_base` and omits `api_token`, which is available only through
+`secrets.get`. Because both are required, withholding `config_read` fails closed
+before guest code runs instead of starting a channel without required config.
 Each channel instance selects the `plugins.entries` key derived from its full
 package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
 isolated.
 
-> **Credential limitation.** Do not add `x-secret` to this channel schema.
-> The current channel world has no `secrets` import, and admission rejects any
-> channel-capable manifest containing that marker. Credentials therefore arrive
-> in the one typed `configure` object and remain in warm guest state. A channel
-> migration that requires scoped reads or rotation must remain built in until a
-> coherent warm-store secret lifecycle lands.
+Call `config.get` and `secrets.get` inside each operation that uses them. The
+host resolves at most one canonical revision for that call and drops its view
+afterward. A public config plus credential rotation within the same logical
+binding is visible together on the next operation without daemon reload or
+channel reconstruction. Changing the bot/account identity, advertised
+capabilities, self-handle, mention, or other load-time metadata requires channel
+lifecycle reconstruction because those exports are read once during static
+discovery.
+
+For an optional schema whose empty object is valid, an instance denied the
+effective `config_read` grant can load, but `config.get` and `secrets.get` return
+`access-denied`. Either import returns `unavailable` during instantiation or
+static discovery, after resolver/validation failure, or when the shared host-call
+budget is exhausted. `secrets.get` additionally returns `not-found` for a name
+that is absent or not marked `x-secret = true`.
 
 ## Build and install
 
@@ -301,8 +308,9 @@ isolated.
 ## Testing against the host contract
 
 The host adapter and config resolver tests are the executable specification:
-they cover typed materialization and schema validation, the denied-grant empty
-object, the inbound queue handoff, capability-gated dispatch, and poll-health
+they cover typed materialization and schema validation, point-of-use public and
+secret scope, coherent same-revision rotation, denied grants, static-discovery
+denial, the inbound queue handoff, capability-gated dispatch, and poll-health
 accounting.
 
 To run your own component under those exact semantics, write an integration

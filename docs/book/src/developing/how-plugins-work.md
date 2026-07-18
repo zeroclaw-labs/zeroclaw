@@ -128,16 +128,20 @@ Even with every permission granted, the sandbox bounds a plugin:
   the filesystem outside its rooted workspace. Network egress is gated by the
   HTTP permission; the SSRF-guarded egress boundary itself is delivered by the
   companion plugin-hardening work.
-- A trusted tool plugin can read a schema-designated secret's plaintext through
-  its scoped `secrets.get` import while the host dispatches `execute`. The host
-  prevents public config injection and cross-instance selection; it does not
-  provide stronger egress-boundary credential injection where guest code never
-  learns the value. Channel manifests cannot use `x-secret` until the host has
-  a coherent warm-store secret lifecycle.
+- A trusted tool or channel plugin can read a schema-designated secret's
+  plaintext through its scoped `secrets.get` import during an authorized
+  service call. Tools receive access during `execute`. Channels receive
+  `config.get` and `secrets.get` during `configure` and operational calls; reads
+  within one call use one canonical revision, so a same-binding public/secret
+  rotation is available on the next operation. Instantiation and static
+  metadata discovery cannot use either import. The host prevents public config
+  injection and cross-instance selection, but a plaintext-returning import
+  cannot prevent a malicious guest from retaining what it reads. Compliant
+  channel plugins must resolve config and credentials at each point of use.
 - It cannot displace a built-in tool: the built-ins register first and tool
   dispatch resolves names first-match, so a colliding plugin tool is simply
   never selected.
 
-These bounds hold regardless of what the plugin's own code attempts, which is
-what makes it safe to load a plugin you did not write, provided your signature
-policy says you trust whoever published it.
+The sandbox and namespace bounds hold regardless of what plugin code attempts.
+The no-retention rule is instead part of the trusted channel-plugin contract,
+which is why publisher review and signature policy still matter.

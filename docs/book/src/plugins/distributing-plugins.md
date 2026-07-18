@@ -28,11 +28,11 @@ Two consequences worth knowing:
   similarly prefixed root fields such as `signature_algorithm`, remain signed.
   Reformatting or reordering retained content invalidates the signature. Sign
   last, after the manifest is final.
-- Tool config exposure markers such as
+- Config exposure markers such as
   `config_schema.properties.api_token.x-secret` are therefore
-  signature-covered policy. Changing a tool property between public injection
-  and scoped `secrets.get` access requires rebuilding and re-signing. Channel
-  manifests containing that marker are currently rejected.
+  signature-covered policy. Changing a tool or channel property between public
+  config exposure and scoped `secrets.get` access requires rebuilding and
+  re-signing.
 - Packages signed by the former prefix-based canonicalizer need re-signing only
   if they relied on one of those edge cases or on TOML decoration attached to a
   removed field. Ordinary manifests keep the same signed content.

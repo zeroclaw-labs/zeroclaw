@@ -1,4 +1,4 @@
-//! End-to-end fixture for the host's channel-component adapter.
+//! End-to-end fixture for the host's channel-component adapter and scoped secrets.
 //!
 //! The source fixture is a workspace member and is built on demand into a
 //! separate target directory so the nested Cargo invocation cannot contend
@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use zeroclaw_api::attribution::Attributable;
@@ -66,8 +66,8 @@ fn limits() -> PluginLimits {
     }
 }
 
-async fn channel(binding: &str) -> WasmChannel {
-    let manifest = PluginManifest {
+fn manifest() -> PluginManifest {
+    PluginManifest {
         name: "channel-fixture".to_string(),
         version: "0.0.0".to_string(),
         description: None,
@@ -78,13 +78,53 @@ async fn channel(binding: &str) -> WasmChannel {
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
-            "required": ["retry_count"],
+            "required": ["retry_count", "credential_epoch", "api_token"],
             "additionalProperties": false,
-            "properties": {"retry_count": {"type": "integer", "minimum": 1}}
+            "properties": {
+                "retry_count": {"type": "integer", "minimum": 1},
+                "credential_epoch": {"type": "string", "minLength": 1},
+                "api_token": {"type": "string", "minLength": 1, "x-secret": true}
+            }
         })),
         signature: None,
         publisher_key: None,
-    };
+    }
+}
+
+type InstanceConfig = HashMap<String, String>;
+type CanonicalConfig = Arc<RwLock<HashMap<String, InstanceConfig>>>;
+
+fn instance_config(epoch: &str, token: &str) -> InstanceConfig {
+    HashMap::from([
+        ("retry_count".to_string(), "5".to_string()),
+        ("credential_epoch".to_string(), epoch.to_string()),
+        ("api_token".to_string(), token.to_string()),
+    ])
+}
+
+fn canonical_config(binding: &str, epoch: &str, token: &str) -> CanonicalConfig {
+    Arc::new(RwLock::new(HashMap::from([(
+        binding.to_string(),
+        instance_config(epoch, token),
+    )])))
+}
+
+fn host_services(config: CanonicalConfig) -> PluginHostServices {
+    let manifest = manifest();
+    let resolver = PluginConfigResolver::new(move |scope| {
+        let configured = config.read().expect("lock canonical fixture config");
+        let values = configured.get(scope.id().binding()).ok_or_else(|| {
+            zeroclaw_plugins::error::PluginError::InvalidConfig(
+                "missing canonical fixture binding".to_string(),
+            )
+        })?;
+        resolve_plugin_config(&manifest, scope, Some(values))
+    });
+    PluginHostServices::new(resolver)
+}
+
+async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {
+    let manifest = manifest();
     let scope = PluginInstanceScope::from_manifest(
         &manifest,
         PluginCapability::Channel,
@@ -93,21 +133,22 @@ async fn channel(binding: &str) -> WasmChannel {
     )
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
-    let configured = HashMap::from([("retry_count".to_string(), "5".to_string())]);
-    let config = PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&manifest, scope, Some(&configured))
-    });
-    let services = PluginHostServices::new(config);
 
-    WasmChannel::from_wasm(endpoint, &fixture(), &services, limits())
+    WasmChannel::from_wasm(endpoint, &fixture(), services, limits())
         .await
         .expect("instantiate fixture channel")
 }
 
-fn outbound() -> SendMessage {
+async fn channel(binding: &str) -> WasmChannel {
+    let config = canonical_config(binding, "v1", &format!("token-{binding}"));
+    let services = host_services(config);
+    build_channel(binding, &services).await
+}
+
+fn outbound(content: &str, recipient: &str) -> SendMessage {
     SendMessage {
-        content: "hello".to_string(),
-        recipient: "room".to_string(),
+        content: content.to_string(),
+        recipient: recipient.to_string(),
         subject: None,
         thread_ts: None,
         cancellation_token: None,
@@ -127,7 +168,7 @@ async fn channel_component_runs_through_host_ingress() {
     assert_eq!(channel.self_handle().as_deref(), Some("@fixture"));
     assert!(channel.health_check().await);
     channel
-        .send(&outbound())
+        .send(&outbound("v1:token-main", "main"))
         .await
         .expect("fixture accepts send");
 
@@ -165,6 +206,87 @@ async fn channel_component_runs_through_host_ingress() {
         .await
         .expect_err("aborting listen must cancel its polling loop");
     assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn channel_secrets_are_scoped_per_alias_at_point_of_use() {
+    let config = Arc::new(RwLock::new(HashMap::from([
+        ("main".to_string(), instance_config("v1", "token-main")),
+        ("backup".to_string(), instance_config("v1", "token-backup")),
+    ])));
+    let services = host_services(config);
+    let (main, backup) = tokio::join!(
+        build_channel("main", &services),
+        build_channel("backup", &services)
+    );
+
+    main.send(&outbound("v1:token-main", "main"))
+        .await
+        .expect("main alias reads its own secret");
+    backup
+        .send(&outbound("v1:token-backup", "backup"))
+        .await
+        .expect("backup alias reads its own secret");
+    assert!(
+        main.send(&outbound("v1:token-backup", "main"))
+            .await
+            .is_err(),
+        "main alias must reject the backup secret"
+    );
+    assert!(
+        backup
+            .send(&outbound("v1:token-main", "backup"))
+            .await
+            .is_err(),
+        "backup alias must reject the main secret"
+    );
+}
+
+#[tokio::test]
+async fn warm_channel_resolves_one_rotated_config_revision_at_point_of_use() {
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(Arc::clone(&config));
+    let channel = build_channel("main", &services).await;
+
+    channel
+        .send(&outbound("v1:token-main", "main"))
+        .await
+        .expect("channel reads the initial canonical config revision");
+
+    {
+        let mut config = config.write().expect("lock canonical fixture config");
+        let main = config
+            .get_mut("main")
+            .expect("main canonical fixture binding");
+        main.insert("credential_epoch".to_string(), "v2".to_string());
+        main.insert("api_token".to_string(), "rotated-main".to_string());
+    }
+
+    assert!(
+        channel
+            .send(&outbound("v1:token-main", "main"))
+            .await
+            .is_err(),
+        "warm channel must not retain the previous config revision"
+    );
+    assert!(
+        channel
+            .send(&outbound("v1:rotated-main", "main"))
+            .await
+            .is_err(),
+        "new secret must not pair with stale public config"
+    );
+    assert!(
+        channel
+            .send(&outbound("v2:token-main", "main"))
+            .await
+            .is_err(),
+        "new public config must not pair with the stale secret"
+    );
+    channel
+        .send(&outbound("v2:rotated-main", "main"))
+        .await
+        .expect("warm channel reads one rotated canonical config revision");
 }
 
 #[tokio::test]
