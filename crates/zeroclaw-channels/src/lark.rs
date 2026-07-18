@@ -704,12 +704,67 @@ async fn build_lark_file_upload_form(
 /// the card after the click so the buttons disappear.
 struct PendingApproval {
     sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    expected_principal: Option<String>,
     /// `data.message_id` returned by the send-card POST. Empty string is a
     /// sentinel meaning "card was sent but message_id was missing from the
     /// response" — handler will skip the post-click PATCH in that case.
     message_id: String,
     tool_name: String,
     arguments_summary: String,
+}
+
+struct PendingApprovalCleanup {
+    pending: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    approval_id: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(
+        pending: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+        approval_id: String,
+    ) -> Self {
+        Self {
+            pending,
+            approval_id,
+            armed: true,
+        }
+    }
+    async fn remove_and_disarm(&mut self) {
+        self.pending.lock().await.remove(&self.approval_id);
+        self.armed = false;
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let pending = Arc::clone(&self.pending);
+            let approval_id = self.approval_id.clone();
+            tokio::spawn(async move {
+                pending.lock().await.remove(&approval_id);
+            });
+        }
+    }
+}
+
+fn take_pending_approval(
+    pending: &mut std::collections::HashMap<String, PendingApproval>,
+    approval_id: &str,
+    principal: &str,
+) -> Option<PendingApproval> {
+    let entry = pending.get(approval_id)?;
+    if entry
+        .expected_principal
+        .as_deref()
+        .is_some_and(|expected| expected != principal)
+    {
+        return None;
+    }
+    pending.remove(approval_id)
 }
 
 #[derive(Clone)]
@@ -766,6 +821,72 @@ pub struct LarkChannel {
 }
 
 impl LarkChannel {
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        let approval_id = Uuid::new_v4().to_string();
+        let card =
+            build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "receive_id_type": "chat_id",
+            "msg_type": "interactive",
+            "content": serde_json::to_string(&card)?,
+        });
+        // Install the receiver before egress. A card action can arrive as soon
+        // as the provider accepts the POST, so publishing first loses fast
+        // authenticated decisions.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender,
+                expected_principal: expected_principal.map(str::to_owned),
+                message_id: String::new(),
+                tool_name: request.tool_name.clone(),
+                arguments_summary: request.arguments_summary.clone(),
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), approval_id.clone());
+        let response_body = {
+            let (status, response) = self.send_text_once(&url, &token, &body).await?;
+            if should_refresh_lark_tenant_token(status, &response) {
+                self.invalidate_token().await;
+                let refreshed = self.get_tenant_access_token().await?;
+                let (retry_status, retry_body) =
+                    self.send_text_once(&url, &refreshed, &body).await?;
+                ensure_lark_send_success(retry_status, &retry_body, "approval retry")?;
+                retry_body
+            } else {
+                ensure_lark_send_success(status, &response, "approval")?;
+                response
+            }
+        };
+        let message_id = response_body
+            .pointer("/data/message_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        if let Some(pending) = self.pending_approvals.lock().await.get_mut(&approval_id) {
+            pending.message_id = message_id;
+        }
+        let response = self
+            .wait_for_decision(receiver, &approval_id, expected_principal.is_some())
+            .await;
+        if response.is_some() {
+            cleanup.disarm();
+        } else {
+            cleanup.remove_and_disarm().await;
+        }
+        Ok(response)
+    }
+
     pub fn new(
         app_id: String,
         app_secret: String,
@@ -2851,64 +2972,21 @@ impl Channel for LarkChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
-        let approval_id = Uuid::new_v4().to_string();
-        let card =
-            build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
+        self.request_approval_inner(recipient, None, request).await
+    }
 
-        let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
-        let body = serde_json::json!({
-            "receive_id": recipient,
-            "receive_id_type": "chat_id",
-            "msg_type": "interactive",
-            "content": serde_json::to_string(&card)?,
-        });
-
-        let response_body = {
-            let (status, resp) = self.send_text_once(&url, &token, &body).await?;
-            if should_refresh_lark_tenant_token(status, &resp) {
-                self.invalidate_token().await;
-                let new_token = self.get_tenant_access_token().await?;
-                let (retry_status, retry_body) =
-                    self.send_text_once(&url, &new_token, &body).await?;
-                ensure_lark_send_success(retry_status, &retry_body, "approval retry")?;
-                retry_body
-            } else {
-                ensure_lark_send_success(status, &resp, "approval")?;
-                resp
-            }
-        };
-
-        let message_id = response_body
-            .pointer("/data/message_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(
-                        module_path!(),
-                        ::zeroclaw_log::Action::Note
-                    )
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
-                    "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
-                );
-                String::new()
-            });
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            approval_id.clone(),
-            PendingApproval {
-                sender: tx,
-                message_id,
-                tool_name: request.tool_name.clone(),
-                arguments_summary: request.arguments_summary.clone(),
-            },
-        );
-
-        Ok(Some(self.wait_for_decision(rx, &approval_id).await))
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -3169,19 +3247,19 @@ impl LarkChannel {
 }
 
 impl LarkChannel {
-    /// Wait for the user's approval click; on timeout, evict the pending entry
-    /// and synthesize a `Deny` response. Never panics.
+    /// Wait for the user's approval click. A goal-bound timeout is not an
+    /// explicit operator denial, so it returns `None` to preserve the pause.
     async fn wait_for_decision(
         &self,
         rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
         approval_id: &str,
-    ) -> zeroclaw_api::channel::ChannelApprovalResponse {
-        use zeroclaw_api::channel::ChannelApprovalResponse;
+        principal_bound: bool,
+    ) -> Option<zeroclaw_api::channel::ChannelApprovalResponse> {
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-            Ok(Ok(response)) => response,
+            Ok(Ok(response)) => Some(response),
             _ => {
                 self.pending_approvals.lock().await.remove(approval_id);
-                ChannelApprovalResponse::Deny
+                crate::util::approval_timeout_response(principal_bound)
             }
         }
     }
@@ -3412,7 +3490,21 @@ impl LarkChannel {
             }
         };
 
-        let pending = self.pending_approvals.lock().await.remove(approval_id);
+        let operator_open_id = event_payload
+            .pointer("/operator/open_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let chat_id = event_payload
+            .pointer("/context/open_chat_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let principal = self
+            .resolve_sender(chat_id, Some(operator_open_id))
+            .to_string();
+        let pending = {
+            let mut pending_approvals = self.pending_approvals.lock().await;
+            take_pending_approval(&mut pending_approvals, approval_id, &principal)
+        };
         let Some(pending) = pending else {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3923,6 +4015,31 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_approval_cleanup_removes_pending_entry() {
+        let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            "approval".into(),
+            PendingApproval {
+                sender,
+                expected_principal: Some("owner".into()),
+                message_id: String::new(),
+                tool_name: "tool".into(),
+                arguments_summary: "args".into(),
+            },
+        );
+        drop(PendingApprovalCleanup::new(
+            Arc::clone(&pending),
+            "approval".into(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            pending.lock().await.is_empty(),
+            "cancelled waiters must not retain tokens"
+        );
+    }
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
@@ -5678,6 +5795,7 @@ mod tests {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                expected_principal: None,
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
@@ -5698,6 +5816,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_card_action_from_another_principal_is_not_consumed() {
+        let ch = make_channel().with_per_user_session(true);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "approval".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("owner".to_string()),
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+        let event = serde_json::json!({
+            "operator": { "open_id": "other" },
+            "context": { "open_chat_id": "chat" },
+            "action": { "value": { "approval_id": "approval", "decision": "approve" } }
+        });
+        ch.handle_card_action_event(&event).await.unwrap();
+        assert!(ch.pending_approvals.lock().await.contains_key("approval"));
+    }
+
+    #[tokio::test]
     async fn handle_card_action_event_parses_card_v2_behaviors_value_payload() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
@@ -5711,6 +5852,7 @@ mod tests {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                expected_principal: None,
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),

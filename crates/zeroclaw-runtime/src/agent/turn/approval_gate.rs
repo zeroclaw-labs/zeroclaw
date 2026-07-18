@@ -150,8 +150,13 @@ pub(crate) async fn gate_tool_approval(
             if current_goal_turn_evaluation_requested() {
                 if explicit_deny {
                     let behavior = current_goal_approval_deny_behavior();
-                    if apply_explicit_goal_approval_denial(ctx, &request, approval_pause.as_ref())
-                        .await
+                    if apply_explicit_goal_approval_denial(
+                        ctx,
+                        &request,
+                        approval_pause.as_ref(),
+                        behavior,
+                    )
+                    .await
                         && behavior == zeroclaw_config::schema::GoalApprovalDenyBehavior::Resume
                     {
                         return ApprovalGateOutcome::Deny(outcome);
@@ -232,6 +237,7 @@ async fn apply_explicit_goal_approval_denial(
     _ctx: &TurnCtx<'_>,
     request: &ApprovalRequest,
     expected_pause: Option<&GoalPauseState>,
+    behavior: zeroclaw_config::schema::GoalApprovalDenyBehavior,
 ) -> bool {
     let Some(goal_ctx) = current_goal_admission_context() else {
         return false;
@@ -246,7 +252,7 @@ async fn apply_explicit_goal_approval_denial(
     });
     match apply_current_goal_approval_denial(
         &goal_ctx,
-        current_goal_approval_deny_behavior(),
+        behavior,
         GoalBlockerKind::NeedsUserInput,
         message,
         Some(payload),
@@ -279,9 +285,7 @@ async fn pause_goal_for_tool_approval(
     if !current_goal_turn_evaluation_requested() {
         return None;
     }
-    let Some(goal_ctx) = current_goal_admission_context() else {
-        return None;
-    };
+    let goal_ctx = current_goal_admission_context()?;
     let arguments_summary = crate::approval::summarize_args(&request.arguments);
     let message = crate::i18n::get_required_cli_string_with_args(
         "goal-command-tool-approval-required-blocker",
@@ -407,8 +411,9 @@ mod tests {
             }
             if let Some((store, task_id)) = &self.resume_race {
                 let _ = store
-                    .pause_goal_task(
+                    .pause_goal_task_if_status(
                         task_id,
+                        control_plane::TaskStatus::Paused,
                         control_plane::GoalPauseState {
                             reason: control_plane::GoalPauseReason::OperatorPaused,
                             description: Some("later operator pause".into()),

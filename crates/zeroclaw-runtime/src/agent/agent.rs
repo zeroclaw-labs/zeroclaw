@@ -2392,10 +2392,12 @@ impl Agent {
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
-                Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
+                let bridge = crate::agent::approval_bridge::AskUserApprovalBridge::new(
                     Arc::clone(handles),
                     self.approval_route.clone(),
-                )) as Box<dyn zeroclaw_api::channel::Channel>
+                )
+                .with_goal_scope_binding();
+                Box::new(bridge) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
         let knobs = crate::agent::loop_::LoopKnobs {

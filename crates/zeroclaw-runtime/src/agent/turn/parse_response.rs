@@ -8,7 +8,7 @@ use super::protocol_detect::{
 };
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
-use crate::agent::cost::record_tool_loop_cost_usage;
+use crate::agent::cost::record_tool_loop_cost_usage_optional;
 use crate::agent::loop_::capture_llm_messages;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
@@ -164,12 +164,10 @@ pub(crate) async fn interpret_chat_response(
     // Non-goal unpriced calls remain observable as `Some(0.0)`; a
     // goal-attributed call instead returns an accounting error before its
     // response can advance the tool loop.
-    let call_cost_usd = match resp.usage.as_ref() {
-        Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
+    let call_cost_usd =
+        record_tool_loop_cost_usage_optional(ctx.provider_name, ctx.model, resp.usage.as_ref())
             .await?
-            .map(|(_total_tokens, cost_usd)| cost_usd),
-        None => None,
-    };
+            .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).

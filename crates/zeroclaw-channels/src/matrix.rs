@@ -32,7 +32,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
     RoomVisibility, SendMessage,
 };
-use zeroclaw_config::schema::{MatrixConfig, StreamMode, TranscriptionConfig};
+use zeroclaw_config::schema::{LeakDetectionConfig, MatrixConfig, StreamMode, TranscriptionConfig};
 
 // ─── markers ───────────────────────────────────────────────────────────────
 mod markers {
@@ -1485,8 +1485,7 @@ mod inbound {
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals:
-            Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+        pub pending_approvals: Arc<TokioMutex<HashMap<String, PendingApproval>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -1495,6 +1494,53 @@ mod inbound {
         /// could not be decrypted. Tracked so the bot reacts ❓ exactly once
         /// per event across sync catchup deliveries.
         pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    }
+
+    pub(super) struct PendingApproval {
+        pub(super) expected_principal: Option<String>,
+        /// Matrix room that received the approval request. A token is valid
+        /// only in this exact durable reply route, even for its bound owner.
+        pub(super) expected_room: String,
+        pub(super) sender: oneshot::Sender<ChannelApprovalResponse>,
+    }
+
+    pub(super) enum PendingApprovalMatch {
+        Matched(PendingApproval),
+        PrincipalMismatch,
+        RoomMismatch,
+        Missing,
+    }
+
+    pub(super) fn take_pending_approval(
+        approvals: &mut HashMap<String, PendingApproval>,
+        token: &str,
+        sender: &str,
+        room_id: &str,
+    ) -> PendingApprovalMatch {
+        match approvals.get(token) {
+            Some(pending)
+                if pending
+                    .expected_principal
+                    .as_deref()
+                    .is_none_or(|expected| expected == sender)
+                    && pending.expected_room == room_id =>
+            {
+                approvals
+                    .remove(token)
+                    .map(PendingApprovalMatch::Matched)
+                    .unwrap_or(PendingApprovalMatch::Missing)
+            }
+            Some(pending)
+                if pending
+                    .expected_principal
+                    .as_deref()
+                    .is_some_and(|expected| expected != sender) =>
+            {
+                PendingApprovalMatch::PrincipalMismatch
+            }
+            Some(_) => PendingApprovalMatch::RoomMismatch,
+            None => PendingApprovalMatch::Missing,
+        }
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
@@ -1633,9 +1679,41 @@ mod inbound {
         // Approval reply has highest priority — operator answer must work even
         // if the room/user filters would otherwise drop the message.
         if let Some((token, response)) = approval::parse_reply(&body) {
-            let waiter = ctx.pending_approvals.lock().await.remove(&token);
-            if let Some(tx) = waiter {
-                let _ = tx.send(response);
+            let pending = {
+                let mut approvals = ctx.pending_approvals.lock().await;
+                match take_pending_approval(&mut approvals, &token, sender, room_id) {
+                    PendingApprovalMatch::Matched(pending) => Some(pending),
+                    PendingApprovalMatch::PrincipalMismatch => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(::serde_json::json!({"sender": sender})),
+                            "matrix: ignored approval reply from non-bound principal"
+                        );
+                        return Ok(());
+                    }
+                    PendingApprovalMatch::RoomMismatch => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(
+                                ::serde_json::json!({"sender": sender, "room_id": room_id})
+                            ),
+                            "matrix: ignored approval reply from non-bound room"
+                        );
+                        return Ok(());
+                    }
+                    PendingApprovalMatch::Missing => None,
+                }
+            };
+            if let Some(pending) = pending {
+                let _ = pending.sender.send(response);
                 return Ok(());
             }
         }
@@ -3186,7 +3264,11 @@ pub struct MatrixChannel {
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<Arc<TranscriptionConfig>>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, inbound::PendingApproval>>>,
+    /// Resolves the canonical runtime leak policy when an approval prompt is
+    /// rendered. This is a resolver rather than a snapshot so config reloads
+    /// protect subsequent externally delivered prompts immediately.
+    leak_detection_resolver: Arc<dyn Fn() -> LeakDetectionConfig + Send + Sync>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -3199,6 +3281,43 @@ pub struct MatrixChannel {
     /// `[channels].ack_reactions` here at construction time, so the
     /// read site doesn't need to re-resolve on every reaction.
     ack_reactions: bool,
+}
+
+struct PendingApprovalCleanup {
+    pending_approvals: Arc<TokioMutex<HashMap<String, inbound::PendingApproval>>>,
+    token: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(
+        pending_approvals: Arc<TokioMutex<HashMap<String, inbound::PendingApproval>>>,
+        token: String,
+    ) -> Self {
+        Self {
+            pending_approvals,
+            token,
+            armed: true,
+        }
+    }
+
+    async fn remove_and_disarm(&mut self) {
+        self.pending_approvals.lock().await.remove(&self.token);
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        let token = self.token.clone();
+        tokio::spawn(async move {
+            pending_approvals.lock().await.remove(&token);
+        });
+    }
 }
 
 impl MatrixChannel {
@@ -3234,6 +3353,7 @@ impl MatrixChannel {
             transcription: None,
             client: tokio::sync::OnceCell::new(),
             pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+            leak_detection_resolver: Arc::new(LeakDetectionConfig::default),
             streaming_state: Arc::new(TokioRwLock::new(streaming::State::default())),
             threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
             alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
@@ -3254,6 +3374,15 @@ impl MatrixChannel {
     #[must_use]
     pub fn with_ack_reactions(mut self, ack_reactions: bool) -> Self {
         self.ack_reactions = ack_reactions;
+        self
+    }
+
+    /// Resolve the active outbound leak policy at prompt-render time.
+    pub fn with_leak_detection_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> LeakDetectionConfig + Send + Sync>,
+    ) -> Self {
+        self.leak_detection_resolver = resolver;
         self
     }
 
@@ -3772,33 +3901,88 @@ impl Channel for MatrixChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        self.request_approval_inner(recipient, None, request).await
+    }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
+    }
+}
+
+impl MatrixChannel {
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
         let token = approval::generate_token_default();
         let prompt = format!(
             "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply `{token} approve` / `{token} deny` / `{token} always`.",
             request.tool_name, request.arguments_summary
         );
+        // This prompt is sent directly by the adapter and bypasses the normal
+        // response pipeline, so scan the final rendered text at this egress
+        // boundary. The resolver preserves the live security configuration.
+        let prompt = redact_approval_prompt(prompt, &(self.leak_detection_resolver)());
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            inbound::PendingApproval {
+                expected_principal: expected_principal.map(str::to_string),
+                expected_room: recipient.to_string(),
+                sender: tx,
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), token.clone());
 
         let send_msg = SendMessage::new(prompt, recipient);
-        if let Err(e) = self.send(&send_msg).await {
-            self.pending_approvals.lock().await.remove(&token);
-            return Err(e);
+        if let Err(error) = self.send(&send_msg).await {
+            cleanup.remove_and_disarm().await;
+            return Err(error);
         }
-
-        let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
-        let result = tokio::time::timeout(timeout, rx).await;
-        if result.is_err() {
-            self.pending_approvals.lock().await.remove(&token);
-        }
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.approval_timeout_secs.max(1));
+        let result = tokio::time::timeout_at(deadline, rx).await;
+        cleanup.remove_and_disarm().await;
         match result {
             Ok(Ok(resp)) => Ok(Some(resp)),
-            Ok(Err(_)) => Ok(Some(ChannelApprovalResponse::Deny)),
-            Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+            // A principal-bound goal approval may apply an explicit-denial
+            // policy (pause/cancel/resume). A closed waiter or timeout is not
+            // an operator decision, so it must preserve the fail-closed pause.
+            Ok(Err(_)) | Err(_) if expected_principal.is_some() => Ok(None),
+            Ok(Err(_)) | Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+        }
+    }
+}
+
+fn redact_approval_prompt(content: String, leak_detection: &LeakDetectionConfig) -> String {
+    if !leak_detection.enabled {
+        return content;
+    }
+    match zeroclaw_runtime::security::LeakDetector::with_config(leak_detection).scan(&content) {
+        zeroclaw_runtime::security::LeakResult::Clean => content,
+        zeroclaw_runtime::security::LeakResult::Detected { patterns, redacted } => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"patterns": patterns})),
+                "output guardrail: credential leak detected in Matrix approval prompt"
+            );
+            redacted
         }
     }
 }
@@ -3893,10 +4077,26 @@ mod tests {
         use super::super::approval::{
             TOKEN_LEN, generate_token, generate_token_default, parse_reply,
         };
+        use super::super::inbound::{PendingApproval, PendingApprovalMatch, take_pending_approval};
+        use super::super::redact_approval_prompt;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
+        use tokio::sync::oneshot;
         use zeroclaw_api::channel::ChannelApprovalResponse;
+        use zeroclaw_config::schema::LeakDetectionConfig;
+
+        #[test]
+        fn rendered_approval_prompt_uses_the_central_leak_guard() {
+            // Approval prompts are adapter-owned egress, so a secret copied
+            // from tool arguments must be removed after the final rendering.
+            let rendered =
+                "APPROVAL REQUIRED [TOKEN]\nArgs: api_key=sk-abcdefghijklmnopqrstuvwxyz1234567890";
+            let protected =
+                redact_approval_prompt(rendered.to_string(), &LeakDetectionConfig::default());
+            assert_ne!(protected, rendered);
+            assert!(!protected.contains("sk-abcdefghijklmnopqrstuvwxyz1234567890"));
+        }
 
         #[test]
         fn token_length_and_alphabet() {
@@ -3918,6 +4118,49 @@ mod tests {
                 "too many collisions: {}",
                 1000 - seen.len()
             );
+        }
+
+        #[test]
+        fn bound_principal_mismatch_does_not_consume_approval_token() {
+            let (tx, _rx) = oneshot::channel();
+            let mut pending = HashMap::from([(
+                "token".to_string(),
+                PendingApproval {
+                    expected_principal: Some("@owner:example.test".into()),
+                    expected_room: "!bound:example.test".into(),
+                    sender: tx,
+                },
+            )]);
+            assert!(matches!(
+                take_pending_approval(
+                    &mut pending,
+                    "token",
+                    "@other:example.test",
+                    "!bound:example.test",
+                ),
+                PendingApprovalMatch::PrincipalMismatch
+            ));
+            assert!(pending.contains_key("token"));
+            assert!(matches!(
+                take_pending_approval(
+                    &mut pending,
+                    "token",
+                    "@owner:example.test",
+                    "!other:example.test",
+                ),
+                PendingApprovalMatch::RoomMismatch
+            ));
+            assert!(pending.contains_key("token"));
+            assert!(matches!(
+                take_pending_approval(
+                    &mut pending,
+                    "token",
+                    "@owner:example.test",
+                    "!bound:example.test",
+                ),
+                PendingApprovalMatch::Matched(_)
+            ));
+            assert!(!pending.contains_key("token"));
         }
 
         #[test]

@@ -45,12 +45,12 @@ acknowledgement is therefore not the goal's first worker response.
 
 ## Configuration
 
-Goal mode is enabled by default. The global policy lives under `[goal]`; the
+Goal mode is opt-in and disabled by default. The global policy lives under `[goal]`; the
 per-agent opt-out lives under `[agents.<alias>.goal]`.
 
 ```toml
 [goal]
-enabled = true
+enabled = false
 channel_status_updates = true
 restart_recovery = "last_state"
 allowed_command_surfaces = ["channel"]
@@ -62,7 +62,7 @@ approval_deny_behavior = "pause"
 [goal.verifier]
 # Verifier checks are enabled by default. Set this to false only when an
 # operator explicitly wants controller completion without a verifier call.
-enabled = false
+enabled = true
 model_provider = ""
 # Omit model to use the provider profile's configured model.
 # model = "qwen3-coder-plus"

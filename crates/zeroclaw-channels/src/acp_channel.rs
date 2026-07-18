@@ -513,6 +513,21 @@ impl Channel for AcpChannel {
             other => anyhow::bail!("ACP returned unexpected permission outcome: {other}"),
         }
     }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        // ACP has one authenticated RPC transport per session. A goal bound
+        // to another session must not use this session's client as its human
+        // approval route.
+        if principal.trim() != self.session_id {
+            return Ok(None);
+        }
+        self.request_approval(recipient, request).await
+    }
 }
 
 #[cfg(test)]
@@ -997,6 +1012,37 @@ mod tests {
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
+    }
+
+    #[tokio::test]
+    async fn bound_approval_rejects_another_acp_session() {
+        let (rpc, mut rx) = make_rpc();
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-owner",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+        let request = ChannelApprovalRequest {
+            tool_name: "git".to_string(),
+            arguments_summary: "git status --short".to_string(),
+            raw_arguments: None,
+        };
+
+        assert_eq!(
+            ch.request_approval_for_principal("", "sess-other", &request)
+                .await
+                .unwrap(),
+            None,
+            "a goal bound to a different ACP session must not prompt this client"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "a rejected bound request must not emit an ACP permission prompt"
+        );
     }
 
     #[tokio::test]

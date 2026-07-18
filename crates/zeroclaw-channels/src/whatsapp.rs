@@ -8,9 +8,57 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
-type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>;
+/// One outstanding prompt. This process-wide map is the sole source of truth
+/// for an approval request until its reply, timeout, send failure, or caller
+/// cancellation removes it.
+struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    expected_principal: Option<String>,
+}
+
+type PendingApprovalsMap = Mutex<HashMap<String, PendingApproval>>;
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Removes a pending request if the controller task is cancelled while it is
+/// awaiting a reply. Without this, a later reply could consume a stale token.
+struct PendingApprovalCleanup {
+    pending_approvals: Arc<PendingApprovalsMap>,
+    token: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(pending_approvals: Arc<PendingApprovalsMap>, token: String) -> Self {
+        Self {
+            pending_approvals,
+            token,
+            armed: true,
+        }
+    }
+
+    async fn remove_and_disarm(&mut self) {
+        self.pending_approvals.lock().await.remove(&self.token);
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        let token = self.token.clone();
+        tokio::spawn(async move {
+            pending_approvals.lock().await.remove(&token);
+        });
+    }
+}
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
@@ -74,11 +122,70 @@ impl WhatsAppChannel {
         self
     }
 
-    /// Access the process-wide pending-approvals map shared across every
-    /// `WhatsAppChannel` instance. See [`PENDING_APPROVALS`] for why this
-    /// must be a static rather than per-instance.
-    pub fn pending_approvals(&self) -> &Arc<PendingApprovalsMap> {
+    /// The webhook ingress and the channel worker use distinct handle
+    /// instances, so both resolve this request-scoped state through the same
+    /// process-wide canonical map.
+    #[cfg(test)]
+    fn pending_approvals(&self) -> &Arc<PendingApprovalsMap> {
         &PENDING_APPROVALS
+    }
+
+    /// Complete a pending approval only when the webhook sender is the exact
+    /// principal bound by the goal's durable continuation context.
+    pub async fn resolve_pending_approval(
+        &self,
+        token: &str,
+        principal: &str,
+        response: ChannelApprovalResponse,
+    ) -> bool {
+        let pending = {
+            let mut approvals = PENDING_APPROVALS.lock().await;
+            take_pending_approval(&mut approvals, token, principal)
+        };
+        pending.is_some_and(|entry| entry.sender.send(response).is_ok())
+    }
+
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let token = crate::util::new_approval_token();
+        let (tx_approval, rx_approval) = oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            token.clone(),
+            PendingApproval {
+                sender: tx_approval,
+                expected_principal: expected_principal.map(str::to_owned),
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&PENDING_APPROVALS), token.clone());
+
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\\nTool: {}\\nArgs: {}\\n\\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token, request.tool_name, request.arguments_summary, token, token, token
+        );
+        if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
+            cleanup.remove_and_disarm().await;
+            return Err(err);
+        }
+
+        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
+        match tokio::time::timeout(timeout, rx_approval).await {
+            Ok(Ok(response)) => {
+                // The webhook handler already consumed the entry.
+                cleanup.disarm();
+                Ok(Some(response))
+            }
+            _ => {
+                cleanup.remove_and_disarm().await;
+                Ok(crate::util::approval_timeout_response(
+                    expected_principal.is_some(),
+                ))
+            }
+        }
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -492,29 +599,21 @@ impl Channel for WhatsAppChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-        let token = crate::util::new_approval_token();
-        let (tx_approval, rx_approval) = oneshot::channel();
-        {
-            let mut map = PENDING_APPROVALS.lock().await;
-            map.insert(token.clone(), tx_approval);
+        self.request_approval_inner(recipient, None, request).await
+    }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
         }
-
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token
-        );
-        self.send(&SendMessage::new(text, recipient)).await?;
-
-        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
-        let response = match tokio::time::timeout(timeout, rx_approval).await {
-            Ok(Ok(response)) => response,
-            _ => {
-                let mut map = PENDING_APPROVALS.lock().await;
-                map.remove(&token);
-                ChannelApprovalResponse::Deny
-            }
-        };
-        Ok(Some(response))
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -560,6 +659,22 @@ impl Channel for WhatsAppChannel {
         // Typing indicator not wired for the WhatsApp Cloud API path.
         Ok(())
     }
+}
+
+fn take_pending_approval(
+    pending: &mut HashMap<String, PendingApproval>,
+    token: &str,
+    principal: &str,
+) -> Option<PendingApproval> {
+    let entry = pending.get(token)?;
+    if entry
+        .expected_principal
+        .as_deref()
+        .is_some_and(|expected| expected != principal)
+    {
+        return None;
+    }
+    pending.remove(token)
 }
 
 #[cfg(test)]
@@ -2405,7 +2520,13 @@ mod tests {
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
         {
             let mut map = orchestrator_ch.pending_approvals().lock().await;
-            map.insert("test_share_tok".to_string(), tx);
+            map.insert(
+                "test_share_tok".to_string(),
+                PendingApproval {
+                    sender: tx,
+                    expected_principal: None,
+                },
+            );
         }
         {
             let map = gateway_ch.pending_approvals().lock().await;
@@ -2420,5 +2541,40 @@ mod tests {
             .lock()
             .await
             .remove("test_share_tok");
+    }
+
+    #[tokio::test]
+    async fn bound_approval_reply_from_another_principal_is_not_consumed() {
+        let channel = WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            "whatsapp_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        PENDING_APPROVALS.lock().await.insert(
+            "bound-token".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("+15551234567".to_string()),
+            },
+        );
+
+        assert!(
+            !channel
+                .resolve_pending_approval(
+                    "bound-token",
+                    "+15557654321",
+                    ChannelApprovalResponse::Approve,
+                )
+                .await,
+            "a mismatched webhook sender must not decide a bound approval"
+        );
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key("bound-token"),
+            "a mismatched reply must leave the real operator's prompt pending"
+        );
+        PENDING_APPROVALS.lock().await.remove("bound-token");
     }
 }

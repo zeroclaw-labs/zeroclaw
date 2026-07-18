@@ -410,6 +410,24 @@ pub async fn record_tool_loop_cost_usage(
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
 ) -> anyhow::Result<Option<(u64, f64)>> {
+    record_tool_loop_cost_usage_optional(model_provider_name, model, Some(usage)).await
+}
+
+/// Record optional provider usage while enforcing goal-owned accounting.
+///
+/// Provider APIs legitimately omit usage for ordinary calls, so those callers
+/// keep best-effort metering. A trusted goal attribution changes that contract:
+/// the same successful response must return an error before it can advance the
+/// loop if the canonical budget ledger cannot be charged.
+pub(crate) async fn record_tool_loop_cost_usage_optional(
+    model_provider_name: &str,
+    model: &str,
+    usage: Option<&zeroclaw_providers::traits::TokenUsage>,
+) -> anyhow::Result<Option<(u64, f64)>> {
+    require_goal_usage(usage)?;
+    let Some(usage) = usage else {
+        return Ok(None);
+    };
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
@@ -572,6 +590,40 @@ pub async fn record_tool_loop_cost_usage(
     Ok(Some(returned_usage))
 }
 
+/// Reject missing or empty provider accounting for a goal-attributed call.
+///
+/// Goal budget enforcement is only trustworthy when each successful model
+/// response contributes usage to the canonical ledger. Ordinary turns remain
+/// best-effort, but a goal turn must return this error to its controller so it
+/// can pause the exact durable task instead of spending with an unknown budget.
+fn require_goal_usage(
+    usage: Option<&zeroclaw_providers::traits::TokenUsage>,
+) -> anyhow::Result<()> {
+    let goal_attributed = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(|context| {
+            context
+                .as_ref()
+                .is_some_and(|context| context.goal_attribution_enabled())
+        })
+        .unwrap_or(false);
+    if !goal_attributed {
+        return Ok(());
+    }
+
+    let Some(usage) = usage else {
+        anyhow::bail!("goal accounting usage unavailable");
+    };
+    if usage
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.output_tokens.unwrap_or(0))
+        == 0
+    {
+        anyhow::bail!("goal accounting usage unavailable");
+    }
+    Ok(())
+}
+
 /// Identifies fail-closed accounting errors produced while a trusted goal owns
 /// a model call. The verifier uses this to preserve the durable accounting
 /// blocker instead of misreporting it as a provider/verifier outage.
@@ -711,6 +763,34 @@ mod tests {
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    #[test]
+    fn goal_attributed_usage_rejects_missing_and_all_zero_provider_usage() {
+        // A successful goal-owned call without measurable usage cannot safely
+        // advance: the controller must receive the accounting error and pause
+        // the exact durable goal instead of spending an unbounded turn.
+        let goal = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_goal_task_id(Some("goal-usage-required".into()));
+        let context = ToolLoopCostTrackingContext::usage_only().with_goal_admission_context(&goal);
+        let zero = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(0),
+        };
+        let cached_only = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(1),
+        };
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                assert!(require_goal_usage(None).is_err());
+                assert!(require_goal_usage(Some(&zero)).is_err());
+                assert!(require_goal_usage(Some(&cached_only)).is_err());
+            }));
     }
 
     #[test]

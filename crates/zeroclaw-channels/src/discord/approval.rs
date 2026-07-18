@@ -1,7 +1,9 @@
 //! Buttoned tool-approval surface for the Discord channel.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use tokio::sync::oneshot;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 
@@ -86,6 +88,7 @@ pub(crate) fn approval_button_binding(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_parked_approval(
     map: &mut HashMap<String, oneshot::Sender<ChannelApprovalResponse>>,
     token: &str,

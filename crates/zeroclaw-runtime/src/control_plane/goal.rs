@@ -38,7 +38,12 @@ tokio::task_local! {
 #[derive(Clone, Default)]
 pub struct GoalRuntimeScope {
     /// Trusted admission facts attached by channel ingress.
-    admission_context: Option<GoalAdmissionContext>,
+    ///
+    /// The inner context is shared by the tools in this one live turn so a
+    /// successful exact goal admission can bind its returned task id before a
+    /// later approval request. This remains transient trust plumbing; the
+    /// canonical task and continuation rows remain authoritative.
+    admission_context: Arc<parking_lot::RwLock<Option<GoalAdmissionContext>>>,
     /// Optional live channel sink for controller/verifier progress messages.
     state_update_sink: Option<GoalStateUpdateSink>,
     /// Shared marker promoted when the current turn becomes goal work.
@@ -53,7 +58,7 @@ impl GoalRuntimeScope {
         turn_evaluation_requested: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
-            admission_context,
+            admission_context: Arc::new(parking_lot::RwLock::new(admission_context)),
             state_update_sink,
             turn_evaluation_requested,
             approval_deny_behavior: None,
@@ -71,7 +76,7 @@ impl GoalRuntimeScope {
     }
 
     fn with_admission_context(mut self, admission_context: Option<GoalAdmissionContext>) -> Self {
-        self.admission_context = admission_context;
+        self.admission_context = Arc::new(parking_lot::RwLock::new(admission_context));
         self
     }
 
@@ -867,7 +872,7 @@ impl GoalAdmissionContext {
 
 pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
     GOAL_RUNTIME_SCOPE
-        .try_with(|scope| scope.admission_context.clone())
+        .try_with(|scope| scope.admission_context.read().clone())
         .ok()
         .flatten()
 }
@@ -883,6 +888,33 @@ pub fn current_goal_approval_deny_behavior() -> GoalApprovalDenyBehavior {
         .ok()
         .flatten()
         .unwrap_or_default()
+}
+
+/// Bind a just-admitted exact goal task to the current live turn.
+///
+/// This does not persist lifecycle state or resolve a goal by route: callers
+/// may supply an id only after a successful controller transition returned it.
+/// It lets later tools in the same turn use the durable continuation route
+/// without falling back to mutable inbound delivery facts.
+pub fn bind_current_goal_task(task_id: &str) -> bool {
+    if task_id.trim().is_empty() {
+        return false;
+    }
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| {
+            let mut admission = scope.admission_context.write();
+            let Some(admission) = admission.as_mut() else {
+                return false;
+            };
+            match admission.goal_task_id.as_deref() {
+                Some(existing) => existing == task_id,
+                None => {
+                    admission.goal_task_id = Some(task_id.to_string());
+                    true
+                }
+            }
+        })
+        .unwrap_or(false)
 }
 
 fn current_goal_runtime_scope() -> GoalRuntimeScope {
@@ -2047,10 +2079,20 @@ async fn update_goal_budget(
     let usage = goal_usage_totals(config, &task_id);
     let budget = goal_budget_summary(updated.goal(), usage.as_ref());
     if let Some(budget_pause) = goal_budget_gate_pause(updated.goal(), usage.as_ref()) {
-        goal_store
-            .pause_goal_task(&task_id, merge_budget_pause(updated.goal(), budget_pause))
+        if !goal_store
+            .pause_goal_task_if_status(
+                &task_id,
+                updated.status(),
+                merge_budget_pause(updated.goal(), budget_pause),
+            )
             .await
-            .with_context(|| msg("goal-command-error-budget-failed", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-budget-failed", &[("task_id", &task_id)]))?
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-budget-failed", &[("task_id", &task_id)])
+            );
+        }
         return Ok(GoalAdmission {
             task_id: Some(task_id.clone()),
             status: TaskStatus::Paused,
@@ -2066,12 +2108,18 @@ async fn update_goal_budget(
     if updated.status() == TaskStatus::Paused && has_budget_pause(updated.goal()) {
         if let Some(pause) = remove_budget_pause(updated.goal()) {
             let blockers = blockers_summary(&pause.blockers);
-            goal_store
-                .pause_goal_task(&task_id, pause)
+            if !goal_store
+                .pause_goal_task_if_status(&task_id, updated.status(), pause)
                 .await
                 .with_context(|| {
                     msg("goal-command-error-budget-failed", &[("task_id", &task_id)])
-                })?;
+                })?
+            {
+                bail!(
+                    "{}",
+                    msg("goal-command-error-budget-failed", &[("task_id", &task_id)])
+                );
+            }
             let message = if let Some(blockers) = blockers {
                 msg(
                     "goal-command-budget-updated-paused-blocked",
@@ -2096,15 +2144,21 @@ async fn update_goal_budget(
             });
         }
 
-        goal_store
-            .resume_goal_task(
+        if !goal_store
+            .resume_paused_goal_task(
                 &task_id,
                 std::process::id(),
                 boot_id,
                 ctx.continuation_context.clone(),
             )
             .await
-            .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-update-failed", &[("task_id", &task_id)])
+            );
+        }
         return Ok(GoalAdmission {
             task_id: Some(task_id.clone()),
             status: TaskStatus::Running,
@@ -2203,10 +2257,16 @@ async fn pause_goal_for_resolved_task_with_budget(
     ensure_goal_not_terminal(task_goal.task())?;
     let task_id = task_goal.task_id().to_string();
     let message_key = goal_pause_message_key(pause.reason);
-    goal_store
-        .pause_goal_task(&task_id, pause)
+    if !goal_store
+        .pause_goal_task_if_status(&task_id, task_goal.status(), pause)
         .await
-        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task_id)]))?;
+        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task_id)]))?
+    {
+        bail!(
+            "{}",
+            msg("goal-command-error-pause-failed", &[("task_id", &task_id)])
+        );
+    }
     Ok(GoalAdmission {
         task_id: Some(task_id.clone()),
         status: TaskStatus::Paused,
@@ -2274,10 +2334,20 @@ async fn resume_goal(
             _ => "goal-command-budget-exhausted",
         };
         let budget = goal_budget_summary(current.goal(), current_usage.as_ref());
-        goal_store
-            .pause_goal_task(&task_id, merge_budget_pause(current.goal(), budget_pause))
+        if !goal_store
+            .pause_goal_task_if_status(
+                &task_id,
+                current.status(),
+                merge_budget_pause(current.goal(), budget_pause),
+            )
             .await
-            .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task_id)]))?
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-resume-failed", &[("task_id", &task_id)])
+            );
+        }
         return Ok(GoalAdmission {
             task_id: Some(task_id.clone()),
             status: TaskStatus::Paused,
@@ -2286,15 +2356,21 @@ async fn resume_goal(
             continue_goal: false,
         });
     }
-    goal_store
-        .resume_goal_task(
+    if !goal_store
+        .resume_paused_goal_task(
             &task_id,
             std::process::id(),
             boot_id,
             ctx.continuation_context.clone(),
         )
         .await
-        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?;
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?
+    {
+        bail!(
+            "{}",
+            msg("goal-command-error-update-failed", &[("task_id", &task_id)])
+        );
+    }
     let budget = goal_budget_summary(current.goal(), current_usage.as_ref());
     Ok(GoalAdmission {
         task_id: Some(task_id.clone()),
@@ -2327,15 +2403,20 @@ async fn cancel_goal(
         );
     }
     let task_id = current.task_id().to_string();
-    store
-        .update_status(
+    if !goal_store
+        .cancel_goal_task_if_status(
             &task_id,
-            TaskStatus::Cancelled,
-            None,
-            Some(msg("goal-terminal-reason-cancelled-by-controller", &[])),
+            current.status(),
+            msg("goal-terminal-reason-cancelled-by-controller", &[]),
         )
         .await
-        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?;
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task_id)]))?
+    {
+        bail!(
+            "{}",
+            msg("goal-command-error-update-failed", &[("task_id", &task_id)])
+        );
+    }
     let usage = goal_usage_totals(config, &task_id);
     let budget = goal_budget_summary(current.goal(), usage.as_ref());
     Ok(GoalAdmission {
@@ -2405,7 +2486,9 @@ pub async fn admit_goal_autonomous_turn(
     let Some(cp) = control_plane() else {
         return Ok(None);
     };
-    let Some(resolved) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
         return Ok(None);
     };
     if !resolved.is_running() {
@@ -2443,7 +2526,11 @@ async fn resolve_goal_task(
     ctx: &GoalAdmissionContext,
     task_id: Option<String>,
 ) -> Result<TaskRecord> {
-    if let Some(task_id) = task_id {
+    // A caller-provided target is authoritative for an operator command. For
+    // trusted controller continuations, the task bound to the admission scope
+    // is equally authoritative: never replace it with the latest active goal
+    // from the same route/principal context.
+    if let Some(task_id) = task_id.or_else(|| ctx.goal_task_id.clone()) {
         let task = store
             .get(&task_id)
             .await
@@ -2501,8 +2588,10 @@ async fn resolved_goal_for_context(
     goal_store: &dyn GoalTaskRegistry,
     ctx: &GoalAdmissionContext,
 ) -> Result<Option<TaskGoal>> {
-    if ctx.goal_task_id.is_some() {
-        return resolve_goal(store, goal_store, ctx, None).await.map(Some);
+    if let Some(task_id) = ctx.goal_task_id.clone() {
+        return resolve_goal(store, goal_store, ctx, Some(task_id))
+            .await
+            .map(Some);
     }
     let Some(task) = goal_store
         .latest_active_goal_for_context(
@@ -4609,6 +4698,65 @@ mod tests {
         let unchanged = store.get(task_id).await.unwrap().unwrap();
         assert_eq!(unchanged.originator_route.as_deref(), Some("legacy-route"));
         assert_eq!(unchanged.principal_id.as_deref(), Some("legacy-principal"));
+    }
+
+    #[tokio::test]
+    async fn bound_terminal_goal_never_falls_back_to_newer_active_goal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("matrix:room-1".into()))
+            .with_principal_id(Some("principal-1".into()));
+        let first = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "finish the first task".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let first_id = first.task_id.unwrap();
+        cancel_goal(&store, &store, &ctx, Some(first_id.clone()), None)
+            .await
+            .unwrap();
+
+        let second = start_goal(
+            &store,
+            "boot-b",
+            ctx.clone(),
+            "finish the replacement task".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let second_id = second.task_id.unwrap();
+
+        let bound_first = ctx.with_goal_task_id(Some(first_id.clone()));
+        let err = pause_goal_for_blocker(
+            &store,
+            &store,
+            &bound_first,
+            None,
+            None,
+            GoalPauseState {
+                reason: GoalPauseReason::OperatorPaused,
+                description: Some("stale continuation".into()),
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("already terminal"), "{err:#}");
+        assert_eq!(
+            store.get(&second_id).await.unwrap().unwrap().status,
+            TaskStatus::Running,
+            "a continuation bound to the terminal first goal must not pause its replacement"
+        );
     }
 
     #[tokio::test]
