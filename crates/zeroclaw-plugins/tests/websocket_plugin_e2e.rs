@@ -2,6 +2,11 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/admit.rs"]
+mod admit_support;
+#[path = "support/state.rs"]
+mod state_support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,6 +30,9 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use admit_support::admit_fixture;
+use state_support::state_service;
 
 const ECHO_HOST: &str = "127.0.0.1";
 
@@ -103,6 +111,7 @@ fn manifest() -> PluginManifest {
         description: None,
         author: None,
         wasm_path: Some("channel-websocket-fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Channel],
         permissions: vec![
             PluginPermission::ConfigRead,
@@ -131,7 +140,7 @@ fn host_services(url: String) -> PluginHostServices {
     let egress = EgressHostService::new(EgressPolicyResolver::new(|_| {
         EgressPolicy::new([ECHO_HOST.to_string()], [ECHO_HOST.to_string()], [], 4)
     }));
-    PluginHostServices::new(config, egress)
+    PluginHostServices::new(config, state_service(), egress)
 }
 
 async fn build_channel(
@@ -142,7 +151,8 @@ async fn build_channel(
     let scope =
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, "main", grants)?;
     let endpoint = PluginChannelEndpoint::new(scope, "websocket_fixture")?;
-    WasmChannel::from_wasm(endpoint, &fixture(), &host_services(url), limits()).await
+    let component = admit_fixture(&fixture(), &manifest);
+    WasmChannel::from_wasm(endpoint, &component, &host_services(url), limits()).await
 }
 
 async fn run_echo_server(listener: TcpListener) {

@@ -82,21 +82,19 @@ The manifest declares two orthogonal things:
 - **Permissions**: what host services the plugin's code may *reach*. The
   `PluginPermission` enum in the same file. Today `config_read` (tool and
   channel adapters receive their own schema-materialized, validated public
-  config and can
-  resolve schema-designated secrets in authorized service calls) and
+  config and can resolve schema-designated secrets in authorized service calls),
   `http_client`,
   `websocket_client` (a bounded host-mediated WebSocket resource is linked for
-  tool and channel worlds),
+  tool and channel worlds), `socket_client` (typed TCP/TLS/STARTTLS resources),
   `state_read`, and `state_write` have behavioral effect. The HTTP permission is
   the necessary grant for adapters that implement outbound `wasi:http`: tool
   and channel enable that surface, while memory intentionally does not yet. The
   state permissions gate encrypted durable state owned by the exact package,
   capability, and binding.
   `config_read` must be paired with the manifest's `config_schema`; either one
-  without the other is rejected. `socket_client` is backed by the typed
-  TCP/TLS/STARTTLS host resource. Filesystem and memory-access permissions are
-  accepted by the schema but not yet backed by host functions, so declaring
-  them grants nothing.
+  without the other is rejected. Filesystem and memory-access permissions are
+  accepted by the schema but not yet backed by host functions, so declaring them
+  grants nothing.
 
 ## The worlds
 
@@ -130,13 +128,13 @@ a precompiled `.cwasm`. Each plugin instantiation gets:
   optional HTTP context, and the fuel budget;
 - a `Linker` with exactly the imports its world, grants, and adapter support call
   for:
-  `logging` always, `secrets` for tools and channels, `config` and `inbound` for
-  channels, `wasi:http` only when the manifest grants `http_client`, and the
-  `websocket` or `sockets` resource only when it grants `websocket_client` or
-  `socket_client`, respectively. HTTP is additionally limited to capability
-  adapters that opt in; memory creates no network context or linker. Each
-  optional surface and its store authority are derived from the same admitted
-  scope and cross-checked at instantiation (`ensure_http_coherent` and
+  `logging` always, `secrets` and `state` for tools and channels, `config` and
+  `inbound` for channels, `wasi:http` only when the manifest grants
+  `http_client`, and the `websocket` or `sockets` resource only when it grants
+  `websocket_client` or `socket_client`. HTTP is additionally limited to
+  capability adapters that opt in; memory creates no network context or linker.
+  Each optional surface and its store authority are derived from the same
+  admitted scope and cross-checked at instantiation (`ensure_http_coherent` and
   `ensure_permission_coherent`), so they cannot disagree.
 
 Tool calls are stateless by construction: `WasmTool::execute` builds a fresh

@@ -247,11 +247,12 @@ For a channel: `capabilities` containing `channel`, and almost certainly
 `config_read` because platforms require credentials. Request the narrow network
 surface the implementation actually uses: `http_client` for outbound
 `wasi:http`, `websocket_client` for the host-mediated WebSocket resource, or
-both for a platform with separate REST and streaming APIs. Neither permission
-allows a listener; inbound host-owned traffic arrives through `inbound`. The
-channel adapter implements these network surfaces but links each one only after
-its grant is validated; without both adapter support and the corresponding
-grant, `send` has no network path to the platform.
+`socket_client` for typed TCP, direct TLS, or STARTTLS. A platform with separate
+REST and streaming APIs may need more than one. None allows a listener; inbound
+host-owned traffic arrives through `inbound`. The channel adapter implements
+these network surfaces but links each one only after its grant is validated;
+without both adapter support and the corresponding grant, `send` has no network
+path to the platform.
 
 Pair `config_read` with the schema consumed by `ChannelConfig`:
 

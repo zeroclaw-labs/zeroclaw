@@ -894,10 +894,11 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::{
         Callback, ErrorResponse, Request as ServerRequest, Response as ServerResponse,
     };
+    use zeroclaw_api::plugin_key::SecretPropertyRef;
 
     use crate::egress::{
-        EgressHostService, EgressPolicy, EgressPolicyResolver, SecretPropertyRef, TlsProfile,
-        TlsProfileName, build_tls_client_config,
+        EgressHostService, EgressPolicy, EgressPolicyResolver, TlsProfile, TlsProfileName,
+        build_tls_client_config,
     };
     use crate::instance::PluginInstanceScope;
     use crate::{PluginCapability, PluginManifest, PluginPermission};
@@ -941,6 +942,7 @@ mod tests {
             description: None,
             author: None,
             wasm_path: None,
+            wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
             permissions: vec![PluginPermission::WebSocketClient],
             config_schema: None,
@@ -1237,7 +1239,7 @@ mod tests {
             TlsProfileName::new("private-ca").unwrap(),
             ["socket.test".to_string()],
             false,
-            Some(SecretPropertyRef::new("ca_pem").unwrap()),
+            Some(SecretPropertyRef::parse("ca_pem").unwrap()),
             None,
         )
         .unwrap();
