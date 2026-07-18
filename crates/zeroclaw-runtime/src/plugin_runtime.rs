@@ -203,10 +203,44 @@ pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::Plu
 
 /// Construct every admitted channel plugin from the exact component bytes the
 /// package host verified. The returned channels carry their canonical alias in
-/// their host-issued `PluginChannelEndpoint`.
+/// their host-issued `PluginChannelEndpoint`. Production callers must inject
+/// the typed host event router; a plugin listener never submits through the
+/// native channel sender.
 pub async fn configured_plugin_channels(
     config: Arc<Config>,
     live_config: Option<Arc<RwLock<Config>>>,
+    #[cfg(feature = "plugins-wasm")] event_router: zeroclaw_plugins::event::PluginEventRouter,
+) -> Vec<Arc<dyn Channel>> {
+    configured_plugin_channels_inner(
+        config,
+        live_config,
+        #[cfg(feature = "plugins-wasm")]
+        Some(event_router),
+    )
+    .await
+}
+
+/// Construct channel plugins for health checks and tests that do not dispatch
+/// inbound traffic. Any guest message emitted in this mode fails closed.
+pub async fn configured_plugin_channels_without_event_dispatch(
+    config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
+) -> Vec<Arc<dyn Channel>> {
+    configured_plugin_channels_inner(
+        config,
+        live_config,
+        #[cfg(feature = "plugins-wasm")]
+        None,
+    )
+    .await
+}
+
+async fn configured_plugin_channels_inner(
+    config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
+    #[cfg(feature = "plugins-wasm")] event_router: Option<
+        zeroclaw_plugins::event::PluginEventRouter,
+    >,
 ) -> Vec<Arc<dyn Channel>> {
     #[cfg(not(feature = "plugins-wasm"))]
     {
@@ -284,11 +318,18 @@ pub async fn configured_plugin_channels(
                     }
                 };
             let alias = endpoint.alias().to_string();
-            match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
-                endpoint, component, &services, limits,
-            )
-            .await
-            {
+            let constructed = if let Some(router) = event_router.clone() {
+                zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
+                    endpoint, component, &services, limits, router,
+                )
+                .await
+            } else {
+                zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_without_event_dispatch(
+                    endpoint, component, &services, limits,
+                )
+                .await
+            };
+            match constructed {
                 Ok(channel) => channels.push(Arc::new(channel)),
                 Err(error) => {
                     ::zeroclaw_log::record!(

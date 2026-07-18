@@ -19,6 +19,10 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
+use zeroclaw_plugins::event::{
+    PluginEventDispatcher, PluginEventEnvelope, PluginEventError, PluginEventResolution,
+    PluginEventRouteResolver, PluginEventRouter, ResolvedPluginEventRoute,
+};
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
@@ -109,7 +113,66 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
     PluginHostServices::new(resolver, state_service(), support::egress_service())
 }
 
+struct AcceptingDispatcher;
+
+#[async_trait::async_trait]
+impl PluginEventDispatcher for AcceptingDispatcher {
+    async fn dispatch(
+        &self,
+        _route: ResolvedPluginEventRoute,
+        _event: PluginEventEnvelope,
+    ) -> Result<(), PluginEventError> {
+        Ok(())
+    }
+}
+
+fn accepting_router() -> PluginEventRouter {
+    let resolver = PluginEventRouteResolver::new(|instance, _| {
+        Ok(PluginEventResolution::Authorized(
+            ResolvedPluginEventRoute::agent(instance, "fixture-agent")?,
+        ))
+    });
+    PluginEventRouter::new(resolver, Arc::new(AcceptingDispatcher))
+}
+
+struct RecordingDispatcher {
+    sender: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+}
+
+#[async_trait::async_trait]
+impl PluginEventDispatcher for RecordingDispatcher {
+    async fn dispatch(
+        &self,
+        _route: ResolvedPluginEventRoute,
+        event: PluginEventEnvelope,
+    ) -> Result<(), PluginEventError> {
+        self.sender
+            .send(event.into_message())
+            .await
+            .map_err(|_| PluginEventError::DispatchFailed("test receiver closed".to_string()))
+    }
+}
+
+fn recording_router(
+    sender: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+) -> PluginEventRouter {
+    let resolver = PluginEventRouteResolver::new(|instance, _| {
+        Ok(PluginEventResolution::Authorized(
+            ResolvedPluginEventRoute::agent(instance, "fixture-agent")?,
+        ))
+    });
+    PluginEventRouter::new(resolver, Arc::new(RecordingDispatcher { sender }))
+}
+
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {
+    build_channel_with_router(binding, services, accepting_router()).await
+}
+
+async fn build_channel_with_router(
+    binding: &str,
+    services: &PluginHostServices,
+    event_router: PluginEventRouter,
+) -> WasmChannel {
     let manifest = manifest();
     let scope = PluginInstanceScope::from_manifest(
         &manifest,
@@ -125,7 +188,7 @@ async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChan
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
     let component = admit_fixture(&fixture(), &manifest);
 
-    WasmChannel::from_wasm(endpoint, &component, services, limits())
+    WasmChannel::from_wasm(endpoint, &component, services, limits(), event_router)
         .await
         .expect("instantiate fixture channel")
 }
@@ -152,7 +215,10 @@ fn outbound(content: &str, recipient: &str) -> SendMessage {
 
 #[tokio::test]
 async fn channel_component_runs_through_host_ingress() {
-    let channel = channel("main").await;
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(config);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+    let channel = build_channel_with_router("main", &services, recording_router(event_tx)).await;
 
     assert_eq!(channel.name(), "plugin");
     assert_eq!(channel.alias(), "main");
@@ -175,9 +241,9 @@ async fn channel_component_runs_through_host_ingress() {
         ..Default::default()
     });
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
-    let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let message = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
         .await
         .expect("fixture message arrives before timeout")
         .expect("listener remains connected");
@@ -191,6 +257,58 @@ async fn channel_component_runs_through_host_ingress() {
     assert!(
         !listener.is_finished(),
         "listen must retain ownership of its polling loop"
+    );
+    listener.abort();
+    let error = listener
+        .await
+        .expect_err("aborting listen must cancel its polling loop");
+    assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn channel_listener_drops_events_denied_by_live_host_routing() {
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(config);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+    let resolver = PluginEventRouteResolver::new(|_, _| Ok(PluginEventResolution::Denied));
+    let router =
+        PluginEventRouter::new(resolver, Arc::new(RecordingDispatcher { sender: event_tx }));
+    let channel = build_channel_with_router("main", &services, router).await;
+    let inbound = channel.inbound();
+    inbound.enqueue(HostInboundMessage {
+        id: "denied-1".to_string(),
+        sender: "blocked".to_string(),
+        reply_target: "room".to_string(),
+        content: "must not dispatch".to_string(),
+        channel: "guest-channel".to_string(),
+        channel_alias: Some("guest-alias".to_string()),
+        timestamp: 8,
+        ..Default::default()
+    });
+
+    let (lifecycle_tx, mut native_rx) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(lifecycle_tx).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while inbound.pending() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture drains denied event");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .is_err(),
+        "denied event must never reach the shared dispatcher"
+    );
+    assert!(
+        native_rx.try_recv().is_err(),
+        "plugin events must never bypass the typed router via Channel::listen"
+    );
+    assert!(
+        !listener.is_finished(),
+        "an authorization denial must not restart a healthy listener"
     );
     listener.abort();
     let error = listener

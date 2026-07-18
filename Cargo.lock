@@ -13310,6 +13310,7 @@ dependencies = [
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-memory",
+ "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-runtime",
  "zeroclaw-spawn",

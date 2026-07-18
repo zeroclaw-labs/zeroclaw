@@ -13,6 +13,7 @@ use crate::component::{
     load_component, wt,
 };
 use crate::endpoint::PluginChannelEndpoint;
+use crate::event::{PluginEventError, PluginEventRouter};
 use crate::host::AdmittedComponent;
 use crate::services::PluginHostServices;
 use anyhow::Result;
@@ -31,6 +32,7 @@ use zeroclaw_api::media::MediaAttachment;
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
     endpoint: PluginChannelEndpoint,
+    event_router: Option<PluginEventRouter>,
     capabilities: ChannelCapabilities,
     state: Mutex<(Store<PluginState>, ChannelPlugin)>,
     inbound: InboundQueue,
@@ -83,11 +85,36 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 }
 
 impl WasmChannel {
+    /// Construct a production channel whose inbound events must enter the
+    /// host-owned typed event router.
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
         component: &AdmittedComponent,
         services: &PluginHostServices,
         limits: crate::component::PluginLimits,
+        event_router: PluginEventRouter,
+    ) -> Result<Self> {
+        Self::from_wasm_with_router(endpoint, component, services, limits, Some(event_router)).await
+    }
+
+    /// Construct a channel only for health checks and tests that never dispatch
+    /// inbound traffic. If the guest does emit a message, the listen loop fails
+    /// closed instead of bypassing the typed host router.
+    pub async fn from_wasm_without_event_dispatch(
+        endpoint: PluginChannelEndpoint,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
+        Self::from_wasm_with_router(endpoint, component, services, limits, None).await
+    }
+
+    async fn from_wasm_with_router(
+        endpoint: PluginChannelEndpoint,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
+        limits: crate::component::PluginLimits,
+        event_router: Option<PluginEventRouter>,
     ) -> Result<Self> {
         services.resolve_config(endpoint.scope())?;
         let component = load_component(component)?;
@@ -172,6 +199,7 @@ impl WasmChannel {
 
         Ok(Self {
             endpoint,
+            event_router,
             capabilities,
             state: Mutex::new((store, bindings)),
             inbound,
@@ -299,12 +327,30 @@ impl Channel for WasmChannel {
                 Ok(Some(wit_msg)) => {
                     mark_poll_healthy(&self.poll_healthy, true);
                     backoff = INITIAL_BACKOFF;
-                    if tx
-                        .send(from_wit_inbound(wit_msg, &self.endpoint))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
+                    let message = from_wit_inbound(wit_msg, &self.endpoint);
+                    let Some(router) = self.event_router.as_ref() else {
+                        return Err(anyhow::Error::msg(
+                            "channel plugin emitted inbound traffic while event dispatch was disabled",
+                        ));
+                    };
+                    if let Err(error) = router.submit(&self.endpoint, message).await {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel": self.endpoint.channel_type(),
+                                "channel_alias": self.endpoint.alias(),
+                                "error": error.to_string(),
+                            })),
+                            "channel plugin event rejected by host routing"
+                        );
+                        if matches!(error, PluginEventError::DispatchFailed(_)) {
+                            return Err(anyhow::Error::new(error));
+                        }
                     }
                     continue;
                 }
@@ -810,7 +856,7 @@ mod tests {
             ))
         }));
         let component = AdmittedComponent::test_component(b"not-a-component");
-        let result = WasmChannel::from_wasm(
+        let result = WasmChannel::from_wasm_without_event_dispatch(
             endpoint,
             &component,
             &services,

@@ -129,7 +129,12 @@ config services, and host-fed `inbound` queue) is complete and unit-covered, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
 to register. The runtime admits enabled `[channels.plugin.<alias>]` declarations
 owned by enabled agents, constructs them from the exact component bytes admitted
-by the host, and supervises them in the ordinary channel listener lifecycle.
+by the host, injects a typed host event router, and supervises them in the
+ordinary channel listener lifecycle. Plugin listeners submit host-stamped
+messages through a bounded queue; the host resolves the current declaration,
+exact agent owner, sender allowlist, and SOP interest for every submission
+before entering the shared dispatcher. Health checks use an explicit
+non-dispatching constructor that fails closed if a guest emits inbound traffic.
 Explicit channel declarations do not require `plugins.auto_discover`; that flag
 controls package-scoped tool and skill discovery. One deterministic
 `plugins.max_active_instances` decision covers all three logical capability

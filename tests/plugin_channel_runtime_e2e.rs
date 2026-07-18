@@ -117,7 +117,11 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     });
 
     let channels =
-        zeroclaw_runtime::plugin_runtime::configured_plugin_channels(Arc::new(config), None).await;
+        zeroclaw_runtime::plugin_runtime::configured_plugin_channels_without_event_dispatch(
+            Arc::new(config),
+            None,
+        )
+        .await;
     assert_eq!(channels.len(), 1, "the configured fixture must construct");
     let channel = Arc::clone(&channels[0]);
     assert_eq!(channel.name(), "plugin");

@@ -15,6 +15,7 @@ zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
+zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
@@ -171,6 +172,7 @@ thiserror = { version = "2.0", optional = true }
 
 [features]
 default = ["default-channels"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 default-channels = [
   "channel-acp-server",
   "channel-discord",

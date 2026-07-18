@@ -15,6 +15,8 @@ pub mod login_probe;
 pub mod login_relink;
 pub mod orchestrator;
 pub mod paced_channel;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_event_dispatch;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
