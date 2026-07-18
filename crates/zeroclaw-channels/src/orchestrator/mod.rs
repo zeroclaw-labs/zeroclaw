@@ -16363,7 +16363,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn addressed_goal_resume_enters_model_loop() {
-        run_channel_dispatch_test(async {
+        run_channel_dispatch_test(|| async {
             ensure_test_control_plane().await;
 
             let channel_impl = Arc::new(AddressedRecordingChannel::default());
