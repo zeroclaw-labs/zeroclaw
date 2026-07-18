@@ -15,7 +15,6 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
@@ -23,9 +22,10 @@ use ratatui::{
 };
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
+use crate::terminal_backend::WideCellCleanupBackend;
 use crate::theme;
 
-pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -66,7 +66,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    Ok(Terminal::new(WideCellCleanupBackend::new(stdout))?)
 }
 
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {

@@ -721,10 +721,11 @@ pub trait FamilyEndpoint {
 }
 
 /// Wire protocol flavor for the model_provider client. `responses` routes
-/// through OpenAI's Codex/Responses API (`POST /v1/responses`);
+/// through OpenAI's Responses API (`POST /v1/responses`);
 /// `chat_completions` routes through the legacy `/v1/chat/completions` (or
-/// the family's chat-completions-compatible endpoint). Auto-selected per
-/// family when unset.
+/// the family's chat-completions-compatible endpoint). New OpenAI provider
+/// slots default to `responses`; other families default to chat-completions
+/// (or ignore the field) when unset.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
@@ -823,7 +824,7 @@ pub struct ModelProviderConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
-    /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider; only override if you're forcing an unusual combination.
+    /// Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
@@ -964,13 +965,43 @@ impl ModelEndpoint for OpenAIEndpoint {
 /// because they're consumed by validation and runtime helpers that operate
 /// on the base struct without family awareness; this wrapper is a thin
 /// typed slot, no extra fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// New OpenAI provider entries **persisted via `create_map_key` / `ensure`**
+/// (quickstart, gateway/config UI, programmatic slot creation) default to
+/// `wire_api = "responses"` because OpenAI has moved recent GPT models onto
+/// `POST /v1/responses` as the primary wire. OpenAI-compatible families
+/// (`custom`, `llamacpp`, branded vendors, …) keep the shared
+/// `ModelProviderConfig` default of unset / chat-completions.
+///
+/// This default governs **persisted slot creation only**. Two paths keep the
+/// legacy chat-completions wire for backward compatibility:
+/// - Existing persisted configs that omit `wire_api` deserialize as `None`, and
+///   the factory falls back to chat-completions.
+/// - Implicit dispatch with no config entry at all — a bare
+///   `model_provider = "openai"` reference or a dotted ref to a nonexistent
+///   alias — is built from a chat-anchored fallback config (see
+///   `openai_missing_entry_fallback_config` in `zeroclaw-providers`), not this
+///   `Default`, and stays on the chat wire so existing bare-ref installs don't
+///   flip wire + tool-calling mode on upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.openai"]
 pub struct OpenAIModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+}
+
+impl Default for OpenAIModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig {
+                // OpenAI's current default wire for new provider slots.
+                wire_api: Some(WireApi::Responses),
+                ..ModelProviderConfig::default()
+            },
+        }
+    }
 }
 
 // ── Azure OpenAI ──
@@ -31731,6 +31762,15 @@ model = "gpt-4o"
             .create_map_key("providers.models.openai", "myalias")
             .expect("typed family slot accepts a new alias");
         assert!(created);
+        assert_eq!(
+            config
+                .providers
+                .models
+                .find("openai", "myalias")
+                .and_then(|e| e.wire_api),
+            Some(WireApi::Responses),
+            "new OpenAI provider slots default to wire_api = responses"
+        );
         config.mark_dirty("providers.models.openai.myalias");
         config.save_dirty().await.unwrap();
 
@@ -31744,6 +31784,15 @@ model = "gpt-4o"
                 .find("openai", "myalias")
                 .is_some(),
             "created alias must survive save_dirty + reload; got:\n{written}"
+        );
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "myalias")
+                .and_then(|e| e.wire_api),
+            Some(WireApi::Responses),
+            "default wire_api must survive save_dirty + reload; got:\n{written}"
         );
     }
 

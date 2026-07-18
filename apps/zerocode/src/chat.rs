@@ -4329,7 +4329,6 @@ fn render_table(
     width: u16,
 ) -> Vec<Line<'static>> {
     use pulldown_cmark::Alignment as MdAlign;
-    use unicode_width::UnicodeWidthStr;
 
     if rows.is_empty() {
         return Vec::new();
@@ -4351,7 +4350,7 @@ fn render_table(
     let mut natural: Vec<usize> = vec![0; cols];
     for row in &grid {
         for (i, cell) in row.iter().enumerate() {
-            natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
+            natural[i] = natural[i].max(crate::display_width::display_width(cell.as_str()));
         }
     }
 
@@ -4373,11 +4372,10 @@ fn render_table(
     };
 
     fn truncate_to(s: &str, budget: usize) -> String {
-        use unicode_width::UnicodeWidthChar;
         if budget == 0 {
             return String::new();
         }
-        let full_width = UnicodeWidthStr::width(s);
+        let full_width = crate::display_width::display_width(s);
         if full_width <= budget {
             return s.to_string();
         }
@@ -4388,13 +4386,13 @@ fn render_table(
         }
         let mut acc = String::new();
         let mut used = 0usize;
-        for ch in s.chars() {
-            let w = ch.width().unwrap_or(0);
+        // Walk graphemes so presentation sequences (⚠️, 🏔️) stay intact.
+        for (_offset, grapheme, w) in crate::display_width::grapheme_widths(s) {
             if used + w + 1 > budget {
                 acc.push('\u{2026}');
                 return acc;
             }
-            acc.push(ch);
+            acc.push_str(grapheme);
             used += w;
             if used == budget {
                 return acc;
@@ -4404,7 +4402,7 @@ fn render_table(
     }
 
     fn pad_cell(s: &str, budget: usize, align: MdAlign) -> String {
-        let w = UnicodeWidthStr::width(s);
+        let w = crate::display_width::display_width(s);
         let slack = budget.saturating_sub(w);
         match align {
             MdAlign::Right => format!("{}{}", " ".repeat(slack), s),
@@ -5326,8 +5324,6 @@ impl ChatState {
     }
 
     fn refresh_title_hit_rects(&mut self, area: Rect) {
-        use unicode_width::UnicodeWidthStr;
-
         self.title_hit_rects.clear();
         let mut x = area.x.saturating_add(2);
         let right = area.x.saturating_add(area.width);
@@ -5335,7 +5331,7 @@ impl ChatState {
             if idx > 0 {
                 x = x.saturating_add(2);
             }
-            let width = UnicodeWidthStr::width(text.as_str()) as u16;
+            let width = crate::display_width::display_width(text.as_str()) as u16;
             if let Some(target) = target
                 && width > 0
                 && x < right
@@ -8127,6 +8123,36 @@ mod tests {
             20,
         );
         assert!(out.contains('\u{2026}'), "expected ellipsis: {out}");
+    }
+
+    #[test]
+    fn md_table_pads_emoji_presentation_to_two_cells() {
+        // 🏔️ is U+1F3D4 + U+FE0F. Natural column width must be 2 (not 1), so a
+        // wider sibling cell still leaves a full cell of space after the glyph.
+        let out = rendered("| A | B |\n|---|---|\n| \u{1F3D4}\u{FE0F} | xx |\n", 40);
+        let data = out
+            .lines()
+            .find(|l| l.contains('\u{1F3D4}'))
+            .expect("emoji data row");
+        let emoji = "\u{1F3D4}\u{FE0F}";
+        let idx = data.find(emoji).expect("emoji in row");
+        let after = &data[idx + emoji.len()..];
+        // Column budget for A is max(width("A"), width(emoji)) = 2, so after
+        // the emoji there is no content pad — only the trailing cell space
+        // before the border.
+        assert!(
+            after.starts_with(" \u{2502}"),
+            "emoji column natural width is 2 cells: {data:?}"
+        );
+        // And the header cell for A is padded to that same 2-cell budget.
+        let header = out
+            .lines()
+            .find(|l| l.contains('A') && l.contains('B'))
+            .expect("header row");
+        assert!(
+            header.contains(" A  "),
+            "header A cell must pad to emoji's 2-cell width: {header:?}"
+        );
     }
 
     #[test]
