@@ -247,22 +247,7 @@ impl PluginInstanceScope {
 /// Validate the package-name grammar once for both manifest admission and
 /// runtime instance construction.
 pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
-    let bytes = name.as_bytes();
-    let valid = (1..=128).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
-    let valid = valid
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
-        });
-    if !valid {
-        return Err(format!(
-            "plugin package must be a 1-128 character lowercase ASCII slug, start with a letter or digit, end with a letter or digit, and use only '-', '_', or '.' as separators (got {name:?})"
-        ));
-    }
-    Ok(())
+    zeroclaw_api::plugin::validate_plugin_package_name(name).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

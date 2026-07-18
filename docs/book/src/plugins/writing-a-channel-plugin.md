@@ -283,6 +283,23 @@ package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
 isolated.
 
+Declare each logical binding under the generic plugin channel family and route
+an agent to the ordinary dotted channel reference:
+
+```toml
+[channels.plugin.primary]
+package = "my-platform"
+enabled = true
+
+[agents.operator]
+channels = ["plugin.primary"]
+```
+
+`channels.plugin.primary` owns only package selection and activation. Put all
+schema values, including secret properties, in the `plugins.entries` row for
+the host-derived `PluginInstanceId`; do not duplicate them in the channel
+declaration.
+
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view
 afterward. A public config plus credential rotation within the same logical

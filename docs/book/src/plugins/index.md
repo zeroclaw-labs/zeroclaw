@@ -192,11 +192,23 @@ Per-instance settings live under `plugins.entries`, keyed by a versioned
 `zpi1_…` string derived from the host-owned package, capability, and binding
 identity. Installation prints and seeds the keys for the package's default
 tool binding; `zeroclaw plugin info <package>` prints that key again. Alias-owned
-channel construction must seed the key derived from its actual alias rather
-than inventing a package-name binding. Full-identity keys let different packages
-and capability worlds safely reuse aliases such as `main` without sharing
-credentials. The canonical operator values are a secret-marked string map and
-remain encrypted at rest (`enc2:…`). A plugin that requests `config_read`
+channel instances declare package selection separately from values:
+
+```toml
+[channels.plugin.operations]
+package = "my-platform"
+enabled = true
+
+[agents.operator]
+channels = ["plugin.operations"]
+```
+
+The host derives the channel instance key from `my-platform`, the `channel`
+capability, and `operations`; the declaration never copies credentials or
+other plugin values. Full-identity keys let different packages and capability
+worlds safely reuse aliases such as `main` without sharing credentials. The
+canonical operator values are a secret-marked string map and remain encrypted
+at rest (`enc2:…`). A plugin that requests `config_read`
 declares the map's single type contract in `config_schema`: a closed Draft
 2020-12 object whose
 top-level properties explicitly use `string`, `boolean`, `integer`, `number`,

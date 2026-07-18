@@ -9573,6 +9573,24 @@ fn validate_plugin_host_patterns(patterns: &[String], path: &str) -> Result<()> 
     Ok(())
 }
 
+fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
+    let mut aliases: Vec<_> = config.plugin.keys().collect();
+    aliases.sort_unstable();
+    for alias in aliases {
+        crate::helpers::validate_alias_key(alias)
+            .map_err(|error| anyhow::anyhow!("channels.plugin.{alias}: {error}"))?;
+        let package = config.plugin[alias].package.trim();
+        if package != config.plugin[alias].package {
+            anyhow::bail!(
+                "channels.plugin.{alias}.package must not have leading or trailing whitespace"
+            );
+        }
+        zeroclaw_api::plugin::validate_plugin_package_name(package)
+            .map_err(|error| anyhow::anyhow!("channels.plugin.{alias}.package: {error}"))?;
+    }
+    Ok(())
+}
+
 fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     let mut seen_names = std::collections::HashSet::new();
     for (i, server) in config.servers.iter().enumerate() {
@@ -12854,6 +12872,12 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub filesystem: HashMap<String, FilesystemConfig>,
+    /// WASM channel plugin instances (`[channels.plugin.<alias>]`).
+    /// The declaration selects a package and logical binding only; operator
+    /// values remain in the instance-keyed `plugins.entries` store.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub plugin: HashMap<String, PluginChannelConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -13121,6 +13145,12 @@ impl ChannelsConfig {
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
+            ChannelInfo {
+                kind: "plugin",
+                name: "Plugin",
+                desc: "installed WASM channel plugin",
+                configured: !self.plugin.is_empty(),
+            },
         ]
     }
 
@@ -13166,6 +13196,7 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
             || self.git.values().any(|c| c.enabled)
+            || self.plugin.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -13175,7 +13206,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -13213,6 +13244,7 @@ impl ChannelsConfig {
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
+            ("plugin", !self.plugin.is_empty(), true),
         ]
     }
 
@@ -13299,6 +13331,7 @@ impl Default for ChannelsConfig {
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -13307,6 +13340,28 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+        }
+    }
+}
+
+/// Host-owned declaration of one installed channel-plugin binding.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.plugin"]
+pub struct PluginChannelConfig {
+    /// Canonical package name from the installed plugin manifest.
+    #[serde(default)]
+    pub package: String,
+    /// Whether this logical instance may be admitted at channel startup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PluginChannelConfig {
+    fn default() -> Self {
+        Self {
+            package: String::new(),
+            enabled: true,
         }
     }
 }
@@ -19598,6 +19653,7 @@ impl Config {
         }
 
         validate_plugin_entries(&self.plugins)?;
+        validate_plugin_channel_instances(&self.channels)?;
 
         // MCP
         if self.mcp.enabled {
@@ -24082,6 +24138,7 @@ auto_save = true
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
                 filesystem: HashMap::new(),
+                plugin: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
@@ -25667,6 +25724,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -26189,6 +26247,7 @@ allowed_numbers = ["+1", "+2"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -33140,6 +33199,110 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        config.agents.get_mut("alpha").unwrap().channels =
+            vec![crate::providers::ChannelRef::new("plugin.operations")];
+
+        config
+            .validate()
+            .expect("plugin channel aliases use the shared dotted reference validator");
+        assert_eq!(config.agent_for_channel("plugin.operations"), Some("alpha"));
+    }
+
+    #[test]
+    async fn plugin_channel_instances_allow_two_aliases_for_one_package() {
+        let mut config = multi_agent_test_config();
+        for alias in ["primary", "backup"] {
+            config.channels.plugin.insert(
+                alias.to_string(),
+                PluginChannelConfig {
+                    package: "acme.chat".to_string(),
+                    enabled: true,
+                },
+            );
+        }
+
+        config
+            .validate()
+            .expect("one package may back isolated logical instances");
+        assert!(config.channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_invalid_alias_or_package() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "bad-alias".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin aliases use canonical config-key grammar");
+        assert!(error.to_string().contains("channels.plugin.bad-alias"));
+
+        config.channels.plugin.clear();
+        config.channels.plugin.insert(
+            "primary".to_string(),
+            PluginChannelConfig {
+                package: "Acme Chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin packages use canonical manifest grammar");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package")
+        );
+    }
+
+    #[test]
+    async fn agent_plugin_channel_reference_rejects_a_missing_instance() {
+        let mut config = multi_agent_test_config();
+        config.agents.get_mut("alpha").unwrap().channels =
+            vec![crate::providers::ChannelRef::new("plugin.missing")];
+
+        let error = config
+            .validate()
+            .expect_err("agent channel references must name a declared instance");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.missing is not configured")
+        );
+    }
+
+    #[test]
+    async fn disabled_plugin_channel_instance_does_not_start_the_supervisor() {
+        let mut channels = ChannelsConfig {
+            cli: false,
+            ..ChannelsConfig::default()
+        };
+        channels.plugin.insert(
+            "paused".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: false,
+            },
+        );
+
+        assert!(!channels.has_any_enabled());
     }
 
     #[test]

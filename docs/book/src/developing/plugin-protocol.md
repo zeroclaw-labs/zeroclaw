@@ -517,7 +517,10 @@ The operator's canonical `plugins.entries.<instance-key>.config` values remain
 a secret-marked string map in memory and are encrypted when persisted. The host
 derives the versioned `zpi1_…` entry key from the full package, capability, and
 binding identity; this lets different packages and capability worlds safely
-reuse aliases such as `main`. The admitted package manifest selects the schema.
+reuse aliases such as `main`. Channel bindings select the package under
+`[channels.plugin.<alias>]` and agents own them through the ordinary
+`plugin.<alias>` channel reference; neither surface stores operator values.
+The admitted package manifest selects the schema.
 A `string` value is stored directly; `boolean`,
 `integer`, and `number` values use JSON scalar text such as `"true"`, `"4"`,
 or `"0.5"`; `array` and `object` values use JSON text such as
