@@ -59,10 +59,12 @@ Teams POSTs an Activity JSON to /api/messages
   ├─ text cleanup: strip <at>…</at> mention tags, decode HTML entities
   ├─ gating (in order):
   │    1. allow_dms — personal-chat messages dropped when false
-  │    2. require_mention — group/channel messages must @-mention the
+  │    2. mention_only — group/channel messages must @-mention the
   │       bot when true; never applied to personal chats (a DM is
   │       definitionally addressed to the bot)
-  │    3. allow_from — sender allowlist (empty = allow all)
+  │    3. sender allowlist via peer_groups (`channel_external_peers`
+  │       resolver, matching every other channel; empty = deny,
+  │       `"*"` = allow all)
   ├─ build ChannelMessage → tx.send()
   └─ respond 200 immediately (agent turn runs async; Teams has a ~15s
      delivery timeout)
@@ -184,8 +186,7 @@ derive, `#[secret]` on the secret field):
 | `port` | u16 | `3978` | axum listen port |
 | `path` | String | `"/api/messages"` | webhook route |
 | `allow_dms` | bool | `true` | whether the bot responds in personal (1:1) chats at all; when `false`, inbound personal-chat activities are dropped |
-| `require_mention` | `Option<bool>` | `None` (= true in groups) | group/channel gating only; personal chats are exempt by definition (gated by `allow_dms` instead) |
-| `allow_from` | `Vec<String>` | empty = allow all | AAD object IDs / UPNs |
+| `mention_only` | `Option<bool>` | `None` (= true in groups) | group/channel gating only; personal chats are exempt by definition (gated by `allow_dms` instead). Named `mention_only` to match the existing telegram/mattermost convention. |
 | `stream_mode` | `StreamMode` | `Off` | `off` / `partial` (progressive draft updates — the gray streaming bubble in 1:1, message edits in groups) / `multi_message`; same enum Telegram/Discord/Lark use |
 | `draft_update_interval_ms` | u64 | `1000` | draft flush cadence; also satisfies Teams' ~1/s streaming rate limit |
 | `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Feeds the orchestrator's `InterruptFlags`. |
@@ -215,7 +216,7 @@ Pre-edit ritual answers for every state-bearing field:
 | Field | Verdict |
 | --- | --- |
 | `app_id` / `app_password` / `tenant_id` | Source of truth is `Config` (`channels.msteams.<alias>`). The channel does NOT copy them into struct fields; it resolves through a `&Config`-backed resolver/closure at use time, following the `peer_resolver` pattern in `mattermost.rs`. |
-| `allow_from` | Source of truth is `Config`. Resolved via closure at message time (`channel_external_peers`-style), never cached. |
+| Sender allowlist | Source of truth is `Config.peer_groups` (no per-channel `allow_from` field — that would duplicate the peer-group registry). Resolved via the `channel_external_peers` closure at message time, never cached. |
 | Connector OAuth token cache | Source of truth is **created here** (issued by Entra at runtime). A time-bounded materialized credential, not a copy of config state. `tokio::sync::OnceCell`/`RwLock` with expiry. |
 | JWKS cache | Source of truth is Microsoft's JWKS endpoint; cached copy with refresh-on-rotation is a runtime materialized view. |
 | ConversationReference map | Source of truth is **created here** (delivered by Teams per activity; exists nowhere else in the codebase). In-memory `RwLock<HashMap<String, ConversationReference>>`. |
@@ -232,8 +233,8 @@ Unit tests (no live Azure):
 - Activity deserialization: personal vs channel conversation, mention
   entities, `;messageid=` suffix normalization.
 - Text cleanup: `<at>` stripping, HTML entity decoding.
-- Gating: `allow_dms` on/off; `require_mention` on/off × personal/channel;
-  `allow_from` filtering.
+- Gating: `allow_dms` on/off; `mention_only` on/off × personal/channel;
+  peer-group allowlist filtering.
 - Streaming: informative → streaming → final activity sequence has
   monotonic `streamSequence` and consistent `streamId` (wiremock);
   group-chat drafts use PUT edits instead of streaminfo entities;
