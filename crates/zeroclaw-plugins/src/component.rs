@@ -163,10 +163,11 @@ pub struct PluginState {
 
 impl PluginState {
     /// Build store state from one typed, host-issued specification.
-    /// `HttpClient` is the only grant that widens the host surface here: it
-    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
-    /// Other grants are consumed by adapters or host services where implemented
-    /// and do not widen ambient WASI.
+    /// `HttpClient` is the only grant that can widen the host surface here, and
+    /// only after the adapter calls [`PluginStoreSpec::with_granted_http`]. That
+    /// opt-in attaches a `WasiHttpCtx` so the gated `wasi:http` import can be
+    /// linked. Other grants are consumed by adapters or host services where
+    /// implemented and do not widen ambient WASI.
     pub(crate) fn new(spec: PluginStoreSpec) -> Self {
         let http = spec.http.then(WasiHttpCtx::new);
         Self {
