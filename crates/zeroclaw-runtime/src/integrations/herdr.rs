@@ -7,21 +7,19 @@
 //! - `HERDR_SOCKET_PATH` — path to the Herdr daemon's Unix socket
 //! - `HERDR_PANE_ID` — the Herdr pane identifier
 //!
-//! A dedicated background I/O thread owns the UDS connection. The observer
-//! never touches a socket — it pushes state transitions to a channel (sub-µs)
-//! and the thread processes them in order with bounded timeouts. Startup and
-//! shutdown messages are guaranteed by flushing the channel synchronously.
+//! Uses tokio for async UDS I/O with bounded timeouts. Messages are sent
+//! fire-and-forget; flush synchronously waits for pending writes at shutdown.
 
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 use parking_lot::RwLock;
 
@@ -35,66 +33,33 @@ use crate::observability::{
 
 /// Maximum time to wait for a UDS connect before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
-/// Maximum time to wait for a UDS write or read before giving up.
+/// Maximum time to wait for a UDS write before giving up.
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Connect to a Unix domain socket with a timeout by delegating to a
-/// background thread. `std::os::unix::net::UnixStream::connect` has no
-/// built-in timeout, so we use a channel + `recv_timeout` to bound it.
+/// Connect to a Unix domain socket with a timeout using tokio.
 #[cfg(unix)]
-fn connect_with_timeout(path: &str, timeout: Duration) -> Result<UnixStream, std::io::Error> {
-    let path = path.to_owned();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(UnixStream::connect(&path));
-    });
-    rx.recv_timeout(timeout).unwrap_or(Err(std::io::Error::new(
+async fn connect_with_timeout(path: &str) -> Result<UnixStream, std::io::Error> {
+    timeout(CONNECT_TIMEOUT, UnixStream::connect(path))
+        .await
+        .unwrap_or(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "herdr connect timed out",
+        )))
+}
+
+/// Write a JSON-RPC notification to a connected UDS stream with bounded timeouts.
+#[cfg(unix)]
+async fn send_on_stream(stream: &mut UnixStream, payload: &str) -> Result<(), std::io::Error> {
+    timeout(IO_TIMEOUT, async {
+        stream.write_all(payload.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        stream.flush().await
+    })
+    .await
+    .unwrap_or(Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        "herdr connect timed out",
+        "herdr write timed out",
     )))
-}
-
-// ── Background I/O thread ─────────────────────────────────────────────────────
-
-/// Commands sent from the observer to the dedicated I/O thread.
-#[cfg(unix)]
-enum IoCommand {
-    /// A pre-serialized JSON-RPC notification to write to the herdr daemon.
-    Message(String),
-    /// Flush the channel and acknowledge that all prior messages were sent on the wire.
-    Flush(mpsc::Sender<()>),
-    /// Terminate the I/O thread.
-    Shutdown,
-}
-
-/// Dedicated I/O thread: owns the UDS connection, processes messages in FIFO
-/// order, reconnects on error, and never outlives the `HerdrClient`.
-#[cfg(unix)]
-fn io_thread_main(socket_path: &str, rx: mpsc::Receiver<IoCommand>) {
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            IoCommand::Message(payload) => {
-                if let Ok(mut stream) = connect_with_timeout(socket_path, CONNECT_TIMEOUT) {
-                    let _ = send_on_stream(&mut stream, &payload);
-                }
-            }
-            IoCommand::Flush(ack) => {
-                let _ = ack.send(());
-            }
-            IoCommand::Shutdown => break,
-        }
-    }
-}
-
-/// Write a JSON-RPC notification to a connected UDS stream with bounded
-/// timeouts. Returns `Err` if any operation times out or the peer disconnects.
-#[cfg(unix)]
-fn send_on_stream(s: &mut UnixStream, payload: &str) -> Result<(), std::io::Error> {
-    s.set_write_timeout(Some(IO_TIMEOUT))?;
-    s.write_all(payload.as_bytes())?;
-    s.write_all(b"\n")?;
-    s.flush()?;
-    Ok(())
 }
 
 // ── Socket discovery ─────────────────────────────────────────────────────────
@@ -163,8 +128,7 @@ fn install_hook_from_env(
     // before any user message triggers a state transition.
     client.report_state("idle", None);
     // Startup messages are best-effort; the first ObserverEvent will re-emit
-    // idle if the daemon was unavailable. The I/O thread processes messages
-    // independently and Shutdown is handled via the observer's Drop.
+    // idle if the daemon was unavailable.
     let reporter = DebouncedReporter::new(client);
     let observer = Arc::new(HerdrObserver::new(reporter));
     Some(set_scoped_broadcast_hook(observer))
@@ -175,35 +139,38 @@ fn install_hook_from_env(
 #[cfg(test)]
 type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
 
-/// Client that sends JSON-RPC notifications to the herdr daemon via a
-/// dedicated background I/O thread. The `send()` method serialises the
-/// message and pushes it to an mpsc channel — it never blocks on I/O.
-/// Call `flush()` to wait until the I/O thread has processed all pending
-/// messages (used at startup and shutdown for guaranteed delivery).
+/// Client that sends JSON-RPC notifications to the herdr daemon via tokio UDS.
+/// The `send()` method serializes and fires off an async write — it never
+/// blocks the caller. Call `flush()` to wait until pending writes complete
+/// (used at startup and shutdown for guaranteed delivery).
 pub(crate) struct HerdrClient {
     pane_id: String,
     #[cfg(test)]
     spy: Option<SpyFn>,
-    /// Channel to the background I/O thread. `None` on non-Unix or when the
-    /// thread failed to spawn (best-effort: messages are silently dropped).
     #[cfg(unix)]
-    io_tx: Option<mpsc::Sender<IoCommand>>,
+    writer: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl HerdrClient {
     pub(crate) fn new(socket_path: String, pane_id: String) -> Self {
         #[cfg(unix)]
         {
-            let (tx, rx) = mpsc::channel::<IoCommand>();
-            let spawned = std::thread::Builder::new()
-                .name("herdr-io".into())
-                .spawn(move || io_thread_main(&socket_path, rx))
-                .is_ok();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let socket_path = socket_path.clone();
+            tokio::spawn(async move {
+                while let Some(payload) = rx.recv().await {
+                    let mut stream = match connect_with_timeout(&socket_path).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let _ = send_on_stream(&mut stream, &payload).await;
+                }
+            });
             Self {
                 pane_id,
                 #[cfg(test)]
                 spy: None,
-                io_tx: if spawned { Some(tx) } else { None },
+                writer: Some(tx),
             }
         }
         #[cfg(not(unix))]
@@ -213,6 +180,8 @@ impl HerdrClient {
                 pane_id,
                 #[cfg(test)]
                 spy: None,
+                #[cfg(unix)]
+                writer: None,
             }
         }
     }
@@ -226,20 +195,15 @@ impl HerdrClient {
             pane_id,
             spy: Some(Arc::new(spy)),
             #[cfg(unix)]
-            io_tx: None,
+            writer: None,
         }
     }
 
-    /// Flush pending messages: acknowledge that all prior messages were sent.
-    /// With one-shot connections, each message is sent independently, so flush
-    /// just acknowledges that the I/O thread has processed all queued messages.
-    pub(crate) fn flush(&self) {
+    /// Flush pending messages: wait for the writer task to drain the channel.
+    pub(crate) async fn flush(&self) {
         #[cfg(unix)]
-        if let Some(tx) = &self.io_tx {
-            let (ack_tx, ack_rx) = mpsc::channel::<()>();
-            if tx.send(IoCommand::Flush(ack_tx)).is_ok() {
-                let _ = ack_rx.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(1));
-            }
+        if let Some(tx) = &self.writer {
+            let _ = tx.closed().await;
         }
     }
 
@@ -285,19 +249,19 @@ impl HerdrClient {
             params_map.insert(k.clone(), v.clone());
         }
 
-        let mut map = serde_json::Map::new();
-        map.insert("id".into(), serde_json::Value::String(self.request_id()));
-        map.insert("method".into(), serde_json::Value::String(method.into()));
-        map.insert("params".into(), serde_json::Value::Object(params_map));
+        let payload = serde_json::json!({
+            "id": self.request_id(),
+            "method": method,
+            "params": params_map,
+        });
 
-        let request = serde_json::Value::Object(map);
-        let payload = serde_json::to_string(&request)?;
+        let payload_str = serde_json::to_string(&payload)?;
 
-        // Push to the background I/O thread. This never blocks — the channel
-        // is unbounded, so send is O(1) even if the thread is busy.
+        // Fire-and-forget: push to writer task. Channel is bounded (32),
+        // so this applies backpressure if the daemon is slow/unavailable.
         #[cfg(unix)]
-        if let Some(tx) = &self.io_tx {
-            let _ = tx.send(IoCommand::Message(payload));
+        if let Some(tx) = &self.writer {
+            let _ = tx.send(payload_str);
         }
 
         Ok(())
@@ -326,15 +290,6 @@ impl HerdrClient {
             serde_json::Value::String(display_agent.into()),
         );
         let _ = self.send("pane.report_metadata", &params);
-    }
-}
-
-impl Drop for HerdrClient {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(tx) = self.io_tx.take() {
-            let _ = tx.send(IoCommand::Shutdown);
-        }
     }
 }
 
@@ -382,15 +337,15 @@ impl DebouncedReporter {
         }
     }
 
-    /// Flush the reporter at shutdown: if the agent has not yet reported
-    /// Released, send the release messages now, then drain the I/O channel.
-    fn flush(&mut self) {
+    /// Flush at shutdown: if not yet Released, emit idle + release_agent,
+    /// then drain the writer channel.
+    pub(crate) async fn flush(&mut self) {
         if self.state != HerdrState::Released {
             self.state = HerdrState::Released;
             self.client.report_state("idle", None);
             self.client.report_released();
         }
-        self.client.flush();
+        self.client.flush().await;
     }
 }
 
@@ -497,7 +452,15 @@ impl Observer for HerdrObserver {
 
     fn flush(&self) {
         let mut reporter = self.reporter.lock().expect("herdr observer poisoned");
-        reporter.flush();
+        // Use block_on since flush is called from sync context during drop
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            handle.block_on(reporter.flush());
+        } else {
+            // No runtime, create a temporary one
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(reporter.flush());
+        }
     }
 
     fn name(&self) -> &str {
@@ -558,8 +521,8 @@ pub(crate) mod tests {
         (reporter, calls)
     }
 
-    #[test]
-    fn send_fire_and_forget_returns_immediately() {
+    #[tokio::test]
+    async fn send_fire_and_forget_returns_immediately() {
         let client = HerdrClient::new(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-pane".into(),
@@ -580,9 +543,9 @@ pub(crate) mod tests {
     /// real blocker: install_hook_from_env creates a client, sends two
     /// messages (release_agent + report_state), and returns. With a stale
     /// socket, each connect attempt times out in 200ms; two messages = 400ms.
-    /// We allow some slack for thread spawn overhead.
-    #[test]
-    fn startup_with_stale_socket_returns_quickly() {
+    /// We allow some slack for task spawn overhead.
+    #[tokio::test]
+    async fn startup_with_stale_socket_returns_quickly() {
         let start = std::time::Instant::now();
         let _guard = install_hook_from_env(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
@@ -619,9 +582,8 @@ pub(crate) mod tests {
     }
 
     /// Non-ASCII pane IDs (e.g., emoji) must not panic on UTF-8 slicing.
-    /// This tests the fix for the blocker: display_name uses char-aware
-    /// suffix extraction instead of byte indexing, which would panic on
-    /// multi-byte characters like 🦀.
+    /// This tests the fix: display_name uses char-aware suffix extraction
+    /// instead of byte indexing, which would panic on multi-byte chars like 🦀.
     #[test]
     fn non_ascii_pane_id_does_not_panic() {
         let _guard = install_hook_from_env(
@@ -633,11 +595,9 @@ pub(crate) mod tests {
 
     /// `DebouncedReporter::flush()` must emit the idle + release_agent
     /// notifications exactly once and transition to `Released`, matching the
-    /// AgentEnd / run-teardown drain contract. This is the coverage the
-    /// reviewer requested: the teardown drains the final idle +
-    /// pane.release_agent notifications instead of merely enqueueing them.
-    #[test]
-    fn debounced_reporter_flush_drains_release_messages() {
+    /// AgentEnd / run-teardown drain contract.
+    #[tokio::test]
+    async fn debounced_reporter_flush_drains_release_messages() {
         let spy = HerdrSpy::new();
         let (mut reporter, calls) = make_spy_reporter(spy);
 
@@ -646,7 +606,7 @@ pub(crate) mod tests {
         reporter.transit_to(HerdrState::Working, Some("test-session"));
         calls.lock().clear();
 
-        reporter.flush();
+        reporter.flush().await;
 
         let captured: Vec<HerdrSpyCall> = calls.lock().clone();
         let methods: Vec<&str> = captured.iter().map(|c| c.method.as_str()).collect();
@@ -682,7 +642,7 @@ pub(crate) mod tests {
 
         // Double-flush is a no-op — the reporter is already Released.
         let count_after_first = calls.lock().len();
-        reporter.flush();
+        reporter.flush().await;
         assert_eq!(
             calls.lock().len(),
             count_after_first,
