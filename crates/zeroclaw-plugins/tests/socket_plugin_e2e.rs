@@ -132,7 +132,7 @@ fn services(
     let egress = EgressHostService::new(EgressPolicyResolver::new(move |_| {
         EgressPolicy::new(
             ["127.0.0.1".to_string()],
-            allow_plaintext.then(|| "127.0.0.1".to_string()).into_iter(),
+            allow_plaintext.then(|| "127.0.0.1".to_string()),
             [],
             4,
         )

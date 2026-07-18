@@ -155,7 +155,7 @@ enum ActorStream {
         stream: Option<TcpStream>,
         state: StartTlsState,
     },
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
     Closed,
 }
 
@@ -248,7 +248,7 @@ impl ActorStream {
                 state
                     .complete_upgrade()
                     .map_err(|_| SocketFailure::InvalidState)?;
-                *self = Self::Tls(stream);
+                *self = Self::Tls(Box::new(stream));
                 Ok(())
             }
             Ok(Err(_)) | Err(_) => {
@@ -549,7 +549,7 @@ async fn connect(
             let config = state
                 .tls_client_config(&authorization)
                 .map_err(|error| map_egress_error(&error))?;
-            ActorStream::Tls(connect_direct_tls(&authorization, config).await?)
+            ActorStream::Tls(Box::new(connect_direct_tls(&authorization, config).await?))
         }
         ConnectMode::StartTls => ActorStream::StartTls {
             stream: Some(connect_pinned(&authorization).await?),
@@ -1184,7 +1184,7 @@ mod tests {
         let stream = connect_direct_tls(&authorization, pki.client_config(Some(&profile)))
             .await
             .expect("custom-CA mTLS handshake succeeds");
-        let connection = spawn_connection(authorization, ActorStream::Tls(stream));
+        let connection = spawn_connection(authorization, ActorStream::Tls(Box::new(stream)));
         connection
             .send(TrafficClass::Application, b"secure".to_vec())
             .await
