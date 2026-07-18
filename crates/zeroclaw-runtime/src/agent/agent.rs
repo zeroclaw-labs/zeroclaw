@@ -258,6 +258,63 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 }
 
+fn goal_approval_binding_for_exact_task(
+    goal_ctx: &crate::control_plane::GoalAdmissionContext,
+    task: crate::control_plane::TaskRecord,
+    continuation: crate::control_plane::TaskContinuationContext,
+) -> crate::agent::approval_bridge::GoalApprovalBindingState {
+    if !goal_approval_task_has_exact_identity(goal_ctx, &task)
+        || continuation.channel.trim().is_empty()
+        || continuation.reply_target.trim().is_empty()
+    {
+        return crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly;
+    }
+    let Some(principal) = task.principal_id else {
+        return crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly;
+    };
+    crate::agent::approval_bridge::GoalApprovalBindingState::Bound(
+        crate::agent::approval_bridge::GoalApprovalBinding {
+            channel: match continuation
+                .channel_alias
+                .as_deref()
+                .filter(|alias| !alias.trim().is_empty())
+            {
+                Some(alias) => format!("{}.{}", continuation.channel, alias),
+                None => continuation.channel,
+            },
+            recipient: continuation.reply_target,
+            principal,
+        },
+    )
+}
+
+fn goal_approval_task_has_exact_identity(
+    goal_ctx: &crate::control_plane::GoalAdmissionContext,
+    task: &crate::control_plane::TaskRecord,
+) -> bool {
+    let Some(task_route) = task
+        .originator_route
+        .as_deref()
+        .filter(|route| !route.trim().is_empty())
+    else {
+        return false;
+    };
+    let Some(context_route) = goal_ctx
+        .originator_route
+        .as_deref()
+        .filter(|route| !route.trim().is_empty())
+    else {
+        return false;
+    };
+    task.kind == crate::control_plane::TaskKind::Goal
+        && task
+            .principal_id
+            .as_deref()
+            .is_some_and(|principal| !principal.trim().is_empty())
+        && task.principal_id.as_deref() == goal_ctx.principal_id.as_deref()
+        && task_route == context_route
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -2390,12 +2447,45 @@ impl Agent {
 
         let mut loop_history = provider_messages;
 
+        let goal_approval_binding = if self.channel_handles.ask_user.is_some() {
+            match crate::control_plane::current_goal_admission_context() {
+                None => crate::agent::approval_bridge::GoalApprovalBindingState::NotGoal,
+                Some(goal_ctx) => match (
+                    goal_ctx.goal_task_id.as_deref(),
+                    crate::control_plane::control_plane(),
+                ) {
+                    (Some(task_id), Some(control_plane)) => match control_plane.store.get(task_id).await
+                    {
+                        Ok(Some(task)) if goal_approval_task_has_exact_identity(&goal_ctx, &task) => {
+                            match control_plane
+                                .goal_store
+                                .get_continuation_context(task_id)
+                                .await
+                            {
+                                Ok(Some(context)) => {
+                                    goal_approval_binding_for_exact_task(&goal_ctx, task, context)
+                                }
+                                _ => crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly,
+                            }
+                        }
+                        _ => crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly,
+                    },
+                    _ => crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly,
+                },
+            }
+        } else {
+            crate::agent::approval_bridge::GoalApprovalBindingState::NotGoal
+        };
+
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
-                Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
-                    Arc::clone(handles),
-                    self.approval_route.clone(),
-                )) as Box<dyn zeroclaw_api::channel::Channel>
+                Box::new(
+                    crate::agent::approval_bridge::AskUserApprovalBridge::new(
+                        Arc::clone(handles),
+                        self.approval_route.clone(),
+                    )
+                    .with_goal_binding(goal_approval_binding),
+                ) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
         let knobs = crate::agent::loop_::LoopKnobs {
@@ -2765,6 +2855,136 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::observability_traits::ObserverMetric;
+
+    fn durable_goal_task_for_approval(principal: Option<&str>) -> crate::control_plane::TaskRecord {
+        crate::control_plane::TaskRecord {
+            id: "goal-approval-binding".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "agent-a".into(),
+            status: crate::control_plane::TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("durable-route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: principal.map(str::to_string),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+        }
+    }
+
+    fn durable_approval_continuation() -> crate::control_plane::TaskContinuationContext {
+        crate::control_plane::TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: "!durable:example.org".into(),
+            sender: "@durable:example.org".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope:
+                crate::control_plane::TaskContinuationConversationScope::ReplyTarget,
+        }
+    }
+
+    #[test]
+    fn goal_approval_binding_uses_exact_durable_identity_or_fails_closed() {
+        let goal_ctx = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("durable-route".into()))
+            .with_principal_id(Some("durable-principal".into()))
+            .with_goal_task_id(Some("goal-approval-binding".into()));
+
+        assert!(matches!(
+            goal_approval_binding_for_exact_task(
+                &goal_ctx,
+                durable_goal_task_for_approval(Some("durable-principal")),
+                durable_approval_continuation(),
+            ),
+            crate::agent::approval_bridge::GoalApprovalBindingState::Bound(_)
+        ));
+        assert!(matches!(
+            goal_approval_binding_for_exact_task(
+                &goal_ctx,
+                durable_goal_task_for_approval(Some("other-principal")),
+                durable_approval_continuation(),
+            ),
+            crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly
+        ));
+
+        let mut wrong_kind = durable_goal_task_for_approval(Some("durable-principal"));
+        wrong_kind.kind = crate::control_plane::TaskKind::Delegate;
+        assert!(!goal_approval_task_has_exact_identity(
+            &goal_ctx,
+            &wrong_kind
+        ));
+
+        let mut wrong_route = durable_goal_task_for_approval(Some("durable-principal"));
+        wrong_route.originator_route = Some("other-route".into());
+        assert!(!goal_approval_task_has_exact_identity(
+            &goal_ctx,
+            &wrong_route
+        ));
+
+        assert!(!goal_approval_task_has_exact_identity(
+            &goal_ctx,
+            &durable_goal_task_for_approval(None)
+        ));
+        assert!(!goal_approval_task_has_exact_identity(
+            &goal_ctx,
+            &durable_goal_task_for_approval(Some(" "))
+        ));
+
+        let mut missing_route = durable_goal_task_for_approval(Some("durable-principal"));
+        missing_route.originator_route = None;
+        assert!(!goal_approval_task_has_exact_identity(
+            &goal_ctx,
+            &missing_route
+        ));
+
+        let mut blank_route = durable_goal_task_for_approval(Some("durable-principal"));
+        blank_route.originator_route = Some(" ".into());
+        assert!(!goal_approval_task_has_exact_identity(
+            &goal_ctx,
+            &blank_route
+        ));
+
+        let mut aliased_continuation = durable_approval_continuation();
+        aliased_continuation.channel_alias = Some("work".into());
+        assert!(matches!(
+            goal_approval_binding_for_exact_task(
+                &goal_ctx,
+                durable_goal_task_for_approval(Some("durable-principal")),
+                aliased_continuation,
+            ),
+            crate::agent::approval_bridge::GoalApprovalBindingState::Bound(
+                crate::agent::approval_bridge::GoalApprovalBinding { channel, .. }
+            ) if channel == "matrix.work"
+        ));
+
+        let mut blank_channel = durable_approval_continuation();
+        blank_channel.channel = " ".into();
+        assert!(matches!(
+            goal_approval_binding_for_exact_task(
+                &goal_ctx,
+                durable_goal_task_for_approval(Some("durable-principal")),
+                blank_channel,
+            ),
+            crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly
+        ));
+
+        let mut blank_recipient = durable_approval_continuation();
+        blank_recipient.reply_target = " ".into();
+        assert!(matches!(
+            goal_approval_binding_for_exact_task(
+                &goal_ctx,
+                durable_goal_task_for_approval(Some("durable-principal")),
+                blank_recipient,
+            ),
+            crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly
+        ));
+    }
 
     #[test]
     fn build_session_model_provider_rejects_undotted_ref() {

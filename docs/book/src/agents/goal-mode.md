@@ -190,4 +190,4 @@ Cancellation is explicit. A final-looking assistant message or a lack of more
 tool calls is not enough to mark a durable goal complete.
 
 For implementation rationale, see
-[`ADR-008`](../../../architecture/decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md).
+[`ADR-008`](../architecture/decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md).

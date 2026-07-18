@@ -279,9 +279,7 @@ async fn pause_goal_for_tool_approval(
     if !current_goal_turn_evaluation_requested() {
         return None;
     }
-    let Some(goal_ctx) = current_goal_admission_context() else {
-        return None;
-    };
+    let goal_ctx = current_goal_admission_context()?;
     let arguments_summary = crate::approval::summarize_args(&request.arguments);
     let message = crate::i18n::get_required_cli_string_with_args(
         "goal-command-tool-approval-required-blocker",
