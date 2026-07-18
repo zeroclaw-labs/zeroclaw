@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One non-fatal configuration validation warning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

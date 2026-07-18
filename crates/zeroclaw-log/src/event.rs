@@ -288,6 +288,8 @@ pub struct LogEvent {
     #[serde(default)]
     pub service: ServiceDescriptor,
 
+    /// Per-turn trace identifier promoted from attributes without removing the
+    /// attributes copy used by downstream observers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
 

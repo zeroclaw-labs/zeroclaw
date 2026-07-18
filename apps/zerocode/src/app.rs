@@ -423,6 +423,9 @@ pub async fn run(
             theme::set_active(base_theme);
         }
 
+        // Recovery stays inside the responsive event loop. During each disconnected
+        // episode an owned ephemeral daemon is respawned at most once, attached daemons
+        // are never spawned, and both modes keep polling for manual recovery.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
             if owns_ephemeral && !ephemeral_respawn_done {
                 ephemeral_respawn_done = true;
