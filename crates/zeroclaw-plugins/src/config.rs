@@ -13,6 +13,10 @@ use std::sync::Arc;
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use serde_json::Map;
 use serde_json::Value;
+#[cfg(any(feature = "plugins-wasmtime", test))]
+use zeroclaw_api::plugin_key::SecretPropertyRef;
+#[cfg(any(feature = "plugins-wasmtime", test))]
+use zeroize::Zeroizing;
 
 use crate::error::PluginError;
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -31,7 +35,7 @@ const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 pub struct ResolvedPluginConfig {
     scope: PluginInstanceScope,
     public_json: Value,
-    secrets: HashMap<String, String>,
+    secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -39,7 +43,7 @@ impl ResolvedPluginConfig {
     fn new(
         scope: &PluginInstanceScope,
         public_json: Value,
-        secrets: HashMap<String, String>,
+        secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
     ) -> Self {
         Self {
             scope: scope.clone(),
@@ -57,7 +61,15 @@ impl ResolvedPluginConfig {
     /// Borrow one schema-designated secret for an immediate host-mediated use.
     #[must_use]
     pub(crate) fn secret(&self, name: &str) -> Option<&str> {
-        self.secrets.get(name).map(String::as_str)
+        SecretPropertyRef::parse(name)
+            .ok()
+            .and_then(|reference| self.secret_ref(&reference))
+    }
+
+    /// Borrow one secret through the canonical portable reference type.
+    #[must_use]
+    pub(crate) fn secret_ref(&self, reference: &SecretPropertyRef) -> Option<&str> {
+        self.secrets.get(reference).map(|secret| secret.as_str())
     }
 
     /// Reject pairing this materialized view with another admission decision.
@@ -216,6 +228,12 @@ fn compile_manifest_config(
                 manifest.name
             )));
         }
+        if is_secret_property(property) && SecretPropertyRef::parse(name.clone()).is_err() {
+            return Err(invalid_manifest(format!(
+                "plugin '{}' config_schema secret property '{name}' is not a portable top-level property reference",
+                manifest.name
+            )));
+        }
     }
     let has_secret_consumer = manifest.capabilities.iter().any(|capability| {
         matches!(
@@ -338,7 +356,13 @@ pub fn resolve_plugin_config_from(
                     manifest.name
                 )));
             };
-            secrets.insert(name, secret);
+            let reference = SecretPropertyRef::parse(name).map_err(|_| {
+                PluginError::InvalidConfig(format!(
+                    "plugin '{}' resolved secret property is not portable",
+                    manifest.name
+                ))
+            })?;
+            secrets.insert(reference, Zeroizing::new(secret));
         } else {
             public.insert(name, value);
         }
@@ -753,6 +777,25 @@ x-secret = true
             }),
         ];
         for schema in invalid_schemas {
+            assert!(matches!(
+                validate_manifest_config(&manifest(Some(schema), true)),
+                Err(PluginError::InvalidManifest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn secret_property_references_use_the_shared_portable_key_grammar() {
+        for name in [
+            "plugin://other/key",
+            "../key",
+            "key:value",
+            "other\\key",
+            "café",
+        ] {
+            let schema = object_schema(json!({
+                (name): {"type": "string", "x-secret": true}
+            }));
             assert!(matches!(
                 validate_manifest_config(&manifest(Some(schema), true)),
                 Err(PluginError::InvalidManifest(_))

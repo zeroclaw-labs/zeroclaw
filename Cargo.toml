@@ -32,6 +32,8 @@ zerocode = { path = "apps/zerocode", version = "0.8.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 sys-locale = "0.3"
+hmac = "0.12"
+zeroize = "1.8"
 
 [package]
 name = "zeroclawlabs"
@@ -152,7 +154,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 chacha20poly1305 = "0.10"
 
 # HMAC for webhook signature verification
-hmac = "0.12"
+hmac.workspace = true
 sha2 = "0.10"
 hex = "0.4"
 

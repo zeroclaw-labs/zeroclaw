@@ -13335,6 +13335,7 @@ dependencies = [
  "clap",
  "directories",
  "hex",
+ "hmac 0.12.1",
  "hostname",
  "parking_lot",
  "postgres",
@@ -13364,6 +13365,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-log",
  "zeroclaw-macros",
+ "zeroize",
 ]
 
 [[package]]
@@ -13588,6 +13590,7 @@ dependencies = [
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-spawn",
+ "zeroize",
 ]
 
 [[package]]
@@ -13734,6 +13737,7 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+ "zeroize",
  "zip",
 ]
 

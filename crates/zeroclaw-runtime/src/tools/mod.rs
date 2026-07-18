@@ -541,6 +541,12 @@ fn plugin_host_services(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
+    let data_dir = config.data_dir.clone();
+    let config_dir = config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     // A live daemon handle and a fallback snapshot are mutually exclusive in
     // the long-lived service, so the resolver never retains two config sources.
     let fallback_config = live_config.is_none().then_some(config);
@@ -568,7 +574,10 @@ fn plugin_host_services(
             })
         }
     });
-    zeroclaw_plugins::services::PluginHostServices::new(config)
+    let state = zeroclaw_plugins::services::PluginStateService::new(
+        crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
+    );
+    zeroclaw_plugins::services::PluginHostServices::new(config, state)
 }
 
 /// Create full tool registry including memory tools and optional Composio.

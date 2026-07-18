@@ -804,7 +804,7 @@ mod tests {
     async fn channel_validates_config_before_loading_guest_code() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
         let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
-        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-before-load".to_string(),
             ))

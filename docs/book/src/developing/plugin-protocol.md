@@ -59,15 +59,16 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, typed config, instance-scoped secrets, `http_client`, and host-fed
-  inbound are wired.** Of the permissions a manifest can declare,
-  `config_read` exposes the plugin's own schema-validated public config. A tool
-  or channel schema can designate secrets withheld from public config and
-  resolved in authorized service calls. An `http_client` grant is necessary
-  for outbound `wasi:http`, but the capability adapter must also opt into that
-  host surface. Tool and channel adapters do; memory intentionally remains
-  HTTP-free until its network boundary has component-level coverage. Filesystem
-  and
+- **`logging`, typed config, instance-scoped secrets and durable state,
+  `http_client`, and host-fed inbound are wired.** Of the permissions a
+  manifest can declare, `config_read` exposes the plugin's own schema-validated
+  public config. A tool or channel schema can designate secrets withheld from
+  public config and resolved in authorized service calls. `state_read` and
+  `state_write` gate encrypted, compare-and-swap state owned by the exact
+  admitted instance. An `http_client` grant is necessary for outbound
+  `wasi:http`, but the capability adapter must also opt into that host surface.
+  Tool and channel adapters do; memory intentionally remains HTTP-free until
+  its network boundary has component-level coverage. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
@@ -272,7 +273,8 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read` and `http_client` have behavioral effect. Requesting
+`config_read`, `http_client`, `state_read`, and `state_write` have behavioral
+effect. Requesting
 `config_read` requires a `config_schema`, and declaring that schema without the
 permission is also rejected. Before a tool or channel component is used, the
 host resolves its effective grant, materializes the plugin's operator values to
@@ -287,7 +289,11 @@ unavailable. `http_client` is a necessary grant, not a complete authority
 decision: the capability adapter must also construct the HTTP context and link
 `wasi:http`. Tool and channel adapters opt in after grant validation. The
 memory adapter deliberately does not, so granting `http_client` to a memory
-scope alone adds no network surface. The remaining variants
+scope alone adds no network surface. The state permissions independently gate
+the `state.get` and `state.put`/`delete`
+imports for tool and channel service frames. Package, capability, and binding
+come only from the admitted host scope; a guest supplies no namespace. The
+remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -307,8 +313,9 @@ signatures.
 `wit/v0/` defines three worlds, bound by `bindgen!` in `component.rs`. Each
 imports `logging` (host) and exports `plugin-info` plus its primary interface:
 `tool-plugin` exports `tool`, `channel-plugin` exports `channel`, and
-`memory-plugin` exports `memory`. Tool also imports `secrets`; channel imports
-`config`, `secrets`, and `inbound`. The required (no-default) exports for each
+`memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
+channel imports `config`, `secrets`, `state`, and `inbound`. The required
+(no-default) exports for each
 world are listed in the world's doc comment in its `.wit` file.
 
 ### `tool` interface
@@ -458,6 +465,38 @@ egress proxy that keeps the value hidden from plugin code. A compliant channel
 plugin **must** resolve secrets at each point of use and must not retain a second
 copy in warm state. The host cannot enforce non-retention after returning the
 plaintext.
+
+Secret property names use the same portable plugin-local grammar as state keys:
+1–128 ASCII bytes containing only letters, digits, `_`, `-`, or `.`. URI, path,
+namespace, control, and non-ASCII syntax is rejected during manifest admission.
+
+### `state`
+
+`wit/v0/state.wit` is imported by the tool and channel worlds. It provides
+encrypted durable byte values owned by the exact admitted package, capability,
+and binding:
+
+```wit
+get: func(key: string) -> result<option<state-entry>, state-error>;
+put: func(key: string, value: list<u8>, expected-revision: option<u64>)
+    -> result<u64, state-error>;
+delete: func(key: string, expected-revision: u64) -> result<_, state-error>;
+```
+
+`state_read` permits `get`; `state_write` permits `put` and `delete`. `none` on
+`put` is an absent-key compare-and-swap, while `some(revision)` must match the
+current revision exactly. Writes return the new revision. Keys use the portable
+plugin-local grammar above and cannot select another instance. State is
+available only during tool execution and channel service frames; static calls,
+host-call budget exhaustion, storage/key failures, and integrity failures return
+closed errors. Fixed per-instance entry, value, and total-size quotas return
+`quota-exceeded` rather than partially committing a write.
+
+The runtime stores one authenticated envelope per value in
+`data/plugin-state.db`, encrypted with the install's existing `.secret_key`.
+The database contains only keyed blind indexes and `enc2:` ciphertext. Missing
+or replaced install keys fail closed and are never silently regenerated while
+durable rows exist. Back up the database and `.secret_key` together.
 
 ### Per-plugin config (`__config` and `config.get`)
 

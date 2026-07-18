@@ -15,6 +15,7 @@ mod component {
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::config::{ConfigError, get as config_get};
     use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
+    use zeroclaw::plugin::state::{StateError, get as state_get, put as state_put};
 
     struct FixtureChannel;
 
@@ -68,6 +69,14 @@ mod component {
             if token.is_empty() {
                 return Err("expected non-empty api_token secret".to_string());
             }
+            let current = state_get("channel-session")
+                .map_err(|_| "expected scoped channel state".to_string())?;
+            let expected = current.as_ref().map(|entry| entry.revision);
+            let revision = state_put("channel-session", token.as_bytes(), expected)
+                .map_err(|_| "expected scoped channel state write".to_string())?;
+            if revision != expected.unwrap_or(0) + 1 {
+                return Err("unexpected channel state revision".to_string());
+            }
 
             Ok(())
         }
@@ -83,6 +92,17 @@ mod component {
             }
             let token = secret_get("api_token")
                 .map_err(|_| "expected api_token during channel operation".to_string())?;
+            let state = state_get("channel-session")
+                .map_err(|_| "expected channel state during operation".to_string())?
+                .ok_or_else(|| "expected configured channel state".to_string())?;
+            if state.value != token.as_bytes() {
+                let next_revision =
+                    state_put("channel-session", token.as_bytes(), Some(state.revision))
+                        .map_err(|_| "expected CAS update after credential rotation".to_string())?;
+                if next_revision != state.revision + 1 {
+                    return Err("unexpected rotated channel state revision".to_string());
+                }
+            }
             if message.content != format!("{epoch}:{token}") {
                 return Err("message did not use one current config revision".to_string());
             }
@@ -112,6 +132,7 @@ mod component {
         fn get_channel_capabilities() -> ChannelCapabilities {
             if matches!(config_get(), Err(ConfigError::Unavailable))
                 && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable))
             {
                 ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SELF_HANDLE
             } else {
@@ -125,7 +146,8 @@ mod component {
 
         fn self_handle() -> Option<String> {
             (matches!(config_get(), Err(ConfigError::Unavailable))
-                && matches!(secret_get("api_token"), Err(SecretError::Unavailable)))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable)))
             .then(|| "@fixture".to_string())
         }
 

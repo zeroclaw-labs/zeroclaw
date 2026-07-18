@@ -42,6 +42,7 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
   "p2",
   "default-send-request",
 ], optional = true }
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3.26"

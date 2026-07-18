@@ -17,7 +17,7 @@ use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
-use support::admit_fixture;
+use support::{admit_fixture, state_service};
 
 fn test_limits() -> PluginLimits {
     PluginLimits {
@@ -69,9 +69,12 @@ fn host_services(
     manifest: PluginManifest,
     configured: Option<HashMap<String, String>>,
 ) -> PluginHostServices {
-    PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&manifest, scope, configured.as_ref())
-    }))
+    PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, configured.as_ref())
+        }),
+        state_service(),
+    )
 }
 
 #[tokio::test]

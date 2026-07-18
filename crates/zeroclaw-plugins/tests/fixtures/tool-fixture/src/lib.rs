@@ -11,6 +11,7 @@ mod component {
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
     use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
+    use zeroclaw::plugin::state::{StateError, get as state_get, put as state_put};
 
     struct FixtureTool;
 
@@ -26,8 +27,10 @@ mod component {
 
     impl Tool for FixtureTool {
         fn name() -> String {
-            match secret_get("api_token") {
-                Err(SecretError::Unavailable) => "scoped-secret-check".to_string(),
+            match (secret_get("api_token"), state_get("fixture-state")) {
+                (Err(SecretError::Unavailable), Err(StateError::Unavailable)) => {
+                    "scoped-secret-check".to_string()
+                }
                 _ => "metadata-secret-gate-failed".to_string(),
             }
         }
@@ -61,6 +64,28 @@ mod component {
                 .map_err(|_| "expected scoped api_token secret".to_string())?;
             if token != format!("token-{binding}") {
                 return Err("received a secret from another binding".to_string());
+            }
+
+            if binding == "state-denied" {
+                if !matches!(state_get("fixture-state"), Err(StateError::AccessDenied))
+                    || !matches!(
+                        state_put("fixture-state", b"denied", None),
+                        Err(StateError::AccessDenied)
+                    )
+                {
+                    return Err("state permissions were not enforced".to_string());
+                }
+            } else {
+                let current = state_get("fixture-state")
+                    .map_err(|_| "expected scoped durable state".to_string())?;
+                let expected = current.as_ref().map(|entry| entry.revision);
+                let next = current.map_or(1, |entry| entry.revision + 1);
+                let value = format!("{binding}:{next}");
+                let revision = state_put("fixture-state", value.as_bytes(), expected)
+                    .map_err(|_| "expected durable state write".to_string())?;
+                if revision != next {
+                    return Err("unexpected durable state revision".to_string());
+                }
             }
 
             Ok(ToolResult {

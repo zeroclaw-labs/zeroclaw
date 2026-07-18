@@ -318,6 +318,10 @@ world channel-plugin {
     /// operational calls for this admitted channel instance. Calls during
     /// instantiation and static metadata discovery return `unavailable`.
     import secrets;
+    /// Read and update encrypted durable state for this admitted channel
+    /// instance. Calls outside host-dispatched service frames return
+    /// `unavailable`.
+    import state;
     import inbound;
     export plugin-info;
     export channel;

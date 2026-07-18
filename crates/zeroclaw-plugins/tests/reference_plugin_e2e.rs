@@ -5,6 +5,9 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/state.rs"]
+mod state_support;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -17,6 +20,8 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use state_support::state_service;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -125,9 +130,12 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     );
     let resolver_manifest = manifest.clone();
     let resolver_section = section.clone();
-    let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
-    }));
+    let services = PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
+        }),
+        state_service(),
+    );
     let mut plugin = runtime::create_plugin(
         component,
         &scope,

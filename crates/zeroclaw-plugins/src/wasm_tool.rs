@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn new_rejects_invalid_config() {
-        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-constructor-config".to_string(),
             ))
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn from_wasm_validates_config_before_loading_guest_code() {
-        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-before-load".to_string(),
             ))
@@ -252,7 +252,7 @@ mod tests {
     async fn execute_revalidates_live_config_before_loading_guest_code() {
         let reject = Arc::new(AtomicBool::new(false));
         let reject_for_resolver = Arc::clone(&reject);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
             if reject_for_resolver.load(Ordering::Relaxed) {
                 return Err(crate::error::PluginError::InvalidConfig(
                     "invalid-before-execute".to_string(),

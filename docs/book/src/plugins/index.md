@@ -84,9 +84,11 @@ The manifest declares two orthogonal things:
   channel adapters receive their own schema-materialized, validated public
   config and can
   resolve schema-designated secrets in authorized service calls) and
-  `http_client` have behavioral effect. The HTTP permission is the necessary
-  grant for adapters that implement outbound `wasi:http`: tool and channel
-  enable that surface, while memory intentionally does not yet.
+  `http_client`, `state_read`, and `state_write` have behavioral effect. The
+  HTTP permission is the necessary grant for adapters that implement outbound
+  `wasi:http`: tool and channel enable that surface, while memory intentionally
+  does not yet. The state permissions gate encrypted durable state owned by the
+  exact package, capability, and binding.
   `config_read` must be paired with the manifest's `config_schema`; either one
   without the other is rejected. The filesystem and memory-access permissions
   are accepted by the schema but not yet backed by host functions, so declaring
@@ -102,8 +104,8 @@ version) plus its primary interface:
 
 | World | Exports | Store lifecycle |
 |-------|---------|-----------------|
-| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` |
-| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports scoped `config`, `secrets`, and host-fed `inbound` |
+| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` and durable `state` |
+| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports scoped `config`, `secrets`, durable `state`, and host-fed `inbound` |
 | `memory-plugin` | `memory`: store, recall, get, forget, plus {{#include ../_snippets/plugin-memory-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call |
 
 The channel and memory worlds use **capability flags**: a bitmask the host
@@ -212,6 +214,15 @@ materializes and validates the resulting typed object before using tool or
 channel guest code; unknown, malformed, or out-of-range values fail instead of
 reaching the plugin. Memory plugins do not yet have a config import and must
 not request `config_read` until that ABI is added.
+
+Tool and channel components can request `state_read` and/or `state_write` for
+the `state` import. The host, not the guest, supplies the admitted package,
+capability, and binding namespace. Portable logical keys address authenticated
+byte values within that exact instance. Reads return a revision; create,
+replace, and delete operations use exact compare-and-swap revisions. Durable
+rows live as `enc2:` ciphertext behind keyed blind indexes in
+`data/plugin-state.db`, using the install `.secret_key`. Fixed quotas and any
+key, storage, or integrity failure fail closed.
 
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed

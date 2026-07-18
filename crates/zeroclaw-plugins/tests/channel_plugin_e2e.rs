@@ -24,7 +24,7 @@ use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
-use support::admit_fixture;
+use support::{admit_fixture, state_service};
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -79,7 +79,11 @@ fn manifest() -> PluginManifest {
         wasm_path: Some("channel-fixture.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![PluginCapability::Channel],
-        permissions: vec![PluginPermission::ConfigRead],
+        permissions: vec![
+            PluginPermission::ConfigRead,
+            PluginPermission::StateRead,
+            PluginPermission::StateWrite,
+        ],
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -125,7 +129,7 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
         })?;
         resolve_plugin_config(&manifest, scope, Some(values))
     });
-    PluginHostServices::new(resolver)
+    PluginHostServices::new(resolver, state_service())
 }
 
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {
@@ -134,7 +138,11 @@ async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChan
         &manifest,
         PluginCapability::Channel,
         binding,
-        [PluginPermission::ConfigRead],
+        [
+            PluginPermission::ConfigRead,
+            PluginPermission::StateRead,
+            PluginPermission::StateWrite,
+        ],
     )
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
