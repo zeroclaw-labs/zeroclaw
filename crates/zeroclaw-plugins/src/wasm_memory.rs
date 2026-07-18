@@ -39,12 +39,11 @@ impl Attributable for WasmMemory {
     }
 }
 
-fn linker(http: bool) -> Result<Linker<PluginState>> {
+/// Build the memory world without HTTP. Memory-network authority will land
+/// only with a component-boundary fixture and the shared egress policy.
+fn linker() -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
-    if http {
-        crate::component::add_wasi_http(&mut linker)?;
-    }
     let mut options = crate::component::bindings::memory::LinkOptions::default();
     options.plugins_wit_v0(true);
     wt(
@@ -68,9 +67,8 @@ impl WasmMemory {
         scope.require_capability(PluginCapability::Memory)?;
         let component = load_component(wasm_path)?;
         let mut store = crate::component::new_store(PluginStoreSpec::new(scope.clone(), limits));
-        let http = store.data().http_enabled();
-        let linker = linker(http)?;
-        crate::component::ensure_http_coherent(&store, http)?;
+        let linker = linker()?;
+        crate::component::ensure_http_coherent(&store, false)?;
         let bindings = wt(
             MemoryPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate memory plugin",

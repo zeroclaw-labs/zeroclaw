@@ -75,7 +75,9 @@ pub async fn create_plugin(
 ) -> Result<Plugin> {
     scope.require_capability(PluginCapability::Tool)?;
     let component = load_component(wasm_path)?;
-    let mut store = crate::component::new_store(PluginStoreSpec::new(scope.clone(), limits));
+    let mut store = crate::component::new_store(
+        PluginStoreSpec::new(scope.clone(), limits).with_granted_http(),
+    );
     let http = store.data().http_enabled();
     let linker = if http {
         tool_linker_http()

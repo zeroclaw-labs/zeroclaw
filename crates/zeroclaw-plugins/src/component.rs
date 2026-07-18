@@ -90,6 +90,7 @@ pub(crate) struct PluginStoreSpec {
     scope: PluginInstanceScope,
     limits: PluginLimits,
     inbound: InboundQueue,
+    http: bool,
 }
 
 impl PluginStoreSpec {
@@ -100,7 +101,19 @@ impl PluginStoreSpec {
             scope,
             limits,
             inbound: InboundQueue::default(),
+            http: false,
         }
+    }
+
+    /// Attach HTTP only when this scope was granted `HttpClient`.
+    ///
+    /// Adapters opt into the surface explicitly. This prevents adding a grant
+    /// to a scope from silently widening an adapter that has not implemented
+    /// and tested the corresponding component boundary.
+    #[must_use]
+    pub(crate) fn with_granted_http(mut self) -> Self {
+        self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
     }
 
     /// Attach the queue shared with a host-owned inbound listener.
@@ -155,11 +168,7 @@ impl PluginState {
     /// Other grants are consumed by adapters or host services where implemented
     /// and do not widen ambient WASI.
     pub(crate) fn new(spec: PluginStoreSpec) -> Self {
-        let http = spec
-            .scope
-            .grants()
-            .allows(PluginPermission::HttpClient)
-            .then(WasiHttpCtx::new);
+        let http = spec.http.then(WasiHttpCtx::new);
         Self {
             scope: spec.scope,
             wasi: WasiCtx::builder().build(),
@@ -326,7 +335,7 @@ mod tests {
     }
 
     fn spec(grants: impl IntoIterator<Item = PluginPermission>, call_fuel: u64) -> PluginStoreSpec {
-        PluginStoreSpec::new(scope("main", grants), test_limits(call_fuel))
+        PluginStoreSpec::new(scope("main", grants), test_limits(call_fuel)).with_granted_http()
     }
 
     #[test]
@@ -360,6 +369,17 @@ mod tests {
         assert!(
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
+        );
+    }
+
+    #[test]
+    fn grant_does_not_enable_http_without_adapter_opt_in() {
+        let granted_scope = scope("main", [PluginPermission::HttpClient]);
+        let state = PluginState::new(PluginStoreSpec::new(granted_scope, test_limits(0)));
+
+        assert!(
+            !state.http_enabled(),
+            "an adapter must explicitly opt into its tested HTTP boundary"
         );
     }
 

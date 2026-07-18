@@ -102,7 +102,9 @@ impl WasmChannel {
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
         let mut store = crate::component::new_store(
-            PluginStoreSpec::new(scope.clone(), limits).with_inbound(inbound.clone()),
+            PluginStoreSpec::new(scope.clone(), limits)
+                .with_granted_http()
+                .with_inbound(inbound.clone()),
         );
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
