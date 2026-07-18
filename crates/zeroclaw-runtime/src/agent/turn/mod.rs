@@ -864,8 +864,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // ── Progress: LLM responded ─────────────────────────────
         // Emitted AFTER the narration relay above: draft updaters flush on
         // Status boundaries, and flushing before the turn's narration Text is
-        // queued would deliver the pre-tool message a boundary late (#8445
-        // multi_message).
+        // queued would deliver the pre-tool message a boundary late for
+        // multi_message channels.
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
             let _ = tx

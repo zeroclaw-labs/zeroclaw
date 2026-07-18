@@ -963,7 +963,7 @@ impl TelegramChannel {
         let text = strip_tool_call_tags(text);
         let (chat_id, parsed_thread) = Self::parse_reply_target(recipient);
 
-        // Skipped when suppress_voice forces text-only delivery (#7361 send_via
+        // Skipped when suppress_voice forces text-only delivery (send_via
         // modality="text"), matching the non-multi-message finalize path.
         if !suppress_voice {
             self.try_queue_voice_reply(recipient, &text, true, false);
@@ -5376,8 +5376,8 @@ mod tests {
         );
     }
 
-    /// #7361/#8561 regression: in MultiMessage stream mode, `finalize_draft`
-    /// must thread `suppress_voice` into `finalize_multi_message_draft` so a
+    /// Regression: in MultiMessage stream mode, `finalize_draft` must thread
+    /// `suppress_voice` into `finalize_multi_message_draft` so a
     /// `send_via(modality="text")` reply on a voice-capable Telegram recipient
     /// delivers text only and does NOT queue a TTS voice reply. The OpenAI TTS
     /// provider is pointed at the mock, so a request to its `/v1/audio/speech`
