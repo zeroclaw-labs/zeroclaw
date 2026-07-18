@@ -23,6 +23,13 @@ base64 = "0.22"
 jsonschema = { version = "0.48", default-features = false }
 ring = "0.17"
 same-file = "1.0"
+rustls = { version = "0.23", default-features = false, features = [
+  "logging",
+  "ring",
+  "std",
+  "tls12",
+] }
+rustls-pemfile = "2"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = "2.0"
@@ -43,8 +50,10 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
   "default-send-request",
 ], optional = true }
 zeroize.workspace = true
+webpki-roots = "1.0.6"
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3.26"
 zeroclaw-config = { path = "../zeroclaw-config" }
 zeroclaw-spawn.workspace = true

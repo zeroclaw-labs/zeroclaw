@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -217,6 +218,94 @@ impl TlsProfile {
             .iter()
             .any(|pattern| pattern.matches_normalized(host))
     }
+}
+
+/// Materialize one connector-neutral rustls client configuration from an
+/// authorized TLS profile.
+///
+/// The profile contains only references into the admitted instance's canonical
+/// secret configuration. `resolve_secret` is invoked only for references the
+/// selected profile actually uses, so callers can resolve each value at the
+/// operation boundary without copying a parallel TLS configuration into an
+/// adapter. `None` selects the implicit system-roots profile.
+///
+/// # Errors
+///
+/// Returns [`EgressError`] when a referenced secret is unavailable, PEM is
+/// malformed or empty, a certificate cannot be trusted, or a client
+/// certificate and private key do not form a valid rustls identity.
+pub fn build_tls_client_config(
+    profile: Option<&TlsProfile>,
+    mut resolve_secret: impl FnMut(&SecretPropertyRef) -> Result<String, EgressError>,
+) -> Result<Arc<rustls::ClientConfig>, EgressError> {
+    let profile_name = profile
+        .map(|profile| profile.name().as_str())
+        .unwrap_or("system-roots")
+        .to_string();
+    let mut roots = rustls::RootCertStore::empty();
+
+    if profile.is_none_or(TlsProfile::uses_system_roots) {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    if let Some(custom_ca) = profile.and_then(TlsProfile::custom_ca) {
+        let pem = resolve_secret(custom_ca)?;
+        let certificates = parse_pem_certificates(&pem, &profile_name, "custom CA")?;
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .map_err(|_| EgressError::InvalidTlsMaterial {
+                    profile: profile_name.clone(),
+                    part: "custom CA certificate".to_string(),
+                })?;
+        }
+    }
+
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = if let Some(identity) = profile.and_then(TlsProfile::client_identity) {
+        let certificate_pem = resolve_secret(identity.certificate())?;
+        let certificates =
+            parse_pem_certificates(&certificate_pem, &profile_name, "client certificate")?;
+        let private_key_pem = resolve_secret(identity.private_key())?;
+        let private_key = rustls_pemfile::private_key(&mut Cursor::new(private_key_pem.as_bytes()))
+            .map_err(|_| EgressError::InvalidTlsMaterial {
+                profile: profile_name.clone(),
+                part: "client private key".to_string(),
+            })?
+            .ok_or_else(|| EgressError::InvalidTlsMaterial {
+                profile: profile_name.clone(),
+                part: "client private key".to_string(),
+            })?;
+        builder
+            .with_client_auth_cert(certificates, private_key)
+            .map_err(|_| EgressError::InvalidTlsMaterial {
+                profile: profile_name,
+                part: "client certificate/private-key pair".to_string(),
+            })?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    Ok(Arc::new(config))
+}
+
+fn parse_pem_certificates(
+    pem: &str,
+    profile: &str,
+    part: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, EgressError> {
+    let certificates = rustls_pemfile::certs(&mut Cursor::new(pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| EgressError::InvalidTlsMaterial {
+            profile: profile.to_string(),
+            part: part.to_string(),
+        })?;
+    if certificates.is_empty() {
+        return Err(EgressError::InvalidTlsMaterial {
+            profile: profile.to_string(),
+            part: part.to_string(),
+        });
+    }
+    Ok(certificates)
 }
 
 /// One materialized view of canonical operator egress policy.
@@ -762,6 +851,15 @@ pub enum EgressError {
     /// Requested named TLS profile is not authorized for this destination.
     #[error("plugin TLS profile {profile:?} is not authorized for host {host:?}")]
     TlsProfileHostDenied { profile: String, host: String },
+    /// A selected TLS profile references missing or invalid certificate material.
+    #[error("plugin TLS profile {profile:?} has invalid {part}")]
+    InvalidTlsMaterial { profile: String, part: String },
+    /// A selected TLS profile references a secret unavailable to this instance.
+    #[error("plugin TLS profile {profile:?} cannot resolve secret property {property:?}")]
+    TlsSecretUnavailable { profile: String, property: String },
+    /// An adapter attempted to use an authorization issued for another store.
+    #[error("plugin egress authorization does not belong to this plugin instance")]
+    AuthorizationScopeMismatch,
     /// DNS resolution failed before policy could pin an address set.
     #[error("DNS resolution for {host}:{port} failed: {reason}")]
     DnsFailed {
@@ -1098,6 +1196,73 @@ mod tests {
         assert!(matches!(
             service.authorize_addresses(wrong_host, [addr("1.1.1.1", 443)]),
             Err(EgressError::TlsProfileHostDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn implicit_tls_profile_uses_system_roots_without_secret_resolution() {
+        let config = build_tls_client_config(None, |_| {
+            panic!("implicit system roots must not resolve plugin secrets")
+        });
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn tls_builder_resolves_custom_trust_and_client_identity_by_reference() {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_parameters =
+            rcgen::CertificateParams::new(vec!["Plugin Test CA".to_string()]).unwrap();
+        ca_parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_certificate = ca_parameters.self_signed(&ca_key).unwrap();
+
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_parameters =
+            rcgen::CertificateParams::new(vec!["client.example".to_string()]).unwrap();
+        let client_certificate = client_parameters.self_signed(&client_key).unwrap();
+
+        let profile = TlsProfile::new(
+            TlsProfileName::new("private-mtls").unwrap(),
+            ["service.example".to_string()],
+            false,
+            Some(SecretPropertyRef::new("ca_pem").unwrap()),
+            Some(TlsClientIdentity::new(
+                SecretPropertyRef::new("client_cert_pem").unwrap(),
+                SecretPropertyRef::new("client_key_pem").unwrap(),
+            )),
+        )
+        .unwrap();
+        let mut resolved = Vec::new();
+        let config = build_tls_client_config(Some(&profile), |reference| {
+            resolved.push(reference.as_str().to_string());
+            match reference.as_str() {
+                "ca_pem" => Ok(ca_certificate.pem()),
+                "client_cert_pem" => Ok(client_certificate.pem()),
+                "client_key_pem" => Ok(client_key.serialize_pem()),
+                property => Err(EgressError::TlsSecretUnavailable {
+                    profile: "private-mtls".to_string(),
+                    property: property.to_string(),
+                }),
+            }
+        });
+
+        assert!(config.is_ok());
+        assert_eq!(resolved, ["ca_pem", "client_cert_pem", "client_key_pem"]);
+    }
+
+    #[test]
+    fn tls_builder_rejects_empty_custom_ca_material() {
+        let profile = TlsProfile::new(
+            TlsProfileName::new("private-ca").unwrap(),
+            ["service.example".to_string()],
+            false,
+            Some(SecretPropertyRef::new("ca_pem").unwrap()),
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            build_tls_client_config(Some(&profile), |_| Ok(String::new())),
+            Err(EgressError::InvalidTlsMaterial { part, .. }) if part == "custom CA"
         ));
     }
 
