@@ -157,7 +157,7 @@ impl HerdrClient {
         {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let socket_path = socket_path.clone();
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 while let Some(payload) = rx.recv().await {
                     let mut stream = match connect_with_timeout(&socket_path).await {
                         Ok(s) => s,
@@ -196,14 +196,6 @@ impl HerdrClient {
             spy: Some(Arc::new(spy)),
             #[cfg(unix)]
             writer: None,
-        }
-    }
-
-    /// Flush pending messages: wait for the writer task to drain the channel.
-    pub(crate) async fn flush(&self) {
-        #[cfg(unix)]
-        if let Some(tx) = &self.writer {
-            let _ = tx.closed().await;
         }
     }
 
@@ -337,15 +329,14 @@ impl DebouncedReporter {
         }
     }
 
-    /// Flush at shutdown: if not yet Released, emit idle + release_agent,
-    /// then drain the writer channel.
-    pub(crate) async fn flush(&mut self) {
+    /// Flush at shutdown: if not yet Released, emit idle + release_agent.
+    /// The writer task drains pending messages naturally when the sender drops.
+    pub(crate) fn flush(&mut self) {
         if self.state != HerdrState::Released {
             self.state = HerdrState::Released;
             self.client.report_state("idle", None);
             self.client.report_released();
         }
-        self.client.flush().await;
     }
 }
 
@@ -406,6 +397,7 @@ impl HerdrObserver {
 
     /// Test-only constructor that accepts a pre-built reporter.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new_with_reporter(reporter: DebouncedReporter) -> Self {
         Self::new(reporter)
     }
@@ -451,16 +443,7 @@ impl Observer for HerdrObserver {
     fn record_metric(&self, _metric: &ObserverMetric) {}
 
     fn flush(&self) {
-        let mut reporter = self.reporter.lock().expect("herdr observer poisoned");
-        // Use block_on since flush is called from sync context during drop
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            handle.block_on(reporter.flush());
-        } else {
-            // No runtime, create a temporary one
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(reporter.flush());
-        }
+        self.reporter.lock().expect("herdr observer poisoned").flush();
     }
 
     fn name(&self) -> &str {
@@ -584,8 +567,8 @@ pub(crate) mod tests {
     /// Non-ASCII pane IDs (e.g., emoji) must not panic on UTF-8 slicing.
     /// This tests the fix: display_name uses char-aware suffix extraction
     /// instead of byte indexing, which would panic on multi-byte chars like 🦀.
-    #[test]
-    fn non_ascii_pane_id_does_not_panic() {
+    #[tokio::test]
+    async fn non_ascii_pane_id_does_not_panic() {
         let _guard = install_hook_from_env(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-🦀".into(),
@@ -606,7 +589,7 @@ pub(crate) mod tests {
         reporter.transit_to(HerdrState::Working, Some("test-session"));
         calls.lock().clear();
 
-        reporter.flush().await;
+        reporter.flush();
 
         let captured: Vec<HerdrSpyCall> = calls.lock().clone();
         let methods: Vec<&str> = captured.iter().map(|c| c.method.as_str()).collect();
@@ -642,7 +625,7 @@ pub(crate) mod tests {
 
         // Double-flush is a no-op — the reporter is already Released.
         let count_after_first = calls.lock().len();
-        reporter.flush().await;
+        reporter.flush();
         assert_eq!(
             calls.lock().len(),
             count_after_first,
@@ -691,8 +674,8 @@ pub(crate) mod tests {
     /// a wall-clock-seeded base. This ensures restart resilience: a process
     /// restarted after herdr stores a prior seq will have a higher starting
     /// value, avoiding silent message rejection.
-    #[test]
-    fn next_seq_is_monotonic_and_restart_safe() {
+    #[tokio::test]
+    async fn next_seq_is_monotonic_and_restart_safe() {
         let client = HerdrClient::new(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-pane".into(),

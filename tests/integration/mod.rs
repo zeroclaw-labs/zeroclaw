@@ -1,6 +1,5 @@
 mod agent;
 mod agent_robustness;
-mod approval_gate_herdr;
 mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
@@ -9,7 +8,6 @@ mod hooks;
 mod memory_comparison;
 mod memory_loop_continuity;
 mod memory_restart;
-mod observability_hook;
 mod report_template_tool_test;
 mod telegram_attachment_fallback;
 mod telegram_finalize_draft;
