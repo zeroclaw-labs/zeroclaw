@@ -7,8 +7,12 @@
 //! the Bot Connector API at the `service_url` carried by each inbound
 //! activity, authenticated with a cached Entra client-credentials token.
 //!
-//! Design: `docs/msteams-channel-design.md`. Streaming draft updates land
-//! in a follow-up PR.
+//! Streaming (`stream_mode = "partial"`) drives Teams' native streaming
+//! protocol in personal chats — the gray in-progress bubble fed by
+//! `streaminfo` typing activities, replaced by the final message — and
+//! falls back to message edits in group chats and team channels.
+//!
+//! Design: `docs/msteams-channel-design.md`.
 
 pub mod activity;
 pub mod auth;
@@ -26,9 +30,11 @@ use axum::{
 };
 use conversation::{ConversationReference, ConversationStore};
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::MSTeamsConfig;
+use zeroclaw_config::schema::{MSTeamsConfig, StreamMode};
 
 /// Resolves this alias's `MSTeamsConfig` from canonical config state at
 /// use-time. No snapshot is stored on the channel (see AGENTS.md
@@ -58,6 +64,40 @@ struct ConnectorHandle {
     provider: Arc<auth::ConnectorTokenProvider>,
 }
 
+/// Resolved per-call context for outbound Connector requests.
+struct SendContext {
+    reference: ConversationReference,
+    base_id: String,
+    client: reqwest::Client,
+    token: String,
+}
+
+/// A `typing`/`message` activity carrying a Teams `streaminfo` entity
+/// (the native streaming protocol; design §4).
+fn streaming_activity_body(
+    activity_type: &str,
+    text: &str,
+    stream_type: &str,
+    sequence: Option<u64>,
+    stream_id: Option<&str>,
+) -> serde_json::Value {
+    let mut entity = serde_json::json!({
+        "type": "streaminfo",
+        "streamType": stream_type,
+    });
+    if let Some(sequence) = sequence {
+        entity["streamSequence"] = serde_json::Value::from(sequence);
+    }
+    if let Some(stream_id) = stream_id {
+        entity["streamId"] = serde_json::Value::from(stream_id);
+    }
+    serde_json::json!({
+        "type": activity_type,
+        "text": text,
+        "entities": [entity],
+    })
+}
+
 /// Microsoft Teams channel handle.
 pub struct MsTeamsChannel {
     /// The alias key under `[channels.msteams.<alias>]` this handle is
@@ -72,6 +112,16 @@ pub struct MsTeamsChannel {
     bot_identity: Arc<OnceLock<BotIdentity>>,
     listener_ready: Arc<AtomicBool>,
     connector: tokio::sync::RwLock<Option<ConnectorHandle>>,
+    /// Per-draft Teams streaming state: `streamId` -> next
+    /// `streamSequence`. Source of truth created here — the streaminfo
+    /// protocol counter is assigned locally and exists nowhere else.
+    /// Entries are removed on finalize/cancel. Drafts without an entry
+    /// use the group-chat message-edit fallback.
+    draft_streams: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Last draft-update instant per recipient, enforcing the
+    /// `draft_update_interval_ms` floor (Teams rate-limits streaming
+    /// updates to roughly one per second).
+    last_draft_update: parking_lot::Mutex<HashMap<String, Instant>>,
     #[cfg(test)]
     token_url_override: Option<String>,
 }
@@ -93,6 +143,8 @@ impl MsTeamsChannel {
             bot_identity: Arc::new(OnceLock::new()),
             listener_ready: Arc::new(AtomicBool::new(false)),
             connector: tokio::sync::RwLock::new(None),
+            draft_streams: parking_lot::Mutex::new(HashMap::new()),
+            last_draft_update: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             token_url_override: None,
         }
@@ -156,6 +208,134 @@ impl MsTeamsChannel {
             provider: provider.clone(),
         });
         provider
+    }
+
+    /// Current stream mode, resolved from canonical state.
+    fn stream_mode(&self) -> StreamMode {
+        self.config().map(|cfg| cfg.stream_mode).unwrap_or_default()
+    }
+
+    /// Resolve everything an outbound Connector call needs for
+    /// `recipient`: the stored conversation reference, an authenticated
+    /// client, and a bearer token.
+    async fn send_context(&self, recipient: &str) -> Result<(MSTeamsConfig, SendContext)> {
+        let cfg = self.config().with_context(|| {
+            format!(
+                "Microsoft Teams channel '{}' has no [channels.msteams.{}] config block",
+                self.alias, self.alias
+            )
+        })?;
+        let (base_id, _) = activity::split_conversation_id(recipient);
+        let reference = self.conversations.get(base_id).with_context(|| {
+            format!(
+                "no conversation reference for '{base_id}': references are in-memory only, \
+                 so the peer must message the bot (again) after a daemon restart before \
+                 proactive sends can reach them"
+            )
+        })?;
+        let provider = self.connector_provider(&cfg.tenant_id).await;
+        let token = provider.token(&cfg.app_id, &cfg.app_password).await?;
+        let client = self.http_client(cfg.proxy_url.as_deref());
+        let base_id = base_id.to_string();
+        Ok((
+            cfg,
+            SendContext {
+                reference,
+                base_id,
+                client,
+                token,
+            },
+        ))
+    }
+
+    /// `{service_url}/v3/conversations/{conversation_id}/activities[/{activity_id}]`.
+    fn activities_url(
+        reference: &ConversationReference,
+        conversation_id: &str,
+        activity_id: Option<&str>,
+    ) -> Result<url::Url> {
+        let mut url = url::Url::parse(&reference.service_url)
+            .with_context(|| format!("invalid service_url '{}'", reference.service_url))?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|()| {
+                anyhow::Error::msg(format!(
+                    "service_url '{}' cannot be a base",
+                    reference.service_url
+                ))
+            })?;
+            segments
+                .pop_if_empty()
+                .extend(["v3", "conversations", conversation_id, "activities"]);
+            if let Some(id) = activity_id {
+                segments.push(id);
+            }
+        }
+        Ok(url)
+    }
+
+    /// Issue a Connector API request; returns the activity id from the
+    /// response body when the Connector provides one.
+    async fn activity_request(
+        ctx: &SendContext,
+        method: reqwest::Method,
+        url: url::Url,
+        body: &serde_json::Value,
+    ) -> Result<Option<String>> {
+        let response = ctx
+            .client
+            .request(method, url)
+            .bearer_auth(&ctx.token)
+            .json(body)
+            .send()
+            .await
+            .context("Teams Connector request failed")?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Teams Connector request failed ({status}): {text}");
+        }
+        Ok(serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("id")
+                    .and_then(|id| id.as_str().map(str::to_string))
+            }))
+    }
+
+    /// Whether the `draft_update_interval_ms` floor allows an update for
+    /// this recipient right now (`0` disables throttling).
+    fn draft_update_allowed(&self, recipient: &str, interval_ms: u64) -> bool {
+        if interval_ms == 0 {
+            return true;
+        }
+        self.last_draft_update
+            .lock()
+            .get(recipient)
+            .is_none_or(|last| last.elapsed().as_millis() >= u128::from(interval_ms))
+    }
+
+    fn mark_draft_update(&self, recipient: &str) {
+        self.last_draft_update
+            .lock()
+            .insert(recipient.to_string(), Instant::now());
+    }
+
+    /// Consume the next `streamSequence` for a native-streaming draft.
+    /// `None` means this draft uses the message-edit fallback.
+    fn next_stream_sequence(&self, stream_id: &str) -> Option<u64> {
+        let mut streams = self.draft_streams.lock();
+        streams.get_mut(stream_id).map(|next| {
+            let sequence = *next;
+            *next += 1;
+            sequence
+        })
+    }
+
+    /// Drop all local state for a draft (finalized or cancelled).
+    fn clear_draft_state(&self, recipient: &str, stream_id: &str) {
+        self.draft_streams.lock().remove(stream_id);
+        self.last_draft_update.lock().remove(recipient);
     }
 
     /// Build the inbound activity router. Split from `listen()` so tests
@@ -384,55 +564,19 @@ impl Channel for MsTeamsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let cfg = self.config().with_context(|| {
-            format!(
-                "Microsoft Teams channel '{}' has no [channels.msteams.{}] config block",
-                self.alias, self.alias
-            )
-        })?;
-
-        let (base_id, _) = activity::split_conversation_id(&message.recipient);
-        let reference = self.conversations.get(base_id).with_context(|| {
-            format!(
-                "no conversation reference for '{base_id}': references are in-memory only, \
-                 so the peer must message the bot (again) after a daemon restart before \
-                 proactive sends can reach them"
-            )
-        })?;
-
-        let provider = self.connector_provider(&cfg.tenant_id).await;
-        let token = provider.token(&cfg.app_id, &cfg.app_password).await?;
-
+        let (_, ctx) = self.send_context(&message.recipient).await?;
         let conversation_id = match message.thread_ts.as_deref() {
-            Some(ts) if !ts.is_empty() => format!("{base_id};messageid={ts}"),
-            _ => base_id.to_string(),
+            Some(ts) if !ts.is_empty() => format!("{};messageid={ts}", ctx.base_id),
+            _ => ctx.base_id.clone(),
         };
-        let mut url = url::Url::parse(&reference.service_url)
-            .with_context(|| format!("invalid service_url '{}'", reference.service_url))?;
-        url.path_segments_mut()
-            .map_err(|()| {
-                anyhow::Error::msg(format!(
-                    "service_url '{}' cannot be a base",
-                    reference.service_url
-                ))
-            })?
-            .pop_if_empty()
-            .extend(["v3", "conversations", &conversation_id, "activities"]);
-
-        let response = self
-            .http_client(cfg.proxy_url.as_deref())
-            .post(url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "type": "message", "text": message.content }))
-            .send()
-            .await
-            .context("Teams Connector send request failed")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Teams Connector send failed ({status}): {body}");
-        }
+        let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
+        Self::activity_request(
+            &ctx,
+            reqwest::Method::POST,
+            url,
+            &serde_json::json!({ "type": "message", "text": message.content }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -498,6 +642,171 @@ impl Channel for MsTeamsChannel {
         self.conversations
             .get(base_id)
             .is_some_and(|reference| reference.is_personal())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_mode() == StreamMode::Partial
+    }
+
+    fn supports_multi_message_streaming(&self) -> bool {
+        self.stream_mode() == StreamMode::MultiMessage
+    }
+
+    /// Open a draft. Personal chats use Teams' native streaming protocol:
+    /// the first `streaminfo` typing activity opens the gray in-progress
+    /// bubble and its activity id becomes the `streamId`. Group chats and
+    /// team channels post a regular message that later updates edit.
+    async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
+        if self.stream_mode() != StreamMode::Partial {
+            return Ok(None);
+        }
+        let (_, ctx) = self.send_context(&message.recipient).await?;
+        let text = if message.content.is_empty() {
+            "..."
+        } else {
+            message.content.as_str()
+        };
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+
+        let draft_id = if ctx.reference.is_personal() {
+            let body = streaming_activity_body("typing", text, "informative", Some(1), None);
+            let stream_id = Self::activity_request(&ctx, reqwest::Method::POST, url, &body)
+                .await?
+                .context("Teams streaming draft opened but no streamId was returned")?;
+            self.draft_streams.lock().insert(stream_id.clone(), 2);
+            stream_id
+        } else {
+            let body = serde_json::json!({ "type": "message", "text": text });
+            Self::activity_request(&ctx, reqwest::Method::POST, url, &body)
+                .await?
+                .context("Teams draft message posted but no activity id was returned")?
+        };
+        self.mark_draft_update(&message.recipient);
+        Ok(Some(draft_id))
+    }
+
+    /// Stream accumulated content into the draft. Non-fatal failures are
+    /// logged and swallowed — the finalize pass carries the full text.
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        let Some(cfg) = self.config() else {
+            return Ok(());
+        };
+        if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
+            return Ok(());
+        }
+        let (_, ctx) = self.send_context(recipient).await?;
+
+        let outcome = match self.next_stream_sequence(message_id) {
+            Some(sequence) => {
+                let body = streaming_activity_body(
+                    "typing",
+                    text,
+                    "streaming",
+                    Some(sequence),
+                    Some(message_id),
+                );
+                let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+                Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await
+            }
+            None => {
+                let body = serde_json::json!({ "type": "message", "text": text });
+                let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(message_id))?;
+                Self::activity_request(&ctx, reqwest::Method::PUT, url, &body).await
+            }
+        };
+        match outcome {
+            Ok(_) => self.mark_draft_update(recipient),
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "Teams draft update failed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Progress/status line (tool execution etc.). Personal chats show it
+    /// as the gray informative text over the streaming bubble; group
+    /// chats skip it (an edit would overwrite real content with status).
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let Some(sequence) = self.next_stream_sequence(message_id) else {
+            return Ok(());
+        };
+        let Some(cfg) = self.config() else {
+            return Ok(());
+        };
+        if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
+            return Ok(());
+        }
+        let (_, ctx) = self.send_context(recipient).await?;
+        let body = streaming_activity_body(
+            "typing",
+            text,
+            "informative",
+            Some(sequence),
+            Some(message_id),
+        );
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+        if let Err(err) = Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                "Teams draft progress update failed"
+            );
+        } else {
+            self.mark_draft_update(recipient);
+        }
+        Ok(())
+    }
+
+    /// Close the draft with the complete response. Personal chats post
+    /// the final `message` activity — Teams replaces the gray streaming
+    /// bubble with a normal message and drops the status history. Group
+    /// chats apply a final edit.
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
+        let (_, ctx) = self.send_context(recipient).await?;
+        let text = crate::util::strip_tool_call_tags(text);
+        let streaming = self.draft_streams.lock().contains_key(message_id);
+        self.clear_draft_state(recipient, message_id);
+
+        if streaming {
+            let body = streaming_activity_body("message", &text, "final", None, Some(message_id));
+            let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+            Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
+        } else {
+            let body = serde_json::json!({ "type": "message", "text": text });
+            let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(message_id))?;
+            Self::activity_request(&ctx, reqwest::Method::PUT, url, &body).await?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort removal of an abandoned draft.
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
+        self.clear_draft_state(recipient, message_id);
+        let Ok((_, ctx)) = self.send_context(recipient).await else {
+            return Ok(());
+        };
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(message_id))?;
+        let _ =
+            Self::activity_request(&ctx, reqwest::Method::DELETE, url, &serde_json::Value::Null)
+                .await;
+        Ok(())
     }
 }
 
@@ -948,6 +1257,268 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no conversation reference"));
+    }
+
+    fn streaming_config() -> MSTeamsConfig {
+        MSTeamsConfig {
+            stream_mode: StreamMode::Partial,
+            draft_update_interval_ms: 0,
+            ..test_config()
+        }
+    }
+
+    async fn mock_token_endpoint(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "connector-tok",
+                "expires_in": 3600,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn draft_channel(config: MSTeamsConfig, connector: &MockServer) -> MsTeamsChannel {
+        MsTeamsChannel::new(
+            "default",
+            Arc::new(move || Some(config.clone())),
+            Arc::new(Vec::new),
+        )
+        .with_token_url(format!("{}/token", connector.uri()))
+    }
+
+    fn record_reference(ch: &MsTeamsChannel, connector: &MockServer, id: &str, kind: &str) {
+        ch.conversations.record(ConversationReference {
+            service_url: format!("{}/teams/", connector.uri()),
+            conversation_id: id.to_string(),
+            conversation_type: Some(kind.to_string()),
+        });
+    }
+
+    #[test]
+    fn streaming_support_flags_follow_stream_mode() {
+        let connector_dummy = |mode: StreamMode| {
+            MsTeamsChannel::new(
+                "default",
+                Arc::new(move || {
+                    Some(MSTeamsConfig {
+                        stream_mode: mode,
+                        ..MSTeamsConfig::default()
+                    })
+                }),
+                Arc::new(Vec::new),
+            )
+        };
+        let off = connector_dummy(StreamMode::Off);
+        assert!(!off.supports_draft_updates());
+        assert!(!off.supports_multi_message_streaming());
+
+        let partial = connector_dummy(StreamMode::Partial);
+        assert!(partial.supports_draft_updates());
+        assert!(!partial.supports_multi_message_streaming());
+
+        let multi = connector_dummy(StreamMode::MultiMessage);
+        assert!(!multi.supports_draft_updates());
+        assert!(multi.supports_multi_message_streaming());
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_streaming_off() {
+        let ch = MsTeamsChannel::new(
+            "default",
+            Arc::new(|| Some(test_config())),
+            Arc::new(Vec::new),
+        );
+        assert!(
+            ch.send_draft(&SendMessage::new("hi", "a:1conv"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Full personal-chat streaming sequence: informative open →
+    /// informative progress → streaming content → final message, with a
+    /// consistent streamId and monotonic streamSequence.
+    #[tokio::test]
+    async fn personal_streaming_draft_lifecycle() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft_id, "stream-1");
+
+        ch.update_draft_progress("a:1conv", &draft_id, "Running tools...")
+            .await
+            .unwrap();
+        ch.update_draft("a:1conv", &draft_id, "Partial answer")
+            .await
+            .unwrap();
+        ch.finalize_draft("a:1conv", &draft_id, "Final answer", false)
+            .await
+            .unwrap();
+
+        let requests = connector.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/activities"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 4);
+
+        assert_eq!(bodies[0]["type"], "typing");
+        assert_eq!(bodies[0]["entities"][0]["streamType"], "informative");
+        assert_eq!(bodies[0]["entities"][0]["streamSequence"], 1);
+        assert!(bodies[0]["entities"][0].get("streamId").is_none());
+
+        assert_eq!(bodies[1]["type"], "typing");
+        assert_eq!(bodies[1]["text"], "Running tools...");
+        assert_eq!(bodies[1]["entities"][0]["streamType"], "informative");
+        assert_eq!(bodies[1]["entities"][0]["streamSequence"], 2);
+        assert_eq!(bodies[1]["entities"][0]["streamId"], "stream-1");
+
+        assert_eq!(bodies[2]["type"], "typing");
+        assert_eq!(bodies[2]["text"], "Partial answer");
+        assert_eq!(bodies[2]["entities"][0]["streamType"], "streaming");
+        assert_eq!(bodies[2]["entities"][0]["streamSequence"], 3);
+
+        assert_eq!(bodies[3]["type"], "message");
+        assert_eq!(bodies[3]["text"], "Final answer");
+        assert_eq!(bodies[3]["entities"][0]["streamType"], "final");
+        assert_eq!(bodies[3]["entities"][0]["streamId"], "stream-1");
+
+        // Draft state is gone: another update would use the edit fallback.
+        assert!(ch.draft_streams.lock().is_empty());
+    }
+
+    /// Group chats and team channels cannot use native streaming: the
+    /// draft is a normal message updated (and finalized) via PUT edits.
+    #[tokio::test]
+    async fn group_draft_falls_back_to_message_edits() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/teams/v3/conversations/19:general@thread.tacv2/activities",
+            ))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "act-7" })),
+            )
+            .expect(1)
+            .mount(&connector)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/teams/v3/conversations/19:general@thread.tacv2/activities/act-7",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "19:general@thread.tacv2", "channel");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("drafting...", "19:general@thread.tacv2"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft_id, "act-7");
+        // Progress updates are personal-chat only; must not edit.
+        ch.update_draft_progress("19:general@thread.tacv2", &draft_id, "status")
+            .await
+            .unwrap();
+        ch.update_draft("19:general@thread.tacv2", &draft_id, "more text")
+            .await
+            .unwrap();
+        ch.finalize_draft("19:general@thread.tacv2", &draft_id, "done", false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn draft_updates_respect_rate_limit_floor() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let cfg = MSTeamsConfig {
+            draft_update_interval_ms: 60_000,
+            ..streaming_config()
+        };
+        let ch = draft_channel(cfg, &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        // Inside the 60s window: both updates short-circuit before the
+        // network.
+        ch.update_draft("a:1conv", &draft_id, "one").await.unwrap();
+        ch.update_draft("a:1conv", &draft_id, "two").await.unwrap();
+
+        let activity_posts = connector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/activities"))
+            .count();
+        assert_eq!(activity_posts, 1, "only the draft open may hit the network");
+    }
+
+    #[tokio::test]
+    async fn cancel_draft_deletes_activity_and_clears_state() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/teams/v3/conversations/a:1conv/activities/stream-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
+        assert!(ch.draft_streams.lock().is_empty());
+        assert!(ch.last_draft_update.lock().is_empty());
     }
 
     #[tokio::test]
