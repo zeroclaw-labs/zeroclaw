@@ -13,10 +13,10 @@ use crate::component::{
     load_component, wt,
 };
 use crate::endpoint::PluginChannelEndpoint;
+use crate::host::AdmittedComponent;
 use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -85,12 +85,12 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 impl WasmChannel {
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
-        wasm_path: &Path,
+        component: &AdmittedComponent,
         services: &PluginHostServices,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
         services.resolve_config(endpoint.scope())?;
-        let component = load_component(wasm_path)?;
+        let component = load_component(component)?;
         let inbound = InboundQueue::default();
         let mut store = crate::component::new_store(
             PluginStoreSpec::new(endpoint.scope().clone(), services.clone(), limits)
@@ -809,9 +809,10 @@ mod tests {
                 "invalid-before-load".to_string(),
             ))
         }));
+        let component = AdmittedComponent::test_component(b"not-a-component");
         let result = WasmChannel::from_wasm(
             endpoint,
-            Path::new("/path/that/must/not/exist.wasm"),
+            &component,
             &services,
             crate::component::test_limits(0),
         )

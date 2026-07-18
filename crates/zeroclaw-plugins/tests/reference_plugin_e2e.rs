@@ -102,7 +102,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     let host = PluginHost::from_plugins_dir(&plugins_dir).expect("scan throwaway plugins dir");
     let details = host.tool_plugin_details();
     assert_eq!(details.len(), 1, "exactly the reference tool discovered");
-    let (manifest, wasm_path) = details[0];
+    let (manifest, component) = details[0];
     assert_eq!(manifest.name, "zeroclaw-reference-plugin");
     assert!(manifest.capabilities.contains(&PluginCapability::Tool));
     assert!(manifest.permissions.contains(&PluginPermission::ConfigRead));
@@ -129,7 +129,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
         resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
     }));
     let mut plugin = runtime::create_plugin(
-        wasm_path,
+        component,
         &scope,
         &services,
         PluginLimits {

@@ -1526,7 +1526,7 @@ pub fn all_tools_with_runtime(
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
                     };
-                    for (manifest, wasm_path) in details {
+                    for (manifest, component) in details {
                         let tool = (|| -> anyhow::Result<_> {
                             let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
                                 manifest,
@@ -1534,7 +1534,7 @@ pub fn all_tools_with_runtime(
                                 manifest.permissions.iter().copied(),
                             )?;
                             zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                                wasm_path.to_path_buf(),
+                                component.clone(),
                                 scope,
                                 host_services.clone(),
                                 plugin_limits,

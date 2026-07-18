@@ -2,12 +2,12 @@
 
 use crate::PluginCapability;
 use crate::component::PluginLimits;
+use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::runtime;
 use crate::services::PluginHostServices;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
 use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
@@ -16,7 +16,7 @@ pub struct WasmTool {
     name: String,
     description: String,
     parameters_schema: Value,
-    wasm_path: PathBuf,
+    component: AdmittedComponent,
     scope: PluginInstanceScope,
     services: PluginHostServices,
     limits: PluginLimits,
@@ -42,7 +42,7 @@ impl WasmTool {
         name: String,
         description: String,
         parameters_schema: Value,
-        wasm_path: PathBuf,
+        component: AdmittedComponent,
         scope: PluginInstanceScope,
         services: PluginHostServices,
         limits: PluginLimits,
@@ -53,7 +53,7 @@ impl WasmTool {
             name,
             description,
             parameters_schema,
-            wasm_path,
+            component,
             scope,
             services,
             limits,
@@ -66,7 +66,7 @@ impl WasmTool {
     /// instead of being registered with synthetic metadata. `services` must
     /// resolve canonical live config under the supplied instance scope.
     pub fn from_wasm(
-        wasm_path: PathBuf,
+        component: AdmittedComponent,
         scope: PluginInstanceScope,
         services: PluginHostServices,
         limits: PluginLimits,
@@ -74,12 +74,12 @@ impl WasmTool {
         scope.require_capability(PluginCapability::Tool)?;
         services.resolve_config(&scope)?;
         let probe = {
-            let wasm_path = wasm_path.clone();
+            let component = component.clone();
             let scope = scope.clone();
             let services = services.clone();
             block_probe(async move {
                 let mut plugin =
-                    runtime::create_plugin(&wasm_path, &scope, &services, limits).await?;
+                    runtime::create_plugin(&component, &scope, &services, limits).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -89,7 +89,7 @@ impl WasmTool {
             name: meta.name,
             description: meta.description,
             parameters_schema: meta.parameters_schema,
-            wasm_path,
+            component,
             scope,
             services,
             limits,
@@ -136,7 +136,7 @@ impl Tool for WasmTool {
         let args_json = serde_json::to_vec(&args)?;
         self.services.resolve_config(&self.scope)?;
         let mut plugin =
-            runtime::create_plugin(&self.wasm_path, &self.scope, &self.services, self.limits)
+            runtime::create_plugin(&self.component, &self.scope, &self.services, self.limits)
                 .await?;
         runtime::call_execute(&mut plugin, &args_json).await
     }
@@ -155,6 +155,10 @@ mod tests {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
     }
 
+    fn component() -> AdmittedComponent {
+        AdmittedComponent::test_component(b"not-a-component")
+    }
+
     #[test]
     fn tool_attribution_keeps_callable_and_instance_identities_distinct() {
         let schema = serde_json::json!({"type": "object", "properties": {}});
@@ -162,7 +166,7 @@ mod tests {
             "redact".to_string(),
             "does things".to_string(),
             schema.clone(),
-            PathBuf::from("/tmp/plugin.wasm"),
+            component(),
             tool_scope(),
             crate::services::test_host_services(),
             crate::component::test_limits(1_000),
@@ -184,7 +188,7 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            PathBuf::from("/tmp/plugin.wasm"),
+            component(),
             scope,
             crate::services::test_host_services(),
             crate::component::test_limits(0),
@@ -204,7 +208,7 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            PathBuf::from("/tmp/plugin.wasm"),
+            component(),
             tool_scope(),
             services,
             crate::component::test_limits(0),
@@ -214,9 +218,9 @@ mod tests {
     }
 
     #[test]
-    fn from_wasm_rejects_a_missing_component() {
+    fn from_wasm_rejects_invalid_component_bytes() {
         let result = WasmTool::from_wasm(
-            PathBuf::from("/path/that/must/not/exist.wasm"),
+            component(),
             tool_scope(),
             crate::services::test_host_services(),
             crate::component::test_limits(0),
@@ -233,7 +237,7 @@ mod tests {
             ))
         }));
         let error = WasmTool::from_wasm(
-            PathBuf::from("/path/that/must/not/exist.wasm"),
+            component(),
             tool_scope(),
             services,
             crate::component::test_limits(0),
@@ -260,7 +264,7 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            PathBuf::from("/path/that/must/not/exist.wasm"),
+            component(),
             tool_scope(),
             services,
             crate::component::test_limits(0),

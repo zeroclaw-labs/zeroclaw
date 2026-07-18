@@ -610,6 +610,10 @@ enforces one of three modes from `plugins.security.signature_mode`:
 
 Verification runs at both discovery and install. Discovery skips a plugin that
 fails its policy rather than aborting the whole host; install returns the error.
+For executable plugins, `strict` mode additionally requires the signed manifest
+to declare `wasm_sha256`. The host confines `wasm_path`, rejects symlinks, reads
+one stable file generation, verifies that digest, and gives adapters only those
+admitted bytes. A declared digest is enforced in every signature mode.
 
 ## Writing a plugin in Rust
 

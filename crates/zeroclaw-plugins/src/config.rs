@@ -606,6 +606,7 @@ mod tests {
             description: None,
             author: None,
             wasm_path: Some("fixture.wasm".to_string()),
+            wasm_sha256: None,
             capabilities: vec![PluginCapability::Tool],
             permissions: requests_config
                 .then_some(PluginPermission::ConfigRead)

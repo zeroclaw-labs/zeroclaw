@@ -2,6 +2,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,6 +15,8 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::admit_fixture;
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -64,6 +68,7 @@ async fn execute(binding: &str) -> String {
         description: None,
         author: None,
         wasm_path: Some("tool-fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
         permissions: vec![PluginPermission::ConfigRead],
         config_schema: Some(serde_json::json!({
@@ -86,6 +91,7 @@ async fn execute(binding: &str) -> String {
         [PluginPermission::ConfigRead],
     )
     .expect("admit fixture scope");
+    let component = admit_fixture(&fixture(), &manifest);
     let configured = HashMap::from([
         ("binding_label".to_string(), binding.to_string()),
         ("api_token".to_string(), format!("token-{binding}")),
@@ -94,7 +100,7 @@ async fn execute(binding: &str) -> String {
         resolve_plugin_config(&manifest, scope, Some(&configured))
     });
     let services = PluginHostServices::new(resolver);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, limits())
+    let mut plugin = runtime::create_plugin(&component, &scope, &services, limits())
         .await
         .expect("instantiate fixture tool");
 

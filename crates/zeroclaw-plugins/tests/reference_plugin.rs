@@ -5,6 +5,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -14,6 +16,8 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::admit_fixture;
 
 fn test_limits() -> PluginLimits {
     PluginLimits {
@@ -33,6 +37,7 @@ fn context(
         description: None,
         author: None,
         wasm_path: Some("reference-plugin.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
         permissions: vec![PluginPermission::ConfigRead],
         config_schema: Some(serde_json::json!({
@@ -71,11 +76,12 @@ fn host_services(
 
 #[tokio::test]
 async fn reference_plugin_reports_metadata() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture_path) = fixture() else {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
     let (manifest, scope) = context([]);
+    let fixture = admit_fixture(&fixture_path, &manifest);
     let services = host_services(manifest, None);
     let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
         .await
@@ -89,11 +95,12 @@ async fn reference_plugin_reports_metadata() {
 
 #[tokio::test]
 async fn reference_plugin_redacts_with_config() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture_path) = fixture() else {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
+    let fixture = admit_fixture(&fixture_path, &manifest);
     let config = HashMap::from([
         ("replacement".to_string(), "<X>".to_string()),
         ("patterns".to_string(), "swordfish".to_string()),
@@ -116,11 +123,12 @@ async fn reference_plugin_redacts_with_config() {
 
 #[tokio::test]
 async fn reference_plugin_jails_config_without_grant() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture_path) = fixture() else {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
     let (manifest, scope) = context([]);
+    let fixture = admit_fixture(&fixture_path, &manifest);
     let config = HashMap::from([("patterns".to_string(), "swordfish".to_string())]);
     let services = host_services(manifest, Some(config));
     let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
@@ -135,11 +143,12 @@ async fn reference_plugin_jails_config_without_grant() {
 
 #[tokio::test]
 async fn reference_plugin_masks_token_by_default() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture_path) = fixture() else {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
+    let fixture = admit_fixture(&fixture_path, &manifest);
     let services = host_services(manifest, None);
     let mut plugin = runtime::create_plugin(&fixture, &scope, &services, test_limits())
         .await
@@ -153,7 +162,7 @@ async fn reference_plugin_masks_token_by_default() {
 
 #[tokio::test]
 async fn reference_plugin_traps_when_fuel_exhausted() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture_path) = fixture() else {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
@@ -164,6 +173,7 @@ async fn reference_plugin_traps_when_fuel_exhausted() {
         max_instances: 64,
     };
     let (manifest, scope) = context([]);
+    let fixture = admit_fixture(&fixture_path, &manifest);
     let services = host_services(manifest, None);
     let mut plugin = runtime::create_plugin(&fixture, &scope, &services, starved)
         .await
@@ -177,7 +187,7 @@ async fn reference_plugin_traps_when_fuel_exhausted() {
 
 #[tokio::test]
 async fn reference_plugin_traps_when_memory_capped() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture_path) = fixture() else {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     };
@@ -188,6 +198,7 @@ async fn reference_plugin_traps_when_memory_capped() {
         max_instances: 64,
     };
     let (manifest, scope) = context([]);
+    let fixture = admit_fixture(&fixture_path, &manifest);
     let services = host_services(manifest, None);
     let outcome = runtime::create_plugin(&fixture, &scope, &services, capped).await;
     assert!(

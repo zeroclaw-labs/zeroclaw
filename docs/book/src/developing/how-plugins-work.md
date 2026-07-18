@@ -38,13 +38,18 @@ one.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
    containing a `manifest.toml`.
-3. **Validate shape.** Each manifest must declare at least one capability, and a
-   non-skill plugin must name a `wasm_path` that exists. A malformed manifest is
-   skipped with a warning, never loaded.
+3. **Validate shape.** Each manifest must declare at least one capability, its
+   package directory must match its canonical name, and a non-skill plugin must
+   name a confined relative `wasm_path`. Traversal and symlink paths are
+   rejected. A malformed manifest is skipped with a warning, never loaded.
 4. **Enforce signature policy.** Each plugin is checked against the configured
    `[plugins.security] signature_mode` and `trusted_publisher_keys`. A plugin
    that fails the policy is dropped from the loaded set, not surfaced as a tool.
-5. **Register tools.** Surviving tool plugins are wrapped as agent tools and
+5. **Admit executable bytes.** The host opens the confined component once,
+   verifies any declared `wasm_sha256`, and retains those exact bytes. In
+   `strict` mode the signed manifest must declare this digest. Adapters compile
+   the admitted buffer rather than reopening its path.
+6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. Tool dispatch resolves names first-match, so a
    plugin tool that collides with a built-in name is never selected; give plugin
    tools unique names.
@@ -66,11 +71,11 @@ signature is enforced through `[plugins.security] signature_mode`:
 
 In `strict` mode the manifest's `publisher_key` must appear in
 `[plugins.security] trusted_publisher_keys`, and the signature must verify
-against the canonical manifest bytes. A plugin that is unsigned, signed by an
-untrusted key, or whose signature does not verify is dropped at discovery and
-never becomes a tool. The default is `disabled` so a fresh local checkout works
-without key management, but a host that loads plugins from anywhere you do not
-control should run `strict`.
+against the canonical manifest bytes. Executable plugins must also declare a
+signed `wasm_sha256` matching the exact admitted bytes. A plugin that fails any
+of these checks is dropped at discovery and never becomes a tool. The default
+is `disabled` so a fresh local checkout works without key management, but a
+host that loads plugins from anywhere you do not control should run `strict`.
 
 This policy is enforced uniformly: the same check that the host applies when you
 list plugins is the check the agent runtime applies when it builds the tool set,

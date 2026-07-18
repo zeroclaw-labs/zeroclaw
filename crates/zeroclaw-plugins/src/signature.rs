@@ -73,6 +73,32 @@ fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Compute a lowercase hexadecimal SHA-256 digest.
+#[must_use]
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    hex_encode(digest.as_ref())
+}
+
+/// Validate the manifest representation of a SHA-256 digest.
+pub fn validate_sha256_hex(expected: &str) -> Result<(), PluginError> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PluginError::PayloadDigestInvalid(expected.to_string()));
+    }
+    Ok(())
+}
+
+/// Verify bytes against a manifest-provided SHA-256 digest.
+pub fn verify_payload_digest(data: &[u8], expected: &str) -> Result<(), PluginError> {
+    validate_sha256_hex(expected)?;
+    let expected = expected.to_ascii_lowercase();
+    let actual = sha256_hex(data);
+    if actual != expected {
+        return Err(PluginError::PayloadDigestMismatch { expected, actual });
+    }
+    Ok(())
+}
+
 // ── Canonical manifest bytes ──
 
 /// Compute the canonical bytes of a manifest for signing/verification.
@@ -326,6 +352,28 @@ type = "string"
             .unwrap();
         assert!(properties.contains_key("signature"));
         assert!(properties.contains_key("publisher_key"));
+    }
+
+    #[test]
+    fn payload_digest_verification_accepts_exact_bytes() {
+        let bytes = b"signed component bytes";
+        let digest = sha256_hex(bytes);
+        verify_payload_digest(bytes, &digest).expect("exact payload digest matches");
+        verify_payload_digest(bytes, &digest.to_ascii_uppercase())
+            .expect("hex digest comparison is case-insensitive");
+    }
+
+    #[test]
+    fn payload_digest_verification_rejects_tampering_and_invalid_shape() {
+        let digest = sha256_hex(b"original");
+        assert!(matches!(
+            verify_payload_digest(b"tampered", &digest),
+            Err(PluginError::PayloadDigestMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_payload_digest(b"original", "not-a-sha256"),
+            Err(PluginError::PayloadDigestInvalid(_))
+        ));
     }
 
     #[test]

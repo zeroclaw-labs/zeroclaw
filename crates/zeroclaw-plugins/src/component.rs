@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
@@ -12,6 +11,7 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
 use crate::error::PluginError;
+use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::services::{ConfigLookupError, PluginHostServices, SecretLookupError};
 use crate::{PluginCapability, PluginPermission};
@@ -482,23 +482,21 @@ pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e}")))
 }
 
-/// Compile a component from a WASM file. With a JIT backend present a `.wasm`
-/// component is compiled on load; in runtime-only builds the file is a
-/// precompiled `.cwasm` deserialized directly.
-pub fn load_component(wasm_path: &Path) -> Result<Component> {
-    wt(load_inner(wasm_path), "failed to load WASM component")
+/// Compile or deserialize the exact component bytes admitted by the host.
+pub fn load_component(component: &AdmittedComponent) -> Result<Component> {
+    wt(load_inner(component), "failed to load WASM component")
 }
 
 #[cfg(feature = "plugins-wasm-cranelift")]
-fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
-    Component::from_file(engine(), wasm_path)
+fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
+    Component::new(engine(), component.bytes())
 }
 
 #[cfg(not(feature = "plugins-wasm-cranelift"))]
-fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
-    // SAFETY: the file is a wasmtime-produced `.cwasm` for this engine; a
+fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
+    // SAFETY: the bytes are a wasmtime-produced `.cwasm` for this engine; a
     // mismatched artifact is rejected by deserialize's version check.
-    unsafe { Component::deserialize_file(engine(), wasm_path) }
+    unsafe { Component::deserialize(engine(), component.bytes()) }
 }
 
 /// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
@@ -586,6 +584,7 @@ mod tests {
             description: None,
             author: None,
             wasm_path: Some("fixture.wasm".to_string()),
+            wasm_sha256: None,
             capabilities: vec![capability],
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({

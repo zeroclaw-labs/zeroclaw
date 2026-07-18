@@ -18,12 +18,13 @@ the rest of the document, and strips trailing empty lines
 self-embeddable: sign the manifest without those root fields, then add them;
 verification removes them before checking.
 
-Two consequences worth knowing:
+Consequences worth knowing:
 
-- The `.wasm` component itself is **not** covered by the signature. What the
-  signature attests is the manifest: the name, version, capabilities, and
-  permissions a publisher stands behind. Pair it with a registry `sha256`
-  digest (below) when the artifact integrity matters in transit.
+- Put the component's SHA-256 in the root `wasm_sha256` field before signing.
+  The signature then binds that digest to the manifest. The host verifies it
+  over the exact bytes it admits and compiles; strict mode rejects executable
+  manifests without it. The registry `sha256` below independently protects the
+  distribution archive in transit.
 - Nested fields with names such as `config_schema.properties.signature`, and
   similarly prefixed root fields such as `signature_algorithm`, remain signed.
   Reformatting or reordering retained content invalidates the signature. Sign
@@ -57,6 +58,8 @@ an unsigned manifest.
 ```toml
 name = "my-plugin"
 version = "0.1.0"
+wasm_path = "my-plugin.wasm"
+wasm_sha256 = "<64-hex-character-component-sha256>"
 signature = "<base64url-signature>"
 publisher_key = "<hex-public-key>"
 

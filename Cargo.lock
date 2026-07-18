@@ -13572,6 +13572,7 @@ dependencies = [
  "base64 0.22.1",
  "jsonschema",
  "ring",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",
