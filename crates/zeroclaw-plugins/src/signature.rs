@@ -73,26 +73,53 @@ fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Compute a lowercase hexadecimal SHA-256 digest.
+#[must_use]
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    hex_encode(digest.as_ref())
+}
+
+/// Validate the manifest representation of a SHA-256 digest.
+pub fn validate_sha256_hex(expected: &str) -> Result<(), PluginError> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PluginError::PayloadDigestInvalid(expected.to_string()));
+    }
+    Ok(())
+}
+
+/// Verify bytes against a manifest-provided SHA-256 digest.
+pub fn verify_payload_digest(data: &[u8], expected: &str) -> Result<(), PluginError> {
+    validate_sha256_hex(expected)?;
+    let expected = expected.to_ascii_lowercase();
+    let actual = sha256_hex(data);
+    if actual != expected {
+        return Err(PluginError::PayloadDigestMismatch { expected, actual });
+    }
+    Ok(())
+}
+
 // ── Canonical manifest bytes ──
 
-pub fn canonical_manifest_bytes(manifest_toml: &str) -> Vec<u8> {
-    let mut lines: Vec<&str> = Vec::new();
-    for line in manifest_toml.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("signature") && trimmed.contains('=') {
-            continue;
-        }
-        if trimmed.starts_with("publisher_key") && trimmed.contains('=') {
-            continue;
-        }
-        lines.push(line);
-    }
+/// Compute the canonical bytes of a manifest for signing/verification.
+///
+/// This strips the exact root `signature` and `publisher_key` fields from the
+/// TOML document and returns the remaining bytes. Nested fields with those
+/// names remain signed, including fields in a plugin config schema.
+pub fn canonical_manifest_bytes(manifest_toml: &str) -> Result<Vec<u8>, PluginError> {
+    let mut document = manifest_toml
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| PluginError::InvalidManifest(format!("invalid TOML: {error}")))?;
+    document.as_table_mut().remove("signature");
+    document.as_table_mut().remove("publisher_key");
+    let rendered = document.to_string();
+    let mut lines: Vec<&str> = rendered.lines().collect();
     // Remove trailing empty lines to normalize
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
     let canonical = lines.join("\n");
-    canonical.into_bytes()
+    Ok(canonical.into_bytes())
 }
 
 // ── Signing ──
@@ -102,7 +129,7 @@ pub fn canonical_manifest_bytes(manifest_toml: &str) -> Vec<u8> {
 pub fn sign_manifest(manifest_toml: &str, pkcs8_der: &[u8]) -> Result<String, PluginError> {
     let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_der)
         .map_err(|e| PluginError::SignatureInvalid(format!("invalid signing key: {e}")))?;
-    let canonical = canonical_manifest_bytes(manifest_toml);
+    let canonical = canonical_manifest_bytes(manifest_toml)?;
     let sig = key_pair.sign(&canonical);
     Ok(b64u_encode(sig.as_ref()))
 }
@@ -153,7 +180,14 @@ pub fn verify_manifest(
     };
 
     // Compute canonical bytes
-    let canonical = canonical_manifest_bytes(manifest_toml);
+    let canonical = match canonical_manifest_bytes(manifest_toml) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return VerificationResult::Invalid {
+                reason: error.to_string(),
+            };
+        }
+    };
 
     // Verify
     let peer_public_key = signature::UnparsedPublicKey::new(&signature::ED25519, &pub_key_bytes);
@@ -262,31 +296,89 @@ capabilities = ["tool"]
 permissions = []
 "#;
 
+    const SCHEMA_MANIFEST: &str = r#"
+name = "schema-plugin"
+version = "0.1.0"
+description = "A plugin with signed config schema fields"
+signature_algorithm = "ed25519"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.signature]
+type = "string"
+
+[config_schema.properties.publisher_key]
+type = "string"
+"#;
+
     fn generate_test_keypair() -> (Vec<u8>, String) {
         generate_signing_key().expect("keygen should succeed")
     }
 
     #[test]
-    fn test_canonical_manifest_strips_signature_fields() {
-        let manifest_with_sig = r#"
-name = "test-plugin"
-version = "0.1.0"
-signature = "abc123"
-publisher_key = "deadbeef"
-wasm_path = "plugin.wasm"
-capabilities = ["tool"]
-"#;
-        let canonical = canonical_manifest_bytes(manifest_with_sig);
+    fn test_canonical_manifest_strips_only_exact_root_signature_fields() {
+        let manifest_with_signature = SCHEMA_MANIFEST.replacen(
+            "wasm_path = \"plugin.wasm\"",
+            "signature = \"abc123\"\npublisher_key = \"deadbeef\"\nwasm_path = \"plugin.wasm\"",
+            1,
+        );
+        let canonical = canonical_manifest_bytes(&manifest_with_signature).unwrap();
+        assert_eq!(
+            canonical,
+            canonical_manifest_bytes(SCHEMA_MANIFEST).unwrap()
+        );
+
         let canonical_str = String::from_utf8(canonical).unwrap();
-        assert!(!canonical_str.contains("signature"));
-        assert!(!canonical_str.contains("publisher_key"));
-        assert!(canonical_str.contains("name = \"test-plugin\""));
-        assert!(canonical_str.contains("wasm_path = \"plugin.wasm\""));
+        let canonical_table: toml::Table = toml::from_str(&canonical_str).unwrap();
+        assert!(!canonical_table.contains_key("signature"));
+        assert!(!canonical_table.contains_key("publisher_key"));
+        assert_eq!(
+            canonical_table
+                .get("signature_algorithm")
+                .and_then(toml::Value::as_str),
+            Some("ed25519")
+        );
+
+        let properties = canonical_table
+            .get("config_schema")
+            .and_then(toml::Value::as_table)
+            .and_then(|schema| schema.get("properties"))
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        assert!(properties.contains_key("signature"));
+        assert!(properties.contains_key("publisher_key"));
+    }
+
+    #[test]
+    fn payload_digest_verification_accepts_exact_bytes() {
+        let bytes = b"signed component bytes";
+        let digest = sha256_hex(bytes);
+        verify_payload_digest(bytes, &digest).expect("exact payload digest matches");
+        verify_payload_digest(bytes, &digest.to_ascii_uppercase())
+            .expect("hex digest comparison is case-insensitive");
+    }
+
+    #[test]
+    fn payload_digest_verification_rejects_tampering_and_invalid_shape() {
+        let digest = sha256_hex(b"original");
+        assert!(matches!(
+            verify_payload_digest(b"tampered", &digest),
+            Err(PluginError::PayloadDigestMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_payload_digest(b"original", "not-a-sha256"),
+            Err(PluginError::PayloadDigestInvalid(_))
+        ));
     }
 
     #[test]
     fn test_canonical_manifest_without_signature_fields() {
-        let canonical = canonical_manifest_bytes(TEST_MANIFEST);
+        let canonical = canonical_manifest_bytes(TEST_MANIFEST).unwrap();
         let canonical_str = String::from_utf8(canonical).unwrap();
         assert!(canonical_str.contains("name = \"test-plugin\""));
     }
@@ -313,6 +405,41 @@ capabilities = ["tool"]
         let tampered = TEST_MANIFEST.replace("0.1.0", "0.2.0");
         let trusted_keys = vec![pub_hex.clone()];
         let result = verify_manifest(&tampered, &sig, &pub_hex, &trusted_keys);
+        assert!(matches!(result, VerificationResult::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_verify_rejects_tampered_nested_schema_signature_field() {
+        let (pkcs8, pub_hex) = generate_test_keypair();
+        let sig = sign_manifest(SCHEMA_MANIFEST, &pkcs8).unwrap();
+        let tampered = SCHEMA_MANIFEST.replace(
+            "[config_schema.properties.signature]\ntype = \"string\"",
+            "[config_schema.properties.signature]\ntype = \"boolean\"",
+        );
+        assert_ne!(tampered, SCHEMA_MANIFEST);
+
+        let trusted_keys = vec![pub_hex.clone()];
+        let result = verify_manifest(&tampered, &sig, &pub_hex, &trusted_keys);
+        assert!(matches!(result, VerificationResult::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_malformed_manifest_cannot_be_signed_or_verified() {
+        let malformed = "name = \"unterminated";
+        assert!(matches!(
+            canonical_manifest_bytes(malformed),
+            Err(PluginError::InvalidManifest(_))
+        ));
+
+        let (pkcs8, pub_hex) = generate_test_keypair();
+        assert!(matches!(
+            sign_manifest(malformed, &pkcs8),
+            Err(PluginError::InvalidManifest(_))
+        ));
+
+        let valid_signature = sign_manifest(TEST_MANIFEST, &pkcs8).unwrap();
+        let trusted_keys = vec![pub_hex.clone()];
+        let result = verify_manifest(malformed, &valid_signature, &pub_hex, &trusted_keys);
         assert!(matches!(result, VerificationResult::Invalid { .. }));
     }
 
