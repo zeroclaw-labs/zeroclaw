@@ -395,22 +395,22 @@ fn persist_model_cache(
     let cache_path = cache_dir.join(MODEL_CACHE_FILE);
 
     // Load existing cache or start fresh.
-    let mut cache: zeroclaw_config::schema::ModelCacheState =
-        std::fs::read_to_string(&cache_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+    let mut cache: zeroclaw_config::schema::ModelCacheState = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
 
     // Replace or insert the entry for this provider.
     let canonical = canonicalize_provider_ref(provider_name);
     cache.entries.retain(|e| e.model_provider != canonical);
-    cache.entries.push(zeroclaw_config::schema::ModelCacheEntry {
-        model_provider: canonical,
-        models: models.to_vec(),
-    });
+    cache
+        .entries
+        .push(zeroclaw_config::schema::ModelCacheEntry {
+            model_provider: canonical,
+            models: models.to_vec(),
+        });
 
-    let json = serde_json::to_string_pretty(&cache)
-        .context("Failed to serialize model cache")?;
+    let json = serde_json::to_string_pretty(&cache).context("Failed to serialize model cache")?;
 
     // Atomic write: write to a temp file then rename to avoid truncated JSON
     // on process interruption.
