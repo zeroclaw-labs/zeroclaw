@@ -5848,7 +5848,7 @@ mod tests {
     /// Resolution chain for `effective_max_context_tokens`, exercised through
     /// `context_usage_max_tokens` (the helper the live emitter calls).
     /// Chain: runtime_profile.max_context_tokens → 32_000 stub.
-    /// Covers #8872 (profile budget wins over the model-window helper).
+    /// Profile budget wins over the model-window helper.
     #[test]
     fn context_usage_max_tokens_resolution() {
         use std::collections::HashMap;
@@ -5857,7 +5857,7 @@ mod tests {
 
         // (runtime_profile.max_context_tokens, provider.context_window, expected)
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 128_000), // #8872: profile wins, no provider window
+            (Some(128_000), None, 128_000), // profile wins, no provider window
             (Some(128_000), Some(200_000), 128_000),
             (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
             (None, None, 32_000),          // hard stub
@@ -5911,7 +5911,7 @@ mod tests {
                 *expected,
                 "resolution (profile={profile:?}, window={window:?})"
             );
-            // #8872 sanity: the model-window helper stays at the 32k stub when
+            // sanity: the model-window helper stays at the 32k stub when
             // no provider context_window is configured, regardless of profile.
             if window.is_none() {
                 assert_eq!(
