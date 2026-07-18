@@ -1,11 +1,4 @@
 //! Multi-provider Text-to-Speech (TTS) subsystem.
-//!
-//! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
-//! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
-//!
-//! per-instance configs live under `[tts_providers.<type>.<alias>]`; agents
-//! pick which instance to use via the `tts_provider` dotted alias reference.
-//! Global runtime knobs (default_voice, max_text_length, etc.) live on `[tts]`.
 
 use std::collections::HashMap;
 
@@ -415,11 +408,6 @@ impl EdgeTtsProvider {
     /// Allowed basenames for the Edge TTS binary.
     const ALLOWED_BINARIES: &[&str] = &["edge-tts", "edge-playback"];
 
-    /// Create a new Edge TTS model_provider from config.
-    ///
-    /// `binary_path` must be a bare command name (no path separators) matching
-    /// one of `ALLOWED_BINARIES`. This prevents arbitrary executable
-    /// paths like `/tmp/malicious/edge-tts` from passing the basename check.
     pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
         let raw_path = config
             .binary_path
@@ -602,11 +590,6 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
-/// Transcode raw audio bytes to OGG/Opus via an `ffmpeg` subprocess.
-///
-/// Pipes `audio` into ffmpeg's stdin and reads OGG/Opus from stdout.
-/// stdin and stdout are driven concurrently to avoid buffer-deadlocks on
-/// large inputs. Requires `ffmpeg` with `libopus` support installed.
 async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
@@ -665,14 +648,6 @@ async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Central manager for per-agent TTS synthesis.
-///
-/// `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
-/// Per-instance voice overrides come from the `voice` field on each
-/// `TtsProviderConfig`. The `agent_tts_provider` field carries the
-/// resolved alias for the agent that owns this manager instance — empty
-/// means the agent doesn't want TTS, and `synthesize_for_agent` fails
-/// loud rather than silently pick a default.
 pub struct TtsManager {
     tts_providers: HashMap<String, Box<dyn TtsProvider>>,
     voice_by_alias: HashMap<String, String>,
@@ -684,28 +659,10 @@ pub struct TtsManager {
 }
 
 impl TtsManager {
-    /// Build a `TtsManager` from `[tts_providers.<type>.<alias>]` instances
-    /// in `Config`. Each instance is registered under its dotted alias key
-    /// (`<type>.<alias>`). Failures to construct a particular instance are
-    /// logged at warn but do not abort the manager.
-    /// Build a `TtsManager` from `[tts_providers.<type>.<alias>]` instances.
-    /// The manager's resolved alias comes from the runtime-active agent's
-    /// `tts_provider` field — there is no global default-provider concept,
-    /// so when no agent-bound resolution is available the manager refuses
-    /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_for_agent(config, None)
     }
 
-    /// Build a `TtsManager` bound to a specific agent's `tts_provider`.
-    ///
-    /// `agent_alias` is the channel-owning agent (resolve via
-    /// [`Config::agent_for_channel`]). When `None`, falls back to the
-    /// runtime-active agent ([`Config::resolved_runtime_agent_alias`]) for
-    /// callers that cannot determine the owning agent. Binding to the
-    /// owning agent is what lets a channel owned by e.g. `primary` use
-    /// `primary`'s `tts_provider` instead of whichever enabled agent
-    /// happens to sort first.
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
@@ -776,11 +733,6 @@ impl TtsManager {
         })
     }
 
-    /// Synthesize `text` and return OGG/Opus audio suitable for Telegram
-    /// `sendVoice` and WhatsApp PTT voice notes. If the active provider
-    /// already outputs Opus (e.g. OpenAI with `response_format = "opus"`),
-    /// the bytes pass through unchanged; otherwise they are transcoded via an
-    /// `ffmpeg` subprocess. Requires `ffmpeg` with `libopus` support installed.
     pub async fn synthesize_opus(&self, text: &str) -> Result<Vec<u8>> {
         let audio = self.synthesize(text).await?;
         let provider_alias = self.agent_tts_provider.as_str();
@@ -795,12 +747,6 @@ impl TtsManager {
         transcode_to_opus(audio).await
     }
 
-    /// Synthesize text using the runtime-active agent's resolved
-    /// `tts_provider` reference and the per-instance voice override (or
-    /// `default_voice` as the per-instance fallback). Fails loud when the
-    /// agent has no `tts_provider` configured — there is no global
-    /// default-provider concept and this manager refuses to silently pick
-    /// one.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
         let provider_alias = self.agent_tts_provider.as_str();
         if provider_alias.is_empty() {
@@ -884,11 +830,6 @@ impl TtsManager {
         names
     }
 
-    /// Audio output format of the runtime-active agent's resolved TTS provider
-    /// (e.g. `"wav"`, `"opus"`, `"mp3"`). `None` when the agent has no
-    /// `tts_provider` configured or the alias is not registered. Channels use
-    /// this to label the upload with the correct MIME type and pick the right
-    /// Telegram send method.
     pub fn agent_output_format(&self) -> Option<&str> {
         let alias = self.agent_tts_provider.as_str();
         if alias.is_empty() {
@@ -1015,10 +956,6 @@ mod tests {
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
     }
 
-    /// Regression for #7001: a channel-owning agent's `tts_provider` must win
-    /// over a lexicographically-earlier enabled agent that has none. Binding
-    /// the manager to the owner (`from_config_for_agent(cfg, Some("primary"))`)
-    /// resolves `primary`'s provider, not the first-sorting agent's empty one.
     #[test]
     fn tts_manager_binds_owning_agent_provider() {
         // Reuse the edge.default provider registration, but install two agents:

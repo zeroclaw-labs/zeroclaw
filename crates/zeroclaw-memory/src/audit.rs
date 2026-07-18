@@ -1,8 +1,4 @@
 //! Audit trail for memory operations.
-//!
-//! Provides a decorator `AuditedMemory<M>` that wraps any `Memory` backend
-//! and logs all operations to a `memory_audit` table. Opt-in via
-//! `[memory] audit_enabled = true`.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use async_trait::async_trait;
@@ -122,7 +118,6 @@ impl<M: Memory> AuditedMemory<M> {
         Ok(count as usize)
     }
 
-    /// The wrapped backend (test-only introspection).
     #[cfg(test)]
     pub(crate) fn inner(&self) -> &M {
         &self.inner
@@ -143,7 +138,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         dimensions: usize,
     ) {
         // Transparent decorator: forward the embedder refresh to the wrapped
-        // backend like every other method (#8359).
+        // backend like every other method
         self.inner
             .refresh_embedder(model_provider, api_key, model, dimensions);
     }
@@ -350,8 +345,6 @@ mod tests {
     use crate::none::NoneMemory;
     use tempfile::TempDir;
 
-    /// The audit decorator must forward `refresh_embedder` to its wrapped
-    /// backend like every other method (#8359).
     #[test]
     fn refresh_embedder_forwards_to_inner_backend() {
         let tmp = TempDir::new().unwrap();

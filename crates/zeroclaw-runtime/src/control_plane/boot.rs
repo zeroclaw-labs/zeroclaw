@@ -1,8 +1,4 @@
 //! Boot wiring for the control-plane — minted once per daemon run.
-//!
-//! [`ControlPlaneHandle`] bundles the durable [`TaskRegistry`] and the run's `boot_id`
-//! (the authority key that distinguishes this daemon's live tasks from prior-boot
-//! orphans). `DaemonRegistry` owns the spawned reaper task's lifetime via its cancel.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,17 +20,6 @@ pub struct ControlPlaneHandle {
 }
 
 impl ControlPlaneHandle {
-    /// Open the durable store at `<data_dir>/control_plane.db`, mint a fresh
-    /// `boot_id`, and run the one-shot crash-recovery sweep (prior-boot `Running`
-    /// orphans → `Lost`). Additive and fail-safe: a fresh install gets an empty DB.
-    ///
-    /// SINGLE-WRITER ASSUMPTION (review finding #8): recovery treats a *different*
-    /// `boot_id` as proof the prior owner is gone. That holds under the deployment
-    /// invariant of one daemon per `data_dir`. The engine-coordinated wiring that mounts
-    /// this into `DaemonRegistry` MUST enforce that invariant with an OS advisory lock
-    /// (`flock`/`O_EXCL` lockfile on `data_dir`) so two concurrent daemons can never both
-    /// run recovery and reap each other's live tasks. Until that lock lands, do not run
-    /// two daemons on one workspace.
     pub async fn start(data_dir: &Path) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
         Self::start_with_boot_id(data_dir, run_id).await
@@ -58,11 +43,6 @@ impl ControlPlaneHandle {
         Ok(Self { store, boot_id })
     }
 
-    /// Spawn the periodic reaper as a detached task whose lifetime `DaemonRegistry`
-    /// owns via `cancel`. Errors inside the loop are logged, never propagated.
-    ///
-    /// Uses `zeroclaw_spawn::spawn!` (NOT raw `tokio::spawn`, which `clippy.toml`
-    /// bans workspace-wide) so the reaper task inherits the caller's tracing span.
     pub fn spawn_reaper(&self, max_runtime_secs: i64, cancel: CancellationToken) -> JoinHandle<()> {
         // Hoist owned clones to locals so the spawn! future captures them by value
         // (not `&self`, which the macro would otherwise hold across the 'static boundary).

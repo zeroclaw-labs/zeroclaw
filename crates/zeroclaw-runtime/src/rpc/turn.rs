@@ -77,13 +77,6 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            // Scope the cost-tracking context so this turn's per-call token
-            // usage is persisted and counted against budgets.
-            // `turn_streamed_with_steering_state` reuses this outer scope; with
-            // no scope set it falls back to a tracker-less `usage_only` context
-            // and model cost is silently dropped (#5221 regression). The scope
-            // must live INSIDE the spawned task — task-locals don't cross the
-            // spawn boundary.
             TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     cost_context,
@@ -103,11 +96,6 @@ where
 
     let mut accumulated_text = String::new();
 
-    // Drive the turn by draining its event channel, but never let a turn task
-    // wedged inside a non-cancellable tool call (shell, HTTP, a stalled provider
-    // stream) hold the dispatch path hostage. The drain exits on channel close,
-    // explicit cancel, OR an idle-stall bound; the latter two return Cancelled
-    // and the in-flight task is aborted on drop.
     let drain =
         drain_until_done_or_cancelled(&mut event_rx, &cancel, &mut accumulated_text, &on_event)
             .await;
@@ -121,17 +109,9 @@ where
             outcome_from_task_result(joined, accumulated_text)
         }
         DrainOutcome::ExplicitCancel => {
-            // The turn task races the same cancel token and unwinds
-            // cooperatively: it synthesizes results for any in-flight tool
-            // call, pushes the `[interrupted]` assistant message, and commits
-            // both into the agent history before returning. Persistence reads
-            // that committed history, so aborting the task mid-commit drops
-            // the cancelled turn's tool exchange and corrupts the next turn.
-            // Give the task a bounded grace window to land its own unwind;
-            // only abort if it is genuinely wedged in a non-cooperative call.
             match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
                 Ok(joined) => outcome_from_task_result(
-                    joined.map_err(|e| TurnError::Panicked(format!("{e}")))?,
+                    joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
                 Err(_) => {
@@ -192,13 +172,6 @@ enum DrainOutcome {
     ExplicitCancel,
 }
 
-/// Drain `event_rx` until the turn finishes or the cancel token fires. Chunk
-/// deltas accumulate in `accumulated` so partial text survives a cancel. The
-/// only terminals are the turn task dropping its sender (`recv` -> `None`,
-/// [`DrainOutcome::Completed`]) and an explicit cancel
-/// ([`DrainOutcome::ExplicitCancel`]). A wedged turn is bounded by the explicit
-/// layers — ownership-gated `session/cancel` and the reaper — never by guessing
-/// from channel quiet.
 async fn drain_until_done_or_cancelled<F, Fut>(
     event_rx: &mut mpsc::Receiver<TurnEvent>,
     cancel: &CancellationToken,
@@ -340,11 +313,6 @@ mod tests {
 
     #[test]
     fn cancel_outcome_carries_committed_messages_not_just_partial_text() {
-        // A cooperative cancel returns StreamedTurnError whose new_messages
-        // hold the synthesized tool results + `[interrupted]` message the task
-        // already committed. The mapping must surface them, not drop them onto
-        // the floor and fall back to bare accumulated text — that drop is what
-        // truncated the cancelled turn's tool exchange from persisted history.
         let msgs = vec![ConversationMessage::Chat(
             zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         )];
@@ -394,11 +362,6 @@ mod tests {
         );
     }
 
-    /// Regression guard for #5221: a turn driven through `execute_turn` with a
-    /// real cost-tracking context must persist token usage to the tracker. The
-    /// RPC/zerocode-TUI path previously ran the turn without scoping the cost
-    /// context, so `turn_streamed_with_steering_state` fell back to a
-    /// tracker-less `usage_only` context and model cost was silently dropped.
     #[tokio::test]
     async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
         use crate::agent::agent::Agent;

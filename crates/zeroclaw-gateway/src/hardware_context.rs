@@ -1,32 +1,4 @@
 //! Hardware context management endpoints.
-//!
-//! These endpoints let remote callers (phone, laptop) register GPIO pins and
-//! append context to the running agent's hardware knowledge base without SSH.
-//!
-//! ## Endpoints
-//!
-//! - `POST /api/hardware/pin`     — register a single GPIO pin assignment
-//! - `POST /api/hardware/context` — append raw markdown to a device file
-//! - `GET  /api/hardware/context` — read all current hardware context files
-//! - `POST /api/hardware/reload`  — verify on-disk context; report what will be
-//!   used on the next chat request
-//!
-//! ## Live update semantics
-//!
-//! ZeroClaw's agent loop calls [`zeroclaw_hardware::boot`] on **every** request,
-//! which re-reads `~/.zeroclaw/hardware/` from disk.  Writing to those files
-//! therefore takes effect on the very next `/api/chat` call — no daemon restart
-//! needed.  The `/api/hardware/reload` endpoint verifies what is on disk and
-//! reports what will be injected into the system prompt next time.
-//!
-//! ## Security
-//!
-//! - **Auth**: same `require_auth` helper used by all `/api/*` routes.
-//! - **Path traversal**: device aliases are validated to be alphanumeric +
-//!   hyphens/underscores only; they are never used as raw path components.
-//! - **Append-only**: all writes use `OpenOptions::append(true)` — existing
-//!   content cannot be truncated or overwritten through these endpoints.
-//! - **Size limit**: individual append payloads are capped at 32 KB.
 
 use super::AppState;
 use axum::{
@@ -118,12 +90,6 @@ fn default_device() -> String {
     "rpi0".to_string()
 }
 
-/// `POST /api/hardware/pin` — register a single GPIO pin assignment.
-///
-/// Appends one line to `~/.zeroclaw/hardware/devices/<device>.md`:
-/// ```text
-/// - GPIO <pin>: <component> — <notes>
-/// ```
 pub async fn handle_hardware_pin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -384,13 +350,6 @@ pub async fn handle_hardware_context_get(
 
 // ── POST /api/hardware/reload ─────────────────────────────────────────────────
 
-/// `POST /api/hardware/reload` — verify on-disk hardware context and report what  
-/// will be loaded on the next chat request.
-///
-/// Since [`zeroclaw_hardware::boot`] re-reads from disk on every agent invocation,
-/// writing to the hardware files via the other endpoints already takes effect on
-/// the next `/api/chat` call.  This endpoint reads the same files and reports
-/// the current state so callers can confirm the update landed.
 pub async fn handle_hardware_reload(
     State(state): State<AppState>,
     headers: HeaderMap,

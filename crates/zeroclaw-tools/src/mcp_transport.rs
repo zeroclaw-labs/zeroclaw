@@ -336,11 +336,6 @@ impl McpTransportConn for HttpTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // A 404/410 only means "stale session" when this request carried an
-            // `Mcp-Session-Id` the server no longer recognizes (MCP spec 2025-06-18,
-            // Session Management). Without a session id, a 404 is just a missing
-            // endpoint (typo'd `url`, wrong path, proxy misroute) — surface it as a
-            // plain error so `call_tool` doesn't burn a reconnect on it.
             if self.session_id.is_some()
                 && (status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE)
             {
