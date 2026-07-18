@@ -6,11 +6,12 @@
 //! the turn before draining would backpressure and deadlock).
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_providers::ConversationMessage;
 use zeroclaw_runtime::agent::Agent;
 use zeroclaw_runtime::agent::cost::TurnUsage;
@@ -266,26 +267,58 @@ where
                 persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
             }
 
-            // Fire-and-forget memory consolidation.
+            // Fire-and-forget memory consolidation via MemoryStrategy
+            // Route through MemoryStrategy, not direct call.
             if state.auto_save {
                 if let Some(mem) = ws_memory.clone() {
                     let model_provider = state.model_provider.clone();
                     let model = state.model.clone();
                     let temperature = state.temperature;
                     let memory_config = state.config.read().memory.clone();
+                    let data_dir = state.config.read().data_dir.clone();
                     let user_msg = user_message.to_string();
                     let assistant_resp = outcome.response.clone();
+                    static RERANK_WARNED: Once = Once::new();
                     zeroclaw_spawn::spawn!(async move {
-                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
-                            mem.as_ref(),
-                            &memory_config,
-                            &user_msg,
-                            &assistant_resp,
-                        )
-                        .await
+                        // The MemoryStrategy constructor warns about
+                        // rerank_enabled every call. Log once then mute.
+                        let mut cfg = memory_config;
+                        if cfg.rerank_enabled {
+                            RERANK_WARNED.call_once(|| {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        "gateway turn runner",
+                                        ::zeroclaw_log::Action::Note,
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "rerank_enabled": true,
+                                            "rerank_threshold": cfg.rerank_threshold,
+                                        })
+                                    ),
+                                    "memory.rerank_enabled is set but \
+                                     the rerank stage is not yet \
+                                     implemented; this setting currently \
+                                     has no effect"
+                                );
+                            });
+                            cfg.rerank_enabled = false;
+                        }
+                        let strategy =
+                            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::new(
+                                mem, cfg, data_dir,
+                            );
+                        if let Err(e) = strategy
+                            .consolidate_turn(
+                                &user_msg,
+                                &assistant_resp,
+                                model_provider.as_ref(),
+                                &model,
+                                temperature,
+                            )
+                            .await
                         {
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -1315,5 +1348,81 @@ mod tests {
             stored.iter().any(|m| m.role == "assistant"),
             "persisted messages must include the assistant reply"
         );
+    }
+
+    // ── Non-resurrection regression ───────────────────────────────────
+
+    struct AppendCounter {
+        calls: std::sync::Mutex<Vec<String>>,
+        exists: bool,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for AppendCounter {
+        fn load(&self, _: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(&self, key: &str, msg: &zeroclaw_providers::ChatMessage) -> std::io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{key}:{role}", role = msg.role));
+            Ok(())
+        }
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _: &str) -> bool {
+            self.exists
+        }
+    }
+
+    #[test]
+    fn cancelled_path_skips_persist_when_session_deleted() {
+        // Simulates the cancelled-path guard: when session_exists()
+        // returns false, persist_conversation_messages is NOT called,
+        // preserving the non-resurrection contract.
+        let backend = AppendCounter {
+            calls: std::sync::Mutex::new(Vec::new()),
+            exists: false,
+        };
+        let messages = vec![
+            zeroclaw_providers::ConversationMessage::Chat(zeroclaw_providers::ChatMessage::user(
+                "hi",
+            )),
+            zeroclaw_providers::ConversationMessage::Chat(
+                zeroclaw_providers::ChatMessage::assistant("done"),
+            ),
+        ];
+
+        if backend.session_exists("gw_deleted") {
+            persist_conversation_messages(&backend, "gw_deleted", &messages);
+        }
+
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persist_messages_creates_first_turn() {
+        // First-turn persistence: even when session_exists is false,
+        // persist_conversation_messages appends (append uses create(true)).
+        let backend = AppendCounter {
+            calls: std::sync::Mutex::new(Vec::new()),
+            exists: false,
+        };
+        let messages = vec![
+            zeroclaw_providers::ConversationMessage::Chat(zeroclaw_providers::ChatMessage::user(
+                "hi",
+            )),
+            zeroclaw_providers::ConversationMessage::Chat(
+                zeroclaw_providers::ChatMessage::assistant("ack"),
+            ),
+        ];
+
+        persist_conversation_messages(&backend, "gw_new", &messages);
+
+        assert_eq!(backend.calls.lock().unwrap().len(), 2);
     }
 }

@@ -21,7 +21,8 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 // Request structures
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChatCompletionRequest {
     #[serde(default)]
     pub model: String,
@@ -44,13 +45,15 @@ fn default_temperature() -> f64 {
     0.7
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChatCompletionMessage {
     pub role: String,
     pub content: String,
@@ -61,6 +64,7 @@ pub struct ChatCompletionMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChatCompletionTool {
     #[serde(rename = "type")]
     pub kind: String,
@@ -68,6 +72,7 @@ pub struct ChatCompletionTool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ToolFunction {
     pub name: String,
     pub description: Option<String>,
@@ -75,6 +80,7 @@ pub struct ToolFunction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -83,6 +89,7 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
@@ -91,7 +98,8 @@ pub struct FunctionCall {
 // Response structures
 
 #[derive(Debug, Serialize)]
-struct ChatCompletionResponse {
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub(crate) struct ChatCompletionResponse {
     id: String,
     object: &'static str,
     created: u64,
@@ -101,14 +109,16 @@ struct ChatCompletionResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct NonStreamChoice {
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub(crate) struct NonStreamChoice {
     index: u32,
     message: AssistantMessage,
     finish_reason: String,
 }
 
 #[derive(Debug, Serialize)]
-struct AssistantMessage {
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub(crate) struct AssistantMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
@@ -117,7 +127,8 @@ struct AssistantMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponseToolCall {
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub(crate) struct ResponseToolCall {
     id: String,
     #[serde(rename = "type")]
     kind: String,
@@ -125,13 +136,15 @@ struct ResponseToolCall {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponseFunctionCall {
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub(crate) struct ResponseFunctionCall {
     name: String,
     arguments: String,
 }
 
 #[derive(Debug, Serialize)]
-struct CompletionUsage {
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub(crate) struct CompletionUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,

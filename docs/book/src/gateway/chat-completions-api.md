@@ -494,11 +494,9 @@ The following parameters are **not supported** per-request and will return a **4
 **SSE event types**:
 1. **First frame**: `delta.role: "assistant"` + `delta.content: ""`
 2. **Content chunks**: `delta.content` contains incremental text
-3. **Thinking chunks** (if triggered): `delta.content` contains thinking process
-4. **Tool call chunks** (if triggered): `delta.tool_calls` contains tool call info
-5. **Final frame**: `delta: {}` + `finish_reason: "stop"`
-6. **Usage chunk** (optional): Contains `usage` stats (requires `stream_options.include_usage: true`)
-7. **End marker**: `data: [DONE]`
+3. **Final frame**: `delta: {}` + `finish_reason: "stop"`
+4. **Usage chunk** (optional): Contains `usage` stats (requires `stream_options.include_usage: true`)
+5. **End marker**: `data: [DONE]`
 
 ---
 

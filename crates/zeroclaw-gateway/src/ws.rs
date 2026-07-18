@@ -344,6 +344,11 @@ async fn handle_socket(
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
+    // Serialise with concurrent HTTP requests sharing the same session.
+    // Acquire BEFORE alias check and history load so a racing HTTP turn
+    // cannot observe stale owner or transcript.
+    let _setup_guard = state.session_queue.acquire(&session_key).await.ok();
+
     if let Some(ref backend) = state.session_backend {
         // Session agent_alias consistency check — must run BEFORE loading
         // history. Mirror the HTTP endpoint's fail-closed guard so sharing

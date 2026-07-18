@@ -1830,6 +1830,10 @@ pub async fn handle_api_session_delete(
         );
     }
 
+    // Hold the session queue so any in-flight turn finishes persistence
+    // before the session is deleted, preventing resurrection.
+    let _guard = state.session_queue.acquire(&session_key).await.ok();
+
     match backend.delete_session(&session_key) {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
         Ok(false) => (
