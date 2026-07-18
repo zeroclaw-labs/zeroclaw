@@ -32,6 +32,11 @@ sender_desc = "the Mattermost user UUID (not a username)"
 sender_example = "9c8f...userUUID"
 
 [[channel]]
+key = "msteams"
+sender_desc = "the Entra (Azure AD) object ID, or the Teams channel-scoped `29:` ID"
+sender_example = "00000000-0000-0000-0000-000000000000"
+
+[[channel]]
 key = "line"
 sender_desc = "the LINE user ID"
 sender_example = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
