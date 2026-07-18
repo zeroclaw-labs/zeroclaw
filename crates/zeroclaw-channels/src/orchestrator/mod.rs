@@ -14347,9 +14347,10 @@ mod tests {
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
-    fn run_channel_dispatch_test<F>(future: F)
+    fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
     where
-        F: std::future::Future<Output = ()> + Send + 'static,
+        F: std::future::Future<Output = ()> + 'static,
+        MakeFuture: FnOnce() -> F + Send + 'static,
     {
         let handle = std::thread::Builder::new()
             .name("zeroclaw-channel-dispatch-test".into())
@@ -14359,7 +14360,7 @@ mod tests {
                     .enable_all()
                     .build()
                     .expect("build channel dispatch test runtime");
-                runtime.block_on(future);
+                runtime.block_on(make_future());
             })
             .expect("spawn channel dispatch test thread");
         if let Err(payload) = handle.join() {
@@ -16935,8 +16936,7 @@ api_key = "anthropic-key"
         }
     }
 
-    #[tokio::test]
-    async fn process_channel_message_fires_message_sent_hook_after_reply_delivery() {
+    async fn assert_process_channel_message_fires_message_sent_hook_after_reply_delivery() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (hook_events, hook_runner) = recording_message_sent_runner();
@@ -17088,14 +17088,19 @@ api_key = "anthropic-key"
         (starts, ends)
     }
 
+    #[test]
+    fn process_channel_message_fires_message_sent_hook_after_reply_delivery() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_fires_message_sent_hook_after_reply_delivery())
+        });
+    }
     /// Regression guard for the fix where channel-originated turns (Telegram,
     /// Discord, ...) never emitted `AgentStart`/`AgentEnd`, so
     /// `/api/events/history` showed `llm_request` frames but no turn
     /// lifecycle brackets. A successful turn must emit exactly one
     /// `AgentStart` (before the LLM request) and one `AgentEnd` (last),
     /// all sharing one `turn_id` and carrying the channel + agent alias.
-    #[tokio::test]
-    async fn process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
+    async fn assert_process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
         // The exactly-one-AgentStart assertion is sensitive to a leaked
         // process-wide model-switch request (the switch retry emits an
         // extra re-attributing AgentStart), so serialize on the guard.
@@ -17163,10 +17168,15 @@ api_key = "anthropic-key"
         );
     }
 
+    #[test]
+    fn process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_brackets_turn_with_agent_start_and_agent_end())
+        });
+    }
     /// An erroring LLM turn must still close its bracket: one `AgentStart`
     /// and one `AgentEnd`, same `turn_id`.
-    #[tokio::test]
-    async fn process_channel_message_emits_brackets_when_llm_errors() {
+    async fn assert_process_channel_message_emits_brackets_when_llm_errors() {
         // See the guard note on the success-turn bracket test.
         let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -17198,12 +17208,17 @@ api_key = "anthropic-key"
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
     }
 
+    #[test]
+    fn process_channel_message_emits_brackets_when_llm_errors() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_emits_brackets_when_llm_errors())
+        });
+    }
     /// A turn cancelled mid-flight (interrupt-on-new-message) must still
     /// close its bracket — the ZeroHome-critical guarantee that a cancelled
     /// turn cannot wedge an "agent in flight" indicator with an unmatched
     /// `AgentStart`.
-    #[tokio::test]
-    async fn process_channel_message_emits_brackets_when_cancelled_mid_turn() {
+    async fn assert_process_channel_message_emits_brackets_when_cancelled_mid_turn() {
         // See the guard note on the success-turn bracket test.
         let _guard = model_switch_test_guard().lock().await;
         let token = CancellationToken::new();
@@ -17244,8 +17259,14 @@ api_key = "anthropic-key"
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
     }
 
-    #[tokio::test]
-    async fn process_channel_message_skips_message_sent_hook_when_reply_delivery_fails() {
+    #[test]
+    fn process_channel_message_emits_brackets_when_cancelled_mid_turn() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_emits_brackets_when_cancelled_mid_turn())
+        });
+    }
+
+    async fn assert_process_channel_message_skips_message_sent_hook_when_reply_delivery_fails() {
         let channel_impl = Arc::new(FailingSendChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (hook_events, hook_runner) = recording_message_sent_runner();
@@ -17270,8 +17291,16 @@ api_key = "anthropic-key"
         assert!(hook_events.lock().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_channel_message_fires_message_sent_hook_after_draft_finalize() {
+    #[test]
+    fn process_channel_message_skips_message_sent_hook_when_reply_delivery_fails() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_skips_message_sent_hook_when_reply_delivery_fails(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_fires_message_sent_hook_after_draft_finalize() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (hook_events, hook_runner) = recording_message_sent_runner();
@@ -17311,8 +17340,14 @@ api_key = "anthropic-key"
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
+    #[test]
+    fn process_channel_message_fires_message_sent_hook_after_draft_finalize() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_fires_message_sent_hook_after_draft_finalize())
+        });
+    }
+
+    async fn assert_process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(true, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (hook_events, hook_runner) = recording_message_sent_runner();
@@ -17352,8 +17387,17 @@ api_key = "anthropic-key"
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_skips_message_sent_hook_when_draft_fallback_send_fails() {
+    #[test]
+    fn process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_fires_message_sent_hook_after_draft_fallback_send(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_skips_message_sent_hook_when_draft_fallback_send_fails()
+    {
         let channel_impl = Arc::new(DraftRecordingChannel::new(true, true));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (hook_events, hook_runner) = recording_message_sent_runner();
@@ -17739,6 +17783,15 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[test]
+    fn process_channel_message_skips_message_sent_hook_when_draft_fallback_send_fails() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+            assert_process_channel_message_skips_message_sent_hook_when_draft_fallback_send_fails(),
+        )
+        });
+    }
+
     #[tokio::test]
     async fn passive_context_records_history_without_channel_or_model_side_effects() {
         Box::pin(async {
@@ -17894,7 +17947,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn addressed_goal_resume_enters_model_loop() {
-        run_channel_dispatch_test(async {
+        run_channel_dispatch_test(|| async {
             ensure_test_control_plane().await;
 
             let channel_impl = Arc::new(AddressedRecordingChannel::default());
@@ -18409,8 +18462,7 @@ BTC is currently around $65,000 based on latest tool output."#
         })
     }
 
-    #[tokio::test]
-    async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
+    async fn assert_process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18523,8 +18575,16 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!reply.contains("mock_price"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_scopes_sender_session_key_for_sessions_current_tool() {
+    #[test]
+    fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_executes_tool_calls_instead_of_sending_raw_json(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_scopes_sender_session_key_for_sessions_current_tool() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18643,8 +18703,17 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("Messages: 1"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_renders_trailing_tool_receipts_block_when_enabled() {
+    #[test]
+    fn process_channel_message_scopes_sender_session_key_for_sessions_current_tool() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_scopes_sender_session_key_for_sessions_current_tool(
+                ),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_renders_trailing_tool_receipts_block_when_enabled() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18790,8 +18859,16 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_omits_receipts_block_when_disabled() {
+    #[test]
+    fn process_channel_message_renders_trailing_tool_receipts_block_when_enabled() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_renders_trailing_tool_receipts_block_when_enabled(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_omits_receipts_block_when_disabled() {
         // Backward-compat: with show_receipts_in_response=false (default), no
         // trailing receipts message is sent — even when a generator is active
         // and the loop ran tools. This is the path every other test relies on
@@ -18917,8 +18994,15 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_disabled_receipt_generator_emits_no_receipts_anywhere() {
+    #[test]
+    fn process_channel_message_omits_receipts_block_when_disabled() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_omits_receipts_block_when_disabled())
+        });
+    }
+
+    async fn assert_process_channel_message_disabled_receipt_generator_emits_no_receipts_anywhere()
+    {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19061,8 +19145,16 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    #[tokio::test]
-    async fn process_channel_message_telegram_does_not_persist_tool_summary_prefix() {
+    #[test]
+    fn process_channel_message_disabled_receipt_generator_emits_no_receipts_anywhere() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+            assert_process_channel_message_disabled_receipt_generator_emits_no_receipts_anywhere(),
+        )
+        });
+    }
+
+    async fn assert_process_channel_message_telegram_does_not_persist_tool_summary_prefix() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19189,8 +19281,14 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
+    #[test]
+    fn process_channel_message_telegram_does_not_persist_tool_summary_prefix() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_telegram_does_not_persist_tool_summary_prefix())
+        });
+    }
+
+    async fn assert_process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19302,8 +19400,16 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!sent_messages[0].contains("\"result\""));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_executes_tool_calls_with_alias_tags() {
+    #[test]
+    fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_executes_tool_calls_with_alias_tags() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19416,8 +19522,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!reply.contains("mock_price"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_handles_models_command_without_llm_call() {
+    #[test]
+    fn process_channel_message_executes_tool_calls_with_alias_tags() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_executes_tool_calls_with_alias_tags())
+        });
+    }
+
+    async fn assert_process_channel_message_handles_models_command_without_llm_call() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19569,8 +19681,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(alt_model_provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
-    async fn process_channel_message_uses_route_override_provider_and_model() {
+    #[test]
+    fn process_channel_message_handles_models_command_without_llm_call() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_handles_models_command_without_llm_call())
+        });
+    }
+
+    async fn assert_process_channel_message_uses_route_override_provider_and_model() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19977,12 +20095,19 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn process_channel_message_persists_model_switch_with_route_credential() {
-        run_channel_dispatch_test(Box::pin(assert_model_switch_persists_route_credential()));
+    fn process_channel_message_uses_route_override_provider_and_model() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_uses_route_override_provider_and_model())
+        });
     }
 
-    #[tokio::test]
-    async fn process_channel_message_uses_classifier_provider_for_precheck_model_selection() {
+    #[test]
+    fn process_channel_message_persists_model_switch_with_route_credential() {
+        run_channel_dispatch_test(|| Box::pin(assert_model_switch_persists_route_credential()));
+    }
+
+    async fn assert_process_channel_message_uses_classifier_provider_for_precheck_model_selection()
+    {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let main_provider_impl = Arc::new(PrecheckProbeModelProvider::default());
@@ -20066,9 +20191,16 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn process_channel_message_uses_classifier_provider_for_precheck_model_selection() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+            assert_process_channel_message_uses_classifier_provider_for_precheck_model_selection(),
+        )
+        });
+    }
     #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
+    async fn assert_process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
@@ -20151,8 +20283,15 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled() {
+    #[test]
+    fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_precheck_log_uses_span_attribution_not_attrs())
+        });
+    }
+
+    async fn assert_process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled()
+     {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
@@ -20202,8 +20341,14 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+    #[test]
+    fn process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled())
+        });
+    }
+
+    async fn assert_process_channel_message_precheck_timeout_fails_open_to_reply() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(PrecheckProbeModelProvider {
@@ -20256,8 +20401,14 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_prefers_cached_default_provider_instance() {
+    #[test]
+    fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_precheck_timeout_fails_open_to_reply())
+        });
+    }
+
+    async fn assert_process_channel_message_prefers_cached_default_provider_instance() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -20370,8 +20521,15 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
     }
 
-    #[tokio::test]
-    async fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
+    #[test]
+    fn process_channel_message_prefers_cached_default_provider_instance() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_prefers_cached_default_provider_instance())
+        });
+    }
+
+    async fn assert_process_channel_message_respects_configured_max_tool_iterations_above_default()
+    {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -20488,8 +20646,16 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!reply.contains("⚠️ Error:"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_reports_configured_max_tool_iterations_limit() {
+    #[test]
+    fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+            assert_process_channel_message_respects_configured_max_tool_iterations_above_default(),
+        )
+        });
+    }
+
+    async fn assert_process_channel_message_reports_configured_max_tool_iterations_limit() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -20849,6 +21015,13 @@ BTC is currently around $65,000 based on latest tool output."#
         fn alias(&self) -> &str {
             "ConcurrencyTrackingProvider"
         }
+    }
+
+    #[test]
+    fn process_channel_message_reports_configured_max_tool_iterations_limit() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_reports_configured_max_tool_iterations_limit())
+        });
     }
 
     #[tokio::test]
@@ -21646,8 +21819,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-2:")));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_cancels_scoped_typing_task() {
+    async fn assert_process_channel_message_cancels_scoped_typing_task() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -21759,8 +21931,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(stops, 1, "stop_typing should be called once");
     }
 
-    #[tokio::test]
-    async fn process_channel_message_adds_and_swaps_reactions() {
+    #[test]
+    fn process_channel_message_cancels_scoped_typing_task() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_cancels_scoped_typing_task())
+        });
+    }
+
+    async fn assert_process_channel_message_adds_and_swaps_reactions() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -21884,12 +22062,17 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(removed[0].2, "\u{1F440}");
     }
 
+    #[test]
+    fn process_channel_message_adds_and_swaps_reactions() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_adds_and_swaps_reactions())
+        });
+    }
     // Pins the no_reply reconciliation: when the agent deliberately chooses
     // silence, the early 👀 ack must be removed (not left dangling) and the
     // message must end carrying only the no-reply kind emoji. A regression that
     // strands the 👀 on this path falsely signals "still processing" forever.
-    #[tokio::test]
-    async fn process_channel_message_no_reply_clears_early_ack() {
+    async fn assert_process_channel_message_no_reply_clears_early_ack() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22056,12 +22239,17 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[test]
+    fn process_channel_message_no_reply_clears_early_ack() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_no_reply_clears_early_ack())
+        });
+    }
     // Pins the early-ack ordering: with a slow model_provider, the 👀 ack must
     // land well before the model completes. Fails on the old order where the
     // ack was awaited after enrichment / the model call. A regression back to
     // the late position would record the ack at >= the model delay.
-    #[tokio::test]
-    async fn process_channel_message_acks_before_slow_model_completes() {
+    async fn assert_process_channel_message_acks_before_slow_model_completes() {
         let model_delay = Duration::from_millis(400);
         let channel_impl = Arc::new(AckTimingChannel {
             start: Instant::now(),
@@ -22178,6 +22366,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "ack fired at {ack_elapsed}ms, must precede the {}ms model delay (early-ack ordering)",
             model_delay.as_millis()
         );
+    }
+
+    #[test]
+    fn process_channel_message_acks_before_slow_model_completes() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_acks_before_slow_model_completes())
+        });
     }
 
     #[test]
@@ -25354,20 +25549,19 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn process_channel_message_restores_per_sender_history_on_follow_ups() {
-        run_channel_dispatch_test(Box::pin(
-            assert_process_channel_message_restores_per_sender_history_on_follow_ups(),
-        ));
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_restores_per_sender_history_on_follow_ups())
+        });
     }
 
     #[test]
     fn process_channel_message_refreshes_available_skills_after_new_session() {
-        run_channel_dispatch_test(Box::pin(
-            assert_process_channel_message_refreshes_available_skills_after_new_session(),
-        ));
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
+        });
     }
 
-    #[tokio::test]
-    async fn process_channel_message_enriches_current_turn_without_persisting_context() {
+    async fn assert_process_channel_message_enriches_current_turn_without_persisting_context() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -25681,14 +25875,24 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn process_channel_message_telegram_system_prompt_is_byte_stable_across_turns() {
-        run_channel_dispatch_test(Box::pin(
-            assert_process_channel_message_telegram_system_prompt_is_byte_stable_across_turns(),
-        ));
+    fn process_channel_message_enriches_current_turn_without_persisting_context() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_enriches_current_turn_without_persisting_context(),
+            )
+        });
     }
 
-    #[tokio::test]
-    async fn process_channel_message_user_text_starting_with_turn_context_still_gets_runtime_preamble()
+    #[test]
+    fn process_channel_message_telegram_system_prompt_is_byte_stable_across_turns() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_telegram_system_prompt_is_byte_stable_across_turns(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_user_text_starting_with_turn_context_still_gets_runtime_preamble()
      {
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         let runtime_ctx = cache_stability_test_context(provider_impl.clone(), Arc::new(NoopMemory));
@@ -25879,10 +26083,17 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn process_channel_message_user_text_starting_with_turn_context_still_gets_runtime_preamble() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_user_text_starting_with_turn_context_still_gets_runtime_preamble())
+        });
+    }
+
+    #[test]
     fn process_channel_message_memory_recall_difference_keeps_system_byte_identical() {
-        run_channel_dispatch_test(Box::pin(
-            assert_memory_recall_difference_keeps_system_byte_identical(),
-        ));
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_memory_recall_difference_keeps_system_byte_identical())
+        });
     }
 
     async fn assert_process_channel_message_user_message_accumulates_no_preamble_in_cached_history()
@@ -25957,13 +26168,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn process_channel_message_user_message_accumulates_no_preamble_in_cached_history() {
-        run_channel_dispatch_test(Box::pin(
+        run_channel_dispatch_test(|| {
+            Box::pin(
             assert_process_channel_message_user_message_accumulates_no_preamble_in_cached_history(),
-        ));
+        )
+        });
     }
 
-    #[tokio::test]
-    async fn process_channel_message_omits_peer_map_when_send_peer_tool_unavailable() {
+    async fn assert_process_channel_message_omits_peer_map_when_send_peer_tool_unavailable() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -26034,8 +26246,16 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!calls[0][0].1.contains("send_message_to_peer"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_persists_image_payload_verbatim() {
+    #[test]
+    fn process_channel_message_omits_peer_map_when_send_peer_tool_unavailable() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_process_channel_message_omits_peer_map_when_send_peer_tool_unavailable(),
+            )
+        });
+    }
+
+    async fn assert_process_channel_message_persists_image_payload_verbatim() {
         // `calls.len() == 1` below is sensitive to a leaked process-wide
         // model-switch request (a pending request makes this turn
         // short-circuit and retry, doubling the provider calls), so
@@ -26188,8 +26408,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("AQIDBA"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
+    #[test]
+    fn process_channel_message_persists_image_payload_verbatim() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_persists_image_payload_verbatim())
+        });
+    }
+
+    async fn assert_process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -26324,6 +26550,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_telegram_keeps_system_instruction_at_top_only())
+        });
     }
 
     #[test]
@@ -28324,8 +28557,7 @@ This is an example JSON object for profile settings."#;
 
     // ── Query classification in channel message processing ─────────
 
-    #[tokio::test]
-    async fn process_channel_message_applies_query_classification_route() {
+    async fn assert_process_channel_message_applies_query_classification_route() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -28476,8 +28708,14 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_classification_disabled_uses_default_route() {
+    #[test]
+    fn process_channel_message_applies_query_classification_route() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_applies_query_classification_route())
+        });
+    }
+
+    async fn assert_process_channel_message_classification_disabled_uses_default_route() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -28621,8 +28859,14 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_classification_no_match_uses_default_route() {
+    #[test]
+    fn process_channel_message_classification_disabled_uses_default_route() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_classification_disabled_uses_default_route())
+        });
+    }
+
+    async fn assert_process_channel_message_classification_no_match_uses_default_route() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -28766,8 +29010,14 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_classification_priority_selects_highest() {
+    #[test]
+    fn process_channel_message_classification_no_match_uses_default_route() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_classification_no_match_uses_default_route())
+        });
+    }
+
+    async fn assert_process_channel_message_classification_priority_selects_highest() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -28944,6 +29194,12 @@ This is an example JSON object for profile settings."#;
     }
 
     #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn process_channel_message_classification_priority_selects_highest() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_classification_priority_selects_highest())
+        });
+    }
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
