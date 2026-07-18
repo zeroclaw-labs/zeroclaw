@@ -1,10 +1,4 @@
 //! SD-JWT / KB-SD-JWT cryptographic primitives.
-//!
-//! Provides JWS signing/verification (ES256), SD-JWT disclosure hashing,
-//! `sd_hash` computation, and selective disclosure resolution.
-//!
-//! Uses `ring` for ECDSA P-256 (already a dependency) and `sha2`/`base64`
-//! for hashing and encoding (also existing dependencies).
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

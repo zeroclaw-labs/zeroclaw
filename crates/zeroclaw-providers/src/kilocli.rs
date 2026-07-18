@@ -1,35 +1,4 @@
 //! KiloCLI subprocess model_provider.
-//!
-//! Integrates with the KiloCLI tool, spawning the `kilo` binary
-//! as a subprocess for each inference request. This allows using KiloCLI's AI
-//! models without an interactive UI session.
-//!
-//! # Usage
-//!
-//! The `kilo` binary must be available in `PATH`, or its location can be
-//! set via the typed alias's `binary_path` field.
-//!
-//! KiloCLI is invoked as:
-//! ```text
-//! kilo --print -
-//! ```
-//! with prompt content written to stdin.
-//!
-//! # Limitations
-//!
-//! - **Conversation history**: Only the system prompt (if present) and the last
-//!   user message are forwarded. Full multi-turn history is not preserved because
-//!   the CLI accepts a single prompt per invocation.
-//! - **System prompt**: The system prompt is prepended to the user message with a
-//!   blank-line separator, as the CLI does not provide a dedicated system-prompt flag.
-//! - **Temperature**: The CLI does not expose a temperature parameter.
-//!   Only default values are accepted; custom values return an explicit error.
-//!
-//! # Authentication
-//!
-//! Authentication is handled by KiloCLI itself (its own credential store).
-//! No explicit API key is required by this model_provider.
-//!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -51,7 +20,6 @@ const KILO_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
 /// ModelProvider that invokes the KiloCLI as a subprocess.
-///
 /// Each inference request spawns a fresh `kilo` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
 pub struct KiloCliModelProvider {

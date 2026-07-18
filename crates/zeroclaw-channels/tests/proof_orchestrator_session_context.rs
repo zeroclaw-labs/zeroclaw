@@ -2,14 +2,6 @@
 //! sender_id from a real `ChannelMessage` produces the values that land
 //! in `session_metadata`. The orchestrator's full
 //! `handle_channel_message` requires a fully-built runtime context which
-//! is heavy to fixture; this test extracts the exact composition the
-//! orchestrator does (verbatim from
-//! `crates/zeroclaw-channels/src/orchestrator/mod.rs` right after
-//! `let history_key = conversation_history_key(&msg);`) and drives it
-//! through the same `SessionBackend::set_session_context` call.
-//!
-//! If this test's composition ever drifts from the production code,
-//! the orchestrator side and this proof have to be updated together.
 
 use std::sync::Arc;
 

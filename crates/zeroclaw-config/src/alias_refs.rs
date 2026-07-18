@@ -1,28 +1,7 @@
-//! Alias reference discovery for typed delete-with-cascade (#7175).
-//!
-//! [`find_all_references`] enumerates every config site that references an
-//! aliased entry of a given [`AliasKind`] (provider / agent / channel), tagging
-//! each as a **HARD** reference (a mandatory field — deletion must refuse) or a
-//! **SOFT** reference (removable — deletion scrubs it). [`plan_delete`] folds
-//! the sites into an [`ImpactReport`] a surface (TUI / web / CLI / RPC) renders
-//! before confirming a destructive action.
-//!
-//! This is the **read-only** foundation: it never mutates [`Config`]. It mirrors,
-//! referrer-for-referrer, the dangling-reference walk in `Config::validate()`
-//! (`schema.rs` ~16245-17483) — the same containers in deterministic order — so
-//! the two cannot drift in which references they recognise. Anchors to the
-//! mirrored validation are cited per arm below. `delete_with_cascade` (mutating)
-//! applies the soft-ref [`ScrubAction`]s and removes the entry; owned non-config
-//! state (memory rows, workspace dir, infra DB rows) is cascaded by the calling
-//! surface, which owns those stores.
+//! Alias reference discovery for typed delete-with-cascade
 
 use crate::schema::Config;
 
-/// Which aliased-entry kind is being deleted. The kind plus the leaf `alias`
-/// determines the *target value* a referrer must equal to count as a reference:
-/// `providers.<category>.<family>.<alias>` → `"<family>.<alias>"`,
-/// `channels.<channel_type>.<alias>` → `"<channel_type>.<alias>"`,
-/// `agents.<alias>` → bare `"<alias>"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasKind {
     /// A provider profile under `providers.<category>.<family>.<alias>`.
@@ -45,11 +24,6 @@ pub enum ProviderCategory {
     Transcription,
 }
 
-/// Parse a map-keyed config section path into the alias kind whose rename or
-/// delete needs config-reference cascade handling.
-///
-/// The section path is the parent map path, not a concrete key path:
-/// `agents`, `providers.models.openai`, or `channels.discord`.
 #[must_use]
 pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
     if path == "agents" {
@@ -141,11 +115,6 @@ impl RefSite {
     }
 }
 
-/// Non-config persisted state attributed to a deleted agent (ACP sessions,
-/// session metadata, memory rows, workspace dirs). Enumerated from infra
-/// stores, **not** from [`Config`], so the pure config walk leaves
-/// [`ImpactReport::owned_state`] empty; the calling surface (which owns the infra
-/// stores) populates and cascades it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArtifact {
     pub store: String,
@@ -212,7 +181,7 @@ pub fn plan_delete(cfg: &Config, kind: &AliasKind, alias: &str) -> ImpactReport 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadePolicy {
     /// Refuse if any HARD reference blocks; otherwise scrub the soft references
-    /// and remove the entry. The #7175-accepted default.
+    /// and remove the entry. The default.
     RefuseOnHard,
     /// Compute the plan and mutate nothing (the dry-run a surface renders).
     DryRun,
@@ -231,15 +200,6 @@ pub struct CascadeReport {
 }
 
 impl CascadeReport {
-    /// Every entry/section config path the delete mutated — the removed entry
-    /// plus the entry of each scrubbed soft reference. A persisting surface marks
-    /// **each** of these dirty before saving: `Config::save_dirty` writes only
-    /// marked paths, so a referrer scrubbed in another entry that isn't listed
-    /// here would be dropped in memory but left stale on disk (reappearing as a
-    /// dangling reference on the next reload). Symmetric with
-    /// [`RenameReport::dirty_paths`]; paths are at entry granularity (e.g.
-    /// `agents.lead`, `peer_groups.crew`, `heartbeat.agent`) so a marked path
-    /// re-serialises the whole changed subtree. Sorted + deduplicated.
     #[must_use]
     pub fn dirty_paths(&self) -> Vec<String> {
         let mut paths: Vec<String> = self
@@ -291,11 +251,6 @@ pub enum CascadeError {
     NotFound(String),
     /// This alias kind is not yet wired into `delete_with_cascade`.
     NotImplemented(String),
-    /// Bug guard: scrub drifted from `find_all_references` and left a dangling
-    /// reference to the deleted alias. **The config WAS mutated** (scrub + entry
-    /// removal ran) — the caller must NOT persist it. Unreachable while the two
-    /// mirror exactly (same soft-ref sites, same `.trim()`); fires only on
-    /// maintenance drift. The message names the offending paths.
     PostCondition(String),
 }
 
@@ -316,21 +271,6 @@ impl std::fmt::Display for CascadeError {
 
 impl std::error::Error for CascadeError {}
 
-/// Delete an aliased entry and repair every reference to it, per `policy`.
-///
-/// `RefuseOnHard` refuses when any HARD reference would dangle (returns
-/// [`CascadeError::Refused`] with the full report, no mutation), otherwise
-/// scrubs the SOFT references, removes the entry, and verifies no dangling
-/// reference to the alias remains. `DryRun` computes the plan and mutates
-/// nothing. [`plan_delete`] is the read-only sibling.
-///
-/// Implements the **model-provider** (`providers.models.<family>.<alias>`),
-/// **agent** (`agents.<alias>`), and **channel** (`channels.<type>.<alias>`)
-/// kinds. The agent arm cascades config references only; its owned non-config
-/// state (memory rows, workspace dir, cron/acp/session rows) is cascaded by the
-/// calling surface and is not reflected in `ImpactReport.owned_state`.
-/// TTS/transcription providers return [`CascadeError::NotImplemented`] until
-/// their follow-up lands (#7175).
 pub fn delete_with_cascade(
     cfg: &mut Config,
     kind: &AliasKind,
@@ -384,11 +324,6 @@ fn delete_model_provider(
     let removed = cfg.providers.models.remove_alias(family, alias);
     debug_assert!(removed, "existence was checked above");
 
-    // Targeted post-condition: the cascade must leave no reference to the
-    // deleted alias. (We intentionally do NOT re-run the global
-    // `Config::validate()` here — that conflates pre-existing, unrelated
-    // invalidity with this cascade's correctness; the calling surface
-    // validates the whole config before persisting.)
     let remaining = find_all_references(cfg, &kind, alias);
     if !remaining.is_empty() {
         let paths: Vec<_> = remaining.iter().map(|s| s.path.as_str()).collect();
@@ -406,14 +341,6 @@ fn delete_model_provider(
     })
 }
 
-/// Mutating mirror of the model-provider arm of [`find_all_references`]: clear
-/// soft scalar refs and drop soft collection elements pointing at `target`
-/// (`"<family>.<alias>"`). `model_provider` is a HARD ref and is never scrubbed
-/// (a delete carrying one is refused before reaching here). `retain` handles
-/// the index-shift concern for the vector drops. Comparisons `.trim()` the
-/// stored value to mirror `find_all_references` (and `validate()`) exactly — a
-/// whitespace-padded ref that find() flagged must be scrubbed here too, or the
-/// post-condition would fail.
 fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
     for agent in cfg.agents.values_mut() {
         if agent.classifier_provider.trim() == target {
@@ -423,7 +350,7 @@ fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
             agent.summary_provider = crate::providers::ModelProviderRef::default();
         }
     }
-    // Profile-level context-compression summarizer ref (#7964).
+    // Profile-level context-compression summarizer ref
     for profile in cfg.runtime_profiles.values_mut() {
         if profile.context_compression.summary_provider.trim() == target {
             profile.context_compression.summary_provider =
@@ -459,12 +386,6 @@ fn delete_agent(
             deleted_entry: None,
         });
     }
-    // Config-scoped gate: refuse if `plan_delete` found any HARD ref. The hard
-    // agent refs are whatever `collect_agent_refs` marks `RefStrength::Hard` —
-    // currently an enabled `heartbeat.agent` and a channel the agent solely owns
-    // (deleting its sole enabled owner would orphan the route). Owned-state HARD
-    // refs (e.g. live ACP sessions) are enforced by the surface layer that owns
-    // the infra stores; the pure config walk does not see them.
     if !report.allowed {
         return Err(CascadeError::Refused(Box::new(report)));
     }
@@ -490,17 +411,6 @@ fn delete_agent(
     })
 }
 
-/// Mutating mirror of [`collect_agent_refs`]: clear soft scalar refs and drop
-/// soft collection elements naming `alias`. Trims the same sites
-/// `collect_agent_refs` trims (heartbeat, acp.default_agent, delegates) and
-/// leaves the three `AgentAlias`-keyed sites raw (workspace.access,
-/// read_memory_from, peer_groups.agents) — both mirror `validate()` exactly.
-/// `heartbeat.agent` is cleared only when reached (an *enabled* heartbeat
-/// pointing at `alias` is a HARD ref, refused before this runs). `retain` is
-/// index-shift-safe. The loop over `cfg.agents.values_mut()` still includes the
-/// to-be-deleted agent, so a self-reference (e.g.
-/// `bot.delegates = [{ agent = "bot", mode = "bounded" }]`) is actively
-/// stripped by the `retain` here before the entry itself is removed.
 fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     if cfg.heartbeat.agent.trim() == alias {
         cfg.heartbeat.agent.clear();
@@ -602,26 +512,10 @@ fn scrub_channel_refs(cfg: &mut Config, target: &str) {
         .retain(|ch| ch.trim() != target);
 }
 
-// ── rename-with-cascade (#7468) ─────────────────────────────────────────────
+// ── rename-with-cascade─────────────────────────────────────────────
 
-/// The agent alias reserved as the runtime fallback. `resolved_runtime_agent_alias`
-/// prefers it, so renaming it away — or onto it — would silently change which
-/// agent answers when no explicit target is given. Protected from rename. This
-/// guard is **agent-specific**: `default` is the conventional single-instance key
-/// for providers/channels (e.g. `providers.models.anthropic.default`,
-/// `channels.discord.default`), which operators rename/delete freely, so it is
-/// reserved only for the agent kind. (The `_deleted` archive marker is rejected
-/// as a new alias of any kind by `validate_alias_key`'s leading-underscore rule,
-/// which `rename_map_key` enforces — no separate guard needed here.)
 const RESERVED_DEFAULT_AGENT: &str = "default";
 
-/// True iff `alias` is the reserved AGENT alias (the runtime fallback
-/// `default`). Renaming to or from it is refused (see [`rename_with_cascade`]),
-/// so letting the create surface author `agents.default` would leave the
-/// operator with an agent the rename guard then refuses to rename.
-/// [`create_map_key_checked`] uses this to refuse the create symmetrically.
-/// Reserved only for the agent kind (`default` is a free, conventional key for
-/// providers/channels/profiles).
 #[must_use]
 pub fn is_reserved_agent_alias(alias: &str) -> bool {
     alias.trim() == RESERVED_DEFAULT_AGENT
@@ -648,27 +542,6 @@ impl std::fmt::Display for CreateError {
 
 impl std::error::Error for CreateError {}
 
-/// Create a new map key under `path`, refusing a reserved alias first, then
-/// delegating to the generated [`Config::create_map_key`] for the insert.
-///
-/// The reserved-agent rule (the `default` runtime fallback) is enforced HERE, at
-/// the shared config boundary, so every operator-facing create surface (the
-/// gateway config-write handlers, the RPC dispatch, and the alias CLI) inherits
-/// it from one place instead of each re-deriving it, which is how the guard would
-/// drift per surface. Set-prop auto-vivification (`PUT /api/config/prop`,
-/// `PATCH /api/config`, RPC `config/set`) is guarded in `ensure_map_key_for_path`
-/// with the same `is_reserved_agent_alias` predicate, so that path cannot
-/// materialize `agents.default` either.
-/// The operator quickstart-apply surface routes through this guard too. The only
-/// raw `create_map_key` writers left are non-operator paths that may legitimately
-/// write `agents.default`: env-override materialization (boot-time, from env
-/// vars) and the v1->v2 migration that synthesizes the fallback agent. Symmetric
-/// with
-/// [`rename_with_cascade`]'s reserved guard: rename refuses renaming to or from
-/// `default`, and this refuses creating it, so no surface can author an
-/// `agents.default` that the rename guard then traps. `create_map_key` still
-/// validates the key and reports an unknown section, surfaced here as
-/// [`CreateError::Invalid`].
 pub fn create_map_key_checked(
     cfg: &mut Config,
     path: &str,
@@ -688,16 +561,6 @@ pub struct RenameReport {
     pub old_alias: String,
     /// The alias the entry now lives under.
     pub new_alias: String,
-    /// Every dotted config path the rename mutated, **deduplicated and sorted**:
-    /// the renamed entry (old key — removed on disk; new key — added) plus the
-    /// entry/section path of each referrer that was rewritten. The persisting
-    /// surface must mark **each** of these dirty before saving — `save_dirty`
-    /// only writes marked paths, so a referrer in another entry that isn't
-    /// listed here would be rewritten in memory but left stale on disk. Paths are
-    /// at entry/section granularity (e.g. `agents.lead`, `peer_groups.crew`,
-    /// `heartbeat.agent`, `model_routes`, `providers.models.anthropic.default`)
-    /// so marking one re-serialises the whole changed subtree, capturing nested
-    /// edits like a `workspace.access` key rename.
     pub dirty_paths: Vec<String>,
 }
 
@@ -734,21 +597,6 @@ impl std::fmt::Display for RenameError {
 
 impl std::error::Error for RenameError {}
 
-/// Rename an aliased entry from `old_alias` to `new_alias`, rewriting every
-/// reference to it. The mutating inverse of [`delete_with_cascade`]'s scrub:
-/// where delete clears/drops soft refs (and refuses on hard ones), rename
-/// **rewrites** every ref — soft *and* hard — to name the new alias, so nothing
-/// is left dangling and no HARD ref blocks (an enabled `heartbeat.agent` or a
-/// `peer_groups.<g>.channel` simply follows the rename).
-///
-/// Steps: reject a no-op / reserved name, swap the entry key via
-/// `Config::rename_map_key` (which validates the new key, blocks the `_deleted`
-/// marker, and refuses a collision), rewrite the referrers, then verify
-/// `find_all_references(old_alias)` is empty. Implements every kind — agents,
-/// model / TTS / transcription providers, and channels (rename has no
-/// owned-state complications, so unlike delete it covers TTS/transcription too).
-/// Owned non-config state (memory rows, workspace dir, cron/acp/session rows) is
-/// re-pointed by the calling surface, which owns those stores.
 pub fn rename_with_cascade(
     cfg: &mut Config,
     kind: &AliasKind,
@@ -844,17 +692,6 @@ fn entry_path(kind: &AliasKind, alias: &str) -> String {
     format!("{}.{alias}", section_path(kind))
 }
 
-/// Mutating mirror of [`collect_agent_refs`] for rename: rewrite every reference
-/// to `old` so it names `new`. Mirrors the collect TRIM/RAW split exactly — trim
-/// heartbeat / acp.default_agent / delegates; leave workspace.access /
-/// read_memory_from / peer_groups.agents raw — matching on the same comparison
-/// and writing the new value verbatim. `heartbeat.agent` is rewritten whether or
-/// not heartbeat is enabled (the pointer follows the rename either way). Includes
-/// the renamed agent itself, so a self-reference
-/// (`bot.delegates=[{ agent = "bot", mode = "bounded" }]` under a bot→bot2
-/// rename) is rewritten here too. Returns the entry/section dirty paths
-/// it touched (`heartbeat.agent`, `acp.default_agent`, `agents.<name>`,
-/// `peer_groups.<g>`) so the surface can persist exactly what changed.
 fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
     use crate::multi_agent::AgentAlias;
     let mut dirty = Vec::new();
@@ -928,12 +765,6 @@ fn rewrite_provider_refs(
     }
 }
 
-/// Mutating mirror of the model-provider arm of [`collect_provider_refs`] for
-/// rename: rewrite the dotted `"<family>.<alias>"` refs from old → new across
-/// `model_provider` (HARD — rewritten, since rename never refuses),
-/// `classifier_provider`, every provider's `fallback[]`, and the model/embedding
-/// routes. All TRIM-matched (validate trims provider refs). Returns the touched
-/// entry/section dirty paths.
 fn rewrite_model_provider_refs(
     cfg: &mut Config,
     family: &str,
@@ -961,7 +792,7 @@ fn rewrite_model_provider_refs(
             dirty.push(format!("agents.{name}"));
         }
     }
-    // Profile-level context-compression summarizer ref (#7964).
+    // Profile-level context-compression summarizer ref
     for (pname, profile) in cfg.runtime_profiles.iter_mut() {
         if profile.context_compression.summary_provider.trim() == old_target {
             profile.context_compression.summary_provider = new_target.as_str().into();
@@ -1042,13 +873,6 @@ fn rewrite_transcription_provider_refs(
     dirty
 }
 
-/// Mutating mirror of [`collect_channel_refs`] for rename: rewrite the dotted
-/// `"<type>.<alias>"` refs from old → new across every agent's `channels[]`, the
-/// HARD `peer_groups.<g>.channel`, and `escalation.alert_channels[]`. All
-/// TRIM-matched. Note the bare-group-member orphan hazard that makes a channel
-/// *delete* refuse does NOT arise here: rewriting a member's channel keeps it a
-/// `<type>.*` channel, so group membership stays valid. Returns the touched
-/// entry/section dirty paths.
 fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &str) -> Vec<String> {
     let old_target = format!("{channel_type}.{old}");
     let new_target = format!("{channel_type}.{new}");
@@ -1083,13 +907,6 @@ fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &s
     }
     dirty
 }
-
-// ── skill bundles (#7468/#7175) ─────────────────────────────────────────────
-// A skill bundle (`[skill_bundles.<alias>]`) has a single SOFT referrer
-// container: each agent's `skill_bundles: Vec<String>` list (validate() trims,
-// schema.rs ~17272). There is no HARD ref (an agent runs fine with an empty
-// bundle list), so bundles don't warrant an `AliasKind` variant — these three
-// standalone fns mirror the channel arm, flattened to the one container.
 
 /// Enumerate every agent that references skill bundle `alias` (TRIM-matched, as
 /// `Config::validate()` does). All refs are SOFT (droppable from the list).
@@ -1167,12 +984,6 @@ fn collect_provider_refs(
     sites: &mut Vec<RefSite>,
 ) {
     let target = format!("{family}.{alias}");
-    // `Config::validate()` TRIMS every provider ref before resolving it
-    // (model_provider schema.rs:17143, classifier :17227, tts :17217,
-    // transcription :17221, model/embedding routes :16549/:16595, the fallback
-    // walk :16177). A whitespace-padded TOML value therefore passes validation,
-    // so we must trim the stored value before matching here too or we silently
-    // miss it. `raw_value` keeps the actual stored text (incl. any whitespace).
     match category {
         ProviderCategory::Models => {
             for (name, agent) in sorted_agents(cfg) {
@@ -1198,7 +1009,7 @@ fn collect_provider_refs(
                     ));
                 }
             }
-            // Profile-level context-compression summarizer ref (#7964).
+            // Profile-level context-compression summarizer ref
             {
                 let mut pnames: Vec<&String> = cfg.runtime_profiles.keys().collect();
                 pnames.sort();
@@ -1304,17 +1115,6 @@ fn collect_channel_refs(cfg: &Config, channel_type: &str, alias: &str, sites: &m
             ));
         }
     }
-    // Last-alias-of-type guard for BARE-type group channels. A bare channel
-    // (`"discord"`) doesn't match the dotted target above, so it's skipped while
-    // any `channels.<type>.*` alias survives — but deleting the *last* alias of
-    // the type empties the block, and validate() then bails the bare-type group
-    // (`peer_groups.<g>.channel = "<type>"` resolves to no configured
-    // `[channels.<type>.*]`, schema.rs:17432-17439). Report those bare groups as
-    // HARD so the plan refuses instead of letting the mutating delete remove the
-    // type's final alias out from under them.
-    // True only when `alias` is the sole existing alias of the type, so deleting
-    // it empties the block. (If the type is unconfigured or `alias` isn't its
-    // only key, this delete doesn't cause the dangle.)
     let removes_last_alias = cfg
         .get_map_keys(&format!("channels.{channel_type}"))
         .is_some_and(|keys| keys.iter().any(|k| k == alias) && keys.iter().all(|k| k == alias));
@@ -1341,18 +1141,6 @@ fn collect_channel_refs(cfg: &Config, channel_type: &str, alias: &str, sites: &m
             ));
         }
     }
-    // peer_groups.<g>.agents[i] — a member of a BARE-type group (`channel =
-    // "discord"`) must keep at least one `<type>.*` channel (validate()
-    // schema.rs:17461-17478, the `None`/bare arm). A bare group channel is not a
-    // dotted ref, so it is not a HARD ref above — but scrubbing a member's *only*
-    // `<type>.*` channel (the SOFT `agents.<m>.channels` ref collected above)
-    // would leave that member without a required channel, producing a config
-    // `validate()` rejects. Treat that as HARD: refuse rather than report success
-    // on a delete that yields an invalid config. validate()'s member check uses
-    // the *untrimmed* channel string, so the survivor test mirrors that exactly.
-    // (This member-level guard is the companion to the type-level last-alias
-    // guard above; it fires even while another `<type>.*` alias keeps the block
-    // present, because the member's *own* only matching channel is the target.)
     let type_prefix = format!("{channel_type}.");
     for (gname, group) in sorted_peer_groups(cfg) {
         // Bare type only; type must match the channel being deleted. Dotted
@@ -1388,15 +1176,6 @@ fn collect_channel_refs(cfg: &Config, channel_type: &str, alias: &str, sites: &m
 }
 
 fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
-    // TRIM-MATCHED agent refs: validate() trims these before resolving
-    // (heartbeat schema.rs:16338, delegates :17331); acp.default_agent is not
-    // load-validated but the ACP runtime resolves it by alias, so trim it too to
-    // avoid leaving a whitespace-padded dangling pointer. raw_value keeps the
-    // actual stored text.
-    //
-    // heartbeat.agent — hard only when heartbeat is enabled (validate() bails on
-    // a dangling target only then); when disabled the pointer is tolerated, so
-    // deletion clears it rather than refusing.
     if cfg.heartbeat.agent.trim() == alias {
         let raw = cfg.heartbeat.agent.as_str();
         if cfg.heartbeat.enabled {
@@ -1434,12 +1213,6 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
                 ));
             }
         }
-        // RAW-MATCHED AgentAlias refs below: validate() compares these via
-        // `as_str()` WITHOUT trimming (workspace.access schema.rs:17358,
-        // read_memory_from :17382, peer_groups.agents :17453), so we must NOT
-        // trim here either — trimming would itself drift from validate().
-        //
-        // workspace.access map key.
         if agent.workspace.access.keys().any(|k| k.as_str() == alias) {
             sites.push(RefSite::soft(
                 format!("agents.{name}.workspace.access.{alias}"),
@@ -1472,15 +1245,6 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
             }
         }
     }
-    // Channel OWNERSHIP (the agent's own `channels`). `Config::agent_for_channel`
-    // resolves a channel's owner to the (first) ENABLED agent whose `channels`
-    // list contains it; deleting that agent leaves the channel with no owner —
-    // the route is silently orphaned. #7175 treats channel ownership as a HARD
-    // agent-delete concern, so report each channel the target *solely* owns as a
-    // blocker (refuse), absent a repoint/prune policy. Ownership uses
-    // `agent_for_channel`'s exact (untrimmed, enabled-only) match. A disabled
-    // target owns nothing; a channel another enabled agent also lists is not
-    // orphaned, so it isn't reported.
     if let Some(target) = cfg.agents.get(alias)
         && target.enabled
     {
@@ -1509,7 +1273,7 @@ mod tests {
         AliasedAgentConfig, Config, DelegateTargetConfig, EmbeddingRouteConfig, ModelRouteConfig,
     };
 
-    /// Empty config with the alias-keyed containers cleared so Config::default()
+    /// Empty config with the alias-keyed containers cleared so Config::default
     /// can't inject spurious references into assertions.
     fn empty_config() -> Config {
         let mut c = Config::default();
@@ -1842,7 +1606,7 @@ mod tests {
         assert_eq!(report.scrubs[0].action, ScrubAction::ClearOptional);
     }
 
-    // ── review #7785: two delete-impact gaps ────────────────────────────────
+    // ── review two delete-impact gaps ────────────────────────────────
 
     #[test]
     fn channel_delete_of_last_alias_blocks_bare_type_peer_group() {
@@ -2513,7 +2277,7 @@ mod tests {
 
     #[test]
     fn cascade_channel_refuses_orphaning_bare_group_member() {
-        // BARE-type group ("discord", not "discord.main"). validate()
+        // BARE-type group ("discord", not "discord.main"). validate
         // (schema.rs:17461-17478) requires each member to keep some `discord.*`
         // channel. `ops`'s only discord channel is the one being deleted, so the
         // delete must REFUSE — scrubbing it would yield a config validate() rejects.
@@ -2607,7 +2371,7 @@ mod tests {
         );
     }
 
-    // ── rename_with_cascade (#7468) ─────────────────────────────────────────
+    // ── rename_with_cascade─────────────────────────────────────────
 
     #[test]
     fn rename_agent_rewrites_every_ref_kind() {
