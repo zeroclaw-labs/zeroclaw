@@ -8184,9 +8184,9 @@ pub struct PluginsConfig {
     /// Auto-discover and load plugins on startup
     #[serde(default)]
     pub auto_discover: bool,
-    /// Maximum number of plugins that can be loaded
-    #[serde(default = "default_max_plugins")]
-    pub max_plugins: usize,
+    /// Maximum number of logical plugin instances admitted across capabilities.
+    #[serde(default = "default_max_active_plugin_instances")]
+    pub max_active_instances: usize,
     /// Plugin signature verification security settings
     #[serde(default)]
     #[nested]
@@ -8403,7 +8403,7 @@ fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
 
-fn default_max_plugins() -> usize {
+fn default_max_active_plugin_instances() -> usize {
     50
 }
 
@@ -8413,7 +8413,7 @@ impl Default for PluginsConfig {
             enabled: false,
             plugins_dir: default_plugins_dir(),
             auto_discover: false,
-            max_plugins: default_max_plugins(),
+            max_active_instances: default_max_active_plugin_instances(),
             security: PluginSecurityConfig::default(),
             limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
@@ -20403,6 +20403,13 @@ impl Config {
             }
         }
 
+        if self.plugins.max_active_instances == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.max_active_instances",
+                "plugins.max_active_instances must be greater than 0; a zero ceiling rejects every logical plugin instance"
+            );
+        }
         if self.plugins.limits.call_fuel == 0 {
             validation_bail!(
                 InvalidNumericRange,
@@ -23165,6 +23172,19 @@ enabled = true
             .expect_err("zero call_fuel must be rejected");
         assert!(
             err.to_string().contains("plugins.limits.call_fuel"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_active_plugin_instances() {
+        let mut config = Config::default();
+        config.plugins.max_active_instances = 0;
+        let err = config
+            .validate()
+            .expect_err("zero active-instance ceiling must be rejected");
+        assert!(
+            err.to_string().contains("plugins.max_active_instances"),
             "error must name the offending path; got: {err}"
         );
     }
