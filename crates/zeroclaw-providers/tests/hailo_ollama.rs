@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -19,6 +19,7 @@ use zeroclaw_providers::traits::{ChatMessage, ModelProvider};
 
 type Capture = Arc<Mutex<Option<Value>>>;
 type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
+type HeaderCapture = Arc<Mutex<Option<HeaderMap>>>;
 
 fn hailo_provider(base_url: &str) -> OllamaModelProvider {
     hailo_provider_with_queue_timeout(base_url, 5)
@@ -60,6 +61,88 @@ async fn capture_raw_chat(State(capture): State<RawCapture>, body: Bytes) -> Jso
         "prompt_eval_count": 7,
         "eval_count": 3
     }))
+}
+
+async fn capture_chat_headers(
+    State(capture): State<HeaderCapture>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    *capture.lock().expect("header capture lock") = Some(headers);
+    Json(json!({
+        "message": {"role": "assistant", "content": "HAILO_NATIVE_OK"},
+        "done": true,
+        "prompt_eval_count": 7,
+        "eval_count": 3
+    }))
+}
+
+#[tokio::test]
+async fn native_hailo_chat_requests_connection_close() {
+    let capture: HeaderCapture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_chat_headers))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let provider = hailo_provider(&format!("http://{addr}"));
+    provider
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("native Hailo request succeeds");
+
+    let headers = capture
+        .lock()
+        .expect("header capture lock")
+        .clone()
+        .expect("request headers captured");
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close")
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn standard_ollama_chat_does_not_force_connection_close() {
+    let capture: HeaderCapture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Ollama server");
+    let addr = listener.local_addr().expect("fake Ollama address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_chat_headers))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Ollama server");
+    });
+
+    let provider = OllamaModelProvider::new("standard", Some(&format!("http://{addr}")), None);
+    provider
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("standard Ollama request succeeds");
+
+    let headers = capture
+        .lock()
+        .expect("header capture lock")
+        .clone()
+        .expect("request headers captured");
+    assert!(headers.get(axum::http::header::CONNECTION).is_none());
+
+    server.abort();
 }
 
 #[tokio::test]
