@@ -111,7 +111,7 @@ impl Drop for PendingApprovalCleanup {
         if self.armed {
             let pending = Arc::clone(&self.pending);
             let token = self.token.clone();
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 pending.lock().await.remove(&token);
             });
         }
