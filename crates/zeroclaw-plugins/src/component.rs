@@ -469,11 +469,6 @@ impl PluginState {
         self.scope.grants().allows(permission)
     }
 
-    /// Whether the admitted scope exposes the socket host interface.
-    pub(crate) fn sockets_enabled(&self) -> bool {
-        self.scope.grants().allows(PluginPermission::SocketClient)
-    }
-
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
     pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
