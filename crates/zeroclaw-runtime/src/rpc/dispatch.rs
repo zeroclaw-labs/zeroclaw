@@ -5150,8 +5150,7 @@ mod tests {
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let config = zeroclaw_config::schema::Config::default();
         let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
-        let ctx =
-            RpcContext::minimal_with_event_tx(config, sessions, event_tx.clone());
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx.clone());
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
 

@@ -316,7 +316,10 @@ mod tests {
             !out.contains("SECRET-STR-MARKER"),
             "str-recorded ephemeral field leaked: {out:?}"
         );
-        assert!(!out.contains(F_EPHEMERAL_ATTRS), "field name leaked: {out:?}");
+        assert!(
+            !out.contains(F_EPHEMERAL_ATTRS),
+            "field name leaked: {out:?}"
+        );
 
         // integer representation (record_i64)
         let out = render_with(|| {
@@ -327,13 +330,19 @@ mod tests {
             !out.contains("424242"),
             "integer-recorded ephemeral field leaked: {out:?}"
         );
-        assert!(!out.contains(F_EPHEMERAL_ATTRS), "field name leaked: {out:?}");
+        assert!(
+            !out.contains(F_EPHEMERAL_ATTRS),
+            "field name leaked: {out:?}"
+        );
 
         // bool representation (record_bool)
         let out = render_with(|| {
             tracing::info!(zc_ephemeral_attrs = true, "bool ephemeral");
         });
-        assert!(out.contains("bool ephemeral"), "event still logged: {out:?}");
+        assert!(
+            out.contains("bool ephemeral"),
+            "event still logged: {out:?}"
+        );
         assert!(
             !out.contains(F_EPHEMERAL_ATTRS),
             "bool-recorded ephemeral field leaked: {out:?}"

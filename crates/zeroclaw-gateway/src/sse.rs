@@ -858,7 +858,10 @@ mod tests {
         acc
     }
 
-    fn pairing_guard(require: bool, tokens: &[&str]) -> Arc<zeroclaw_runtime::security::pairing::PairingGuard> {
+    fn pairing_guard(
+        require: bool,
+        tokens: &[&str],
+    ) -> Arc<zeroclaw_runtime::security::pairing::PairingGuard> {
         let owned: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
         Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
             require, &owned,
