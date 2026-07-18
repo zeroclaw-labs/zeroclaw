@@ -245,6 +245,54 @@ struct ChatRequest {
     tools: Option<Vec<serde_json::Value>>,
 }
 
+/// Observed with the tested Hailo-Ollama 0.5.1 stack: a request containing
+/// literal non-ASCII UTF-8 wedged, while semantically equivalent ASCII-escaped
+/// JSON completed. Emit ASCII-only JSON on the Hailo path as a wire workaround.
+struct HailoAsciiJsonFormatter;
+
+impl serde_json::ser::Formatter for HailoAsciiJsonFormatter {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let fragment_bytes = fragment.as_bytes();
+        let mut ascii_start = 0;
+        for (index, character) in fragment.char_indices() {
+            if character.is_ascii() {
+                continue;
+            }
+
+            std::io::Write::write_all(writer, &fragment_bytes[ascii_start..index])?;
+            let mut utf16 = [0_u16; 2];
+            for code_unit in character.encode_utf16(&mut utf16) {
+                let escaped = [
+                    b'\\',
+                    b'u',
+                    HEX[(((*code_unit) >> 12) & 0x0f) as usize],
+                    HEX[(((*code_unit) >> 8) & 0x0f) as usize],
+                    HEX[(((*code_unit) >> 4) & 0x0f) as usize],
+                    HEX[((*code_unit) & 0x0f) as usize],
+                ];
+                std::io::Write::write_all(writer, &escaped)?;
+            }
+            ascii_start = index + character.len_utf8();
+        }
+
+        std::io::Write::write_all(writer, &fragment_bytes[ascii_start..])
+    }
+}
+
+fn serialize_hailo_request(request: &ChatRequest) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut body, HailoAsciiJsonFormatter);
+    request.serialize(&mut serializer).map_err(|error| {
+        anyhow::Error::msg(format!("Failed to serialize Hailo-Ollama request: {error}"))
+    })?;
+    Ok(body)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Message {
     role: String,
@@ -1397,7 +1445,15 @@ impl OllamaModelProvider {
             );
         }
 
-        let mut request_builder = self.http_client()?.post(&url).json(&request);
+        let client = self.http_client()?;
+        let mut request_builder = if self.is_hailo() {
+            client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(serialize_hailo_request(&request)?)
+        } else {
+            client.post(&url).json(&request)
+        };
 
         if should_auth && let Some(key) = self.api_key.as_ref() {
             request_builder = request_builder.bearer_auth(key);

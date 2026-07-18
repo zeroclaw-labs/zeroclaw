@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::State,
     routing::{get, post},
 };
@@ -17,6 +18,7 @@ use zeroclaw_providers::ollama::{OllamaModelProvider, OllamaTuning};
 use zeroclaw_providers::traits::{ChatMessage, ModelProvider};
 
 type Capture = Arc<Mutex<Option<Value>>>;
+type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
 
 fn hailo_provider(base_url: &str) -> OllamaModelProvider {
     hailo_provider_with_queue_timeout(base_url, 5)
@@ -42,6 +44,16 @@ fn hailo_provider_with_queue_timeout(
 
 async fn capture_chat(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
     *capture.lock().expect("capture lock") = Some(body);
+    Json(json!({
+        "message": {"role": "assistant", "content": "HAILO_NATIVE_OK"},
+        "done": true,
+        "prompt_eval_count": 7,
+        "eval_count": 3
+    }))
+}
+
+async fn capture_raw_chat(State(capture): State<RawCapture>, body: Bytes) -> Json<Value> {
+    *capture.lock().expect("raw capture lock") = Some(body.to_vec());
     Json(json!({
         "message": {"role": "assistant", "content": "HAILO_NATIVE_OK"},
         "done": true,
@@ -108,6 +120,116 @@ async fn native_hailo_normalizes_messages_and_reports_honest_capabilities() {
         Role::Provider(ProviderKind::Model(ModelProviderKind::HailoOllama))
     );
     assert_eq!(provider.alias(), "edge");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_emits_ascii_only_json_for_wire_compatibility() {
+    let capture: RawCapture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_raw_chat))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let provider = hailo_provider(&format!("http://{addr}"));
+    let messages = [
+        ChatMessage::system("Identity — concise."),
+        ChatMessage::user("Vastaa yhdellä virkkeellä: näyttö, sähkökatkos ja testi 🧪."),
+    ];
+    provider
+        .chat(
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "qwen3:1.7b",
+            Some(0.2),
+        )
+        .await
+        .expect("native Hailo request succeeds");
+
+    let raw = capture
+        .lock()
+        .expect("raw capture lock")
+        .clone()
+        .expect("raw request captured");
+    let body: Value = serde_json::from_slice(&raw).expect("captured request is valid JSON");
+    let content = body["messages"][0]["content"]
+        .as_str()
+        .expect("captured Unicode content");
+    assert!(content.contains("Identity — concise."));
+    assert!(content.contains("näyttö, sähkökatkos ja testi 🧪"));
+    assert!(
+        raw.is_ascii(),
+        "native Hailo request body must contain ASCII-only JSON"
+    );
+    assert!(raw.windows(6).any(|window| window == br"\u2014"));
+    assert!(raw.windows(6).any(|window| window == br"\u00e4"));
+    assert!(raw.windows(6).any(|window| window == br"\u00f6"));
+    assert!(raw.windows(12).any(|window| window == br"\ud83e\uddea"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn standard_ollama_keeps_default_non_ascii_json_serialization() {
+    let capture: RawCapture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Ollama server");
+    let addr = listener.local_addr().expect("fake Ollama address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_raw_chat))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Ollama server");
+    });
+
+    let provider = OllamaModelProvider::new("standard", Some(&format!("http://{addr}")), None);
+    let messages = [ChatMessage::user("näyttö ja testi 🧪")];
+    provider
+        .chat(
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "qwen3:1.7b",
+            Some(0.2),
+        )
+        .await
+        .expect("standard Ollama request succeeds");
+
+    let raw = capture
+        .lock()
+        .expect("raw capture lock")
+        .clone()
+        .expect("raw request captured");
+    let body: Value = serde_json::from_slice(&raw).expect("captured request is valid JSON");
+    assert_eq!(body["messages"][0]["content"], "näyttö ja testi 🧪");
+    assert!(!raw.is_ascii());
+    assert!(
+        raw.windows("ä".len())
+            .any(|window| window == "ä".as_bytes())
+    );
+    assert!(
+        raw.windows("🧪".len())
+            .any(|window| window == "🧪".as_bytes())
+    );
+    assert!(!raw.windows(6).any(|window| window == br"\u00e4"));
+    assert!(!raw.windows(12).any(|window| window == br"\ud83e\uddea"));
 
     server.abort();
 }
