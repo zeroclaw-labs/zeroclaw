@@ -32,6 +32,7 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "discord",
     "slack",
     "mattermost",
+    "msteams",
     "matrix",
     "qq",
     "whatsapp",
