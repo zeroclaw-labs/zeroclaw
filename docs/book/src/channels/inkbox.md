@@ -1,9 +1,5 @@
 # Inkbox
 
-> **Branch note:** the Inkbox channel ships on the `inkbox` branch of this fork.
-> `master` tracks upstream and carries no Inkbox code, so build and test the
-> integration from `inkbox`.
-
 [Inkbox](https://inkbox.ai) gives an agent its own communication identity (a real
 email mailbox, a phone number for SMS and voice, and iMessage) behind a single
 hosted account. One `[channels.inkbox.<alias>]` instance binds the agent to one
