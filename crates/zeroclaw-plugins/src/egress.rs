@@ -1224,10 +1224,10 @@ mod tests {
             TlsProfileName::new("private-mtls").unwrap(),
             ["service.example".to_string()],
             false,
-            Some(SecretPropertyRef::new("ca_pem").unwrap()),
+            Some(SecretPropertyRef::parse("ca_pem").unwrap()),
             Some(TlsClientIdentity::new(
-                SecretPropertyRef::new("client_cert_pem").unwrap(),
-                SecretPropertyRef::new("client_key_pem").unwrap(),
+                SecretPropertyRef::parse("client_cert_pem").unwrap(),
+                SecretPropertyRef::parse("client_key_pem").unwrap(),
             )),
         )
         .unwrap();
@@ -1255,7 +1255,7 @@ mod tests {
             TlsProfileName::new("private-ca").unwrap(),
             ["service.example".to_string()],
             false,
-            Some(SecretPropertyRef::new("ca_pem").unwrap()),
+            Some(SecretPropertyRef::parse("ca_pem").unwrap()),
             None,
         )
         .unwrap();
