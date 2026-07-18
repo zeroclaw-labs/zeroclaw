@@ -12,6 +12,9 @@ const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
 /// Default HTTP request timeout for TTS API calls.
 const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Maximum time allowed for a local ffmpeg transcode.
+const FFMPEG_TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 // ── TtsProvider trait ────────────────────────────────────────────
 
 /// Trait for pluggable TTS backends.
@@ -590,11 +593,37 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
-async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
-    use std::process::Stdio;
+async fn write_audio_and_wait_with_output(
+    mut child: tokio::process::Child,
+    audio: Vec<u8>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = tokio::process::Command::new("ffmpeg")
+    let mut stdin = child.stdin.take().context("ffmpeg stdin was not piped")?;
+
+    tokio::time::timeout(timeout, async move {
+        // Drive stdin and wait concurrently: if the child fills its stdout pipe
+        // before stdin is complete, sequential operation would deadlock.
+        let (write_result, output) = tokio::join!(
+            async move {
+                stdin.write_all(&audio).await?;
+                stdin.shutdown().await
+            },
+            child.wait_with_output()
+        );
+
+        write_result.context("failed to write audio to ffmpeg stdin")?;
+        output.context("ffmpeg process error")
+    })
+    .await
+    .with_context(|| format!("ffmpeg transcode timed out after {timeout:?}"))?
+}
+
+async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
+    use std::process::Stdio;
+
+    let child = tokio::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -614,26 +643,14 @@ async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context(
             "failed to spawn ffmpeg — ensure ffmpeg with libopus support is installed \
              (e.g. `sudo dnf install ffmpeg` / `sudo apt install ffmpeg`)",
         )?;
 
-    let mut stdin = child.stdin.take().expect("stdin configured above");
-
-    // Drive stdin and wait concurrently: if ffmpeg fills its stdout pipe
-    // before we finish writing stdin, sequential operation would deadlock.
-    let (write_result, output) = tokio::join!(
-        async move {
-            stdin.write_all(&audio).await?;
-            stdin.shutdown().await
-        },
-        child.wait_with_output()
-    );
-
-    write_result.context("failed to write audio to ffmpeg stdin")?;
-    let output = output.context("ffmpeg process error")?;
+    let output = write_audio_and_wait_with_output(child, audio, FFMPEG_TRANSCODE_TIMEOUT).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -899,6 +916,80 @@ impl ::zeroclaw_api::attribution::Attributable for PiperTtsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn piped_shell_child(script: &str) -> tokio::process::Child {
+        use std::process::Stdio;
+
+        tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn test child")
+    }
+
+    #[cfg(unix)]
+    async fn process_exists(pid: u32) -> bool {
+        use std::process::Stdio;
+
+        tokio::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcode_process_times_out_stalled_child() {
+        let child = piped_shell_child("exec sleep 60");
+        let pid = child.id().expect("spawned child has a process ID");
+        let started = std::time::Instant::now();
+        let error = write_audio_and_wait_with_output(
+            child,
+            b"audio".to_vec(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("stalled child must time out");
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "expected timeout error, got: {error:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stalled child must return promptly"
+        );
+
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_exists(pid).await && std::time::Instant::now() < cleanup_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!process_exists(pid).await, "timed-out child must be killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcode_process_preserves_healthy_pipe_io() {
+        let input = vec![b'a'; 1024 * 1024];
+        let output = write_audio_and_wait_with_output(
+            piped_shell_child("exec cat"),
+            input.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("healthy child completes");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, input);
+    }
 
     fn config_with_edge_alias() -> Config {
         let mut cfg = Config::default();
