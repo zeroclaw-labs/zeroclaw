@@ -115,6 +115,15 @@ use zeroclaw_config::schema::Config;
 #[cfg(test)]
 use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
 use zeroclaw_memory::{self, Memory};
+#[cfg(feature = "plugins-wasm")]
+use zeroclaw_plugins::PluginCapability;
+#[cfg(feature = "plugins-wasm")]
+use zeroclaw_plugins::event::{
+    PluginEventDispatcher, PluginEventError, PluginEventResolution, PluginEventRouteResolver,
+    PluginEventRouter, ResolvedPluginEventRoute,
+};
+#[cfg(feature = "plugins-wasm")]
+use zeroclaw_plugins::instance::PluginInstanceId;
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
@@ -4327,10 +4336,20 @@ fn spawn_scoped_typing_task(
     })
 }
 
+#[cfg(test)]
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
+) {
+    process_channel_message_with_sop(ctx, msg, cancellation_token, true).await;
+}
+
+async fn process_channel_message_with_sop(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    cancellation_token: CancellationToken,
+    route_to_sop: bool,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -4351,7 +4370,14 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            process_channel_message_body(
+                ctx,
+                msg,
+                cancellation_token,
+                composite_for_body,
+                route_to_sop,
+            )
+            .await;
         }
     )
     .await;
@@ -4475,11 +4501,48 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
+async fn dispatch_channel_sop_fan_in(
+    engine: &Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    audit: &zeroclaw_runtime::sop::SopAuditLogger,
+    msg: &ChannelMessage,
+) -> std::result::Result<bool, String> {
+    if !channel_sop_wants(Some(engine))? {
+        return Ok(false);
+    }
+
+    let topic = match &msg.channel_alias {
+        Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+        _ => msg.channel.clone(),
+    };
+    zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
+        engine,
+        audit,
+        zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        Some(&topic),
+        Some(&msg.content),
+    )
+    .await;
+    Ok(true)
+}
+
+fn channel_sop_wants(
+    engine: Option<&Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+) -> std::result::Result<bool, String> {
+    let Some(engine) = engine else {
+        return Ok(false);
+    };
+    engine
+        .lock()
+        .map(|engine| engine.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
+        .map_err(|error| format!("SOP engine lock is unavailable: {error}"))
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     channel_composite: String,
+    route_to_sop: bool,
 ) {
     ::zeroclaw_log::record!(
         INFO,
@@ -4541,25 +4604,17 @@ async fn process_channel_message_body(
         }
     }
 
-    if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
-        let wants = engine
-            .lock()
-            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
-            .unwrap_or(false);
-        if wants {
-            let topic = match &msg.channel_alias {
-                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
-                _ => msg.channel.clone(),
-            };
-            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
-                engine,
-                audit,
-                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-                Some(&topic),
-                Some(&msg.content),
-            )
-            .await;
-        }
+    if route_to_sop
+        && let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref())
+        && let Err(error) = dispatch_channel_sop_fan_in(engine, audit, &msg).await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": error})),
+            "channel SOP fan-in failed"
+        );
     }
 
     let history_key = conversation_history_key(&msg);
@@ -6220,6 +6275,7 @@ async fn dispatch_worker(
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    route_to_sop: bool,
 ) {
     let _permit = permit;
     let interrupt_enabled = ctx
@@ -6257,7 +6313,7 @@ async fn dispatch_worker(
         }
     }
 
-    process_channel_message(ctx, msg, cancellation_token).await;
+    process_channel_message_with_sop(ctx, msg, cancellation_token, route_to_sop).await;
 
     if register_in_flight {
         let mut active = in_flight.lock().await;
@@ -6329,6 +6385,180 @@ impl AgentRouter {
             return Some(Arc::clone(ctx));
         }
         None
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn resolve_plugin_event_route_from_config(
+    config: &Config,
+    instance: &PluginInstanceId,
+    message: &ChannelMessage,
+    sop_wants_channel: bool,
+) -> Result<PluginEventResolution, PluginEventError> {
+    if !config.plugins.enabled || instance.capability() != PluginCapability::Channel {
+        return Ok(PluginEventResolution::Unknown);
+    }
+
+    let Some(declaration) = config.channels.plugin.get(instance.binding()) else {
+        return Ok(PluginEventResolution::Unknown);
+    };
+    if !declaration.enabled || declaration.package != instance.package() {
+        return Ok(PluginEventResolution::Unknown);
+    }
+
+    if message.sender.trim().is_empty() {
+        return Ok(PluginEventResolution::Denied);
+    }
+    let allowed = config.channel_external_peers("plugin", instance.binding());
+    if !crate::allowlist::is_user_allowed(
+        &allowed,
+        message.sender.as_str(),
+        crate::allowlist::Match::Sensitive,
+    ) {
+        return Ok(PluginEventResolution::Denied);
+    }
+
+    let channel_ref = format!("plugin.{}", instance.binding());
+    let mut owners: Vec<&str> = config
+        .agents
+        .iter()
+        .filter(|(_, agent)| {
+            agent.enabled
+                && agent
+                    .channels
+                    .iter()
+                    .any(|configured| configured.as_str() == channel_ref)
+        })
+        .map(|(alias, _)| alias.as_str())
+        .collect();
+    owners.sort_unstable();
+    owners.dedup();
+
+    let owner = match owners.as_slice() {
+        [] => return Ok(PluginEventResolution::Unknown),
+        [owner] => *owner,
+        _ => {
+            return Err(PluginEventError::InvalidRoute(format!(
+                "plugin channel binding {:?} has more than one enabled agent owner",
+                instance.binding()
+            )));
+        }
+    };
+
+    let route = if sop_wants_channel {
+        ResolvedPluginEventRoute::sop_and_agent(instance, owner)?
+    } else {
+        ResolvedPluginEventRoute::agent(instance, owner)?
+    };
+    Ok(PluginEventResolution::Authorized(route))
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn build_plugin_event_router(
+    config: Arc<RwLock<Config>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    dispatcher: Arc<dyn PluginEventDispatcher>,
+) -> PluginEventRouter {
+    let resolver = PluginEventRouteResolver::new(move |instance, message| {
+        let sop_wants_channel =
+            channel_sop_wants(sop_engine.as_ref()).map_err(PluginEventError::InvalidRoute)?;
+        resolve_plugin_event_route_from_config(&config.read(), instance, message, sop_wants_channel)
+    });
+    PluginEventRouter::new(resolver, dispatcher)
+}
+
+#[cfg(feature = "plugins-wasm")]
+struct PluginDispatchTargets {
+    agent: Option<Arc<ChannelRuntimeContext>>,
+    sop: bool,
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn resolve_plugin_dispatch_targets(
+    router: &AgentRouter,
+    route: &ResolvedPluginEventRoute,
+    event_instance: &PluginInstanceId,
+    message: &ChannelMessage,
+) -> Result<PluginDispatchTargets, PluginEventError> {
+    if route.instance_id() != event_instance
+        || message.channel != "plugin"
+        || message.channel_alias.as_deref() != Some(event_instance.binding())
+    {
+        return Err(PluginEventError::RouteMismatch);
+    }
+
+    let agent = match route.agent_alias() {
+        Some(alias) => {
+            let context = router.by_agent.get(alias).ok_or_else(|| {
+                PluginEventError::DispatchFailed(
+                    "resolved plugin agent route is no longer active".to_string(),
+                )
+            })?;
+            if context.agent_alias.as_str() != alias {
+                return Err(PluginEventError::DispatchFailed(
+                    "resolved plugin agent route does not match its runtime context".to_string(),
+                ));
+            }
+            Some(Arc::clone(context))
+        }
+        None => None,
+    };
+    let sop = route.routes_to_sop();
+    if agent.is_none() && !sop {
+        return Err(PluginEventError::InvalidRoute(
+            "plugin event route has no dispatch target".to_string(),
+        ));
+    }
+
+    Ok(PluginDispatchTargets { agent, sop })
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn validate_resolved_plugin_sop(router: &AgentRouter) -> Result<(), PluginEventError> {
+    let engine = router.sop_engine.as_ref().ok_or_else(|| {
+        PluginEventError::DispatchFailed(
+            "resolved plugin SOP route is no longer available".to_string(),
+        )
+    })?;
+    router.sop_audit.as_ref().ok_or_else(|| {
+        PluginEventError::DispatchFailed(
+            "resolved plugin SOP audit service is no longer available".to_string(),
+        )
+    })?;
+    match channel_sop_wants(Some(engine)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(PluginEventError::DispatchFailed(
+            "resolved plugin SOP route is stale".to_string(),
+        )),
+        Err(error) => Err(PluginEventError::DispatchFailed(error.to_string())),
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn dispatch_resolved_plugin_sop(router: &AgentRouter, message: &ChannelMessage) {
+    let (Some(engine), Some(audit)) = (router.sop_engine.as_ref(), router.sop_audit.as_ref())
+    else {
+        return;
+    };
+    match dispatch_channel_sop_fan_in(engine, audit, message).await {
+        Ok(true) => {}
+        Ok(false) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "accepted plugin SOP route became stale before dispatch"
+            );
+        }
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error})),
+                "accepted plugin SOP dispatch failed"
+            );
+        }
     }
 }
 
@@ -6422,10 +6652,45 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+#[cfg(feature = "plugins-wasm")]
+enum MessageDispatchInput {
+    Native(ChannelMessage),
+    Plugin(crate::plugin_event_dispatch::PluginEventDispatchRequest),
+}
+
+#[cfg(any(test, not(feature = "plugins-wasm")))]
 async fn run_message_dispatch_loop(
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+) {
+    run_message_dispatch_loop_inner(
+        rx,
+        router,
+        max_in_flight_messages,
+        #[cfg(feature = "plugins-wasm")]
+        None,
+    )
+    .await;
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn run_message_dispatch_loop_with_plugin_events(
+    rx: tokio::sync::mpsc::Receiver<ChannelMessage>,
+    plugin_rx: crate::plugin_event_dispatch::PluginEventDispatchReceiver,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+) {
+    run_message_dispatch_loop_inner(rx, router, max_in_flight_messages, Some(plugin_rx)).await;
+}
+
+async fn run_message_dispatch_loop_inner(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
+    #[cfg(feature = "plugins-wasm")] mut plugin_rx: Option<
+        crate::plugin_event_dispatch::PluginEventDispatchReceiver,
+    >,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
@@ -6435,7 +6700,97 @@ async fn run_message_dispatch_loop(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        #[cfg(feature = "plugins-wasm")]
+        let input = if let Some(receiver) = plugin_rx.as_mut() {
+            tokio::select! {
+                message = rx.recv() => {
+                    let Some(message) = message else { break };
+                    MessageDispatchInput::Native(message)
+                }
+                request = receiver.recv() => {
+                    let Some(request) = request else {
+                        plugin_rx = None;
+                        continue;
+                    };
+                    MessageDispatchInput::Plugin(request)
+                }
+            }
+        } else {
+            let Some(message) = rx.recv().await else {
+                break;
+            };
+            MessageDispatchInput::Native(message)
+        };
+
+        #[cfg(not(feature = "plugins-wasm"))]
+        let Some(msg) = rx.recv().await else {
+            break;
+        };
+
+        #[cfg(feature = "plugins-wasm")]
+        let msg = match input {
+            MessageDispatchInput::Native(message) => message,
+            MessageDispatchInput::Plugin(request) => {
+                let (route, event, acknowledgement) = request.into_parts();
+                let targets = match resolve_plugin_dispatch_targets(
+                    &router,
+                    &route,
+                    event.instance_id(),
+                    event.message(),
+                ) {
+                    Ok(targets) => targets,
+                    Err(error) => {
+                        acknowledgement.send(Err(error));
+                        continue;
+                    }
+                };
+                if targets.sop
+                    && let Err(error) = validate_resolved_plugin_sop(&router)
+                {
+                    acknowledgement.send(Err(error));
+                    continue;
+                }
+                let permit = match Arc::clone(&semaphore).acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        acknowledgement.send(Err(PluginEventError::DispatchFailed(
+                            "shared channel dispatcher is shutting down".to_string(),
+                        )));
+                        break;
+                    }
+                };
+                let message = event.into_message();
+                let plugin_router = router.clone();
+                let plugin_in_flight = Arc::clone(&in_flight_by_sender);
+                let plugin_task_sequence = Arc::clone(&task_sequence);
+                workers.spawn(async move {
+                    if targets.sop {
+                        dispatch_resolved_plugin_sop(&plugin_router, &message).await;
+                    }
+                    if let Some(context) = targets.agent {
+                        dispatch_worker(
+                            context,
+                            message,
+                            plugin_in_flight,
+                            plugin_task_sequence,
+                            permit,
+                            false,
+                        )
+                        .await;
+                    } else {
+                        let _permit = permit;
+                    }
+                });
+                acknowledgement.send(Ok(()));
+
+                while let Some(result) = workers.try_join_next() {
+                    log_worker_join_result(result);
+                }
+                continue;
+            }
+        };
+
         let Some(ctx) = router.resolve(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
@@ -6529,6 +6884,7 @@ async fn run_message_dispatch_loop(
                             debounce_in_flight,
                             debounce_task_seq,
                             permit,
+                            true,
                         )
                         .await;
                     });
@@ -6553,7 +6909,7 @@ async fn run_message_dispatch_loop(
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit, true).await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -7661,6 +8017,22 @@ struct ConfiguredChannel {
     display_name: &'static str,
     alias: Option<String>,
     channel: Arc<dyn Channel>,
+}
+
+fn append_configured_plugin_channels(
+    configured: &mut Vec<ConfiguredChannel>,
+    plugin_channels: Vec<Arc<dyn Channel>>,
+) {
+    for channel in plugin_channels {
+        debug_assert_eq!(channel.name(), "plugin");
+        debug_assert!(!channel.alias().is_empty());
+        let alias = channel.alias().to_string();
+        configured.push(ConfiguredChannel {
+            display_name: "Plugin",
+            alias: Some(alias),
+            channel,
+        });
+    }
 }
 
 /// Compose the registry key for a channel given its `name()` and configured alias.
@@ -9481,6 +9853,15 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
     let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
 
+    let plugin_config = Arc::new(config_arc.read().clone());
+    let plugin_channels =
+        zeroclaw_runtime::plugin_runtime::configured_plugin_channels_without_event_dispatch(
+            plugin_config,
+            Some(Arc::clone(&config_arc)),
+        )
+        .await;
+    append_configured_plugin_channels(&mut channels, plugin_channels);
+
     #[cfg(feature = "channel-nostr")]
     {
         // Materialize the work list into owned values BEFORE any `.await`
@@ -9659,6 +10040,15 @@ pub async fn start_channels(
 ) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
+    #[cfg(feature = "plugins-wasm")]
+    let (plugin_event_dispatcher, plugin_event_rx) =
+        crate::plugin_event_dispatch::bounded_plugin_event_dispatch();
+    #[cfg(feature = "plugins-wasm")]
+    let plugin_event_router = build_plugin_event_router(
+        Arc::clone(&config_arc),
+        sop_engine.clone(),
+        plugin_event_dispatcher,
+    );
     let any_agent_provider_resolves = config
         .agents
         .iter()
@@ -10275,6 +10665,14 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
+            let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
+                Arc::new(config.clone()),
+                Some(Arc::clone(&config_arc)),
+                #[cfg(feature = "plugins-wasm")]
+                plugin_event_router.clone(),
+            )
+            .await;
+            append_configured_plugin_channels(&mut configured_channels, plugin_channels);
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
@@ -10580,6 +10978,9 @@ pub async fn start_channels(
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
+    #[cfg(feature = "plugins-wasm")]
+    run_message_dispatch_loop_with_plugin_events(rx, plugin_event_rx, router, max_in_flight).await;
+    #[cfg(not(feature = "plugins-wasm"))]
     run_message_dispatch_loop(rx, router, max_in_flight).await;
 
     for h in listener_handles {
@@ -11636,6 +12037,234 @@ temperature = 0.3
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_event_scope(
+        package: &str,
+        binding: &str,
+    ) -> zeroclaw_plugins::instance::PluginInstanceScope {
+        let manifest = zeroclaw_plugins::PluginManifest {
+            name: package.to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            wasm_path: None,
+            wasm_sha256: None,
+            capabilities: vec![PluginCapability::Channel],
+            permissions: Vec::new(),
+            config_schema: None,
+            signature: None,
+            publisher_key: None,
+        };
+        zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            &manifest,
+            PluginCapability::Channel,
+            binding,
+            [],
+        )
+        .expect("admit plugin event fixture")
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_event_instance(package: &str, binding: &str) -> PluginInstanceId {
+        plugin_event_scope(package, binding).id().clone()
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_event_config() -> Config {
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.channels.plugin.insert(
+            "operations".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "event-fixture".to_string(),
+                enabled: true,
+            },
+        );
+        config.agents.insert(
+            "operator".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    "plugin.operations",
+                )],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "plugin_operations".to_string(),
+            peer_group("plugin.operations", &["alice"], false),
+        );
+        config
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_event_resolver_reads_exact_live_declaration_owner_and_allowlist() {
+        let instance = plugin_event_instance("event-fixture", "operations");
+        let mut message = channel_message("plugin", Some("operations"));
+        message.sender = "alice".to_string();
+        let mut config = plugin_event_config();
+
+        let resolution =
+            resolve_plugin_event_route_from_config(&config, &instance, &message, false)
+                .expect("resolve agent route");
+        let PluginEventResolution::Authorized(route) = resolution else {
+            panic!("exact allowed sender must be authorized");
+        };
+        assert_eq!(route.agent_alias(), Some("operator"));
+        assert!(!route.routes_to_sop());
+
+        let resolution = resolve_plugin_event_route_from_config(&config, &instance, &message, true)
+            .expect("resolve combined route");
+        let PluginEventResolution::Authorized(route) = resolution else {
+            panic!("live SOP interest must add the typed SOP target");
+        };
+        assert_eq!(route.agent_alias(), Some("operator"));
+        assert!(route.routes_to_sop());
+
+        message.sender = "mallory".to_string();
+        assert_eq!(
+            resolve_plugin_event_route_from_config(&config, &instance, &message, false)
+                .expect("deny unknown sender"),
+            PluginEventResolution::Denied
+        );
+        config
+            .peer_groups
+            .get_mut("plugin_operations")
+            .expect("fixture peer group")
+            .external_peers = vec!["*".into()];
+        assert!(matches!(
+            resolve_plugin_event_route_from_config(&config, &instance, &message, false)
+                .expect("wildcard authorization"),
+            PluginEventResolution::Authorized(_)
+        ));
+
+        config.peer_groups.clear();
+        assert_eq!(
+            resolve_plugin_event_route_from_config(&config, &instance, &message, false)
+                .expect("empty allowlist denies"),
+            PluginEventResolution::Denied
+        );
+
+        config = plugin_event_config();
+        config.agents.insert(
+            "second".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    "plugin.operations",
+                )],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        message.sender = "alice".to_string();
+        assert!(matches!(
+            resolve_plugin_event_route_from_config(&config, &instance, &message, false),
+            Err(PluginEventError::InvalidRoute(_))
+        ));
+
+        let other_package = plugin_event_instance("other-fixture", "operations");
+        assert_eq!(
+            resolve_plugin_event_route_from_config(&config, &other_package, &message, false)
+                .expect("package mismatch is unknown"),
+            PluginEventResolution::Unknown
+        );
+        message.sender.clear();
+        assert_eq!(
+            resolve_plugin_event_route_from_config(
+                &plugin_event_config(),
+                &instance,
+                &message,
+                false,
+            )
+            .expect("empty sender denies"),
+            PluginEventResolution::Denied
+        );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_dispatch_matrix_uses_exact_agent_and_rejects_stale_routes() {
+        let base = (*router_test_ctx()).clone();
+        let operator = Arc::new(ChannelRuntimeContext {
+            agent_alias: Arc::new("operator".to_string()),
+            ..base
+        });
+        let router = AgentRouter::multi(
+            HashMap::from([("operator".to_string(), Arc::clone(&operator))]),
+            HashMap::new(),
+            None,
+            None,
+        );
+        let instance = plugin_event_instance("event-fixture", "operations");
+        let message = channel_message("plugin", Some("operations"));
+
+        let agent_route =
+            ResolvedPluginEventRoute::agent(&instance, "operator").expect("valid agent route");
+        let agent = resolve_plugin_dispatch_targets(&router, &agent_route, &instance, &message)
+            .expect("agent target");
+        assert!(agent.agent.is_some());
+        assert!(!agent.sop);
+
+        let sop_route = ResolvedPluginEventRoute::sop(&instance);
+        let sop = resolve_plugin_dispatch_targets(&router, &sop_route, &instance, &message)
+            .expect("SOP target");
+        assert!(sop.agent.is_none());
+        assert!(sop.sop);
+
+        let both_route = ResolvedPluginEventRoute::sop_and_agent(&instance, "operator")
+            .expect("valid combined route");
+        let both = resolve_plugin_dispatch_targets(&router, &both_route, &instance, &message)
+            .expect("combined targets");
+        assert!(both.agent.is_some());
+        assert!(both.sop);
+
+        let stale = ResolvedPluginEventRoute::agent(&instance, "removed-agent")
+            .expect("valid stale route shape");
+        assert!(matches!(
+            resolve_plugin_dispatch_targets(&router, &stale, &instance, &message),
+            Err(PluginEventError::DispatchFailed(_))
+        ));
+
+        let other = plugin_event_instance("event-fixture", "other");
+        assert!(matches!(
+            resolve_plugin_dispatch_targets(&router, &agent_route, &other, &message),
+            Err(PluginEventError::RouteMismatch)
+        ));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn typed_dispatch_loop_acknowledges_a_stale_agent_route_as_failure() {
+        let (dispatcher, plugin_rx) = crate::plugin_event_dispatch::bounded_plugin_event_dispatch();
+        let resolver = PluginEventRouteResolver::new(|instance, _| {
+            Ok(PluginEventResolution::Authorized(
+                ResolvedPluginEventRoute::agent(instance, "removed-agent")?,
+            ))
+        });
+        let event_router = PluginEventRouter::new(resolver, dispatcher);
+        let endpoint = zeroclaw_plugins::endpoint::PluginChannelEndpoint::new(
+            plugin_event_scope("event-fixture", "operations"),
+            "plugin",
+        )
+        .expect("bind plugin event fixture");
+        let agent_router = AgentRouter::multi(HashMap::new(), HashMap::new(), None, None);
+        let (native_tx, native_rx) = tokio::sync::mpsc::channel(1);
+        let dispatch_loop = zeroclaw_spawn::spawn!(async move {
+            run_message_dispatch_loop_with_plugin_events(native_rx, plugin_rx, agent_router, 1)
+                .await;
+        });
+        let message = channel_message("plugin", Some("operations"));
+
+        assert!(matches!(
+            event_router.submit(&endpoint, message).await,
+            Err(PluginEventError::DispatchFailed(_))
+        ));
+        drop(native_tx);
+        tokio::time::timeout(Duration::from_secs(1), dispatch_loop)
+            .await
+            .expect("native receiver closure stops the shared dispatch loop")
+            .expect("dispatch loop joins");
     }
 
     #[test]
@@ -22769,6 +23398,10 @@ This is an example JSON object for profile settings."#;
         err: Mutex<Option<anyhow::Error>>,
     }
 
+    struct PluginLifecycleChannel {
+        calls: Arc<AtomicUsize>,
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -22822,6 +23455,18 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for PluginLifecycleChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Plugin,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "operations"
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for BlockUntilClosedChannel {
         fn name(&self) -> &str {
@@ -22862,6 +23507,68 @@ This is an example JSON object for profile settings."#;
             }
             Ok(())
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PluginLifecycleChannel {
+        fn name(&self) -> &str {
+            "plugin"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_only_channel_enters_the_shared_listener_lifecycle_with_exact_alias() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(PluginLifecycleChannel {
+            calls: Arc::clone(&calls),
+        });
+        let mut configured = Vec::new();
+        append_configured_plugin_channels(&mut configured, vec![channel]);
+
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].alias.as_deref(), Some("operations"));
+        let map = configured_channel_map(&configured);
+        assert!(map.contains_key("plugin.operations"));
+        assert!(map.contains_key("plugin"));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(
+            Arc::clone(&configured[0].channel),
+            configured[0].alias.clone(),
+            tx,
+            1,
+            1,
+            cancel.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("plugin-only listener must start under shared supervision");
+        drop(rx);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("plugin-only listener must stop with shared cancellation")
+            .expect("plugin-only listener task must join cleanly");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
