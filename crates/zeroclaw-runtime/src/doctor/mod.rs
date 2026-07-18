@@ -80,6 +80,7 @@ impl DiagItem {
 pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     let mut items: Vec<DiagItem> = Vec::new();
 
+    check_degraded_sections(config, &mut items);
     check_config_semantics(config, &mut items);
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
@@ -111,11 +112,6 @@ fn model_probe_row(label: &str, probe: &ModelProbe) -> DiagResult {
     }
 }
 
-/// Collapse per-type model probes: when ≥2 aliases of a provider type return
-/// the same result, emit a single `type: …` row; otherwise emit each alias as
-/// `type.alias: …` so divergence (or a single configured alias) stays visible.
-/// Input is in iteration order, where aliases of a type are contiguous (that's
-/// how `iter_entries` yields them). Pure — separated for unit testing.
 fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     let mut groups: Vec<(String, Vec<(String, ModelProbe)>)> = Vec::new();
     for (name, probe) in probes {
@@ -165,12 +161,6 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
-/// Cross-check OpenAI Codex (OAuth/subscription) credentials against the
-/// OpenAI provider slots that opt into them via `requires_openai_auth`.
-///
-/// Pure — separated for unit testing. Takes the already-resolved fact "is a
-/// Codex credential present?" plus the live `Config`, reads slot state on
-/// demand, and stores nothing (single-source-of-truth rule).
 fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<DiagItem> {
     const CAT: &str = "providers.auth";
 
@@ -742,11 +732,6 @@ fn model_in_catalog(model: &str, catalog: &[String]) -> bool {
     catalog.iter().any(|id| id == model)
 }
 
-/// List the models configured in `config.toml` (one per `[providers.models.*]`
-/// entry). Default is an offline readout; `verify = true` (`models list
-/// --check`, and the `doctor models` health path) additionally probes each
-/// provider's live catalog and flags whether the configured model is actually
-/// available.
 pub async fn run_configured_models(
     config: &Config,
     provider_override: Option<&str>,
@@ -918,6 +903,33 @@ pub fn run_traces(
 }
 
 // ── Config semantic validation ───────────────────────────────────
+
+/// Surface config sections the resilient loader dropped at load time
+/// (`Config::degraded_sections` / `Config::degraded_security`, populated by
+/// `migrate_to_current_salvaged` in `zeroclaw-config`) so `doctor` names the
+/// actual malformed section instead of downstream checks reporting confusing
+/// secondary symptoms (e.g. "no channels configured").
+fn check_degraded_sections(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    for path in &config.degraded_security {
+        items.push(DiagItem::error(
+            cat,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-degraded-security",
+                &[("path", path.as_str())],
+            ),
+        ));
+    }
+    for path in &config.degraded_sections {
+        items.push(DiagItem::warn(
+            cat,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-degraded-section",
+                &[("path", path.as_str())],
+            ),
+        ));
+    }
+}
 
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
@@ -1135,18 +1147,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 }
 
-/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
-/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
-/// verbatim and never invokes a shell, so values like `~/web-dist` or
-/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
-/// find the bundled assets — surface that here at `zeroclaw doctor` time
-/// instead of at runtime. Parallel check lives in
-/// `src/commands/self_test.rs::check_web_dist_dir`.
-///
-/// User-facing message goes through Fluent
-/// (`cli-doctor-web-dist-dir-expansion-warning`) per AGENTS.md §
-/// Localization — no bare Rust literals for CLI output. Reason phrases
-/// are Fluent keys too (`cli-web-dist-dir-reason-{tilde,dollar}`).
 fn check_web_dist_dir(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
     match config.gateway.web_dist_dir.as_deref() {
@@ -1277,12 +1277,6 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
-    // Per-agent personality files. These are resolved per agent from
-    // `<install>/agents/<alias>/workspace/` (or an explicit
-    // `[agents.<alias>.workspace.path]` override) — never from `data_dir`.
-    // Iterate every enabled agent so multi-agent installs each get checked,
-    // and name the alias in the result so the report is unambiguous. Sorted
-    // for deterministic output (HashMap iteration order is unspecified).
     let mut agent_aliases: Vec<&String> = config.agents.keys().collect();
     agent_aliases.sort();
     for alias in agent_aliases {
@@ -1777,6 +1771,57 @@ mod tests {
     }
 
     #[test]
+    fn degraded_sections_reported_as_warning() {
+        let config = Config {
+            degraded_sections: vec!["channels.telegram.default".to_string()],
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("channels.telegram.default"));
+        assert!(
+            item.is_some(),
+            "expected a diagnostic naming the degraded section, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn degraded_security_reported_as_error() {
+        let config = Config {
+            degraded_security: vec!["security".to_string()],
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        let item = items.iter().find(|i| {
+            i.category == "config"
+                && i.severity == Severity::Error
+                && i.message.contains("security")
+        });
+        assert!(
+            item.is_some(),
+            "expected an error diagnostic naming the degraded security section, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clean_config_reports_no_degraded_sections() {
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        assert!(
+            items.is_empty(),
+            "a config with no degraded sections must not produce degraded-section diagnostics, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn configured_model_provider_api_key_uses_alias_profile() {
         let mut config = Config::default();
         config
@@ -1861,13 +1906,6 @@ mod tests {
         );
         assert_eq!(prov_item.unwrap().severity, Severity::Warn);
     }
-
-    // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`
-    // and `config_validation_accepts_custom_provider` are obsolete: the typed
-    // ModelProviders container can't represent malformed `custom:` outer keys at
-    // all. Custom-URL model_providers now live under the `custom` typed slot with the
-    // operator-supplied URL in `base.uri`. The malformed-custom-key validator
-    // path is unreachable.
 
     #[test]
     fn config_validation_warns_empty_model_route() {
@@ -2165,7 +2203,7 @@ mod tests {
     fn diagnose_flags_web_dist_dir_with_tilde() {
         // Asserts the localized Fluent message resolves and inlines the path +
         // the tilde reason — the diagnostic now goes through Fluent per
-        // AGENTS.md (#6961 Round 3).
+        // AGENTS.mdRound 3).
         let mut config = Config::default();
         config.gateway.web_dist_dir = Some("~/web-dist".to_string());
 

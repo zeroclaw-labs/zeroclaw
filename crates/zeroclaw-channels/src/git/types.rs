@@ -1,11 +1,3 @@
-//! Contract layer for the git-forge channel.
-//!
-//! Provider-agnostic constants, identifier newtypes, and the channel error
-//! enum. Zero business logic and zero forge specifics — sibling modules
-//! (`events`, `poll`, `router`, `traits`, `channel`) depend on this file;
-//! provider implementations under `providers::<forge>` depend on it too,
-//! but the forge's REST payload structs live with the provider, never here.
-
 use chrono::{DateTime, Utc};
 
 /// Maximum characters per posted comment. GitHub caps bodies at 65536;
@@ -140,12 +132,6 @@ impl std::fmt::Display for IssueRef {
     }
 }
 
-/// Errors raised by the git-forge channel and its providers.
-///
-/// Variants are provider-neutral in shape; messages name the forge where
-/// it aids the operator. Forge-specific failures (key loading, JWT) carry
-/// the forge in the message rather than in the variant set, so a second
-/// provider reuses the same error type without growing it.
 #[derive(Debug, thiserror::Error)]
 pub enum GitChannelError {
     #[error(

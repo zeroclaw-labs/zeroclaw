@@ -201,11 +201,6 @@ async fn fetch_link_summary(url: &str, timeout_secs: u64) -> Option<LinkSummary>
     Some(LinkSummary { title, snippet })
 }
 
-/// Enrich a message by prepending link summaries for any URLs found in the text.
-///
-/// This is the main entry point called from the channel message processing pipeline.
-/// If the enricher is disabled or no URLs are found, the original message is returned
-/// unchanged.
 pub async fn enrich_message(content: &str, config: &LinkEnricherConfig) -> String {
     if !config.enabled || config.max_links == 0 {
         return content.to_string();

@@ -6,13 +6,6 @@ use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-// MIME types we will inline for vision providers. Deliberately excludes
-// `image/bmp`: no major vision provider (Anthropic, OpenAI) accepts BMP, so
-// inlining it would make the *entire* provider request fail rather than just
-// dropping the one image. Rejecting it here instead surfaces a clean
-// "could not be loaded" note while the request (and any accompanying text or
-// metadata) still goes through. BMP is still detected by `detect_mime` so the
-// skip is logged as an explicit unsupported-MIME event rather than "unknown".
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
@@ -117,11 +110,6 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
-/// Returns true for payloads that are plausibly loadable image references:
-/// absolute filesystem paths, `http(s)://` URLs, or base64 `data:` URIs.
-/// Placeholder-style payloads like `...`, `<path>`, or `example.png` fail
-/// this check and are left as literal text by [`parse_image_markers`], so
-/// illustrative markdown in a conversation does not trigger loader errors.
 fn is_loadable_image_reference(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("http://")
@@ -149,16 +137,6 @@ fn is_windows_path(candidate: &str) -> bool {
     matches!(chars.next(), Some('\\') | Some('/'))
 }
 
-/// Returns true for Windows UNC share paths like `\\server\share\…`.
-///
-/// `image_info` emits these after unwrapping the verbatim-UNC prefix
-/// (`\\?\UNC\…`) that `canonicalize` produces on Windows. Without recognizing
-/// the unwrapped form here, [`is_loadable_image_reference`] would reject the
-/// marker (it is neither a `/`-rooted POSIX path nor a `C:\` drive path), so
-/// [`parse_image_markers`] would leave it as literal text and the image would
-/// never be inlined for vision models. Requires a non-empty server component
-/// and at least one further path segment; the verbatim/device prefixes
-/// (`\\?\…`, `\\.\…`) are rejected because they are not plain shares.
 fn is_windows_unc_path(candidate: &str) -> bool {
     let Some(rest) = candidate.strip_prefix(r"\\") else {
         return false;
@@ -172,12 +150,6 @@ fn is_windows_unc_path(candidate: &str) -> bool {
     !server.is_empty() && !share.is_empty()
 }
 
-/// Normalize a marker payload that may have been line-wrapped when pasted
-/// from a terminal (e.g. a log line where a long path was broken across
-/// rows with leading indentation). Interior newlines — and any whitespace
-/// immediately following them — are dropped; leading/trailing whitespace
-/// is trimmed. Legitimate paths may contain spaces but never newlines, so
-/// this only recovers corrupted markers and does not mangle real paths.
 fn collapse_wrapped_marker(raw: &str) -> String {
     if !raw.contains('\n') && !raw.contains('\r') {
         return raw.trim().to_string();
@@ -261,15 +233,6 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
-/// Count image markers that originate from genuine **user** messages (i.e.
-/// inbound attachments), excluding tool-result carriers (`role == "tool"` and
-/// `[Tool results]` user messages).
-///
-/// Callers use this to distinguish "the user sent an image we cannot see"
-/// (which should surface a user-facing capability error so the attachment is
-/// not silently ignored) from "an image marker arrived only via a tool result"
-/// (e.g. `image_info`/`screenshot`/`image_gen`), which can degrade to text-only
-/// on a non-vision provider without misleading the user.
 pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -278,18 +241,6 @@ pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
-/// Count image markers in the **most recent** genuine user message (the newest
-/// inbound user turn), ignoring tool-result carriers and any earlier user
-/// messages still present in history.
-///
-/// This is the turn-scoped counterpart to [`count_user_image_markers`]. It lets
-/// the vision router distinguish "the user *just* sent an image we cannot see"
-/// (surface a capability error so the attachment is not silently ignored) from
-/// "an earlier user image is merely carried over in history" (degrade to
-/// text-only). Erroring on a carried-over marker would poison every later turn,
-/// since the marker lives in the long-lived session history permanently. That
-/// was the reported bug: a single image to a non-vision provider made every
-/// subsequent text turn fail.
 pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -299,22 +250,6 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .unwrap_or(0)
 }
 
-/// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
-/// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
-/// `[media attachment]`. Match is case-insensitive to align with the channel
-/// attachment parsers, which all uppercase the kind before comparing
-/// (`crates/zeroclaw-channels/src/util.rs::ATTACHMENT_KINDS`,
-/// `telegram.rs`, `discord.rs`, `qq.rs`, `whatsapp_web.rs`).
-///
-/// Use before passing user-facing text to auxiliary `chat_with_system` calls
-/// (intent classification, summarization, delegation) so that local file
-/// paths from inbound channels do not leak to the upstream provider — the
-/// upstream API would otherwise receive a filesystem path as `image_url.url`
-/// and reject the request.
-///
-/// Auxiliary calls do not need to *see* the media content; they only route
-/// or summarize, so the placeholder is sufficient. The main agent loop
-/// continues to call `prepare_messages_for_provider` for full normalization.
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
@@ -434,17 +369,6 @@ fn replay_message_without_stale_tool_images(
     }
 }
 
-/// Attempt to normalize image markers inside a native tool-result JSON
-/// payload produced by `NativeToolDispatcher::to_provider_messages`. On
-/// success, returns the reserialized JSON string with the inner `content`
-/// field rewritten to inline `[IMAGE:data:…]` markers (data URIs). Returns
-/// `Ok(None)` when the payload is not a JSON object with a string `content`
-/// field, when the inner content has no normalizable markers, or when no
-/// rewriting is needed — letting the caller fall through to the existing
-/// plain-text path. The returned JSON preserves `tool_call_id` and any
-/// other top-level fields so downstream native adapters
-/// (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`) can keep
-/// recovering the tool-call linkage via `serde_json::from_str`.
 async fn normalize_native_tool_result_json(
     content: &str,
     config: &MultimodalConfig,
@@ -548,16 +472,6 @@ async fn prepare_messages_inner(
             continue;
         }
 
-        // Native tool dispatchers wrap tool results as a JSON object
-        // (`{"tool_call_id":"…","content":"…"}`) so that provider adapters
-        // can recover `tool_call_id` via `serde_json::from_str` on
-        // `message.content`. Treating that JSON blob as plain text would
-        // strip markers out of the `content` field and append the data URI
-        // outside the JSON object, breaking the native tool-result contract
-        // and dropping `tool_call_id`. When we recognise that shape,
-        // normalize only the inner `content` string and reserialize the
-        // JSON so adapters keep seeing the structure they expect. Falls
-        // through to the plain-text path for non-JSON tool messages.
         if message.role == "tool"
             && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
                 &message.content,
@@ -660,11 +574,6 @@ async fn prepare_messages_inner(
         messages: capped_messages,
     })
 }
-/// Strip images from user messages that are more than `max_turns` turns back
-/// from the end of `messages`.  A "turn" here is counted as a user-role
-/// message, so `max_turns = 2` keeps images in the two most recent user
-/// messages and strips them from all earlier ones.  Tool-result images are
-/// handled by the stale-tool-result mechanism and are left untouched.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
     // Count user messages from the end to find the cutoff index.
     let mut user_turn_count = 0usize;
@@ -833,17 +742,6 @@ async fn normalize_image_references(
                     "reason": error_reason.as_deref().unwrap_or(""),
                     "marker_preview": marker_preview,
                 });
-                // Severity rules:
-                //   - For inbound user attachments, any failure is a real
-                //     loss the operator cares about → WARN.
-                //   - For tool-result content, marker-looking strings often
-                //     come from tool output that just happened to contain
-                //     `[IMAGE:...]` patterns (e.g. an agent reading a test
-                //     fixture, a code search hitting an assertion, log
-                //     snippets). Treat best-effort recoverable failures as
-                //     DEBUG so they stop drowning real signal. Keep WARN
-                //     only for configuration/limit problems that the
-                //     operator can actually act on.
                 let is_tool_role = ctx.role == "tool";
                 let is_recoverable_load_failure = matches!(
                     error_kind,
@@ -1357,7 +1255,7 @@ mod tests {
 
     #[test]
     fn parse_image_markers_extracts_unc_path() {
-        // Regression for the #7446 Windows follow-up: `image_info` unwraps the
+        // Regression for theWindows follow-up: `image_info` unwraps the
         // verbatim-UNC prefix (`\\?\UNC\…`) to a plain `\\server\share\…`
         // path, which must be treated as a loadable image reference (not left
         // as literal text) so the image reaches vision models.
@@ -1461,11 +1359,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // Covers the plain-text fallback path for `role == "tool"` messages
-    // whose `content` is not a native-dispatcher JSON payload (e.g.
-    // synthetic XML-shaped input or future non-JSON tool transports). The
-    // JSON-shaped native contract is exercised by
-    // `prepare_messages_preserves_native_tool_result_json_shape` below.
     async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("tool-sample.png");
@@ -1496,17 +1389,6 @@ mod tests {
         assert!(refs[0].starts_with("data:image/png;base64,"));
     }
 
-    // Regression for the JSON-clobber bug surfaced on PR #6183: native tool
-    // dispatchers serialize tool results as `{"tool_call_id":"…","content":"…"}`
-    // and downstream adapters (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`)
-    // recover `tool_call_id` via `serde_json::from_str` on the message
-    // content. The multimodal preprocessor must keep that JSON intact while
-    // still inlining any `[IMAGE:/path]` markers inside the inner `content`
-    // field. Asserts:
-    //   1. Prepared content is still valid JSON.
-    //   2. `tool_call_id` survives unchanged.
-    //   3. The inner `content` field carries `data:image/png;base64,…`
-    //      (marker rewritten) and keeps surrounding text.
     #[tokio::test]
     async fn prepare_messages_preserves_native_tool_result_json_shape() {
         let temp = tempfile::tempdir().unwrap();
@@ -1855,10 +1737,10 @@ mod tests {
             ChatMessage::user("[IMAGE:/tmp/new.png]\nNew caption".to_string()),
         ];
 
-        // Should not error — instead trims oldest.
-        // (Will error on normalize_image_reference for the surviving images
-        //  since /tmp/mid.png and /tmp/new.png don't exist, but the trimming
-        //  itself should succeed.)
+        // Should not error — instead trims oldest. (Will error on
+        // normalize_image_reference for the surviving images since
+        // /tmp/mid.png and /tmp/new.png don't exist, but the trimming
+        // itself should succeed.)
         let trimmed = trim_old_images(&messages, 2);
         assert_eq!(trimmed.len(), 3);
 
@@ -2088,11 +1970,6 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_messages_caps_to_newest_successful_images() {
-        // Regression for the dead pre-normalization trim: with more valid images
-        // than the cap, normalization must run on all of them and the cap must
-        // keep the *newest* `max_images`, dropping the oldest. Exactly one
-        // "post-normalization image cap exceeded" path should fire — there is no
-        // longer a separate, misleading pre-normalization "trimmed_to" warning.
         let temp = tempfile::tempdir().unwrap();
         // Minimal valid PNG (1x1 RGB pixel).
         let png_data = [
@@ -2306,8 +2183,6 @@ mod tests {
         assert_eq!(payload, "abcd==");
     }
 
-    /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision model_providers.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
@@ -2317,8 +2192,6 @@ mod tests {
         assert_eq!(refs[0], "/tmp/photo.jpg");
     }
 
-    /// An image-only message (no caption) should produce an empty string after
-    /// marker stripping, so callers can drop it from history.
     #[test]
     fn parse_image_markers_image_only_message_becomes_empty() {
         let input = "[IMAGE:/tmp/photo.jpg]";
