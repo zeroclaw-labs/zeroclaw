@@ -11,14 +11,6 @@ use ratatui::{
 };
 use std::sync::Arc;
 
-/// Display placeholder the daemon emits for an unset `Option` field,
-/// mirroring `zeroclaw_config::traits::UNSET_DISPLAY`. zerocode talks to
-/// the daemon over RPC and mirrors config types on the wire rather than
-/// depending on `zeroclaw-config`, so the sentinel is duplicated here.
-/// It is a *display* value, never a real default — seeding a field
-/// buffer with it or submitting it makes the daemon validate `<unset>`
-/// against the field's true type (e.g. a bool), which fails with
-/// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
 const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
 const MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT: usize = 5;
@@ -140,18 +132,6 @@ impl Selector {
     }
 }
 
-/// Drop validation errors for selectors the user hasn't filled yet.
-///
-/// `revalidate` runs after every selector commit, and the runtime
-/// validates the *whole* submission, short-circuiting at the first
-/// failing step. Mid-build that first failure is almost always a
-/// selector the user simply hasn't reached — e.g. the empty risk
-/// profile, surfacing the instant the model provider is committed. Shown
-/// as a red "1 error(s) — fix selectors and resubmit", it reads as if the
-/// step they just finished broke. Keep only errors for selectors the user
-/// has actually filled; unfilled ones are already tracked as `[ ]` in the
-/// checklist, and submit re-validates the full set with nothing empty to
-/// short-circuit on.
 fn retain_filled_selector_errors(
     form: &FormState,
     errors: Vec<QuickstartError>,
@@ -327,13 +307,6 @@ fn queue_apply_handoff(
     }
 }
 
-/// The character a key press contributes to a free-text buffer (the
-/// agent-name field), or `None` for control chords and non-character
-/// keys. Letters that double as modal hotkeys on file rows — `e` (edit
-/// in $EDITOR), `t` (from template), `c` (clear), `d` (delete) — are
-/// still plain text on a text row, so this deliberately ignores the
-/// chord mapping: the hotkey arms are gated on `on_file` and never fire
-/// while the cursor is on the name field.
 fn typed_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
@@ -412,16 +385,6 @@ fn runtime_picker_options(snapshot: Option<&QuickstartStateResult>) -> Vec<Picke
 }
 
 fn memory_options() -> Vec<PickerOption> {
-    // Walk every variant of the schema's canonical `MemoryBackendKind`.
-    // `serde_json::to_value` returns the `#[serde(rename_all =
-    // "snake_case")]` string for each variant — that string IS the
-    // wire key written into `memory.backend`, so the picker carries
-    // no parallel mapping. Variants come out in declaration order
-    // because `enum-iterator`-style iteration is unnecessary for a
-    // closed set: we list them once here against the schema and any
-    // schema additions are caught at compile time because
-    // `MemoryKind` is a public re-export and a `match` exhaustiveness
-    // check below would fail to compile if a variant were dropped.
     let variants: [MemoryKind; 6] = [
         MemoryKind::Sqlite,
         MemoryKind::Markdown,
@@ -455,12 +418,6 @@ fn memory_options() -> Vec<PickerOption> {
 }
 
 fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
-    // Source of truth is the daemon-side
-    // `zeroclaw_runtime::quickstart::snapshot_state`, which maps the
-    // canonical `zeroclaw_providers::list_model_providers()` registry
-    // into wire rows. Adding a model provider in
-    // `zeroclaw-providers` lights up here automatically — Quickstart
-    // never maintains its own list.
     let Some(snap) = snapshot else {
         return Vec::new();
     };
@@ -873,11 +830,6 @@ struct TextInputModal {
     peer_group_channel: Option<String>,
 }
 
-/// Lifecycle of the live model catalog for a ModelProvider FieldForm.
-/// The form opens immediately in `Pending` so the modal paints a
-/// loading row instead of the picker blocking on the catalog RPC; a
-/// later `tick` resolves it to `Loaded` (model row upgraded to an
-/// enum picker) or `Empty` (catalog unavailable → free-text fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelCatalogState {
     /// Section has no model row (channels) — nothing to load.
@@ -1254,11 +1206,6 @@ impl QuickstartPane {
             self.handle_modal_key(key).await;
             return false;
         }
-        // After Apply, `applied_alias` is set and the daemon is in the
-        // middle of reloading. Suppress all main-list key handling
-        // until the connection drops and the next `app::run`
-        // iteration consumes the armed Stage-2 intent. Pressing Enter
-        // here does nothing — there's no reachable RPC to act on.
         if self.applied_alias.is_some() {
             return false;
         }
@@ -1305,14 +1252,6 @@ impl QuickstartPane {
         }
     }
 
-    /// Route a bracketed-paste payload into the active modal's text
-    /// field. Mirrors the per-modal char-insertion rules in
-    /// `handle_modal_key` so paste lands in exactly the same buffer a
-    /// keystroke would: the TextInput buffer, the focused non-enum
-    /// FieldForm row (e.g. an `api_key`), or the Agent name row. Panes
-    /// without an active text target ignore the paste. Without this,
-    /// `app`'s `Event::Paste` had no Quickstart arm, so paste was
-    /// silently dropped on every Quickstart widget.
     pub fn handle_paste(&mut self, text: &str) {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
@@ -1348,14 +1287,6 @@ impl QuickstartPane {
             .await;
     }
 
-    /// Mouse handler. Recognises:
-    ///   - left-click on a modal row → moves modal cursor + synthesises
-    ///     Enter (committing that row);
-    ///   - left-click outside an active modal → closes the modal;
-    ///   - left-click on a selector row → moves the selector cursor +
-    ///     opens that selector's modal;
-    ///   - scroll up/down → moves the cursor on whichever surface is
-    ///     active (modal if open, otherwise selector list).
     pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent, _content: Rect) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let col = mouse.column;
@@ -2198,11 +2129,6 @@ impl QuickstartPane {
             .collect()
     }
 
-    /// Debounced-ish validation: after a selector commit, ask the
-    /// runtime whether the assembled submission would pass. Errors
-    /// land in `last_errors` and surface in the status strip. The
-    /// `quickstart/validate` path is read-only and cheap; we run it
-    /// once per commit rather than per keystroke.
     async fn revalidate(&mut self) {
         let submission = self.form.to_submission();
         match self.rpc.quickstart_validate(&submission).await {
@@ -2238,12 +2164,6 @@ impl QuickstartPane {
             }
         };
         let is_model_provider = matches!(section, QuickstartFieldSection::ModelProvider);
-        // Open the form before loading the live model catalog. The next
-        // idle tick upgrades the model row to a picker or paints the
-        // free-text fallback, so users see progress instead of a
-        // frozen modal while the catalog RPC runs. The row builder also
-        // handles bool toggles, enum defaults, and the synthetic model
-        // provider alias row.
         let mut rows = build_field_form_rows(section, fields, None);
         restore_field_form_rows_from_form(section, &type_key, &mut rows, &self.form);
         let model_catalog_state = if is_model_provider {
@@ -2640,15 +2560,6 @@ fn generate_run_id() -> String {
     format!("{now:x}-{pid:x}")
 }
 
-/// Wrapped visual-row height of each logical line at `width`, using the
-/// same word-wrap (`Wrap { trim: false }`) the modal body renders with.
-/// Every line occupies at least one row — a blank line still takes a row.
-///
-/// Sizing the modal by logical line count alone left it too short
-/// whenever content soft-wrapped: long risk-profile blurbs pushed the
-/// `yolo` option off-screen, and a long pasted `api_key` pushed the
-/// `model` picker out of view. These heights drive both the box size and
-/// the cursor-tracking scroll so the geometry survives wrapping.
 fn wrapped_row_heights(lines: &[Line], width: u16) -> Vec<u16> {
     lines
         .iter()
@@ -2873,11 +2784,6 @@ fn build_field_form_rows(
             if matches!(d.kind, crate::client::QuickstartFieldKind::Bool) {
                 d.enum_variants = Some(vec!["false".to_string(), "true".to_string()]);
             }
-            // For enum fields, default the buffer to the first variant
-            // so the user lands on a valid value. ←/→ cycles through the
-            // list. The daemon's `<unset>` placeholder for optional
-            // fields is treated as no value — seeding or submitting it
-            // would fail validation against the field's real type.
             let default = d
                 .default
                 .clone()
@@ -2991,11 +2897,6 @@ fn missing_template_error(filename: &str) -> QuickstartError {
     }
 }
 
-/// Paint the modal and return `(inner_rect, row_to_cursor)` so the
-/// pane's mouse handler can resolve a click to a cursor index. The
-/// `row_to_cursor` vec maps each body row (top → bottom) to either
-/// `Some(cursor_index)` for clickable rows or `None` for help /
-/// blank lines.
 fn draw_modal(
     frame: &mut Frame,
     area: Rect,
@@ -3108,13 +3009,6 @@ fn draw_modal(
                     row.buf.clone()
                 };
                 let is_empty_buf = raw_display.is_empty();
-                // Ghost text (the field default) is a placeholder for an
-                // empty buffer, but only when the row is NOT focused.
-                // Showing it on the focused row makes the default look
-                // like real, editable text the user cannot Backspace
-                // away — the alias `default` ghost-state defect. The
-                // focused empty row renders empty so the cursor sits
-                // where typing lands.
                 let show_ghost = is_empty_buf && !is_cursor && !is_enum;
                 let (display, value_style) = if is_model_row
                     && matches!(
@@ -3456,11 +3350,6 @@ fn draw_modal(
         .inner(Rect::new(area.x, area.y, box_w, area.height))
         .width;
 
-    // Size the box from the *wrapped* row counts, not the logical line
-    // counts. Long picker blurbs and long pasted field values (e.g. an
-    // `api_key`) soft-wrap across several rows; sizing by line count alone
-    // left the box too short, so later rows — the `yolo` risk option, the
-    // `model` picker — fell outside the viewport entirely.
     let body_heights = wrapped_row_heights(&body_lines, inner_width);
     let header_rows = wrapped_total(&header_lines, inner_width);
     // Prefix sums: where each logical body line begins in wrapped-row
@@ -3857,11 +3746,6 @@ mod tests {
 
     #[test]
     fn optional_channel_and_peer_group_rows_do_not_block_submit() {
-        // Regression: Channels and Peer groups are labelled optional,
-        // but the checklist stayed incomplete until the user opened
-        // each row and explicitly confirmed "none". They still render
-        // as incomplete when empty so optional "skipped" is not
-        // confused with "completed".
         let f = complete_form();
         assert!(f.channels.is_empty());
         assert!(f.peer_groups.is_empty());
@@ -4535,11 +4419,6 @@ mod tests {
 
     #[test]
     fn revalidate_hides_errors_for_unfilled_selectors() {
-        // Regression: committing the model provider triggered a full
-        // re-validate. The runtime short-circuits at the first failing
-        // step, so the still-empty risk profile came back as a single
-        // error and the status strip flashed "1 error(s) — fix selectors
-        // and resubmit", as if the provider step had failed.
         let mut f = FormState::default_form();
         f.provider_type = "anthropic".into();
         f.provider_alias = "default".into();
@@ -4583,13 +4462,6 @@ mod tests {
 
     #[test]
     fn name_field_accepts_hotkey_letters() {
-        // Regression: e/t/c/d double as Agent-modal hotkeys (edit in
-        // $EDITOR, from template, clear, delete) on file rows. On the
-        // name row they are plain text, but the old handler routed every
-        // keypress through the chord mapping and dropped any char that
-        // resolved to an action — so agent names could not contain those
-        // letters. `typed_char` is the text-buffer path; assert it keeps
-        // them, and that they really are bound actions (bug was reachable).
         use crate::keymap::QuickstartModalAction;
         for ch in ['e', 'c', 't', 'd', 'E', 'C', 'T', 'D'] {
             let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
@@ -4611,11 +4483,6 @@ mod tests {
 
     #[test]
     fn unset_placeholder_is_not_a_real_default() {
-        // The daemon emits `<unset>` as a display placeholder for
-        // optional fields. Seeding a buffer with it (or submitting it)
-        // made the daemon validate `<unset>` against the field's real
-        // type, failing e.g. a bool with "length 7". Confirm the
-        // sentinel matches the daemon's UNSET_DISPLAY wire value.
         assert_eq!(UNSET_DISPLAY, "<unset>");
         let seeded = Some(UNSET_DISPLAY.to_string())
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
@@ -4701,11 +4568,6 @@ mod tests {
 
     #[test]
     fn wrapped_total_counts_soft_wrapped_rows() {
-        // Regression: the modal box was sized from logical line count, so
-        // a picker blurb (or pasted value) wider than the box still
-        // counted as one row — leaving later options like `yolo` outside
-        // the viewport. `wrapped_total` must report the real wrapped
-        // height the body Paragraph renders.
         let long = Line::from("a".repeat(40));
         assert_eq!(wrapped_total(std::slice::from_ref(&long), 10), 4);
         // A blank line still occupies one row.
@@ -4727,11 +4589,6 @@ mod tests {
         assert_eq!(wrapped_total(&lines, 10), 5);
     }
 
-    /// Render a modal through a headless `TestBackend` and return the
-    /// `(box_rect, per-cursor hit-rects)` `draw_modal` produced — the same
-    /// geometry the live render path uses, so a test can assert on the
-    /// post-scroll, wrapped-row layout instead of just the measurement
-    /// primitives.
     fn render_modal_rects(area: Rect, modal: &Modal) -> (Rect, Vec<Rect>) {
         use ratatui::{Terminal, backend::TestBackend};
         let backend = TestBackend::new(area.width, area.height);
@@ -4760,12 +4617,6 @@ mod tests {
 
     #[test]
     fn picker_keeps_every_option_visible_when_blurbs_wrap() {
-        // #7359 headline: each risk-profile option carries an inline help
-        // blurb that wraps to two rows. The old box was sized from the
-        // logical line count (3), so the last option (`yolo`) fell off the
-        // bottom. With wrapped sizing the box grows to fit all three, and
-        // the hit-rects are spaced by *wrapped* height (>=2 rows apart),
-        // not logical lines (which would be 1 apart — the pre-fix bug).
         let help = "Applies specific filesystem and approval defaults for day-to-day operation.";
         let modal = risk_picker(2, help);
         let area = Rect::new(0, 0, 60, 24);
@@ -4786,12 +4637,6 @@ mod tests {
 
     #[test]
     fn picker_scrolls_to_keep_selected_option_visible() {
-        // When even the grown box can't fit every wrapped row, the selected
-        // row must scroll into view: its hit-rect is non-zero while an
-        // earlier row that scrolled off the top collapses to a zero rect.
-        // This exercises the row_starts -> scroll_offset -> row_rects chain
-        // that the measurement-helper tests don't reach. On the pre-fix code
-        // (logical-line scroll) the first option's rect stayed non-zero.
         let help = "Applies specific filesystem and approval defaults, with extra \
                     explanation to force several wrapped rows inside a narrow modal box.";
         let modal = risk_picker(2, help);

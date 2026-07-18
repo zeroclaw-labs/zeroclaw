@@ -1,16 +1,4 @@
 //! Runtime-generated OpenAPI 3.1 document for the new `/api/config/*` surface.
-//!
-//! Built from the same `schemars::JsonSchema` derives the request/response
-//! types carry. The generator does not introspect the axum router — instead it
-//! walks a hand-maintained `(method, path, request_type, response_type)` list
-//! local to this module. New endpoints under the same surface should be added
-//! to that list when they land. CI checks (forthcoming) can diff the rendered
-//! spec against a committed snapshot to fail builds when handlers are added
-//! without a corresponding OpenAPI entry.
-//!
-//! Cached behind a `OnceCell` because the spec is static per build.
-//!
-//!
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
@@ -40,13 +28,6 @@ use schemars::{JsonSchema, schema_for};
 
 static CACHED: OnceLock<serde_json::Value> = OnceLock::new();
 
-/// `GET /api/docs` — the Scalar API explorer page. Loads the standalone Scalar
-/// bundle from a CDN and points it at `/api/openapi.json`. The page is a
-/// single static HTML blob — no NPM dep, no committed bundle, ~2KB.
-///
-/// Authentication: Scalar's built-in panel prompts the user for the bearer
-/// token before any "Try it out" call, so the docs themselves are
-/// unauthenticated but the live calls honor the existing pairing/bearer auth.
 pub async fn handle_docs() -> Response {
     let html = include_str!("openapi_docs.html");
     let mut response = (StatusCode::OK, html).into_response();
@@ -74,12 +55,6 @@ pub async fn handle_openapi_json() -> Response {
     response
 }
 
-/// Build the OpenAPI 3.1 document. Pub so the `xtask gen-openapi` binary
-/// can render the same JSON the gateway serves and write it to the
-/// committed snapshot at `crates/zeroclaw-gateway/openapi.json`. CI
-/// staleness check (`xtask gen-openapi --check`) diffs the rendered
-/// spec against the committed file so a handler change without a spec
-/// update fails the build.
 #[cfg(feature = "schema-export")]
 pub fn build_spec() -> serde_json::Value {
     use crate::api_config::{
@@ -490,21 +465,10 @@ fn augment_spec_with_a2a(
     }
 }
 
-/// schemars emits nested types under each component's `$defs` and
-/// references them as `#/$defs/<Name>`. OpenAPI 3.1 tooling
-/// (openapi-typescript, Scalar, codegen) expects them at top-level
-/// `#/components/schemas/<Name>`. Hoist every `$defs` entry into
-/// `components.schemas` and rewrite refs in place so the spec validates
-/// and external tooling can walk it.
 #[cfg(feature = "schema-export")]
 fn flatten_defs_into_components(spec: &mut serde_json::Value) {
     use serde_json::Value;
 
-    // Collect every `$defs` map across the spec — typically one per
-    // top-level component schema. Hoist entries into a single
-    // `components.schemas` map. Later entries with the same name win;
-    // the macro generates identical schemas for identical types so
-    // collisions are benign.
     let mut hoisted: serde_json::Map<String, Value> = serde_json::Map::new();
     collect_defs(spec, &mut hoisted);
     if let Some(schemas) = spec

@@ -174,11 +174,6 @@ pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
     });
 }
 
-/// Guard returned by [`set_scoped_broadcast_hook`].
-///
-/// Dropping the guard removes the hook it installed, but only if a later caller
-/// has not already replaced the process-wide hook. If multiple scoped hooks are
-/// live at once, dropping the newest hook restores the previous still-live hook.
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
 pub struct BroadcastHookGuard {
     scoped_id: u64,
@@ -370,12 +365,6 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
             {
-                // Derive the per-observer content policy once, at the observer
-                // construction boundary. `ObservabilityConfig` remains the source
-                // of truth; this immutable snapshot is owned by the `OtelObserver`
-                // and consulted at the OTel export boundary. There is no
-                // process-global mutable content policy, so concurrently live
-                // observers with different policies never drift into each other.
                 let content_config = OtelContentConfig::from_observability_config(config);
 
                 match OtelObserver::new(

@@ -1,14 +1,4 @@
 //! Custom wa-rs storage backend using ZeroClaw's rusqlite
-//!
-//! This module implements all 4 wa-rs storage traits using rusqlite directly,
-//! avoiding the Diesel/libsqlite3-sys dependency conflict from wa-rs-sqlite-storage.
-//!
-//! # Traits Implemented
-//!
-//! - [`SignalStore`]: Signal protocol cryptographic operations
-//! - [`AppSyncStore`]: WhatsApp app state synchronization
-//! - [`ProtocolStore`]: WhatsApp Web protocol alignment
-//! - [`DeviceStore`]: Device persistence operations
 
 #[cfg(feature = "whatsapp-web")]
 use async_trait::async_trait;
@@ -38,11 +28,6 @@ use wacore::store::traits::DeviceStore as DeviceStoreTrait;
 #[cfg(feature = "whatsapp-web")]
 use wacore::store::traits::*;
 
-/// Custom wa-rs storage backend using rusqlite
-///
-/// This implements all 4 storage traits required by wa-rs.
-/// The backend uses ZeroClaw's existing rusqlite setup, avoiding the
-/// Diesel/libsqlite3-sys conflict from wa-rs-sqlite-storage.
 #[cfg(feature = "whatsapp-web")]
 #[derive(Clone)]
 pub struct RusqliteStore {
@@ -54,11 +39,6 @@ pub struct RusqliteStore {
     device_id: i32,
 }
 
-/// Helper macro to convert rusqlite errors to StoreError
-/// For execute statements that return usize, maps to ()
-///
-/// Wraps the underlying error in a `Box<dyn std::error::Error + Send + Sync>`
-/// to match the `StoreError::Database` variant signature in wacore 0.6.
 macro_rules! to_store_err {
     // For expressions returning Result<usize, E>
     (execute: $expr:expr) => {
@@ -133,11 +113,6 @@ pub fn persisted_device_exists<P: AsRef<Path>>(db_path: P) -> bool {
 
 #[cfg(feature = "whatsapp-web")]
 impl RusqliteStore {
-    /// Create a new rusqlite-based storage backend
-    ///
-    /// # Arguments
-    ///
-    /// * `db_path` - Path to the SQLite database file (will be created if needed)
     pub fn new<P: AsRef<Path>>(db_path: P) -> anyhow::Result<Self> {
         let db_path = db_path.as_ref().to_string_lossy().to_string();
 
@@ -169,11 +144,6 @@ impl RusqliteStore {
     fn init_schema(&self) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
 
-        // Decide whether the `raw_id` ALTER is needed BEFORE opening the tx.
-        // PRAGMA table_info is read-only and may target a not-yet-created
-        // table (returns no rows) — in that case the CREATE TABLE inside the
-        // transaction will produce the column anyway, so `needs_raw_id` stays
-        // false and we correctly skip the ALTER.
         let needs_raw_id = {
             let mut stmt = conn.prepare("PRAGMA table_info(device_registry)")?;
             let mut has_raw_id = false;
@@ -189,13 +159,6 @@ impl RusqliteStore {
             table_exists && !has_raw_id
         };
 
-        // Probe `device` for the 5 wacore-0.6 columns. Each entry is
-        // (column_name, SQL fragment for ALTER TABLE ... ADD COLUMN).
-        // The order mirrors upstream's sqlite-storage migration history
-        // so a sqlite-browser diff against an upstream DB is readable.
-        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so we resolve which
-        // ones to add up-front and apply only the missing ones inside
-        // the transaction — same crash-safety contract as `raw_id`.
         let device_06_migrations: Vec<(&'static str, &'static str)> = {
             let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut stmt = conn.prepare("PRAGMA table_info(device)")?;
@@ -224,11 +187,6 @@ impl RusqliteStore {
             }
         };
 
-        // Wrap CREATEs + the conditional ALTER in a single transaction so a
-        // crash between them can't leave the DB with new tables but no
-        // `raw_id` column — that state survives reboots because the PRAGMA
-        // probe sees the column as missing yet the ALTER may have already
-        // been recorded as run.
         let tx = to_store_err!(conn.transaction())?;
 
         to_store_err!(tx.execute_batch(
@@ -425,12 +383,6 @@ impl RusqliteStore {
                 ON sent_messages(device_id, created_at);",
         ))?;
 
-        // Migration: ensure `raw_id` column exists on legacy device_registry
-        // rows (added in wacore 0.6 for ADV identity-change detection).
-        // SQLite has no `IF NOT EXISTS` for ADD COLUMN, so we use the pragma
-        // probe performed above to skip the ALTER if it is already applied.
-        // Runs inside the same transaction as the CREATEs so a crash between
-        // them rolls everything back.
         if needs_raw_id {
             to_store_err!(execute: tx.execute(
                 "ALTER TABLE device_registry ADD COLUMN raw_id INTEGER",
@@ -438,12 +390,6 @@ impl RusqliteStore {
             ))?;
         }
 
-        // Apply the wacore-0.6 device column migrations inside the same
-        // transaction as the CREATEs + raw_id ALTER. SQLite refuses to
-        // ALTER TABLE if the column already exists, so we use the
-        // pre-computed `device_06_migrations` list rather than a blanket
-        // probe inside the loop (which would re-read PRAGMA after each
-        // ALTER and complicate failure modes).
         for (col, ty) in &device_06_migrations {
             to_store_err!(execute: tx.execute(
                 &format!("ALTER TABLE device ADD COLUMN {col} {ty}"),
@@ -766,11 +712,6 @@ impl AppSyncStore for RusqliteStore {
     ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
 
-        // Store the MAC bytes raw, not JSON-wrapped: `get_mutation_mac` feeds the
-        // returned value_mac straight into the app-state LTHash, which must see
-        // the original bytes — matches InMemoryStore and the diesel SqliteStore.
-        // JSON-wrapping corrupts the running collection hash (snapshot MAC
-        // mismatch), which fails the critical app-state sync on first pairing.
         for mutation in mutations {
             to_store_err!(execute: conn.execute(
                 "INSERT OR REPLACE INTO app_state_mutation_macs
@@ -848,14 +789,6 @@ impl AppSyncStore for RusqliteStore {
 #[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl ProtocolStore for RusqliteStore {
-    // --- Per-Device Sender Key Tracking ---
-    //
-    // Replaces the wacore 0.2 SKDM-recipients model with WA Web's
-    // `participant.senderKey` map. Tracks per-device `(has_key)` status:
-    // `true` = SKDM already distributed, `false` = needs fresh SKDM.
-    // The legacy `skdm_recipients` table is kept around (no migration drops it)
-    // but is no longer read or written.
-
     async fn get_sender_key_devices(
         &self,
         group_jid: &str,
@@ -1182,13 +1115,6 @@ impl ProtocolStore for RusqliteStore {
         ))
     }
 
-    // NOTE: `mark_forget_sender_key` / `consume_forget_marks` were dropped from
-    // ProtocolStore in wacore 0.6. The lazy-deletion semantics they implemented
-    // (a separate "marked for forget" set drained on next send) are now handled
-    // in-band by the boolean status column on `sender_key_devices` (see
-    // `set_sender_key_status` above). The old `sender_key_status` table is left
-    // in place but is no longer read or written.
-
     // --- TcToken Storage ---
 
     async fn get_tc_token(&self, jid: &str) -> wacore::store::error::Result<Option<TcTokenEntry>> {
@@ -1285,15 +1211,6 @@ impl ProtocolStore for RusqliteStore {
 
         Ok(deleted)
     }
-
-    // --- Sent Message Store (retry support) ---
-    //
-    // Added in wacore 0.6 to mirror WA Web's `getMessageTable`. Each outbound
-    // send writes the protobuf-encoded payload here keyed by (chat_jid,
-    // message_id); retry-receipt handling consumes (atomic SELECT + DELETE)
-    // the entry so we don't double-retry. Expiry is invoked from a periodic
-    // cleanup hook ZeroClaw doesn't yet schedule — see TODO in
-    // `delete_expired_sent_messages`.
 
     async fn store_sent_message(
         &self,

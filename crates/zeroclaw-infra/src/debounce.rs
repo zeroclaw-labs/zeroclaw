@@ -1,9 +1,4 @@
 //! Inbound message debouncing for rapid senders.
-//!
-//! When users type fast and send multiple messages in quick succession, each
-//! message would normally trigger a separate LLM call. [`MessageDebouncer`]
-//! accumulates rapid messages per sender within a configurable time window and
-//! emits them as a single concatenated message, reducing unnecessary agent runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;

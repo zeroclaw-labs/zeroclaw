@@ -17,7 +17,6 @@ pub struct ScreenshotResult {
 }
 
 /// Capture the screen and return a base64-encoded PNG.
-///
 /// Returns `permission_denied("screen_recording")` when TCC blocks the capture.
 #[tauri::command]
 pub fn take_screenshot() -> Result<ScreenshotResult, String> {

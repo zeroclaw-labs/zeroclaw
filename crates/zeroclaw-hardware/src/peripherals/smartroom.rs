@@ -1,12 +1,4 @@
 //! High-level smart-room device tools for ESP32 boards.
-//!
-//! Provides `set_device` and `read_device` tools that let the LLM
-//! reason in terms of named devices (e.g. "reading_lamp", "fan")
-//! instead of raw pin numbers. This eliminates the common failure mode
-//! where the model guesses the wrong pin based on training priors.
-//!
-//! These tools are automatically registered when a board with
-//! `board = "esp32"` or `board = "esp32-sim"` is configured.
 
 use super::serial::SerialTransport;
 use async_trait::async_trait;
@@ -15,15 +7,6 @@ use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Pin mapping for the smart-room demo board.
-///
-/// This mapping is intentionally hardcoded for the specific ESP32 demo board
-/// used in the hackathon vignette. If the physical wiring on a board changes,
-/// both this table and the firmware must be kept in sync.
-///
-/// For dynamic discovery of named devices, prefer the `pin_devices` map
-/// returned by the `hardware_capabilities` tool (see the companion PR that
-/// surfaces this field).
 fn output_pin(device: &str) -> Option<u8> {
     match device {
         "reading_lamp" | "lamp" | "reading lamp" => Some(12),
