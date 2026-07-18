@@ -13,11 +13,6 @@ const RETRY_BASE_DELAY_MS: u64 = 2000;
 /// Maximum number of characters to include from an error response body.
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
-/// Notion channel — polls a Notion database for pending tasks and writes results back.
-///
-/// The channel connects to the Notion API, queries a database for rows with a "pending"
-/// status, dispatches them as channel messages, and writes results back when processing
-/// completes. It supports crash recovery by resetting stale "running" tasks on startup.
 pub struct NotionChannel {
     api_key: String,
     database_id: String,

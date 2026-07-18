@@ -178,12 +178,6 @@ impl MattermostChannel {
         if ids.is_empty() { None } else { Some(ids) }
     }
 
-    /// Resolve the set of channels this listener should poll, combining:
-    ///
-    /// - explicit `channel_ids` from config (looked up to learn each channel's
-    ///   type so the DM/non-DM distinction reaches the receive path), or
-    /// - auto-discovery via `/api/v4/users/me/channels` filtered by
-    ///   `team_ids` and `discover_dms`.
     pub(crate) async fn list_target_channels(&self) -> Result<Vec<TargetChannel>> {
         let token = self.token().await?.to_string();
         if let Some(ids) = self.scoped_channel_ids() {
@@ -342,11 +336,6 @@ impl MattermostChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                // Bind the sole registered provider as the agent transcription
-                // provider for the channel-direct ingest path. Multi-provider
-                // setups still resolve via the orchestrator's per-agent
-                // routing (see orchestrator/mod.rs). See wati.rs for full
-                // rationale.
                 let names = m.available_providers();
                 let m = if names.len() == 1 {
                     let only = names[0].to_string();
@@ -811,11 +800,6 @@ impl Channel for MattermostChannel {
 }
 
 impl MattermostChannel {
-    /// Poll one target channel for new posts since its cursor, dispatch each
-    /// post through `parse_mattermost_post`, and update the cursor in place.
-    /// Returns `true` when the outbound mpsc was closed (caller exits the
-    /// listen loop). Errors during the poll are logged and treated as a
-    /// no-op for this iteration; the next iteration retries.
     #[allow(clippy::too_many_arguments)]
     async fn poll_channel(
         &self,
@@ -1021,11 +1005,6 @@ fn is_audio_file(file: &serde_json::Value) -> bool {
     )
 }
 
-/// Check whether a Mattermost post contains an @-mention of the bot.
-///
-/// Checks two sources:
-/// 1. Text-based: looks for `@bot_username` in the message body (case-insensitive).
-/// 2. Metadata-based: checks the post's `metadata.mentions` array for the bot user ID.
 #[cfg(test)]
 fn contains_bot_mention_mm(
     text: &str,
@@ -1099,11 +1078,6 @@ fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)>
     spans
 }
 
-/// Gate incoming Mattermost content when `mention_only` is enabled.
-///
-/// Returns `None` if the message doesn't mention the bot, otherwise the
-/// trimmed text with the mention preserved so downstream consumers can
-/// see who was addressed.
 fn normalize_mattermost_content(
     text: &str,
     bot_user_id: &str,

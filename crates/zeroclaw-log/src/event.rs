@@ -1,11 +1,3 @@
-//! Canonical event schema. OTel logs data model + ECS attribute
-//! conventions, with a `zeroclaw.*` namespace for the alias-bound
-//! domain attribution fields.
-//!
-//! On-disk JSON shape is the canonical contract — third-party tail
-//! consumers parse `serde_json::Value` and walk the keys. This struct is
-//! `pub(crate)` to keep external consumers off the typed surface.
-
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -214,15 +206,6 @@ pub fn is_attribution_field(name: &str) -> bool {
     false
 }
 
-/// ZeroClaw-domain attribution. Every field is alias-bound where
-/// applicable: `channel` is the `<type>.<alias>` composite, `model_provider`
-/// is the `<type>.<alias>` composite, etc. Composites are stored as three
-/// keys (`<prefix>`, `<prefix>_type`, `<prefix>_alias`) so filters can
-/// match either coarse or precise.
-///
-/// The shape is a flat string map flattened into the parent on-disk JSON,
-/// driven by [`ATTRIBUTION_FIELDS`] + [`COMPOSITE_PREFIXES`]. Adding a new
-/// attribution key requires extending those constants — nothing else.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZeroclawAttribution {
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -305,11 +288,6 @@ pub struct LogEvent {
     #[serde(default)]
     pub service: ServiceDescriptor,
 
-    /// Per-turn trace identifier so multiple events from one agent
-    /// turn group together in the UI. Populated by the `LogCaptureLayer`,
-    /// which promotes it from `attributes.trace_id`, set at the call site
-    /// via `record!(.. with_attrs(json!({"trace_id": ..})))` or inherited
-    /// from a `scope!(trace_id: ..)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
 

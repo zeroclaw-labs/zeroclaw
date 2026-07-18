@@ -58,12 +58,6 @@ pub(crate) async fn send_discord_message_payload(
     extract_message_id(resp).await
 }
 
-/// POST a message built from a full [`DiscordOutgoing`] (content + components),
-/// returning the new message's ID. The plain-text path stays
-/// [`send_discord_message_json`]; this is the components-bearing send (e.g. the
-/// buttoned approval prompt). `components` serialize through the same
-/// `to_rest_json` chokepoint, so an action row whose buttons all fail to encode
-/// simply omits the key. (EPIC B)
 pub(crate) async fn send_discord_outgoing(
     client: &reqwest::Client,
     bot_token: &str,
@@ -189,11 +183,6 @@ pub(crate) async fn edit_discord_message(
     .await
 }
 
-/// Edit an existing Discord message with a full envelope (content plus embeds)
-/// via PATCH.
-///
-/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
-/// level and returns `Ok(())` since skipping a mid-stream edit is harmless.
 pub(crate) async fn edit_discord_message_payload(
     client: &reqwest::Client,
     bot_token: &str,
@@ -233,7 +222,6 @@ pub(crate) async fn edit_discord_message_payload(
 }
 
 /// Delete a Discord message.
-///
 /// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
 /// level and returns `Ok(())` since a stale message is cosmetic only.
 pub(crate) async fn delete_discord_message(
@@ -271,11 +259,6 @@ pub(crate) async fn delete_discord_message(
     Ok(())
 }
 
-/// URL-encode a Unicode emoji for use in Discord reaction API paths.
-///
-/// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
-/// but they must be percent-encoded per RFC 3986. Custom guild emojis use
-/// the `name:id` format and are passed through unencoded.
 pub(crate) fn encode_emoji_for_discord(emoji: &str) -> String {
     if emoji.contains(':') {
         return emoji.to_string();

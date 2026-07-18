@@ -1,11 +1,4 @@
 //! TG4: Agent Loop Robustness Tests
-//!
-//! Prevents: Pattern 4 — Agent loop & tool call processing bugs (13% of user bugs).
-//! Issues: #746, #418, #777, #848
-//!
-//! Tests agent behavior with malformed tool calls, empty responses,
-//! max iteration limits, and cascading tool failures using mock model_providers.
-//! Complements inline parse_tool_calls tests in `src/agent/loop_.rs`.
 
 use crate::support::helpers::{build_agent, text_response, tool_response};
 use crate::support::{CountingTool, EchoTool, FailingTool, MockModelProvider};
@@ -15,7 +8,6 @@ use zeroclaw::providers::{ChatResponse, ToolCall};
 // TG4.1: Malformed tool call recovery
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should recover when LLM returns text with residual XML tags (#746)
 #[tokio::test]
 async fn agent_recovers_from_text_with_xml_residue() {
     let model_provider = Box::new(MockModelProvider::new(vec![text_response(
@@ -30,7 +22,6 @@ async fn agent_recovers_from_text_with_xml_residue() {
     );
 }
 
-/// Agent should handle tool call with empty arguments gracefully
 #[tokio::test]
 async fn agent_handles_tool_call_with_empty_arguments() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -48,7 +39,6 @@ async fn agent_handles_tool_call_with_empty_arguments() {
     assert!(!response.is_empty());
 }
 
-/// Agent should handle unknown tool name without crashing (#848 related)
 #[tokio::test]
 async fn agent_handles_nonexistent_tool_gracefully() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -70,10 +60,9 @@ async fn agent_handles_nonexistent_tool_gracefully() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TG4.2: Tool failure cascade handling (#848)
+// TG4.2: Tool failure cascade handling
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should handle repeated tool failures without infinite loop
 #[tokio::test]
 async fn agent_handles_failing_tool() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -94,7 +83,6 @@ async fn agent_handles_failing_tool() {
     );
 }
 
-/// Agent should handle mixed tool calls (some succeed, some fail)
 #[tokio::test]
 async fn agent_handles_mixed_tool_success_and_failure() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -124,11 +112,9 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TG4.3: Iteration limit enforcement (#777)
+// TG4.3: Iteration limit enforcement
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should not exceed max_tool_iterations (default=10) even with
-/// a model_provider that keeps returning tool calls
 #[tokio::test]
 async fn agent_respects_max_tool_iterations() {
     let (counting_tool, count) = CountingTool::new();
@@ -166,7 +152,6 @@ async fn agent_respects_max_tool_iterations() {
 // TG4.4: Empty and whitespace responses
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should handle empty text response from model_provider (#418 related)
 #[tokio::test]
 async fn agent_handles_empty_provider_response() {
     let model_provider = Box::new(MockModelProvider::new(vec![ChatResponse {
@@ -181,7 +166,6 @@ async fn agent_handles_empty_provider_response() {
     let _result = agent.turn("test").await;
 }
 
-/// Agent should handle None text response from model_provider
 #[tokio::test]
 async fn agent_handles_none_text_response() {
     let model_provider = Box::new(MockModelProvider::new(vec![ChatResponse {
@@ -195,7 +179,6 @@ async fn agent_handles_none_text_response() {
     let _result = agent.turn("test").await;
 }
 
-/// Agent should handle whitespace-only response
 #[tokio::test]
 async fn agent_handles_whitespace_only_response() {
     let model_provider = Box::new(MockModelProvider::new(vec![text_response("   \n\t  ")]));
@@ -208,7 +191,6 @@ async fn agent_handles_whitespace_only_response() {
 // TG4.5: Tool call with special content
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should handle tool arguments with unicode content
 #[tokio::test]
 async fn agent_handles_unicode_tool_arguments() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -226,7 +208,6 @@ async fn agent_handles_unicode_tool_arguments() {
     assert!(!response.is_empty());
 }
 
-/// Agent should handle tool arguments with nested JSON
 #[tokio::test]
 async fn agent_handles_nested_json_tool_arguments() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -244,7 +225,6 @@ async fn agent_handles_nested_json_tool_arguments() {
     assert!(!response.is_empty());
 }
 
-/// Agent should handle tool call followed by immediate text (no second LLM call)
 #[tokio::test]
 async fn agent_handles_sequential_tool_then_text() {
     let model_provider = Box::new(MockModelProvider::new(vec![
