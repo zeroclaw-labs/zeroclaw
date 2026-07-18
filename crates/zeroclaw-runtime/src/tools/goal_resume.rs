@@ -108,7 +108,7 @@ impl Tool for GoalResumeTool {
         .await?;
         if admission.continue_goal {
             let task_id = admission.task_id.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("continuing goal admission returned no exact task id")
+                anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
             if !crate::control_plane::bind_current_goal_task(task_id) {
                 anyhow::bail!("goal admission could not bind its exact live task");
