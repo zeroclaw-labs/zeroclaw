@@ -890,7 +890,8 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
-    /// Whether any config write has landed since the last admin reload.
+    /// Whether any config write has landed since the last admin reload and may
+    /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
 }
 
