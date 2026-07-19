@@ -6805,6 +6805,54 @@ mod tests {
     }
 
     #[test]
+    fn transcript_selection_clears_when_snapshot_changes() {
+        let replacements = [
+            (
+                "geometry",
+                transcript_snapshot(Rect::new(0, 0, 6, 1), &["hello "]),
+            ),
+            (
+                "content",
+                transcript_snapshot(Rect::new(0, 0, 5, 1), &["hullo"]),
+            ),
+        ];
+
+        for (case, replacement) in replacements {
+            let mut state = state();
+            state.transcript_snapshot =
+                Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+            assert!(state.begin_transcript_drag(0, 0));
+            assert!(state.update_transcript_drag(1, 0));
+            state.copy_hit_regions.push(CopyHitRegion {
+                rect: Rect::new(0, 0, 2, 1),
+                text: "he".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+            });
+            state.copy_feedback = Some(CopyFeedback::Transcript {
+                rect: Rect::new(0, 0, 2, 1),
+                shown_at: Instant::now(),
+            });
+
+            state.set_transcript_snapshot(replacement);
+
+            assert_eq!(state.transcript_selection, None, "{case} selection");
+            assert_eq!(state.transcript_drag_anchor, None, "{case} drag anchor");
+            assert!(
+                state
+                    .copy_hit_regions
+                    .iter()
+                    .all(|region| region.kind != CopyHitKind::Transcript),
+                "{case} transcript copy region"
+            );
+            assert!(
+                !matches!(state.copy_feedback, Some(CopyFeedback::Transcript { .. })),
+                "{case} transcript copy feedback"
+            );
+        }
+    }
+
+    #[test]
     fn transcript_selection_clears_when_another_interaction_takes_focus() {
         let mut state = state();
         state
