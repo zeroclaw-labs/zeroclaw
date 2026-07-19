@@ -505,12 +505,16 @@ async fn process_activity(
     let Some(conversation) = &activity.conversation else {
         return StatusCode::OK;
     };
-    let (base_id, thread_suffix) = activity::split_conversation_id(&conversation.id);
     let is_team_channel = conversation.conversation_type.as_deref() == Some("channel");
+    let (base_id, message_id_suffix) = activity::split_conversation_id(&conversation.id);
     // In team channels, reply in-thread: on the existing thread root when
-    // the message came from one, else on the triggering message itself.
-    let thread_ts = thread_suffix
-        .map(str::to_string)
+    // the message came from one, else on the triggering message itself. Teams
+    // may also append `;messageid=` to non-channel conversation IDs; it is
+    // not a valid thread-addressing suffix there and sending it back produces
+    // Connector's "Failed to decrypt conversation id" response.
+    let thread_ts = is_team_channel
+        .then(|| message_id_suffix.map(str::to_string))
+        .flatten()
         .or_else(|| is_team_channel.then(|| activity.id.clone()).flatten());
 
     let seq = state.counter.fetch_add(1, Ordering::Relaxed);
@@ -523,7 +527,9 @@ async fn process_activity(
     let msg = ChannelMessage {
         channel_alias: Some(state.alias.clone()),
         thread_ts,
-        interruption_scope_id: thread_suffix.map(str::to_string),
+        interruption_scope_id: is_team_channel
+            .then(|| message_id_suffix.map(str::to_string))
+            .flatten(),
         explicitly_addressed,
         ..ChannelMessage::new(
             activity
@@ -565,18 +571,21 @@ impl Channel for MsTeamsChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let (_, ctx) = self.send_context(&message.recipient).await?;
-        let conversation_id = match message.thread_ts.as_deref() {
-            Some(ts) if !ts.is_empty() => format!("{};messageid={ts}", ctx.base_id),
+        let conversation_id = match (
+            ctx.reference.conversation_type.as_deref(),
+            message.thread_ts.as_deref(),
+        ) {
+            (Some("channel"), Some(thread_id)) if !thread_id.is_empty() => {
+                format!("{};messageid={thread_id}", ctx.base_id)
+            }
             _ => ctx.base_id.clone(),
         };
         let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
-        Self::activity_request(
-            &ctx,
-            reqwest::Method::POST,
-            url,
-            &serde_json::json!({ "type": "message", "text": message.content }),
-        )
-        .await?;
+        let mut body = serde_json::json!({ "type": "message", "text": message.content });
+        if let Some(reply_to_id) = message.in_reply_to.as_deref() {
+            body["replyToId"] = serde_json::Value::String(reply_to_id.to_string());
+        }
+        Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
         Ok(())
     }
 
@@ -1242,6 +1251,49 @@ mod tests {
 
         let message = SendMessage::new("threaded reply", "19:general@thread.tacv2")
             .in_thread(Some("1700".to_string()));
+        ch.send(&message).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn personal_send_ignores_thread_suffix_and_sets_reply_to_id() {
+        let connector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "connector-tok",
+                "expires_in": 3600,
+            })))
+            .mount(&connector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .and(body_partial_json(serde_json::json!({
+                "type": "message",
+                "text": "reply",
+                "replyToId": "1784443787334",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = MsTeamsChannel::new(
+            "default",
+            Arc::new(|| Some(test_config())),
+            Arc::new(Vec::new),
+        )
+        .with_token_url(format!("{}/token", connector.uri()));
+        ch.conversations.record(ConversationReference {
+            service_url: format!("{}/teams/", connector.uri()),
+            conversation_id: "a:1conv".to_string(),
+            conversation_type: Some("personal".to_string()),
+        });
+
+        // A non-channel activity can carry a `;messageid=` suffix, but it
+        // must not become part of a Connector conversation ID.
+        let message = SendMessage::new("reply", "a:1conv")
+            .in_thread(Some("1784443787334".to_string()))
+            .in_reply_to(Some("1784443787334".to_string()));
         ch.send(&message).await.unwrap();
     }
 
