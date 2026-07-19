@@ -1,11 +1,5 @@
 //! Whole-turn history trimming. One rule: keep the most recent whole turns
 //! that fit the token budget, drop the rest, never cut a turn in half.
-//!
-//! A turn starts at a real user message and runs until the next real user
-//! message, covering the assistant reply, any assistant tool-call rows, and
-//! any tool-result rows in between. Tool exchanges live entirely inside a
-//! turn, so dropping whole turns can never split a tool_use/tool_result pair.
-//! Pairing safety for providers like Anthropic is structural, not swept.
 
 use crate::agent::history::estimate_history_tokens;
 use zeroclaw_providers::ChatMessage;

@@ -1,21 +1,4 @@
 //! ACP (Agent Control Protocol) Server — JSON-RPC 2.0 over stdio.
-//!
-//! Provides an IDE-friendly interface for spawning and managing isolated agent
-//! sessions. Each session wraps an [`Agent`] built from the global config with
-//! streaming support via JSON-RPC notifications.
-//!
-//! ## Protocol
-//!
-//! Requests and responses are newline-delimited JSON objects on stdin/stdout.
-//!
-//! | Method            | Description                              |
-//! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel when configured) |
-//! | `session/new`     | Create an isolated agent session          |
-//! | `session/prompt`  | Send a prompt, stream back `session/update` events |
-//! | `session/stop`    | Gracefully terminate a session            |
-//! | `session/cancel`  | Abort an in-flight `session/prompt` turn  |
-//! | `session/update`  | Streaming events and bidirectional events |
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -88,16 +71,6 @@ pub struct AcpServer {
     /// Receiver for the writer task. Pulled out (replaced with `None`) the
     /// first time `run()` starts the writer loop.
     writer_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
-    /// Per-session cancellation tokens for aborting in-flight `session/prompt`
-    /// turns. Lives outside `Session`'s inner `Mutex` so `session/cancel` can
-    /// fire the token without waiting for the turn to release the inner lock.
-    ///
-    /// **Single-turn-per-session invariant:** this map holds at most one token
-    /// per `session_id` because the ACP protocol does not pipeline multiple
-    /// `session/prompt` calls on the same session — each prompt must complete
-    /// (or be cancelled) before the next one is sent. A second prompt is
-    /// rejected before it can overwrite the active turn's token. If pipelining
-    /// is needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Tracks session IDs currently being loaded/resumed (between the initial
     /// check and the final insert into `sessions`). Used to prevent duplicate
@@ -114,12 +87,12 @@ pub struct AcpServer {
     /// build their own engine from config.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    /// Most-recently-seen `clientCapabilities.elicitation` block from
-    /// `initialize`. ACP `initialize` happens once per connection,
-    /// before any `session/new`, but some clients legally re-send
-    /// `initialize`; `RwLock` honours "1 writer (initialize), N readers
-    /// (session/new)" with last-write-wins, and matches the
-    /// `std::sync::*` family used elsewhere in this file.
+    /// Connection-scoped default agent alias (`?agent=` on the gateway ACP
+    /// endpoint). Slots into the `session/new` alias precedence chain between
+    /// an explicit `agentAlias` and `[acp].default_agent`. Not a config
+    /// change: it only supplies the default for new sessions on this
+    /// connection (restore keeps the operator-controlled fallback chain).
+    connection_default_agent: Option<String>,
     client_elicitation_caps: std::sync::RwLock<ElicitationCapabilities>,
 }
 
@@ -174,8 +147,22 @@ impl AcpServer {
             canvas_store: None,
             sop_engine: None,
             sop_audit: None,
+            connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
+    }
+
+    /// Set the connection-scoped default agent alias (`?agent=` query param
+    /// on the gateway ACP endpoint). Blank values are treated as absent. The
+    /// alias is validated at `session/new` with the same dispatchable-agent
+    /// checks as an explicit `agentAlias`. Restore paths ignore this value.
+    pub fn with_connection_default_agent(mut self, alias: Option<String>) -> Self {
+        self.connection_default_agent = alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        self
     }
 
     /// Attach the shared gateway [`CanvasStore`] so that agents created by
@@ -311,12 +298,6 @@ impl AcpServer {
         Ok(())
     }
 
-    /// Run the ACP server against an already-framed line source.
-    ///
-    /// This is used by the gateway WebSocket bridge, where inbound WebSocket
-    /// text messages are already complete JSON-RPC frames and outbound frames
-    /// are supplied by the writer channel passed to [`Self::new_with_writer`]
-    /// or [`Self::new_with_writer_and_store`].
     pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -365,13 +346,6 @@ impl AcpServer {
                     }
                     return;
                 }
-                // Spawn so a long-running session/prompt doesn't block the
-                // read loop — outbound RPC responses (e.g. for
-                // session/request_permission) need to be processable
-                // while a prompt turn is in flight. Once `handle_request`
-                // resolves session/agent context and attaches an
-                // attribution scope, every log record emitted from this
-                // task lands attributed in the TUI instead of orphaning.
                 let server = Arc::clone(self);
                 ::zeroclaw_spawn::spawn!(async move {
                     server.handle_request(request).await;
@@ -503,6 +477,66 @@ impl AcpServer {
         }))
     }
 
+    /// True when `alias` names a configured agent that can dispatch a turn.
+    fn alias_if_dispatchable(&self, alias: &str) -> Option<String> {
+        if alias.trim().is_empty() {
+            return None;
+        }
+        self.config
+            .agent(alias)
+            .filter(|agent| agent.is_dispatchable())
+            .map(|_| alias.to_string())
+    }
+
+    /// Shared validation for explicit `agentAlias`, `?agent=`, config defaults,
+    /// and sole-agent auto-select.
+    fn validate_dispatchable_agent_alias(&self, agent_alias: &str) -> Result<(), RpcError> {
+        match self.config.agent(agent_alias) {
+            None => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!(
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
+                ),
+                data: None,
+            }),
+            Some(agent) if !agent.is_dispatchable() => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!("Agent `{agent_alias}` is not enabled for dispatch"),
+                data: None,
+            }),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Restore alias precedence: persisted owner (when still dispatchable) →
+    /// `[acp].default_agent` → sole configured agent → `"default"`.
+    ///
+    /// The connection-scoped `?agent=` default is intentionally omitted: restore
+    /// accepts only a session ID and must not let transport input rebind a
+    /// persisted workspace/history to a different agent.
+    fn resolve_restore_agent_alias(&self, persisted_agent_alias: &str) -> String {
+        self.alias_if_dispatchable(persisted_agent_alias)
+            .or_else(|| {
+                self.config
+                    .acp
+                    .default_agent
+                    .as_ref()
+                    .and_then(|alias| self.alias_if_dispatchable(alias))
+            })
+            .or_else(|| {
+                if self.config.agents.len() == 1 {
+                    self.config
+                        .agents
+                        .keys()
+                        .next()
+                        .and_then(|alias| self.alias_if_dispatchable(alias))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let requested_cwd = self.requested_session_cwd(params);
 
@@ -519,9 +553,11 @@ impl AcpServer {
             .into_owned();
 
         // Every ACP session is bound to an explicit agent alias.
-        // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`.
-        // When the client omits the alias and exactly one agent is configured,
-        // auto-select it so single-agent setups work without extra config.
+        // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
+        // then the connection-scoped default (`?agent=`), then
+        // `[acp].default_agent`. When all are absent and exactly one agent
+        // is configured, auto-select it so single-agent setups work without
+        // extra config.
         let agent_alias = params
             .get("agentAlias")
             .or_else(|| params.get("agent_alias"))
@@ -530,6 +566,7 @@ impl AcpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+            .or_else(|| self.connection_default_agent.clone())
             .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
@@ -546,23 +583,10 @@ impl AcpServer {
                     .to_string(),
                 data: None,
             })?;
-        if self.config.agent(&agent_alias).is_none() {
-            return Err(RpcError {
-                code: INVALID_PARAMS,
-                message: format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
-                ),
-                data: None,
-            });
-        }
+        self.validate_dispatchable_agent_alias(&agent_alias)?;
 
         let session_id = Uuid::new_v4().to_string();
 
-        // Atomically check the session limit and reserve a loading slot, then
-        // release the locks before building the agent. Agent construction can
-        // perform opt-in MCP startup (`[agents.<alias>].acp_enable_mcp`), which
-        // may block on external server timeouts; holding `self.sessions` across
-        // it would stall unrelated session ops. Mirrors `session/load`.
         {
             let sessions = self.sessions.lock().await;
             let mut loading = self.loading_sessions.lock().await;
@@ -591,14 +615,6 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        // Build agent from global config, with the session's cwd pinned as
-        // the file/shell sandbox boundary. The agent's data directory
-        // (identity, scheduled tasks) still lives under `config.data_dir`.
-        // ACP sessions exclude persistent memory — context comes from the
-        // persisted session history, not the agent's long-term memory store.
-        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
-        // by default to keep `session/new` prompt; on to load this agent's
-        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
         let enable_mcp = self
             .config
             .agent(&agent_alias)
@@ -818,21 +834,10 @@ impl AcpServer {
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
         // Restore the agent the session was created with — its alias is
-        // persisted on the session row. Fall back to the ACP default (or sole
-        // agent, or "default") only when that agent no longer exists in config,
-        // so a deleted owner degrades gracefully instead of failing the restore.
-        let restore_alias = Some(data.agent_alias.clone())
-            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
-            .or_else(|| self.config.acp.default_agent.clone())
-            .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
-                    keys.next().cloned()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "default".to_string());
+        // persisted on the session row. Fall back to the operator-controlled
+        // ACP default (or sole agent, or "default") only when the persisted
+        // owner is missing or not dispatchable. `?agent=` is not consulted.
+        let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -1029,21 +1034,10 @@ impl AcpServer {
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
         // Restore the agent the session was created with — its alias is
-        // persisted on the session row. Fall back to the ACP default (or sole
-        // agent, or "default") only when that agent no longer exists in config,
-        // so a deleted owner degrades gracefully instead of failing the restore.
-        let restore_alias = Some(data.agent_alias.clone())
-            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
-            .or_else(|| self.config.acp.default_agent.clone())
-            .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
-                    keys.next().cloned()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "default".to_string());
+        // persisted on the session row. Fall back to the operator-controlled
+        // ACP default (or sole agent, or "default") only when the persisted
+        // owner is missing or not dispatchable. `?agent=` is not consulted.
+        let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -1153,14 +1147,6 @@ impl AcpServer {
         );
         Ok(serde_json::json!({}))
     }
-    /// Handle `session/close` requests (ACP spec §Session Management).
-    ///
-    /// Closes a session: fires the cancel token to interrupt any in-flight turn,
-    /// removes the session from the in-memory map, and unregisters the ACP channel.
-    /// The session record in the persistent store is NOT deleted.
-    ///
-    /// Returns an empty object on success, or SESSION_NOT_FOUND if the session
-    /// is not in the in-memory map (it may still exist in the store).
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1276,13 +1262,6 @@ impl AcpServer {
             }
         };
 
-        // Instrument the rest of the turn so every record! inside lands in
-        // the Attribution section of the log viewer with agent_alias,
-        // model_provider, and session_key populated.
-        // scope! wraps the body with .instrument() internally — no EnteredSpan
-        // held across .await points, so the future stays Send.
-        // Clone before the macro so the owned values remain available inside
-        // the async move block.
         let session_id_s = session_id.clone();
         let agent_alias_s = agent_alias.clone();
         let model_provider_s = model_provider.clone();
@@ -1304,21 +1283,10 @@ impl AcpServer {
             "ACP session/prompt turn starting"
         );
 
-        // Create a cancellation token for this turn and register it so that a
-        // concurrent `session/cancel` notification can fire it without waiting
-        // for the inner session lock (which is held for the full turn duration).
-        // The lock can never be poisoned — all critical sections guarded by this
-        // mutex are short, infallible HashMap operations (insert/remove/get)
-        // that never call user code, panic, or block on I/O.
         let cancel_token = tokio_util::sync::CancellationToken::new();
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
-        // Cost-tracking inputs, resolved before the spawn while `self.config`
-        // is in scope. `turn_streamed` reuses the outer cost scope set below;
-        // without it the turn falls back to a tracker-less `usage_only` context
-        // and model cost is silently dropped (#5221). Mirrors the gateway WS
-        // path. The process-global tracker is shared with the gateway/daemon.
         let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
             self.config.cost.clone(),
             &self.config.data_dir,
@@ -1373,11 +1341,6 @@ impl AcpServer {
             // guard drops here, releasing the inner lock
         });
 
-        // Forward events as they arrive. Use standard ACP `session/update`
-        // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
-        // `tool_call_update` for completion (status + rawOutput/content). This enables
-        // proper pending→completed flow in ACP clients.
-        // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
         let mut tool_call_count: u32 = 0;
         // Latest whole-list plan emitted this turn (TodoWrite). Persisted
@@ -1385,23 +1348,7 @@ impl AcpServer {
         // resume/restart replay the daemon RPC bridge already provides.
         let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
-            // ACP has no `session/update` shape for token-usage events; the
-            // task-local cost tracker records them out-of-band. We DO use the
-            // event to update the per-session `token_count` so the TUI ctx
-            // bar resumes accurately. Then skip before dispatching to the
-            // notification builder so the helper match can stay exhaustive
-            // on the four UI-relevant variants.
             if let TurnEvent::Usage { input_tokens, .. } = &event {
-                // Token-count persistence is best-effort UI bookkeeping (it
-                // restores the TUI ctx bar on resume). It must never gate the
-                // draining of `event_rx`: this loop is the sole consumer of the
-                // turn's bounded `event_tx` (capacity 100). The session store
-                // wraps a single SQLite connection behind one process-wide
-                // mutex, so a concurrent session mid-`append_turn` transaction
-                // can stall this write. Awaiting it here would stop draining,
-                // fill `event_tx`, and block the agent's unguarded
-                // `event_tx.send(...).await` — wedging the turn on "working"
-                // with no cancel path. Fire-and-forget keeps the consumer live.
                 if let (Some(store), Some(it)) = (&self.store, input_tokens) {
                     let store = store.clone();
                     let sid = session_id.clone();
@@ -1767,18 +1714,6 @@ impl AcpServer {
         }))
     }
 
-    /// Handle `session/cancel` notifications (ACP spec §Cancellation).
-    ///
-    /// Fires the cancellation token for the named session's active turn, if
-    /// one is running. Idempotent — silently succeeds when there is no active
-    /// turn. The return value is ignored for notifications.
-    ///
-    /// Cancel-vs-stop interaction: if `session/cancel` and `session/stop` fire
-    /// nearly simultaneously, both handlers race — cancel fires the token
-    /// (which may or may not interrupt the turn), and stop sets
-    /// `session.stopped = true` and awaits the turn handle. The net effect is
-    /// harmless: either the turn sees the cancellation token or it doesn't, and
-    /// stop always waits for the turn to finish.
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1811,12 +1746,6 @@ impl AcpServer {
         Ok(serde_json::json!({}))
     }
 
-    /// Handle incoming `session/update` (or legacy `session/event`) notifications.
-    ///
-    /// This processes bidirectional events for an active session (e.g. tool results,
-    /// status updates, or client-side events). Currently updates session activity
-    /// to prevent premature reaping; future extensions can route specific event
-    /// types into the Agent.
     async fn handle_session_event(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
@@ -1969,13 +1898,6 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
     }
 }
 
-/// Translate tool args into the ACP `rawInput` shape.
-///
-/// For file-editing tools, the ACP Diff schema uses `oldText`/`newText` (camelCase).
-/// ZeroClaw's internal tool args use `old_string`/`new_string` (snake_case) for
-/// `file_edit` and `content` for `file_write`. Without this translation, ACP clients
-/// (Toad, Zed) cannot recognise the Diff shape and fall back to rendering the raw JSON
-/// fields as giant strings.
 fn to_acp_raw_input(name: &str, args: &Value) -> Value {
     match name {
         "file_edit" => {
@@ -1993,12 +1915,6 @@ fn to_acp_raw_input(name: &str, args: &Value) -> Value {
     }
 }
 
-/// Build the ACP `content` array for a tool call notification.
-///
-/// Zed and Toad render tool call content from the `content` array. For
-/// file-editing tools, emit an ACP Diff content item (`{ "type": "diff", ... }`)
-/// so clients show a side-by-side diff editor. Non-edit tools return an empty
-/// array — their `rawInput` is displayed via the standard `raw_input` fallback.
 fn to_acp_content(name: &str, args: &Value) -> Value {
     match name {
         "file_edit" => {
@@ -2147,11 +2063,6 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
-        // ACP has its own approval mechanism via `session/request_permission`
-        // routed through the channel's `request_choice` impl. The agent only
-        // emits ApprovalRequest events when a back-channel like the gateway
-        // WS is registered to handle them; on ACP-only sessions they should
-        // not arrive here.
         TurnEvent::ApprovalRequest { .. } => return None,
         TurnEvent::HistoryTrimmed {
             dropped_messages,
@@ -2523,13 +2434,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -2551,7 +2462,7 @@ mod tests {
     /// Spin up a wiremock server speaking the minimum MCP HTTP handshake
     /// (`initialize` → `notifications/initialized` → `tools/list`) advertising a
     /// single tool. HTTP transport keeps the test cross-platform (no stdio
-    /// scripts). Mirrors the runtime crate's #8193 helper.
+    /// scripts). Mirrors the runtime crate'shelper.
     async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2637,10 +2548,6 @@ mod tests {
         );
     }
 
-    /// By default (`acp_enable_mcp = false` on the agent) an ACP session must
-    /// NOT touch the servers granted by the agent's mcp_bundles — preserving
-    /// the prompt-`session/new` contract (#8193). The granted MCP server
-    /// records zero requests.
     #[tokio::test]
     async fn session_new_skips_mcp_by_default() {
         let cwd = tempfile::tempdir().unwrap();
@@ -2666,11 +2573,6 @@ mod tests {
         );
     }
 
-    /// With the agent's `acp_enable_mcp = true` an ACP session connects to the
-    /// servers granted by that agent's mcp_bundles (the same eager wiring used
-    /// by gateway/daemon sessions), so the agent can call those tools. The
-    /// granted MCP server receives the `tools/list` handshake during
-    /// `session/new`.
     #[tokio::test]
     async fn session_new_loads_mcp_bundles_when_agent_opts_in() {
         let cwd = tempfile::tempdir().unwrap();
@@ -2731,13 +2633,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "only-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -2806,21 +2708,17 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "agent-alpha".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -2864,21 +2762,17 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         config.agents.insert(
             "agent-alpha".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -2897,6 +2791,338 @@ mod tests {
         .expect("should use agent-beta despite default_agent = agent-alpha");
 
         assert!(result["sessionId"].as_str().is_some());
+    }
+
+    /// `make_test_config` plus `agent-alpha`/`agent-beta`, for exercising the
+    /// connection-default slot of the `session/new` alias precedence chain.
+    fn dispatchable_test_agent(
+        model_provider: &str,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: model_provider.into(),
+            risk_profile: "default".into(),
+            runtime_profile: "default".into(),
+            ..Default::default()
+        }
+    }
+
+    fn two_agent_config(cwd: &std::path::Path) -> Config {
+        let mut cfg = make_test_config(cwd);
+        for alias in ["agent-alpha", "agent-beta"] {
+            cfg.agents.insert(
+                alias.to_string(),
+                dispatchable_test_agent("anthropic.default"),
+            );
+        }
+        cfg
+    }
+
+    async fn session_agent_alias(server: &AcpServer, session_id: &str) -> String {
+        let sessions = server.sessions.lock().await;
+        let session = sessions.get(session_id).expect("session must exist");
+        let session = session.lock().await;
+        session.agent_alias.clone()
+    }
+
+    #[tokio::test]
+    async fn session_new_uses_connection_default_agent_when_alias_omitted() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("session/new should use the connection default agent");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_new_explicit_alias_overrides_connection_default_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-alpha",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("explicit agentAlias should win over the connection default");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_connection_default_agent_overrides_config_default_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("connection default should win over [acp].default_agent");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_new_unknown_connection_default_agent_errors_like_explicit_alias() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_default_agent(Some("ghost".to_string()));
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("an unconfigured connection default must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("Unknown agent"),
+            "error should reuse the explicit-alias validation message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_blank_connection_default_agent_is_treated_as_absent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("  ".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("blank connection default should fall through to config default");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_restore_ignores_connection_default_when_persisted_agent_deleted() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-restore-ignores-conn-default";
+        store
+            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed for a deleted persisted agent");
+
+        // Operator `[acp].default_agent` wins; `?agent=` must not rebind restore.
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_disabled_connection_default_agent_errors_like_explicit_alias() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.agents.get_mut("agent-beta").unwrap().enabled = false;
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("a disabled connection default must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("not enabled for dispatch"),
+            "expected disabled-agent error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_disabled_explicit_alias_errors() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = two_agent_config(cwd.path());
+        config.agents.get_mut("agent-beta").unwrap().enabled = false;
+        let server = AcpServer::new(config, AcpServerConfig::default());
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-beta",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("explicit disabled alias must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("not enabled for dispatch"));
+    }
+
+    #[tokio::test]
+    async fn session_load_restore_skips_missing_config_default_to_sole_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-restore-missing-config-default";
+        store
+            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = make_test_config(cwd.path());
+        config.agents.clear();
+        config.agents.insert(
+            "agent-beta".to_string(),
+            dispatchable_test_agent("anthropic.default"),
+        );
+        // Missing config default is skipped; sole configured agent applies.
+        // Connection default stays out of the restore chain.
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_default_agent(Some("ghost".to_string()));
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must skip a missing config default");
+
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_resume_restore_skips_disabled_persisted_owner() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-disabled-owner";
+        store
+            .create_session(session_id, "agent-alpha", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.agents.insert(
+            "agent-gamma".to_string(),
+            dispatchable_test_agent("anthropic.default"),
+        );
+        config.agents.get_mut("agent-alpha").unwrap().enabled = false;
+        config.acp.default_agent = Some("agent-beta".to_string());
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        // Tempting transport rebind — must lose to operator default.
+        .with_connection_default_agent(Some("agent-gamma".to_string()));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must skip a disabled persisted owner");
+
+        assert_eq!(session_agent_alias(&server, session_id).await, "agent-beta");
+    }
+
+    #[tokio::test]
+    async fn session_resume_restore_ignores_connection_default_when_persisted_agent_deleted() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-ignores-conn-default";
+        store
+            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut config = two_agent_config(cwd.path());
+        config.acp.default_agent = Some("agent-alpha".to_string());
+        let server = AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed for a deleted persisted agent");
+
+        assert_eq!(
+            session_agent_alias(&server, session_id).await,
+            "agent-alpha"
+        );
     }
 
     #[test]
@@ -3291,46 +3517,13 @@ mod tests {
         assert_eq!(entries[1]["activeForm"], "Creating unit tests");
     }
 
-    /// `session/stop` must succeed while a `session/prompt` turn is in flight.
-    ///
-    /// The session entry lives in the outer map for its entire lifetime.
-    /// The inner `Arc<Mutex<Session>>` serialises access: the prompt turn holds
-    /// the inner lock while running; `session/stop` removes the outer entry
-    /// then waits for the inner lock before cleaning up.  It must never see
-    /// SESSION_NOT_FOUND just because a turn happens to be running.
     #[tokio::test]
     async fn session_stop_finds_session_during_active_prompt_turn() {
         let cwd = tempfile::tempdir().unwrap();
-        let mut config = Config {
-            data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.anthropic.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::AnthropicModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            model: Some("claude-haiku-4-5".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
-            ..Default::default()
-        };
-        config.risk_profiles.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::RiskProfileConfig::default(),
-        );
-        config.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
-        );
-        let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
 
         // Create a real session via the normal path.
         let new_result = server
@@ -3438,18 +3631,17 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
+        cfg.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
         cfg.agents.insert(
             "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("anthropic.default"),
         );
         cfg
     }
 
-    /// `session/cancel` on an idle session (no active turn) must succeed silently.
     #[tokio::test]
     async fn session_cancel_idle_session_is_noop() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3474,8 +3666,6 @@ mod tests {
         assert!(result.is_ok(), "idle cancel must succeed: {result:?}");
     }
 
-    /// `session/cancel` for an unknown session ID must succeed silently (notification
-    /// semantics: no response, no error propagation).
     #[tokio::test]
     async fn session_cancel_unknown_session_is_noop() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3515,8 +3705,6 @@ mod tests {
         assert!(active_token.is_cancelled());
     }
 
-    /// A second prompt for the same session must fail before it can overwrite
-    /// the active turn's cancellation token.
     #[tokio::test]
     async fn register_cancel_token_rejects_concurrent_prompt_for_session() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3595,10 +3783,6 @@ mod tests {
         assert!(active_token.is_cancelled());
     }
 
-    /// Verify that inserting and removing a cancel token from the map works
-    /// correctly. This tests map mechanics directly rather than the
-    /// `handle_session_prompt` lifecycle, so a regression in the production
-    /// path's cleanup wouldn't be caught by this test.
     #[tokio::test]
     async fn cancel_tokens_map_remove_works() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3756,11 +3940,6 @@ mod tests {
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
-    /// `make_mcp_granting_test_config`, reshaped so the MCP-opted-in agent is
-    /// NOT the ACP default. `finance` owns the granted `b1` bundle and sets
-    /// `acp_enable_mcp = true`; the ACP default `test-agent` has neither. A
-    /// restored session owned by `finance` therefore loads MCP only if restore
-    /// resolves the stored alias rather than `acp.default_agent`.
     fn make_cross_agent_restore_config(cwd: &std::path::Path, mock_uri: String) -> Config {
         let mut cfg = make_mcp_granting_test_config(cwd, mock_uri);
         // ACP default agent: no bundle, MCP off.
@@ -3775,6 +3954,7 @@ mod tests {
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
                 risk_profile: "default".into(),
+                runtime_profile: "default".into(),
                 mcp_bundles: vec!["b1".into()],
                 acp_enable_mcp: true,
                 ..Default::default()
@@ -3784,12 +3964,6 @@ mod tests {
         cfg
     }
 
-    /// A restored session must rebuild under the agent it was CREATED with
-    /// (`AcpSessionData.agent_alias`), not `acp.default_agent`, and apply that
-    /// agent's `acp_enable_mcp`. Here the owner `finance` opts into MCP while
-    /// the ACP default `test-agent` does not, so a correct restore means the
-    /// granted MCP server receives the `tools/list` handshake. Regression for
-    /// the restore-path review on #8237.
     #[tokio::test]
     async fn session_load_restores_owning_agent_and_its_mcp_optin() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3833,9 +4007,6 @@ mod tests {
         );
     }
 
-    /// Same restore-alias contract as the load test, exercised through
-    /// `session/resume` (which shares the restore path). Regression for the
-    /// restore-path review on #8237.
     #[tokio::test]
     async fn session_resume_restores_owning_agent_and_its_mcp_optin() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4044,9 +4215,6 @@ mod tests {
         assert_eq!(err.code, SESSION_NOT_FOUND);
     }
 
-    /// `session/new` must return SESSION_LIMIT_REACHED when `max_sessions` is
-    /// already reached. Guards the reservation/limit check that moved out from
-    /// under the long-held sessions lock so MCP startup no longer blocks it.
     #[tokio::test]
     async fn session_new_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4080,8 +4248,6 @@ mod tests {
         );
     }
 
-    /// `session/load` must return SESSION_LIMIT_REACHED when `max_sessions` is
-    /// already reached by an active session created via `session/new`.
     #[tokio::test]
     async fn session_load_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4126,8 +4292,6 @@ mod tests {
         );
     }
 
-    /// `session/resume` must return SESSION_LIMIT_REACHED when `max_sessions` is
-    /// already reached by an active session created via `session/new`.
     #[tokio::test]
     async fn session_resume_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4172,8 +4336,6 @@ mod tests {
         );
     }
 
-    /// A SQLite error during `store.load_session` must release the `loading_sessions`
-    /// reservation so a subsequent restore attempt is not permanently blocked.
     #[tokio::test]
     async fn session_load_releases_reservation_on_store_error() {
         let cwd = tempfile::tempdir().unwrap();
@@ -4231,8 +4393,6 @@ mod tests {
         );
     }
 
-    /// Same coverage as `session_load_releases_reservation_on_store_error` but
-    /// for the `session/resume` path.
     #[tokio::test]
     async fn session_resume_releases_reservation_on_store_error() {
         let cwd = tempfile::tempdir().unwrap();

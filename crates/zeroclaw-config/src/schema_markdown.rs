@@ -2,15 +2,6 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
-/// Build the channel streaming-capability table by walking the `channels`
-/// section of the `Config` schema. Capability is derived from each channel
-/// struct's fields, never hand-listed:
-///   - has `stream_mode` (the off/partial/multi_message enum) -> draft updates
-///     and multi-message streaming are both supported.
-///   - has `stream_drafts` (a partial-only boolean) -> draft updates only.
-///   - neither -> no streaming.
-///
-/// Returns a Markdown table sorted by channel key.
 pub fn channel_streaming_matrix(root: &Value) -> String {
     let empty = Map::new();
     let defs = root
@@ -63,36 +54,6 @@ pub fn channel_streaming_matrix(root: &Value) -> String {
     out
 }
 
-/// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
-/// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
-/// render that section's fields via [`field_table`]. Map nodes (Rust
-/// `HashMap<String, T>`, rendered by schemars with `additionalProperties`) are
-/// transparently descended into their value type, and an `<alias>` placeholder
-/// is inserted into the displayed config prefix at each crossing so the
-/// per-field deep-links and `config set` commands carry the right path
-/// (`channels.matrix` -> `channels.matrix.<alias>`).
-///
-/// Returns an error string (as a visible HTML comment) when the path does not
-/// resolve, so a typo in a directive fails loudly in the rendered page rather
-/// than silently emitting nothing.
-/// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
-/// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
-/// render that section's fields via [`field_table`]. Map nodes (Rust
-/// `HashMap<String, T>`, rendered by schemars with `additionalProperties`) are
-/// transparently descended into their value type, and an `<alias>` placeholder
-/// is inserted into the displayed config prefix at each crossing so the
-/// per-field deep-links and `config set` commands carry the right path
-/// (`channels.matrix` -> `channels.matrix.<alias>`).
-///
-/// `defaults` is the serialized `Default::default()` of the section struct that
-/// `path` resolves to (for a map section, the map's *value* type). It lets a
-/// field's real default (`false`, `[]`, `{}`, `null`) surface even when
-/// schemars omits the schema `default` key for `skip_serializing_if` fields.
-/// Pass `None` to fall back to schema-only defaults.
-///
-/// Returns an error string when the path does not resolve, so a typo in a
-/// directive fails loudly in the rendered page rather than silently emitting
-/// nothing.
 pub fn field_table_for_path(
     root: &Value,
     path: &str,
@@ -146,10 +107,6 @@ pub fn field_table_for_path(
     Ok(field_table(node, include_enabled, Some(&prefix), defaults))
 }
 
-/// The set of field names a section path resolves to (after descending any map
-/// to its value type). Used to compute the shared base field set across many
-/// sibling sections (e.g. every model-provider slot) so a directive can render
-/// the common fields once and only the per-section extras per entry.
 pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeSet<String> {
     let empty = Map::new();
     let defs = root
@@ -183,11 +140,6 @@ pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeS
         .unwrap_or_default()
 }
 
-/// Like [`field_table_for_path`] but omits every field whose name is in
-/// `exclude`. Lets a directive render a shared base table once and then only
-/// the per-section extras, instead of repeating the common fields for every
-/// sibling section. Returns an empty string (not an error) when nothing remains
-/// after exclusion, so callers can render a "no extra fields" note.
 pub fn field_table_for_path_excluding(
     root: &Value,
     path: &str,
@@ -251,20 +203,6 @@ pub fn field_table_for_path_excluding(
     Ok(field_table(&node, include_enabled, Some(&prefix), defaults))
 }
 
-/// Renders a single struct's fields as an interactive config table from that
-/// struct's `schema_for!` JSON value. Top-level `enabled` is skipped by default
-/// since channel pages document it separately; pass `include_enabled = true` to
-/// keep it. `$ref` types resolve against the schema's own `$defs`. This is the
-/// same type/default/description extraction used by [`generate`], so a
-/// per-channel field table can never drift from the global config reference.
-///
-/// When `prefix` is `Some` (the struct's dotted config path, e.g.
-/// `channels.mattermost.<alias>`), the table is emitted as raw HTML with each
-/// field name as an accordion trigger: clicking a field expands a detail row
-/// directly beneath it carrying the per-field gateway-dashboard deep-link,
-/// zerocode location, and `zeroclaw config set` command. The
-/// `pc-enhance.js` `installConfigFieldRows` handler wires the toggle. When
-/// `prefix` is `None`, a plain Markdown table is emitted (no accordion).
 pub fn field_table(
     root: &Value,
     include_enabled: bool,
@@ -288,11 +226,6 @@ pub fn field_table(
     let Some(prefix) = prefix else {
         return plain_field_table(props, &required, defs, include_enabled);
     };
-    // Dashboard deep-link path. The web dashboard routes `/config/<section>/
-    // <type>` where `<type>` is the map key and `<section>` is the dot-joined
-    // prefix before it. `channels.mattermost.<alias>` -> `channels/mattermost`;
-    // `providers.models.venice.<alias>` -> `providers.models/venice`; a bare
-    // `acp` section (no `<alias>`) stays `acp`.
     let section_owned = {
         let segs: Vec<&str> = prefix.split('.').collect();
         if let Some(alias_idx) = segs.iter().position(|s| *s == "<alias>") {
@@ -345,13 +278,6 @@ pub fn field_table(
             .and_then(Value::as_str)
             .unwrap_or("");
 
-        // Detail is a `<div>` wrapping Markdown, not raw HTML table cells, so
-        // mdbook-i18n-helpers extracts the prose (field description and the
-        // tab guidance) for translation. Everything that must stay verbatim
-        // (field name, dotted path, `config set` command, env-var name) is in
-        // inline `code` spans or fenced blocks, which i18n-helpers leaves
-        // untouched. The `os-tabs-src` widget is the same one used elsewhere;
-        // `pc-enhance.js` turns it into the tab strip client-side.
         let _ = write!(
             rows,
             concat!(
@@ -541,12 +467,6 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         return;
     }
 
-    // Family-map container (e.g. `providers.models`, `channels`): every field
-    // is a `HashMap<String, T>` slot. Listing all slots here, each an empty
-    // `map | —` row, then recursing into every one, duplicates the per-slot
-    // detail that already lives on the dedicated section page. Collapse to a
-    // single note instead. Detected structurally (all fields are maps), not by
-    // a hardcoded path, so it can never drift.
     let all_maps = !props.is_empty()
         && props.values().all(|v| {
             resolve(v, defs)
@@ -894,7 +814,7 @@ mod tests {
 
     #[test]
     fn cron_section_exposes_uses_memory_field() {
-        // Regression test for #8397: the generated config reference must expose
+        // Regression test: the generated config reference must expose
         // per-cron-job fields (including `uses_memory`) instead of only the
         // top-level `[cron]` summary. `cron` is a `HashMap<String, CronJobDecl>`
         // — the generator must descend into `additionalProperties` to render
