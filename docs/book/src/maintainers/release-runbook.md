@@ -356,12 +356,31 @@ published artifacts can follow
 
 ## Step 7: Versioned documentation deployment
 
-ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is pushed, the `Deploy mdBook docs to Pages` workflow automatically builds and deploys the documentation for that version. This runs automatically after the tag from step 4 lands; the bootstrap and version-floor details below are reference material for when you need to recreate `gh-pages` or change the supported-version window.
+ZeroClaw docs use a versioned structure on the `gh-pages` branch. The `Release
+Stable` workflow's `deploy-docs` job dispatches the `Deploy mdBook docs to
+Pages` workflow for the release tag once `publish` succeeds; that dispatched
+run builds and publishes the version's documentation into `/vX.Y.Z/`
+asynchronously (the dispatch job does not wait for it). The bootstrap and
+version-floor details below are reference material for when you need to
+recreate `gh-pages` or change the supported-version window.
+
+> **Why an explicit dispatch and not the tag-push trigger.** `docs-deploy.yml`
+> lists `tags: [v*]`, but the release tag is created by the `publish` job via
+> `gh release create` using `GITHUB_TOKEN`. GitHub does not start a new workflow
+> run from a tag push created with `GITHUB_TOKEN`
+> ([docs](https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow)),
+> so the `tags: [v*]` trigger never fires for a release cut this way. The
+> `deploy-docs` job therefore invokes `docs-deploy.yml` via `workflow_dispatch`
+> (the documented exception that runs even under `GITHUB_TOKEN`) with the tag as
+> input. If you ever cut a tag by hand with a personal token instead, the
+> `tags: [v*]` push trigger fires and the release-workflow dispatch is a no-op
+> re-run of the same deploy, and both paths converge on `/vX.Y.Z/`.
 
 ### What happens automatically
 
-- Pushing a tag (e.g., `v0.8.0`) triggers a build that lands in `/v0.8.0/`.
+- The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
 - "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
+- **Ordering matters:** the tag deploy must land `/vX.Y.Z/` on `gh-pages` *before* a master deploy can flip the stable pointer to it. In the normal release sequence the version-bump PR merges first (Step 2), so its `master` docs deploy typically runs *before* `Release Stable` creates and deploys the tag. That earlier master deploy finds `/vX.Y.Z/` absent and deliberately retains the previous pointer; the flip is deferred (see the deferred-flip logic in `docs-deploy.yml`). The `deploy-docs` job then creates `/vX.Y.Z/`, and the flip publishes on the *next* master deploy after the dir is live. Note that `deploy-docs` only dispatches the tag build and does not wait for it: a green `deploy-docs` job means the dispatch was accepted, not that the docs run finished. After `/vX.Y.Z/` is live, dispatch `docs-deploy.yml` with `tag=master` to publish the stable-pointer flip (and confirm the dispatched runs actually succeeded in the Actions tab).
 - `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.

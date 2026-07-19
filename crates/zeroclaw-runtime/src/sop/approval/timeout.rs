@@ -1,13 +1,4 @@
 //! Fail-closed SOP approval-timeout behavior (EPIC C, C2). [SEC-FLIP]
-//!
-//! The default `Escalate` re-surfaces a timed-out gate to the out-of-band approver
-//! and NEVER self-approves. `Cancel` terminates the run (fail-safe). `AutoApprove`
-//! is the ONLY path to the legacy fail-open behavior and is opt-in.
-//!
-//! NOTE: this behavior is correct but DORMANT until something drives
-//! `check_approval_timeouts` on a tick (EPIC A's `sop_tick`, not yet in master);
-//! today only tests call it. Landing the fail-closed default now means the tick
-//! is safe to turn on the moment it exists.
 
 use super::decision::{ApprovalDecision, ResolveOutcome};
 use super::ledger::{GateEventKind, GateLedgerEntry};

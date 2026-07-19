@@ -1,10 +1,4 @@
 //! Live SOP action executor.
-//!
-//! The SOP engine is intentionally synchronous: it decides the next
-//! [`SopRunAction`] and owns run state, while callers perform side effects.
-//! This module is the bridge for live agent execution. It drives
-//! `ExecuteStep` actions through an async step runner, feeds the result back to
-//! the engine, and repeats until the run blocks or terminates.
 
 use std::collections::VecDeque;
 use std::future::Future;

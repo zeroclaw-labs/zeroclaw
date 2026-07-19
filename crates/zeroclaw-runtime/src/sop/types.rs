@@ -263,7 +263,6 @@ impl fmt::Display for SopStepKind {
 // ── Typed step parameters ────────────────────────────────────────
 
 /// JSON Schema fragment for validating step input/output data.
-///
 /// Stored as a raw `serde_json::Value` so callers can validate without
 /// pulling in a full JSON Schema library.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
