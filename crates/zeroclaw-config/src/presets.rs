@@ -307,6 +307,7 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
 
 pub use crate::multi_agent::MemoryBackendKind as MemoryChoice;
 
+/// Model provider selection submitted by the Quickstart builder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelProviderChoice {
@@ -328,6 +329,7 @@ pub struct ModelProviderChoice {
     pub fields: std::collections::HashMap<String, String>,
 }
 
+/// One channel selection submitted by the Quickstart builder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChannelQuickStart {
@@ -381,6 +383,7 @@ pub struct QuickstartPersonalityFile {
     pub content: String,
 }
 
+/// Complete builder submission consumed by the shared Quickstart apply path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct BuilderSubmission {
@@ -431,6 +434,7 @@ pub struct QuickstartPeerGroup {
     pub ignore: Vec<String>,
 }
 
+/// Selects either an existing configured value or a fresh builder value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", tag = "mode", content = "value")]

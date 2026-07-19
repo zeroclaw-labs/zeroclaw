@@ -1,8 +1,8 @@
 # FND-002: Intentional Documentation: Standards, Structure, and i18n Strategy
 
-> Starting v0.7.0 · Type: Documentation · Rev. 2
+> Starting v0.7.0 · Type: Documentation · Rev. 3
 >
-> **Canonical reference** · Ratified by the team · Rev. 2
+> **Canonical reference** · Ratified by the team · Rev. 3
 > Discussion thread and full revision history: [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)
 
 ---
@@ -35,6 +35,7 @@
 |---|---|---|
 | 1 | 2026-04-20 | Initial ratified documentation standard |
 | 2 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions |
+| 3 | 2026-07-18 | Added proposed ADR-006 and ADR-007 records for the resolved runtime-channel-plugin and separate-gateway-process targets while keeping acceptance implementation-gated |
 
 ---
 
@@ -305,9 +306,9 @@ Links to the relevant code files, issues, and external resources.
 
 <a id="63-retroactive-adrs"></a>
 
-### 6.3 Foundational ADR Backlog
+### 6.3 Foundational ADR Set
 
-The following foundational decisions and roadmap targets need durable ADRs. ADR-001 through ADR-005 are retroactive records of architecture that already exists. ADR-006 and ADR-007 describe implementation-gated targets from FND-001 and should remain proposed until their corresponding boundaries ship.
+The following foundational decisions and roadmap targets have durable ADRs. ADR-001 through ADR-005 are retroactive records of architecture that already exists. ADR-006 and ADR-007 describe implementation-gated targets from FND-001 and should remain proposed until their corresponding boundaries ship.
 
 | ADR | Decision to record | Classification |
 |---|---|---|
@@ -677,7 +678,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 **Deliverables:**
 
 - [x] Write ADR-005 as a retroactive record of the current memory storage contract
-- [ ] Write proposed ADR-006 and ADR-007 records for the implementation-gated FND-001 targets
+- [x] Write proposed ADR-006 and ADR-007 records for the implementation-gated FND-001 targets
 - [ ] Add a Vale configuration (`.vale.ini` + style rules) and CI check
 - [ ] Replace `docs-contract.md` in full with the version specified in Section 9
 - [ ] Migrate `docs/setup-guides/` content to the GitHub Wiki
@@ -750,8 +751,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ## Appendix B: Further Reading
 
-- [Diátaxis documentation framework](<https://diataxis.fr>): The definitive reference for structuring technical documentation by type.
-- [EA Artifacts on a Page (v2.2)](<https://eaonapage.com>): The classification framework used in Section 3.
+- [Diátaxis documentation framework](https://diataxis.fr): The definitive reference for structuring technical documentation by type.
+- [EA Artifacts on a Page (v2.2)](https://eaonapage.com): The classification framework used in Section 3.
 - **"Docs for Developers"**: Jared Bhatti et al.: A practical guide to technical documentation written by engineers who have maintained large documentation systems.
 - [Vale documentation](https://vale.sh/docs): Setup guide and configuration reference for the prose linter proposed in Section 10.
 - [Michael Nygard on ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): The original post that introduced the ADR format used in Section 6.

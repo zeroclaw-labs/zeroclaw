@@ -41,6 +41,8 @@
     - [ADR-003: Extism plugin bootstrap](./architecture/decisions/ADR-003-wasm-plugin-model.md)
     - [ADR-004: Tool shared state ownership](./architecture/decisions/ADR-004-tool-shared-state-ownership.md)
     - [ADR-005: Pluggable memory backends](./architecture/decisions/ADR-005-pluggable-memory-backends.md)
+    - [ADR-006: Runtime channel plugins](./architecture/decisions/ADR-006-runtime-channel-plugins.md)
+    - [ADR-007: Gateway extraction](./architecture/decisions/ADR-007-gateway-extraction.md)
     - [ADR-008: Goal mode control plane](./architecture/decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md)
     - [ADR-009: WIT/wasmtime plugin execution](./architecture/decisions/ADR-009-wit-wasmtime-plugin-execution.md)
   - [Logging](./architecture/logging.md)
