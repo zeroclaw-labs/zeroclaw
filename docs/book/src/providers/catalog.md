@@ -55,8 +55,12 @@ CLI's own login / `XAI_API_KEY`.
 
 This avoids OS `ARG_MAX` without writing system prompts to a shared temp path
 on Linux/macOS (gemini-style stdin handoff; Grok exposes it as
-`--prompt-file /dev/stdin`). ACP (`grok agent stdio`) is intentionally not
-used here; prefer a future shared runner if multi-turn ACP embedding is needed.
+`--prompt-file /dev/stdin`).
+
+Optional **`transport = "acp"`** drives documented **`grok agent stdio`**
+(JSON-RPC one-shot: initialize → authenticate → session/new → session/prompt)
+so large prompts never use argv or a temp file. Default remains
+`transport = "headless"`.
 
 Optional `binary_path` when `grok` is not on `PATH`. Optional
 `working_directory` sets the subprocess cwd so project `.grok/config.toml`

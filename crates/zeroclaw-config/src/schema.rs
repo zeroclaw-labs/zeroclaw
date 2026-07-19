@@ -2662,6 +2662,21 @@ pub struct GeminiCliModelProviderConfig {
 
 // ── Grok Build CLI (subprocess wrapper) ──
 
+/// How ZeroClaw drives the local `grok` binary for `providers.models.grok_cli`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GrokCliTransport {
+    /// Documented headless one-shot (`--single` / large prompt via stdin).
+    #[default]
+    Headless,
+    /// Agent Client Protocol over `grok agent stdio` (JSON-RPC). Prefer for
+    /// large structured prompts without argv/temp-file handoff.
+    Acp,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.grok_cli"]
@@ -2677,6 +2692,11 @@ pub struct GrokCliModelProviderConfig {
     /// relative to this path. Defaults to the daemon process cwd when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Subprocess transport. Defaults to headless one-shot; set `acp` to
+    /// drive `grok agent stdio` (JSON-RPC) for long prompts without a
+    /// headless prompt file.
+    #[serde(default, skip_serializing_if = "is_default_grok_cli_transport")]
+    pub transport: GrokCliTransport,
     /// Extra argv tokens appended after the built-in headless plumbing flags
     /// (for example `["--max-turns", "20"]` or `["--sandbox", "off"]`).
     /// Reserved transport flags (`--single`, `--prompt-file`, `--output-format`,
@@ -2686,6 +2706,10 @@ pub struct GrokCliModelProviderConfig {
     /// rules for tools; use `extra_args` for explicit CLI opt-in behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+}
+
+fn is_default_grok_cli_transport(value: &GrokCliTransport) -> bool {
+    *value == GrokCliTransport::Headless
 }
 
 // ── LMStudio (local default) ──

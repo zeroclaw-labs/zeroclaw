@@ -20,11 +20,9 @@
 //! | `--sandbox <profile>` | Default `strict` (fail-closed); override via `extra_args` |
 //!
 //! Official docs emphasize `-p` / `--single` and ACP (`grok agent stdio`).
-//! This provider stays on **headless one-shot** (same contract as `gemini_cli`)
-//! rather than a full ACP client. Large prompts avoid argv via stdin
-//! (`--prompt-file /dev/stdin`), not a world-readable temp path. ACP remains
-//! a future option for multi-turn embedding; see module tests for the help
-//! surface contract.
+//! Default transport is **headless one-shot** (same role as `gemini_cli`).
+//! Set `transport = "acp"` to drive **`grok agent stdio`** (JSON-RPC) so large
+//! prompts never touch argv or a temp file.
 //!
 //! # Usage
 //!
@@ -33,6 +31,8 @@
 //! model = "grok-4.5"
 //! # binary_path = "/home/you/.grok/bin/grok"
 //! working_directory = "/path/to/agents/default/workspace"
+//! # transport = "headless"  # default
+//! # transport = "acp"       # grok agent stdio (JSON-RPC)
 //! # Default argv injects `--sandbox strict`. Ops agents that need broader
 //! # access can override: extra_args = ["--sandbox", "off"]
 //!
@@ -49,8 +49,8 @@
 //! - clears the inherited environment and allowlists runtime/auth vars only
 //! - defaults to `--sandbox strict` unless `extra_args` already sets `--sandbox`
 //! - rejects `extra_args` that collide with provider-owned transport flags
-//! - never puts large prompts on argv or a predictable world-readable path
-//! - bounds captured stdout and keeps stderr out of public error strings
+//! - never puts large headless prompts on a predictable world-readable path
+//! - bounds captured stdout (headless) and keeps stderr out of public errors
 //!
 //! # Limitations
 //!
@@ -59,8 +59,8 @@
 //! - **Native tool calls**: This provider does not emit ZeroClaw tool_calls.
 //! - **Temperature**: Only baseline values `0.7` and `1.0` are accepted
 //!   (CLI has no sampling flag; values are not forwarded).
-//! - **ACP**: Not used here; prefer a future shared runner if multi-turn ACP
-//!   embedding is required.
+//! - **ACP**: One-shot only (no session resume / multi-turn). Permission
+//!   requests are auto-selected when options exist.
 //!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
@@ -69,6 +69,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+use zeroclaw_config::schema::GrokCliTransport;
 
 /// Default `grok` binary name (resolved via `PATH`).
 const DEFAULT_GROK_CLI_BINARY: &str = "grok";
@@ -120,6 +121,9 @@ const RESERVED_EXTRA_ARG_FLAGS: &[&str] = &[
     "--cwd",
     "--system-prompt-override",
     "--system-prompt",
+    // ACP subcommand pieces (transport owns `agent stdio`).
+    "agent",
+    "stdio",
 ];
 
 /// Environment variable names always allowed in the child process.
@@ -157,7 +161,7 @@ const ENV_ALLOWLIST_EXACT: &[&str] = &[
     "all_proxy",
 ];
 
-/// ModelProvider that invokes Grok Build CLI headless.
+/// ModelProvider that invokes Grok Build CLI (headless or ACP).
 pub struct GrokCliModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -169,6 +173,8 @@ pub struct GrokCliModelProvider {
     extra_args: Vec<String>,
     /// Wall-clock timeout for the child process.
     timeout: Duration,
+    /// Headless one-shot vs `grok agent stdio` ACP.
+    transport: GrokCliTransport,
 }
 
 /// How the prompt is handed to the CLI (mutually exclusive).
@@ -248,6 +254,7 @@ impl GrokCliModelProvider {
         working_directory: Option<&str>,
         extra_args: Vec<String>,
         timeout_secs: Option<u64>,
+        transport: GrokCliTransport,
     ) -> anyhow::Result<Self> {
         let binary_path = binary_path
             .map(str::trim)
@@ -269,6 +276,7 @@ impl GrokCliModelProvider {
             working_directory,
             extra_args,
             timeout,
+            transport,
         })
     }
 
@@ -415,6 +423,129 @@ impl GrokCliModelProvider {
         for (key, value) in std::env::vars() {
             if env_var_allowed(&key) {
                 cmd.env(key, value);
+            }
+        }
+    }
+
+    /// Global flags + `agent stdio` subcommand for ACP transport.
+    fn build_acp_cli_args(model: &str, extra_args: &[String]) -> Vec<String> {
+        let mut args = Vec::with_capacity(12 + extra_args.len());
+        args.push("--no-auto-update".to_string());
+        if !Self::extra_args_set_sandbox(extra_args) {
+            args.push("--sandbox".to_string());
+            args.push(DEFAULT_SANDBOX_PROFILE.to_string());
+        }
+        if Self::should_forward_model(model) {
+            args.push("-m".to_string());
+            args.push(model.to_string());
+        }
+        args.extend(extra_args.iter().cloned());
+        args.push("agent".to_string());
+        args.push("stdio".to_string());
+        args
+    }
+
+    async fn invoke_acp(&self, message: &str, model: &str) -> anyhow::Result<String> {
+        let args = Self::build_acp_cli_args(model, &self.extra_args);
+        let cwd = self
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.args(&args);
+        cmd.current_dir(&cwd);
+        Self::apply_env_allowlist(&mut cmd);
+        cmd.kill_on_drop(true);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "binary": self.binary_path.display().to_string(),
+                            "phase": "spawn_acp",
+                            "error": format!("{err}"),
+                        })),
+                    "grok_cli: failed to spawn ACP binary"
+                );
+                return Err(anyhow::Error::msg(format!(
+                    "Failed to spawn Grok Build CLI (ACP) at {}. \
+                     Ensure `grok` is installed and on PATH, or set binary_path.",
+                    self.binary_path.display()
+                )));
+            }
+        };
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::Error::msg("Failed to open Grok ACP stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::Error::msg("Failed to open Grok ACP stdout"))?;
+
+        #[cfg(unix)]
+        let group_guard = ChildGroupGuard::new(child.id());
+
+        let model_fwd = if Self::should_forward_model(model) {
+            Some(model)
+        } else {
+            None
+        };
+
+        let acp_result = timeout(
+            self.timeout,
+            crate::grok_cli_acp::run_oneshot_prompt(&mut stdin, stdout, message, &cwd, model_fwd),
+        )
+        .await;
+
+        // Close stdin so the child can exit after the session.
+        drop(stdin);
+
+        match acp_result {
+            Ok(Ok(text)) => {
+                #[cfg(unix)]
+                group_guard.disarm();
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let bytes = text.into_bytes();
+                Self::truncate_stdout(bytes)
+            }
+            Ok(Err(err)) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                Err(err)
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "binary": self.binary_path.display().to_string(),
+                            "timeout": format!("{:?}", self.timeout),
+                            "transport": "acp",
+                        })),
+                    "grok_cli: ACP request timed out"
+                );
+                Err(anyhow::Error::msg(format!(
+                    "Grok Build CLI ACP request timed out after {}s",
+                    self.timeout.as_secs()
+                )))
             }
         }
     }
@@ -641,7 +772,10 @@ impl ModelProvider for GrokCliModelProvider {
             _ => message.to_string(),
         };
 
-        self.invoke_cli(&full_message, model).await
+        match self.transport {
+            GrokCliTransport::Headless => self.invoke_cli(&full_message, model).await,
+            GrokCliTransport::Acp => self.invoke_acp(&full_message, model).await,
+        }
     }
 
     async fn chat(
@@ -686,7 +820,15 @@ mod tests {
         extra: Vec<String>,
         timeout_secs: Option<u64>,
     ) -> GrokCliModelProvider {
-        GrokCliModelProvider::new("test", binary, cwd, extra, timeout_secs).expect("provider")
+        GrokCliModelProvider::new(
+            "test",
+            binary,
+            cwd,
+            extra,
+            timeout_secs,
+            GrokCliTransport::Headless,
+        )
+        .expect("provider")
     }
 
     #[test]
@@ -744,6 +886,7 @@ mod tests {
             None,
             vec!["--prompt-file".into(), "/tmp/x".into()],
             None,
+            GrokCliTransport::Headless,
         );
         let err = match result {
             Ok(_) => panic!("expected reserved flag rejection"),
@@ -757,8 +900,14 @@ mod tests {
 
     #[test]
     fn new_rejects_reserved_model_flag() {
-        let result =
-            GrokCliModelProvider::new("test", None, None, vec!["-m".into(), "x".into()], None);
+        let result = GrokCliModelProvider::new(
+            "test",
+            None,
+            None,
+            vec!["-m".into(), "x".into()],
+            None,
+            GrokCliTransport::Headless,
+        );
         let err = match result {
             Ok(_) => panic!("expected reserved flag rejection"),
             Err(e) => e,
@@ -911,6 +1060,18 @@ mod tests {
         );
         // Public error must not echo OS err details beyond the template.
         assert!(!msg.contains("prompt-file"));
+    }
+
+    #[test]
+    fn build_acp_cli_args_ends_with_agent_stdio() {
+        let args = GrokCliModelProvider::build_acp_cli_args("grok-4.5", &[]);
+        assert_eq!(args[args.len() - 2], "agent");
+        assert_eq!(args[args.len() - 1], "stdio");
+        assert!(args.iter().any(|a| a == "--no-auto-update"));
+        let sandbox_idx = args.iter().position(|a| a == "--sandbox").expect("sandbox");
+        assert_eq!(args[sandbox_idx + 1], "strict");
+        let m_idx = args.iter().position(|a| a == "-m").expect("-m");
+        assert_eq!(args[m_idx + 1], "grok-4.5");
     }
 
     /// Live compatibility check: when `grok` is on PATH, its `--help` must

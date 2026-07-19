@@ -1389,6 +1389,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
             self.working_directory.as_deref(),
             self.extra_args.clone(),
             self.base.timeout_secs,
+            self.transport,
         )?))
     }
 
