@@ -20,6 +20,18 @@ export interface StatusResponse {
    * and FreeBSD via the `sysinfo` crate; on unsupported hosts
    * `rss_bytes = 0` and `cpu_percent = null`. */
   process?: ProcessStats;
+  /** Whether the gateway is configured to poll for newer releases and show an
+   *  update indicator (`gateway.check_updates`, default true). */
+  check_updates?: boolean;
+  /** Whether browser-triggered self-upgrade is enabled
+   *  (`gateway.allow_self_upgrade`, default false). Gates the upgrade button. */
+  allow_self_upgrade?: boolean;
+  /** How a post-upgrade restart is achieved: `supervised` (systemd/launchd
+   *  relaunches on exit), `self_respawn` (bare unix — the daemon detached-spawns
+   *  the new binary), or `manual` (container / non-unix bare — no auto-restart). */
+  restart_mode?: "supervised" | "self_respawn" | "manual";
+  /** Command to show the operator for finishing an upgrade with a restart. */
+  restart_hint?: string;
 }
 
 export interface ProcessStats {
@@ -48,10 +60,20 @@ export interface ComponentHealth {
   restart_count: number;
 }
 
+export type OptionDomain =
+  | "channel_refs"
+  | "peer_targets"
+  | "peer_groups"
+  | "agent_aliases"
+  | "tool_names"
+  | "memory_categories";
+
 export interface ToolSpec {
   name: string;
   description: string;
   parameters: any;
+  output?: any;
+  param_domains?: Record<string, OptionDomain>;
 }
 
 export interface CronDeliveryConfig {
@@ -77,6 +99,7 @@ export interface CronJob {
   enabled: boolean;
   delivery: CronDeliveryConfig;
   delete_after_run: boolean;
+  uses_memory: boolean;
   session_target: string | null;
   model: string | null;
   allowed_tools: string[] | null;

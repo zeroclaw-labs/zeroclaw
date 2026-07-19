@@ -1,11 +1,4 @@
 //! Keymap abstraction for zerocode.
-//!
-//! Each leaf action enum carries its own default bindings inline.
-//! Consumers call `ChatTabAction::from_chord(&key)` directly — no
-//! `Keymap` struct, no plumbed argument.
-//!
-//! On darwin, `Chord::matches` translates the `CTRL` modifier to
-//! `SUPER` so Linux's `Ctrl+K` and macOS's `⌘K` resolve identically.
 
 pub mod actions;
 mod chord;
@@ -129,9 +122,6 @@ mod tests {
         assert_eq!(action, back);
     }
 
-    /// Every action enum's binding table must have no duplicate chord
-    /// keys (one chord → one action per enum). Runs as a unit test so
-    /// the rejection is loud and reproducible in CI.
     #[test]
     fn no_intra_enum_chord_conflicts() {
         fn check<A: Copy + std::fmt::Debug>(label: &str, table: Vec<(Chord, A)>) {
@@ -151,6 +141,7 @@ mod tests {
         check(ConfigTabAction::TAG, ConfigTabAction::bindings());
         check(DoctorTabAction::TAG, DoctorTabAction::bindings());
         check(QuickstartTabAction::TAG, QuickstartTabAction::bindings());
+        check(SopTabAction::TAG, SopTabAction::bindings());
         check(InputBarAction::TAG, InputBarAction::bindings());
         check(ModalAction::TAG, ModalAction::bindings());
         check(CaptureAction::TAG, CaptureAction::bindings());
@@ -206,6 +197,13 @@ mod tests {
                     .map(|(c, _)| c)
                     .collect(),
             ),
+            (
+                "sop",
+                SopTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
         ];
         for (gc, ga) in &global {
             for (label, chords) in panes {
@@ -219,9 +217,6 @@ mod tests {
         }
     }
 
-    /// Every rebindable enum's TAG and serialized variant names must be
-    /// snake_case — the action-key wire form (`"<tag>.<variant>"`) is
-    /// only valid snake_case, and kebab-case is banned project-wide.
     #[test]
     fn tags_and_variant_names_are_snake_case() {
         fn ok(s: &str) -> bool {
@@ -245,6 +240,7 @@ mod tests {
         check::<DashboardTabAction>();
         check::<ConfigTabAction>();
         check::<QuickstartTabAction>();
+        check::<SopTabAction>();
         check::<InputBarAction>();
         check::<FileExplorerAction>();
     }

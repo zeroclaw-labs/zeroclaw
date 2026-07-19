@@ -2,7 +2,6 @@
 //! `shared/` containment, uniqueness) live in [`zeroclaw_config::skill_bundles`]
 //! so `Config::validate` and the SkillsService share one implementation.
 //! This module is a thin re-exporter plus the `BundleSummary` shape
-//! returned to surface callers.
 
 use std::path::{Path, PathBuf};
 

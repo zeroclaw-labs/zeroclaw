@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileDownloadConfig;
 
@@ -16,12 +16,6 @@ static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 pub struct FileDownloadTool {
     security: Arc<SecurityPolicy>,
     config: FileDownloadConfig,
-    /// Whether the downloaded file persists on the host filesystem. `false` on
-    /// an ephemeral runtime (Docker tmpfs / no volume mount), where the file is
-    /// written inside the container but invisible on the host and discarded at
-    /// session end. When `false`, a successful download carries a loud
-    /// ephemeral-workspace warning. Mirrors
-    /// [`super::file_write::FileWriteTool`]. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -144,7 +138,7 @@ impl Tool for FileDownloadTool {
         else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg("tool-file-download-error-disabled")),
             });
         };
@@ -152,7 +146,7 @@ impl Tool for FileDownloadTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg("tool-file-download-error-read-only")),
             });
         }
@@ -160,7 +154,7 @@ impl Tool for FileDownloadTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg("tool-file-download-error-rate-limited-hour")),
             });
         }
@@ -208,7 +202,7 @@ impl Tool for FileDownloadTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-invalid-file-name",
                         &[("dest_path", dest_path)],
@@ -220,7 +214,7 @@ impl Tool for FileDownloadTool {
         let Some(parent) = full.parent() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-file-download-error-no-parent",
                     &[("dest_path", dest_path)],
@@ -236,7 +230,7 @@ impl Tool for FileDownloadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-resolve-dir",
                         &[("dest_path", dest_path), ("err", &e.to_string())],
@@ -248,7 +242,7 @@ impl Tool for FileDownloadTool {
         if !self.security.is_resolved_path_allowed(&canonical_parent) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&canonical_parent),
@@ -260,7 +254,7 @@ impl Tool for FileDownloadTool {
         if !self.security.is_resolved_path_allowed(&dest) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(self.security.resolved_path_violation_message(&dest)),
             });
         }
@@ -270,7 +264,7 @@ impl Tool for FileDownloadTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg(
                     "tool-file-download-error-rate-limited-budget",
                 )),
@@ -291,7 +285,7 @@ impl Tool for FileDownloadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-client-build",
                         &[("err", &e.to_string())],
@@ -310,7 +304,7 @@ impl Tool for FileDownloadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(Self::tool_msg_with_args(
                         "tool-file-download-error-request",
                         &[("err", &e.to_string())],
@@ -324,11 +318,6 @@ impl Tool for FileDownloadTool {
         if !status.is_success() {
             let raw_body = response.text().await.unwrap_or_default();
             let truncated = if raw_body.len() > RESPONSE_BODY_LIMIT_BYTES {
-                // The body is attacker-influenceable, so split on a char boundary
-                // to avoid panicking when the byte cutoff lands inside a
-                // multi-byte UTF-8 sequence. floor_char_boundary is unstable, so
-                // walk down at most three bytes — a UTF-8 code point is at most
-                // four bytes wide, so a boundary is always within reach.
                 let mut cut = RESPONSE_BODY_LIMIT_BYTES;
                 while cut > 0 && !raw_body.is_char_boundary(cut) {
                     cut -= 1;
@@ -343,7 +332,7 @@ impl Tool for FileDownloadTool {
             };
             return Ok(ToolResult {
                 success: false,
-                output: truncated,
+                output: truncated.into(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-file-download-error-status",
                     &[("status", &status.to_string())],
@@ -358,7 +347,7 @@ impl Tool for FileDownloadTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(Self::tool_msg_with_args(
                     "tool-file-download-error-too-large-reported",
                     &[
@@ -391,7 +380,7 @@ impl Tool for FileDownloadTool {
                     );
                     // The download landed in an ephemeral workspace and will not
                     // reach the host — warn loudly rather than report a bare
-                    // success (issue #4627).
+                    // success
                     let output = if self.persistent_writes {
                         output
                     } else {
@@ -399,7 +388,7 @@ impl Tool for FileDownloadTool {
                     };
                     Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     })
                 }
@@ -407,7 +396,7 @@ impl Tool for FileDownloadTool {
                     let _ = tokio::fs::remove_file(&temp_path).await;
                     Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(Self::tool_msg_with_args(
                             "tool-file-download-error-move",
                             &[("err", &e.to_string())],
@@ -419,7 +408,7 @@ impl Tool for FileDownloadTool {
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 })
             }
@@ -650,9 +639,6 @@ mod tests {
         );
     }
 
-    /// On an ephemeral runtime a successful download lands in a workspace that
-    /// won't persist; the output must carry the loud warning while preserving
-    /// the original status, and the bytes must still be written (issue #4627).
     #[tokio::test]
     async fn execute_warns_on_ephemeral_workspace() {
         let server = MockServer::start().await;
@@ -857,9 +843,6 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
 
-        // The configured endpoint returns a 302 pointing at a sibling path.
-        // With redirects disabled, the tool must surface the 302 itself as a
-        // non-success status and must never contact the redirect target.
         Mock::given(method("GET"))
             .and(path("/download"))
             .respond_with(
@@ -910,11 +893,6 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
 
-        // Build a non-2xx body that is longer than RESPONSE_BODY_LIMIT_BYTES
-        // (4096) and where the byte at offset 4096 lands inside a multi-byte
-        // UTF-8 sequence. Pre-truncation pad — 4094 ASCII bytes — places the
-        // first byte of the next 3-byte character ("界") at offset 4094, so
-        // offset 4096 lies in the middle of that code point.
         let mut body = "x".repeat(4094);
         body.push_str("世界世界世界世界世界世界");
         assert!(!body.is_char_boundary(4096));

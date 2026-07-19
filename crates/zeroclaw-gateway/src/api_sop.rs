@@ -1,12 +1,4 @@
 //! Out-of-band SOP approval surface (EPIC C, C6).
-//!
-//! `GET /admin/sop/pending`, `POST /admin/sop/approve`, `POST /admin/sop/deny`.
-//! Auth reuses the vetted `/admin/reload` gate verbatim: loopback (the CLI) is
-//! allowed and attributed as a `cli` principal; a non-loopback caller needs
-//! `gateway.allow_remote_admin` + pairing and passes `require_auth`, attributed
-//! as an `http` principal. The principal is ALWAYS derived from the transport
-//! here, never from the request body. Resolution funnels through the shared
-//! engine's `resolve_gate` chokepoint; `sop_engine = None` yields 503.
 
 use std::net::SocketAddr;
 
@@ -157,6 +149,15 @@ fn resolve(
                 )
             })?
     };
+    if let ResolveOutcome::Resumed(action) = &outcome {
+        let config = state.config.read().clone();
+        zeroclaw_runtime::sop::spawn_headless_run_driver(
+            config,
+            std::sync::Arc::clone(engine),
+            state.sop_audit.clone(),
+            action.as_ref().clone(),
+        );
+    }
     let (code, label) = outcome_response(&outcome);
     Ok((
         code,
