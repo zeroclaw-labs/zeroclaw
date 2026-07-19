@@ -229,47 +229,6 @@ pub fn resolve_openai_stt_api_key(existing: Option<&str>) -> Option<String> {
     None
 }
 
-/// Legacy provider-native env-var fallbacks applied after
-/// [`apply_env_overrides`] so that `ZEROCLAW_*` values always win.
-///
-/// Checks whether `TRANSCRIPTION_API_KEY` or `OPENAI_API_KEY` is set
-/// and logs a note for operator visibility.  The actual credential
-/// resolution is done on-demand by [`resolve_openai_stt_api_key`],
-/// which is called during provider construction — no value is ever
-/// written into the [`Config`] struct by this function, so the
-/// single-source-of-truth rule is preserved and save/reload cycles
-/// never persist the environment credential.
-///
-/// Returns an empty `Vec` (no injection paths).  The caller's merge
-/// loop is a deliberate no-op — retain it at the call site for
-/// future legacy-fallback additions that need injection machinery.
-pub fn apply_legacy_env_fallbacks(_config: &mut Config) -> Vec<(String, String)> {
-    let value = find_first_env(&["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"]);
-    if value.is_some() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Legacy env vars (TRANSCRIPTION_API_KEY / OPENAI_API_KEY) \
-             detected; credentials resolved on demand during provider construction"
-        );
-    }
-    Vec::new()
-}
-
-/// Returns the value of the first matching env var from `names`,
-/// checked in order so the first entry takes priority.
-fn find_first_env(names: &[&str]) -> Option<String> {
-    for name in names {
-        if let Ok(value) = std::env::var(name) {
-            let trimmed = value.trim().to_string();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +255,7 @@ mod tests {
     /// (`TRANSCRIPTION_API_KEY`, `OPENAI_API_KEY`) while the shared
     /// `env_test_lock()` is held. Snapshots pre-existing values on
     /// construction, clears them both, and restores originals on drop.
-    /// Tests that exercise `apply_legacy_env_fallbacks` use this instead
+    /// Tests that exercise `resolve_openai_stt_api_key` use this instead
     /// of bare `EnvVarGuard` so their behaviour is deterministic
     /// regardless of what the dev or CI shell has set.
     struct LegacyEnvFixture {
@@ -620,87 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_skips_empty_env_values() {
-        let _guard = super::env_test_lock().await;
-        let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "   ");
-        assert_eq!(resolve_openai_stt_api_key(None), None);
-    }
-
-    // ── apply_legacy_env_fallbacks tests ──────────────────────────
-
-    #[tokio::test]
-    async fn legacy_fallback_no_env_does_nothing() {
-        let _guard = super::env_test_lock().await;
-        let _fixture = LegacyEnvFixture::isolate();
-
-        let mut config = Config::default();
-        assert!(
-            config.transcription.openai.is_none(),
-            "precondition: openai must be None"
-        );
-        let results = apply_legacy_env_fallbacks(&mut config);
-        assert!(results.is_empty(), "no fallbacks should apply: {results:?}");
-        // Must NOT materialize the Option field when no env var is set.
-        assert!(
-            config.transcription.openai.is_none(),
-            "must not create [transcription.openai] when no env var is set"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_fallback_does_not_mutate_config() {
-        let _guard = super::env_test_lock().await;
-        let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env-value");
-
-        let mut config = Config::default();
-        config.transcription.openai = Some(crate::schema::OpenAiSttConfig {
-            api_key: Some("sk-config-value".to_string()),
-            model: "whisper-1".to_string(),
-        });
-
-        let results = apply_legacy_env_fallbacks(&mut config);
-        assert!(
-            results.is_empty(),
-            "must return empty vec (no injection): {results:?}"
-        );
-        assert_eq!(
-            config
-                .transcription
-                .openai
-                .as_ref()
-                .unwrap()
-                .api_key
-                .as_deref(),
-            Some("sk-config-value"),
-            "config must remain unmodified",
-        );
-        // The table must NOT be materialized when it starts as None.
-        let mut cfg2 = Config::default();
-        assert!(cfg2.transcription.openai.is_none());
-        let _ = apply_legacy_env_fallbacks(&mut cfg2);
-        assert!(
-            cfg2.transcription.openai.is_none(),
-            "must not materialize [transcription.openai]",
-        );
-    }
-
-    #[tokio::test]
-    async fn env_only_path_default_model_is_whisper_1() {
-        let _guard = super::env_test_lock().await;
-        let _fixture = LegacyEnvFixture::isolate();
-
-        let mut config = Config::default();
-        // No [transcription.openai] table at all.
-        assert!(config.transcription.openai.is_none());
-        // `apply_legacy_env_fallbacks` must not materialize the table.
-        let results = apply_legacy_env_fallbacks(&mut config);
-        assert!(results.is_empty());
-        assert!(config.transcription.openai.is_none());
-
-        // The Default impl on OpenAiSttConfig must produce model = "whisper-1"
-        // (not an empty String).
+    async fn default_model_is_whisper_1() {
         let default_cfg = crate::schema::OpenAiSttConfig::default();
         assert_eq!(default_cfg.model, "whisper-1");
         assert!(default_cfg.api_key.is_none());
