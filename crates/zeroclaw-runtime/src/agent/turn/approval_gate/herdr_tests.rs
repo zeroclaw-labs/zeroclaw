@@ -7,9 +7,9 @@ use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResp
 use zeroclaw_config::policy::AutonomyLevel;
 use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
 
+use crate::agent::turn::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use crate::agent::turn::context::TurnCtx;
 use crate::agent::turn::events::DraftEvent;
-use crate::agent::turn::approval_gate::{gate_tool_approval, ApprovalGateOutcome};
 use crate::approval::ApprovalManager;
 use crate::integrations::herdr::HerdrObserver;
 use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
@@ -22,7 +22,10 @@ struct TestChannel {
 
 impl TestChannel {
     fn new(response: ChannelApprovalResponse, approval_requests: Arc<AtomicUsize>) -> Self {
-        Self { response, approval_requests }
+        Self {
+            response,
+            approval_requests,
+        }
     }
 }
 
@@ -32,19 +35,27 @@ impl ::zeroclaw_api::attribution::Attributable for TestChannel {
             ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
         )
     }
-    fn alias(&self) -> &str { "test-channel" }
+    fn alias(&self) -> &str {
+        "test-channel"
+    }
 }
 
 #[async_trait::async_trait]
 impl Channel for TestChannel {
-    fn name(&self) -> &str { "test-channel" }
+    fn name(&self) -> &str {
+        "test-channel"
+    }
 
-    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> { Ok(()) }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn listen(
         &self,
         _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-    ) -> anyhow::Result<()> { Ok(()) }
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn request_approval(
         &self,
@@ -114,13 +125,20 @@ async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
     crate::integrations::herdr::update_session_id("test-session-1");
 
     let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
-    let channel = Arc::new(TestChannel::new(ChannelApprovalResponse::Approve, Arc::new(AtomicUsize::new(0)))) as Arc<dyn Channel>;
+    let channel = Arc::new(TestChannel::new(
+        ChannelApprovalResponse::Approve,
+        Arc::new(AtomicUsize::new(0)),
+    )) as Arc<dyn Channel>;
     let (tx, _rx) = mpsc::channel(8);
     let pacing = PacingConfig::default();
     let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);
 
-    let outcome = gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "echo hi"}), 0).await;
-    assert!(matches!(outcome, ApprovalGateOutcome::Proceed { approved: true }));
+    let outcome =
+        gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "echo hi"}), 0).await;
+    assert!(matches!(
+        outcome,
+        ApprovalGateOutcome::Proceed { approved: true }
+    ));
     assert_state_sequence!(calls, vec!["blocked", "working"]);
 }
 
@@ -134,12 +152,16 @@ async fn approval_gate_herdr_deny_transitions_blocked_to_idle() {
     crate::integrations::herdr::update_session_id("test-session-2");
 
     let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
-    let channel = Arc::new(TestChannel::new(ChannelApprovalResponse::Deny, Arc::new(AtomicUsize::new(0)))) as Arc<dyn Channel>;
+    let channel = Arc::new(TestChannel::new(
+        ChannelApprovalResponse::Deny,
+        Arc::new(AtomicUsize::new(0)),
+    )) as Arc<dyn Channel>;
     let (tx, _rx) = mpsc::channel(8);
     let pacing = PacingConfig::default();
     let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);
 
-    let outcome = gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "rm -rf /"}), 0).await;
+    let outcome =
+        gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "rm -rf /"}), 0).await;
     assert!(matches!(outcome, ApprovalGateOutcome::Deny(_)));
     assert_state_sequence!(calls, vec!["blocked", "idle"]);
 }

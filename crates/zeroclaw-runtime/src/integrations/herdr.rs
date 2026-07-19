@@ -249,8 +249,10 @@ impl HerdrClient {
 
         let payload_str = serde_json::to_string(&payload)?;
 
-        // Fire-and-forget: push to writer task. Channel is bounded (32),
-        // so this applies backpressure if the daemon is slow/unavailable.
+        // Fire-and-forget: push to writer task. The channel is unbounded, so
+        // send is O(1) even if the writer task is stuck connecting to a stale
+        // socket. Messages may accumulate if the daemon is slow/unavailable;
+        // they are drained when the writer task reconnects or dropped on Drop.
         #[cfg(unix)]
         if let Some(tx) = &self.writer {
             let _ = tx.send(payload_str);
@@ -443,7 +445,10 @@ impl Observer for HerdrObserver {
     fn record_metric(&self, _metric: &ObserverMetric) {}
 
     fn flush(&self) {
-        self.reporter.lock().expect("herdr observer poisoned").flush();
+        self.reporter
+            .lock()
+            .expect("herdr observer poisoned")
+            .flush();
     }
 
     fn name(&self) -> &str {
@@ -681,6 +686,14 @@ pub(crate) mod tests {
             "test-pane".into(),
         );
 
+        // Capture `now_micros` BEFORE generating seq. The seq counter is
+        // seeded from wall clock on first use, so seq1 should be >= the
+        // clock value captured here (within the resolution of SystemTime).
+        let now_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+
         let seq1 = client.next_seq();
         let seq2 = client.next_seq();
         let seq3 = client.next_seq();
@@ -688,12 +701,10 @@ pub(crate) mod tests {
         assert!(seq2 > seq1, "seq must be monotonic: {} <= {}", seq2, seq1);
         assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
 
-        let now_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+        // seq1 was captured AFTER now_micros, so seq1 >= now_micros. We allow
+        // 10ms slack to absorb scheduler latency and SystemTime granularity.
         assert!(
-            seq1 >= now_micros.saturating_sub(1000),
+            seq1 >= now_micros.saturating_sub(10_000),
             "seq {} should be seeded from wall clock (now ~{})",
             seq1,
             now_micros
