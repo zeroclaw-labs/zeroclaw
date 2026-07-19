@@ -2,10 +2,6 @@
 //! default keymap (`apps/zerocode/src/keymap/actions.rs`). The registry is the
 //! single source of truth; the docs render whatever chords it carries so a
 //! rebind never drifts the rendered tables.
-//!
-//! Outputs (gitignored, derived — `{{#include}}`d at build time):
-//!   docs/book/src/_snippets/zerocode-pane-nav-keys.md
-//!   docs/book/src/_snippets/zerocode-quickstart-pane-keys.md
 
 use anyhow::Result;
 use std::fmt::Write as _;

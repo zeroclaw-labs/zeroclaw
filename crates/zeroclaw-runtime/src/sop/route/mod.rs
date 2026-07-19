@@ -37,11 +37,11 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         return NextStep::Complete;
     };
 
-    if let Some(when) = current.routing.when.as_deref()
-        && !evaluate_condition(when, Some(&ctx.run_data.to_payload().to_string()))
-    {
-        return NextStep::Complete;
-    }
+    let payload = ctx.run_data.to_payload().to_string();
+    let when_allows_jump = match current.routing.when.as_deref() {
+        None => true,
+        Some(when) => evaluate_condition(when, Some(&payload)),
+    };
 
     // ── Switch: evaluate ports top to bottom; first passing rule routes. A
     // rule with no `when` is the catch-all. No rule matches → Complete.
@@ -74,12 +74,19 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
     }
 
     let explicit_next = current.routing.next;
-    if explicit_next.is_none() && current.routing.terminal {
+    // A failed `when` disables the explicit jump: the step routes as if
+    // `next` were absent, so `terminal` still completes the run.
+    let effective_next = if when_allows_jump {
+        explicit_next
+    } else {
+        None
+    };
+    if effective_next.is_none() && current.routing.terminal {
         return NextStep::Complete;
     }
-    let next_step = explicit_next.unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
+    let next_step = effective_next.unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
     let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
-        return if explicit_next.is_none() && next_step > ctx.run.total_steps {
+        return if effective_next.is_none() && next_step > ctx.run.total_steps {
             NextStep::Complete
         } else {
             NextStep::Fail(format!("step {next_step} does not exist"))
@@ -119,7 +126,7 @@ mod tests {
         }
     }
 
-    fn sop() -> Sop {
+    fn sop_with_steps(steps: Vec<SopStep>) -> Sop {
         Sop {
             name: "test".into(),
             description: "test".into(),
@@ -127,7 +134,7 @@ mod tests {
             priority: SopPriority::Normal,
             execution_mode: SopExecutionMode::Auto,
             triggers: Vec::new(),
-            steps: vec![step(1), step(2)],
+            steps,
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
@@ -135,6 +142,40 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+        }
+    }
+
+    fn sop() -> Sop {
+        sop_with_steps(vec![step(1), step(2)])
+    }
+
+    fn run_at(current_step: u32, total_steps: u32) -> SopRun {
+        let mut run = run();
+        run.current_step = current_step;
+        run.total_steps = total_steps;
+        run
+    }
+
+    fn loop_step(number: u32) -> SopStep {
+        let mut loop_step = step(number);
+        loop_step.routing.when = Some(format!("$.steps.{number}.remaining > 0"));
+        loop_step.routing.next = Some(number);
+        loop_step
+    }
+
+    fn run_data_with_remaining(step_number: u32, remaining: u32) -> RunData {
+        let mut run_data = RunData::default();
+        run_data.insert_output_str(step_number, &format!(r#"{{"remaining":{remaining}}}"#));
+        run_data
+    }
+
+    fn route_ctx<'a>(sop: &'a Sop, run: &'a SopRun, run_data: &'a RunData) -> RouteCtx<'a> {
+        RouteCtx {
+            sop,
+            run,
+            run_data,
+            last_status: SopStepStatus::Completed,
+            max_step_visits: 256,
         }
     }
 
@@ -192,5 +233,35 @@ mod tests {
         };
 
         assert_eq!(resolve_next(&ctx), NextStep::Wait(2));
+    }
+
+    #[test]
+    fn when_true_self_loop_routes_back() {
+        let sop = sop_with_steps(vec![step(1), loop_step(2), step(3)]);
+        let run = run_at(2, 3);
+        let run_data = run_data_with_remaining(2, 1);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Step(2));
+    }
+
+    #[test]
+    fn when_false_advances_to_following_step() {
+        let sop = sop_with_steps(vec![step(1), loop_step(2), step(3)]);
+        let run = run_at(2, 3);
+        let run_data = run_data_with_remaining(2, 0);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Step(3));
+    }
+
+    #[test]
+    fn when_false_tail_loop_completes() {
+        let sop = sop_with_steps(vec![step(1), loop_step(2)]);
+        let run = run_at(2, 2);
+        let run_data = run_data_with_remaining(2, 0);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 }

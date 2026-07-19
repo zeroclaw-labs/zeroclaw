@@ -64,7 +64,7 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) name: String,
     pub(crate) description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
-    /// transparently, never deep-cloned per request (#8642).
+    /// transparently, never deep-cloned per request
     pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
@@ -229,19 +229,6 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// Single source of truth for "does the per-turn tool list contain at least
-/// one entry?" — used by both `send_responses_request` and `stream_chat`
-/// to gate `tool_choice` and `parallel_tool_calls` on the request body.
-///
-/// Returns `true` only when `tools` is `Some(non_empty)`. Returns `false`
-/// for `Some(vec![])` and for `None`. This is the wire-format contract that
-/// vLLM 0.19+ and other spec-compliant validators enforce: when
-/// `tool_choice` is present, `tools` must also be present and non-empty
-/// (issue #7862, surface left out of #7864).
-///
-/// Factored out so the gate is tested in one place rather than mirrored
-/// inside the regression test. Both production call sites now call this
-/// helper, so the test that exercises it covers both paths.
 pub(crate) fn has_turn_tools(tools: Option<&Vec<ResponsesToolSpec>>) -> bool {
     tools.as_ref().is_some_and(|t| !t.is_empty())
 }
@@ -1091,12 +1078,6 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
-/// Read the response body incrementally via `bytes_stream()` to avoid
-/// buffering the entire SSE payload in memory.  The previous implementation
-/// used `response.text().await?` which holds the HTTP connection open until
-/// every byte has arrived — on high-latency links the long-lived connection
-/// often drops mid-read, producing the "error decoding response body" failure
-/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
@@ -1779,14 +1760,6 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
-        // End-to-end regression for #7862 (vLLM HTTP 400). The test
-        // drives the production `chat()` path against the mock Codex
-        // transport, then asserts the **captured** request body
-        // (the actual JSON the provider sent over the wire) does not
-        // contain `tool_choice` or `parallel_tool_calls` when the
-        // converted tool list is empty. This proves the gate is wired
-        // into the production request builder, not just a struct field
-        // shape that happens to omit the keys.
         let (provider, captured, server_handle, _temp_dir) =
             mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
                 "output_text": "ok",

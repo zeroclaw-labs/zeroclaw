@@ -1,22 +1,5 @@
 //! Unified memory-context injection: ONE policy and ONE renderer for the
 //! memory preamble, applied at the turn engine.
-//!
-//! Replaces the per-path inline renderers (the three `loop_` sites, the
-//! channel orchestrator's budgeted renderer, the agent-direct loader, and
-//! the cron/daemon pre-prompt blocks). The injection decision is keyed on
-//! [`TurnOrigin`] (who initiated the turn), resolved by
-//! [`resolve_inject_policy`]; the pipeline in [`render_memory_context`] is
-//! the uniform superset of the legacy renderers' behavior. Divergences from
-//! any individual legacy path are deliberate and documented on the PR that
-//! wires this module (uniform rigour: a per-path difference is an error
-//! unless documented).
-//!
-//! Pipeline: recall (per session, key-deduped) -> time decay -> relevance
-//! filter -> skip set (autosave keys/content, `*_history` keys, `[IMAGE:`
-//! markers, `<tool_result` blocks, optional Conversation-category
-//! exclusion) -> budget caps (entry count, per-entry chars, total chars)
-//! -> `[Memory context]` wrapper. Exactly one `MemoryRecall` observer
-//! event is emitted per render, covering all recalls.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -98,24 +81,13 @@ pub enum InjectPolicy {
     /// Inject via the uniform pipeline.
     Inject {
         /// Drop `MemoryCategory::Conversation` entries. True for scheduled
-        /// origins (chat history must not leak into autonomous runs, #5456)
+        /// origins (chat history must not leak into autonomous runs,
         /// and for turns without a session scope (without a session filter,
         /// other channels' conversations would bleed in).
         exclude_conversation: bool,
     },
 }
 
-/// Resolve the injection policy from who initiated the turn.
-///
-/// The uniform rule set:
-/// - `SubTurn` never injects: a nested turn must not re-absorb the parent's
-///   memory; the parent states what the child needs in the prompt it writes.
-/// - Scheduled origins (`Cron`, `Daemon`) inject with Conversation entries
-///   excluded (#5456).
-/// - All other origins inject; Conversation entries are excluded when the
-///   turn has no session scope.
-/// - `suppress` covers per-spawn opt-outs (e.g. a cron job configured with
-///   `uses_memory = false`).
 #[must_use]
 pub fn resolve_inject_policy(
     origin: TurnOrigin,
@@ -169,14 +141,6 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     false
 }
 
-/// Render the memory-context preamble for one turn: the uniform pipeline
-/// over one or more session scopes (multi-session recall is key-deduped in
-/// order, mirroring the channel renderer's history-key + sender recall).
-///
-/// Returns the wrapped block followed by a blank line, or an empty string
-/// when nothing qualifies. Recall errors are swallowed (the turn proceeds
-/// without memory); exactly one `MemoryRecall` observer event is emitted
-/// per call, with `success = false` only when every recall failed.
 pub async fn render_memory_context(
     mem: &dyn Memory,
     observer: &dyn Observer,

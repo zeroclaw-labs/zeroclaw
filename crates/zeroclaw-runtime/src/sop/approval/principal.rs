@@ -1,9 +1,4 @@
 //! WHO resolved a SOP approval gate, and from WHERE (EPIC C).
-//!
-//! `source` is the security-load-bearing field: it is ALWAYS derived from the
-//! transport that called `resolve_gate`, NEVER from a client-supplied JSON field.
-//! The constructors are the only way to build a principal, so a remote caller
-//! cannot claim to be the agent (or vice versa) by shaping a request body.
 
 use serde::{Deserialize, Serialize};
 

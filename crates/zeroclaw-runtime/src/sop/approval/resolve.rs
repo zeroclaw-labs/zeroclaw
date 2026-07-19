@@ -1,11 +1,4 @@
 //! The single gate-clearing chokepoint (EPIC C, C3).
-//!
-//! Every principal - the agent tool, the loopback CLI, the gateway, the timeout
-//! tick - funnels through `resolve_gate`. It enforces `approval_mode`, is
-//! idempotent (a second resolve in flight is `AlreadyResolved`, no double ledger
-//! row), records WHO resolved into B's append-only ledger, and persists the
-//! mutated run. `approve_step` keeps its own (unchanged) deterministic-checkpoint
-//! path; both share the extracted `clear_waiting_gate` transition body.
 
 use anyhow::Result;
 
