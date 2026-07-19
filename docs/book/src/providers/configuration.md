@@ -26,11 +26,13 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 ## Field resolution order
 
-For every family, the URL is resolved in this order:
+For most families, the URL is resolved in this order:
 
 1. **Operator override**: `uri` field on the alias entry, if set.
 2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
 3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
+
+Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). The `uri` alias field and the schema-level `providers.models.bedrock.<alias>.region` field have no effect in the current implementation.
 
 ## Family slots
 
@@ -118,6 +120,11 @@ The Bedrock provider uses the credential paths implemented in `crates/zeroclaw-p
 3. `credential_process` in the active profile from `~/.aws/config`, or from `AWS_CONFIG_FILE`, uses SigV4. `AWS_PROFILE` selects the profile and defaults to `default`.
 4. EC2 IMDSv2 instance credentials are the final SigV4 fallback.
 
+The config schema additionally defines a `providers.models.bedrock.<alias>.region`
+field, but the current implementation does not read it. The endpoint region is
+always resolved from the AWS credential chain (environment variables,
+`credential_process`, or IMDS) as described above.
+
 A normal static profile in `~/.aws/credentials` is not read by the current Bedrock implementation. `~/.zeroclaw/secrets` only stores ZeroClaw config secrets such as an alias `api_key`; it does not export `AWS_*` variables for the provider.
 
 To reuse an AWS CLI profile through the implemented profile path, put a `credential_process` in `~/.aws/config`:
@@ -127,6 +134,9 @@ To reuse an AWS CLI profile through the implemented profile path, put a `credent
 credential_process = /usr/bin/aws configure export-credentials --profile my-existing-profile
 region = us-east-1
 ```
+
+`/usr/bin/aws` is the default path on Debian and Ubuntu. On other systems,
+use the absolute path from `command -v aws`.
 
 Then run ZeroClaw with `AWS_PROFILE=zeroclaw-bedrock`. For a systemd user service, see [Service management](../setup/service.md#environment-overrides-systemd).
 
