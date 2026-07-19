@@ -30,7 +30,7 @@ Three authentication mechanisms:
 ```
 Authorization: Bearer <token>
 ```
-Obtained via `POST /pair`. Required for value reads and mutations under `/api/*` when `require_pairing = true` (default). Shape discovery through `/api/docs`, `/api/openapi.json`, and config `OPTIONS` is public.
+Obtained via `POST /pair`. The configuration value reads and mutations documented below require it when `require_pairing = true` (default). Shape discovery through `/api/docs`, `/api/openapi.json`, and config `OPTIONS` is public.
 
 ### Webhook Secret
 ```

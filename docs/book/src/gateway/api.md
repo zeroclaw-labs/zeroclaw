@@ -11,8 +11,8 @@ This page is a high-level overview. Field-level definitions, request and respons
 
 ## Authentication
 
-Value reads and mutations under `/api/*` are gated by the existing pairing and
-bearer authentication. Shape discovery through `/api/docs`,
+The configuration value reads and mutations described on this page are gated
+by the existing pairing and bearer authentication. Shape discovery through `/api/docs`,
 `/api/openapi.json`, and config `OPTIONS` is public. A first-run pairing code is
 printed when the daemon starts; subsequent authenticated calls send the derived
 bearer token in the `Authorization` header. The Scalar explorer at `/api/docs`
@@ -86,7 +86,7 @@ Per-property reads never expose secret fields (those marked `#[secret]` or
 `{populated: bool}` only, with no value, length, masked stand-in, or hash. The
 compatibility `GET /api/config` instead serializes the whole config after
 applying `MaskSecrets`, so secret fields can appear there only as masked
-placeholders. No HTTP endpoint returns the underlying secret value.
+placeholders. Neither config read surface returns the underlying secret value.
 
 `PUT` and `PATCH` write the new secret value and respond with
 `{populated: true}`; `DELETE` clears it and responds with

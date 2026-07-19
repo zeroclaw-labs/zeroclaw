@@ -1,6 +1,6 @@
 # Streaming
 
-Streaming is capability-driven. Providers that implement the streaming methods and return `supports_streaming() == true` can emit token deltas; other providers use the non-streaming response path. The runtime forwards available streams to channel adapters that support partial updates, such as Discord, Slack, Telegram, and the gateway WebSocket.
+Streaming is capability-driven. Providers that implement the streaming methods and return `supports_streaming() == true` can emit token deltas; other providers use the non-streaming response path. The runtime forwards available streams to channel adapters that support partial updates.
 
 ## What gets streamed
 
