@@ -205,12 +205,23 @@ impl TranscriptionProvider for GroqProvider {
 
 // ── OpenAiWhisperProvider ───────────────────────────────────────
 
-#[derive(Debug)]
 /// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     alias: String,
     api_key: String,
     model: String,
+}
+
+impl std::fmt::Debug for OpenAiWhisperProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the raw API key to prevent accidental credential leakage
+        // in logs, error messages, or debug output.
+        f.debug_struct("OpenAiWhisperProvider")
+            .field("alias", &self.alias)
+            .field("api_key", &"<REDACTED>")
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 impl OpenAiWhisperProvider {
