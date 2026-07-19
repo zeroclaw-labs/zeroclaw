@@ -751,8 +751,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ## Appendix B: Further Reading
 
-- [Diátaxis documentation framework](<https://diataxis.fr>): The definitive reference for structuring technical documentation by type.
-- [EA Artifacts on a Page (v2.2)](<https://eaonapage.com>): The classification framework used in Section 3.
+- [Diátaxis documentation framework](https://diataxis.fr): The definitive reference for structuring technical documentation by type.
+- [EA Artifacts on a Page (v2.2)](https://eaonapage.com): The classification framework used in Section 3.
 - **"Docs for Developers"**: Jared Bhatti et al.: A practical guide to technical documentation written by engineers who have maintained large documentation systems.
 - [Vale documentation](https://vale.sh/docs): Setup guide and configuration reference for the prose linter proposed in Section 10.
 - [Michael Nygard on ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): The original post that introduced the ADR format used in Section 6.
