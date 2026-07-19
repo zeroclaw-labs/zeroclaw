@@ -757,10 +757,8 @@ mod tests {
         let mut guard = FlushGuard::new(observer.clone());
         guard.fire();
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
-        // Second explicit fire is a no-op.
         guard.fire();
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
-        // Dropping after fire must not flush again.
         drop(guard);
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
     }

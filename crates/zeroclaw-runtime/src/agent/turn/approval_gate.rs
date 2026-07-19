@@ -201,3 +201,6 @@ pub(crate) async fn gate_tool_approval(
         approved: approval_requirement == ApprovalRequirement::Approved,
     }
 }
+
+#[cfg(test)]
+mod herdr_tests;
