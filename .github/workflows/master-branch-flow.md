@@ -18,7 +18,7 @@ re-enabled from branch protection with no code change).
 ZeroClaw uses a single default branch: `master`. All contributor PRs target
 `master` directly. There is no `dev` or promotion branch.
 
-Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `WareWolf-MoonWall`, `Nillth`, and `tidux`.
+Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWall`, `Nillth`, and `tidux`.
 
 ---
 

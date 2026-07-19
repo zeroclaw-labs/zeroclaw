@@ -25,11 +25,6 @@ pub struct SkillSummary {
     pub frontmatter: SkillFrontmatter,
 }
 
-/// Where an agent-effective skill came from. The dashboard mirrors the
-/// runtime's four-source union ([`super::load_skills_for_agent_from_config`])
-/// so an operator sees the same skills the agent actually loads — not just
-/// the `[skill_bundles.*]` table. Only [`SkillOrigin::Bundle`] skills are
-/// editable through the bundle write APIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillOrigin {
     /// `<install>/agents/<alias>/workspace/skills/`.
@@ -55,14 +50,14 @@ pub struct EffectiveSkill {
     /// `Some(alias)` iff `editable` (routes the bundle editor).
     pub bundle: Option<String>,
     /// Lower-precedence same-name skills this one shadowed (didn't load).
-    /// Empty for the common case. (#7963)
+    /// Empty for the common case.
     pub shadowed: Vec<ShadowedSkill>,
 }
 
 /// Result of resolving an agent's effective skills: the loaded set plus the
 /// audit-dropped candidates the resolver skipped. Lets the dashboard tell
 /// "no skills configured" (both empty) apart from "all failed audit"
-/// (skills empty, dropped non-empty). (#7963)
+/// (skills empty, dropped non-empty).
 #[derive(Debug, Clone)]
 pub struct EffectiveSkillSet {
     pub skills: Vec<EffectiveSkill>,
@@ -98,13 +93,6 @@ pub enum ServiceError {
     Io(#[from] std::io::Error),
 }
 
-/// Single source of truth for skill + skill-bundle operations.
-///
-/// Holds an immutable reference to `Config` and the install-root path. Reads
-/// are filesystem operations against the resolved bundle directories;
-/// writes go through the matching helpers in [`super::scaffold`],
-/// [`super::bundle`], and [`super::document`] so a single rule lives in a
-/// single place.
 pub struct SkillsService<'a> {
     config: &'a Config,
     install_root: PathBuf,
@@ -188,14 +176,6 @@ impl<'a> SkillsService<'a> {
         Ok(out)
     }
 
-    /// An agent's *effective* skill set — the four-source union the runtime
-    /// actually loads (workspace / open-skills / plugin / bundle), each tagged
-    /// with its [`SkillOrigin`]. This fixes the dashboard's "shows zero skills
-    /// when skills exist" gap (#7757): it is sourced from the **audited**
-    /// resolver [`super::load_skills_for_agent_from_config`], NOT from
-    /// [`Self::list_skills`] (which is bundle-only and does a raw, unaudited
-    /// `read_dir`) — so the page reflects exactly what the agent injects, and
-    /// never surfaces un-audited external (open-skills/plugin) frontmatter.
     pub fn resolve_effective_skills(
         &self,
         agent_alias: &str,
@@ -206,7 +186,7 @@ impl<'a> SkillsService<'a> {
         let (skills, dropped, shadows) =
             super::load_skills_for_agent_from_config_audited(self.config, agent_alias);
         // Group shadow records by the winning skill's name so each
-        // EffectiveSkill can carry the losers it shadowed. (#7963)
+        // EffectiveSkill can carry the losers it shadowed.
         let mut shadow_index: HashMap<String, Vec<ShadowedSkill>> = HashMap::new();
         for sh in shadows {
             shadow_index.entry(sh.name.clone()).or_default().push(sh);
@@ -272,15 +252,6 @@ impl<'a> SkillsService<'a> {
         Ok(SkillDocument::parse(&content)?)
     }
 
-    /// A bundle write/delete is permitted only when the target resolves to an
-    /// existing skill *inside its bundle directory* — i.e. a real `Bundle`-origin
-    /// skill. Workspace/open-skills/plugin skills never have a manifest under the
-    /// bundle dir, so this rejects them with [`ServiceError::NotEditable`] rather
-    /// than a misleading [`ServiceError::NotFound`]. Operates on the bundle `dir`
-    /// the caller already resolved and existence-checked, so a truly-absent target
-    /// still surfaces as `NotFound` and this guard fires only for a dir that exists
-    /// but is not a bundle skill (one `skill_directory` resolve per call, no
-    /// assumption that a second resolve returns the same path). (#7963 write-guard)
     fn ensure_editable(&self, target: &SkillRef, dir: &Path) -> Result<(), ServiceError> {
         if has_manifest(dir) {
             Ok(())
@@ -431,7 +402,7 @@ mod tests {
         assert_eq!(alpha_only[0].r#ref.bundle(), "alpha");
     }
 
-    // #7757: provenance derivation mirrors the resolver's own discriminators.
+    // provenance derivation mirrors the resolver's own discriminators.
     #[test]
     fn derive_origin_classifies_each_source() {
         let bundles = vec![BundleSummary {
@@ -476,7 +447,7 @@ mod tests {
         );
     }
 
-    // #7757: the effective set unions non-bundle sources (workspace) with
+    // the effective set unions non-bundle sources (workspace) with
     // bundle skills, tagging origin + editability — the gap that made the
     // dashboard render empty when only workspace skills existed.
     #[test]
@@ -579,7 +550,7 @@ mod tests {
         assert!(matches!(err, ServiceError::NotFound(_)));
     }
 
-    // #7963 write-guard: a write/delete targeting a directory that exists in the
+    // write-guard: a write/delete targeting a directory that exists in the
     // bundle dir but lacks a manifest (i.e. not a real bundle skill) is rejected
     // with NotEditable, not the misleading NotFound.
     #[test]
@@ -631,7 +602,7 @@ mod tests {
         assert!(skill_dir.exists());
     }
 
-    // #7963 skipped-audit: resolve_effective_skills surfaces audit-dropped
+    // skipped-audit: resolve_effective_skills surfaces audit-dropped
     // candidates so the dashboard can distinguish "none configured" from
     // "all failed audit".
     #[test]
@@ -707,7 +678,7 @@ mod tests {
         assert_eq!(all_dropped.dropped.len(), 1);
     }
 
-    // #7963 shadowed-by: a workspace skill that also exists in an assigned
+    // shadowed-by: a workspace skill that also exists in an assigned
     // bundle wins, and the EffectiveSkill records the shadowed bundle skill.
     #[test]
     fn resolve_effective_skills_records_shadow() {
