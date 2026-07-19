@@ -6,7 +6,6 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
-    buffer::Cell,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -2297,6 +2296,7 @@ impl Chat {
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
+                        state.clear_transcript_selection();
                         state.scrollbar_drag = Some(ScrollbarDrag {
                             start_scroll: state.scroll_offset,
                             start_row: row,
@@ -2315,6 +2315,7 @@ impl Chat {
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(drag) = state.scrollbar_drag {
+                        state.clear_transcript_selection();
                         let max = state
                             .last_total_rows
                             .saturating_sub(state.last_inner_height);
@@ -2355,7 +2356,7 @@ impl Chat {
                         {
                             if !region.text.is_empty() {
                                 crate::mouse::copy_osc52(&region.text);
-                                state.set_transcript_copy_feedback(region.rect);
+                                state.set_overlay_copy_feedback(region.rect);
                                 state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                             }
                         } else {
@@ -2389,14 +2390,14 @@ impl Chat {
                             match region.kind {
                                 CopyHitKind::Code => {
                                     state.clear_mouse_highlight();
-                                    state.set_code_copy_feedback(region.group);
+                                    state.set_copy_feedback(CopyFeedbackTarget::Code(region.group));
                                 }
                                 CopyHitKind::Message => {
-                                    state.clear_transcript_selection();
-                                    state.set_message_copy_feedback(region.rect);
+                                    state.clear_browse_selection();
+                                    state.set_overlay_copy_feedback(region.rect);
                                 }
                                 CopyHitKind::Transcript => {
-                                    state.set_transcript_copy_feedback(region.rect);
+                                    state.set_overlay_copy_feedback(region.rect);
                                 }
                             }
                             state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
@@ -2435,7 +2436,7 @@ impl Chat {
                             state.mark_dirty_full();
                         }
                     } else {
-                        state.clear_transcript_selection();
+                        state.clear_browse_selection();
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -3537,10 +3538,6 @@ fn message_copied_label() -> String {
     crate::i18n::t("zc-chat-copy-message-copied")
 }
 
-fn code_copied_label() -> String {
-    crate::i18n::t("zc-chat-copy-code-copied")
-}
-
 /// Recover the fence language token from a code-fence header bar line. The
 /// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
 /// empty info string both yield `None` so the rebuilt fence stays unlabelled.
@@ -3610,19 +3607,7 @@ fn centered_message_copy_rect(label: &str, anchor: Rect, body: Rect) -> Option<R
     Some(Rect::new(x, row, cells, 1))
 }
 
-fn code_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
-    use unicode_width::UnicodeWidthStr;
-
-    let cells = UnicodeWidthStr::width(label) as u16;
-    if cells == 0 || anchor.height == 0 {
-        return None;
-    }
-    let center = anchor.x.saturating_add(anchor.width / 2);
-    let x = center.saturating_sub(cells / 2);
-    Some(Rect::new(x, anchor.y, cells, 1))
-}
-
-fn message_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
+fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     use unicode_width::UnicodeWidthStr;
 
     let cells = UnicodeWidthStr::width(label) as u16;
@@ -3793,7 +3778,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.copy_hit_regions.clear();
         render_transcript_copy_overlay(f, state);
     }
-    render_code_copy_feedback(f, state);
+    render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
@@ -3819,17 +3804,34 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 }
 
 fn capture_transcript_snapshot(f: &mut Frame, state: &mut ChatState, body: Rect) {
-    let rows = {
+    use unicode_width::UnicodeWidthStr;
+
+    let cells = {
         let buffer = f.buffer_mut();
-        (body.y..body.y.saturating_add(body.height))
-            .map(|y| {
-                (body.x..body.x.saturating_add(body.width))
-                    .map(|x| buffer[(x, y)].clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+        let mut cells = Vec::with_capacity(usize::from(body.width) * usize::from(body.height));
+        for y in body.y..body.y.saturating_add(body.height) {
+            let mut column = 0;
+            while column < body.width {
+                let symbol = buffer[(body.x + column, y)].symbol().to_string();
+                let width = (UnicodeWidthStr::width(symbol.as_str()) as u16)
+                    .max(1)
+                    .min(body.width - column);
+                cells.push(TranscriptCell {
+                    symbol,
+                    span_start: column,
+                });
+                for _ in 1..width {
+                    cells.push(TranscriptCell {
+                        symbol: String::new(),
+                        span_start: column,
+                    });
+                }
+                column += width;
+            }
+        }
+        cells
     };
-    state.set_transcript_snapshot(TranscriptSnapshot { area: body, rows });
+    state.set_transcript_snapshot(TranscriptSnapshot { area: body, cells });
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -3845,7 +3847,7 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     let buffer = f.buffer_mut();
     for row in 0..snapshot.area.height {
         for column in 0..snapshot.area.width {
-            if selection.contains(CellPoint { column, row }) {
+            if snapshot.selection_contains(selection, CellPoint { column, row }) {
                 buffer[(snapshot.area.x + column, snapshot.area.y + row)]
                     .set_style(theme::selected_bg_style());
             }
@@ -3857,19 +3859,6 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
     state
         .copy_hit_regions
         .retain(|region| region.kind != CopyHitKind::Transcript);
-
-    if let Some(CopyFeedback::Transcript { rect, .. }) = state.copy_feedback {
-        f.render_widget(Clear, rect);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                message_copied_label(),
-                theme::success_style().add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center),
-            rect,
-        );
-        return;
-    }
 
     let Some(snapshot) = &state.transcript_snapshot else {
         return;
@@ -3906,19 +3895,6 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
 }
 
 fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
-    if let Some(CopyFeedback::Message { rect, .. }) = state.copy_feedback {
-        f.render_widget(Clear, rect);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                message_copied_label(),
-                theme::success_style().add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center),
-            rect,
-        );
-        return;
-    }
-
     let Some(region) = state.message_copy_region(body) else {
         return;
     };
@@ -3933,28 +3909,40 @@ fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
     );
 }
 
-fn render_code_copy_feedback(f: &mut Frame, state: &ChatState) {
-    let Some(CopyFeedback::Code { group, .. }) = state.copy_feedback else {
+fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
+    let Some(feedback) = state.copy_feedback else {
         return;
     };
-    for region in state
-        .copy_hit_regions
-        .iter()
-        .filter(|r| r.kind == CopyHitKind::Code && r.group == group)
-    {
-        let Some(rect) = code_copy_feedback_rect(&code_copied_label(), region.rect) else {
-            continue;
-        };
-        f.render_widget(Clear, rect);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                code_copied_label(),
-                theme::success_style().add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center),
-            rect,
-        );
+
+    match feedback.target {
+        CopyFeedbackTarget::Code(group) => {
+            let label = message_copied_label();
+            for region in state
+                .copy_hit_regions
+                .iter()
+                .filter(|region| region.kind == CopyHitKind::Code && region.group == group)
+            {
+                if let Some(rect) = centered_copy_feedback_rect(&label, region.rect) {
+                    render_copied_label(f, &label, rect);
+                }
+            }
+        }
+        CopyFeedbackTarget::Overlay(rect) => {
+            render_copied_label(f, &message_copied_label(), rect);
+        }
     }
+}
+
+fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label.to_string(),
+            theme::success_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        rect,
+    );
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -4885,10 +4873,15 @@ struct CopyHitRegion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopyFeedback {
-    Code { group: usize, shown_at: Instant },
-    Message { rect: Rect, shown_at: Instant },
-    Transcript { rect: Rect, shown_at: Instant },
+enum CopyFeedbackTarget {
+    Code(usize),
+    Overlay(Rect),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyFeedback {
+    target: CopyFeedbackTarget,
+    shown_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4912,21 +4905,18 @@ impl TranscriptSelection {
             (self.head, self.anchor)
         }
     }
+}
 
-    fn contains(self, point: CellPoint) -> bool {
-        if !self.dragged {
-            return false;
-        }
-        let (start, end) = self.normalized();
-        (point.row, point.column) >= (start.row, start.column)
-            && (point.row, point.column) <= (end.row, end.column)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptCell {
+    symbol: String,
+    span_start: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TranscriptSnapshot {
     area: Rect,
-    rows: Vec<Vec<Cell>>,
+    cells: Vec<TranscriptCell>,
 }
 
 impl TranscriptSnapshot {
@@ -4940,58 +4930,96 @@ impl TranscriptSnapshot {
         })
     }
 
+    fn cell(&self, point: CellPoint) -> Option<&TranscriptCell> {
+        if point.column >= self.area.width || point.row >= self.area.height {
+            return None;
+        }
+        let index =
+            usize::from(point.row) * usize::from(self.area.width) + usize::from(point.column);
+        self.cells.get(index)
+    }
+
     fn has_text_at(&self, point: CellPoint) -> bool {
-        self.rows
-            .get(usize::from(point.row))
-            .and_then(|row| row.get(usize::from(point.column)))
-            .is_some_and(|cell| !cell.symbol().chars().all(char::is_whitespace))
+        let Some(cell) = self.cell(point) else {
+            return false;
+        };
+        self.cell(CellPoint {
+            column: cell.span_start,
+            row: point.row,
+        })
+        .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
+    }
+
+    fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
+        if !selection.dragged {
+            return None;
+        }
+        let (mut start, mut end) = selection.normalized();
+        start.column = self.cell(start)?.span_start;
+        let end_cell = self.cell(end)?;
+        let origin = self.cell(CellPoint {
+            column: end_cell.span_start,
+            row: end.row,
+        })?;
+        end.column = end_cell
+            .span_start
+            .saturating_add(
+                (unicode_width::UnicodeWidthStr::width(origin.symbol.as_str()) as u16)
+                    .max(1)
+                    .saturating_sub(1),
+            )
+            .min(self.area.width.saturating_sub(1));
+        Some((start, end))
+    }
+
+    fn selection_contains(&self, selection: TranscriptSelection, point: CellPoint) -> bool {
+        let Some((start, end)) = self.selection_bounds(selection) else {
+            return false;
+        };
+        (point.row, point.column) >= (start.row, start.column)
+            && (point.row, point.column) <= (end.row, end.column)
     }
 
     fn selected_text(&self, selection: TranscriptSelection) -> Option<String> {
-        if !selection.dragged || self.rows.is_empty() {
+        if self.cells.is_empty() {
             return None;
         }
 
-        let (start, end) = selection.normalized();
-        let start_row = usize::from(start.row).min(self.rows.len().saturating_sub(1));
-        let end_row = usize::from(end.row).min(self.rows.len().saturating_sub(1));
+        let (start, end) = self.selection_bounds(selection)?;
+        let start_row = usize::from(start.row);
+        let end_row = usize::from(end.row);
         let mut selected_rows = Vec::with_capacity(end_row.saturating_sub(start_row) + 1);
 
         for row_idx in start_row..=end_row {
-            let row = &self.rows[row_idx];
-            if row.is_empty() {
-                selected_rows.push(String::new());
-                continue;
-            }
-
             let first_col = if row_idx == start_row {
-                usize::from(start.column).min(row.len() - 1)
+                start.column
             } else {
                 0
             };
             let last_col = if row_idx == end_row {
-                usize::from(end.column).min(row.len() - 1)
+                end.column
             } else {
-                row.len() - 1
+                self.area.width.saturating_sub(1)
             };
 
-            if first_col > last_col {
-                selected_rows.push(String::new());
-                continue;
+            let mut row_text = String::new();
+            for column in first_col..=last_col {
+                let point = CellPoint {
+                    column,
+                    row: row_idx as u16,
+                };
+                let Some(cell) = self.cell(point) else {
+                    continue;
+                };
+                if cell.span_start == column {
+                    row_text.push_str(&cell.symbol);
+                }
             }
-
-            let mut cells = row[first_col..=last_col].to_vec();
-            while cells
-                .last()
-                .is_some_and(|cell| cell.symbol().chars().all(char::is_whitespace))
-            {
-                cells.pop();
-            }
-            selected_rows.push(cells.iter().map(Cell::symbol).collect::<String>());
+            selected_rows.push(row_text.trim_end_matches(char::is_whitespace).to_string());
         }
 
         let text = selected_rows.join("\n");
-        (!text.is_empty()).then_some(text)
+        text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
     }
 
     fn selection_anchor_rect(&self, selection: TranscriptSelection) -> Option<Rect> {
@@ -5064,10 +5092,6 @@ pub struct ChatState {
     browse_anchor: Option<usize>,
     /// Ctrl+click multi-select set, independent of cursor/anchor range.
     browse_multi: std::collections::BTreeSet<usize>,
-    /// Click-selected entry for visual feedback without entering browse mode.
-    /// Set by mouse click, cleared on any key press. Separate from
-    /// `browse_cursor` so clicking doesn't steal keyboard input.
-    highlighted_entry: Option<usize>,
     /// Entry index where mouse went down while browse mode is active. Used
     /// only to extend in-app range selection during a drag; mouse-up never
     /// copies implicitly.
@@ -5077,8 +5101,6 @@ pub struct ChatState {
     transcript_snapshot: Option<TranscriptSnapshot>,
     /// Normal-mode character selection within `transcript_snapshot`.
     transcript_selection: Option<TranscriptSelection>,
-    /// Anchor retained only while a normal-mode left-button drag is active.
-    transcript_drag_anchor: Option<CellPoint>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable `[Copy]` labels from the last draw.
@@ -5187,11 +5209,9 @@ impl ChatState {
             browse_cursor: None,
             browse_anchor: None,
             browse_multi: std::collections::BTreeSet::new(),
-            highlighted_entry: None,
             mouse_down_entry: None,
             transcript_snapshot: None,
             transcript_selection: None,
-            transcript_drag_anchor: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
             copy_feedback: None,
@@ -5240,13 +5260,15 @@ impl ChatState {
         self.dirty = LinesDirty::Full;
     }
 
-    fn clear_transcript_cell_selection(&mut self) {
+    fn clear_transcript_selection(&mut self) {
+        let changed = self.transcript_selection.is_some()
+            || !self.copy_hit_regions.is_empty()
+            || self.copy_feedback.is_some();
         self.transcript_selection = None;
-        self.transcript_drag_anchor = None;
-        self.copy_hit_regions
-            .retain(|region| region.kind != CopyHitKind::Transcript);
-        if matches!(self.copy_feedback, Some(CopyFeedback::Transcript { .. })) {
-            self.copy_feedback = None;
+        self.copy_hit_regions.clear();
+        self.copy_feedback = None;
+        if changed {
+            self.mark_dirty_full();
         }
     }
 
@@ -5255,18 +5277,15 @@ impl ChatState {
             return false;
         };
         let Some(point) = snapshot.point_at(column, row) else {
-            self.clear_transcript_cell_selection();
+            self.clear_transcript_selection();
             return false;
         };
         if !snapshot.has_text_at(point) {
-            self.clear_transcript_cell_selection();
+            self.clear_transcript_selection();
             return false;
         }
 
-        if matches!(self.copy_feedback, Some(CopyFeedback::Transcript { .. })) {
-            self.copy_feedback = None;
-        }
-        self.transcript_drag_anchor = Some(point);
+        self.copy_feedback = None;
         self.transcript_selection = Some(TranscriptSelection {
             anchor: point,
             head: point,
@@ -5276,7 +5295,7 @@ impl ChatState {
     }
 
     fn update_transcript_drag(&mut self, column: u16, row: u16) -> bool {
-        let Some(anchor) = self.transcript_drag_anchor else {
+        let Some(anchor) = self.transcript_selection.map(|selection| selection.anchor) else {
             return false;
         };
         let Some(head) = self
@@ -5296,7 +5315,6 @@ impl ChatState {
     }
 
     fn finish_transcript_drag(&mut self) {
-        self.transcript_drag_anchor = None;
         if self
             .transcript_selection
             .is_some_and(|selection| !selection.dragged)
@@ -5318,36 +5336,26 @@ impl ChatState {
             .as_ref()
             .is_some_and(|current| current != &snapshot)
         {
-            self.clear_transcript_cell_selection();
+            self.clear_transcript_selection();
         }
         self.transcript_snapshot = Some(snapshot);
     }
 
     fn clear_mouse_highlight(&mut self) {
-        let had_transcript_selection = self.transcript_selection.is_some()
-            || matches!(self.copy_feedback, Some(CopyFeedback::Transcript { .. }));
-        self.clear_transcript_cell_selection();
-        if had_transcript_selection
-            || self.highlighted_entry.is_some()
-            || self.mouse_down_entry.is_some()
-            || self.copy_feedback.is_some()
-        {
-            self.highlighted_entry = None;
-            self.mouse_down_entry = None;
-            self.copy_feedback = None;
+        let had_mouse_down = self.mouse_down_entry.take().is_some();
+        self.clear_transcript_selection();
+        if had_mouse_down {
             self.mark_dirty_full();
         }
     }
 
-    fn clear_transcript_selection(&mut self) {
-        if self.highlighted_entry.is_some()
-            || self.mouse_down_entry.is_some()
+    fn clear_browse_selection(&mut self) {
+        if self.mouse_down_entry.is_some()
             || self.browse_cursor.is_some()
             || self.browse_anchor.is_some()
             || !self.browse_multi.is_empty()
             || self.copy_feedback.is_some()
         {
-            self.highlighted_entry = None;
             self.mouse_down_entry = None;
             self.browse_cursor = None;
             self.browse_anchor = None;
@@ -5400,7 +5408,7 @@ impl ChatState {
 
     /// Enter browse mode: jump cursor to last entry, clear anchor.
     fn enter_browse_mode(&mut self) {
-        self.clear_transcript_cell_selection();
+        self.clear_transcript_selection();
         if !self.entries.is_empty() {
             self.browse_cursor = Some(self.entries.len() - 1);
             self.browse_anchor = None;
@@ -5411,7 +5419,6 @@ impl ChatState {
     /// Leave browse mode: clear both cursor and anchor, return to input.
     fn exit_browse_mode(&mut self) {
         self.browse_cursor = None;
-        self.highlighted_entry = None;
         self.mouse_down_entry = None;
         self.browse_anchor = None;
         self.copy_hit_regions.clear();
@@ -5499,8 +5506,7 @@ impl ChatState {
             .is_some_and(|(lo, hi)| idx >= lo && idx <= hi)
     }
 
-    /// True when `idx` should render highlighted: in range, in multi-select,
-    /// matches the lone cursor, or is the click-highlighted entry.
+    /// True when `idx` should render highlighted in browse mode.
     fn is_entry_highlighted(&self, idx: usize) -> bool {
         if self.browse_multi.contains(&idx) {
             return true;
@@ -5508,7 +5514,7 @@ impl ChatState {
         if self.is_in_browse_range(idx) {
             return true;
         }
-        self.browse_cursor == Some(idx) || self.highlighted_entry == Some(idx)
+        self.browse_cursor == Some(idx)
     }
 
     /// Total selection: multi-select set ∪ browse range ∪ lone cursor.
@@ -5795,13 +5801,13 @@ impl ChatState {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
-        self.clear_transcript_cell_selection();
+        self.clear_transcript_selection();
         self.pinned_to_bottom = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
-        self.clear_transcript_cell_selection();
+        self.clear_transcript_selection();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
         if self.scroll_offset >= max {
@@ -5818,13 +5824,13 @@ impl ChatState {
     }
 
     pub fn scroll_to_top(&mut self) {
-        self.clear_transcript_cell_selection();
+        self.clear_transcript_selection();
         self.pinned_to_bottom = false;
         self.scroll_offset = 0;
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.clear_transcript_cell_selection();
+        self.clear_transcript_selection();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = max;
         self.pinned_to_bottom = true;
@@ -6284,33 +6290,17 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn set_code_copy_feedback(&mut self, group: usize) {
-        self.copy_feedback = Some(CopyFeedback::Code {
-            group,
+    fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
+        if let Some(rect) = centered_copy_feedback_rect(&message_copied_label(), anchor) {
+            self.set_copy_feedback(CopyFeedbackTarget::Overlay(rect));
+        }
+    }
+
+    fn set_copy_feedback(&mut self, target: CopyFeedbackTarget) {
+        self.copy_feedback = Some(CopyFeedback {
+            target,
             shown_at: Instant::now(),
         });
-        self.mark_dirty_full();
-    }
-
-    fn set_message_copy_feedback(&mut self, anchor: Rect) {
-        self.copy_feedback =
-            message_copy_feedback_rect(&message_copied_label(), anchor).map(|rect| {
-                CopyFeedback::Message {
-                    rect,
-                    shown_at: Instant::now(),
-                }
-            });
-        self.mark_dirty_full();
-    }
-
-    fn set_transcript_copy_feedback(&mut self, anchor: Rect) {
-        self.copy_feedback =
-            message_copy_feedback_rect(&message_copied_label(), anchor).map(|rect| {
-                CopyFeedback::Transcript {
-                    rect,
-                    shown_at: Instant::now(),
-                }
-            });
         self.mark_dirty_full();
     }
 
@@ -6322,14 +6312,9 @@ impl ChatState {
     }
 
     fn expire_copy_feedback(&mut self) {
-        let expired = match self.copy_feedback {
-            Some(CopyFeedback::Code { shown_at, .. })
-            | Some(CopyFeedback::Message { shown_at, .. })
-            | Some(CopyFeedback::Transcript { shown_at, .. }) => {
-                shown_at.elapsed() >= COPY_FEEDBACK_TTL
-            }
-            None => false,
-        };
+        let expired = self
+            .copy_feedback
+            .is_some_and(|feedback| feedback.shown_at.elapsed() >= COPY_FEEDBACK_TTL);
         if expired {
             self.copy_feedback = None;
             self.mark_dirty_full();
@@ -6555,11 +6540,9 @@ impl ChatState {
         self.cancel_started_at = None;
         self.browse_cursor = None;
         self.browse_anchor = None;
-        self.highlighted_entry = None;
         self.mouse_down_entry = None;
         self.transcript_snapshot = None;
         self.transcript_selection = None;
-        self.transcript_drag_anchor = None;
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
@@ -6687,57 +6670,82 @@ mod tests {
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
-        TranscriptSnapshot {
-            area,
-            rows: rows
-                .iter()
-                .map(|row| {
-                    row.chars()
-                        .map(|ch| {
-                            let mut cell = Cell::default();
-                            cell.set_char(ch);
-                            cell
-                        })
-                        .collect()
-                })
-                .collect(),
+        use unicode_width::UnicodeWidthChar;
+
+        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(area.height));
+        for row in 0..area.height {
+            let mut column = 0;
+            for ch in rows
+                .get(usize::from(row))
+                .copied()
+                .unwrap_or_default()
+                .chars()
+            {
+                if column >= area.width {
+                    break;
+                }
+                let width = (ch.width().unwrap_or(0) as u16)
+                    .max(1)
+                    .min(area.width - column);
+                cells.push(TranscriptCell {
+                    symbol: ch.to_string(),
+                    span_start: column,
+                });
+                for _ in 1..width {
+                    cells.push(TranscriptCell {
+                        symbol: String::new(),
+                        span_start: column,
+                    });
+                }
+                column += width;
+            }
+            while column < area.width {
+                cells.push(TranscriptCell {
+                    symbol: " ".to_string(),
+                    span_start: column,
+                });
+                column += 1;
+            }
         }
+        TranscriptSnapshot { area, cells }
     }
 
     #[test]
     fn transcript_selection_extracts_visible_wrapped_text() {
         let snapshot = transcript_snapshot(Rect::new(10, 5, 8, 2), &["alpha be", "ta gamma"]);
-        let selection = TranscriptSelection {
+        let forward = TranscriptSelection {
             anchor: CellPoint { column: 6, row: 0 },
             head: CellPoint { column: 1, row: 1 },
             dragged: true,
         };
-
-        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("be\nta"));
-    }
-
-    #[test]
-    fn transcript_selection_normalizes_reverse_drags() {
-        let snapshot = transcript_snapshot(Rect::new(0, 0, 8, 2), &["alpha be", "ta gamma"]);
-        let selection = TranscriptSelection {
+        let reverse = TranscriptSelection {
             anchor: CellPoint { column: 1, row: 1 },
             head: CellPoint { column: 6, row: 0 },
             dragged: true,
         };
-
-        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("be\nta"));
-    }
-
-    #[test]
-    fn transcript_selection_requires_drag_motion() {
-        let snapshot = transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]);
-        let selection = TranscriptSelection {
-            anchor: CellPoint { column: 2, row: 0 },
-            head: CellPoint { column: 2, row: 0 },
+        let click = TranscriptSelection {
+            anchor: CellPoint { column: 6, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
             dragged: false,
         };
 
-        assert_eq!(snapshot.selected_text(selection), None);
+        assert_eq!(snapshot.selected_text(forward).as_deref(), Some("be\nta"));
+        assert_eq!(snapshot.selected_text(reverse).as_deref(), Some("be\nta"));
+        assert_eq!(snapshot.selected_text(click), None);
+    }
+
+    #[test]
+    fn transcript_selection_expands_wide_character_cells() {
+        let snapshot = transcript_snapshot(Rect::new(0, 0, 4, 1), &["A界B"]);
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 2, row: 0 },
+            head: CellPoint { column: 3, row: 0 },
+            dragged: true,
+        };
+
+        assert!(snapshot.has_text_at(CellPoint { column: 2, row: 0 }));
+        assert!(snapshot.selection_contains(selection, CellPoint { column: 1, row: 0 }));
+        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("界B"));
     }
 
     #[test]
@@ -6755,18 +6763,6 @@ mod tests {
         assert!(state.update_transcript_drag(11, 6));
         state.finish_transcript_drag();
         assert_eq!(state.transcript_selected_text().as_deref(), Some("be\nta"));
-    }
-
-    #[test]
-    fn transcript_selection_mouse_up_does_not_copy() {
-        let mut state = state();
-        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
-
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-
-        assert_eq!(state.transcript_selected_text().as_deref(), Some("he"));
         assert_eq!(state.copy_feedback, None);
         assert!(state.info_message.is_none());
     }
@@ -6778,9 +6774,12 @@ mod tests {
         assert!(state.begin_transcript_drag(0, 0));
         assert!(state.update_transcript_drag(1, 0));
         state.finish_transcript_drag();
+        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 1));
 
         state.scroll_up(1);
         assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.copy_feedback, None);
+        assert!(state.copy_hit_regions.is_empty());
 
         assert!(state.begin_transcript_drag(0, 0));
         assert!(state.update_transcript_drag(1, 0));
@@ -6796,6 +6795,13 @@ mod tests {
         state.scroll_to_bottom();
         assert_eq!(state.transcript_selection, None);
 
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.enter_browse_mode();
+        assert_eq!(state.transcript_selection, None);
+
+        state.exit_browse_mode();
         assert!(state.begin_transcript_drag(0, 0));
         assert!(state.update_transcript_drag(1, 0));
         state.finish_transcript_drag();
@@ -6829,49 +6835,17 @@ mod tests {
                 kind: CopyHitKind::Transcript,
                 group: 0,
             });
-            state.copy_feedback = Some(CopyFeedback::Transcript {
-                rect: Rect::new(0, 0, 2, 1),
+            state.copy_feedback = Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(Rect::new(0, 0, 2, 1)),
                 shown_at: Instant::now(),
             });
 
             state.set_transcript_snapshot(replacement);
 
             assert_eq!(state.transcript_selection, None, "{case} selection");
-            assert_eq!(state.transcript_drag_anchor, None, "{case} drag anchor");
-            assert!(
-                state
-                    .copy_hit_regions
-                    .iter()
-                    .all(|region| region.kind != CopyHitKind::Transcript),
-                "{case} transcript copy region"
-            );
-            assert!(
-                !matches!(state.copy_feedback, Some(CopyFeedback::Transcript { .. })),
-                "{case} transcript copy feedback"
-            );
+            assert!(state.copy_hit_regions.is_empty(), "{case} copy regions");
+            assert_eq!(state.copy_feedback, None, "{case} copy feedback");
         }
-    }
-
-    #[test]
-    fn transcript_selection_clears_when_another_interaction_takes_focus() {
-        let mut state = state();
-        state
-            .entries
-            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
-        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-
-        state.enter_browse_mode();
-        assert_eq!(state.transcript_selection, None);
-
-        state.exit_browse_mode();
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-        state.clear_mouse_highlight();
-        assert_eq!(state.transcript_selection, None);
     }
 
     #[tokio::test]
@@ -6879,10 +6853,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
@@ -6905,13 +6876,13 @@ mod tests {
             "panel chrome stays outside snapshot"
         );
         let (text_row, text_col) = snapshot
-            .rows
-            .iter()
+            .cells
+            .chunks(usize::from(snapshot.area.width))
             .enumerate()
             .find_map(|(row, cells)| {
                 cells
                     .iter()
-                    .map(Cell::symbol)
+                    .map(|cell| cell.symbol.as_str())
                     .collect::<String>()
                     .find("hello")
                     .map(|column| (row as u16, column as u16))
@@ -6956,10 +6927,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state.transcript_snapshot = Some(transcript_snapshot(
             Rect::new(1, 1, 20, 1),
@@ -7001,7 +6969,10 @@ mod tests {
         };
         assert!(matches!(
             state.copy_feedback,
-            Some(CopyFeedback::Transcript { .. })
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
         ));
         assert!(state.info_message.is_some());
     }
@@ -7010,10 +6981,7 @@ mod tests {
     async fn scrollbar_drag_works_outside_browse_mode() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state.last_total_rows = 100;
         state.last_inner_height = 20;
@@ -8186,15 +8154,11 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
             .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
-        state.highlighted_entry = Some(0);
         state.mouse_down_entry = Some(0);
         state.mark_dirty_full();
 
@@ -8206,6 +8170,12 @@ mod tests {
                 render(frame, &mut state, area);
             })
             .expect("draw chat");
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
 
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -8221,7 +8191,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.transcript_selection, None);
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.dirty,
@@ -8235,15 +8205,11 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
             .push(ChatEntry::AgentMessage(Arc::<str>::from("hi")));
-        state.highlighted_entry = Some(0);
         state.mouse_down_entry = Some(0);
         state.mark_dirty_full();
 
@@ -8255,6 +8221,12 @@ mod tests {
                 render(frame, &mut state, area);
             })
             .expect("draw chat");
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
 
         // The rendered entry rect must hug the text, not span the panel, so
         // there is blank space beside the short message to click in.
@@ -8291,7 +8263,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.transcript_selection, None);
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.dirty,
@@ -8305,10 +8277,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
@@ -8345,8 +8314,8 @@ mod tests {
             panic!("expected active chat");
         };
         assert_eq!(
-            state.highlighted_entry, None,
-            "normal-mode click must not select the message"
+            state.browse_cursor, None,
+            "normal-mode click must not enter browse mode"
         );
         assert!(
             state.info_message.is_none(),
@@ -8416,7 +8385,13 @@ mod tests {
             "copy action should dismiss selection"
         );
         assert!(
-            matches!(state.copy_feedback, Some(CopyFeedback::Message { .. })),
+            matches!(
+                state.copy_feedback,
+                Some(CopyFeedback {
+                    target: CopyFeedbackTarget::Overlay(_),
+                    ..
+                })
+            ),
             "message copy should leave a transient copied-state cue"
         );
     }
@@ -8426,10 +8401,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
             "select just this word",
@@ -8468,7 +8440,7 @@ mod tests {
             "modifier-click outside browse mode must not app-copy the whole message"
         );
         assert_eq!(
-            state.highlighted_entry, None,
+            state.browse_cursor, None,
             "modifier-click outside browse mode should not select the whole message"
         );
     }
@@ -8477,10 +8449,7 @@ mod tests {
     async fn mouse_up_after_browse_drag_does_not_copy_selection() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
@@ -8513,14 +8482,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn code_copy_clears_stale_highlight_and_shows_feedback() {
+    async fn code_copy_shows_shared_feedback() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
@@ -8528,7 +8494,6 @@ mod tests {
         state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
             "```bash\necho hello\n```",
         )));
-        state.highlighted_entry = Some(0);
         state.enter_browse_mode();
         state.mark_dirty_full();
 
@@ -8572,10 +8537,6 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert_eq!(
-            state.highlighted_entry, None,
-            "code copy is a scoped button action, not whole-message selection"
-        );
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.info_message.as_ref().map(|m| m.text.as_str()),
@@ -8583,7 +8544,10 @@ mod tests {
         );
         assert!(matches!(
             state.copy_feedback,
-            Some(CopyFeedback::Code { group, .. }) if group == copy_group
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Code(group),
+                ..
+            }) if group == copy_group
         ));
     }
 
@@ -9849,8 +9813,8 @@ mod tests {
             kind: CopyHitKind::Message,
             group: 0,
         });
-        s.copy_feedback = Some(CopyFeedback::Message {
-            rect: Rect::new(1, 1, 8, 1),
+        s.copy_feedback = Some(CopyFeedback {
+            target: CopyFeedbackTarget::Overlay(Rect::new(1, 1, 8, 1)),
             shown_at: Instant::now(),
         });
         s.reset_for_session("sess-2".to_string(), None);

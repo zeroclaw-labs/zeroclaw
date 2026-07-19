@@ -435,7 +435,6 @@ zc-chat-approval-action-edit = Edit
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
-zc-chat-copy-code-copied = [Copied]
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 
