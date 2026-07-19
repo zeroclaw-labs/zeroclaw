@@ -223,6 +223,8 @@ where
             }
         }
 
+        // Copy the recognized trace id into the native field while retaining the
+        // attributes entry consumed by the observer bridge.
         if log_event.trace_id.is_none()
             && let Some(tid) = log_event.attributes.get("trace_id").and_then(Value::as_str)
         {
