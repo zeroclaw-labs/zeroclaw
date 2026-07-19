@@ -5504,8 +5504,8 @@ pub struct LocalWhisperTranscriptionProviderConfig {
 // inserts `<T as Default>::default()` for new map entries — leaving
 // `max_audio_bytes = 0`, `timeout_secs = 0`. `LocalWhisperProvider::from_typed_config`
 // bridges those fields into `LocalWhisperProvider::from_config`, which still
-// rejects zero for both fields. Mirrors the `LocalWhisperConfig` fix above;
-// see #8718.
+// rejects zero for both fields. Defaults here mirror `LocalWhisperConfig` so
+// scaffolded entries load without operator intervention.
 impl Default for LocalWhisperTranscriptionProviderConfig {
     fn default() -> Self {
         Self {
@@ -5682,7 +5682,7 @@ fn default_local_whisper_timeout_secs() -> u64 {
 // at load (`max_audio_bytes must be greater than zero`), the failure poisons
 // the parent `[transcription]` block's deserialization, and the daemon logs
 // `dropped_config: transcription` while running with `transcription.enabled =
-// false` regardless of operator intent. See #8718.
+// false` regardless of operator intent.
 impl Default for LocalWhisperConfig {
     fn default() -> Self {
         Self {
