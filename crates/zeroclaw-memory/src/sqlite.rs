@@ -1139,11 +1139,10 @@ impl SqliteMemory {
             } else {
                 Some(allowed.as_slice())
             };
-            // The vector stage is live only when an embedder produced a
-            // query vector. The BM25-only path (stock
-            // `embedding_provider = "none"` => Noop embedder, and explicit
-            // `search_mode = "bm25"`) must keep its exact legacy behavior:
-            // raw keyword scores and a strict session filter.
+            // The vector stage is live only when an embedder produced a query
+            // vector; it selects the scoped FTS variant. The BM25-only path
+            // (stock `embedding_provider = "none"` => Noop embedder, and
+            // explicit `search_mode = "bm25"`) keeps its strict session filter.
             let vector_live = query_embedding.is_some();
 
             // FTS5 BM25 keyword search (skip for embedding-only mode)
@@ -1186,33 +1185,21 @@ impl SqliteMemory {
 
             // Merge results based on search mode
             let merged = if vector_results.is_empty() {
-                if vector_live {
-                    // FTS-only survivors under a live vector stage are
-                    // thresholded downstream against a cosine-tuned
-                    // relevance floor; map raw BM25 onto the same [0, 1]
-                    // axis (matching hybrid_merge's internal keyword
-                    // normalization). Raw scores pass through untouched
-                    // when the vector stage is off.
-                    crate::normalize::bm25_to_unit(&keyword_results)
-                        .into_iter()
-                        .map(|(id, score)| vector::ScoredResult {
-                            id,
-                            vector_score: None,
-                            keyword_score: Some(score),
-                            final_score: score,
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    keyword_results
-                        .iter()
-                        .map(|(id, score)| vector::ScoredResult {
-                            id: id.clone(),
-                            vector_score: None,
-                            keyword_score: Some(*score),
-                            final_score: *score,
-                        })
-                        .collect::<Vec<_>>()
-                }
+                // FTS-only survivors: map raw BM25 onto the [0, 1] axis
+                // (matching hybrid_merge's internal keyword normalization) so
+                // downstream relevance thresholding and the injection rerank
+                // stage see one calibrated scale, whether or not the vector
+                // stage is live. Batch-max normalization; the strict session
+                // filter still applies below.
+                crate::normalize::bm25_to_unit(&keyword_results)
+                    .into_iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id,
+                        vector_score: None,
+                        keyword_score: Some(score),
+                        final_score: score,
+                    })
+                    .collect::<Vec<_>>()
             } else if keyword_results.is_empty() {
                 vector_results
                     .iter()
@@ -3437,12 +3424,12 @@ mod tests {
         );
     }
 
-    /// Neutrality bar: with the stock Noop embedder (vector stage never
-    /// runs), session-scoped recall keeps the strict legacy filter (global
-    /// core rows stay out) and keyword scores pass through as raw negated
-    /// BM25, bit-identical to `fts5_search`.
+    /// With the stock Noop embedder (vector stage never runs), session-scoped
+    /// recall keeps the strict legacy filter (global core rows stay out) and
+    /// batch-max normalizes keyword scores onto [0, 1] so downstream relevance
+    /// thresholding and the injection rerank stage see one calibrated scale.
     #[tokio::test]
-    async fn noop_embedder_session_recall_keeps_strict_filter_and_raw_scores() {
+    async fn noop_embedder_session_recall_keeps_strict_filter_and_normalizes_scores() {
         let (_tmp, mem) = temp_sqlite();
         mem.store(
             "vault_fact",
@@ -3482,27 +3469,39 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, vec!["this_chat", "this_chat_2"]);
 
-        // Multi-entry raw passthrough: every surviving row's score must be
-        // bit-identical to the raw negated BM25 that `fts5_search` produced.
-        // A batch normalization slipping into this path would remap at
-        // least one of two distinct raw scores (the batch max becomes 1.0).
+        // Multi-entry normalization: BM25-only scores are batch-max normalized
+        // onto [0, 1] (dividing each raw negated BM25 by the batch maximum) so
+        // downstream relevance thresholding and the injection rerank stage see
+        // one calibrated scale. The recall FTS batch and the probe below both
+        // request limit*2 = 20, so they share the batch maximum.
         let raw = {
             let conn = mem.conn.lock();
             SqliteMemory::fts5_search(&conn, "orbital vault", 20).unwrap()
         };
         assert!(
             hits.len() > 1,
-            "raw-passthrough assertion needs multiple surviving entries"
+            "normalization assertion needs multiple surviving entries"
+        );
+        let max_raw = raw.iter().map(|(_, score)| *score).fold(0.0_f32, f32::max);
+        assert!(
+            max_raw > 0.0,
+            "the batch maximum BM25 magnitude must be positive"
         );
         for hit in &hits {
             let (_, raw_score) = raw
                 .iter()
                 .find(|(id, _)| *id == hit.id)
                 .expect("recalled row must come from the FTS stage");
-            assert_eq!(
-                hit.score,
-                Some(f64::from(*raw_score)),
-                "BM25-only scores must pass through unnormalized for {}",
+            let got = hit.score.expect("BM25-only recall carries a score");
+            let expected = f64::from(*raw_score / max_raw);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "BM25-only scores are batch-max normalized for {}: got {got}, expected {expected}",
+                hit.key
+            );
+            assert!(
+                (0.0..=1.0).contains(&got),
+                "normalized score is within [0, 1] for {}: {got}",
                 hit.key
             );
         }
