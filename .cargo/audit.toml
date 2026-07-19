@@ -16,4 +16,28 @@ ignore = [
     "RUSTSEC-2026-0098",  # rustls-webpki URI name constraints; same as above
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraints; same as above
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic; same as above
+
+    # ── Still present in Cargo.lock though no longer in cargo-deny's resolved
+    # graph (removed from deny.toml in this same PR); each entry has a
+    # replacement path already landed or in flight, tracking #8519. ──
+    "RUSTSEC-2024-0429",  # glib VariantStrIter unsoundness; GTK3 stack in Cargo.lock but not resolved graph
+    "RUSTSEC-2024-0411",  # gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0412",  # gdk unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0413",  # atk unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0414",  # gdkx11-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0415",  # gtk unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0416",  # atk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0417",  # gdkx11 unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0418",  # gdk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0419",  # gtk3-macros unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0420",  # gtk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2025-0075",  # unic-char-range unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2025-0080",  # unic-common unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2025-0081",  # unic-char-property unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2025-0098",  # unic-ucd-version unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2025-0100",  # unic-ucd-ident unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2024-0388",  # derivative unmaintained; in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2025-0141",  # bincode unmaintained (informational, no CVE); in Cargo.lock but not resolved graph; tracking #8519
+    "RUSTSEC-2024-0384",  # instant unmaintained (informational); in Cargo.lock but not resolved graph; tracking #8519
 ]

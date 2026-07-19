@@ -75,63 +75,78 @@ successor on the dependency lines we use. They are
 is replaced (e.g. GTK3 → GTK4, rumqttc upgrade that pulls
 `rustls-webpki 0.103.x`).
 
-Live groups:
+Live, deny+audit (both files):
 
 - **`rustls-pemfile` (`RUSTSEC-2025-0134`)**: unmaintained;
   transitive dep awaiting upstream migration to `rustls-pki-types`.
   Present in both `deny.toml` and `audit.toml`.
 
+Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
+in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
+lockfile — remove from `audit.toml` only once the crate is dropped
+from `Cargo.lock` entirely, e.g. via `cargo update` or a dependency
+bump):
+
 - **`rustls-webpki` (4 entries, `RUSTSEC-2026-0049`, `-0098`, `-0099`,
   `-0104`)**: 0.102.x copy is in `Cargo.lock` but not in the resolved
-  dependency graph (CI Rust 1.93.0). `cargo deny` does not flag it;
-  `cargo audit` does (reads full lockfile). Ignore entries are
-  **audit.toml only**.
-
-Resolved groups:
-
-- **GTK3 stack (10 entries, `RUSTSEC-2024-0411..-0420`)**: pulled in
-  transitively by the now-removed `zeroclaw-desktop` (Tauri →
-  webkit2gtk → gtk-rs bindings). These ignore entries were dropped in
-  PR #8544 along with the desktop app. No GTK3 code remains in the
-  workspace.
+  dependency graph. `cargo deny` does not flag it; `cargo audit` does.
+- **GTK3 stack (11 entries, `RUSTSEC-2024-0411..-0420`, `-0429`)**:
+  `gdk`/`gtk`/`atk`-family gtk-rs bindings and `glib`. Present in
+  `Cargo.lock` — `zeroclaw-desktop` (Tauri) was removed in PR #8544
+  and reintroduced in PR #8565 — but not needed by `cargo deny`'s
+  current default-target resolved graph (`cargo deny check bans` and
+  `check advisories` both pass clean without these ignores). Do not
+  assume this means the crates are gone from the tree; re-check with
+  `grep '^name = "<crate>"$' Cargo.lock` before removing from
+  `audit.toml`. Tracking #8519.
 - **`unic-*` (5 entries, `RUSTSEC-2025-0075`, `-0080`, `-0081`,
-  `-0098`, `-0100`)**: Unicode data tables previously transitive via
-  `pulldown-cmark` and `mime_guess`. No longer in the dependency tree.
-- **macro / font helpers (3 entries, `RUSTSEC-2026-0173`,
-  `-2024-0388`, `-2024-0384`)**: `proc-macro-error2`, `derivative`,
-  `instant`. No longer in the dependency tree.
+  `-0098`, `-0100`)**: Unicode data tables, previously transitive via
+  `pulldown-cmark` and `mime_guess`. Same drift as above; tracking
+  #8519.
+- **macro / font helpers (2 entries, `RUSTSEC-2026-0173`,
+  `-2024-0388`)**: `proc-macro-error2`, `derivative`. Same drift;
+  tracking #8519.
 - **`bincode` (`RUSTSEC-2025-0141`)**: previously transitive via
-  `probe-rs builtin-targets`. No longer in the dependency tree.
-- **`glib` (`RUSTSEC-2024-0429`)**: previously transitive via
-  `zeroclaw-desktop/tauri/webkit2gtk`. No longer in the dependency
-  tree.
-- **`rand` (`RUSTSEC-2026-0097`)**: re-entrancy unsoundness; no
-  longer in the resolved dependency graph (CI Rust 1.93.0 resolves
-  only rand 0.9.x+).
-- **`rustls-webpki` (4 entries, `RUSTSEC-2026-0049`, `-0098`, `-0099`,
-  `-0104`)**: 0.102.x copy no longer in the resolved dependency graph;
-  only the patched 0.103.x copy remains.
+  `probe-rs builtin-targets`. Same drift; tracking #8519.
+- **`instant` (`RUSTSEC-2024-0384`)**: informational-only unmaintained
+  advisory. Same drift; tracking #8519.
+
+Resolved (no longer in `Cargo.lock` at all — safe to drop from both
+files, or already dropped):
+
+- **`rand` (`RUSTSEC-2026-0097`)**: re-entrancy unsoundness; the
+  0.8.x copy affected by this advisory is no longer resolved by any
+  workspace crate.
 
 **Process for this category:**
 
 - Use a short reason naming the crate role, e.g.
-  `gtk-rs GTK3 bindings; transitive via zeroclaw-desktop/tauri/webkit2gtk`.
+  `gtk-rs GTK3 bindings; transitive via zeroclaw-desktop/tauri`.
 - Do not add `; tracking #...` for entries that are stable
   unmaintained warnings and unlikely to be resolved in the next
   release cycle.
-- When a replacement lands upstream and the dep gets bumped, remove
-  the entry from both files.
+- An entry drops out of `deny.toml` as soon as `cargo deny`'s resolved
+  graph no longer needs it — that is a graph fact, not a lockfile fact,
+  and it can change on the next dependency bump or feature change
+  without the crate leaving `Cargo.lock`. It only drops out of
+  `audit.toml` once the crate is gone from `Cargo.lock` entirely.
+  Removing an audit-only entry while the crate is still resolvable
+  reintroduces the CI failure this doc exists to prevent — always
+  check `Cargo.lock` directly, not just `cargo deny`'s last result.
 
 ---
 
 ## Tracking issues
 
 - **#8519**: *Reconcile cargo-audit ignores and remediate wasmtime-wasi
-  CVEs.* Master issue for the audit/deny drift. The GTK3, unic-*,
-  macro/font helper, bincode, glib, and rand ignore entries have been
-  removed (no longer in the dependency tree). Remaining deny+audit live
-  ignore: `rustls-pemfile`. Remaining audit-only ignores: `rustls-webpki`
-  (4 entries; 0.102.x in Cargo.lock but not in resolved dep graph).
+  CVEs.* Master issue for the audit/deny drift. The GTK3 stack, unic-*,
+  macro/font helpers, `bincode`, and `instant` are no longer needed in
+  `deny.toml` (removed from the resolved dependency graph) but remain
+  audit-only ignores in `.cargo/audit.toml` until they're gone from
+  `Cargo.lock`. `rand` is fully resolved and removed from both files.
+  Remaining deny+audit live ignore: `rustls-pemfile`. Remaining
+  audit-only ignores: `rustls-webpki` (4) plus the 20 lockfile-stale
+  entries above.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
@@ -163,15 +178,25 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
-- 2026-07-06: Removed stale advisory ignores for crates no longer in the
-  CI-resolved dependency tree (Rust 1.93.0): `unic-*` (5 entries),
-  `proc-macro-error2`, `derivative`, `instant`, `bincode`, `glib`, all
-  GTK3 stack entries, `rand` (0.8.x no longer resolved), and
-  `rustls-webpki` entries from `deny.toml` (0.102.x no longer in
-  resolved graph). Remaining deny+audit ignore: `rustls-pemfile` (1).
-  Remaining audit-only ignores: `rustls-webpki` (4 entries; in
-  `Cargo.lock` but not in resolved dep graph). Closes the Security CI
-  gate failure from stale `advisory-not-detected` warnings.
+- 2026-07-19: Corrected the 07-06 pass, which removed 20 entries from
+  `.cargo/audit.toml` (`unic-*`, `proc-macro-error2`, `derivative`,
+  `instant`, `bincode`, `glib`, all 10 GTK3 stack entries) that were
+  still present in `Cargo.lock` and still reported by `cargo audit`.
+  Restored those 20 as audit-only ignores; they remain removed from
+  `deny.toml`, where `cargo deny`'s resolved graph still doesn't need
+  them even after the `zeroclaw-desktop` (Tauri) reintroduction in PR
+  #8565 (`cargo deny check advisories`/`bans` verified clean). `rand`
+  (`RUSTSEC-2026-0097`) is confirmed fully out of `Cargo.lock` and
+  stays removed from both files.
+- 2026-07-06: Removed advisory ignores from `deny.toml` for crates no
+  longer in `cargo deny`'s resolved dependency graph: `unic-*`
+  (5 entries), `proc-macro-error2`, `derivative`, `instant`, `bincode`,
+  `glib`, all GTK3 stack entries, `rand` (0.8.x no longer resolved),
+  and the `rustls-webpki` entries (0.102.x no longer in resolved
+  graph). Remaining deny+audit ignore: `rustls-pemfile` (1). Remaining
+  audit-only ignores: `rustls-webpki` (4 entries; in `Cargo.lock` but
+  not in resolved dep graph). Closes the Security CI gate failure from
+  stale `advisory-not-detected` warnings in `cargo deny`.
 - 2026-07-01: Updated after `upstream/master` merge. Documented that
   the GTK3 stack was resolved by PR #8544 (Tauri desktop removal),
   `proc-macro-error` ignore was dropped, `ttf-parser` is being handled
