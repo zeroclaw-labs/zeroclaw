@@ -1513,10 +1513,7 @@ fn apply_channels(
                     let session_path =
                         format!("channels.{config_channel_type}.{alias}.session_path");
                     let default_path = default_whatsapp_web_session_path(config, alias);
-                    if let Err(err) = config.set_prop_persistent(
-                        &session_path,
-                        &default_path,
-                    ) {
+                    if let Err(err) = config.set_prop_persistent(&session_path, &default_path) {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
                             format!("channels[{idx}].channel_type"),
@@ -2765,7 +2762,10 @@ mod tests {
                 .join("personal.db")
                 .to_string_lossy()
                 .into_owned();
-            assert_eq!(whatsapp.session_path.as_deref(), Some(expected_session.as_str()));
+            assert_eq!(
+                whatsapp.session_path.as_deref(),
+                Some(expected_session.as_str())
+            );
             assert!(
                 whatsapp.is_web_config(),
                 "fresh WhatsApp Web entry must seed a Web selector"
