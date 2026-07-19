@@ -2662,19 +2662,6 @@ pub struct GeminiCliModelProviderConfig {
 
 // ── Grok Build CLI (subprocess wrapper) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum GrokCliEndpoint {
-    #[default]
-    LocalSubprocess,
-}
-impl ModelEndpoint for GrokCliEndpoint {
-    fn uri(&self) -> &'static str {
-        // Subprocess — no remote endpoint. Sentinel for trait conformity.
-        "subprocess://grok-cli"
-    }
-}
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.grok_cli"]
@@ -2691,10 +2678,12 @@ pub struct GrokCliModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
     /// Extra argv tokens appended after the built-in headless plumbing flags
-    /// (for example `["--max-turns", "20"]` or `["--always-approve"]`).
-    /// Empty by default: ZeroClaw does not inject permission/tool policy unless
-    /// the operator sets this field. Prefer workspace `.grok` permission rules
-    /// when possible; use `extra_args` for explicit opt-in CLI behavior.
+    /// (for example `["--max-turns", "20"]` or `["--sandbox", "off"]`).
+    /// Reserved transport flags (`--single`, `--prompt-file`, `--output-format`,
+    /// `-m`, session flags, `--cwd`, …) are rejected at provider construction.
+    /// When `extra_args` does not set `--sandbox`, ZeroClaw injects
+    /// `--sandbox strict` (fail-closed). Prefer workspace `.grok` permission
+    /// rules for tools; use `extra_args` for explicit CLI opt-in behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
 }

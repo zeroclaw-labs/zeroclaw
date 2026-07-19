@@ -1388,7 +1388,8 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
             self.binary_path.as_deref(),
             self.working_directory.as_deref(),
             self.extra_args.clone(),
-        )))
+            self.base.timeout_secs,
+        )?))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {

@@ -6,9 +6,10 @@ Sandbox settings live on a risk profile. Each agent points at a risk profile via
 
 **CLI model providers (for example `grok_cli`):** most file and shell work runs
 *inside* the external CLI process, not as ZeroClaw native tools. Risk-profile
-sandboxing above does not confine that CLI. For Grok Build, enable Grok’s own
-`--sandbox` via `providers.models.grok_cli.<alias>.extra_args` (or
-`GROK_SANDBOX`), and use project `.grok/` for permission rules and optional
+sandboxing above does not confine that CLI. The `grok_cli` provider injects
+Grok’s `--sandbox strict` by default; override with
+`extra_args = ["--sandbox", "off"]` (or another profile) or via `GROK_SANDBOX`
+when intentional, and use project `.grok/` for permission rules and optional
 custom sandbox profiles. See [Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli)
 (sections *Recommended pattern* and *Grok CLI OS sandbox*).
 

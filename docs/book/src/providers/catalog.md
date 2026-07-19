@@ -38,23 +38,42 @@ Shells out to the `gemini` CLI; uses the CLI's existing auth.
 
 ### Grok Build CLI: slot `grok_cli`
 
-Shells out to the Grok Build CLI (`grok --prompt-file` headless); uses the
-CLI's own login / `XAI_API_KEY`. Optional `binary_path` when `grok` is not on
-`PATH`. Optional `working_directory` sets the subprocess cwd so project
-`.grok/config.toml` permissions, skills, and agents resolve correctly.
-By default ZeroClaw does **not** pass tool/permission argv
-(`--always-approve`, `--disallowed-tools`, `--max-turns`, etc.); prefer the
-workspace `.grok/` tree. Operators who want those flags on the CLI can set
-optional `extra_args` on the alias (appended after the built-in headless
-plumbing flags).
+Shells out to the Grok Build CLI in **documented headless mode**; uses the
+CLI's own login / `XAI_API_KEY`.
+
+**Transport contract** (CLI builds that list these in `grok --help`, typically
+≥ 0.2.x stable). Headless one-shot only (same role as `gemini_cli`); not ACP:
+
+| Flag | When |
+| ---- | ---- |
+| `--single` / `-p` | When the assembled prompt fits under an argv budget |
+| `--prompt-file /dev/stdin` | Large prompts on Unix: body on the child stdin (no disk file) |
+| `--prompt-file <temp>` | Non-Unix fallback only: exclusive `0600` temp + cleanup |
+| `--output-format plain` | Always |
+| `--no-auto-update` | Always (script/CI hygiene) |
+| `--sandbox strict` | Default when `extra_args` does not set `--sandbox` |
+
+This avoids OS `ARG_MAX` without writing system prompts to a shared temp path
+on Linux/macOS (gemini-style stdin handoff; Grok exposes it as
+`--prompt-file /dev/stdin`). ACP (`grok agent stdio`) is intentionally not
+used here; prefer a future shared runner if multi-turn ACP embedding is needed.
+
+Optional `binary_path` when `grok` is not on `PATH`. Optional
+`working_directory` sets the subprocess cwd so project `.grok/config.toml`
+permissions, skills, and agents resolve correctly. Optional alias
+`timeout_secs` bounds the child (default 600s). The child environment is
+cleared and allowlisted (PATH, HOME, `XAI_*` / `GROK_*`, locale, proxy/CA
+vars). Reserved transport flags in `extra_args` (`--single`, `--prompt-file`,
+`-m`, session flags, `--cwd`, …) are rejected at construction.
 
 #### Recommended pattern: default channel chatbot
 
 Use a **dedicated provider alias** for the messaging agent (for example
 `agents.default`), and a separate alias for agents that need write/shell
-(dependabot, triage, …). Sandbox **selection** is via `extra_args` (project
-`.grok` cannot choose the active profile by itself); **permission** rules live
-in the agent workspace `.grok/config.toml`.
+(dependabot, triage, …). Sandbox **defaults to `strict`** from ZeroClaw argv;
+override with `extra_args = ["--sandbox", "off"]` (or another profile) for ops
+agents. **Permission** rules still live in the agent workspace
+`.grok/config.toml`.
 
 **Reply-intent precheck (classifier):** ZeroClaw runs a short REPLY /
 `NO_REPLY[*]` classification before the full agent loop. Prefer a **stable
@@ -67,12 +86,12 @@ channel message (“staying silent” / “no Slack reply”). Empty
 CLI channel bots. ACP channels skip the classifier entirely.
 
 ```toml
-# Full answers — Grok Build CLI with strict OS sandbox + workspace permissions
+# Full answers — Grok Build CLI (default argv includes --sandbox strict)
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/default/workspace"
-extra_args = ["--sandbox", "strict"]
+# optional: extra_args = ["--sandbox", "strict"]  # already the default
 
 # REPLY / NO_REPLY precheck — API (format-stable). Reuse an existing xAI
 # HTTP alias if you already have one; do not point this at grok_cli.
@@ -80,10 +99,11 @@ extra_args = ["--sandbox", "strict"]
 model = "grok-4.5"
 # uri / auth as for the normal xAI provider (OAuth session or api_key)
 
-# Ops / coding agents — no strict sandbox (writes / broader FS reads allowed)
+# Ops / coding agents — override fail-closed default sandbox
 [providers.models.grok_cli.ops]
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
+extra_args = ["--sandbox", "off"]
 
 [agents.default]
 model_provider = "grok_cli.default"
@@ -112,7 +132,7 @@ deny = [
 | ----- | ----- | ------- |
 | Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
 | Full answer | `model_provider` → `grok_cli.default` | Grok Build CLI agent loop (tools, workspace `.grok`) |
-| OS sandbox | `extra_args = ["--sandbox", "strict"]` | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
+| OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
 | App permissions | `<workspace>/.grok/config.toml` `[permission]` | Deny `zeroclaw channel send` variants |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 | Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |
