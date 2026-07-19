@@ -1587,6 +1587,17 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// Derive the canonical storage key for a client-visible session ID.
+/// Chat, WS, abort, and all session-management endpoints must use the
+/// same sanitized form so queue serialization, cancel tokens, and
+/// persistence all agree on one key.
+fn canonical_session_key(id: &str) -> String {
+    format!(
+        "gw_{}",
+        zeroclaw_api::session_keys::sanitize_session_key(id)
+    )
+}
+
 // ── Session API handlers ─────────────────────────────────────────
 
 /// GET /api/sessions — list gateway sessions
@@ -1675,11 +1686,7 @@ pub async fn handle_api_session_messages(
     // Accept either the full DB key (channel-driven sessions like
     // `discord.clamps_…`) or the stripped form (legacy callers that pass
     // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = canonical_session_key(&id);
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1727,7 +1734,7 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = canonical_session_key(&id);
     if !backend
         .list_sessions()
         .iter()
@@ -1809,11 +1816,7 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = canonical_session_key(&id);
 
     let token = state
         .cancel_tokens
@@ -1877,7 +1880,7 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = canonical_session_key(&id);
 
     // Verify the session exists before renaming
     let sessions = backend.list_sessions();
@@ -1951,7 +1954,7 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = canonical_session_key(&id);
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({

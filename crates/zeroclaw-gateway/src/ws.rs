@@ -345,52 +345,44 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     // Serialise with concurrent HTTP requests sharing the same session.
-    // Acquire BEFORE alias check and history load so a racing HTTP turn
-    // cannot observe stale owner or transcript.
-    let _setup_guard = state.session_queue.acquire(&session_key).await.ok();
-
-    if let Some(ref backend) = state.session_backend {
-        // Session agent_alias consistency check — must run BEFORE loading
-        // history. Mirror the HTTP endpoint's fail-closed guard so sharing
-        // a session across agents is rejected rather than silently
-        // overwriting the stored owner.
-        if let Ok(Some(stored_alias)) = backend.get_session_agent_alias(&session_key) {
-            if stored_alias != agent_alias {
-                let err_frame = serde_json::json!({
-                    "type": "error",
-                    "code": "SESSION_AGENT_MISMATCH",
-                    "message": format!(
-                        "Session belongs to agent '{stored_alias}', not '{agent_alias}'"
-                    ),
-                });
-                let _ = sender
-                    .send(Message::Text(err_frame.to_string().into()))
-                    .await;
-                let _ = sender.close().await;
-                return;
+    // Guard is scoped to the setup section only — it drops before the
+    // first message handler acquires the queue again (L587 / L736).
+    {
+        let _setup_guard = state.session_queue.acquire(&session_key).await.ok();
+        if let Some(ref backend) = state.session_backend {
+            if let Ok(Some(stored_alias)) = backend.get_session_agent_alias(&session_key) {
+                if stored_alias != agent_alias {
+                    let err_frame = serde_json::json!({
+                        "type": "error",
+                        "code": "SESSION_AGENT_MISMATCH",
+                        "message": format!(
+                            "Session belongs to agent '{stored_alias}', not '{agent_alias}'"
+                        ),
+                    });
+                    let _ = sender
+                        .send(Message::Text(err_frame.to_string().into()))
+                        .await;
+                    let _ = sender.close().await;
+                    return;
+                }
             }
+            let messages = backend.load(&session_key);
+            if !messages.is_empty() {
+                message_count = messages.len();
+                stored_messages = messages;
+                resumed = true;
+            }
+            if let Some(ref name) = session_name
+                && !name.is_empty()
+            {
+                let _ = backend.set_session_name(&session_key, name);
+                effective_name = Some(name.clone());
+            }
+            if effective_name.is_none() {
+                effective_name = backend.get_session_name(&session_key).unwrap_or(None);
+            }
+            let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
         }
-
-        let messages = backend.load(&session_key);
-        if !messages.is_empty() {
-            message_count = messages.len();
-            stored_messages = messages;
-            resumed = true;
-        }
-        // Set session name if provided (non-empty) on connect
-        if let Some(ref name) = session_name
-            && !name.is_empty()
-        {
-            let _ = backend.set_session_name(&session_key, name);
-            effective_name = Some(name.clone());
-        }
-        // If no name was provided via query param, load the stored name
-        if effective_name.is_none() {
-            effective_name = backend.get_session_name(&session_key).unwrap_or(None);
-        }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
     }
 
     // Send session_start message to client

@@ -109,7 +109,7 @@ data: [DONE]
 | `created` | integer | Unix timestamp |
 | `model` | string | Echo of request model (empty string normalized to `"zeroclaw"`) |
 | `choices[]` | array | Streaming chunks |
-| `choices[].delta` | object | Incremental content (`role` / `content` / `tool_calls`) |
+| `choices[].delta` | object | Incremental content (`role` / `content`) |
 | `choices[].finish_reason` | string | Stop reason (`"stop"`) |
 | `usage` | object | Token stats (only when `stream_options.include_usage: true`) |
 
@@ -905,7 +905,7 @@ Exceeding the limit returns 429 with a `Retry-After` header indicating the wait 
 **Answer**: Tool control is enforced at three layers that work together:
 
 1. **Request validation** -- The handler validates `tool_choice` and `tools` combinations before the turn starts. Invalid or unavailable tool configurations return a 400 error (fail-closed), never silently falling back to the full tool set.
-2. **Provider-visible specs** -- Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all. This is the primary lever: the model is only ever told about the requested tools.
+2. **Provider-visible specs** -- Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all. For native-tool models, this is the primary lever: only the requested tools are sent as structured API parameters. For text-protocol models, the system prompt may still include descriptions of all agent-configured tools; see the model-compatibility notes in §3.2.7.
 3. **Execution enforcement** -- If the model still returns a call for a tool outside the requested subset, that call is rejected and never executes. The model receives a failure result ("Unknown tool" / "Tool not available") it can use to self-correct on the next turn.
 
 This ensures a tool outside the requested subset can never run, regardless of what the model returns. Only the requested tools can actually execute.
