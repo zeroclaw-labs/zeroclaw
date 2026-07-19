@@ -1,16 +1,18 @@
 # Static analysis — fast pattern checks on every PR, deep taint on master+schedule.
 #
-# Semgrep (every PR): <60s, no build, catches injection/path-traversal/unsafe
-#   patterns. Community rules auto-detected for Rust.
+# Semgrep: fast pattern scan (injection / path-traversal / unsafe patterns, plus
+#   config-layer surfaces CodeQL does not cover — GitHub Actions YAML, Dockerfiles,
+#   shell, HTML). On PRs it runs diff-aware (--baseline-commit) so only findings the
+#   branch introduces are reported; on master push it does a full scan. Results upload
+#   as SARIF to the GitHub Security tab. Report-only (no --error) — surfaced, never
+#   gating. .semgrepignore suppresses known false-positive surfaces (tests, examples,
+#   docs theme).
 # CodeQL (master push + daily): 10-30 min, inter-procedural taint tracking,
 #   SARIF results published to GitHub Security tab.
 #
 # We deliberately do NOT gate every PR on CodeQL. A 20-minute analysis that
 # sometimes times out on Rust is a productivity tax, not a security guarantee.
 # Semgrep covers the fast path; CodeQL catches what Semgrep misses.
-#
-# Semgrep currently runs in report-only mode (no --error). The 43 initial findings
-# need triage before making it a required check — tracked as a follow-up.
 
 name: Code Analysis
 
@@ -37,17 +39,42 @@ jobs:
     name: Semgrep
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    container:
-      image: semgrep/semgrep@sha256:06938c1f365d3f67b8cedd8bc117607ae64253f88a0e768e9da9408548927dd6 # 2026-06-17
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to the Security tab
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run Semgrep CE
-        run: semgrep scan --config auto
+        with:
+          fetch-depth: 0   # full history so diff-aware --baseline-commit can reach the PR base
+      - name: Run Semgrep CE (diff-aware on PRs, full scan on push)
         env:
-          # Suppress telemetry / version-check noise.
-          SEMGREP_SEND_TELEMETRY: "off"
-          SEMGREP_VERSION_CHECK: "off"
+          # PR base commit -> report only findings the branch introduces. Empty on
+          # push, so master push does a full-tree scan that seeds the Security-tab baseline.
+          SEMGREP_BASELINE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          baseline=""
+          if [ -n "${SEMGREP_BASELINE:-}" ]; then
+            baseline="--baseline-commit ${SEMGREP_BASELINE}"
+          fi
+          # Digest-pinned image (same one the container: field used), run via docker so
+          # the SARIF-upload JS action can run on the host runner afterwards (the semgrep
+          # image has no node). safe.directory clears git "dubious ownership" for the
+          # root-in-container vs runner-owned mount. Report-only: no --error, never gates.
+          docker run --rm -v "${PWD}:/src" -w /src \
+            -e SEMGREP_SEND_TELEMETRY=off \
+            -e SEMGREP_VERSION_CHECK=off \
+            semgrep/semgrep@sha256:06938c1f365d3f67b8cedd8bc117607ae64253f88a0e768e9da9408548927dd6 \
+            sh -c "git config --global --add safe.directory /src && \
+                   semgrep scan --config auto ${baseline} --sarif --output semgrep.sarif"
+      - name: Upload SARIF to code scanning
+        if: always()
+        continue-on-error: true   # fork PRs run with a read-only token; don't fail the job on upload
+        uses: github/codeql-action/upload-sarif@b0c4fd77f6c559021d78430ec4d0d169ae74a4eb # v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
 
   # ── Deep taint analysis (master push + daily, ~15 min) ────────────────
 
