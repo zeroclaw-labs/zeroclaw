@@ -18,7 +18,7 @@ pub const MAX_CANDIDATE_POOL: usize = 1024;
 
 #[must_use]
 pub fn bounded_final_limit(final_limit: usize) -> usize {
-    final_limit.min(MAX_CANDIDATE_POOL).max(1)
+    final_limit.clamp(1, MAX_CANDIDATE_POOL)
 }
 
 #[must_use]
