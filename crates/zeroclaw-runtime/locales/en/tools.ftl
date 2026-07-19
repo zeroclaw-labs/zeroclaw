@@ -146,18 +146,14 @@ tool-image-gen-error-resolved-url-resolve-empty = Failed to resolve image downlo
 # Secure-client builder
 tool-image-gen-error-client-build = Failed to build secure image download client: { $err }
 
-# validate_redirect_image_url (free function — used by reqwest redirect callback)
-tool-image-gen-error-redirect-url-empty = redirect image URL cannot be empty
-tool-image-gen-error-redirect-url-whitespace = redirect image URL cannot contain whitespace
-tool-image-gen-error-redirect-url-scheme = Only http:// and https:// redirect URLs are allowed
-tool-image-gen-error-redirect-url-parse = Invalid redirect image URL format: { $err }
-tool-image-gen-error-redirect-url-userinfo = redirect image URL userinfo is not allowed
-tool-image-gen-error-redirect-url-no-host = redirect image URL has no host
-tool-image-gen-error-redirect-url-metadata-host = Blocked redirect to cloud metadata host: { $host }
-tool-image-gen-error-redirect-url-private-host = Blocked redirect to local/private host: { $host }. To allow, add it (or "*") to image_gen.allowed_private_hosts in config.toml
+# resolved-IP gate (DNS rebinding)
+tool-image-gen-error-resolved-ip-metadata = Image host '{ $host }' resolves to cloud metadata address { $ip }
+tool-image-gen-error-resolved-ip-non-global = Image host '{ $host }' resolves to non-global address { $ip }. To allow, add the host (or "*") to image_gen.allowed_private_hosts in config.toml
 
-# redirect policy hop limit
+# manual redirect loop
 tool-image-gen-error-redirect-limit = Too many image-URL redirects (max { $max })
+tool-image-gen-error-redirect-location-missing = Redirect response from image host is missing a Location header
+tool-image-gen-error-redirect-location-invalid = Invalid redirect Location from image host: { $err }
 
 tool-jira = Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues.
 
