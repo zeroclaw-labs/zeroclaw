@@ -808,39 +808,48 @@ impl Chat {
     }
 
     fn pump_queue(&mut self) {
-        let next = match self.phase {
-            ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
-            _ => None,
-        };
-        let Some(msg) = next else { return };
         let sid = match self.phase {
             ChatPhase::Active(ref state) => state.session_id.clone(),
             _ => return,
         };
-
         let transport = self.rpc.transport();
-        let attachments_json = if msg.attachments.is_empty() {
-            Vec::new()
-        } else {
-            match build_attachments_json(&msg.attachments, transport) {
-                Ok(json) => json,
-                Err(error) => {
-                    let error = error.to_string();
-                    if let ChatPhase::Active(ref mut state) = self.phase {
-                        state.restore_dispatchable(msg);
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(
-                                crate::i18n::t_args(
-                                    "zc-queue-dispatch-failed",
-                                    &[("error", &error)],
-                                ),
-                            )));
-                        state.mark_dirty_append();
+
+        // Serialize before removing from queue — if serialization fails the
+        // item stays in place and restore_dispatchable is never needed.
+        let (attachments_json, msg) = match self.phase {
+            ChatPhase::Active(ref mut state) => {
+                let idx = match state.next_dispatch_index() {
+                    Some(idx) => idx,
+                    None => return,
+                };
+                let attachments_json = if state.message_queue[idx].attachments.is_empty() {
+                    Vec::new()
+                } else {
+                    match build_attachments_json(&state.message_queue[idx].attachments, transport) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            let error = error.to_string();
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                    crate::i18n::t_args(
+                                        "zc-queue-dispatch-failed",
+                                        &[("error", &error)],
+                                    ),
+                                )));
+                            state.mark_dirty_append();
+                            return;
+                        }
                     }
-                    return;
+                };
+                let msg = state.message_queue.remove(idx).unwrap();
+                state.resume_override = false;
+                if state.queue_sel == Some(msg.id) {
+                    state.queue_sel = None;
                 }
+                (attachments_json, msg)
             }
+            _ => return,
         };
 
         if let ChatPhase::Active(ref mut state) = self.phase {
@@ -5636,14 +5645,31 @@ impl ChatState {
                 }
             }
             SessionUpdate::TurnComplete {
-                outcome, content, ..
+                outcome,
+                content,
+                failure_reason,
+                ..
             } => match outcome {
                 TurnEndOutcome::Completed => {
                     self.commit_turn(content, true);
                 }
                 TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
+                    let display = if let Some(reason) = &failure_reason {
+                        let localized = crate::i18n::t_args(
+                            &format!("zc-skill-error-{reason}"),
+                            &[("details", content.as_str())],
+                        );
+                        if localized.starts_with('{') {
+                            // Fluent key not found, fall back to bare content
+                            content.clone()
+                        } else {
+                            localized
+                        }
+                    } else {
+                        content.clone()
+                    };
                     self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(display.as_str())));
                     self.mark_dirty_append();
                     self.commit_turn(String::new(), false);
                 }
@@ -5801,6 +5827,7 @@ impl ChatState {
             .position(|m| m.status == QueueItemStatus::Pending)
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
         let idx = self.next_dispatch_index()?;
         let msg = self.message_queue.remove(idx)?;
@@ -5811,11 +5838,19 @@ impl ChatState {
         Some(msg)
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     fn restore_dispatchable(&mut self, msg: QueuedMessage) {
         if matches!(msg.status, QueueItemStatus::Injected) {
             self.message_queue.push_front(msg);
         } else {
-            self.message_queue.push_back(msg);
+            // Preserve FIFO: insert after injected items, before pending items
+            let insert_idx = self
+                .message_queue
+                .iter()
+                .rposition(|m| m.status == QueueItemStatus::Injected)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            self.message_queue.insert(insert_idx, msg);
         }
         self.ensure_queue_selection();
     }
@@ -8548,6 +8583,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             outcome: TurnEndOutcome::Completed,
             content: "ok".to_string(),
+            failure_reason: None,
         });
 
         assert!(!state.turn_in_flight);
@@ -8584,6 +8620,33 @@ mod tests {
         s.restore_dispatchable(msg);
         assert_eq!(s.queue_len(), 1);
         assert_eq!(s.take_next_dispatchable().unwrap().text, "retry");
+    }
+
+    #[test]
+    fn restore_dispatchable_preserves_fifo_order_on_failure() {
+        let mut s = state();
+        s.message_queue.push_back(QueuedMessage {
+            id: 1,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            skill: None,
+            status: QueueItemStatus::Pending,
+        });
+        s.message_queue.push_back(QueuedMessage {
+            id: 2,
+            text: "second".to_string(),
+            attachments: Vec::new(),
+            skill: None,
+            status: QueueItemStatus::Pending,
+        });
+
+        // Simulate failure of the first item: remove and restore
+        let first = s.take_next_dispatchable().unwrap();
+        s.restore_dispatchable(first);
+
+        // The queue should still be [first, second], not [second, first]
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "first");
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "second");
     }
 
     #[test]

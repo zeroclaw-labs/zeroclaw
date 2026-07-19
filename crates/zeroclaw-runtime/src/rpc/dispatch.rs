@@ -437,7 +437,13 @@ fn split_command_arguments(input: &str) -> Vec<String> {
     let mut escaped = false;
     for ch in input.chars() {
         if escaped {
-            current.push(ch);
+            // Only treat as escape if followed by a quote or another backslash
+            if ch == '\\' || ch == '\'' || ch == '"' {
+                current.push(ch);
+            } else {
+                current.push('\\');
+                current.push(ch);
+            }
             escaped = false;
             continue;
         }
@@ -448,6 +454,8 @@ fn split_command_arguments(input: &str) -> Vec<String> {
         if let Some(q) = quote {
             if ch == q {
                 quote = None;
+                // Preserve empty quoted position
+                args.push(std::mem::take(&mut current));
             } else {
                 current.push(ch);
             }
@@ -462,6 +470,9 @@ fn split_command_arguments(input: &str) -> Vec<String> {
         } else {
             current.push(ch);
         }
+    }
+    if escaped {
+        current.push('\\');
     }
     if !current.is_empty() {
         args.push(current);
@@ -1745,11 +1756,17 @@ impl RpcDispatcher {
         match self.expand_session_skill_prompt(req).await {
             Ok(req) => self.handle_session_prompt(req).await,
             Err(error) => {
+                let failure_reason = if error.code == SESSION_NOT_FOUND {
+                    "session-not-found"
+                } else {
+                    "skill-prompt-failure"
+                };
                 let content = skill_prompt_failure_content(&error);
                 self.emit_turn_complete(
                     &session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     content,
+                    Some(failure_reason),
                 )
                 .await;
                 Err(error)
@@ -1797,10 +1814,17 @@ impl RpcDispatcher {
                 format!("Skill `{skill_name}` rendered an empty prompt"),
             ));
         }
+        let arguments = req.arguments.trim();
+        let original_text = if arguments.is_empty() {
+            Some(format!("/{}", skill_name))
+        } else {
+            Some(format!("/{} {}", skill_name, arguments))
+        };
         Ok(SessionPromptParams {
             session_id: req.session_id,
             prompt,
             attachments: req.attachments,
+            original_text,
         })
     }
 
@@ -1825,12 +1849,13 @@ impl RpcDispatcher {
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({ "session_id": sid })),
-                    "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
+                        "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
                     );
                     self.emit_turn_complete(
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
                         SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string(),
+                        None,
                     )
                     .await;
                     return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -1862,8 +1887,25 @@ impl RpcDispatcher {
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
                 let result =
-                    process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
-                        .await?;
+                    match process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let content = format!("Attachment processing failed: {}", e.message);
+                            self.emit_turn_complete(
+                                sid,
+                                crate::rpc::types::TurnCompletionOutcome::Failed,
+                                content,
+                                Some("attachment-failure"),
+                            )
+                            .await;
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Attachment processing failed: {}", e.message),
+                            ));
+                        }
+                    };
                 if idx > 0 {
                     prompt.push('\n');
                 }
@@ -1871,13 +1913,20 @@ impl RpcDispatcher {
             }
         }
 
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(sid)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _guard = match self.ctx.sessions.session_queue.acquire(sid).await {
+            Ok(g) => g,
+            Err(e) => {
+                let content = format!("Session busy: {e}");
+                self.emit_turn_complete(
+                    sid,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    content.clone(),
+                    Some("session-busy"),
+                )
+                .await;
+                return Err(rpc_err(SESSION_BUSY, content));
+            }
+        };
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
@@ -2116,7 +2165,8 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
+                    let user_text = req.original_text.as_deref().unwrap_or(&prompt);
+                    let _ = backend.append(&key, &ChatMessage::user(user_text));
                     match &outcome {
                         Ok(TurnOutcome::Completed { text, .. }) => {
                             let _ = backend.append(&key, &ChatMessage::assistant(text));
@@ -2138,6 +2188,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
                     text.clone(),
+                    None,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -2181,6 +2232,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
+                    None,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -2209,6 +2261,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     format!("turn failed: {e}"),
+                    None,
                 )
                 .await;
                 Err(rpc_err(INTERNAL_ERROR, e.to_string()))
@@ -2219,16 +2272,19 @@ impl RpcDispatcher {
     /// Emit the terminal `session/update` notification for a turn.
     /// The TUI uses this — not the JSON-RPC response — to flip
     /// `turn_in_flight` back to false.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_turn_complete(
         &self,
         session_id: &str,
         outcome: crate::rpc::types::TurnCompletionOutcome,
         content: String,
+        failure_reason: Option<&str>,
     ) {
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
             content,
+            failure_reason: failure_reason.map(|r| r.to_string()),
         };
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
@@ -4860,6 +4916,32 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn split_command_arguments_preserves_empty_first_arg() {
+        let args = split_command_arguments("\"\" dangerous");
+        assert_eq!(
+            args,
+            vec!["", "dangerous"],
+            "empty quoted first arg must preserve position"
+        );
+    }
+
+    #[test]
+    fn split_command_arguments_handles_windows_path() {
+        let args = split_command_arguments(r"C:\temp\file");
+        assert_eq!(
+            args,
+            vec![r"C:\temp\file"],
+            "backslash path separators must be preserved"
+        );
+    }
+
+    #[test]
+    fn split_command_arguments_handles_trailing_backslash() {
+        let args = split_command_arguments(r"foo\");
+        assert_eq!(args, vec![r"foo\"], "trailing backslash must be preserved");
+    }
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
@@ -8368,6 +8450,7 @@ mod tests {
                 session_id: "gone-id".to_string(),
                 prompt: "anything".to_string(),
                 attachments: Vec::new(),
+                original_text: None,
             })
             .await;
         assert!(

@@ -128,6 +128,10 @@ zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
 zc-queue-dispatch-failed = Could not send queued message: { $error }
+zc-skill-error-skill-prompt-failure = Skill prompt failed: { $details }
+zc-skill-error-session-not-found = Session not found
+zc-skill-error-attachment-failure = Attachment processing failed: { $details }
+zc-skill-error-session-busy = Session busy: { $details }
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity

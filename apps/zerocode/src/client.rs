@@ -265,6 +265,10 @@ pub enum SessionUpdate {
         session_id: String,
         outcome: TurnEndOutcome,
         content: String,
+        /// Machine-readable failure key for client-side localization.
+        /// When set, the client should look up a Fluent key like
+        /// `zc-skill-error-{reason}` instead of displaying `content` verbatim.
+        failure_reason: Option<String>,
     },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
@@ -337,6 +341,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            failure_reason: params
+                .get("failure_reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();

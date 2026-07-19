@@ -209,6 +209,11 @@ rpc_type! {
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub attachments: Vec<FileEntry>,
+        /// Original user-visible text to persist instead of the expanded prompt.
+        /// When set, session history stores this text rather than `prompt`,
+        /// so the user sees their original invocation on replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub original_text: Option<String>,
     }
 }
 
@@ -835,7 +840,7 @@ rpc_type! {
 
 rpc_type! {
     /// One skill in an agent's *effective* set (the runtime's four-source
-    /// union), with provenance — for `GET /api/agents/{alias}/skills` (#7757).
+    /// union), with provenance — for `GET /api/agents/{alias}/skills`.
     /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
     /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
     /// the source detail; `editable` is `true` only for `origin == "bundle"`.
@@ -1383,6 +1388,11 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+        /// Machine-readable failure key for client-side localization.
+        /// When set, the client should look up a Fluent key like
+        /// `zc-skill-error-{reason}` instead of displaying `content` verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_reason: Option<String>,
     },
     HistoryTrimmed {
         session_id: String,
