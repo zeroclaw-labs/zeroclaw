@@ -7,6 +7,7 @@ zc-pane-logs = Journaux
 zc-pane-quickstart = Démarrage rapide
 zc-pane-sop = SOPs
 zc-app-help-cycle-mode = Changer de mode
+zc-app-help-help = Aide
 zc-app-help-reload = Recharger le démon
 zc-app-help-quit = Quitter
 zc-app-press-any-key-to-close = Appuyez sur une touche pour fermer

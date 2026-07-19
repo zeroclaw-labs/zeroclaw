@@ -7,6 +7,7 @@ zc-pane-logs = ログ
 zc-pane-quickstart = クイックスタート
 zc-pane-sop = SOP
 zc-app-help-cycle-mode = モード切り替え
+zc-app-help-help = ヘルプ
 zc-app-help-reload = デーモンを再読み込み
 zc-app-help-quit = 終了
 zc-app-press-any-key-to-close = 任意のキーを押して閉じる

@@ -7,6 +7,7 @@ zc-pane-logs = Registros
 zc-pane-quickstart = Inicio rápido
 zc-pane-sop = SOPs
 zc-app-help-cycle-mode = Modo cíclico
+zc-app-help-help = Ayuda
 zc-app-help-reload = Recargar daemon
 zc-app-help-quit = Salir
 zc-app-press-any-key-to-close = Pulsa cualquier tecla para cerrar

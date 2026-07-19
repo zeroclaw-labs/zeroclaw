@@ -8,6 +8,7 @@ zc-pane-quickstart = Quickstart
 zc-pane-sop = SOPs
 
 zc-app-help-cycle-mode = Cycle mode
+zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
 

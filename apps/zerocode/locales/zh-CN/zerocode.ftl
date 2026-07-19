@@ -7,6 +7,7 @@ zc-pane-logs = 日志
 zc-pane-quickstart = 快速开始
 zc-pane-sop = SOP
 zc-app-help-cycle-mode = 循环模式
+zc-app-help-help = 帮助
 zc-app-help-reload = 重新加载守护进程
 zc-app-help-quit = 退出
 zc-app-press-any-key-to-close = 按任意键关闭

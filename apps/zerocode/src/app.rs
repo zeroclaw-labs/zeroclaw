@@ -373,29 +373,7 @@ pub async fn run(
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
-                use crate::keymap::RebindableActions;
-                let chord_keys = |chords: Vec<crate::keymap::Chord>| -> Vec<String> {
-                    chords.iter().map(crate::keymap::Chord::display).collect()
-                };
-                let mut node = HelpNode::entries(vec![
-                    HelpEntry::new(
-                        [
-                            chord_keys(crate::keymap::GlobalAction::PaneNavLeft.resolved()),
-                            chord_keys(crate::keymap::GlobalAction::PaneNavRight.resolved()),
-                        ]
-                        .concat(),
-                        crate::i18n::t("zc-app-help-cycle-mode"),
-                    ),
-                    HelpEntry::new(
-                        chord_keys(crate::keymap::GlobalAction::ReloadDaemon.resolved()),
-                        crate::i18n::t("zc-app-help-reload"),
-                    ),
-                    HelpEntry::new(
-                        chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
-                        crate::i18n::t("zc-app-help-quit"),
-                    ),
-                    HelpEntry::spacer(),
-                ]);
+                let mut node = HelpNode::entries(global_help_entries());
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
@@ -797,6 +775,30 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn global_help_entries() -> Vec<HelpEntry> {
+    use crate::keymap::{GlobalAction, action_key_labels};
+
+    let cycle_keys = action_key_labels(GlobalAction::PaneNavLeft)
+        .into_iter()
+        .chain(action_key_labels(GlobalAction::PaneNavRight));
+    vec![
+        HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(
+            action_key_labels(GlobalAction::Help),
+            crate::i18n::t("zc-app-help-help"),
+        ),
+        HelpEntry::new(
+            action_key_labels(GlobalAction::ReloadDaemon),
+            crate::i18n::t("zc-app-help-reload"),
+        ),
+        HelpEntry::new(
+            action_key_labels(GlobalAction::Quit),
+            crate::i18n::t("zc-app-help-quit"),
+        ),
+        HelpEntry::spacer(),
+    ]
 }
 
 fn resolve_agent_overrides(
@@ -1266,6 +1268,24 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_help_entries_include_live_help_binding() {
+        use crate::keymap::{GlobalAction, RebindableActions};
+
+        let entries = global_help_entries();
+        let help = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-app-help-help"))
+            .expect("global Help section should include its own opening binding");
+        let expected: Vec<String> = GlobalAction::Help
+            .resolved()
+            .iter()
+            .map(crate::keymap::Chord::display)
+            .collect();
+
+        assert_eq!(help.keys, expected);
+    }
 
     #[test]
     fn quickstart_chat_handoff_consumes_immediate_target() {
