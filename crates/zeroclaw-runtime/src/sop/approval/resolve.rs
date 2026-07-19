@@ -82,8 +82,20 @@ pub fn resolve_gate(
     //     It also guarantees the run holds its claim before ANY transition out of
     //     WaitingApproval - including the `Pending` (route-ineligible) branch inside
     //     clear_waiting_gate - so a live non-terminal run is never claimless.
-    if matches!(decision, ApprovalDecision::Approve) {
-        engine.reacquire_claim_on_resume(run_id)?;
+    if matches!(decision, ApprovalDecision::Approve)
+        && let Err(e) = engine.reacquire_claim_on_resume(run_id)
+    {
+        if crate::sop::engine::err_is_resume_at_capacity(&e) {
+            // Approved, but every exec slot is full: re-admitting would exceed
+            // the per-SOP or global cap. Leave the gate untouched
+            // (WaitingApproval, re-resolvable) - no ledger row, no claim - and
+            // report backpressure. A later resolve, or the timeout tick's retry,
+            // resumes it once a slot frees. This is what enforces the documented
+            // concurrency caps on resume: an over-cap resume is refused, never
+            // oversubscribed.
+            return Ok(ResolveOutcome::DeferredAtCapacity);
+        }
+        return Err(e);
     }
 
     // 3. Build the audit-of-record row, but do not append it independently.

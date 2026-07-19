@@ -166,6 +166,14 @@ impl Tool for SopApproveTool {
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
             }),
+            Ok(ResolveOutcome::DeferredAtCapacity) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Approval could not resume run {run_id}: execution slots are full. \
+                     The gate stays waiting and re-resolvable; retry once a slot frees."
+                )),
+            }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

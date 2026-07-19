@@ -77,6 +77,11 @@ fn outcome_response(outcome: &ResolveOutcome) -> (StatusCode, &'static str) {
         ResolveOutcome::AlreadyResolved => (StatusCode::OK, "already_resolved"),
         ResolveOutcome::NotWaiting => (StatusCode::NOT_FOUND, "not_waiting"),
         ResolveOutcome::RejectedSelfApproval => (StatusCode::FORBIDDEN, "rejected_self_approval"),
+        // Approved, but re-admitting would exceed the concurrency caps: temporary
+        // backpressure, retry once a slot frees (the gate stays waiting).
+        ResolveOutcome::DeferredAtCapacity => {
+            (StatusCode::SERVICE_UNAVAILABLE, "deferred_at_capacity")
+        }
     }
 }
 

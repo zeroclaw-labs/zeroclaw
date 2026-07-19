@@ -322,28 +322,41 @@ async fn dispatch_sop_event_filtered(
         };
 
         // AMQP is the only durable (manual-ack) transport, so a multi-match delivery is
-        // handled ALL-OR-NOTHING: either every matched SOP starts, or none does and the
-        // whole delivery is requeued. A partial start would ack the delivery (see
-        // `results_need_redelivery`) and permanently drop the unstarted siblings.
+        // handled ALL-OR-NOTHING for the SOPs that can actually run: either every
+        // ADMISSIBLE sibling starts (and the delivery acks), or none does and the whole
+        // delivery is requeued. Two rules keep that honest:
+        //   * Redelivery only helps a RETRYABLE outcome. A `Defer` (backpressure) may
+        //     become admissible later; a terminal `Drop`/`Coalesce` never will. So a
+        //     terminal sibling must NOT force the delivery to requeue - that would NACK
+        //     forever waiting for something that can't change (the 2a bug).
+        //   * A partial start must never ack-and-lose an unstarted sibling. Activation
+        //     runs no irreversible side effect (deterministic execution and the LLM agent
+        //     loop both run LATER), so the batch is activated ATOMICALLY: activate every
+        //     reserved sibling first, and if any activation fails, roll the rest back and
+        //     defer the whole set for requeue - no sibling is ever Started while another
+        //     is dropped (the 2b bug).
         if event.source == SopTriggerSource::Amqp && matched_names.len() > 1 {
             let admissions: Vec<(&String, SopAdmission)> = matched_names
                 .iter()
                 .map(|sop_name| (sop_name, eng.evaluate_admission(sop_name)))
                 .collect();
 
-            // If ANY matched SOP cannot be admitted right now, start NONE: surface each
-            // per its policy and return, so the whole durable delivery requeues
-            // (Deferred) / is absorbed (Coalesced) / is deliberately dropped (Skipped).
-            if admissions
+            // A RETRYABLE `Defer` on any sibling means the batch cannot start atomically
+            // now, but could on a later delivery: defer the WHOLE delivery for requeue.
+            // (Terminal siblings are surfaced too, but the presence of a Deferred is what
+            // requeues.) Only when NO sibling is retryably deferred do we start the
+            // admissible subset and let terminal siblings settle without an endless NACK.
+            let has_retryable_defer = admissions
                 .iter()
-                .any(|(_, admission)| !matches!(admission, SopAdmission::Admit))
-            {
+                .any(|(_, admission)| matches!(admission, SopAdmission::Defer { .. }));
+            if has_retryable_defer {
                 for (sop_name, admission) in admissions {
                     match admission {
-                        SopAdmission::Admit => {
-                            let reason =
-                                "AMQP delivery deferred because another matched SOP is backpressured"
-                                    .to_string();
+                        SopAdmission::Admit | SopAdmission::Defer { .. } => {
+                            let reason = match admission {
+                                SopAdmission::Defer { reason } => reason,
+                                _ => "AMQP delivery deferred because another matched SOP is backpressured".to_string(),
+                            };
                             ::zeroclaw_log::record!(
                                 INFO,
                                 ::zeroclaw_log::Event::new(
@@ -354,26 +367,7 @@ async fn dispatch_sop_event_filtered(
                                     "sop_name": sop_name, "reason": reason
                                 })),
                                 &format!(
-                                    "SOP dispatch: deferred '{sop_name}' (amqp batch): {reason}"
-                                )
-                            );
-                            results.push(DispatchResult::Deferred {
-                                sop_name: sop_name.clone(),
-                                reason,
-                            });
-                        }
-                        SopAdmission::Defer { reason } => {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({
-                                    "sop_name": sop_name, "reason": reason
-                                })),
-                                &format!(
-                                    "SOP dispatch: deferred '{sop_name}' (backpressure): {reason}"
+                                    "SOP dispatch: deferred '{sop_name}' (amqp batch backpressure): {reason}"
                                 )
                             );
                             results.push(DispatchResult::Deferred {
@@ -422,19 +416,107 @@ async fn dispatch_sop_event_filtered(
                 return results;
             }
 
-            // Every matched SOP is individually admissible. RESERVE the whole batch's
-            // exec slots through the authoritative store CAS BEFORE activating any of
-            // them — a reservation holds a real claim but creates no run and runs no
-            // step, so no SOP side effect occurs yet. A sibling engine that grabs a slot
-            // mid-batch makes one reservation fail; we then release the reservations
-            // already held and defer the WHOLE delivery for requeue, rather than leaving
-            // a partial start. RESIDUAL: a sibling can still claim a slot between our
-            // consecutive reservation CAS calls, but that only causes an extra (safe)
-            // requeue, never a partial start, so no per-message-id idempotency (tracked
-            // separately) is required for correctness here.
+            // No retryable sibling. The only non-`Admit` outcomes (if any) are TERMINAL
+            // (`Drop`/`Coalesce`) and will never become admissible - record them now, and
+            // collect the admissible subset to start. Redelivering the batch for a
+            // terminal sibling would re-drop it and, with no Started sibling, NACK forever.
+            let mut admit_names: Vec<String> = Vec::new();
+            for (sop_name, admission) in admissions {
+                match admission {
+                    SopAdmission::Admit => admit_names.push(sop_name.clone()),
+                    SopAdmission::Coalesce { existing_run_id } => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "existing_run_id": existing_run_id
+                            })),
+                            &format!(
+                                "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
+                            )
+                        );
+                        results.push(DispatchResult::Coalesced {
+                            sop_name: sop_name.clone(),
+                            existing_run_id,
+                        });
+                    }
+                    SopAdmission::Drop { reason } => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                            &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                        );
+                        results.push(DispatchResult::Skipped {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        });
+                    }
+                    // `has_retryable_defer` was false, so no `Defer` remains here.
+                    SopAdmission::Defer { .. } => unreachable!(
+                        "a retryable Defer would have returned via the has_retryable_defer branch"
+                    ),
+                }
+            }
+
+            // Structural over-capacity guard. If the admissible fan-out is LARGER than the
+            // global concurrency budget, an all-or-nothing batch can NEVER be satisfied: from
+            // idle every sibling is `Admit`, the reservation loop fills the global cap and the
+            // next reservation always fails, so deferring the batch NACK-requeues it and the
+            // redelivery reproduces the identical state - a permanent livelock, not transient
+            // backpressure. Redelivery cannot help, so drop the whole delivery with a loud
+            // health error (Skipped keeps `results_need_redelivery` false, so the broker acks
+            // instead of NACK-looping) and tell the operator to raise `max_concurrent_total` or
+            // reduce the matched fan-out. Starting only the subset that fits is NOT an option:
+            // a mixed Started+Deferred set would either ack-and-lose the deferred siblings or
+            // replay the started ones on redelivery (the 2b double-execution hazard).
+            let global_cap = eng.config().max_concurrent_total;
+            if admit_names.len() > global_cap {
+                let reason = format!(
+                    "matched AMQP fan-out ({}) exceeds max_concurrent_total ({}); an all-or-nothing delivery this large can never be satisfied and is dropped to avoid a NACK-requeue livelock - raise max_concurrent_total or reduce the matched SOP fan-out",
+                    admit_names.len(),
+                    global_cap
+                );
+                crate::health::mark_component_error("sop_dispatch", reason.clone());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "admissible_fan_out": admit_names.len(),
+                            "max_concurrent_total": global_cap,
+                        })),
+                    &format!("SOP dispatch: {reason}")
+                );
+                for sop_name in &admit_names {
+                    results.push(DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+                return results;
+            }
+
+            // Reserve every ADMISSIBLE sibling's exec slot through the authoritative store
+            // CAS BEFORE activating any of them — a reservation holds a real claim but
+            // creates no run and runs no step, so no SOP side effect occurs yet. A sibling
+            // engine that grabs a slot mid-batch makes one reservation fail; we then release
+            // the reservations already held and defer the admissible set for requeue, rather
+            // than leaving a partial start. (An empty admissible set — every sibling terminal
+            // — reserves nothing and simply acks the recorded terminals.) RESIDUAL: a sibling
+            // can still claim a slot between our consecutive reservation CAS calls, but that
+            // only causes an extra (safe) requeue, never a partial start.
             let mut reservations = Vec::new();
             let mut shortfall: Option<(String, String)> = None;
-            for sop_name in &matched_names {
+            for sop_name in &admit_names {
                 match eng.reserve_run_slot(sop_name) {
                     Ok(reservation) => reservations.push(reservation),
                     Err(e) => {
@@ -454,10 +536,10 @@ async fn dispatch_sop_event_filtered(
                             "blocked_sop": blocked.as_str(), "reason": reason.as_str()
                         })),
                     &format!(
-                        "SOP dispatch: AMQP batch not fully admissible ('{blocked}'); deferring whole delivery for requeue"
+                        "SOP dispatch: AMQP batch not fully admissible ('{blocked}'); deferring admissible set for requeue"
                     )
                 );
-                for sop_name in &matched_names {
+                for sop_name in &admit_names {
                     results.push(DispatchResult::Deferred {
                         sop_name: sop_name.clone(),
                         reason: format!(
@@ -468,25 +550,65 @@ async fn dispatch_sop_event_filtered(
                 return results;
             }
 
-            // All matched slots are reserved, so no sibling can take them now: every
-            // activation proceeds and the delivery starts as a whole batch. Activation
-            // drives side effects; a rare activation error rolls that run back and is
-            // reclassified (the batch is already committed at that point).
-            for reservation in reservations {
+            // Every admissible slot is reserved, so no sibling can take them now. ACTIVATE
+            // the whole reserved set ATOMICALLY: activation inserts an in-memory run and
+            // produces its first action but runs NO irreversible side effect (deterministic
+            // execution and the LLM agent loop both run LATER, in `record_started_run` / the
+            // driver). So we activate every reservation FIRST; if any activation fails, roll
+            // the already-activated siblings back (remove their runs + release their claims),
+            // release the reservations not yet activated, and defer the whole set for requeue
+            // — never leaving one sibling Started while another is dropped. Only once EVERY
+            // sibling has activated do we `record_started_run` (which drives headless
+            // deterministic runs to terminal); a failure there is that run's own terminal
+            // outcome (Started-then-Failed), not a lost trigger.
+            let mut activated: Vec<(String, SopRunAction)> = Vec::new();
+            let mut activation_failure: Option<(String, String)> = None;
+            let mut remaining = reservations.into_iter();
+            for reservation in remaining.by_ref() {
                 let sop_name = reservation.sop_name().to_string();
                 match eng.activate_reserved_run(reservation, event.clone()) {
-                    Ok(action) => {
-                        results.push(record_started_run(
-                            &mut eng,
-                            &sop_name,
-                            action,
-                            &mut started_runs,
-                        ));
-                    }
+                    Ok(action) => activated.push((sop_name, action)),
                     Err(e) => {
-                        results.push(reclassify_failed_start(&eng, &sop_name, &e));
+                        activation_failure = Some((sop_name, e.to_string()));
+                        break;
                     }
                 }
+            }
+            if let Some((failed_sop, reason)) = activation_failure {
+                for (_sop_name, action) in &activated {
+                    eng.rollback_activated_run(extract_run_id_from_action(action));
+                }
+                for reservation in remaining {
+                    eng.release_reservation(reservation);
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "failed_sop": failed_sop.as_str(), "reason": reason.as_str()
+                        })),
+                    &format!(
+                        "SOP dispatch: AMQP batch activation of '{failed_sop}' failed; rolled the batch back and deferred the whole delivery for requeue"
+                    )
+                );
+                for sop_name in &admit_names {
+                    results.push(DispatchResult::Deferred {
+                        sop_name: sop_name.clone(),
+                        reason: format!(
+                            "AMQP delivery deferred: activation of matched SOP '{failed_sop}' failed for the whole batch ({reason})"
+                        ),
+                    });
+                }
+                return results;
+            }
+            for (sop_name, action) in activated {
+                results.push(record_started_run(
+                    &mut eng,
+                    &sop_name,
+                    action,
+                    &mut started_runs,
+                ));
             }
         } else {
             for sop_name in &matched_names {
@@ -1984,7 +2106,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amqp_multi_match_defers_all_when_batch_exceeds_free_global_slots() {
+    async fn amqp_multi_match_drops_over_capacity_batch_instead_of_livelocking() {
+        // A batch whose admissible fan-out is LARGER than max_concurrent_total (here 2 matched
+        // SOPs, global cap 1) can never fit all-or-nothing: from idle both Admit, but only one
+        // slot exists, so the batch can never start as a whole. Deferring it would NACK-requeue
+        // forever (the redelivery reproduces the identical idle state). It must be DROPPED
+        // (Skipped) with a loud error so the delivery acks - not livelocked.
         let amqp_trigger = || SopTrigger::Amqp {
             routing_key: "anitya.update".into(),
             condition: None,
@@ -2013,16 +2140,126 @@ mod tests {
         assert!(
             results
                 .iter()
-                .all(|r| matches!(r, DispatchResult::Deferred { .. })),
-            "global-slot batch overflow must defer every would-start SOP before side effects: {results:?}"
+                .all(|r| matches!(r, DispatchResult::Skipped { .. })),
+            "a structurally-over-capacity batch is dropped (Skipped), not deferred: {results:?}"
         );
         assert!(
-            results_need_redelivery(&results),
-            "no SOP started, so the broker delivery is safe to requeue"
+            !results_need_redelivery(&results),
+            "a permanently-unsatisfiable batch must ACK, never NACK-requeue-livelock: {results:?}"
         );
         assert!(
             engine.lock().unwrap().active_runs().is_empty(),
-            "no matched SOP may start when the whole AMQP batch cannot fit"
+            "no matched SOP may start when the whole AMQP batch can never fit"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_starts_admissible_sibling_when_another_is_terminal_drop() {
+        // 2a: a matched SOP with a TERMINAL `Drop` outcome must NOT force the whole delivery
+        // to requeue forever (a `Drop` can never become admissible on retry). The admissible
+        // sibling starts; the dropped sibling is `Skipped`; no `Deferred` remains, so the
+        // delivery acks instead of NACKing endlessly.
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let mut dropper = test_sop("drop-amqp", vec![amqp_trigger()]);
+        dropper.admission_policy = crate::sop::types::SopAdmissionPolicy::Drop;
+        dropper.max_concurrent = 1;
+        let admit = test_sop("admit-amqp", vec![amqp_trigger()]);
+        let engine = test_engine(vec![dropper, admit]);
+        let audit = test_audit();
+
+        // Fill drop-amqp's only slot so its next admission is a terminal Drop.
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.start_run(
+                "drop-amqp",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("anitya.update".into()),
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .expect("first drop-amqp run fills its only slot");
+        }
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+        )
+        .await;
+
+        assert!(
+            results.iter().any(|r| matches!(r, DispatchResult::Started { sop_name, .. } if sop_name == "admit-amqp")),
+            "the admissible sibling must start even though a sibling drops: {results:?}"
+        );
+        assert!(
+            results.iter().any(
+                |r| matches!(r, DispatchResult::Skipped { sop_name, .. } if sop_name == "drop-amqp")
+            ),
+            "the terminal Drop sibling is skipped, not deferred: {results:?}"
+        );
+        assert!(
+            !results_need_redelivery(&results),
+            "a terminal Drop sibling must NOT force an endless requeue - the delivery acks: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_rolls_back_and_defers_when_a_sibling_activation_fails() {
+        // 2b: activation is atomic. If a later sibling fails to activate after an earlier one
+        // already activated, the batch rolls the earlier one back and defers the WHOLE
+        // delivery for requeue - never leaving one sibling Started while another is dropped.
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let good = test_sop("good-amqp", vec![amqp_trigger()]);
+        // `broken-amqp` has no step numbered 1, so activating it (which dispatches step 1)
+        // fails - modelling a post-reservation activation error mid-batch.
+        let mut broken = test_sop("broken-amqp", vec![amqp_trigger()]);
+        broken.steps[0].number = 2;
+        let engine = test_engine(vec![good, broken]);
+        let audit = test_audit();
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "both matched SOPs return a result: {results:?}"
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Started { .. })),
+            "atomic activation must not leave any sibling Started when one fails: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, DispatchResult::Deferred { .. })),
+            "the whole batch defers for requeue: {results:?}"
+        );
+        assert!(
+            results_need_redelivery(&results),
+            "no sibling started, so the delivery is safe to requeue"
+        );
+        assert!(
+            engine.lock().unwrap().active_runs().is_empty(),
+            "the rolled-back sibling leaves no live run (no partial start leaked): {results:?}"
         );
     }
 

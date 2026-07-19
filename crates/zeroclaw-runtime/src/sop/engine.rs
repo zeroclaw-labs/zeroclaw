@@ -111,6 +111,40 @@ impl std::error::Error for TerminalPersistenceRetained {
     }
 }
 
+/// Typed marker: a resume could not re-acquire an exec slot because the SOP's
+/// per-SOP `max_concurrent` or the global `max_concurrent_total` is already
+/// saturated. This is routine BACKPRESSURE, not a fault - kept distinct from a
+/// store error so callers surface it as "at capacity, retry" (leaving the run
+/// parked and re-resolvable) instead of logging it as a failure. It is the
+/// signal that enforces the documented concurrency caps on the resume path: a
+/// resume that would exceed them is refused rather than oversubscribed.
+#[derive(Debug)]
+struct ResumeAtCapacity {
+    run_id: String,
+    sop_name: String,
+}
+
+impl std::fmt::Display for ResumeAtCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "run {} ({}) cannot resume yet: execution slots are full; it stays parked and re-resolvable once a slot frees",
+            self.run_id, self.sop_name
+        )
+    }
+}
+
+impl std::error::Error for ResumeAtCapacity {}
+
+/// True when `err` is the typed [`ResumeAtCapacity`] backpressure marker (an
+/// over-cap resume was refused), as opposed to a store fault. Lets a caller in
+/// another module or crate (e.g. `resolve_gate`, or the gateway resume endpoint)
+/// render it as backpressure (HTTP 503) rather than a fault without depending on
+/// the private struct.
+pub fn err_is_resume_at_capacity(err: &anyhow::Error) -> bool {
+    err.is::<ResumeAtCapacity>()
+}
+
 enum ActivePersistOutcome {
     Saved,
     CapacityFull,
@@ -278,9 +312,19 @@ impl SopEngine {
                                             "error": e.to_string(),
                                         })
                                     ),
-                                    "SOP engine: failed to inspect parked claim retention marker"
+                                    "SOP engine: failed to inspect parked claim retention marker; failing closed (assuming retained)"
                                 );
-                                false
+                                // FAIL CLOSED: a transient inspection read error must NOT
+                                // discard a claim the terminal-rollback marker may exist to
+                                // preserve (mapping it to `false` here would route into the
+                                // release branch and drop that claim). Assume retained: the
+                                // run keeps its claim. `heartbeat_claim` is an UPDATE-only
+                                // no-op when the claim row is in fact already gone, so this
+                                // cannot resurrect a released claim; the lease reaper reclaims
+                                // a genuine orphan later. Erring toward keeping is the safe
+                                // direction - releasing here could strand a run a real failed
+                                // terminal write left restorable.
+                                true
                             }
                         };
                         if retained && Self::terminal_rollback_marker_is_stale(&pr.run) {
@@ -884,28 +928,96 @@ impl SopEngine {
     ///   current step; a restart before re-resolution would release that legitimate
     ///   marker. That direction is safe: the run is still restored into `active_runs`
     ///   (never lost) and only loses its HELD slot, degrading to standard parked
-    ///   semantics — it reacquires uncapped via `reacquire_claim_on_resume` on the next
-    ///   decision. No double execution, no permanent leak, no hard-cap violation; it is
-    ///   the same bounded, self-correcting overshoot `reacquire_claim_on_resume` documents.
+    ///   semantics — it re-acquires its exec slot on its next decision, capped
+    ///   (subject to `max_concurrent`/`max_concurrent_total`) via
+    ///   `reacquire_claim_on_resume` for an approval or checkpoint-approve resume, or
+    ///   uncapped via `reacquire_claim_uncapped` for a subsequent denial. No double
+    ///   execution, no permanent leak, no hard-cap violation.
     fn terminal_rollback_marker_is_stale(run: &SopRun) -> bool {
         run.step_results
             .iter()
             .any(|result| result.step_number == run.current_step)
     }
 
-    /// A1: re-establish a resumed run's exec claim. Uses the uncapped restore
-    /// path: the run was admitted once already, so resuming it after an approval
-    /// is a continuation, not new admission, and must never be blocked by the
-    /// concurrency cap (an approved run always resumes). This can transiently push
-    /// executing runs above `max_concurrent` when many approvals resolve at once;
-    /// that overshoot is bounded and self-corrects (new triggers see the higher
-    /// count and wait). Strict serialization is the `Hold` admission policy, not this.
-    /// Fail-CLOSED: returns `Err` if the claim cannot be re-established, so the
-    /// caller aborts the resume BEFORE flipping the run to `Running` and leaves it
-    /// parked (re-resolvable). Executing without a claim would under-count
-    /// concurrency and oversubscribe. A missing run is a no-op `Ok` (the caller
-    /// already validated the run exists).
+    /// A1: re-establish a RESUMING run's exec claim, subject to the SOP's per-SOP
+    /// `max_concurrent` AND the global `max_concurrent_total`. A run parked at a HITL
+    /// approval / deterministic checkpoint released its exec slot on park; resuming
+    /// it must re-admit through the SAME store CAS (`try_claim_run`) a fresh start
+    /// uses, so a burst of simultaneous approvals can never push executing runs past
+    /// the configured caps. (That burst is the reviewed defect: many runs park,
+    /// releasing their slots, then all resume at once - the uncapped restore path
+    /// let them oversubscribe.) Three outcomes:
+    /// - `Ok(())`                 a slot was available; the run holds its claim and may resume.
+    /// - `Err(ResumeAtCapacity)`  the cap is saturated. TYPED backpressure, NOT a fault:
+    ///   the caller leaves the run parked and re-resolvable (`resolve_gate` reports
+    ///   `DeferredAtCapacity`; the checkpoint paths surface it to the operator), and a
+    ///   later approval attempt or the timeout tick's retry resumes it once a slot frees.
+    /// - `Err(_)`                 a store fault (fail-closed, as before): abort the resume,
+    ///   never execute uncounted.
+    ///
+    /// A missing run is a no-op `Ok` (the caller already validated it exists). The
+    /// checkpoint-DENIAL path uses `reacquire_claim_uncapped` instead - a denial may
+    /// TERMINATE the run, and gating a terminating run on a free slot would refuse to
+    /// end it under load and strand it.
     pub(crate) fn reacquire_claim_on_resume(&self, run_id: &str) -> Result<()> {
+        let Some((rid, sop_name)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.run_id.clone(), run.sop_name.clone()))
+        else {
+            return Ok(());
+        };
+        // Resolve the per-SOP cap exactly as the normal admit path does. The resume
+        // pre-flights (`can_clear_waiting_gate` / `can_advance_deterministic_step`)
+        // already proved the SOP is still loaded before we reach here; if it somehow
+        // is not, fail closed rather than resume uncounted.
+        let per_sop_cap = self
+            .get_sop(&sop_name)
+            .map(|sop| sop.max_concurrent as usize);
+        let Some(per_sop_cap) = per_sop_cap else {
+            return Err(anyhow::Error::msg(format!(
+                "failed to re-acquire exec claim on resume for run {rid}: SOP '{sop_name}' no longer loaded"
+            )));
+        };
+        match self.store.try_claim_run(
+            &rid,
+            &sop_name,
+            per_sop_cap,
+            self.config.max_concurrent_total,
+        ) {
+            Ok(Some(_token)) => Ok(()),
+            Ok(None) => Err(anyhow::Error::new(ResumeAtCapacity {
+                run_id: rid,
+                sop_name,
+            })),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": rid.as_str(),
+                            "error": e.to_string(),
+                        })),
+                    "SOP engine: resume aborted, could not re-acquire the run admission claim (fail-closed)"
+                );
+                Err(anyhow::Error::msg(format!(
+                    "failed to re-acquire exec claim on resume for run {rid}: {e}"
+                )))
+            }
+        }
+    }
+
+    /// UNCAPPED exec-claim re-establishment, for the checkpoint-DENIAL path only
+    /// (`deny_checkpoint`). A denial may TERMINATE the run - it reacquires the claim
+    /// to write terminal state and the terminal-rollback retention marker atomically,
+    /// so this is rollback/atomicity machinery, not new admission, and must never be
+    /// blocked by the concurrency cap (refusing to terminate a run under load would
+    /// strand it, since it already released its slot at park). This is the ORIGINAL
+    /// uncapped restore behavior; the capped `reacquire_claim_on_resume` above governs
+    /// the three resume-to-continue paths (approval approve, checkpoint approve,
+    /// deterministic resume). Fail-CLOSED on a store error, as before.
+    pub(crate) fn reacquire_claim_uncapped(&self, run_id: &str) -> Result<()> {
         let Some(run) = self.active_runs.get(run_id) else {
             return Ok(());
         };
@@ -1285,6 +1397,45 @@ impl SopEngine {
         self.active_runs.remove(run_id);
         self.release_claim_best_effort(claim);
         err
+    }
+
+    /// Undo a SUCCESSFUL `activate_reserved_run` that must be reversed because a LATER
+    /// sibling in the same all-or-nothing AMQP multi-match batch failed to activate.
+    /// Activation runs no irreversible side effect (deterministic execution and the LLM
+    /// agent loop both run LATER, in `record_started_run` / the driver), so the run is
+    /// safe to reverse. Two cases:
+    /// - A still-EXECUTING sibling (`holds_exec_claim` true) never durably persisted during
+    ///   activation: drop it in-memory and release its exec claim.
+    /// - A sibling that PARKED at a step-1 approval/checkpoint gate DID durably persist its
+    ///   parked snapshot (and already released its claim). Dropping it only in-memory would
+    ///   ORPHAN that durable row: after a restart, `restore_runs` would reconstruct it,
+    ///   duplicating a run whose whole delivery was deferred + requeued. Durably supersede it
+    ///   with a terminal `Cancelled` (a higher revision the store's guard accepts) so restore
+    ///   skips it. Best-effort: a store failure here only leaves the bounded orphan back
+    ///   (logged), never a double execution — the sibling never ran.
+    pub(crate) fn rollback_activated_run(&mut self, run_id: &str) {
+        let Some(mut run) = self.active_runs.remove(run_id) else {
+            return;
+        };
+        if holds_exec_claim(run.status) {
+            self.release_claim_best_effort(&Self::claim_handle_for_run(&run));
+            return;
+        }
+        // Parked sibling: its durable snapshot must not survive the rollback.
+        run.status = SopRunStatus::Cancelled;
+        run.completed_at = Some(now_iso8601());
+        if let Err(e) = self.persist_terminal(&run) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run.run_id.as_str(),
+                        "error": e.to_string(),
+                    })),
+                "SOP dispatch: could not durably cancel a rolled-back parked AMQP sibling; a stale parked row may be reconstructed on restart"
+            );
+        }
     }
 
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
@@ -2428,7 +2579,11 @@ impl SopEngine {
             .get(run_id)
             .cloned()
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        self.reacquire_claim_on_resume(run_id)?;
+        // UNCAPPED reacquire: a denial may terminate the run, and gating a
+        // terminating run on a free slot would strand it under load. The concurrency
+        // cap applies to resume-to-CONTINUE paths (approve/checkpoint-approve/
+        // deterministic-resume), not to a denial's terminal-rollback atomicity.
+        self.reacquire_claim_uncapped(run_id)?;
         if let Err(marker_err) = self
             .store
             .mark_claim_retained_after_terminal_rollback(run_id)
@@ -6905,6 +7060,334 @@ mod tests {
     }
 
     #[test]
+    fn resume_admission_enforces_per_sop_concurrency_cap() {
+        // Reviewer scenario: with `max_concurrent = 1` and the default unbounded pending
+        // pool, many runs can park (each releasing its slot), then approving them all must
+        // NOT let them all resume at once. Capped resume: the first resumes; the rest are
+        // refused at capacity (`DeferredAtCapacity`) and stay parked, re-resolvable.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.max_concurrent = 1;
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+
+        // Two runs park in sequence (the first frees its slot on park, so the second admits).
+        let a = engine.start_run("s1", manual_event()).unwrap();
+        let id_a = extract_run_id(&a).to_string();
+        assert!(
+            matches!(a, SopRunAction::WaitApproval { .. }),
+            "run A parks: {a:?}"
+        );
+        let b = engine.start_run("s1", manual_event()).unwrap();
+        let id_b = extract_run_id(&b).to_string();
+        assert!(
+            matches!(b, SopRunAction::WaitApproval { .. }),
+            "run B parks too: {b:?}"
+        );
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "both parked: no exec claim held"
+        );
+
+        // Approve A: it resumes into the single free slot.
+        let out_a = engine
+            .resolve_gate(
+                &id_a,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(out_a.is_resumed(), "A resumes: {out_a:?}");
+        assert_eq!(
+            store.claim_counts("s1").unwrap().0,
+            1,
+            "A holds the one exec slot"
+        );
+
+        // Approve B: the slot is taken, so B must defer at capacity - never oversubscribe.
+        let out_b = engine
+            .resolve_gate(
+                &id_b,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(
+            matches!(out_b, ResolveOutcome::DeferredAtCapacity),
+            "B is refused at capacity, not oversubscribed: {out_b:?}"
+        );
+        assert_eq!(
+            store.claim_counts("s1").unwrap().0,
+            1,
+            "still exactly one exec slot in use, not two"
+        );
+        assert!(
+            matches!(engine.gate_state(&id_b), GateState::Waiting { .. }),
+            "B stays WaitingApproval, re-resolvable"
+        );
+    }
+
+    #[test]
+    fn resume_admission_enforces_global_concurrency_cap() {
+        // The global `max_concurrent_total` is enforced on resume too: two DIFFERENT SOPs
+        // (each `max_concurrent = 1`) share a global cap of 1. Both park; approving both
+        // resumes only the first - the second defers at capacity.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut s1 = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        s1.max_concurrent = 1;
+        let mut s2 = test_sop("s2", SopExecutionMode::Supervised, SopPriority::Normal);
+        s2.max_concurrent = 1;
+        let cfg = SopConfig {
+            max_concurrent_total: 1,
+            ..SopConfig::default()
+        };
+        let mut engine = engine_with_config_sops(cfg, vec![s1, s2]).with_store(store.clone());
+
+        let a = engine.start_run("s1", manual_event()).unwrap();
+        let id_a = extract_run_id(&a).to_string();
+        let b = engine.start_run("s2", manual_event()).unwrap();
+        let id_b = extract_run_id(&b).to_string();
+        assert!(
+            matches!(a, SopRunAction::WaitApproval { .. })
+                && matches!(b, SopRunAction::WaitApproval { .. }),
+            "both runs park for approval"
+        );
+
+        let out_a = engine
+            .resolve_gate(
+                &id_a,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(
+            out_a.is_resumed(),
+            "the first resumes into the one global slot"
+        );
+        let out_b = engine
+            .resolve_gate(
+                &id_b,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(
+            matches!(out_b, ResolveOutcome::DeferredAtCapacity),
+            "the global cap refuses the second resume: {out_b:?}"
+        );
+        assert_eq!(
+            store.claim_counts("s2").unwrap().1,
+            1,
+            "exactly one exec slot in use globally, not two"
+        );
+    }
+
+    #[test]
+    fn checkpoint_resume_enforces_concurrency_cap() {
+        // The cap applies to the checkpoint-resume path (`approve_step`) too, via the same
+        // reacquire chokepoint. Two deterministic runs park at a checkpoint (each frees its
+        // slot); approving both resumes only the first - the second is refused at capacity
+        // with the typed backpressure marker, and stays paused.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = deterministic_sop("det-cp");
+        sop.max_concurrent = 1;
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+
+        let a = engine.start_run("det-cp", manual_event()).unwrap();
+        let id_a = extract_run_id(&a).to_string();
+        engine
+            .advance_deterministic_step(&id_a, serde_json::json!("a1"), None)
+            .unwrap();
+        assert_eq!(
+            engine.get_run(&id_a).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+        let b = engine.start_run("det-cp", manual_event()).unwrap();
+        let id_b = extract_run_id(&b).to_string();
+        engine
+            .advance_deterministic_step(&id_b, serde_json::json!("b1"), None)
+            .unwrap();
+        assert_eq!(
+            engine.get_run(&id_b).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert_eq!(
+            store.claim_counts("det-cp").unwrap(),
+            (0, 0),
+            "both parked at the checkpoint: no exec claim held"
+        );
+
+        engine.approve_step(&id_a).unwrap();
+        assert_eq!(
+            store.claim_counts("det-cp").unwrap().0,
+            1,
+            "A holds the one slot after resuming"
+        );
+
+        let err = engine
+            .approve_step(&id_b)
+            .expect_err("B's checkpoint resume must be refused at capacity");
+        assert!(
+            err_is_resume_at_capacity(&err),
+            "the refusal is typed capacity backpressure, not a fault: {err}"
+        );
+        assert_eq!(
+            engine.get_run(&id_b).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "B stays paused at the checkpoint, re-resolvable"
+        );
+        assert_eq!(
+            store.claim_counts("det-cp").unwrap().0,
+            1,
+            "still exactly one slot in use, not two"
+        );
+    }
+
+    #[test]
+    fn sqlite_daemon_restart_resumes_parked_run_and_enforces_cap() {
+        // Near-live boundary evidence: with a REAL file-backed SQLite store, runs parked for
+        // approval survive a daemon "restart" (a fresh engine over the same DB), restore
+        // holding no exec slot, and the resume concurrency cap holds ACROSS the restart -
+        // exercising the durable status round-trip plus capped `reacquire_claim_on_resume`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sop.db");
+
+        // Boot 1: park two runs of a max_concurrent=1 SOP, then shut down.
+        let (id_a, id_b);
+        {
+            let store =
+                std::sync::Arc::new(crate::sop::store::sqlite::SqliteRunStore::open(&db).unwrap());
+            let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+            sop.max_concurrent = 1;
+            let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+            let a = engine.start_run("s1", manual_event()).unwrap();
+            id_a = extract_run_id(&a).to_string();
+            let b = engine.start_run("s1", manual_event()).unwrap();
+            id_b = extract_run_id(&b).to_string();
+            assert!(
+                matches!(a, SopRunAction::WaitApproval { .. })
+                    && matches!(b, SopRunAction::WaitApproval { .. }),
+                "both runs park for approval"
+            );
+            assert_eq!(
+                store.claim_counts("s1").unwrap(),
+                (0, 0),
+                "parked runs hold no exec slot (durably)"
+            );
+        }
+
+        // Boot 2: restart over the SAME DB, restore, then approve both.
+        {
+            let store =
+                std::sync::Arc::new(crate::sop::store::sqlite::SqliteRunStore::open(&db).unwrap());
+            let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+            sop.max_concurrent = 1;
+            let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+            engine.restore_runs();
+            assert_eq!(
+                engine.get_run(&id_a).map(|r| r.status),
+                Some(SopRunStatus::WaitingApproval),
+                "run A restored WaitingApproval after restart"
+            );
+            assert_eq!(
+                engine.get_run(&id_b).map(|r| r.status),
+                Some(SopRunStatus::WaitingApproval),
+                "run B restored WaitingApproval after restart"
+            );
+            assert_eq!(
+                store.claim_counts("s1").unwrap(),
+                (0, 0),
+                "restored parked runs hold no exec claim"
+            );
+
+            // Approve A: resumes into the free slot. Approve B: refused at capacity - the cap
+            // holds across the restart boundary.
+            let out_a = engine
+                .resolve_gate(
+                    &id_a,
+                    ApprovalDecision::Approve,
+                    ApprovalPrincipal::cli(None),
+                )
+                .unwrap();
+            assert!(out_a.is_resumed(), "A resumes after restart: {out_a:?}");
+            let out_b = engine
+                .resolve_gate(
+                    &id_b,
+                    ApprovalDecision::Approve,
+                    ApprovalPrincipal::cli(None),
+                )
+                .unwrap();
+            assert!(
+                matches!(out_b, ResolveOutcome::DeferredAtCapacity),
+                "the resume cap holds across restart: B is refused at capacity: {out_b:?}"
+            );
+            assert_eq!(
+                store.claim_counts("s1").unwrap().0,
+                1,
+                "exactly one exec slot in use after restart + resume, not two"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_activated_run_durably_cancels_a_parked_sibling() {
+        // 2b atomic-rollback: a sibling that PARKED (persisted) during activation and is then
+        // rolled back (because a later sibling failed to activate) must be durably CANCELLED,
+        // not merely dropped in memory - otherwise `restore_runs` reconstructs an orphaned
+        // parked run after a restart, duplicating a delivery that was deferred + requeued.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        // A sibling that activated and PARKED at its step-1 approval gate (persisted).
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        assert!(
+            store
+                .load_active_runs()
+                .unwrap()
+                .iter()
+                .any(|r| r.run.run_id == run_id),
+            "the parked sibling is durable before rollback"
+        );
+
+        // Roll it back, as the atomic batch does when a later sibling's activation fails.
+        engine.rollback_activated_run(&run_id);
+        assert!(
+            engine.get_run(&run_id).is_none(),
+            "the rolled-back sibling is dropped in memory"
+        );
+        // The durable row is now terminal Cancelled, not an active parked run.
+        assert!(
+            store
+                .load_active_runs()
+                .unwrap()
+                .iter()
+                .all(|r| r.run.run_id != run_id),
+            "the rolled-back parked sibling is no longer a durable ACTIVE run"
+        );
+
+        // A restart must NOT resurrect it as a LIVE parked run (the post-requeue duplicate);
+        // at most it appears as terminal history.
+        let mut fresh = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        fresh.restore_runs();
+        let restored = fresh.get_run(&run_id).map(|r| r.status);
+        assert!(
+            restored.is_none() || restored == Some(SopRunStatus::Cancelled),
+            "restart must not resurrect the rolled-back sibling as a live parked run (got {restored:?})"
+        );
+    }
+
+    #[test]
     fn restored_parked_run_holds_no_exec_claim() {
         // A parked run persisted before a restart must restore WITHOUT re-taking an
         // exec slot (it is waiting on a human, not executing), so the slot stays free
@@ -6951,6 +7434,61 @@ mod tests {
         assert!(
             engine.can_start("s1"),
             "its slot stays free for a new trigger"
+        );
+    }
+
+    #[test]
+    fn restore_fails_closed_when_retention_inspection_errors() {
+        // Finding 3: if inspecting the terminal-rollback retention marker ERRORS during
+        // restore, we must fail CLOSED and KEEP the claim - a transient read failure must
+        // not discard a claim the marker exists to preserve. (The prior code mapped the
+        // error to `retained = false`, routing a legitimate marker into the release branch.)
+        let store = std::sync::Arc::new(FailingSaveLeasedStore::healthy());
+        // Seed a parked run whose current step has NO recorded result (a legitimate,
+        // non-stale terminal-rollback marker) plus a retained claim for it.
+        let now = now_iso8601();
+        let parked = SopRun {
+            run_id: "parked-1".to_string(),
+            sop_name: "s1".to_string(),
+            trigger_event: manual_event(),
+            frame_marker_id: "marker".to_string(),
+            status: SopRunStatus::WaitingApproval,
+            current_step: 1,
+            total_steps: 2,
+            started_at: now.clone(),
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: Some(now.clone()),
+            llm_calls_saved: 0,
+        };
+        store
+            .save_run(&PersistedRun::new(parked, now, SopTriggerSource::Manual))
+            .unwrap();
+        store.try_claim_run("parked-1", "s1", 1, 4).unwrap();
+        store
+            .mark_claim_retained_after_terminal_rollback("parked-1")
+            .unwrap();
+        assert_eq!(
+            store.claim_counts("s1").unwrap().1,
+            1,
+            "seeded a retained terminal-rollback claim"
+        );
+
+        // Make the retention inspection fail during restore.
+        store.set_fail_has_retained(true);
+        let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        engine.restore_runs();
+
+        // Fail-closed: the claim is PRESERVED, not discarded, and the run is still restored.
+        assert_eq!(
+            store.claim_counts("s1").unwrap().1,
+            1,
+            "an inspection error must fail closed: the retained claim survives (not released)"
+        );
+        assert!(
+            engine.get_run("parked-1").is_some(),
+            "the parked run is still restored"
         );
     }
 
@@ -7011,10 +7549,13 @@ mod tests {
         );
     }
 
-    /// Delegates to an in-memory store but fails every `renew_claim_for_restore`,
-    /// to prove resume fails CLOSED when the claim store errors.
+    /// Delegates to an in-memory store but can be flipped to fail claim acquisition
+    /// (both the capped `try_claim_run` the resume reacquire now uses and the uncapped
+    /// `renew_claim_for_restore`), to prove resume fails CLOSED when the claim store
+    /// errors. Flipped ON only after the initial admit so `start_run` still succeeds.
     struct FailingReacquireStore {
         inner: InMemoryRunStore,
+        fail_claim: std::sync::atomic::AtomicBool,
     }
     impl SopRunStore for FailingReacquireStore {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
@@ -7060,10 +7601,16 @@ mod tests {
             p: usize,
             g: usize,
         ) -> Result<Option<ClaimToken>, StoreError> {
+            if self.fail_claim.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected claim failure".into()));
+            }
             self.inner.try_claim_run(id, s, p, g)
         }
-        fn renew_claim_for_restore(&self, _id: &str, _s: &str) -> Result<ClaimToken, StoreError> {
-            Err(StoreError::Backend("injected renew failure".into()))
+        fn renew_claim_for_restore(&self, id: &str, s: &str) -> Result<ClaimToken, StoreError> {
+            if self.fail_claim.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected renew failure".into()));
+            }
+            self.inner.renew_claim_for_restore(id, s)
         }
         fn claim_counts(&self, s: &str) -> Result<(usize, usize), StoreError> {
             self.inner.claim_counts(s)
@@ -7112,15 +7659,21 @@ mod tests {
         // uncounted: the resume aborts (Err) and the gate stays WaitingApproval.
         let store = std::sync::Arc::new(FailingReacquireStore {
             inner: InMemoryRunStore::new(),
+            fail_claim: std::sync::atomic::AtomicBool::new(false),
         });
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
-        let mut engine = engine_with_sops(vec![sop]).with_store(store);
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
         let a = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&a).to_string();
         assert_eq!(
             engine.get_run(&run_id).unwrap().status,
             SopRunStatus::WaitingApproval
         );
+        // Fail the claim store now (after the admit): the resume reacquire hits a
+        // store fault (not capacity backpressure) and must abort fail-closed.
+        store
+            .fail_claim
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let res = engine.resolve_gate(
             &run_id,
             ApprovalDecision::Approve,
@@ -7895,6 +8448,7 @@ mod tests {
         fail_finish: std::sync::atomic::AtomicBool,
         fail_marker: std::sync::atomic::AtomicBool,
         fail_release: std::sync::atomic::AtomicBool,
+        fail_has_retained: std::sync::atomic::AtomicBool,
     }
     impl FailingSaveLeasedStore {
         fn healthy() -> Self {
@@ -7906,6 +8460,7 @@ mod tests {
                 fail_finish: std::sync::atomic::AtomicBool::new(false),
                 fail_marker: std::sync::atomic::AtomicBool::new(false),
                 fail_release: std::sync::atomic::AtomicBool::new(false),
+                fail_has_retained: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn new() -> Self {
@@ -7917,6 +8472,7 @@ mod tests {
                 fail_finish: std::sync::atomic::AtomicBool::new(false),
                 fail_marker: std::sync::atomic::AtomicBool::new(false),
                 fail_release: std::sync::atomic::AtomicBool::new(false),
+                fail_has_retained: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn finish_fails() -> Self {
@@ -7928,6 +8484,7 @@ mod tests {
                 fail_finish: std::sync::atomic::AtomicBool::new(true),
                 fail_marker: std::sync::atomic::AtomicBool::new(false),
                 fail_release: std::sync::atomic::AtomicBool::new(false),
+                fail_has_retained: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn finish_and_marker_fail() -> Self {
@@ -7939,6 +8496,7 @@ mod tests {
                 fail_finish: std::sync::atomic::AtomicBool::new(true),
                 fail_marker: std::sync::atomic::AtomicBool::new(true),
                 fail_release: std::sync::atomic::AtomicBool::new(false),
+                fail_has_retained: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn fail_next_save(&self) {
@@ -7950,6 +8508,12 @@ mod tests {
         /// fault during the checkpoint-denial continuation release.
         fn set_fail_release(&self, on: bool) {
             self.fail_release
+                .store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Inject a retention-marker inspection failure: `has_retained_terminal_rollback_claim`
+        /// errors, modelling a transient claim-store read fault during restore.
+        fn set_fail_has_retained(&self, on: bool) {
+            self.fail_has_retained
                 .store(on, std::sync::atomic::Ordering::SeqCst);
         }
         fn should_fail_save(&self) -> bool {
@@ -8080,6 +8644,14 @@ mod tests {
             Ok(())
         }
         fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+            if self
+                .fail_has_retained
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Backend(
+                    "injected retention-marker inspection failure".into(),
+                ));
+            }
             Ok(self
                 .claims
                 .lock()

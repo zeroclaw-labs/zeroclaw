@@ -31,7 +31,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine};
+pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
 pub use executor::spawn_headless_run_driver;
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
