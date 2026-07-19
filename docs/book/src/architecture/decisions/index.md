@@ -1,20 +1,16 @@
 ---
 type: architecture
 status: accepted
-last-reviewed: 2026-07-14
+last-reviewed: 2026-07-18
 relates-to:
   - docs/book/src/foundations/fnd-002-documentation-standards.md
 ---
 
 # Architecture Decision Records
 
-Architecture Decision Records (ADRs) are the durable record of
-architecture choices that constrain future ZeroClaw work. They are
-shorter than RFCs: each one records the context, decision,
-consequences, and the sources that justify the decision.
+Architecture Decision Records (ADRs) are the durable record of architecture choices that constrain future ZeroClaw work. They are shorter than RFCs: each one records the context, decision, consequences, and the sources that justify the decision.
 
-Accepted ADRs are immutable. If the architecture changes, write a new
-ADR and mark the old one as superseded rather than rewriting history.
+Accepted ADRs are immutable. If the architecture changes, write a new ADR and mark the old one as superseded rather than rewriting history.
 
 ## Current ADRs
 
@@ -25,14 +21,9 @@ ADR and mark the old one as superseded rather than rewriting history.
 | [ADR-003](./ADR-003-wasm-plugin-model.md) | superseded by [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | WASM plugins initially used Extism as the execution bridge. |
 | [ADR-004](./ADR-004-tool-shared-state-ownership.md) | accepted | Tool-held shared state follows daemon-owned identity, handle ownership, isolation, and reload rules. |
 | [ADR-005](./ADR-005-pluggable-memory-backends.md) | accepted | Memory storage uses a backend-neutral contract with SQLite as the default. |
+| [ADR-006](./ADR-006-runtime-channel-plugins.md) | proposed | Runtime plugins are the target for optional channels, with explicit capability-based native exceptions during migration. |
+| [ADR-007](./ADR-007-gateway-extraction.md) | proposed | The gateway becomes a separate optional process over a supported local IPC contract. |
 | [ADR-008](./ADR-008-goal-mode-control-plane-and-usage-accounting.md) | accepted | Goal mode uses the durable task control plane and canonical usage ledger. |
 | [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | accepted | WIT components and direct `wasmtime` replace the Extism plugin bridge. |
 
-## Planned Architecture Decisions
-
-[FND-002](../../foundations/fnd-002-documentation-standards.md) also reserves two implementation-gated roadmap decisions:
-
-- ADR-006: migration from compiled optional channels to runtime plugins
-- ADR-007: Gateway extraction as a separate optional binary
-
-ADR-009 is intentionally present because it supersedes the historical ADR-003 plugin bridge. ADR numbers do not have to be contiguous. Planned entries have no placeholder files because an ADR must contain a reviewed decision record.
+ADR-006 and ADR-007 are implementation-gated roadmap decisions from [FND-002](../../foundations/fnd-002-documentation-standards.md). Their target directions are recorded, but they remain proposed until the acceptance boundaries in each record ship.

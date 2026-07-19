@@ -802,6 +802,7 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+    /// Optional natural key used to address entries in list-backed sections.
     pub natural_key: Option<&'static str>,
     /// Whether this section's map key is a `#[resource_key]` — a value
     /// drawn from another domain (a model id, tool name, …) that may

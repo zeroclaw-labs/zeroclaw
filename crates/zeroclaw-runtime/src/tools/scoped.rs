@@ -1,4 +1,9 @@
 //! `ScopedToolRegistry` - the one gated seam that mints the per-agent tool set.
+//!
+//! Assembly applies peripherals, built-in policy, ACP memory stripping, MCP
+//! scope and policy, capability tools, pinned resources, and skills in that
+//! order. This is the intended construction path; the type boundary remains
+//! temporarily unsealed while legacy callers still accept raw tool vectors.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -465,6 +470,8 @@ impl ScopedToolRegistry {
             runtime,
         );
 
+        // Skills and deferred MCP helpers are registered after the built-in filter,
+        // so the explicit denylist must subtract once more at the final boundary.
         if let Some(excluded) = security.excluded_tools.as_deref() {
             tools_registry.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
             // The registry and prompt surfaces must move together: if `tool_search`
