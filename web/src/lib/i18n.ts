@@ -925,6 +925,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'tool_permission_grid.add_placeholder': "Add tool name not in catalog",
     'tool_permission_grid.appr_auto_title': "Auto-approve - never asks",
     'tool_permission_grid.appr_inherit_title': "Use this profile's risk-tier default",
+    'tool_permission_grid.appr_level_banner_full': "Autonomy level is Full: tools are auto-approved, so the approval settings below do not drive prompts here. They stay editable because they remain in effect on other runtime paths (for example, Always Ask still blocks independent delegation). These settings drive approval prompts only under the Supervised level.",
+    'tool_permission_grid.appr_level_banner_readonly': "Autonomy level is Read-only: nothing prompts and mutating tools are blocked, so the approval settings below do not drive prompts here. They stay editable because they remain in effect on other runtime paths (for example, Always Ask still blocks independent delegation). These settings drive approval prompts only under the Supervised level.",
     'tool_permission_grid.appr_moot_title': "Denied — approval doesn't apply",
     'tool_permission_grid.appr_wildcard_always_ask_title': "Always Ask wildcard applies; edit the * row to change this",
     'tool_permission_grid.appr_wildcard_auto_title': "Auto-approve wildcard applies; add Ask to override or edit the * row",

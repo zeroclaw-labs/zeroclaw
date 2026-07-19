@@ -41,6 +41,7 @@ import {
   applyAuthState,
   applyCustomPermission,
   applyStrictMode,
+  approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
   isAlwaysAskWildcardLocked,
@@ -48,6 +49,7 @@ import {
   realAllowedTools,
   type ApprState,
   type AuthState,
+  type AutonomyLevel,
   type CustomPermissionTarget,
   type ToolPermissionGridValue,
 } from './ToolPermissionGrid.logic';
@@ -66,6 +68,11 @@ export interface ToolPermissionGridProps {
   id?: string;
   /** Scope the tool catalog to this agent, same as ToolPicker. */
   agent?: string;
+  /** The profile's autonomy level. Under `full` / `readonly` the runtime
+   *  decides approval before consulting the per-tool lists, so the approval
+   *  column is shown locked with an explanatory tooltip instead of a state the
+   *  runtime would not honor. Defaults to `supervised` (lists are live). */
+  level?: AutonomyLevel;
 }
 
 interface Row {
@@ -80,6 +87,7 @@ export default function ToolPermissionGrid({
   disabled = false,
   id,
   agent,
+  level = 'supervised',
 }: ToolPermissionGridProps) {
   const cacheKey = agent ?? '';
   const [catalog, setCatalog] = useState<CatalogEntry[] | null>(() => peekToolCatalog(cacheKey));
@@ -194,6 +202,11 @@ export default function ToolPermissionGrid({
 
   function setApproval(name: string, next: ApprState) {
     if (disabled) return;
+    // The control stays live under full/readonly: those levels bypass approval
+    // PROMPTS, but the stored always_ask/auto_approve entries remain editable and
+    // still matter on other runtime paths (e.g. always_ask blocks independent
+    // delegation), so an operator must be able to clear them. The level effect is
+    // surfaced by the caveat banner, not by locking the row.
     if (isAlwaysAskWildcardLocked({ name, alwaysAskSet })) return;
     onChange(applyApprovalState(value, name, next));
   }
@@ -246,9 +259,29 @@ export default function ToolPermissionGrid({
   const listId = id ? `${id}-rows` : undefined;
   const customInputId = id ? `${id}-custom-tool` : undefined;
   const canAddCustom = !disabled && customName.trim().length > 0;
+  // full/readonly bypass approval PROMPTS, but the approval lists stay live
+  // (editable) because they still take effect on other runtime paths. A visible
+  // banner - not a row lock - identifies them as stored overrides.
+  const levelCaveat = approvalLevelCaveat(level);
 
   return (
     <div className="space-y-3">
+      {levelCaveat && (
+        <div
+          role="note"
+          className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 px-3 py-2 text-xs text-pc-text-secondary"
+        >
+          <AlertCircle
+            className="h-4 w-4 flex-shrink-0 text-status-warning mt-0.5"
+            aria-hidden="true"
+          />
+          <span>
+            {levelCaveat === 'full'
+              ? t('tool_permission_grid.appr_level_banner_full')
+              : t('tool_permission_grid.appr_level_banner_readonly')}
+          </span>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 justify-between">
         <div className="flex items-center gap-2 text-sm">
           <button

@@ -3,10 +3,14 @@ import test from 'node:test';
 
 import {
   APPROVAL_WILDCARD,
+  applyApprovalState,
   applyCustomPermission,
+  approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
   isMcpAutoAdmitted,
+  normalizeAutonomyLevel,
+  profileLevelFromDraft,
   type ToolPermissionGridValue,
 } from './ToolPermissionGrid.logic.ts';
 
@@ -114,6 +118,63 @@ test('approval wildcards follow runtime precedence', () => {
     }),
     'ask',
   );
+});
+
+test('full/readonly surface a caveat but keep approval overrides live and clearable', () => {
+  // full/readonly bypass approval PROMPTS, but the stored always_ask/auto_approve
+  // entries are not inert - a non-empty always_ask still refuses independent
+  // delegation with no level check - so the grid must show a caveat and keep the
+  // control live, not lock it to an "effective" value.
+  const withAlwaysAsk: ToolPermissionGridValue = {
+    allowedTools: [],
+    excludedTools: [],
+    autoApprove: [],
+    alwaysAsk: ['shell'],
+  };
+  const s = sets(withAlwaysAsk);
+
+  // The caveat fires for full/readonly, and never for supervised.
+  assert.equal(approvalLevelCaveat('full'), 'full');
+  assert.equal(approvalLevelCaveat('readonly'), 'readonly');
+  assert.equal(approvalLevelCaveat('supervised'), null);
+
+  // The control reflects the STORED entry at every level (never collapsed to an
+  // effective value that would hide what is actually configured).
+  assert.equal(
+    effectiveApprovalState({
+      name: 'shell',
+      autoApproveSet: s.autoApproveSet,
+      alwaysAskSet: s.alwaysAskSet,
+    }),
+    'ask',
+  );
+
+  // A stored always_ask entry is clearable regardless of level, so an operator is
+  // never trapped by an entry that is still load-bearing for delegation.
+  assert.deepEqual(applyApprovalState(withAlwaysAsk, 'shell', 'inherit').alwaysAsk, []);
+});
+
+test('level normalization and FieldForm draft derivation', () => {
+  assert.equal(normalizeAutonomyLevel('full'), 'full');
+  assert.equal(normalizeAutonomyLevel('readonly'), 'readonly');
+  assert.equal(normalizeAutonomyLevel('supervised'), 'supervised');
+  // Unknown / empty / unset fall back to supervised so an unreadable level never
+  // hides a real prompt state.
+  assert.equal(normalizeAutonomyLevel(''), 'supervised');
+  assert.equal(normalizeAutonomyLevel(undefined), 'supervised');
+  assert.equal(normalizeAutonomyLevel('bogus'), 'supervised');
+
+  // The grid reads the level from the parent's `.level` sibling leaf, exactly as
+  // FieldForm supplies it.
+  const draft = {
+    'risk_profiles.dev.level': 'full',
+    'risk_profiles.dev.always_ask': '["shell"]',
+    'risk_profiles.ro.level': 'readonly',
+  };
+  assert.equal(profileLevelFromDraft(draft, 'risk_profiles.dev'), 'full');
+  assert.equal(profileLevelFromDraft(draft, 'risk_profiles.ro'), 'readonly');
+  // Group with no level leaf in the draft -> supervised default.
+  assert.equal(profileLevelFromDraft(draft, 'risk_profiles.missing'), 'supervised');
 });
 
 test('custom names can be added to each permission state', () => {

@@ -5,6 +5,12 @@ export type AuthState = 'deny' | 'inherit' | 'allow';
 export type ApprState = 'ask' | 'inherit' | 'auto';
 export type CustomPermissionTarget = AuthState | ApprState;
 
+/** Profile autonomy level. Mirrors the runtime `AutonomyLevel` enum, whose
+ *  serde representation lowercases the variants (`readonly` / `supervised` /
+ *  `full`). The level takes precedence over the per-tool approval lists in the
+ *  runtime, so the grid must honor it to display the effective state. */
+export type AutonomyLevel = 'readonly' | 'supervised' | 'full';
+
 export interface ToolPermissionGridValue {
   allowedTools: string[];
   excludedTools: string[];
@@ -67,6 +73,46 @@ export function effectiveApprovalState({
   if (alwaysAskSet.has(APPROVAL_WILDCARD) || alwaysAskSet.has(name)) return 'ask';
   if (autoApproveSet.has(APPROVAL_WILDCARD) || autoApproveSet.has(name)) return 'auto';
   return 'inherit';
+}
+
+/** Normalize a raw config `level` string into a known [`AutonomyLevel`].
+ *  Unknown or empty values fall back to `supervised` - the runtime default and
+ *  the only level under which the per-tool approval lists are live, so an
+ *  unreadable level never silently hides a real prompt state. */
+export function normalizeAutonomyLevel(raw: string | null | undefined): AutonomyLevel {
+  if (raw === 'full') return 'full';
+  if (raw === 'readonly') return 'readonly';
+  return 'supervised';
+}
+
+/** Resolve the autonomy level for a permission group's grid from the config
+ *  draft. The level lives at the group parent's `.level` sibling leaf (e.g.
+ *  `risk_profiles.<alias>.level`); this is the single derivation FieldForm uses
+ *  to supply the grid's `level` prop, so the draft -> level wiring is covered by
+ *  testing this function rather than only the display helper. */
+export function profileLevelFromDraft(
+  draft: Readonly<Record<string, string>>,
+  parent: string,
+): AutonomyLevel {
+  return normalizeAutonomyLevel(draft[`${parent}.level`]);
+}
+
+/** Which autonomy level (if any) adds a caveat to the per-tool approval lists.
+ *
+ *  Under `full` / `readonly` the runtime bypasses approval PROMPTS regardless of
+ *  these lists (`full` auto-approves, `readonly` blocks mutating tools). But the
+ *  stored entries are NOT inert: they remain valid config and still take effect
+ *  on other runtime paths - for example a non-empty `always_ask` still refuses
+ *  independent delegation, with no autonomy-level check. So the grid keeps the
+ *  approval control LIVE (editable, clearable) and surfaces a caveat, rather than
+ *  locking it to an effective value - which would both overstate the level's
+ *  reach and trap an operator who needs to clear a still-load-bearing entry.
+ *
+ *  `supervised` -> no caveat (the lists are fully live and drive prompting). */
+export type ApprovalLevelCaveat = 'full' | 'readonly' | null;
+
+export function approvalLevelCaveat(level: AutonomyLevel): ApprovalLevelCaveat {
+  return level === 'supervised' ? null : level;
 }
 
 export function isAlwaysAskWildcardLocked({

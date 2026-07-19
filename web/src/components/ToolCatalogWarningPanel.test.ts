@@ -43,6 +43,10 @@ test('partial catalog warning renders source failures and retry action', async (
   assert.match(html, /Agent tools: agent catalog unavailable/);
   assert.match(html, /CLI tools: CLI catalog unavailable/);
   assert.match(html, /aria-label="Retry loading tools"/);
+  // Inserted asynchronously after the catalog settles, so it must announce to
+  // assistive tech as a polite live region.
+  assert.match(html, /role="status"/);
+  assert.match(html, /aria-live="polite"/);
 });
 
 test('partial catalog retry button can render disabled while reloading', async () => {

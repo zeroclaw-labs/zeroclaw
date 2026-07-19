@@ -23,6 +23,11 @@ export function ToolCatalogWarningPanel({
   return createElement(
     'div',
     {
+      // The panel is inserted asynchronously after the catalog settles, so it
+      // must be announced to assistive tech. `status`/`polite` (not `alert`)
+      // because a partial load is recoverable and should not interrupt.
+      role: 'status',
+      'aria-live': 'polite',
       className:
         'rounded-[var(--radius-md)] border border-status-warning/25 bg-status-warning/10 px-3 py-2 text-xs text-status-warning',
     },

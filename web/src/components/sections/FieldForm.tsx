@@ -45,6 +45,7 @@ import ToolPicker from "@/components/ToolPicker";
 import ToolPermissionGrid, {
   type ToolPermissionGridValue,
 } from "@/components/ToolPermissionGrid";
+import { profileLevelFromDraft } from "@/components/ToolPermissionGrid.logic";
 import { Badge, Button, ComboBox, Select } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
@@ -1526,6 +1527,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             <ToolPermissionGrid
               id={g.parent}
               agent={toolAgent}
+              level={profileLevelFromDraft(draft, g.parent)}
               value={{
                 allowedTools: parseArrayRows(draft[g.fields.allowed_tools.path] ?? ""),
                 excludedTools: parseArrayRows(draft[g.fields.excluded_tools.path] ?? ""),
