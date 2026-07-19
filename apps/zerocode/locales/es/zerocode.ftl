@@ -81,7 +81,6 @@ zc-zerocode-agent-theme-hint = { $assign } asignar tema   ·   { $clear } elimin
 zc-input-no-pending-attachments = No hay adjuntos pendientes.
 zc-input-no-clipboard-image = No hay ninguna imagen en el portapapeles.
 zc-input-placeholder-chat = Escribe para chatear
-zc-input-help-slash-commands = Comandos de barra
 zc-input-help-completions-navigate = Navegar completados
 zc-input-help-completions-accept = Aceptar
 zc-input-help-completions-dismiss = Descartar

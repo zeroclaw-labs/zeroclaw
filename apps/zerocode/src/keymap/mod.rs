@@ -15,13 +15,23 @@ pub mod overrides;
 pub use actions::*;
 pub use chord::Chord;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn chord_bypasses_text_input(chord: &Chord) -> bool {
+    if !matches!(chord.code, KeyCode::Char(_)) {
+        return true;
+    }
+
+    let mut modifiers = chord.modifiers;
+    modifiers.remove(KeyModifiers::SHIFT);
+    !modifiers.is_empty()
+}
 
 pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
     GlobalAction::Help
         .resolved()
         .iter()
-        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+        .any(|chord| chord_bypasses_text_input(chord) && chord.matches(event))
 }
 
 /// Uniform interface over every `keyactions!`-generated enum so generic
@@ -91,6 +101,37 @@ mod tests {
         assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
         let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(GlobalAction::from_chord(&ctrl_g), Some(GlobalAction::Help));
+    }
+
+    #[test]
+    fn help_bypass_distinguishes_text_from_command_chords() {
+        let cases = [
+            (
+                Chord::char('?'),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                false,
+            ),
+            (
+                Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                false,
+            ),
+            (
+                Chord::key(KeyCode::F(1)),
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                true,
+            ),
+            (
+                Chord::ctrl('g'),
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                true,
+            ),
+        ];
+
+        for (chord, event, expected) in cases {
+            assert!(chord.matches(&event));
+            assert_eq!(chord_bypasses_text_input(&chord), expected, "{chord:?}");
+        }
     }
 
     #[test]

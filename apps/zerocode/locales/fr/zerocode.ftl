@@ -81,7 +81,6 @@ zc-zerocode-agent-theme-hint = { $assign } assigner un thème   ·   { $clear } 
 zc-input-no-pending-attachments = Aucune pièce jointe en attente.
 zc-input-no-clipboard-image = Aucune image dans le presse-papiers.
 zc-input-placeholder-chat = Tapez pour discuter
-zc-input-help-slash-commands = Commandes slash
 zc-input-help-completions-navigate = Parcourir les complétions
 zc-input-help-completions-accept = Accepter
 zc-input-help-completions-dismiss = Ignorer

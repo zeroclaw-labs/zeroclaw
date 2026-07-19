@@ -81,7 +81,6 @@ zc-zerocode-agent-theme-hint = { $assign } テーマを割り当て   ·   { $cl
 zc-input-no-pending-attachments = 保留中の添付ファイルはありません。
 zc-input-no-clipboard-image = クリップボードに画像がありません。
 zc-input-placeholder-chat = 入力してチャット
-zc-input-help-slash-commands = スラッシュコマンド
 zc-input-help-completions-navigate = 補完を移動
 zc-input-help-completions-accept = 確定
 zc-input-help-completions-dismiss = 閉じる

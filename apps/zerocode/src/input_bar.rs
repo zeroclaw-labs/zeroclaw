@@ -2179,13 +2179,18 @@ mod tests {
         use crate::widgets::HelpContext;
         let bar = InputBarState::new();
         let node = bar.help_context();
-        let title = crate::i18n::t("zc-input-help-slash-commands");
-        assert!(
-            node.children
-                .iter()
-                .all(|c| c.title.as_deref() != Some(title.as_str())),
-            "slash commands stay in / autocomplete, not the general Help modal"
-        );
+        let listed = node
+            .entries
+            .iter()
+            .chain(node.children.iter().flat_map(|child| child.entries.iter()))
+            .map(|entry| entry.key_str())
+            .collect::<Vec<_>>();
+        for command in SLASH_COMMANDS {
+            assert!(
+                !listed.iter().any(|key| key == command),
+                "{command} stays in autocomplete, not the general Help modal"
+            );
+        }
     }
 
     #[test]

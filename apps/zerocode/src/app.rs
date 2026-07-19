@@ -614,9 +614,8 @@ pub async fn run(
                     continue;
                 }
 
-                let help_bypasses_text_input = crate::keymap::help_bypasses_text_input(&key);
                 if global == Some(GlobalAction::Help)
-                    && (!in_text_input || help_bypasses_text_input)
+                    && (!in_text_input || crate::keymap::help_bypasses_text_input(&key))
                 {
                     show_help = true;
                     continue;
@@ -1271,18 +1270,14 @@ mod tests {
 
     #[test]
     fn global_help_entries_include_live_help_binding() {
-        use crate::keymap::{GlobalAction, RebindableActions};
+        use crate::keymap::{GlobalAction, action_key_labels};
 
         let entries = global_help_entries();
         let help = entries
             .iter()
             .find(|entry| entry.action == crate::i18n::t("zc-app-help-help"))
             .expect("global Help section should include its own opening binding");
-        let expected: Vec<String> = GlobalAction::Help
-            .resolved()
-            .iter()
-            .map(crate::keymap::Chord::display)
-            .collect();
+        let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
     }

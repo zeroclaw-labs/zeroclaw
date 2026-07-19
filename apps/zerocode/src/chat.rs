@@ -1426,9 +1426,7 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::EnterBrowseMode => {
-                    if !state.in_browse_mode() {
-                        state.enter_browse_mode();
-                    }
+                    state.enter_browse_mode();
                     return false;
                 }
                 InputBarAction::OpenHelp => {
