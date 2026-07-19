@@ -1,5 +1,4 @@
 //! Firejail sandbox (Linux user-space sandboxing)
-//!
 //! Firejail is a SUID sandbox program that Linux applications use to sandbox themselves.
 
 use crate::security::traits::Sandbox;

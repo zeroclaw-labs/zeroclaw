@@ -1,5 +1,4 @@
 //! Audit logging for security events
-//!
 //! Each audit entry is chained via a Merkle hash: `entry_hash = SHA-256(prev_hash || canonical_json)`.
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
@@ -74,13 +73,6 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
-    /// Owning agent's alias. `None` on system-level events (boot,
-    /// migration, scheduler ticks not bound to any specific agent) and
-    /// on legacy entries written before the field existed. Audit
-    /// storage stays at `<install>/audit/` (global, not per-agent), so
-    /// an agent delete does NOT remove its prior audit trail; this
-    /// field lets queries reconstruct per-agent activity after the
-    /// fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
 
@@ -188,10 +180,6 @@ impl AuditEvent {
     }
 }
 
-/// Compute the SHA-256 entry hash: `H(prev_hash || content_json)`.
-///
-/// `content_json` is the canonical JSON of the event *without* the chain fields
-/// (`sequence`, `prev_hash`, `entry_hash`), so the hash covers only the payload.
 fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
     // Build a canonical representation of the content fields only.
     let content = serde_json::json!({
@@ -222,8 +210,6 @@ struct ChainState {
 pub struct AuditLogger {
     log_path: PathBuf,
     config: AuditConfig,
-    #[allow(dead_code)] // WIP: buffered writes for batch flushing
-    buffer: Mutex<Vec<AuditEvent>>,
     chain: Mutex<ChainState>,
     /// Signing key (loaded once at construction time if sign_events enabled)
     signing_key: Option<Vec<u8>>,
@@ -242,13 +228,6 @@ pub struct CommandExecutionLog<'a> {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger.
-    ///
-    /// If the log file already exists, the chain state is recovered from the last
-    /// entry so that new writes continue the existing hash chain.
-    ///
-    /// If `config.sign_events` is true, requires `ZEROCLAW_AUDIT_SIGNING_KEY` env var
-    /// to be set with a hex-encoded 32-byte key. Fails if key is missing or invalid.
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         // Load and validate signing key if sign_events enabled
         let signing_key = if config.sign_events {
@@ -307,7 +286,6 @@ impl AuditLogger {
         Ok(Self {
             log_path,
             config,
-            buffer: Mutex::new(Vec::new()),
             chain: Mutex::new(chain_state),
             signing_key,
         })
@@ -438,7 +416,6 @@ impl AuditLogger {
 }
 
 /// Recover chain state from an existing log file.
-///
 /// Returns the genesis state if the file does not exist or is empty.
 fn recover_chain_state(log_path: &Path) -> ChainState {
     let file = match std::fs::File::open(log_path) {
@@ -471,16 +448,6 @@ fn recover_chain_state(log_path: &Path) -> ChainState {
     }
 }
 
-/// Verify the integrity of an audit log's Merkle hash chain.
-///
-/// Reads every entry from the log file and checks:
-/// - Each `entry_hash` matches the recomputed `SHA-256(prev_hash || content)`.
-/// - `prev_hash` links to the preceding entry (or the genesis seed for the first).
-/// - Sequence numbers are contiguous starting from 0.
-/// - If a record has a `signature` field and `ZEROCLAW_AUDIT_SIGNING_KEY` is available,
-///   verifies the HMAC-SHA256 signature over `entry_hash`.
-///
-/// Returns `Ok(entry_count)` on success, or an error describing the first violation.
 pub fn verify_chain(log_path: &Path) -> Result<u64> {
     let file = std::fs::File::open(log_path)?;
     let reader = BufReader::new(file);
@@ -1117,8 +1084,6 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: a non-UTF-8 signing key must be rejected without echoing the
-    /// raw value back to the operator or into structured logs (#8591).
     #[cfg(unix)]
     #[test]
     fn constructor_fails_if_signing_key_not_unicode_and_does_not_leak_value() -> Result<()> {

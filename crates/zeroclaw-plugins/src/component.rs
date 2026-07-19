@@ -1,8 +1,4 @@
 //! Shared wasmtime component-model plumbing for all plugin worlds.
-//!
-//! One async-enabled engine, one store state carrying the host imports, and the
-//! per-world linker wiring. Tool plugins use a fresh store per call; channel and
-//! memory plugins hold a warm store guarded by an async mutex.
 
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -16,12 +12,6 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
 
-/// A host-owned queue of inbound messages destined for a channel plugin.
-///
-/// The host runs the listener (webhook server, vendor tunnel, polling client)
-/// and pushes each received message in; the plugin drains it from the imported
-/// `inbound` interface. Cloning shares the same underlying queue, so a listener
-/// task can hold one handle while the plugin's store holds another.
 #[derive(Clone, Default)]
 pub struct InboundQueue {
     inner: Arc<Mutex<VecDeque<HostInboundMessage>>>,
@@ -107,11 +97,6 @@ pub mod bindings {
     }
 }
 
-/// Per-store host state. Carries a sandboxed WASI context (no preopens, no
-/// network) so Rust-compiled wasip2 components instantiate, plus the resource
-/// table WASI requires. Outbound HTTP is present only when the plugin's manifest
-/// grants `HttpClient`; otherwise `http` is `None` and `wasi:http` is never
-/// linked, so the component cannot reach the network at all.
 pub struct PluginState {
     wasi: WasiCtx,
     table: ResourceTable,
@@ -122,12 +107,6 @@ pub struct PluginState {
 }
 
 impl PluginState {
-    /// Build store state for a plugin holding `permissions` under `limits`.
-    /// `HttpClient` is the only permission that widens the host surface here: it
-    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
-    /// Every other permission resolves elsewhere (config jail, memory bridge)
-    /// and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
-    /// the memory/table/instance ceilings the store limiter enforces.
     pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
         Self::with_inbound(permissions, InboundQueue::default(), limits)
     }
@@ -210,14 +189,6 @@ pub fn add_wasi_http(linker: &mut wasmtime::component::Linker<PluginState>) -> R
     )
 }
 
-/// Assert that a store and the linker chosen for it agree on the `wasi:http`
-/// surface before instantiation. The store carries a `WasiHttpCtx` only when
-/// its manifest granted `HttpClient`; `linker_has_http` is whether the linker
-/// picked for it wired `wasi:http`. A registration path that pairs an
-/// http-linked linker with a store lacking the context (or the reverse) gets a
-/// named startup error here instead of a `WasiHttpView::http` panic at the
-/// first outbound call, so a misconfigured wiring cannot crash a live task and
-/// cannot silently link a surface the store cannot back.
 pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -> Result<()> {
     let store_has_http = store.data().http_enabled();
     if store_has_http != linker_has_http {

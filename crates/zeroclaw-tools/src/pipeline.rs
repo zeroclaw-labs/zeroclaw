@@ -1,9 +1,3 @@
-// Pipeline tool: collapses multi-step tool chains into a single inference call.
-//
-// The agent invokes `execute_pipeline` with a JSON payload describing steps,
-// and this tool executes them sequentially (or in parallel) with result
-// interpolation between steps.
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -329,7 +323,6 @@ impl Tool for PipelineTool {
 }
 
 /// Interpolate `{{step[N].result}}` references in tool arguments.
-///
 /// Single-pass replacement: values containing `{{` after substitution are stripped
 /// to prevent injection.
 pub fn interpolate_args(

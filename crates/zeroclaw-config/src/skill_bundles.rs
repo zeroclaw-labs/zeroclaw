@@ -1,14 +1,4 @@
 //! Skill-bundle directory rules and helpers.
-//!
-//! Single source of truth for:
-//! - the `shared/skills/<alias>/` default
-//! - the inside-`shared/` containment rule
-//! - the per-config uniqueness rule
-//!
-//! Lives in `zeroclaw-config` (not `zeroclaw-runtime/skills/bundle.rs`) so
-//! [`crate::schema::Config::validate`] can call into it at load time.
-//! Runtime's `bundle.rs` re-exports these functions; there is no second
-//! implementation.
 
 use std::path::{Path, PathBuf};
 

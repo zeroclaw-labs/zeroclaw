@@ -900,6 +900,15 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Web 仪表盘重启提示 — 应用内升级后显示的 RestartInfo.hint（PR #8173）──
+# 前四个是按原样展示的 shell 命令模板，不作翻译。
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = 重启 `zeroclaw daemon` 进程
+
 cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
 cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
@@ -914,3 +923,7 @@ cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
 cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
 cli-doctor-ctxwin-none = 无需更新。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
