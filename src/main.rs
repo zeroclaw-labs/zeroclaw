@@ -243,7 +243,9 @@ where
 }
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
-    let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    let t: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid temperature '{s}': {e}"))?;
     config::schema::validate_temperature(t)
 }
 
