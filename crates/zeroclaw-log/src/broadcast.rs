@@ -1,13 +1,4 @@
 //! Process-wide broadcast channel for the canonical log stream.
-//!
-//! The gateway installs a [`tokio::sync::broadcast::Sender<Value>`] here at
-//! startup; every event passing through [`crate::record_event`] is fanned
-//! out to that channel so SSE clients (and any other in-process subscriber)
-//! see the live stream.
-//!
-//! Lives in this crate, not in zeroclaw-runtime, so the dependency graph
-//! stays clean: zeroclaw-api → zeroclaw-config → zeroclaw-log → everything
-//! else.
 
 use std::sync::OnceLock;
 
@@ -51,12 +42,6 @@ pub fn subscribe() -> Option<broadcast::Receiver<Value>> {
     slot().read().as_ref().map(|s| s.subscribe())
 }
 
-/// Test-only convenience: ensure a broadcast hook is installed and
-/// return a receiver. If no hook is set yet, install one with a 64K
-/// ring buffer (large enough that parallel workspace tests firing
-/// `record!` into the global hook can't evict the test's own event
-/// during the short window between emit and receive) and subscribe.
-/// Idempotent.
 #[doc(hidden)]
 #[must_use]
 pub fn subscribe_or_install() -> broadcast::Receiver<Value> {
@@ -71,13 +56,6 @@ pub fn subscribe_or_install() -> broadcast::Receiver<Value> {
     rx
 }
 
-/// Shared test lock guarding mutation of the global broadcast hook. Every
-/// test that installs, clears, or subscribes-then-records against the global
-/// hook must hold this so a parallel test cannot clear the hook mid-flight and
-/// drop another test's event. Lives at module scope (not inside `mod tests`)
-/// so sibling modules (e.g. `layer::e2e_tests`) acquire the SAME lock.
-/// Always compiled (not gated behind `#[cfg(test)]`) so peer crates can
-/// borrow it via the `__private_test_hook_lock` helper in `lib.rs`.
 pub(crate) static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]

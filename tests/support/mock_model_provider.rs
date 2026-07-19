@@ -135,7 +135,6 @@ impl ::zeroclaw_api::attribution::Attributable for RecordingModelProvider {
 }
 
 /// ModelProvider that replays responses from an `LlmTrace` fixture.
-///
 /// Each call to `chat()` returns the next step from the trace in FIFO order.
 /// If the agent calls the model_provider more times than there are steps, an error is returned.
 pub struct TraceLlmModelProvider {

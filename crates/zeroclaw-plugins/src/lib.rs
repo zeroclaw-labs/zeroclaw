@@ -1,5 +1,4 @@
 //! WASM plugin system for ZeroClaw.
-//!
 //! Plugins are WebAssembly components loaded via wasmtime that can extend
 //! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 

@@ -1,17 +1,4 @@
-//! Per-alias webhook routing helpers (#6312).
-//!
-//! Inbound channel webhooks historically resolved their channel instance with
-//! `config.channels.<type>.values().next()`, so a multi-instance config (e.g.
-//! `whatsapp.work` + `whatsapp.personal`) only ever delivered traffic to the
-//! first instance. This module adds path-based routing: `/<type>/{alias}`
-//! resolves to the matching instance, while the bare `/<type>` path keeps
-//! working as a deprecated fallback that resolves to a single, deterministic
-//! instance (the lexicographically-first alias) and tags the response with
-//! [`DEPRECATION_HEADER`].
-//!
-//! Channel handlers store their instances (and any per-instance signing
-//! secrets) in `AppState` as `HashMap<String, _>` keyed by alias and call
-//! [`resolve`] with the optional `<alias>` captured from the request path.
+//! Per-alias webhook routing helpers
 
 use std::collections::HashMap;
 
@@ -64,17 +51,6 @@ impl<'a, T> Resolved<'a, T> {
     }
 }
 
-/// Resolve an optional path `<alias>` against a map of channel instances.
-///
-/// - `Some(alias)` → exact lookup: [`Resolved::Alias`] or [`Resolved::NotFound`].
-/// - `None` (bare path) → lexicographically-first configured instance as
-///   [`Resolved::Fallback`], or [`Resolved::NotFound`] when nothing is configured.
-///
-/// `HashMap` has no stable iteration order, so the bare-path fallback selects the
-/// lexicographically-smallest alias rather than an arbitrary one. This keeps the
-/// deprecated fallback deterministic across process restarts even for
-/// multi-instance configs. Single-instance configs are trivially stable (the map
-/// holds exactly one entry) and behave as before.
 pub fn resolve<'a, T>(map: &'a HashMap<String, T>, alias: Option<&str>) -> Resolved<'a, T> {
     match alias {
         Some(alias) => match map.get_key_value(alias) {

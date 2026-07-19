@@ -1,9 +1,4 @@
 //! Browser automation tool with pluggable backends.
-//!
-//! By default this uses Vercel's `agent-browser` CLI for automation.
-//! Optionally, a Rust-native backend can be enabled at build time via
-//! `--features browser-native` and selected through config.
-//! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use crate::helpers::domain_guard;
 use anyhow::Context;
@@ -456,21 +451,6 @@ impl BrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        // Parse with `reqwest::Url` (re-exported `url` crate, the Rust de-facto
-        // standard URL parser) instead of hand-rolling authority/host
-        // extraction. Reviewer caught two parser-mismatch bypasses against the
-        // prior hand-rolled `extract_host`:
-        //
-        //   1. `http://example.com@127.0.0.1/` — userinfo `example.com@…`
-        //      classified as host, browser navigates to loopback.
-        //   2. `http://127.0.0.1?x` / `http://127.0.0.1#x` — no `/` before the
-        //      query/fragment, so `127.0.0.1?x` classified as host, not
-        //      private, browser still navigates to loopback.
-        //
-        // Both classes vanish once we use the same parser the browser backend
-        // ultimately resolves against. This also aligns the `browser` SSRF
-        // gate with `http_request.rs`, `domain_guard.rs`, and the existing
-        // `reqwest::Url::parse` calls already in this file.
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
 
@@ -489,12 +469,6 @@ impl BrowserTool {
             .host_str()
             .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
-        // Re-add IPv6 brackets so the host string fed to `is_private_or_local_host`
-        // and `host_matches_allowlist` matches the shape used elsewhere in this
-        // crate (`[::1]`, `[fe80::1]`). `Url::host_str` strips the brackets for
-        // IPv6 literals. We detect IPv6 by parsing the bracket-less form as an
-        // `IpAddr` — avoids depending on `url::Host` (only `url::Url` is
-        // re-exported via `reqwest`).
         let is_ipv6 = host_str.parse::<std::net::Ipv6Addr>().is_ok();
         let host = if is_ipv6 {
             format!("[{host_str}]")
@@ -2914,16 +2888,6 @@ mod tests {
         assert!(err.contains("allowed_domains"));
     }
 
-    // ── userinfo SSRF regression tests ──────────────────────────
-    //
-    // `extract_host` is a hand-rolled prefix-strip and does NOT parse `@`
-    // userinfo. Without an explicit reject, a URL like
-    // `http://example.com@127.0.0.1/` is classified by its `example.com@…`
-    // host string (which satisfies the default `["*"]` public allowlist)
-    // while the browser backend actually navigates to `127.0.0.1`. Pin both
-    // the public-wildcard case and the private-wildcard case so neither
-    // allowlist surface can be used to smuggle a private destination.
-
     #[test]
     fn userinfo_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
         // Default-shipped posture: allowed_domains = ["*"], no private
@@ -2960,15 +2924,6 @@ mod tests {
             .to_string();
         assert!(err.contains("userinfo"), "got: {err}");
     }
-
-    // Regression: a URL with no slash before the query or fragment — e.g.
-    // `http://127.0.0.1?x` — must still classify the host as `127.0.0.1`,
-    // not `127.0.0.1?x`. The pre-fix hand-rolled `extract_host` only split
-    // the authority on `/`, so under the default `allowed_domains = ["*"]`
-    // posture this string slipped past the SSRF gate while the browser
-    // backend still navigated to loopback. Both `?` and `#` are now handled
-    // correctly because `validate_url` parses with `reqwest::Url` (the `url`
-    // crate), the same parser the browser backend resolves against.
 
     #[test]
     fn query_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
