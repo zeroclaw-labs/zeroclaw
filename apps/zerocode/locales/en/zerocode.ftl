@@ -172,6 +172,15 @@ zc-dashboard-memory-not-configured = Memory is not configured yet. Use Quickstar
 zc-dashboard-search-action-apply = apply
 zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
+zc-dashboard-agent-rename-action-apply = rename
+zc-dashboard-agent-rename-action-cancel = cancel
+zc-dashboard-agent-rename-hint = rename
+zc-dashboard-agent-rename-prefix = rename:
+zc-dashboard-agent-rename-empty = Agent name cannot be empty
+zc-dashboard-agent-rename-unchanged = Agent name unchanged
+zc-dashboard-agent-rename-success = Renamed { $from } to { $to }
+zc-dashboard-agent-rename-success-warnings = Renamed { $from } to { $to } with warnings: { $warnings }
+zc-dashboard-agent-rename-failed = Rename failed: { $error }
 
 zc-dashboard-label-connected = Connected
 zc-dashboard-label-server = Server
@@ -264,7 +273,6 @@ zc-dashboard-run-pending-status = running
 zc-dashboard-run-pending-window = starting now
 zc-dashboard-run-pending-output = Manual trigger in progress…
 
-
 zc-dashboard-yes = yes
 zc-dashboard-no = no
 zc-dashboard-enabled = enabled
@@ -296,6 +304,8 @@ zc-quickstart-risk-yolo-desc = Full autonomy. No approval gates. Use on disposab
 
 zc-quickstart-runtime-tight = Tight
 zc-quickstart-runtime-tight-desc = Low ceilings on iterations and tokens.
+zc-quickstart-runtime-local-small = Local Small
+zc-quickstart-runtime-local-small-desc = Compact limits for smaller local models with structured tool calls.
 zc-quickstart-runtime-balanced = Balanced
 zc-quickstart-runtime-balanced-desc = Sensible ceilings. Recommended.
 zc-quickstart-runtime-unbounded = Unbounded

@@ -1,22 +1,5 @@
 #![allow(clippy::to_string_in_format_args)]
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
-//!
-//! ## Reserved Key Prefixes
-//!
-//! The following key prefixes are reserved for the auto-save system. Any memory
-//! stored under these keys will be **excluded from context assembly** by the
-//! engine's unified memory-context renderer (`agent::memory_inject` in
-//! `zeroclaw-runtime`), which applies this skip set on every injection path.
-//! Do not use these prefixes for semantic memories that should surface in
-//! agent context.
-//!
-//! | Prefix | Purpose | Detection function |
-//! |---|---|---|
-//! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
-//! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
-//!
-//! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
-//! **not** filtered — they use different prefixes and are handled separately.
 
 /// Opening delimiter for recalled memory injected into provider context.
 pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
@@ -138,11 +121,6 @@ where
             Ok(Box::new(LucidMemory::new("lucid", workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => {
-            // Postgres requires a typed `[storage.postgres.<alias>]` config, which this
-            // builder-only entry point does not receive. All supported call paths go
-            // through `create_memory_with_storage_and_routes`, which handles postgres via
-            // an early return. Fail loudly if a caller ever reaches this arm, rather than
-            // pretending to work with default configs that can never connect.
             anyhow::bail!(
                 "postgres backend requires storage config; \
                  call create_memory_with_storage_and_routes instead of create_memory_with_builders"
@@ -176,11 +154,6 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
-/// Auto-save key used for raw user messages captured per-turn.
-/// Re-injecting these into the memory-context preamble causes exponential
-/// bloat: each recalled entry contains prior generations' context verbatim,
-/// growing unboundedly; the engine's memory-context skip set filters them.
-/// Consolidated knowledge is already promoted to Core/Daily entries.
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "user_msg" || normalized.starts_with("user_msg_")
@@ -226,11 +199,6 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
-/// Embedding provider settings resolved from the canonical config, returned to
-/// callers that need to rebuild an embedder after a provider profile changes at
-/// runtime (`config/set`) — e.g. the runtime's memory-embedder refresh hook for
-/// #8359. `model_provider` is the literal factory input
-/// (`openai` / `openrouter` / `custom:<url>` / `none`), not a dotted catalog ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingSettings {
     pub model_provider: String,
@@ -239,13 +207,6 @@ pub struct EmbeddingSettings {
     pub api_key: Option<String>,
 }
 
-/// Resolve the embedding settings a memory backend would use right now, from
-/// the live `[memory]` config, `[[embedding_routes]]`, and provider catalog.
-///
-/// This mirrors the resolution performed when the backend is first constructed
-/// (dotted `<type>.<alias>` refs → concrete endpoint/key), so a long-lived
-/// memory handle can be refreshed after a `config/set` provider-profile change
-/// without a daemon restart. Pair with [`Memory::refresh_embedder`].
 pub fn resolve_embedding_settings(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -267,14 +228,6 @@ fn resolve_embedding_config(
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> ResolvedEmbeddingConfig {
-    // Key resolution precedence (highest first):
-    //   1. per-route `api_key` override (routed branch) / `[memory].embedding_api_key` (base branch)
-    //   2. the referenced provider profile's own key, when `model_provider`
-    //      is a dotted `<type>.<alias>` catalog ref (resolved in `resolve_provider_ref`)
-    //   3. the seed model provider's key, inherited via `api_key`
-    // (1)/(2) let embeddings keep their own credential when the chat model runs
-    // on a provider that carries no usable embedding key; (3) preserves the
-    // prior behavior verbatim when neither override nor a catalog ref applies.
     let inherited_api_key = api_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -351,35 +304,6 @@ fn resolve_embedding_config(
     )
 }
 
-/// Finalize an embedding profile, resolving a dotted `<type>.<alias>`
-/// `model_provider` reference against the canonical `providers.models`
-/// catalog.
-///
-/// The embeddings factory ([`embeddings::create_embedding_provider`]) only
-/// understands the literal providers `openai`, `openrouter`, and
-/// `custom:<base_url>`. An `[[embedding_routes]]` entry, however, points at a
-/// configured provider profile by dotted reference (e.g. `openai.default`),
-/// which passes config validation but matches none of those arms — so without
-/// this step it would silently fall through to [`embeddings::NoopEmbedding`]
-/// and degrade retrieval to keyword-only (issue #7949).
-///
-/// Resolution maps the dotted ref to the referenced profile's concrete
-/// endpoint and key:
-///   - an explicit `uri` override becomes `custom:<uri>`;
-///   - with no `uri`, an `openai` / `openrouter` family passes through so the
-///     factory applies its built-in family default endpoint.
-///
-/// Non-dotted providers (`openai`, `openrouter`, `custom:<url>`, `none`, or any
-/// empty/literal value) are returned unchanged. A dotted ref is logged loudly
-/// and left unresolved — never silently degraded — when it cannot be resolved
-/// (no catalog, or missing from `providers.models`) OR when it resolves to a
-/// family with no usable embeddings endpoint (a non-`openai`/`openrouter`
-/// family configured without a `uri`).
-///
-/// Key precedence: `explicit_api_key` (per-route / `[memory]` override) wins,
-/// then the referenced profile's own key, then `inherited_api_key` (the chat
-/// seed key). No provider state is cached: the key and endpoint are read from
-/// the live catalog on each call.
 fn resolve_provider_ref(
     model_provider: String,
     model: String,
@@ -429,14 +353,6 @@ fn resolve_provider_ref(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    // Map the resolved profile to a form the embeddings factory understands.
-    // An explicit `uri` becomes `custom:<uri>` (works for any OpenAI-compatible
-    // endpoint). With no `uri`, only `openai` / `openrouter` have a built-in
-    // default endpoint in the factory; any other resolved family has no
-    // embeddings endpoint to hit, so we must NOT pass its bare name through —
-    // that would silently fall back to `NoopEmbedding`. Report it loudly
-    // instead, leaving the reference unresolved (keyword-only), so a configured
-    // route never degrades in silence (issue #7949).
     let concrete_provider = match provider_cfg
         .uri
         .as_deref()
@@ -477,13 +393,6 @@ fn resolve_provider_ref(
     }
 }
 
-/// Factory: create the right memory backend from config
-///
-/// Passes no provider catalog, so a dotted `<type>.<alias>` embedding provider
-/// reference cannot be resolved through this entrypoint — callers that wire
-/// `[[embedding_routes]]` should use
-/// [`create_memory_with_storage_and_routes`] with the live
-/// `providers.models` catalog instead.
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
@@ -499,19 +408,6 @@ pub fn create_memory(
     )
 }
 
-/// Factory: create memory with a resolved active storage backend and embedding routes.
-///
-/// Pass [`ActiveStorage::None`] when no typed storage config is needed (sqlite,
-/// markdown, lucid, none — all infer settings from the workspace). Postgres and
-/// Qdrant require their typed variants and will error if the wrong variant is
-/// supplied.
-///
-/// `providers` is the canonical `providers.models` catalog, used to resolve a
-/// dotted `<type>.<alias>` embedding `model_provider` reference (from
-/// `[[embedding_routes]]` or `[memory].embedding_provider`) to a concrete
-/// endpoint + key. Pass `None` only when no catalog is available (e.g. the
-/// bare [`create_memory`] entrypoint); dotted refs then stay unresolved and
-/// are logged rather than silently disabled.
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -617,11 +513,6 @@ pub fn create_memory_with_storage_and_routes(
             config.search_mode.clone(),
         )?;
 
-        // Identity reconciliation is lifecycle policy, kept out of the
-        // backend per the #6850 storage/policy boundary. Skipped without a
-        // real embedder so keyword-only setups stay byte-identical: a
-        // temporarily unresolved provider (NoopEmbedding) must not be
-        // mistaken for an identity change and wipe valid vectors.
         if has_embedder {
             reconcile_embedding_identity(
                 &mem,
@@ -725,24 +616,6 @@ enum EmbeddingIdentityOutcome {
     Failed,
 }
 
-/// Compare the embedding identity recorded in the store against the one the
-/// current config resolves to, and auto-migrate on mismatch (issue #7948).
-///
-/// Policy (this fn) is deliberately separate from the storage primitives on
-/// [`SqliteMemory`], following the #6850 storage/lifecycle boundary:
-///
-/// - no identity recorded → adopt the current one silently (a pre-existing
-///   store's vectors were produced by an unknown embedder; wiping them on
-///   upgrade would surprise operators, and recall behavior is unchanged);
-/// - identical → no-op;
-/// - mismatch → invalidate vectors + clear the embedding cache (lossless,
-///   zero API calls — `content` is retained on every row) and warn. The
-///   expensive re-embed is gated: run `zeroclaw memory reindex`, or set
-///   `[memory] auto_reindex_on_identity_change = true` to have it kicked
-///   off in the background here.
-///
-/// Errors are logged, not propagated: a reconcile failure must not take
-/// memory (or the daemon) down with it.
 fn reconcile_embedding_identity(
     mem: &SqliteMemory,
     current: &embeddings::EmbeddingIdentity,
@@ -872,19 +745,6 @@ pub fn create_memory_for_migration(
     )
 }
 
-/// Build the per-agent memory wrapper for `agent_alias`.
-///
-/// Wraps the appropriate inner backend with `AgentScopedMemory` (for
-/// SQL- and Qdrant-backed agents — single shared backend, agent_id
-/// column distinguishes rows) or `AgentScopedMarkdownMemory` (for
-/// Markdown-backed agents — per-agent dirs, peer set composed from
-/// the resolved `read_memory_from` allowlist). `NoneMemory` agents
-/// pass through unwrapped.
-///
-/// Cross-backend allowlist entries are rejected at config load, so by
-/// the time we get here every entry on
-/// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
-/// at a sibling on the same backend kind.
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -920,12 +780,6 @@ pub async fn create_memory_for_agent(
         return Ok(Arc::new(NoneMemory::new("none")));
     }
 
-    // SQL / Qdrant / Lucid: single install-wide backend; the
-    // agent_id column (or payload field) carries the per-agent
-    // attribution. We synthesize the inner backend from the existing
-    // install-wide factory using the install workspace_dir, then wrap
-    // with AgentScopedMemory holding the agent's UUID + resolved
-    // allowlist UUIDs.
     let inner = create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
@@ -936,13 +790,6 @@ pub async fn create_memory_for_agent(
     )?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
-    // Resolve the bound agent's identifier + the allowlist
-    // identifiers via the trait method `ensure_agent_uuid`. SQL
-    // backends override to look up agents-table UUIDs; Markdown,
-    // Qdrant, None use the trait default that returns the alias
-    // verbatim (alias-keyed; no UUID indirection at the storage
-    // layer). The factory is therefore backend-agnostic past the
-    // Markdown branch above.
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
     let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
     for peer in &agent_cfg.workspace.read_memory_from {
@@ -1006,7 +853,7 @@ mod tests {
         assert_eq!(mem.name(), "sqlite");
     }
 
-    // ── Embedding identity reconciliation policy (issue #7948) ────
+    // ── Embedding identity reconciliation policy────
 
     /// Embedder returning fixed vectors so store() persists real embeddings.
     struct StaticEmbedding(usize);
@@ -1392,7 +1239,7 @@ mod tests {
 
     #[test]
     fn resolve_embedding_settings_exposes_resolved_values_for_runtime_refresh() {
-        // The public runtime entry point (#8359) must surface the same resolved
+        // The public runtime entry pointmust surface the same resolved
         // literal provider/model/dims/key the constructor would use.
         let cfg = MemoryConfig {
             embedding_provider: "openai".into(),
@@ -1645,7 +1492,7 @@ mod tests {
             resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"), Some(&providers));
 
         // The dotted `<type>.<alias>` ref resolves to the referenced profile's
-        // concrete endpoint + key — not a silent NoopEmbedding (issue #7949).
+        // concrete endpoint + key — not a silent NoopEmbedding
         // The provider's own key beats the inherited chat-provider key.
         assert_eq!(
             resolved,
@@ -1861,11 +1708,6 @@ mod tests {
         assert_eq!(embedder.name(), "openai");
     }
 
-    /// The "not silent" contract is the WARN itself: a resolved-but-unusable
-    /// route must emit an operator-visible, structured diagnostic. Asserting
-    /// only the keyword-only fallback (as the sibling test does) would stay
-    /// green if the WARN were deleted — so capture the broadcast event and
-    /// assert its severity + stable `error_key`.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_embedding_config_no_endpoint_emits_loud_warning() {

@@ -1,15 +1,4 @@
 //! UF2 flashing support — detect BOOTSEL-mode Pico and deploy firmware.
-//!
-//! # Workflow
-//! 1. [`find_rpi_rp2_mount`] — check well-known mount points for the RPI-RP2 volume
-//!    that appears when a Pico is held in BOOTSEL mode.
-//! 2. [`ensure_firmware_dir`] — extract the bundled UF2 to
-//!    `~/.zeroclaw/firmware/pico/` if it isn't there yet.
-//! 3. [`flash_uf2`] — copy the UF2 to the mount point; the Pico reboots automatically.
-//!
-//! # Embedded assets
-//! The UF2 firmware is compiled into the binary with `include_bytes!` so
-//! users never need to download it separately.
 
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
@@ -27,11 +16,6 @@ const UF2_MAGIC1: [u8; 4] = [0x55, 0x46, 0x32, 0x0A];
 
 // ── Volume detection ──────────────────────────────────────────────────────────
 
-/// Find the RPI-RP2 mount point if a Pico is connected in BOOTSEL mode.
-///
-/// Checks:
-/// - macOS:  `/Volumes/RPI-RP2`
-/// - Linux:  `/media/*/RPI-RP2` and `/run/media/*/RPI-RP2`
 pub fn find_rpi_rp2_mount() -> Option<PathBuf> {
     // macOS
     let mac = PathBuf::from("/Volumes/RPI-RP2");
@@ -56,12 +40,6 @@ pub fn find_rpi_rp2_mount() -> Option<PathBuf> {
 
 // ── Firmware directory management ─────────────────────────────────────────────
 
-/// Ensure `~/.zeroclaw/firmware/pico/` exists and contains the bundled assets.
-///
-/// Files are only written if they are absent — existing files are never overwritten
-/// so users can substitute their own firmware.
-///
-/// Returns the firmware directory path.
 pub fn ensure_firmware_dir() -> Result<PathBuf> {
     use directories::BaseDirs;
 
@@ -106,16 +84,6 @@ pub fn ensure_firmware_dir() -> Result<PathBuf> {
 
 // ── Flashing ──────────────────────────────────────────────────────────────────
 
-/// Copy the UF2 file to the RPI-RP2 mount point.
-///
-/// macOS often returns "Operation not permitted" for `std::fs::copy` on FAT
-/// volumes presented by BOOTSEL-mode Picos.  We try four approaches in order
-/// and return a clear manual-fallback message if all fail:
-///
-/// 1. `std::fs::copy`  — fast, no subprocess; works on most Linux setups.
-/// 2. `cp <src> <dst>` — bypasses some macOS VFS permission layers.
-/// 3. `sudo cp …`      — escalates for locked volumes.
-/// 4. Error — instructs the user to run the `sudo cp` manually.
 pub async fn flash_uf2(mount_point: &Path, firmware_dir: &Path) -> Result<()> {
     let uf2_src = firmware_dir.join("zeroclaw-pico.uf2");
     let uf2_dst = mount_point.join("firmware.uf2");
@@ -286,7 +254,6 @@ pub async fn flash_uf2(mount_point: &Path, firmware_dir: &Path) -> Result<()> {
 }
 
 /// Wait for `/dev/cu.usbmodem*` (macOS) or `/dev/ttyACM*` (Linux) to appear.
-///
 /// Polls every `interval` for up to `timeout`. Returns the first matching path
 /// found, or `None` if the deadline expires.
 pub async fn wait_for_serial_port(

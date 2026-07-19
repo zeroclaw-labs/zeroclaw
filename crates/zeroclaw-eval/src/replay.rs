@@ -1,5 +1,4 @@
 //! A [`ModelProvider`] that replays scripted LLM responses from an [`LlmTrace`].
-//!
 //! Promoted from the test-only trace-replay helper so the same deterministic
 //! engine backs both the shipped `zeroclaw eval` command and the test suite.
 
@@ -20,20 +19,6 @@ struct ReplayState {
     current: usize,
 }
 
-/// Replays the steps of an [`LlmTrace`], scoped to one conversation turn at a time.
-///
-/// Each call to [`ModelProvider::chat`] returns the next scripted step **of the
-/// current turn**. Steps are FIFO *within* a turn, but turn boundaries are enforced
-/// rather than flattened: a turn can neither borrow steps from the next one nor
-/// leave its own steps unconsumed.
-///
-/// - `chat` errors if the current turn runs out of steps (the trace *under*-specifies
-///   that turn's LLM round-trips).
-/// - The runner calls [`ReplayHandle::finish_turn`] between turns; it errors if the
-///   finished turn left steps behind (the trace *over*-specifies them).
-///
-/// Either mismatch surfaces as a clear, turn-scoped error instead of silently
-/// bleeding responses across turn boundaries.
 pub struct TraceLlmProvider {
     state: Arc<Mutex<ReplayState>>,
     trace_name: String,
@@ -63,7 +48,6 @@ impl TraceLlmProvider {
 }
 
 /// Runner-side handle for advancing the replay cursor between conversation turns.
-///
 /// Shares the provider's queues (the same `Arc` the agent holds), so the runner can
 /// assert per-turn consumption without owning the boxed provider.
 pub struct ReplayHandle {

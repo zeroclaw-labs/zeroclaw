@@ -30,27 +30,10 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// SQLite-backed persistent memory — the brain
-///
-/// Full-stack search engine:
-/// - **Vector DB**: embeddings stored as BLOB, cosine similarity search
-/// - **Keyword Search**: FTS5 virtual table with BM25 scoring
-/// - **Hybrid Merge**: weighted fusion of vector + keyword results
-/// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
-/// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
-///
-/// Cloning is cheap and yields a handle to the SAME database connection and
-/// embedder (all shared state is behind `Arc`) — used to hand a background
-/// task (e.g. an auto-triggered reindex) its own handle.
 #[derive(Clone)]
 pub struct SqliteMemory {
     alias: String,
     conn: Arc<Mutex<Connection>>,
-    // `Arc` so `#[derive(Clone)]` handles share ONE lock: a `swap_embedder`
-    // on any clone is observed by all others (the shared-embedder contract in
-    // the type doc). `RwLock` inside lets `config/set` hot-swap the embedder on
-    // a long-lived handle without a daemon restart (#8359). Reads snapshot the
-    // inner `Arc` and drop the guard before any `.await`.
     embedder: Arc<RwLock<Arc<dyn EmbeddingProvider>>>,
     vector_weight: f32,
     keyword_weight: f32,
@@ -106,11 +89,6 @@ impl SqliteMemory {
         })
     }
 
-    /// Build SQLite memory with optional open timeout.
-    ///
-    /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
-    /// (capped at 300). Useful when the DB file may be locked or on slow storage.
-    /// `None` = wait indefinitely (default).
     pub fn with_embedder(
         alias: &str,
         workspace_dir: &Path,
@@ -130,15 +108,6 @@ impl SqliteMemory {
 
         let conn = Self::open_connection(&db_path, open_timeout_secs)?;
 
-        // ── Production-grade PRAGMA tuning ──────────────────────
-        // foreign_keys ON: SQLite defaults FKs OFF per-connection;
-        //                  the multi-agent migration's REFERENCES
-        //                  agents(id) is unenforced without it.
-        // WAL mode: concurrent reads during writes, crash-safe
-        // normal sync: 2× write speed, still durable on WAL
-        // mmap 8 MB: let the OS page-cache serve hot reads
-        // cache 2 MB: keep ~500 hot pages in-process
-        // temp_store memory: temp tables never hit disk
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
@@ -377,14 +346,6 @@ impl SqliteMemory {
         Ok(())
     }
 
-    /// One-shot, idempotent normalization of `memories.session_id`.
-    ///
-    /// The orchestrator sanitizes session keys at the source so the runtime
-    /// HashMap, on-disk JSONL filename, and `session_id` filter for recall
-    /// all agree. Rows written before that fix retained the raw, un-sanitized
-    /// form (e.g. `slack_C123_1.2_user one`) and would be invisible to the
-    /// new sanitized recall filter. Rewrite them once at startup; later runs
-    /// find nothing to update because `sanitize_session_key` is idempotent.
     fn migrate_session_ids_to_sanitized(conn: &Connection) -> anyhow::Result<()> {
         let distinct: Vec<String> = {
             let mut stmt = conn
@@ -569,11 +530,6 @@ impl SqliteMemory {
         &self.conn
     }
 
-    /// Read the embedding identity recorded in `memory_meta`, if any.
-    ///
-    /// Returns `None` when the store predates identity tracking (or any of
-    /// the three keys is missing/unparseable) — callers treat that as "adopt
-    /// the current identity" rather than a mismatch.
     pub fn stored_embedding_identity(
         &self,
     ) -> anyhow::Result<Option<super::embeddings::EmbeddingIdentity>> {
@@ -609,7 +565,6 @@ impl SqliteMemory {
     }
 
     /// Record `identity` in `memory_meta` without touching any vectors.
-    ///
     /// Used to adopt the current identity on stores that predate identity
     /// tracking, and after a match check confirms nothing changed.
     pub fn record_embedding_identity(
@@ -623,14 +578,6 @@ impl SqliteMemory {
         Ok(())
     }
 
-    /// Migrate the store to a new embedding identity: NULL every stored
-    /// vector, clear the (identity-agnostic, content-hash-keyed)
-    /// `embedding_cache`, and stamp the new identity — atomically.
-    ///
-    /// This is the cheap, lossless half of an identity migration: `content`
-    /// is retained on every row, so `reindex()` can re-embed from it later.
-    /// No embedding API calls are made here. Returns the number of rows
-    /// whose vector was invalidated.
     pub fn invalidate_embeddings_for_identity_change(
         &self,
         new_identity: &super::embeddings::EmbeddingIdentity,
@@ -891,7 +838,6 @@ impl SqliteMemory {
     }
 
     /// Vector similarity search: scan embeddings and compute cosine similarity.
-    ///
     /// Optional `category` and `session_id` filters reduce full-table scans
     /// when the caller already knows the scope of relevant memories.
     ///
@@ -1479,14 +1425,14 @@ impl SqliteMemory {
     /// `refresh_embedder` hook (after a `config/set` provider-profile change)
     /// and tests that need to inject a fake embedder. Existing `Arc<dyn Memory>`
     /// holders observe the new embedder on their next embed without rebuilding
-    /// the handle (#8359).
+    /// the handle.
     pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
         *self.embedder.write() = embedder;
         // `embedding_cache` is keyed by content hash only, so every cached
         // vector belongs to the *previous* provider/model/dimensions. Drop the
         // cache on swap so the next embed goes through the new embedder instead
-        // of returning a stale vector (#8359). Best-effort — a cache-clear
-        // failure must not block the swap.
+        // of returning a stale vector. Best-effort - a cache-clear failure must
+        // not block the swap.
         if let Err(e) = self.conn.lock().execute("DELETE FROM embedding_cache", []) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1500,7 +1446,7 @@ impl SqliteMemory {
 
     /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
     /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
-    /// took effect after a `config/set` provider-profile change (#8359).
+    /// took effect after a `config/set` provider-profile change.
     pub fn embedder_dimensions(&self) -> usize {
         self.embedder.read().dimensions()
     }
@@ -1805,12 +1751,6 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = conn.lock();
-            // `agent_alias` is the human alias, but `memories.agent_id` holds
-            // the agent's UUID (FK → agents.id). Resolve alias → id via the same
-            // subselect the insert path uses (`store_with_agent`); binding the
-            // alias straight into agent_id matches zero rows and silently
-            // no-ops. An unknown alias yields a NULL subselect → matches
-            // nothing, which is the correct outcome.
             let affected = conn.execute(
                 "DELETE FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
                 params![agent_alias],
@@ -1904,17 +1844,6 @@ impl Memory for SqliteMemory {
             .unwrap_or(false)
     }
 
-    /// Rebuild backend indexes: FTS tables and missing embedding vectors.
-    ///
-    /// Step 1 rebuilds the FTS5 index unconditionally (idempotent, cheap).
-    /// Step 2 fills in vectors for every row with `embedding IS NULL` using
-    /// the configured embedder. If interrupted, re-running is safe — only
-    /// rows still missing a vector are re-processed. Intended to be run
-    /// after bulk writes that didn't go through `store()` (e.g. `zeroclaw
-    /// migrate openclaw`, which uses `NoopEmbedding` for speed). Returns
-    /// the number of rows that received a new embedding; returns 0 if the
-    /// embedder has no dimensions (Noop) or if everything is already
-    /// embedded.
     async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5 (always safe, cheap)
         {
@@ -3058,7 +2987,7 @@ mod tests {
         assert_eq!(entry.content, "this content must be retained");
     }
 
-    // ── Embedder hot-swap (#8359) ────────────────────────────────
+    // ── Embedder hot-swap────────────────────────────────
 
     /// A working embedder double that returns a fixed-length vector (each
     /// element = `fill`, so the source embedder is identifiable) and counts its
@@ -3094,9 +3023,6 @@ mod tests {
         }
     }
 
-    /// Swapping the embedder on a live handle is observed by the real embed
-    /// path: a Noop handle yields no vector, and after the swap the same handle
-    /// produces one from the new embedder — no rebuild of the `SqliteMemory`.
     #[tokio::test]
     async fn refresh_embedder_takes_effect_on_live_handle() {
         let (_tmp, mem) = temp_sqlite(); // constructed with NoopEmbedding (dims 0)
@@ -3119,9 +3045,6 @@ mod tests {
         assert_eq!(embedding.len(), 4, "vector must come from the new embedder");
     }
 
-    /// After an embedder swap, the same content must re-embed through the NEW
-    /// provider rather than return the previous provider's cached vector — the
-    /// `embedding_cache` (keyed by content hash only) must be invalidated.
     #[tokio::test]
     async fn swap_embedder_invalidates_stale_embedding_cache() {
         let tmp = TempDir::new().unwrap();
@@ -3170,9 +3093,6 @@ mod tests {
         );
     }
 
-    /// The `Memory::refresh_embedder` hook rebuilds the embedder from freshly
-    /// resolved provider settings and installs it on the live handle (the shape
-    /// `config/set` uses after a provider-profile change).
     #[test]
     fn refresh_embedder_rebuilds_from_resolved_settings() {
         let (_tmp, mem) = temp_sqlite(); // NoopEmbedding, dims 0
@@ -3649,7 +3569,7 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    // ── Embedding identity primitives (issue #7948) ──────────────
+    // ── Embedding identity primitives──────────────
 
     /// Embedder that returns a fixed vector, so store() persists real
     /// (non-NULL) embeddings and populates the embedding cache.
@@ -5005,7 +4925,7 @@ mod tests {
     #[tokio::test]
     async fn export_with_time_range() {
         let (_tmp, mem) = temp_sqlite();
-        // Store entries — created_at is set to Local::now() by store()
+        // Store entries — created_at is set to Local::now() by store
         mem.store("a", "old data", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -5259,13 +5179,6 @@ mod tests {
         assert!(!results.is_empty(), "Hybrid mode should find results");
     }
 
-    // Wires-crossed regression coverage. The user reported memory rows
-    // returning the agents table UUID in `agent_alias` — the dashboard
-    // then tried to route /config/agents/<uuid> and 404'd. These tests
-    // assert the read path emits the resolved alias text in
-    // `agent_alias` and keeps the raw UUID in `agent_id` so the
-    // scoping wrapper still works.
-
     #[tokio::test]
     async fn get_returns_alias_text_in_agent_alias_and_uuid_in_agent_id() {
         let (_tmp, mem) = temp_sqlite();
@@ -5407,17 +5320,6 @@ mod tests {
         assert!(entry.session_id.is_none());
     }
 
-    // ── §4.8 Issue #7694: storage-reader timestamp / ordering coverage ──
-    //
-    // These tests guard regressions in the storage reader's timestamp
-    // loading and session-metadata ordering paths. They use neutral
-    // fixture data only (no user-provided content) and rely on the
-    // public `Memory` trait surface so they catch breakage at the
-    // boundary a real caller would observe.
-
-    /// Regression test for issue #7694: every recalled entry must expose
-    /// a parseable RFC 3339 timestamp. A regression here would silently
-    /// break UI rendering and time-windowed recall filters.
     #[tokio::test]
     async fn sqlite_timestamp_loading_is_rfc3339_round_trippable() {
         let (_tmp, mem) = temp_sqlite();
@@ -5457,18 +5359,9 @@ mod tests {
         }
     }
 
-    /// Regression test for issue #7694: `list()` must return rows for a
-    /// single session in stable `updated_at DESC` order so that the UI
-    /// doesn't reshuffle rows on every refresh.
     #[tokio::test]
     async fn sqlite_session_metadata_ordering_is_stable_descending() {
         let (_tmp, mem) = temp_sqlite();
-        // Seed with sleep gaps wide enough that updated_at strictly differs.
-        // 50ms is well above the SQLite `created_at`/`updated_at` millisecond
-        // resolution and stays comfortably under any reasonable CI time
-        // budget; 15ms (the original value) was observed to flake on slow
-        // shared runners where two adjacent writes landed within the same
-        // millisecond bucket.
         let keys = ["ord-a", "ord-b", "ord-c", "ord-d"];
         for key in keys {
             mem.store(key, "body", MemoryCategory::Core, Some("sess-order"))
@@ -5501,28 +5394,6 @@ mod tests {
         }
     }
 
-    /// Regression test for issue #7694: when two rows in the same
-    /// session share an `updated_at` boundary timestamp, `list()` must
-    /// still return them deterministically (not randomly swap order on
-    /// each read).
-    ///
-    /// Implementation note: `Local::now()` in `store()` carries
-    /// nanosecond precision on this host (e.g. `…15.007463284+08:00`),
-    /// so two back-to-back `store()` calls naturally land in distinct
-    /// `updated_at` buckets and never tie. To exercise the tie path
-    /// deterministically we seed the rows through the public `store()`
-    /// API and then collapse both `updated_at` values to a single
-    /// RFC 3339 timestamp via a direct SQL update through the public
-    /// `connection()` accessor. The `list()` calls themselves still go
-    /// through the public `Memory` trait surface.
-    ///
-    /// Scope note: this test verifies stable read-ordering when a tie
-    /// has been forced. A query-level secondary sort key (e.g.
-    /// `ORDER BY updated_at DESC, rowid ASC`) that would make
-    /// tied-timestamp ordering *guaranteed* rather than
-    /// implementation-defined is a production-logic change and is
-    /// tracked separately — see PR #7921's follow-up notes for the
-    /// reader-cursor side of the same family of issues.
     #[tokio::test]
     async fn sqlite_session_metadata_ordering_ties_are_deterministic() {
         let (_tmp, mem) = temp_sqlite();
@@ -5533,12 +5404,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Force both rows to share the exact same `created_at` /
-        // `updated_at` value. Without this, two back-to-back `store()`
-        // calls on this host produce distinct nanosecond timestamps
-        // and the test would never exercise the tie path. We pin both
-        // columns because `list()` exposes `m.created_at` as the
-        // entry's `timestamp` while ordering by `m.updated_at`.
         let tied_ts = "2026-06-19T00:00:00.000000000+00:00";
         {
             let conn = mem.connection().lock();

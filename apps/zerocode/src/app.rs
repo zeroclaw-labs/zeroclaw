@@ -114,11 +114,15 @@ async fn switch_mode(
     mode: &mut Mode,
     next: Mode,
     conn_state: &ConnectionState,
+    dashboard_pane: &mut dashboard::Dashboard,
     quickstart: &mut quickstart_pane::QuickstartPane,
     acp_pane: &mut acp::Acp,
     chat_pane: &mut chat::Chat,
     sop_pane: &mut sop_pane::SopPane,
 ) {
+    if *mode == Mode::Dashboard && next != Mode::Dashboard {
+        dashboard_pane.on_pane_blur();
+    }
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
         quickstart.dismiss_beacon().await;
     }
@@ -188,12 +192,6 @@ pub async fn run(
     owns_ephemeral: bool,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
-    // Per-agent theme overrides live in a process-global registry (theme.rs),
-    // mirroring how the global theme works: the Config pane writes there on
-    // assign/clear so changes apply live, and the draw loop reads it each frame
-    // to tint the Code/Chat pane for the focused agent. Seed it once from config
-    // here; an unknown override name resolves to the terminal theme rather than
-    // aborting.
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut show_help = false;
     let mut reload_confirm = false;
@@ -201,12 +199,6 @@ pub async fn run(
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
-    // In-loop reconnection state. `reconnect_last_attempt` throttles
-    // connect tries so the draw/input loop keeps running between them.
-    // `ephemeral_respawn_done` enforces the "owned ephemeral daemon is
-    // respawned at most once" policy; `needs_intervention` latches when
-    // that single respawn fails to come back, stopping auto-respawn while
-    // the UI stays responsive and quittable.
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
@@ -215,16 +207,6 @@ pub async fn run(
     // reconnect so every rebuilt pane talks to the recovered daemon.
     let mut rpc = rpc;
 
-    // (Re)build the full pane set against the current `rpc`. Used at
-    // startup and again after each reconnect so panes re-subscribe to the
-    // new client's notification channel (a stale `notif_rx` would leave
-    // chat/logs silently deaf). Consumes any pending Quickstart Stage-2
-    // intent so a freshly-created agent lands directly in Chat.
-    //
-    // Evaluates to `anyhow::Result<(panes…)>`: startup unwraps with `?`,
-    // but the recovery path treats a mid-init failure (daemon flapped
-    // again) as a transient disconnect and stays in the loop rather than
-    // tearing down the TUI.
     macro_rules! build_panes {
         ($resume_chat:expr, $resume_acp:expr) => {
             async {
@@ -236,7 +218,7 @@ pub async fn run(
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
                 let mut acp_pane = acp::Acp::new(rpc.clone());
                 // Carry the pre-disconnect session across a reconnect rebuild so
-                // the rebuilt pane resumes the daemon-retained session (#7182)
+                // the rebuilt pane resumes the daemon-retained session
                 // instead of minting a fresh one. None on first build.
                 acp_pane.set_resume_session_id($resume_acp.0);
                 acp_pane.set_resume_agent_alias($resume_acp.1);
@@ -295,12 +277,6 @@ pub async fn run(
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
         }
-        // Per-agent theme override: while the Code or Chat pane is focused on
-        // an agent with a configured override, swap that palette in for the
-        // whole frame (backdrop, pane, bars) so the pane reads cohesively, then
-        // restore the base theme after drawing. The base theme is whatever the
-        // global currently holds, so live theme changes from the Config pane
-        // still take effect for non-overridden panes.
         let base_theme = theme::active_raw();
         let frame_theme = match mode {
             Mode::Acp => acp_pane.selected_agent().and_then(theme::agent_override),
@@ -451,22 +427,10 @@ pub async fn run(
             theme::set_active(base_theme);
         }
 
-        // In-loop recovery. The draw above already rendered the cached
-        // panes and the Disconnected status, and the input poll below keeps
-        // the UI responsive (quit always works), so reconnection happens
-        // here without ever leaving the event loop. This runs every
-        // iteration, not just when the input poll times out: a steady stream
-        // of events (mouse scroll, resize, focus) would otherwise keep
-        // `event::poll` returning true and the grace timer would never start,
-        // leaving the UI frozen on the red "Disconnected" status bar.
+        // Recovery stays inside the responsive event loop. During each disconnected
+        // episode an owned ephemeral daemon is respawned at most once, attached daemons
+        // are never spawned, and both modes keep polling for manual recovery.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
-            // Owned ephemeral daemon: respawn exactly once. After that single
-            // respawn we set `needs_intervention` to stop auto-respawning and
-            // surface the state — but we keep polling below, so a manually
-            // restarted daemon still recovers gracefully. Attached daemons
-            // (external socket / WSS) are never spawned: multiple TUIs
-            // respawning would stampede; they only poll for the daemon to
-            // reappear at the expected address.
             if owns_ephemeral && !ephemeral_respawn_done {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(_) = target {
@@ -474,11 +438,6 @@ pub async fn run(
                 }
             }
 
-            // Always poll (throttled) for the daemon to become reachable —
-            // whether it is our respawned ephemeral one or a daemon the user
-            // brought back up by hand. `needs_intervention` only gates the
-            // auto-respawn above, never the reconnect poll, so recovery is
-            // never a dead end.
             {
                 let now = std::time::Instant::now();
                 let due = reconnect_last_attempt
@@ -494,18 +453,7 @@ pub async fn run(
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
-                        // Adopt the recovered client and rebuild every pane
-                        // against it (a kept-alive pane would still hold the
-                        // dead client's notification receiver). History is
-                        // not bulk-reloaded — panes refetch lazily and the
-                        // daemon rehydrates the session from its durable row
-                        // on the next prompt.
                         rpc = Arc::new(new_client);
-                        // Carry the live sessions across the rebuild so the
-                        // recovered panes reattach to the daemon-retained
-                        // sessions instead of starting fresh. The agent alias
-                        // rides along so a multi-agent reconnect reattaches to
-                        // the right agent rather than dropping the session.
                         let resume_chat = (
                             chat_pane.current_session_id().map(String::from),
                             chat_pane.current_agent_alias().map(String::from),
@@ -678,6 +626,7 @@ pub async fn run(
                         &mut mode,
                         next,
                         &conn_state,
+                        &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -719,6 +668,7 @@ pub async fn run(
                         &mut mode,
                         Mode::Dashboard,
                         &conn_state,
+                        &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -758,6 +708,7 @@ pub async fn run(
                             &mut mode,
                             next,
                             &conn_state,
+                            &mut dashboard_pane,
                             &mut quickstart,
                             &mut acp_pane,
                             &mut chat_pane,
@@ -780,23 +731,7 @@ pub async fn run(
                 if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
                     match mode {
                         Mode::Dashboard => {
-                            if let Some(action) = dashboard_pane.handle_mouse(mouse, content_area) {
-                                match action {
-                                    dashboard::DashboardMouseAction::OpenAgentConfig(alias) => {
-                                        config_app.open_agent_config(&alias).await?;
-                                        switch_mode(
-                                            &mut mode,
-                                            Mode::Config,
-                                            &conn_state,
-                                            &mut quickstart,
-                                            &mut acp_pane,
-                                            &mut chat_pane,
-                                            &mut sop_pane,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
+                            dashboard_pane.handle_mouse(mouse, content_area);
                         }
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
@@ -855,12 +790,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Resolve every `[theme.agent_override.<alias>]` entry into a ready palette,
-/// keyed by agent alias. Loads the local zerocode config; an unreadable config
-/// or an override naming an unknown theme is skipped silently (never written to
-/// stderr — that would corrupt the alternate-screen TUI). The base theme
-/// remains in effect for any agent not present in the returned map; a bad
-/// override surfaces in the Config pane's own validation, not here.
 fn resolve_agent_overrides(
     config_dir: &std::path::Path,
 ) -> std::collections::HashMap<String, theme::Theme> {

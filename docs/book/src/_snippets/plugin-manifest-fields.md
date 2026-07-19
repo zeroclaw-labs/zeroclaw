@@ -5,7 +5,7 @@ fields are the serde surface of `PluginManifest` in
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `name` | yes | Unique plugin identifier. Also the key operators use to configure the plugin, and the directory name convention. |
+| `name` | yes | Unique canonical package slug and operator config key. Use 1–128 lowercase ASCII characters; start and end with `[a-z0-9]`, with only `[a-z0-9._-]` between. Discovery rejects invalid or duplicate names. |
 | `version` | yes | Version string, e.g. `0.1.0`. |
 | `description` | no | Human-readable description shown by `zeroclaw plugin list`. |
 | `author` | no | Author name or organization. |
