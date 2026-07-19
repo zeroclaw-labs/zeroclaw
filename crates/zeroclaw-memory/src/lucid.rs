@@ -42,7 +42,9 @@ impl LucidMemory {
 
     /// Construct with config-sourced overrides (`[storage.lucid.<alias>]`).
     /// Each `None` falls back to the built-in default, so an unconfigured
-    /// alias behaves exactly like [`Self::new`].
+    /// alias behaves exactly like [`Self::new`]. Blank commands and zero
+    /// deadlines also fall back because normal config loading warns and keeps
+    /// the process available for operator repair after validation errors.
     pub fn with_overrides(
         alias: &str,
         workspace_dir: &Path,
@@ -51,18 +53,24 @@ impl LucidMemory {
         recall_timeout_ms: Option<u64>,
         store_timeout_ms: Option<u64>,
     ) -> Self {
+        let lucid_cmd = lucid_cmd
+            .filter(|command| !command.trim().is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string());
+        let recall_timeout_ms = recall_timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(Self::DEFAULT_RECALL_TIMEOUT_MS);
+        let store_timeout_ms = store_timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(Self::DEFAULT_STORE_TIMEOUT_MS);
+
         Self {
             alias: alias.to_string(),
             local,
-            lucid_cmd: lucid_cmd.unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string()),
+            lucid_cmd,
             token_budget: Self::DEFAULT_TOKEN_BUDGET,
             workspace_dir: workspace_dir.to_path_buf(),
-            recall_timeout: Duration::from_millis(
-                recall_timeout_ms.unwrap_or(Self::DEFAULT_RECALL_TIMEOUT_MS),
-            ),
-            store_timeout: Duration::from_millis(
-                store_timeout_ms.unwrap_or(Self::DEFAULT_STORE_TIMEOUT_MS),
-            ),
+            recall_timeout: Duration::from_millis(recall_timeout_ms),
+            store_timeout: Duration::from_millis(store_timeout_ms),
             local_hit_threshold: Self::DEFAULT_LOCAL_HIT_THRESHOLD,
             failure_cooldown: Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
             last_failure_at: Mutex::new(None),
@@ -899,6 +907,30 @@ exit 1
                 .any(|e| e.content.contains("Delayed token refresh guidance")),
             "with_overrides(None, None, None) must apply the same raised \
              default timeout as `new`, tolerating the simulated 1.5s cold start"
+        );
+    }
+
+    #[test]
+    fn with_overrides_normalizes_invalid_values_to_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some("   ".into()),
+            Some(0),
+            Some(0),
+        );
+
+        assert_eq!(memory.lucid_cmd, LucidMemory::DEFAULT_LUCID_CMD);
+        assert_eq!(
+            memory.recall_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            memory.store_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS)
         );
     }
 

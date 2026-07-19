@@ -18737,6 +18737,17 @@ impl Config {
         lucid_aliases.sort();
         for alias in lucid_aliases {
             let lucid = &self.storage.lucid[alias];
+            if lucid
+                .binary_path
+                .as_ref()
+                .is_some_and(|path| path.trim().is_empty())
+            {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("storage.lucid.{alias}.binary_path"),
+                    "storage.lucid.{alias}.binary_path must not be empty"
+                );
+            }
             if matches!(lucid.recall_timeout_ms, Some(0)) {
                 validation_bail!(
                     InvalidNumericRange,
@@ -24190,6 +24201,26 @@ default_temperature = 0.7
                 "validation error must name {expected_path}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    async fn validate_rejects_blank_lucid_binary_with_alias_qualified_path() {
+        let raw = r#"
+default_temperature = 0.7
+
+[storage.lucid.edge_arm]
+binary_path = "   "
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("blank Lucid binary path must fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("storage.lucid.edge_arm.binary_path"),
+            "validation error must name the alias-qualified binary path: {error:#}"
+        );
     }
 
     #[test]

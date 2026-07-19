@@ -74,7 +74,7 @@ use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
-    ActiveStorage, EmbeddingRouteConfig, MemoryConfig, PostgresStorageConfig,
+    ActiveStorage, Config, EmbeddingRouteConfig, MemoryConfig, PostgresStorageConfig,
 };
 
 #[cfg(feature = "memory-postgres")]
@@ -397,6 +397,13 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    if config.backend.trim().contains('.') {
+        anyhow::bail!(
+            "memory backend {:?} references a storage alias; construct memory from the full Config so the selected alias is applied",
+            config.backend
+        );
+    }
+
     create_memory_with_storage_and_routes(
         config,
         &[],
@@ -404,6 +411,51 @@ pub fn create_memory(
         workspace_dir,
         api_key,
         None,
+    )
+}
+
+/// Construct memory from the canonical loaded configuration.
+///
+/// Config-aware production paths should use this entrypoint so the selected
+/// storage alias, embedding route, and provider settings are applied together.
+pub fn create_memory_from_config(
+    config: &Config,
+    api_key: Option<&str>,
+) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        config.resolve_active_storage(),
+        &config.data_dir,
+        api_key,
+        Some(&config.providers.models),
+    )
+}
+
+fn build_lucid_memory(
+    workspace_dir: &Path,
+    local: SqliteMemory,
+    active_storage: ActiveStorage<'_>,
+) -> LucidMemory {
+    // Lucid predates typed storage aliases and still supports the bare
+    // `memory.backend = "lucid"` form. A resolved alias overrides the
+    // executable and deadlines; otherwise the constructor uses defaults.
+    let (binary_path, recall_timeout_ms, store_timeout_ms) = match active_storage {
+        ActiveStorage::Lucid(lucid) => (
+            lucid.binary_path.clone(),
+            lucid.recall_timeout_ms,
+            lucid.store_timeout_ms,
+        ),
+        _ => (None, None, None),
+    };
+
+    LucidMemory::with_overrides(
+        "lucid",
+        workspace_dir,
+        local,
+        binary_path,
+        recall_timeout_ms,
+        store_timeout_ms,
     )
 }
 
@@ -584,32 +636,16 @@ pub fn create_memory_with_storage_and_routes(
     }
 
     if matches!(backend_kind, MemoryBackendKind::Lucid) {
-        // Unlike Postgres/Qdrant, Lucid has always worked with zero
-        // `[storage.lucid.<alias>]` config (it shells out to `lucid` on
-        // PATH using built-in defaults), so an unresolved alias falls back
-        // to defaults here instead of erroring.
-        let (lucid_binary_path, lucid_recall_timeout_ms, lucid_store_timeout_ms) =
-            match active_storage {
-                ActiveStorage::Lucid(l) => (
-                    l.binary_path.clone(),
-                    l.recall_timeout_ms,
-                    l.store_timeout_ms,
-                ),
-                _ => (None, None, None),
-            };
         let local = build_sqlite_memory(
             config,
             sqlite_open_timeout_secs,
             workspace_dir,
             &resolved_embedding,
         )?;
-        return Ok(Box::new(LucidMemory::with_overrides(
-            "lucid",
+        return Ok(Box::new(build_lucid_memory(
             workspace_dir,
             local,
-            lucid_binary_path,
-            lucid_recall_timeout_ms,
-            lucid_store_timeout_ms,
+            active_storage,
         )));
     }
 
@@ -756,20 +792,27 @@ fn spawn_auto_reindex(mem: &SqliteMemory) {
     });
 }
 
-pub fn create_memory_for_migration(
-    backend: &str,
-    workspace_dir: &Path,
-) -> anyhow::Result<Box<dyn Memory>> {
-    if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
+pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    let backend = backend_kind_from_dotted(&config.memory.backend);
+    if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         anyhow::bail!(
             "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
         );
     }
 
+    if matches!(classify_memory_backend(&backend), MemoryBackendKind::Lucid) {
+        let local = SqliteMemory::new("sqlite", &config.data_dir)?;
+        return Ok(Box::new(build_lucid_memory(
+            &config.data_dir,
+            local,
+            config.resolve_active_storage(),
+        )));
+    }
+
     create_memory_with_builders(
-        backend,
-        workspace_dir,
-        || SqliteMemory::new("sqlite", workspace_dir),
+        &backend,
+        &config.data_dir,
+        || SqliteMemory::new("sqlite", &config.data_dir),
         " during migration",
     )
 }
@@ -809,14 +852,7 @@ pub async fn create_memory_for_agent(
         return Ok(Arc::new(NoneMemory::new("none")));
     }
 
-    let inner = create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.embedding_routes,
-        config.resolve_active_storage(),
-        &config.data_dir,
-        api_key,
-        Some(&config.providers.models),
-    )?;
+    let inner = create_memory_from_config(config, api_key)?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
@@ -873,7 +909,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-    #[cfg(unix)]
     use zeroclaw_config::schema::Config;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
 
@@ -1234,18 +1269,12 @@ recall_timeout_ms = 900
 store_timeout_ms = 900
 "#
         );
-        let config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
+        let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
+        config.data_dir = tmp.path().to_path_buf();
         config.validate().expect("Lucid aliases must validate");
 
-        let memory = create_memory_with_storage_and_routes(
-            &config.memory,
-            &config.embedding_routes,
-            config.resolve_active_storage(),
-            tmp.path(),
-            None,
-            Some(&config.providers.models),
-        )
-        .expect("build Lucid memory from parsed alias");
+        let memory =
+            create_memory_from_config(&config, None).expect("build Lucid memory from parsed alias");
 
         memory
             .store(
@@ -1286,6 +1315,53 @@ store_timeout_ms = 900
                 .iter()
                 .all(|entry| !entry.content.contains("Factory-selected remote result"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migration_factory_uses_selected_lucid_alias() {
+        let tmp = TempDir::new().unwrap();
+        let selected_log = tmp.path().join("selected-migration.log");
+        let decoy_log = tmp.path().join("decoy-migration.log");
+        let (selected_cmd, decoy_cmd) =
+            write_factory_lucid_scripts(tmp.path(), &selected_log, &decoy_log);
+        let raw = format!(
+            r#"
+default_temperature = 0.7
+
+[memory]
+backend = "lucid.selected"
+
+[storage.lucid.selected]
+binary_path = "{selected_cmd}"
+recall_timeout_ms = 100
+store_timeout_ms = 300
+
+[storage.lucid.decoy]
+binary_path = "{decoy_cmd}"
+recall_timeout_ms = 900
+store_timeout_ms = 900
+"#
+        );
+        let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
+        config.data_dir = tmp.path().to_path_buf();
+
+        let memory = create_memory_for_migration(&config)
+            .expect("build migration memory from selected Lucid alias");
+        memory
+            .store(
+                "fast_store",
+                "Migration alias store",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
+        assert!(selected_calls.contains("store-start:fast_store:"));
+        assert!(selected_calls.contains("fast-store-complete"));
+        assert!(!decoy_log.exists(), "unselected Lucid alias was invoked");
     }
 
     #[test]
@@ -1337,10 +1413,26 @@ store_timeout_ms = 900
         };
         let error = create_memory(&cfg, tmp.path(), None)
             .err()
-            .expect("backend=postgres requires a [storage.postgres.<alias>] entry");
+            .expect("dotted backend references require the full Config");
         assert!(
-            error.to_string().contains("storage.postgres"),
-            "error should reference storage.postgres alias: {error}"
+            error.to_string().contains("full Config"),
+            "error should require config-aware construction: {error}"
+        );
+    }
+
+    #[test]
+    fn factory_lucid_alias_without_full_config_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "lucid.selected".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("dotted Lucid aliases require the full Config");
+        assert!(
+            error.to_string().contains("full Config"),
+            "error should require config-aware construction: {error}"
         );
     }
 
@@ -1353,10 +1445,10 @@ store_timeout_ms = 900
         };
         let error = create_memory(&cfg, tmp.path(), None)
             .err()
-            .expect("backend=qdrant requires a [storage.qdrant.<alias>] entry");
+            .expect("dotted backend references require the full Config");
         assert!(
-            error.to_string().contains("storage.qdrant"),
-            "error should reference storage.qdrant alias: {error}"
+            error.to_string().contains("full Config"),
+            "error should require config-aware construction: {error}"
         );
     }
 
@@ -1382,14 +1474,20 @@ store_timeout_ms = 900
     #[test]
     fn migration_factory_lucid() {
         let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
+        let mut config = Config::default();
+        config.memory.backend = "lucid".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let mem = create_memory_for_migration(&config).unwrap();
         assert_eq!(mem.name(), "lucid");
     }
 
     #[test]
     fn migration_factory_none_is_rejected() {
         let tmp = TempDir::new().unwrap();
-        let error = create_memory_for_migration("none", tmp.path())
+        let mut config = Config::default();
+        config.memory.backend = "none".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let error = create_memory_for_migration(&config)
             .err()
             .expect("backend=none should be rejected for migration");
         assert!(error.to_string().contains("disables persistence"));

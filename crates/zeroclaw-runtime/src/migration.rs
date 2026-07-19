@@ -106,7 +106,7 @@ pub async fn migrate_openclaw_memory(
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    zeroclaw_memory::create_memory_for_migration(&config.memory.backend, &config.data_dir)
+    zeroclaw_memory::create_memory_for_migration(config)
 }
 
 fn collect_source_entries(
