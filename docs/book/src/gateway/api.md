@@ -46,6 +46,21 @@ CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
 returned.
 
+`GET /api/plugins` returns the authenticated, read-only package catalog used by
+the dashboard. It materializes one row per package name from host-admitted
+installed manifests and the already-cached registry, using the same unpinned
+registry selection rule as `plugin install`. Installed and registry records
+remain separate so clients can show both versions without guessing that an
+upgrade exists. The endpoint performs no registry fetch and no mutation.
+
+The route exists in every gateway build. When WASM plugin support is absent it
+returns `wasm_plugins_available: false` and an empty package source rather than
+a 404. `[plugins].enabled` is reported as configuration intent, not runtime
+health. Stable `issues` codes distinguish source failures from a valid empty
+catalog while detailed diagnostics remain in gateway logs. Registry download
+URLs and the cached registry URL are never returned; an available record only
+exposes inert `name@version` install identity.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |

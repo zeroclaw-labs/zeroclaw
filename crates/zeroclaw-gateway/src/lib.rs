@@ -14,7 +14,6 @@ pub mod api_config;
 pub mod api_logs;
 pub mod api_pairing;
 pub mod api_personality;
-#[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
@@ -1866,12 +1865,9 @@ pub async fn run_gateway(
             delete(api_webauthn::handle_delete_credential),
         );
 
-    // ── Plugin management API (requires plugins-wasm feature) ──
-    #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
-        "/api/plugins",
-        get(api_plugins::plugin_routes::list_plugins),
-    );
+    // The read-only package catalog remains discoverable in every gateway
+    // build; WASM-specific sources degrade explicitly when support is absent.
+    let inner = inner.route("/api/plugins", get(api_plugins::list_plugins));
 
     let inner = inner
         // ── SSE event stream ──
@@ -4422,6 +4418,48 @@ mod tests {
             )
             .expect("test device registry insert");
         token
+    }
+
+    #[tokio::test]
+    async fn plugin_catalog_rejects_missing_and_invalid_bearer_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+
+        let response = api_plugins::list_plugins(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-token"),
+        );
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn plugin_catalog_accepts_a_paired_bearer_in_every_gateway_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "plugin-catalog-browser").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["wasm_plugins_available"],
+            cfg!(feature = "plugins-wasm")
+        );
+        assert!(json["plugins"].is_array());
+        assert!(json["issues"].is_array());
     }
 
     async fn admin_paircode_response_json(

@@ -364,6 +364,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -2665,7 +2667,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -2715,58 +2717,95 @@ fn plugin_host_with_configured_security(
 }
 
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entry(
-    config: &mut crate::config::schema::Config,
+fn installed_plugin_config_entries(
+    host: &zeroclaw::plugins::host::PluginHost,
     plugin_name: &str,
+) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    if manifest.config_schema.is_none()
+        || !manifest
+            .capabilities
+            .contains(&zeroclaw::plugins::PluginCapability::Tool)
+    {
+        return Ok(Vec::new());
+    }
+
+    // Tool registration currently owns the only package-name runtime binding.
+    // Alias-owned channel bindings must seed their actual instance key when
+    // their production construction path lands; install must not invent one.
+    let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+        manifest,
+        zeroclaw::plugins::PluginCapability::Tool,
+        std::iter::empty(),
+    )?;
+    Ok(vec![(
+        zeroclaw::plugins::PluginCapability::Tool,
+        scope.id().config_entry_key()?,
+    )])
+}
+
+/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
+/// canonical default instance keys. `config set
+/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
+/// resolution, which only matches entries already present in live config.
+/// Idempotent: existing entries and operator values remain untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entries(
+    config: &mut crate::config::schema::Config,
+    entries: &[(zeroclaw::plugins::PluginCapability, String)],
 ) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
     let whole_config_degraded = config
         .degraded_security
         .iter()
         .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
     if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-skipped",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the \
-                 [plugins] section on disk is malformed. Repair it, add \
-                 `[[plugins.entries]]` with the plugin name, then set values \
-                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
-            )
-        );
+        for (_, instance_key) in entries {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seed-skipped",
+                    &[("name", instance_key)],
+                    "warning: skipped seeding the plugin config entry: the \
+                     [plugins] section on disk is malformed. Repair it, add \
+                     `[[plugins.entries]]` with the instance key, then set values \
+                     with `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+        }
         return Ok(());
     }
-    if plugin_name.is_empty() || plugin_name.contains('.') {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-unaddressable",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the plugin \
-                 name cannot be addressed by a dotted config path. Add a \
-                 `[[plugins.entries]]` block to the config file by hand."
-            )
-        );
+
+    let mut created = Vec::new();
+    for (_, instance_key) in entries {
+        if config
+            .create_map_key("plugins.entries", instance_key)
+            .map_err(anyhow::Error::msg)?
+        {
+            config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+            created.push(instance_key);
+        }
+    }
+    if created.is_empty() {
         return Ok(());
     }
-    let created = config
-        .create_map_key("plugins.entries", plugin_name)
-        .map_err(anyhow::Error::msg)?;
-    if !created {
-        return Ok(());
-    }
-    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
     Box::pin(config.save_dirty()).await?;
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-config-entry-seeded",
-            &[("name", plugin_name)],
-            "Seeded config entry. Set plugin config values with \
-             `zeroclaw config set plugins.entries.<name>.config.<key>`."
-        )
-    );
+    for instance_key in created {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", instance_key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+            )
+        );
+    }
     Ok(())
 }
 
@@ -5995,20 +6034,7 @@ async fn main() -> Result<()> {
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -6084,6 +6110,7 @@ async fn main() -> Result<()> {
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6092,7 +6119,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6111,6 +6138,7 @@ async fn main() -> Result<()> {
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6122,7 +6150,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 }
                 Ok(())
             }
@@ -6169,6 +6197,17 @@ async fn main() -> Result<()> {
                                 "Permissions"
                             )
                         );
+                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
+                        {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-config-entry-key",
+                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
+                                    "Config entry key"
+                                )
+                            );
+                        }
                         match &info.wasm_path {
                             Some(path) => println!(
                                 "{}",
