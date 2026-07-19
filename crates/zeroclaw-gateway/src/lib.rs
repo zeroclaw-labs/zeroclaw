@@ -1337,12 +1337,6 @@ pub async fn run_gateway(
         .map(std::path::PathBuf::from)
         && !stale.join("index.html").is_file()
     {
-        .gateway
-        .web_dist_dir
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        && !stale.join("index.html").is_file()
-    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1354,7 +1348,22 @@ pub async fn run_gateway(
         );
     }
 
-    match resolve_web_dashboard_availability(&config) {
+    // Derive dashboard availability from the single resolved `web_dist_dir`
+    // snapshot so the log and banner always agree with what AppState serves.
+    let availability: Option<WebDashboardAvailability> = {
+        #[cfg(feature = "embedded-web")]
+        {
+            Some(WebDashboardAvailability::Embedded)
+        }
+        #[cfg(not(feature = "embedded-web"))]
+        {
+            web_dist_dir
+                .clone()
+                .map(WebDashboardAvailability::Filesystem)
+        }
+    };
+
+    match availability {
         Some(WebDashboardAvailability::Embedded) => {
             ::zeroclaw_log::record!(
                 INFO,
@@ -1365,8 +1374,9 @@ pub async fn run_gateway(
         Some(WebDashboardAvailability::Filesystem(ref dir)) => {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!("Web dashboard: serving from {}", dir.display().to_string())
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": dir.display().to_string()})),
+                "Web dashboard: serving filesystem assets"
             );
         }
         None if config.gateway.web_dist_dir.is_some() => {
@@ -1395,7 +1405,7 @@ pub async fn run_gateway(
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    if resolve_web_dashboard_availability(&config).is_some() {
+    if availability.is_some() {
         println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
     } else {
         println!(
