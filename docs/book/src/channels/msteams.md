@@ -22,23 +22,58 @@ Matching is case-insensitive.
 
 1. Create the Azure Bot + app registration and note the **App ID**, **client
    secret**, and **Tenant ID** (see [Setup](#setup)).
-2. Configure the channel:
+2. Add the blocks below to `config.toml` (channel + peer group + agent bind).
+3. Point a public HTTPS domain (reverse proxy, tunnel, etc.) at the listener
+   port and register `https://<domain>/api/messages` as the bot's **messaging
+   endpoint** in Azure. With Docker Compose, publish host port `3978` to the
+   container's `port`.
+4. Restart the daemon (`docker compose restart zeroclaw` or equivalent) and
+   confirm `zeroclaw status` shows Microsoft Teams as configured.
+5. DM the bot or @-mention it in a team channel.
+
+## Example `config.toml`
+
+Three pieces are required. An empty peer-group allowlist **denies everyone**,
+so the channel alone is not enough.
 
 ```toml
+# 1) Channel credentials and listener
 [channels.msteams.default]
 enabled = true
 app_id = "<Azure Bot app (client) ID>"
 app_password = "<client secret>"      # secret — use your secrets backend
 tenant_id = "<Entra tenant ID>"
-port = 3978                           # inbound listener port
+port = 3978                           # inbound Bot Framework listener
 # path = "/api/messages"              # webhook route (default)
+
+# Optional behaviour
+# allow_dms = true                    # false = ignore personal (1:1) chats
+# mention_only = true                 # group/channel must @-mention the bot
+# stream_mode = "partial"             # gray "thinking" bubble in 1:1 chats
+# draft_update_interval_ms = 1000
+# interrupt_on_new_message = false
+
+# 2) Who may talk to the bot (Entra object ID preferred)
+[peer_groups.msteams-ops]
+channel = "msteams.default"           # or "msteams" for every alias
+agents = ["default"]                  # your agent alias
+external_peers = [
+  "00000000-0000-0000-0000-xxxxxxxxxxxx",
+  # "*"                               # temporary: allow anyone (debug only)
+]
+
+# 3) Bind the channel to an agent (alongside any other channels)
+[agents.default]
+channels = ["msteams.default"]
 ```
 
-3. Point a public HTTPS domain (reverse proxy, tunnel, etc.) at the listener
-   port and register `https://<domain>/api/messages` as the bot's **messaging
-   endpoint** in Azure.
-4. Add the sender's Entra object ID to the channel's peer group.
-5. DM the bot or @-mention it in a team channel.
+Find a user's Object ID under **Microsoft Entra ID → Users → (user) → Object
+ID**. The channel also accepts the Teams-scoped `29:…` id, but that value is
+less stable across conversations.
+
+After editing, reload/restart so the daemon picks up the new blocks. Docker
+Compose examples already expose `3978` for the activity listener; the gateway
+dashboard port (`42617`) is separate.
 
 ## Configuration
 
