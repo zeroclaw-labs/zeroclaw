@@ -7663,6 +7663,22 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+fn append_configured_plugin_channels(
+    configured: &mut Vec<ConfiguredChannel>,
+    plugin_channels: Vec<Arc<dyn Channel>>,
+) {
+    for channel in plugin_channels {
+        debug_assert_eq!(channel.name(), "plugin");
+        debug_assert!(!channel.alias().is_empty());
+        let alias = channel.alias().to_string();
+        configured.push(ConfiguredChannel {
+            display_name: "Plugin",
+            alias: Some(alias),
+            channel,
+        });
+    }
+}
+
 /// Compose the registry key for a channel given its `name()` and configured alias.
 /// Aliased channels live at `<name>.<alias>`; un-aliased singletons keep the bare name.
 pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
@@ -9481,6 +9497,14 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
     let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
 
+    let plugin_config = Arc::new(config_arc.read().clone());
+    let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
+        plugin_config,
+        Some(Arc::clone(&config_arc)),
+    )
+    .await;
+    append_configured_plugin_channels(&mut channels, plugin_channels);
+
     #[cfg(feature = "channel-nostr")]
     {
         // Materialize the work list into owned values BEFORE any `.await`
@@ -10275,6 +10299,12 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
+            let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
+                Arc::new(config.clone()),
+                Some(Arc::clone(&config_arc)),
+            )
+            .await;
+            append_configured_plugin_channels(&mut configured_channels, plugin_channels);
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
@@ -22769,6 +22799,10 @@ This is an example JSON object for profile settings."#;
         err: Mutex<Option<anyhow::Error>>,
     }
 
+    struct PluginLifecycleChannel {
+        calls: Arc<AtomicUsize>,
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -22822,6 +22856,18 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for PluginLifecycleChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Plugin,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "operations"
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for BlockUntilClosedChannel {
         fn name(&self) -> &str {
@@ -22862,6 +22908,68 @@ This is an example JSON object for profile settings."#;
             }
             Ok(())
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PluginLifecycleChannel {
+        fn name(&self) -> &str {
+            "plugin"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_only_channel_enters_the_shared_listener_lifecycle_with_exact_alias() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(PluginLifecycleChannel {
+            calls: Arc::clone(&calls),
+        });
+        let mut configured = Vec::new();
+        append_configured_plugin_channels(&mut configured, vec![channel]);
+
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].alias.as_deref(), Some("operations"));
+        let map = configured_channel_map(&configured);
+        assert!(map.contains_key("plugin.operations"));
+        assert!(map.contains_key("plugin"));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(
+            Arc::clone(&configured[0].channel),
+            configured[0].alias.clone(),
+            tx,
+            1,
+            1,
+            cancel.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("plugin-only listener must start under shared supervision");
+        drop(rx);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("plugin-only listener must stop with shared cancellation")
+            .expect("plugin-only listener task must join cleanly");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
