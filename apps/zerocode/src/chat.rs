@@ -2349,14 +2349,25 @@ impl Chat {
                             .copy_hit_regions
                             .iter()
                             .find(|region| {
-                                region.kind == CopyHitKind::Transcript
+                                matches!(region.kind, CopyHitKind::Code | CopyHitKind::Transcript)
                                     && mouse::in_rect(col, row, region.rect)
                             })
                             .cloned()
                         {
                             if !region.text.is_empty() {
                                 crate::mouse::copy_osc52(&region.text);
-                                state.set_overlay_copy_feedback(region.rect);
+                                match region.kind {
+                                    CopyHitKind::Code => {
+                                        state.clear_mouse_highlight();
+                                        state.set_copy_feedback(CopyFeedbackTarget::Code(
+                                            region.group,
+                                        ));
+                                    }
+                                    CopyHitKind::Transcript => {
+                                        state.set_overlay_copy_feedback(region.rect);
+                                    }
+                                    CopyHitKind::Message => {}
+                                }
                                 state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                             }
                         } else {
@@ -3771,11 +3782,10 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
+    state.rebuild_copy_regions(inner_width, scroll, body_rect);
     if state.in_browse_mode() {
-        state.rebuild_copy_regions(inner_width, scroll, body_rect);
         state.rebuild_message_copy_region(body_rect);
     } else {
-        state.copy_hit_regions.clear();
         render_transcript_copy_overlay(f, state);
     }
     render_copy_feedback(f, state);
@@ -8494,8 +8504,8 @@ mod tests {
         state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
             "```bash\necho hello\n```",
         )));
-        state.enter_browse_mode();
         state.mark_dirty_full();
+        assert!(!state.in_browse_mode());
 
         let area = Rect::new(0, 0, 80, 20);
         let backend = TestBackend::new(area.width, area.height);
