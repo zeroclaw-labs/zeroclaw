@@ -1056,6 +1056,13 @@ mod tests {
         assert!(manual.contains("zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}"));
         assert!(!manual.contains("excluded_features"));
 
+        let target_env = manual.find("- name: Configure target environment").unwrap();
+        let release_step = manual.find("- name: Build release").unwrap();
+        let companion = manual.find("- name: Build ZeroCode companion").unwrap();
+        assert!(target_env < release_step && release_step < companion);
+        assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
+        assert!(!manual[release_step..companion].contains("matrix.linker_env"));
+
         for feature in exclusions.values().flatten() {
             assert!(!release.contains(feature));
             assert!(!manual.contains(feature));

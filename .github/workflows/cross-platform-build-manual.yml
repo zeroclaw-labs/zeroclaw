@@ -127,20 +127,26 @@ jobs:
           fi
           echo "$NDK_PREBUILT/bin" >> "$GITHUB_PATH"
 
+      - name: Configure target environment
+        shell: bash
+        run: |
+          {
+            if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+              echo "${{ matrix.linker_env }}=${{ matrix.linker }}"
+            fi
+            if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+              # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556).
+              # Ubuntu's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+              # which segfaults on ARMv6 devices (e.g., Raspberry Pi Zero W).
+              echo "CFLAGS_arm_unknown_linux_gnueabihf=-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+              echo "CXXFLAGS_arm_unknown_linux_gnueabihf=-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+              echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-C target-feature=-neon"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Build release
         shell: bash
         run: |
-          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
-            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
-          fi
-          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
-            # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556).
-            # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
-            # which segfaults on ARMv6 devices (e.g., Raspberry Pi Zero W).
-            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
-            export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
-            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
-          fi
           FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection "${{ inputs.distribution }}" --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
