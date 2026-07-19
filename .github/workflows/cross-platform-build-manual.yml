@@ -2,6 +2,15 @@ name: Cross-Platform Build
 
 on:
   workflow_dispatch:
+    inputs:
+      distribution:
+        description: Feature distribution to measure
+        required: true
+        type: choice
+        default: dist
+        options:
+          - dist
+          - dist-broad
 
 permissions:
   contents: read
@@ -43,10 +52,10 @@ jobs:
           retention-days: 1
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ inputs.distribution }} / ${{ matrix.target }}
     needs: [web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -132,18 +141,26 @@ jobs:
             export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection "${{ inputs.distribution }}" --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
-          if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
-            cargo build --release --locked -p zerocode --target ${{ matrix.target }}
-          fi
+          binary="target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
+          bytes="$(wc -c < "$binary" | tr -d ' ')"
+          {
+            echo "### ${{ inputs.distribution }} / ${{ matrix.target }}"
+            echo
+            echo "- Binary bytes: $bytes"
+            echo "- Resolved features: \`$FEATURES\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zeroclaw-manual-${{ matrix.target }}
+          name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}
           if-no-files-found: error
           retention-days: 1
+      - name: Build ZeroCode companion
+        if: matrix.target != 'aarch64-linux-android'
+        run: cargo build --release --locked -p zerocode --target ${{ matrix.target }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: matrix.target != 'aarch64-linux-android'
         with:
