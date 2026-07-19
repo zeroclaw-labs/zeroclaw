@@ -2,12 +2,6 @@
 //! source per-user, so it must expose feature selection (overridable), not a
 //! fixed set. We generate a sentinel-delimited zone defining the zeroclaw +
 //! zerocode packages with the canonical Dist feature list as the default
-//! `buildFeatures`, overridable via `.override { features = [...]; }`. The
-//! feature list and version come from the spec; nothing is typed.
-//!
-//! Git-dep NAR hashes (not derivable from Cargo.toml) live in nix/hashes.json
-//! and are loaded at Nix evaluation time via builtins.fromJSON. The generator
-//! only emits the structural reference — it never reads or embeds hash values.
 
 use super::spec::{self, Selection};
 use std::path::Path;
@@ -38,7 +32,7 @@ pub fn render_zone(root: &Path) -> anyhow::Result<String> {
     // building each binary with --no-default-features --features <list>. Users
     // override with `.override { features = [ ... ]; }`.
     let lines = [
-        "        # Default feature set: canonical Dist (all channels, no heavyweight).".to_string(),
+        "        # Default feature set: canonical lean Dist.".to_string(),
         "        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.".to_string(),
         format!("        zeroclawDefaultFeatures = [ {feature_list} ];"),
         "        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:"
@@ -121,10 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn zone_default_is_dist_channels_no_heavyweight() {
+    fn zone_default_is_lean_dist() {
         let z = render_zone(&root()).unwrap();
-        assert!(z.contains("\"channel-discord\""), "dist ships all channels");
-        assert!(!z.contains("\"hardware\""), "dist excludes heavyweight");
+        assert!(z.contains("\"channel-matrix\""));
+        assert!(z.contains("\"whatsapp-web\""));
+        assert!(!z.contains("\"channel-slack\""));
     }
 
     #[test]

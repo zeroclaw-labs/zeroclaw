@@ -1,9 +1,4 @@
 //! File attachment processing for the RPC transport.
-//!
-//! Handles base64-encoded uploads and local-path reads, SHA-256
-//! content-addressed deduplication, workspace storage, and marker
-//! generation. Used by both `file/attach` and `session/prompt`
-//! (inline attachments).
 
 use super::session::SessionStore;
 // FileSource is only referenced from the `#[cfg(test)] mod tests` below,
@@ -28,13 +23,6 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
-/// Process a single [`FileEntry`] — resolve bytes, dedup, write to the
-/// upload root, and return a [`FileEntryResult`].
-///
-/// `upload_root` is the directory under which a `uploads/` subdir is
-/// created and bytes are written. Callers should pass the per-agent
-/// workspace dir, NOT the session cwd — uploads belong to the agent,
-/// not to whatever directory the user happened to launch the TUI from.
 pub async fn process_file_entry(
     entry: &FileEntry,
     session_id: &str,
@@ -152,29 +140,6 @@ pub async fn process_file_entry(
     let canonical_display = canonical.to_string_lossy();
     let workspace_path = strip_windows_verbatim_prefix(&canonical_display).into_owned();
 
-    // 6. Build marker.
-    //
-    // Images use `[IMAGE:path]` so the multimodal processor can inline them
-    // as data URIs for vision models. Non-image files use a prose format
-    // matching the channel attachment style (`[Document: name] path`) so the
-    // LLM sees a readable path it can access with file-reading tools.
-    //
-    // Regardless of source (file pick vs clipboard paste) and regardless of
-    // transport (Unix path vs WSS base64), the canonical workspace path is
-    // ALWAYS a valid local file that the multimodal pipeline can load — the
-    // bytes were just written above. Emitting `[IMAGE:<workspace_path>]` for
-    // every source ensures vision models receive the actual image data.
-    //
-    // (A previous implementation emitted `[IMAGE from clipboard]` for the
-    // Clipboard source. That marker had no path, so the multimodal loader
-    // silently produced no inline image part and the model received text
-    // only — observed as the agent hallucinating about prior screenshots.)
-    //
-    // The `display_path` preference is the user's original path only for
-    // stable file picks (Unix transport, non-clipboard). Clipboard pastes
-    // use a /tmp path that the TUI deletes after the turn completes, so
-    // on the next turn the multimodal pipeline would find the file gone
-    // and emit a WARN. Always use the workspace /uploads/ copy for clipboard.
     let kind = attachment_kind(&mime_type);
     let is_clipboard = matches!(entry.source, FileSource::Clipboard);
     let marker = if kind == "IMAGE" {

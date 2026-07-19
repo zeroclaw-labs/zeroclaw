@@ -172,6 +172,15 @@ zc-dashboard-memory-not-configured = Memory is not configured yet. Use Quickstar
 zc-dashboard-search-action-apply = apply
 zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
+zc-dashboard-agent-rename-action-apply = rename
+zc-dashboard-agent-rename-action-cancel = cancel
+zc-dashboard-agent-rename-hint = rename
+zc-dashboard-agent-rename-prefix = rename:
+zc-dashboard-agent-rename-empty = Agent name cannot be empty
+zc-dashboard-agent-rename-unchanged = Agent name unchanged
+zc-dashboard-agent-rename-success = Renamed { $from } to { $to }
+zc-dashboard-agent-rename-success-warnings = Renamed { $from } to { $to } with warnings: { $warnings }
+zc-dashboard-agent-rename-failed = Rename failed: { $error }
 
 zc-dashboard-label-connected = Connected
 zc-dashboard-label-server = Server
@@ -264,7 +273,6 @@ zc-dashboard-run-pending-status = running
 zc-dashboard-run-pending-window = starting now
 zc-dashboard-run-pending-output = Manual trigger in progress…
 
-
 zc-dashboard-yes = yes
 zc-dashboard-no = no
 zc-dashboard-enabled = enabled
@@ -296,6 +304,8 @@ zc-quickstart-risk-yolo-desc = Full autonomy. No approval gates. Use on disposab
 
 zc-quickstart-runtime-tight = Tight
 zc-quickstart-runtime-tight-desc = Low ceilings on iterations and tokens.
+zc-quickstart-runtime-local-small = Local Small
+zc-quickstart-runtime-local-small-desc = Compact limits for smaller local models with structured tool calls.
 zc-quickstart-runtime-balanced = Balanced
 zc-quickstart-runtime-balanced-desc = Sensible ceilings. Recommended.
 zc-quickstart-runtime-unbounded = Unbounded
@@ -360,6 +370,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-switch-error = Failed to switch session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
@@ -408,6 +419,8 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
+zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
 zc-elicit-help-cancel = Cancel

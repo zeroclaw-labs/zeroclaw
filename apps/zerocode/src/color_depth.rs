@@ -1,13 +1,4 @@
 //! Terminal colour-depth detection and RGB down-conversion.
-//!
-//! ratatui emits `Color::Rgb` as 24-bit `\e[38;2;…m` SGR sequences
-//! unconditionally. Terminals that cap at 256 colours (older macOS
-//! Terminal.app, and tmux/screen advertising `screen-256color`) either
-//! ignore or mangle those sequences, producing the washed-out / garbled
-//! palette users hit over SSH+tmux. Detecting the supported depth once at
-//! startup and snapping every themed `Rgb` to the nearest xterm-256 (or
-//! ANSI-16) index keeps the palette legible everywhere instead of forcing
-//! the user to fall back to the uncoloured `terminal` theme.
 
 use std::sync::OnceLock;
 
@@ -25,12 +16,6 @@ pub(crate) enum ColorDepth {
 
 static DEPTH: OnceLock<ColorDepth> = OnceLock::new();
 
-/// The terminal's colour depth, detected once from the environment on first
-/// use and memoised. Detection honours the `ZEROCODE_COLOR` override, then
-/// falls back to truecolor for every terminal except a `dumb`/`ansi`/`-16color`
-/// / empty `TERM`, which gets ANSI-16. Lazy initialisation means callers never
-/// need an explicit startup hook — the first themed colour to render triggers
-/// it.
 pub(crate) fn active() -> ColorDepth {
     *DEPTH.get_or_init(|| {
         detect_from_env(
@@ -80,16 +65,6 @@ fn detect_from_env(
     // universal default below.
     let _ = (colorterm, in_tmux);
 
-    // Default to truecolor. crossterm emits colours verbatim — a 24-bit
-    // `\e[38;2;R;G;Bm` SGR — and that sequence passes through terminal
-    // multiplexers (tmux/screen) uncorrupted even when their TERM advertises a
-    // low-colour terminfo. 256-indexed escapes do NOT: a `screen`/`tmux`
-    // terminfo down-translates `\e[38;5;Nm` to the nearest of the host's 16
-    // ANSI palette slots, collapsing every theme colour onto whatever those
-    // slots happen to be (often near-monochrome). Truecolor sidesteps that
-    // translation, so it is the most faithful universal output for every modern
-    // terminal. The `ZEROCODE_COLOR` override (handled above) forces 256/16 for
-    // the rare terminal that genuinely mishandles 24-bit SGR.
     ColorDepth::TrueColor
 }
 
@@ -106,11 +81,6 @@ fn parse_override(v: &str) -> Option<ColorDepth> {
     }
 }
 
-/// Snap a colour to what the active terminal can render. `Rgb` is passed
-/// through untouched on truecolor terminals, down-converted to the nearest
-/// xterm-256 index on 256-colour terminals, and to the nearest ANSI-16
-/// colour otherwise. Non-`Rgb` colours (named, indexed, `Reset`) are
-/// already renderable everywhere and pass through.
 pub(crate) fn downgrade(color: Color) -> Color {
     downgrade_at(color, active())
 }
