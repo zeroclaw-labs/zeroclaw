@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,6 +23,7 @@ use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 use zeroclaw_runtime::tools::CanvasStore;
 
+use super::acp_embedded;
 use crate::acp_channel::AcpChannel;
 
 // ── Configuration ────────────────────────────────────────────────
@@ -59,6 +60,8 @@ struct Session {
     model_provider: String,
     /// Model identifier (e.g. `"claude-sonnet-4-6"`) for attributable span logs.
     model: String,
+    /// Session cwd / workspace jail root (absolute), used for embedded blob materialization.
+    workspace_dir: String,
 }
 
 // ── ACP Server ───────────────────────────────────────────────────
@@ -566,7 +569,7 @@ impl AcpServer {
                 "promptCapabilities": {
                     "image": false,
                     "audio": false,
-                    "embeddedContext": false,
+                    "embeddedContext": true,
                 },
                 "mcpCapabilities": {
                     "http": false,
@@ -852,6 +855,7 @@ impl AcpServer {
                         .model_provider_for_agent(&agent_alias)
                         .and_then(|mp| mp.model.clone())
                         .unwrap_or_default(),
+                    workspace_dir: workspace_dir.clone(),
                 })),
             );
         }
@@ -1055,6 +1059,7 @@ impl AcpServer {
                         .model_provider_for_agent(&restore_alias)
                         .and_then(|mp| mp.model.clone())
                         .unwrap_or_default(),
+                    workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
             );
         }
@@ -1253,6 +1258,7 @@ impl AcpServer {
                         .model_provider_for_agent(&restore_alias)
                         .and_then(|mp| mp.model.clone())
                         .unwrap_or_default(),
+                    workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
             );
         }
@@ -1383,8 +1389,6 @@ impl AcpServer {
             })?
             .to_string();
 
-        let prompt = Self::parse_prompt(params)?;
-
         // Clone the Arc so the session stays visible in the map throughout the
         // turn. `session/stop` and the reaper can still find it; they will
         // block on the inner Mutex until the turn completes.
@@ -1397,8 +1401,9 @@ impl AcpServer {
             })?
         };
 
-        // Snapshot attribution fields before releasing the outer lock.
-        let (agent_alias, model_provider, model) = {
+        // Snapshot attribution + workspace before releasing the outer lock.
+        // Workspace is required to materialize `resource.blob` into uploads/.
+        let (agent_alias, model_provider, model, workspace_dir) = {
             // Try-lock: if the inner lock is held by an active turn, we'll
             // reject below via register_cancel_token anyway. Use a brief
             // non-blocking peek so we can log the alias even on the error path.
@@ -1407,11 +1412,21 @@ impl AcpServer {
                     s.agent_alias.clone(),
                     s.model_provider.clone(),
                     s.model.clone(),
+                    s.workspace_dir.clone(),
                 )
             } else {
-                (String::new(), String::new(), String::new())
+                (String::new(), String::new(), String::new(), String::new())
             }
         };
+
+        let prompt = Self::materialize_prompt(
+            params,
+            if workspace_dir.is_empty() {
+                None
+            } else {
+                Some(Path::new(&workspace_dir))
+            },
+        )?;
 
         let session_id_s = session_id.clone();
         let agent_alias_s = agent_alias.clone();
@@ -1774,7 +1789,12 @@ impl AcpServer {
         }
     }
 
-    fn parse_prompt(params: &Value) -> std::result::Result<String, RpcError> {
+    /// Join prompt parts into a string. When `workspace_dir` is set, ACP
+    /// `resource.blob` parts are materialized under `{workspace}/uploads/`.
+    fn materialize_prompt(
+        params: &Value,
+        workspace_dir: Option<&Path>,
+    ) -> std::result::Result<String, RpcError> {
         match params.get("prompt") {
             Some(Value::String(s)) => Ok(s.clone()),
             Some(Value::Array(arr)) => {
@@ -1790,13 +1810,38 @@ impl AcpServer {
                     }
                     // Support ACP resource blocks for @-notation file attachments
                     // (clients send {"type":"resource","resource":{"uri":"...","text":"..."}})
-                    if let Some(res) = part.get("resource")
-                        && let Some(text) = res.get("text").and_then(|v| v.as_str())
-                    {
-                        if added || !joined.is_empty() {
-                            joined.push_str("\n\n");
+                    // and embedded binary context via `resource.blob` (base64).
+                    if let Some(res) = part.get("resource") {
+                        if let Some(text) = res.get("text").and_then(|v| v.as_str()) {
+                            if added || !joined.is_empty() {
+                                joined.push_str("\n\n");
+                            }
+                            joined.push_str(text);
+                            added = true;
                         }
-                        joined.push_str(text);
+                        if let Some(blob) = res.get("blob").and_then(|v| v.as_str()) {
+                            let Some(ws) = workspace_dir else {
+                                return Err(RpcError {
+                                    code: INVALID_PARAMS,
+                                    message: "resource.blob requires an active session workspace"
+                                        .to_string(),
+                                    data: None,
+                                });
+                            };
+                            let uri = res.get("uri").and_then(|v| v.as_str());
+                            let mime = res.get("mimeType").and_then(|v| v.as_str());
+                            let materialized =
+                                acp_embedded::materialize_resource_blob(ws, uri, mime, blob)
+                                    .map_err(|e| RpcError {
+                                        code: INVALID_PARAMS,
+                                        message: e.0,
+                                        data: None,
+                                    })?;
+                            if added || !joined.is_empty() {
+                                joined.push_str("\n\n");
+                            }
+                            joined.push_str(&materialized.marker);
+                        }
                     }
                 }
                 if joined.is_empty() {
@@ -2084,6 +2129,110 @@ fn to_acp_content(name: &str, args: &Value) -> Value {
     }
 }
 
+/// Parse `acp.deliver_file path=… mimeType=… titleB64=…` trailer from `deliver_file`.
+///
+/// Returns `(path, mime, title)`. Path may contain spaces (`mimeType=` ends it).
+/// The display title is base64-encoded (`titleB64=`, the optional final key) so
+/// caller prose cannot inject delimiters into this single line; it decodes to an
+/// empty string when absent (older `deliver_file` output) or malformed.
+fn parse_deliver_file_trailer(output: &str) -> Option<(String, String, String)> {
+    for line in output.lines().rev() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("acp.deliver_file ") else {
+            continue;
+        };
+        let path_key = "path=";
+        let mime_key = " mimeType=";
+        let title_key = " titleB64=";
+        let path_start = rest.find(path_key)?;
+        let after_path = &rest[path_start + path_key.len()..];
+        let mime_at = after_path.rfind(mime_key)?;
+        let path = after_path[..mime_at].to_string();
+        let after_mime = &after_path[mime_at + mime_key.len()..];
+        // base64 contains no spaces, so " titleB64=" occurs at most once here.
+        let (mime, title) = match after_mime.find(title_key) {
+            Some(t) => {
+                let mime = after_mime[..t].trim().to_string();
+                let b64 = after_mime[t + title_key.len()..].trim();
+                let title = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .ok()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
+                (mime, title)
+            }
+            None => (after_mime.trim().to_string(), String::new()),
+        };
+        if path.is_empty() || mime.is_empty() {
+            continue;
+        }
+        return Some((path, mime, title));
+    }
+    None
+}
+
+/// Citation-only `uri=` line from deliver_file output; ignored unless it uses `attachment://deliver/`.
+fn parse_deliver_file_uri_line(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(uri) = line.strip_prefix("uri=") else {
+            continue;
+        };
+        let uri = uri.trim();
+        if uri.starts_with("attachment://deliver/") {
+            return Some(uri.to_string());
+        }
+    }
+    None
+}
+
+/// Build ACP `tool_call_update.content` with embedded `resource`+`blob` for `deliver_file`.
+///
+/// Returns `None` to fall back to text-only content (wrong tool name, bad trailer, IO error).
+fn deliver_file_tool_result_content(name: &str, output: &str) -> Option<Value> {
+    if name != "deliver_file" {
+        return None;
+    }
+    let (path, mime_type, _title) = parse_deliver_file_trailer(output)?;
+    // Defense-in-depth: `deliver_file` already validated and size-capped the
+    // path, but we re-read it here. Re-check it is a regular file within the
+    // delivery size limit before loading it, so a swapped/oversized file (or a
+    // path that somehow slipped past the tool) can never load an unbounded blob
+    // into memory. On any mismatch, fall back to text-only content.
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > zeroclaw_runtime::tools::MAX_DELIVER_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let blob = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    let filename = Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    // Prefer the uri emitted by deliver_file (identical string); else shared helper.
+    let uri = parse_deliver_file_uri_line(output)
+        .unwrap_or_else(|| zeroclaw_runtime::tools::attachment_deliver_uri(filename));
+    Some(serde_json::json!([
+        {
+            "type": "content",
+            "content": {
+                "type": "text",
+                "text": output
+            }
+        },
+        {
+            "type": "content",
+            "content": {
+                "type": "resource",
+                "resource": {
+                    "uri": uri,
+                    "mimeType": mime_type,
+                    "blob": blob
+                }
+            }
+        }
+    ]))
+}
+
 fn map_tool_kind(name: &str) -> &'static str {
     match name {
         "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
@@ -2104,6 +2253,7 @@ fn map_tool_kind(name: &str) -> &'static str {
         | "browser_delegate"
         | "cloud_patterns"
         | "data_management"
+        | "deliver_file"
         | "file_read"
         | "git_operations"
         | "google_workspace"
@@ -2177,30 +2327,47 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }),
             }
         }
-        TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: serde_json::json!({
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": id,
-                    "name": name,
-                    "title": name,
-                    "kind": map_tool_kind(name),
-                    "status": "completed",
-                    "rawOutput": output,
-                    "body": output,
-                    "content": [{
-                        "type": "content",
-                        "content": {
-                            "type": "text",
-                            "text": output
-                        }
-                    }]
-                }
-            }),
-        },
+        TurnEvent::ToolResult { id, name, output } => {
+            let content = deliver_file_tool_result_content(name, output).unwrap_or_else(|| {
+                serde_json::json!([{
+                    "type": "content",
+                    "content": {
+                        "type": "text",
+                        "text": output
+                    }
+                }])
+            });
+            // `deliver_file` carries a caller-supplied chat label in its trailer;
+            // surface it as the standard ACP `title` so the client can render a
+            // human-readable name for the delivered file. Falls back to the tool
+            // name (which is what every other tool uses).
+            let title = if name == "deliver_file" {
+                parse_deliver_file_trailer(output)
+                    .map(|(_, _, t)| t)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| name.to_string())
+            } else {
+                name.to_string()
+            };
+            JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": id,
+                        "name": name,
+                        "title": title,
+                        "kind": map_tool_kind(name),
+                        "status": "completed",
+                        "rawOutput": output,
+                        "body": output,
+                        "content": content
+                    }
+                }),
+            }
+        }
         TurnEvent::Thinking { delta } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -2463,6 +2630,10 @@ mod tests {
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["image"],
             false
+        );
+        assert_eq!(
+            result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
         );
         assert_eq!(
             result["agentCapabilities"]["mcpCapabilities"]["http"],
@@ -3430,46 +3601,59 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_parsing() {
-        // String prompt
-        let string_params = serde_json::json!({"prompt": "hello world"});
-        let result = AcpServer::parse_prompt(&string_params).unwrap();
-        assert_eq!(result, "hello world");
-
-        // Array prompt (valid)
-        let array_params = serde_json::json!({
-            "prompt": [
-                {"type": "text", "text": "part 1"},
-                {"type": "text", "text": "part 2"}
-            ]
+    fn materialize_prompt_writes_blob_and_returns_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"pdf-bytes";
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let params = serde_json::json!({
+            "prompt": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///docs/a.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": b64
+                }
+            }]
         });
-        let result = AcpServer::parse_prompt(&array_params).unwrap();
-        assert_eq!(result, "part 1\n\npart 2");
+        let result = AcpServer::materialize_prompt(&params, Some(dir.path())).unwrap();
+        assert!(result.contains("[Document: a.pdf]"));
+        assert!(result.contains("uploads"));
+        let uploads = dir.path().join("uploads");
+        assert!(uploads.exists());
+        let written: Vec<_> = std::fs::read_dir(&uploads).unwrap().collect();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            std::fs::read(written[0].as_ref().unwrap().path()).unwrap(),
+            bytes
+        );
+    }
 
-        // Array prompt (empty or no text)
-        let empty_array_params = serde_json::json!({"prompt": []});
-        let result = AcpServer::parse_prompt(&empty_array_params);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, INVALID_PARAMS);
-
-        let no_text_params = serde_json::json!({
-            "prompt": [
-                {"type": "image", "data": "..."}
-            ]
+    #[test]
+    fn materialize_prompt_blob_without_workspace_is_invalid() {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"x");
+        let params = serde_json::json!({
+            "prompt": [{
+                "type": "resource",
+                "resource": { "uri": "file:///x.bin", "blob": b64 }
+            }]
         });
-        let result = AcpServer::parse_prompt(&no_text_params);
-        assert!(result.is_err());
+        let err = AcpServer::materialize_prompt(&params, None).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("workspace"));
+    }
 
-        // Array prompt with resource (file @-notation from ACP client)
-        let resource_params = serde_json::json!({
-            "prompt": [
-                {"type": "text", "text": "analyze this file:"},
-                {"type": "resource", "resource": {"uri": "file:///tmp/example.rs", "text": "fn main() { println!(\"hi\"); }", "mimeType": "text/rust"}}
-            ]
+    #[test]
+    fn materialize_prompt_rejects_bad_blob_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = serde_json::json!({
+            "prompt": [{
+                "type": "resource",
+                "resource": { "uri": "file:///x.bin", "blob": "%%%" }
+            }]
         });
-        let result = AcpServer::parse_prompt(&resource_params).unwrap();
-        assert!(result.contains("analyze this file:"));
-        assert!(result.contains("fn main() { println!(\"hi\"); }"));
+        let err = AcpServer::materialize_prompt(&params, Some(dir.path())).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.to_lowercase().contains("base64"));
     }
 
     #[test]
@@ -3679,6 +3863,7 @@ mod tests {
         assert_eq!(map_tool_kind("memory_purge"), "delete");
         assert_eq!(map_tool_kind("cron_run"), "execute");
         assert_eq!(map_tool_kind("file_read"), "other");
+        assert_eq!(map_tool_kind("deliver_file"), "other");
         assert_eq!(map_tool_kind("knowledge"), "other");
         assert_eq!(map_tool_kind("web_fetch"), "other");
         assert_eq!(map_tool_kind("file_write"), "edit");
@@ -3765,6 +3950,206 @@ mod tests {
         assert_eq!(
             result_value["params"]["update"]["content"][0]["content"]["text"],
             "file1.txt\nfile2.txt"
+        );
+    }
+
+    #[test]
+    fn deliver_file_tool_result_includes_resource_blob_not_in_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let abs = path.to_string_lossy();
+        let output = format!(
+            "Delivered x.pdf (4 bytes)\nacp.deliver_file path={abs} mimeType=application/pdf"
+        );
+
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output: output.clone(),
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        let update = &n.params["update"];
+        assert_eq!(update["rawOutput"], output);
+        let content = update["content"].as_array().unwrap();
+        assert!(content.iter().any(|c| {
+            c.pointer("/content/type").and_then(|v| v.as_str()) == Some("resource")
+                && c.pointer("/content/resource/blob")
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                && c.pointer("/content/resource/mimeType")
+                    .and_then(|v| v.as_str())
+                    == Some("application/pdf")
+        }));
+        let raw = update["rawOutput"].as_str().unwrap();
+        assert!(!raw.contains("JVBE") && raw.len() < 10_000);
+        let blob = content
+            .iter()
+            .find_map(|c| c.pointer("/content/resource/blob").and_then(|v| v.as_str()))
+            .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob).unwrap();
+        assert_eq!(decoded, b"%PDF");
+    }
+
+    #[test]
+    fn deliver_file_tool_call_update_title_uses_trailer_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let abs = path.to_string_lossy();
+        let title_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "Quarterly report",
+        );
+        let output = format!(
+            "Delivered report.pdf (4 bytes)\nuri=attachment://deliver/report.pdf\nacp.deliver_file path={abs} mimeType=application/pdf titleB64={title_b64}"
+        );
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output,
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        // The caller-supplied prose label (with its space) becomes the ACP title.
+        assert_eq!(n.params["update"]["title"], "Quarterly report");
+    }
+
+    #[test]
+    fn deliver_file_tool_call_update_title_falls_back_to_name_without_trailer_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let abs = path.to_string_lossy();
+        // Older deliver_file output with no `title=` field: fall back to the name.
+        let output = format!(
+            "Delivered x.pdf (4 bytes)\nacp.deliver_file path={abs} mimeType=application/pdf"
+        );
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output,
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        assert_eq!(n.params["update"]["title"], "deliver_file");
+    }
+
+    #[test]
+    fn deliver_file_resource_uri_matches_summary_uri_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a1b2c3d4e5f6.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let abs = path.to_string_lossy();
+        // uri= may differ from path basename; resource.uri must follow uri= line.
+        let uri = "attachment://deliver/other-name.pdf";
+        let output = format!(
+            "Delivered a1b2c3d4e5f6.pdf (4 bytes)\nuri={uri}\nacp.deliver_file path={abs} mimeType=application/pdf"
+        );
+
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output: output.clone(),
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        let update = &n.params["update"];
+        let content = update["content"].as_array().unwrap();
+        let resource_uri = content
+            .iter()
+            .find_map(|c| c.pointer("/content/resource/uri").and_then(|v| v.as_str()))
+            .expect("resource uri");
+        assert_eq!(resource_uri, uri);
+        // No ACP protocol extension for pretty names:
+        assert!(
+            content
+                .iter()
+                .filter_map(|c| c.pointer("/content/resource"))
+                .all(|r| r.get("filename").is_none()),
+            "resource must not carry filename"
+        );
+        let raw = update["rawOutput"].as_str().unwrap();
+        assert!(!raw.contains("JVBE") && raw.len() < 10_000);
+    }
+
+    #[test]
+    fn deliver_file_resource_uri_uses_shared_helper_when_uri_line_absent() {
+        // Backward-compat / trailer-only path: still must match attachment_deliver_uri(basename).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let abs = path.to_string_lossy();
+        let output = format!(
+            "Delivered x.pdf (4 bytes)\nacp.deliver_file path={abs} mimeType=application/pdf"
+        );
+        let expected = zeroclaw_runtime::tools::attachment_deliver_uri("x.pdf");
+
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output,
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        let uri = n.params["update"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|c| c.pointer("/content/resource/uri").and_then(|v| v.as_str()))
+            .unwrap();
+        assert_eq!(uri, expected);
+    }
+
+    #[test]
+    fn deliver_file_rejects_non_attachment_uri_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        let abs = path.to_string_lossy();
+        let output = format!(
+            "Delivered x.pdf (4 bytes)\nuri=file:///etc/passwd\nacp.deliver_file path={abs} mimeType=application/pdf"
+        );
+        let expected = zeroclaw_runtime::tools::attachment_deliver_uri("x.pdf");
+
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output,
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        let uri = n.params["update"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|c| c.pointer("/content/resource/uri").and_then(|v| v.as_str()))
+            .unwrap();
+        assert_eq!(uri, expected);
+    }
+
+    #[test]
+    fn deliver_file_result_caps_oversized_trailer_path() {
+        // A trailer path exceeding the delivery limit must not be read into a
+        // blob (DoS guard); the update falls back to text-only content.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        std::fs::write(
+            &path,
+            vec![0u8; (zeroclaw_runtime::tools::MAX_DELIVER_FILE_BYTES as usize) + 1],
+        )
+        .unwrap();
+        let abs = path.to_string_lossy();
+        let output =
+            format!("Delivered\nacp.deliver_file path={abs} mimeType=application/octet-stream");
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output,
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        let content = n.params["update"]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .all(|c| c.pointer("/content/resource").is_none()),
+            "oversized file must not be materialized into a blob"
         );
     }
 
