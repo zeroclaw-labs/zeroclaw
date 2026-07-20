@@ -125,6 +125,7 @@ mod tests {
             check: check.to_string(),
             passed,
             detail: detail.to_string(),
+            category: crate::grader::GradeCategory::Response,
         }
     }
 
@@ -250,5 +251,10 @@ mod tests {
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
+        // Each grade now carries its category (snake_case) in the JSON report.
+        assert_eq!(
+            json["cases"][0]["grades"][0]["category"].as_str(),
+            Some("response")
+        );
     }
 }

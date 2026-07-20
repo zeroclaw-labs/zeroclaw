@@ -12,11 +12,20 @@ use zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher;
 
 use crate::Mode;
 use crate::case::{LlmTrace, load_suite};
-use crate::grader::evaluate_expects;
+use crate::grader::{GradeResult, grade_run};
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
+
+/// A completed case run plus its grades, produced while the case's temp
+/// workspace is still alive. The workspace itself is intentionally not carried
+/// here (it is dropped once grading finishes).
+#[derive(Debug)]
+pub struct CaseOutcome {
+    pub record: RunRecord,
+    pub grades: Vec<GradeResult>,
+}
 
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
@@ -83,10 +92,10 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
             .to_string();
 
         let report = match run_case(&trace, deps).await {
-            Ok(record) => CaseReport {
+            Ok(outcome) => CaseReport {
                 name,
                 source,
-                grades: evaluate_expects(&trace.expects, &record),
+                grades: outcome.grades,
                 error: None,
             },
             Err(e) => CaseReport {
@@ -102,9 +111,9 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
     Ok(SuiteReport { cases })
 }
 
-/// Run a single trace through a freshly built, isolated agent and capture the run,
-/// dispatching on the mode in `deps`.
-pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
+/// Run a single trace through a freshly built, isolated agent, grade it while its
+/// workspace is still alive, and return the outcome. Dispatches on `deps.mode`.
+pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
     match deps.mode {
         Mode::Replay => run_replay_case(trace, deps).await,
         Mode::Live => crate::live::run_live_case(trace, deps).await,
@@ -113,7 +122,7 @@ pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRec
 
 /// Replay a scripted trace through the Phase 0 deterministic agent (echo tools,
 /// native dispatcher, no network).
-async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
+async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
     // Each case gets an isolated temp workspace and an ephemeral "none" memory
     // backend so cases cannot observe one another.
     let tmp = tempfile::tempdir()?;
@@ -142,14 +151,17 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Run
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
-    Ok(RunRecord {
+    let record = RunRecord {
         final_response,
         history: agent.history().to_vec(),
         tools_called: observer.tool_names(),
         all_tools_succeeded: observer.all_tools_succeeded(),
         input_tokens,
         output_tokens,
-    })
+    };
+    // Grade while the temp workspace is still alive, then let `tmp` drop.
+    let grades = grade_run(trace, &record, tmp.path()).await;
+    Ok(CaseOutcome { record, grades })
 }
 
 #[cfg(test)]
@@ -180,21 +192,27 @@ mod tests {
     #[tokio::test]
     async fn replays_text_only_trace() {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
-        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert!(record.final_response.contains("Hello"));
-        assert!(record.tools_called.is_empty());
-        let grades = evaluate_expects(&trace.expects, &record);
-        assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        assert!(outcome.record.final_response.contains("Hello"));
+        assert!(outcome.record.tools_called.is_empty());
+        assert!(
+            outcome.grades.iter().all(|g| g.passed),
+            "grades: {:?}",
+            outcome.grades
+        );
     }
 
     #[tokio::test]
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
-        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert_eq!(record.tools_called, vec!["echo".to_string()]);
-        assert!(record.all_tools_succeeded);
-        let grades = evaluate_expects(&trace.expects, &record);
-        assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        assert_eq!(outcome.record.tools_called, vec!["echo".to_string()]);
+        assert!(outcome.record.all_tools_succeeded);
+        assert!(
+            outcome.grades.iter().all(|g| g.passed),
+            "grades: {:?}",
+            outcome.grades
+        );
     }
 
     const MULTI_TURN: &str = r#"{
@@ -209,12 +227,12 @@ mod tests {
     #[tokio::test]
     async fn replays_multi_turn_trace_in_order() {
         let trace: LlmTrace = serde_json::from_str(MULTI_TURN).unwrap();
-        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
         // The final response comes from the *last* turn, proving turns replay in order.
         assert!(
-            record.final_response.contains("Goodbye"),
+            outcome.record.final_response.contains("Goodbye"),
             "final response: {:?}",
-            record.final_response
+            outcome.record.final_response
         );
     }
 
