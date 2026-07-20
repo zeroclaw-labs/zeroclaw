@@ -343,6 +343,12 @@ pub struct ChannelQuickStart {
     /// Bot token / shared secret if the channel needs one
     /// (Telegram, Discord). `None` for channels that don't.
     pub token: Option<String>,
+    /// Extra `channels.<type>.<alias>.<key> = value` settings for channels
+    /// that need more than a single secret — Inkbox writes `api_key`,
+    /// `identity`, `signing_key`, etc. Keyed by schema field name; empty
+    /// for single-secret channels.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 /// Agent identity payload from the Agent step. Personality file
@@ -754,6 +760,7 @@ mod tests {
                 channel_type: "cli".into(),
                 alias: "cli".into(),
                 token: None,
+                fields: std::collections::BTreeMap::new(),
             })],
             peer_groups: vec![],
             agent: AgentIdentity {

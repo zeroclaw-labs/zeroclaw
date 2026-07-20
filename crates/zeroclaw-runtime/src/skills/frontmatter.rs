@@ -79,6 +79,7 @@ impl SkillFrontmatter {
                 derived_from_secret: false,
                 credential_class: None,
                 tab: zeroclaw_config::config::ConfigTab::None,
+                quickstart: zeroclaw_config::config::QuickstartVisibility::Hidden,
                 alias_source: None,
                 multiline: false,
             },
@@ -108,6 +109,7 @@ fn field(
         derived_from_secret: false,
         credential_class: None,
         tab: zeroclaw_config::config::ConfigTab::None,
+        quickstart: zeroclaw_config::config::QuickstartVisibility::Hidden,
         alias_source: None,
         multiline: false,
     }

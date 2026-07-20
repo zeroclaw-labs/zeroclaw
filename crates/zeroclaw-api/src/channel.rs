@@ -349,6 +349,9 @@ impl SendMessage {
     }
 }
 
+/// Default interval for refreshing a channel's typing indicator, in seconds.
+const DEFAULT_TYPING_REFRESH_SECS: u64 = 4;
+
 /// A low-level, provider-relative forge API request routed through a
 /// forge-backed channel. Channel-neutral so the `Channel` trait carries no
 /// forge-specific types; the git channel maps this onto its provider's
@@ -459,6 +462,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Seconds between typing-indicator refreshes for this channel.
+    fn typing_refresh_secs(&self) -> u64 {
+        DEFAULT_TYPING_REFRESH_SECS
     }
 
     /// Whether this channel supports progressive message updates via draft edits.

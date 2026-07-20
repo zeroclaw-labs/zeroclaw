@@ -517,6 +517,10 @@ struct ChannelDraft {
     channel_type: String,
     alias: String,
     token: Option<String>,
+    /// Extra `channels.<type>.<alias>.<key>` settings for multi-field channels
+    /// (Inkbox: api_key / identity / signing_key …); empty for single-secret
+    /// channels.
+    fields: std::collections::BTreeMap<String, String>,
     mode: SelectorMode,
 }
 
@@ -712,6 +716,7 @@ impl FormState {
                         channel_type: c.channel_type.clone(),
                         alias: c.alias.clone(),
                         token: c.token.clone(),
+                        fields: c.fields.clone(),
                     }),
                     SelectorMode::Existing => {
                         SelectorChoice::Existing(format!("{}.{}", c.channel_type, c.alias))
@@ -2090,6 +2095,7 @@ impl QuickstartPane {
                 channel_type: ty.to_string(),
                 alias: alias.to_string(),
                 token: None,
+                fields: Default::default(),
                 mode: SelectorMode::Existing,
             });
         }
@@ -2344,6 +2350,11 @@ impl QuickstartPane {
                 // `bot-token` covers Telegram / Discord; `token` is the
                 // generic fallback for any channel kind that just needs
                 // one secret.
+                let is_token_key = |k: &str| {
+                    k.eq_ignore_ascii_case("bot-token")
+                        || k.eq_ignore_ascii_case("token")
+                        || k.eq_ignore_ascii_case("access-token")
+                };
                 let token = {
                     let v = pick("bot-token");
                     if v.is_empty() {
@@ -2353,10 +2364,26 @@ impl QuickstartPane {
                         Some(v)
                     }
                 };
+                // Every other non-empty field (Inkbox: api_key/identity/…)
+                // persists through `fields`.
+                let fields = f
+                    .fields
+                    .iter()
+                    .filter(|r| !is_token_key(&r.descriptor.key))
+                    .filter_map(|r| {
+                        let v = r.buf.trim();
+                        if v.is_empty() {
+                            None
+                        } else {
+                            Some((r.descriptor.key.clone(), v.to_string()))
+                        }
+                    })
+                    .collect();
                 self.form.channels.push(ChannelDraft {
                     channel_type: f.type_key.clone(),
                     alias: f.alias.clone(),
                     token,
+                    fields,
                     mode: SelectorMode::Fresh,
                 });
             }
@@ -3765,6 +3792,7 @@ mod tests {
             channel_type: "telegram".into(),
             alias: "chat".into(),
             token: None,
+            fields: Default::default(),
             mode: SelectorMode::Fresh,
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {

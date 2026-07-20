@@ -2351,18 +2351,31 @@ async fn run_quickstart_cli(
                 alias,
                 extras,
                 ..
-            } => SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: kind,
-                alias,
-                token: extras
+            } => {
+                // Single-secret channels (Telegram, Discord) carry their secret
+                // as `token`; everything else (Inkbox: api_key/identity/…) flows
+                // through `fields`. Splitting here keeps existing channels byte
+                // -for-byte identical while letting multi-field channels persist.
+                let is_token_key = |k: &str| {
+                    k.eq_ignore_ascii_case("bot-token")
+                        || k.eq_ignore_ascii_case("token")
+                        || k.eq_ignore_ascii_case("access-token")
+                };
+                let token = extras
+                    .iter()
+                    .find(|(k, _)| is_token_key(k))
+                    .map(|(_, v)| v.clone());
+                let fields = extras
                     .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
-            }),
+                    .filter(|(k, _)| !is_token_key(k))
+                    .collect();
+                SelectorChoice::Fresh(ChannelQuickStart {
+                    channel_type: kind,
+                    alias,
+                    token,
+                    fields,
+                })
+            }
             ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
         })
         .collect();

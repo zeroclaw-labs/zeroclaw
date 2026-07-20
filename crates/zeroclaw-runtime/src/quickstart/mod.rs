@@ -684,12 +684,18 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
     }
     let leaf_prefix = format!("{section_path}.{SYNTHETIC_ALIAS}.");
 
+    use zeroclaw_config::traits::QuickstartVisibility;
     let mut out = Vec::new();
     for info in probe.prop_fields() {
         let Some(field_path) = info.name.strip_prefix(&leaf_prefix) else {
             continue;
         };
-        if !essentials.contains(&field_path) {
+        // A field is surfaced when the schema marks it `#[quickstart]` (the
+        // registry drives it — no per-channel list to keep in sync) or it is a
+        // legacy essential still carried in the section allowlist below.
+        let shown =
+            info.quickstart != QuickstartVisibility::Hidden || essentials.contains(&field_path);
+        if !shown {
             continue;
         }
         let default = if info.is_secret {
@@ -714,14 +720,20 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             kind: info.kind,
             is_secret: info.is_secret,
             enum_variants: info.enum_variants.map(|f| f()),
-            // `uri` is an override-only field — operators set it only
-            // when pointing at a self-hosted gateway. `api_key` is left
-            // non-required because local providers (Ollama) and Codex
-            // subscription auth don't need one — the runtime surfaces a clear
-            // error at request time if a remote provider is missing its key.
-            // Everything else in the essentials list is required to actually
-            // issue a request.
-            required: !matches!(field_path, "uri" | "api_key"),
+            // A `#[quickstart]`-annotated field carries its own required/optional
+            // designation from the registry. Legacy essentials (no annotation)
+            // keep the historical rule: `uri` is an override-only field —
+            // operators set it only when pointing at a self-hosted gateway.
+            // `api_key` is left non-required because local providers (Ollama)
+            // and Codex subscription auth don't need one — the runtime surfaces
+            // a clear error at request time if a remote provider is missing its
+            // key. Everything else in the essentials list is required to
+            // actually issue a request.
+            required: match info.quickstart {
+                QuickstartVisibility::Required => true,
+                QuickstartVisibility::Optional => false,
+                QuickstartVisibility::Hidden => !matches!(field_path, "uri" | "api_key"),
+            },
             default,
         });
     }
@@ -745,6 +757,10 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
 /// while keeping the modal focused on what an agent cannot start
 /// without.
 const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri"];
+// Legacy per-section allowlist for channels that predate the `#[quickstart]`
+// registry attribute. New channels (e.g. Inkbox) mark their fields in the schema
+// instead of adding a name here, so the surface never carries a private copy of
+// "the fields channel X needs" that can drift from the schema.
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
@@ -1505,6 +1521,18 @@ fn apply_channels(
                             err.to_string(),
                         ));
                         continue;
+                    }
+                }
+                // Extra fields for channels that need more than a single
+                // secret (Inkbox writes api_key / identity / signing_key …).
+                for (key, value) in &entry.fields {
+                    let path = format!("channels.{}.{}.{}", entry.channel_type, entry.alias, key);
+                    if let Err(err) = config.set_prop_persistent(&path, value) {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].{key}"),
+                            err.to_string(),
+                        ));
                     }
                 }
                 refs.push(format!("{}.{}", entry.channel_type, entry.alias));
@@ -2556,6 +2584,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn field_shape_inkbox_is_registry_driven() {
+        // Inkbox carries NO entry in CHANNEL_ESSENTIALS; its Quickstart fields
+        // come entirely from `#[quickstart]` annotations in the schema. This
+        // proves Inkbox onboards through the same schema-walked field-form as
+        // every other channel — no bespoke wizard, no hardcoded field list.
+        assert!(
+            !super::CHANNEL_ESSENTIALS.contains(&"api_key"),
+            "Inkbox's fields must NOT be typed into the CHANNEL_ESSENTIALS surface",
+        );
+        let rows = super::field_shape(super::FieldSection::Channel, "inkbox");
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        for expected in ["api_key", "identity", "signing_key", "base_url"] {
+            assert!(
+                keys.contains(&expected),
+                "`{expected}` must surface via its `#[quickstart]` annotation; got {keys:?}",
+            );
+        }
+        // required/optional is carried by the annotation, not a hardcoded rule.
+        let req = |k: &str| rows.iter().find(|r| r.key == k).unwrap().required;
+        assert!(req("api_key"), "api_key is `#[quickstart]` (required)");
+        assert!(req("identity"), "identity is `#[quickstart]` (required)");
+        assert!(
+            !req("signing_key"),
+            "signing_key is `#[quickstart(optional)]`"
+        );
+        assert!(!req("base_url"), "base_url is `#[quickstart(optional)]`");
+    }
+
     async fn apply_to_temp(submission: BuilderSubmission) -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
@@ -2648,11 +2705,13 @@ mod tests {
                 channel_type: "telegram".into(),
                 alias: "tg".into(),
                 token: Some("tok-a".into()),
+                fields: Default::default(),
             }),
             SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "discord".into(),
                 alias: "dc".into(),
                 token: Some("tok-b".into()),
+                fields: Default::default(),
             }),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
@@ -2671,12 +2730,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_extra_fields_persist_to_their_own_paths() {
+        // A multi-field channel (Inkbox-shaped): no bot_token, several
+        // dedicated fields. Each must land at its real config path.
+        let mut submission = fresh_submission("bot");
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("api_key".to_string(), "ApiKey_test".to_string());
+        fields.insert("identity".to_string(), "on-call-agent".to_string());
+        fields.insert("signing_key".to_string(), "whsec_test".to_string());
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "inkbox".into(),
+            alias: "main".into(),
+            token: None,
+            fields,
+        })];
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let ink = reloaded
+            .channels
+            .inkbox
+            .get("main")
+            .expect("inkbox channel persisted");
+        // `identity` is a plain field — it round-trips verbatim, proving the
+        // write landed at `channels.inkbox.main.identity`.
+        assert_eq!(ink.identity, "on-call-agent");
+        // `api_key` and `signing_key` are `#[secret]`, so they are encrypted at
+        // rest (`enc2:…`). A non-empty value proves the field was written and
+        // recognised as a secret — i.e. routed to the right path.
+        assert!(!ink.api_key.is_empty(), "api_key persisted (encrypted)");
+        assert!(
+            !ink.signing_key.is_empty(),
+            "signing_key persisted (encrypted)"
+        );
+    }
+
+    #[tokio::test]
     async fn peer_groups_persist_to_canonical_section() {
         let mut submission = fresh_submission("bot");
         submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
             channel_type: "telegram".into(),
             alias: "tg".into(),
             token: Some("tok-a".into()),
+            fields: Default::default(),
         })];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),

@@ -44,6 +44,8 @@ pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_gen;
 pub mod image_info;
+#[cfg(feature = "inkbox")]
+pub mod inkbox;
 pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;

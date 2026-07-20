@@ -676,6 +676,8 @@ cli-quickstart-error-agent-name-required = agent name is required
 cli-quickstart-error-agent-exists = agent `{$name}` already exists
 cli-no-channels-compiled = {"  "}No channel types are compiled into this binary.
 cli-quickstart-complete = Quickstart complete. Created agent `{$alias}`.
+
+# Inkbox channel onboarding wizard (Channels step)
 cli-next-steps = Next steps:
 cli-agent-not-created = Your agent was not created — and nothing on disk was changed.
 cli-onboard-deprecated = `zeroclaw onboard` is deprecated — use `zeroclaw quickstart`.

@@ -73,6 +73,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "mattermost",
     "webhook",
     "imessage",
+    "inkbox",
     "matrix",
     "signal",
     "whatsapp",

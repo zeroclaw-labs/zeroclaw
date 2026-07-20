@@ -504,6 +504,81 @@ pub fn all_tools(
     )
 }
 
+/// Pick the Inkbox identity an agent's proactive tools should act as.
+///
+/// Mirrors the channel listener's agent→channel binding (`ActiveChannelAliases`):
+/// the agent only gets tools for an `[channels.inkbox.<alias>]` it owns via its
+/// `agents.<alias>.channels` entries, so it can't act through an identity it does
+/// not own. When no agent binds any channel at all (legacy "accept all enabled
+/// channels" mode), only the single fallback owner the inbound router resolves
+/// (`build_owner_by_channel_key`: the resolved runtime agent, else the first
+/// enabled alias in sort order) is eligible — every other agent gets nothing,
+/// so proactive tools and inbound routing agree on who owns the identity.
+/// Returns `None` when the agent owns no enabled Inkbox channel, in which case
+/// no Inkbox tools register.
+///
+/// # Arguments
+/// * `agent_alias` - the agent the tool set is being built for.
+/// * `agents` - all configured agents (their `channels` carry the bindings).
+/// * `inkbox` - the `[channels.inkbox.*]` map, keyed by alias.
+///
+/// # Returns
+/// `Some(&InkboxConfig)` for the owned, enabled identity, or `None`.
+#[cfg(feature = "inkbox-tools")]
+fn owned_inkbox_channel<'a>(
+    agent_alias: &str,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    inkbox: &'a HashMap<String, zeroclaw_config::schema::InkboxConfig>,
+) -> Option<&'a zeroclaw_config::schema::InkboxConfig> {
+    // Legacy fallback matches ActiveChannelAliases: with no bindings anywhere,
+    // every enabled channel is accepted — but only by the router's single
+    // fallback owner (`Config::resolved_runtime_agent_alias` semantics: the
+    // "default" agent when enabled, else the first enabled alias in sort
+    // order). Handing every agent the tools would let a non-owner act through
+    // the owner's API key.
+    let any_bindings = agents.values().any(|a| !a.channels.is_empty());
+    let mut owned: Vec<&str> = if any_bindings {
+        agents
+            .get(agent_alias)
+            .map(|a| {
+                a.channels
+                    .iter()
+                    .filter_map(|c| c.as_str().strip_prefix("inkbox."))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else if legacy_fallback_agent(agents).is_some_and(|owner| owner == agent_alias) {
+        inkbox.keys().map(String::as_str).collect()
+    } else {
+        Vec::new()
+    };
+    // Deterministic pick if the agent somehow owns more than one.
+    owned.sort();
+    owned
+        .into_iter()
+        .filter_map(|alias| inkbox.get(alias))
+        .find(|c| c.enabled)
+}
+
+/// The single agent the inbound router assigns all channels to in legacy
+/// (no-bindings) mode. Mirrors `build_owner_by_channel_key`'s fallback:
+/// `Config::resolved_runtime_agent_alias` (the literal `"default"` alias)
+/// when that agent is enabled, else the first enabled alias in sort order.
+#[cfg(feature = "inkbox-tools")]
+fn legacy_fallback_agent(agents: &HashMap<String, AliasedAgentConfig>) -> Option<&str> {
+    agents
+        .get_key_value("default")
+        .filter(|(_, a)| a.enabled)
+        .map(|(k, _)| k.as_str())
+        .or_else(|| {
+            agents
+                .iter()
+                .filter(|(_, a)| a.enabled)
+                .map(|(k, _)| k.as_str())
+                .min()
+        })
+}
+
 /// Peer groups that include `agent_alias`, cloned from `config`. Used as the
 /// live resolver body for `send_via` authority (and the snapshot fallback).
 fn filter_agent_peer_groups(
@@ -717,6 +792,18 @@ pub fn all_tools_with_runtime(
                 Arc::clone(&configs),
                 auth_service,
             )));
+        }
+    }
+
+    // Inkbox tools — scoped to the inkbox channel THIS agent owns (mirrors the
+    // listener's agent→channel binding) so an agent can't act through an Inkbox
+    // identity it doesn't own. No owned + enabled identity → no Inkbox tools.
+    #[cfg(feature = "inkbox-tools")]
+    if let Some(ic) = owned_inkbox_channel(agent_alias, agents, &root_config.channels.inkbox) {
+        for tool in
+            zeroclaw_tools::inkbox::build_inkbox_tools(&ic.api_key, &ic.identity, &ic.base_url)
+        {
+            tool_arcs.push(tool);
         }
     }
 
@@ -1577,6 +1664,132 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+
+    /// Inkbox tools must be scoped to the channel an agent actually owns, so one
+    /// agent can't act through another identity's API key (confused deputy).
+    #[cfg(feature = "inkbox-tools")]
+    mod inkbox_tool_scoping {
+        use super::super::owned_inkbox_channel;
+        use std::collections::HashMap;
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::{AliasedAgentConfig, InkboxConfig};
+
+        fn ink(identity: &str, enabled: bool) -> InkboxConfig {
+            InkboxConfig {
+                enabled,
+                api_key: format!("ApiKey_{identity}"),
+                identity: identity.into(),
+                base_url: "https://inkbox.ai".into(),
+                ..Default::default()
+            }
+        }
+
+        fn agent_with(channels: &[&str]) -> AliasedAgentConfig {
+            AliasedAgentConfig {
+                channels: channels.iter().map(|c| ChannelRef::new(*c)).collect(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn each_agent_gets_only_its_owned_identity() {
+            let inkbox = HashMap::from([
+                ("a".to_string(), ink("ident-a", true)),
+                ("b".to_string(), ink("ident-b", true)),
+            ]);
+            let agents = HashMap::from([
+                ("agent_a".to_string(), agent_with(&["inkbox.a"])),
+                ("agent_b".to_string(), agent_with(&["inkbox.b"])),
+            ]);
+            assert_eq!(
+                owned_inkbox_channel("agent_a", &agents, &inkbox).map(|c| c.identity.as_str()),
+                Some("ident-a"),
+            );
+            assert_eq!(
+                owned_inkbox_channel("agent_b", &agents, &inkbox).map(|c| c.identity.as_str()),
+                Some("ident-b"),
+            );
+        }
+
+        #[test]
+        fn agent_that_owns_no_inkbox_gets_nothing() {
+            let inkbox = HashMap::from([("a".to_string(), ink("ident-a", true))]);
+            let agents = HashMap::from([
+                ("agent_a".to_string(), agent_with(&["inkbox.a"])),
+                // owns a non-inkbox channel only
+                ("agent_b".to_string(), agent_with(&["telegram.main"])),
+            ]);
+            assert!(owned_inkbox_channel("agent_b", &agents, &inkbox).is_none());
+            // an agent absent from the map gets nothing either
+            assert!(owned_inkbox_channel("ghost", &agents, &inkbox).is_none());
+        }
+
+        #[test]
+        fn disabled_owned_identity_registers_nothing() {
+            let inkbox = HashMap::from([("a".to_string(), ink("ident-a", false))]);
+            let agents = HashMap::from([("agent_a".to_string(), agent_with(&["inkbox.a"]))]);
+            assert!(owned_inkbox_channel("agent_a", &agents, &inkbox).is_none());
+        }
+
+        #[test]
+        fn legacy_no_bindings_accepts_any_enabled_identity() {
+            // No agent binds any channel → legacy accept-all (matches the listener).
+            let inkbox = HashMap::from([("main".to_string(), ink("ident-main", true))]);
+            let agents = HashMap::from([("default".to_string(), agent_with(&[]))]);
+            assert_eq!(
+                owned_inkbox_channel("default", &agents, &inkbox).map(|c| c.identity.as_str()),
+                Some("ident-main"),
+            );
+        }
+
+        #[test]
+        fn legacy_multi_agent_only_router_fallback_owner_gets_tools() {
+            // Legacy mode with several enabled, unbound agents: the inbound
+            // router assigns every channel to ONE fallback owner
+            // (build_owner_by_channel_key), so only that agent may register
+            // Inkbox tools — otherwise a non-owner could act through the
+            // owner's API key.
+            let inkbox = HashMap::from([("main".to_string(), ink("ident-main", true))]);
+
+            // With a "default" agent enabled, it is the fallback owner.
+            let agents = HashMap::from([
+                ("default".to_string(), agent_with(&[])),
+                ("alpha".to_string(), agent_with(&[])),
+                ("zeta".to_string(), agent_with(&[])),
+            ]);
+            assert_eq!(
+                owned_inkbox_channel("default", &agents, &inkbox).map(|c| c.identity.as_str()),
+                Some("ident-main"),
+            );
+            assert!(owned_inkbox_channel("alpha", &agents, &inkbox).is_none());
+            assert!(owned_inkbox_channel("zeta", &agents, &inkbox).is_none());
+
+            // Without a "default" agent, the first enabled alias in sort
+            // order owns the identity.
+            let agents = HashMap::from([
+                ("alpha".to_string(), agent_with(&[])),
+                ("zeta".to_string(), agent_with(&[])),
+            ]);
+            assert_eq!(
+                owned_inkbox_channel("alpha", &agents, &inkbox).map(|c| c.identity.as_str()),
+                Some("ident-main"),
+            );
+            assert!(owned_inkbox_channel("zeta", &agents, &inkbox).is_none());
+
+            // A disabled "default" cedes ownership to the first enabled alias.
+            let mut disabled_default = agent_with(&[]);
+            disabled_default.enabled = false;
+            let agents = HashMap::from([
+                ("default".to_string(), disabled_default),
+                ("zeta".to_string(), agent_with(&[])),
+            ]);
+            assert!(owned_inkbox_channel("default", &agents, &inkbox).is_none());
+            assert_eq!(
+                owned_inkbox_channel("zeta", &agents, &inkbox).map(|c| c.identity.as_str()),
+                Some("ident-main"),
+            );
+        }
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {

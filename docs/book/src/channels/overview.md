@@ -68,6 +68,16 @@ See [Git](./git.md).
 
 See [Email](./email.md).
 
+### Unified agent identity
+
+A hosted service that gives the agent one identity spanning email, SMS, voice, and iMessage, with inbound traffic delivered through a built-in tunnel (no public host required).
+
+| Channel | Feature flag | Service |
+|---|---|---|
+| Inkbox | `channel-inkbox` | Hosted email + SMS + voice + iMessage identity |
+
+See [Inkbox](./inkbox.md).
+
 ### Voice & telephony
 
 | Channel | Feature flag | Service |

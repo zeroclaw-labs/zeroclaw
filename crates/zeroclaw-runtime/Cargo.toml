@@ -108,6 +108,8 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-
 
 browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+# Inkbox agent tools (send/triage/call), registered when an inkbox channel is enabled.
+inkbox-tools = ["zeroclaw-tools/inkbox"]
 webauthn = []
 sandbox-bubblewrap = []
 
