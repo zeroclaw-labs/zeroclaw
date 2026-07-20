@@ -726,6 +726,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -1705,6 +1708,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
             }
 
@@ -2210,6 +2216,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
                     });
                 }
 

@@ -48,21 +48,6 @@ pub struct TurnTokenUsage {
     pub output_tokens: u64,
 }
 
-/// Borrowed turn-correlation metadata handed to memory and RAG hooks so the
-/// events they emit can join the active turn trace.
-///
-/// All fields are optional: `None` means the operation is not running inside
-/// a correlated agent turn, and observers degrade to root spans rather than
-/// fabricating correlation. The source of truth for each value is the turn
-/// mint site (`Agent::turn`, `run()`, `process_message`); this struct only
-/// carries the borrow.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TurnMetaRef<'a> {
-    pub channel: Option<&'a str>,
-    pub agent_alias: Option<&'a str>,
-    pub turn_id: Option<&'a str>,
-}
-
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,

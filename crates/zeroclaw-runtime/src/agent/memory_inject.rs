@@ -188,6 +188,9 @@ pub async fn render_memory_context(
         num_entries: entries.len(),
         backend,
         success: any_ok,
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
 
     // Older non-Core memories score lower; Core is evergreen.
