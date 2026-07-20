@@ -75,7 +75,7 @@ The per-agent tool registry is the first surface with a single gated constructor
 `ScopedToolRegistry::assemble` (`crates/zeroclaw-runtime/src/tools/scoped.rs`). The
 registry has historically been assembled by hand at six construction sites - the
 reason the built-in filter and MCP scoping had to be patched per-site (#7064,
-#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
+\#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
 (when connected - see the knob below), the built-in `allowed_tools`/
 `excluded_tools` filter, the ACP memory strip, MCP server scoping per `mcp_bundles`
 plus per-tool gating (eager or deferred; omission is not a grant) with the MCP

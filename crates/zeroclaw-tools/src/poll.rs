@@ -258,17 +258,6 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
 
         let recipient_id = recipient.unwrap_or_default();
 
-        // Try the channel's native interactive path first. Channels that don't
-        // override request_choice / request_multi_choice (i.e. everything except
-        // ACP today) return Ok(None) from the default trait impl, and we fall
-        // through to the existing formatted-text path below.
-        //
-        // Note on output shape: this interactive branch returns a JSON-encoded
-        // `ToolResult.output` string (keys: question, answer|answers, channel);
-        // the fallback path below returns a human-readable confirmation string.
-        // The union is documented in `description()` and tracked for unification
-        // (ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation)
-        // (Future Extensions: typed ToolResult.output).
         let interactive_timeout =
             std::time::Duration::from_secs(duration_minutes.saturating_mul(60));
 
@@ -328,11 +317,6 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
             }
         }
 
-        // Fallback: formatted text + emoji reactions (existing behaviour).
-        // For channels with native poll support, we still send a formatted message.
-        // The Channel trait does not expose a create_poll method, so all channels
-        // receive a text-formatted poll. Native Telegram/Discord poll APIs would
-        // require a trait extension; for now we note the intent in the output.
         let is_native = supports_native_poll(&channel_name);
 
         let poll_text = format_text_poll(&question, &options, duration_minutes, multi_select);

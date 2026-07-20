@@ -8,8 +8,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      ZEROCLAW_providers__models__openrouter__agent_demo__api_key: "${OPENROUTER_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-zeroclaw=info,zeroclaw_hardware=info,esp32_sim=info}"
     volumes:
       # Mount the demo config (constrained hardware-only surface).

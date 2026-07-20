@@ -1,8 +1,4 @@
 //! Arduino upload tool — agent generates code, uploads via arduino-cli.
-//!
-//! When user says "make a heart on the LED grid", the agent generates Arduino
-//! sketch code and calls this tool. ZeroClaw compiles and uploads it — no
-//! manual IDE or file editing.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
