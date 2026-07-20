@@ -92,6 +92,7 @@ zc-input-pending-attachments-header = 保留中の添付ファイル:
 zc-input-clipboard-error = クリップボードエラー: { $error }
 zc-queue-empty = 送信するものがありません。
 zc-cancel-timed-out = キャンセルがタイムアウトしました。ターンはローカルで確定されました。
+zc-turn-no-output = ターンが出力なしで完了しました。
 zc-queue-full = キューが満杯です（最大 { $cap } 件）。メッセージが送信されるまでお待ちください。
 zc-queue-title = キュー（{ $count }）
 zc-queue-empty-list = キュー済みメッセージはありません。

@@ -433,8 +433,8 @@ pub async fn run(
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
             if owns_ephemeral && !ephemeral_respawn_done {
                 ephemeral_respawn_done = true;
-                if let crate::ConnectTarget::LocalSocket(_) = target {
-                    let _ = crate::spawn_ephemeral_daemon(config_dir);
+                if let crate::ConnectTarget::LocalSocket(socket) = target {
+                    let _ = crate::spawn_ephemeral_daemon(config_dir, socket);
                 }
             }
 

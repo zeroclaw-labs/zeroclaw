@@ -146,7 +146,7 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
-      - name: Comment hygiene gate (no issue refs / gravitas / truncation artifacts)
+      - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
