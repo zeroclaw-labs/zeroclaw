@@ -349,7 +349,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Export every memory row attributed to `agent_alias`, for the agent-
-    /// deletion archive (export-then-delete, #7175). Pairs with
+    /// deletion archive (export-then-delete,). Pairs with
     /// [`Self::purge_agent`]: the surface exports these rows to the archive,
     /// then purges. Default: empty (backends without per-agent export).
     async fn export_agent(&self, _agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -357,8 +357,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Re-point every memory row from the `from` alias to the `to` alias,
-    /// returning the number of rows re-pointed. Called when an alias is renamed
-    /// (#7468). For the SQL backends (sqlite/postgres) memory rows ride the
+    /// returning the number of rows re-pointed. Called when an alias is renamed.
+    /// For the SQL backends (sqlite/postgres) memory rows ride the
     /// agent's UUID, so this is a single `UPDATE agents SET alias` and the count
     /// is the agents-row count (0 or 1); payload-keyed backends (qdrant) rewrite
     /// the alias on every matching memory point and return that count.
@@ -368,7 +368,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("rename_agent not supported by this memory backend")
     }
 
-    /// Read-only residue probe for the agent-rename cascade (#7940): the count
+    /// Read-only residue probe for the agent-rename cascade: the count
     /// of state [`Self::rename_agent`] WOULD re-point for `agent_alias`, without
     /// mutating anything. Used by the gateway to tell a genuine post-persist
     /// partial failure (state still lagging at the old alias) apart from an
@@ -444,8 +444,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 
     /// Hot-swap the embedding provider after a `config/set` provider-profile
     /// change, so a long-lived memory handle (e.g. the install-wide RPC memory
-    /// handle) stops using stale endpoint/key values without a daemon restart
-    /// (#8359).
+    /// handle) stops using stale endpoint/key values without a daemon restart.
     ///
     /// The arguments are the already-resolved embedding settings — the literal
     /// provider (`openai` / `openrouter` / `custom:<url>`), key, model, and

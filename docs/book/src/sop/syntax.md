@@ -13,41 +13,88 @@ SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir`
 
 Each SOP must have `SOP.toml`. `SOP.md` is optional, but runs with no parsed steps will fail validation.
 
-## 2. `SOP.toml`
+## 2. Authoring Boundary
 
-`SOP.toml` is the SOP manifest. It declares the procedure's metadata in a `[sop]` table and its event sources in a `[[triggers]]` array. Step definitions live in `SOP.md`, not in the manifest. This per-SOP `[sop]` table is distinct from the global engine `[sop]` config documented later under Step Contract Enforcement.
+The file-backed representation still contains a manifest file plus `SOP.md`.
+This page intentionally does not enumerate manifest fields or provide
+hand-authored manifest examples.
 
-### The `[sop]` table
+Use this page for the syntax that remains visible when reviewing, validating, or
+debugging SOPs: `SOP.md` step bullets, trigger field summaries generated from
+the runtime schema, and `condition` expressions. Before running a generated or
+checked-in SOP, validate it with `zeroclaw sop validate <name>`.
 
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `name` | yes | | SOP name. |
-| `description` | yes | | Human-readable summary. |
-| `version` | no | `0.1.0` | Semantic version string. |
-| `priority` | no | `normal` | One of `low`, `normal`, `high`, `critical`. Drives mode resolution under `priority_based`. |
-| `execution_mode` | no | `supervised` | One of `auto`, `supervised`, `step_by_step`, `priority_based`, `deterministic`. |
-| `cooldown_secs` | no | `0` | Minimum seconds between runs of this SOP. |
-| `max_concurrent` | no | `1` | Maximum concurrent runs of this SOP. |
-| `deterministic` | no | `false` | When `true`, forces `deterministic` execution. |
+`SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
+`triggers`, and its execution knobs. The concurrency-admission fields govern what
+happens when a trigger arrives while this SOP's execution slots are full:
 
-`execution_mode` controls how a run asks for approval: `auto` runs end to end with no approval, `supervised` approves once at the start, `step_by_step` approves each step, `priority_based` picks `auto` for `critical` or `high` priority and `supervised` otherwise, and `deterministic` pipes each step's output into the next step's input with no LLM round-trip between them.
+| Field | Default | Effect |
+|---|---:|---|
+| `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. |
+| `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
+| `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
 
-### The `[[triggers]]` array
+`admission_policy` values (`SopAdmissionPolicy`, snake_case):
 
-Each trigger is a TOML table tagged by its lowercase `type`. The `type` selects which fields the trigger accepts; see Trigger Types below for the per-variant field reference. A manifest may declare more than one trigger.
+- `parallel` (default) - admit up to `max_concurrent`; a trigger that cannot admit
+  now is **deferred** (surfaced for backpressure/redelivery on the trigger's
+  transport), never silently dropped. Best for independent work (e.g.
+  PR-approval SOPs).
+- `hold` - serialize: admit only when no run of this SOP is active or parked;
+  other triggers are deferred. For pipelines whose pre-approval steps must not
+  overlap.
+- `coalesce` - collapse a concurrent trigger onto the already-in-flight run (the
+  in-flight run's latest state already covers it).
+- `drop` - legacy fire-and-forget: a trigger that cannot admit is dropped.
+  Explicit opt-in only; never the default.
+
+A deferred trigger's recovery is transport-dependent - there is no in-engine
+durable pending-trigger queue in this version (that is a separate follow-up):
+
+- **AMQP** (`durable_ack = true`, SOP-only dispatch): the delivery is nacked
+  (`requeue = true`) so the broker retries it once there is room.
+- **AMQP combined `sop_and_agent_loop`**: the agent side already consumed the
+  delivery, so a backpressured SOP overflow is logged loudly and ACKed (not
+  redelivered), to avoid double-running the agent side.
+- **MQTT / cron / filesystem / channel-router** (and any other headless source
+  that only logs its dispatch results): no per-message redelivery, so a
+  deferred trigger is dropped after a loud log (the next
+  scheduled/published/observed trigger is the only recovery).
 
 ```toml
 [sop]
-name = "test-sop"
-description = "A test SOP"
+name = "deploy-prod"
+description = "Production deploy with approval"
+version = "1.0.0"
+max_concurrent = 1
+admission_policy = "hold"
+max_pending_approvals = 8
 
 [[triggers]]
 type = "manual"
-
-[[triggers]]
-type = "webhook"
-path = "/sop/test"
 ```
+
+Approval broker groups and policies live in the main ZeroClaw config, not in
+per-SOP `SOP.toml` files. A step can reference a configured policy by name with
+`- policy: prod` in `SOP.md`:
+
+```toml
+[sop.approval.groups.release]
+members = ["http:<paired-token-subject>", "agent:release-bot"]
+
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+escalation_route = "oncall"
+```
+
+`[sop.approval.groups.*]` members are approval identities, not account names.
+Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
+`agent:<alias>`) to grant approval rights on one transport only, or bare
+(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+approval surfaces use the paired-token subject; the current CLI approval path
+(`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
+membership yet.
 
 ## 3. `SOP.md` Step Format
 
@@ -62,9 +109,39 @@ Steps are parsed from the `## Steps` section.
 2. **Deploy** — Run deployment command.
    - tools: shell
    - requires_confirmation: true
+   - policy: prod
    - input: {"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}
    - output: {"type":"object","required":["digest"],"properties":{"digest":{"type":"string"}}}
    - next: 3
+```
+
+Routing and approval bullets can be combined in the same `SOP.md` steps:
+
+```md
+## Steps
+
+1. **Classify event** — Inspect the incoming payload.
+   - output: {"type":"object","required":["severity"],"properties":{"severity":{"type":"string"}}}
+   - when: $.steps.1.severity == "critical"
+   - next: 2
+
+2. **Prepare summary** — Build the operator-facing remediation plan.
+   - depends_on: 1
+   - on_failure: retry:2
+   - next: 3
+
+3. **Approval gate** — Require explicit approval before changing state.
+   - kind: checkpoint
+   - requires_confirmation: true
+   - next: 4
+
+4. **Apply remediation** — Execute the approved action.
+   - tools: shell
+   - allow-tools: shell
+   - on_failure: goto:5
+
+5. **Notify operator** — Send a failure notice for follow-up.
+   - tools: http_request
 ```
 
 Parser behavior:
@@ -73,15 +150,50 @@ Parser behavior:
 - Leading bold text (`**Title**`) becomes step title.
 - `- tools:` maps to `suggested_tools`.
 - `- requires_confirmation: true` enforces approval for that step.
-- `- kind:` sets the step kind: `execute` (default) or `checkpoint`. A `checkpoint` step pauses the run for human approval before continuing.
-- `- when:` is an optional routing guard that uses the same expression grammar as trigger `condition` (see Condition Syntax), evaluated against the accumulated run data. When the guard does not hold, the run completes and no further steps execute.
+- `- kind:` accepts `execute` (default) or `checkpoint`. A checkpoint step
+  pauses deterministic execution at that step. Use `requires_confirmation: true`
+  when a step must require approval in any execution mode.
 - `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
+- `- when:` is a routing guard evaluated against accumulated completed-step
+  outputs after the current step finishes. When it does not match, the run
+  completes instead of dispatching another step.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- when:` guards an explicit `- next:` jump; when the condition is false, the
+  run advances to the next linear step (`current_step + 1`) instead of completing.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
+- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
+  that gates this step's approval with required-group membership and quorum. Omit
+  it for an unpoliced gate. A step that names a policy absent from
+  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
+  clearing on a single approval.
+
+### `[sop.approval]` policies and route delivery
+
+A policy may also route its approval out of band to a channel, so an approver can
+act without watching the surface that started the run:
+
+```toml
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+# Delivered when a run PARKS at a gate this policy governs.
+request_route = "discord.ops:123456789012345678"
+# Delivered only if that gate later TIMES OUT (a distinct second route).
+escalation_route = "discord.oncall:987654321098765432"
+```
+
+Both routes are `channel:recipient`: `channel` is a configured channel's map key
+(`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
+channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
+and never blocks or clears the gate - the approval itself still comes back through
+the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
+approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
+(where channels are configured); leave them unset (or empty) to notify only the
+originating surface, which is the default.
 
 ### Step Contract Enforcement
 
@@ -122,64 +234,77 @@ stored SOP proposals, capture completed run context into a candidate procedure,
 and apply an approved proposal to `SOP.toml`/`SOP.md`. Write-back only happens
 through the explicit `apply` action.
 
+### Run Durability
+
+The `[sop]` config also controls whether run state survives a daemon restart:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `persist_runs` | `true` | Persist run state - including runs parked at a HITL approval or a deterministic checkpoint - so they survive a restart. Set `false` for an in-memory-only, non-durable engine. |
+| `run_store_backend` | `"sqlite"` | Durable backend when `persist_runs` is true. `sqlite` writes `runs.db` under the run-state dir. |
+
+`persist_runs = true` is the default so a parked HITL approval is not lost on
+restart (`build_sop_engine` falls back to an in-memory store with a loud log if
+the durable backend cannot open, so this is default-safe); `persist_runs = false`
+is the documented opt-out for an ephemeral engine.
+
 ## 4. Trigger Types
 
 {{#sop-trigger-index}}
-
-Each trigger is a `[[triggers]]` table tagged by its lowercase `type`. The fields each type accepts:
-
-| `type` | Fields | Notes |
-|---|---|---|
-| `mqtt` | `topic`, `condition` (optional) | `topic` supports `+` (one level) and `#` (remaining levels). Live via the MQTT listener. |
-| `webhook` | `path` | Matched exactly against the request path. No live route feeds it. |
-| `cron` | `expression` | A cron expression. No scheduler feeds it. |
-| `peripheral` | `board`, `signal`, `condition` (optional) | Matched as `board/signal`. No live listener. |
-| `filesystem` | `path`, `events` (optional), `condition` (optional) | `path` is a glob (`*`, `**`, `?`); a bare directory matches anything under it. `events` is one or more of `created`, `modified`, `deleted`, `renamed`. Live via the filesystem watcher. |
-| `calendar` | `calendar_source`, `calendar_ids` (optional) | `calendar_ids` scopes to specific calendars; empty matches all. No live poller. |
-| `manual` | none | Agent-initiated via the `sop_execute` tool. |
-| `amqp` | `routing_key`, `condition` (optional) | Topic-exchange semantics: `.`-delimited words, `*` one word, `#` zero or more words. Live via the AMQP consumer. |
 
 For the live-versus-unwired status of each source and the transport details, see [SOP Fan-In](./fan-in/overview.md).
 
 ## 5. Condition Syntax
 
-A trigger's `condition` is an optional expression evaluated against the event payload; the run starts only when it holds. Step `when:` guards use the same grammar, evaluated against the accumulated run data. Evaluation is fail-closed: a missing or empty payload, an unparseable condition, an unresolved path, or non-comparable values all mean no match, so the trigger does not fire. An empty condition matches unconditionally.
+Trigger `condition` fields and step `when:` guards use the same expression
+grammar. Trigger conditions evaluate against the event payload. Step `when:`
+guards evaluate against accumulated completed-step outputs in this shape:
 
-There are two forms.
+```json
+{
+  "steps": {
+    "1": {
+      "severity": "critical"
+    }
+  }
+}
+```
 
-### JSON path form
+Evaluation is fail-closed for invalid conditions, missing payloads, unresolved
+JSON paths, and direct numeric comparisons whose payload or comparand is not a
+number. An empty condition matches unconditionally.
 
-A condition that starts with `$` compares a value inside a JSON payload: `$.path.to.field <op> <value>`. The path is dot-separated object keys, with a bare number addressing an array element.
+### JSON Path Form
+
+A condition beginning with `$` compares a value inside a JSON payload:
+`$.path.to.field <op> <value>`.
 
 | Expression | Payload | Matches |
 |---|---|---|
-| `$.value > 85` | `{"value": 90}` | yes |
-| `$.value >= 85` | `{"value": 85}` | yes |
-| `$.temp < 25` | `{"temp": 20}` | yes |
-| `$.temp <= 25` | `{"temp": 25}` | yes |
-| `$.status == "critical"` | `{"status": "critical"}` | yes |
-| `$.status != "error"` | `{"status": "ok"}` | yes |
-| `$.count == 42` | `{"count": 42}` | yes |
-| `$.data.sensor.value > 85` | `{"data": {"sensor": {"value": 87.3}}}` | yes |
-| `$.readings.1 == 20` | `{"readings": [10, 20, 30]}` | yes |
-| `$.active == "true"` | `{"active": true}` | yes |
-| `$.nonexistent > 0` | `{"value": 90}` | no (unresolved path, fail-closed) |
+| `$.value > 85` | `{"value":90}` | yes |
+| `$.value >= 85` | `{"value":85}` | yes |
+| `$.temp < 25` | `{"temp":20}` | yes |
+| `$.temp <= 25` | `{"temp":25}` | yes |
+| `$.status == "critical"` | `{"status":"critical"}` | yes |
+| `$.status != "error"` | `{"status":"ok"}` | yes |
+| `$.count == 42` | `{"count":42}` | yes |
+| `$.data.sensor.value > 85` | `{"data":{"sensor":{"value":87.3}}}` | yes |
+| `$.readings.1 == 20` | `{"readings":[10,20,30]}` | yes |
+| `$.active == "true"` | `{"active":true}` | yes |
+| `$.nonexistent > 0` | `{"value":90}` | no |
 
 Path rules:
 
-- Dot-only paths. There is no bracket syntax: write `$.readings.1`, not `$.readings[1]`.
-- No wildcards, no recursive descent, no filters. A missing key fails closed.
-- A numeric segment addresses an array index.
+- Use dot-separated segments. Array elements use a numeric segment such as
+  `$.readings.1`; bracket syntax is not supported.
+- Missing keys, out-of-range array indexes, invalid JSON, and empty payloads
+  fail closed.
+- There are no wildcards, filters, recursive descent, or built-in variables.
 
-Comparison rules:
+### Direct Numeric Form
 
-- Numeric comparison is tried first. If both sides parse as numbers, they compare as numbers.
-- Otherwise values compare as strings. Surrounding double quotes on the comparand are stripped, so quote string literals: `$.status == "critical"`.
-- JSON booleans serialize as the strings `true` and `false`, so compare them as quoted strings: `$.active == "true"`.
-
-### Direct form
-
-A condition with no leading `$` compares the whole payload as a number. This suits peripheral triggers whose payload is a single scalar reading.
+A condition with no leading `$` compares the whole payload as a number. This is
+useful for scalar event payloads.
 
 | Expression | Payload | Matches |
 |---|---|---|
@@ -190,16 +315,22 @@ A condition with no leading `$` compares the whole payload as a number. This sui
 | `== 42` | `42` | yes |
 | `!= 0` | `1` | yes |
 | `> 3.14` | `3.15` | yes |
-
-A non-numeric payload fails closed.
+| `> 0` | `not a number` | no |
 
 ### Operators
 
-A comparison uses one operator, matched longest-first: `>=`, `<=`, `!=`, `==`, `>`, `<`. There is no other operator.
+A comparison uses one operator, matched longest-first: `>=`, `<=`, `!=`, `==`,
+`>`, `<`. JSON-path comparisons try numeric comparison first. If both sides
+parse as numbers, they compare numerically; otherwise values compare as strings.
+Surrounding double quotes on the comparand are stripped, so quote string
+literals: `$.status == "critical"`. Direct numeric conditions are numeric-only:
+if either side does not parse as a number, there is no match.
 
-### What is not supported
+JSON booleans serialize as the strings `true` and `false`, so compare them as
+quoted strings, for example `$.active == "true"`.
 
-A condition is a single comparison. There are no logical combinators (`AND`, `OR`, `NOT`) and no built-in variables (no `$now`, `$run`, `$step`, and so on). To require multiple events, declare multiple triggers or nest SOPs.
+A condition is a single comparison. Logical combinators such as `AND`, `OR`,
+and `NOT` are not supported.
 
 ## 6. Validation
 

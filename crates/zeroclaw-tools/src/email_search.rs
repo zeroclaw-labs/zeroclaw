@@ -215,7 +215,7 @@ impl Tool for EmailSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -289,13 +289,6 @@ pub fn to_imap_date(s: &str) -> Option<String> {
     Some(format!("{}-{}-{}", day, month, year))
 }
 
-/// Allowlist-validates an agent-supplied IMAP SEARCH filter value. The search
-/// criteria string is assembled by concatenation, so a value containing `(`,
-/// `)`, `"`, or IMAP keywords (`OR`, `NOT`, `ALL`, `UNSEEN`) could escape its
-/// quoted group and change the search semantics. We accept only the characters
-/// that occur in real addresses and subject keywords and reject anything else
-/// with a descriptive error, so a crafted filter fails loudly rather than
-/// silently returning a different message set.
 fn validate_search_filter(field: &str, value: &str) -> anyhow::Result<()> {
     if let Some(bad) = value
         .chars()

@@ -42,11 +42,6 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
-    /// Threads (`thread_ts`) for which we have already prepended a
-    /// `[Thread context]` backfill block. In-memory only — after a
-    /// process restart the set is empty and each active thread sees one
-    /// re-backfill on the next inbound message, which is the accepted
-    /// tradeoff (matches `matrix.rs::context`).
     seen_threads: Mutex<HashSet<String>>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
@@ -189,11 +184,6 @@ fn parse_outbound_attachment_markers(
     (cleaned.trim().to_string(), attachments)
 }
 
-/// Extract the Slack message timestamp from a ZeroClaw message ID.
-///
-/// Message IDs follow the format `slack_{channel_id}_{ts}` where `ts`
-/// contains a dot (e.g. `"1234567890.123456"`). If the format is
-/// unrecognised the raw `message_id` is returned as-is.
 fn extract_slack_ts(message_id: &str) -> &str {
     message_id
         .strip_prefix("slack_")
@@ -207,7 +197,6 @@ fn extract_slack_ts(message_id: &str) -> &str {
 }
 
 /// Map a Unicode emoji to its Slack short-name.
-///
 /// The orchestration layer passes Unicode characters (e.g. `"\u{1F440}"`).
 /// Slack's reactions API expects colon-free short-names (`"eyes"`).
 fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
@@ -769,11 +758,6 @@ impl SlackChannel {
         Ok(())
     }
 
-    /// Post a new Slack message and return the message timestamp (`ts`).
-    ///
-    /// This is a lower-level helper that exposes the `ts` value needed for
-    /// subsequent `chat.update` calls. For simple sends, use the [`Channel::send`]
-    /// trait method instead.
     pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<String> {
         let body = serde_json::json!({
             "channel": channel,
@@ -827,7 +811,6 @@ impl SlackChannel {
     }
 
     /// Update an existing Slack message in-place using `chat.update`.
-    ///
     /// `channel` is the channel ID and `ts` is the timestamp of the original
     /// message (returned by `post_message`).
     pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
@@ -922,27 +905,12 @@ impl SlackChannel {
             .map(str::to_string)
     }
 
-    /// Like `inbound_thread_ts`, but only returns a value when Slack's own
-    /// `thread_ts` field is present (genuine thread reply). Does **not** fall
-    /// back to the message's `ts`, so top-level messages get `None`. Used when
-    /// `thread_replies=false` so that all top-level messages from the same user
-    /// share a single conversation session key.
     fn inbound_thread_ts_genuine_only(msg: &serde_json::Value) -> Option<String> {
         msg.get("thread_ts")
             .and_then(|t| t.as_str())
             .map(str::to_string)
     }
 
-    /// Returns the interruption scope identifier for a Slack message.
-    ///
-    /// Returns `Some(thread_ts)` only when the message is a genuine thread reply
-    /// (Slack's `thread_ts` field is present and differs from the message's own `ts`).
-    /// Returns `None` for top-level messages and thread parent messages (where
-    /// `thread_ts == ts`), placing them in the 3-component scope key
-    /// (`channel_reply_target_sender`).
-    ///
-    /// Intentional: top-level messages and threaded replies are separate conversational
-    /// scopes and should not cancel each other's in-flight tasks.
     fn inbound_interruption_scope_id(msg: &serde_json::Value, ts: &str) -> Option<String> {
         msg.get("thread_ts")
             .and_then(|t| t.as_str())
@@ -1230,13 +1198,6 @@ impl SlackChannel {
         })
     }
 
-    /// First-encounter thread-context gate. Returns a rendered
-    /// `[Thread context]` block when this is the first message we forward
-    /// for the given thread; returns `None` for top-level messages, thread
-    /// parents, threads we have already backfilled, or fetch failures.
-    ///
-    /// Marks the thread as seen on success, leaves `seen_threads` untouched
-    /// on fetch failure so the next message in the same thread can retry.
     async fn maybe_render_thread_backfill(
         &self,
         message: &serde_json::Value,
@@ -1257,25 +1218,9 @@ impl SlackChannel {
         block
     }
 
-    /// Pure filter for `render_thread_backfill_block`. Drops, in order:
-    ///
-    /// - the triggering message itself (already forwarded as the message
-    ///   body — including it here would duplicate it for the agent),
-    /// - unsupported message subtypes (`channel_join`, `channel_leave`,
-    ///   bot status messages, etc. — same gate the main polling loop uses),
-    /// - messages with no `user` field (webhook posts, integration bots).
-    ///   The normal Socket Mode and polling paths skip these before they
-    ///   reach the agent under a restricted `allowed_users` config; the
-    ///   backfill path matches that boundary so historical webhook
-    ///   content can't be smuggled in via `conversations.replies`. The
-    ///   count is folded into the same allow-list gap marker so the
-    ///   agent learns context exists but is policy-filtered,
-    /// - messages from users not on the channel's allow-list. The count
-    ///   is returned separately so the renderer can surface a gap marker.
-    ///
-    /// The bot's own past replies (`user == bot_user_id`) are the only
-    /// positively-identified passthrough — they're useful self-context
-    /// for the agent and don't widen the channel's privacy boundary.
+    /// Applies the same authorization boundary to historical thread context as
+    /// to live messages. Only the bot's own replies bypass the user allowlist;
+    /// unsupported, unattributed, and unauthorized messages are omitted.
     fn filter_backfill_messages<'a>(
         messages: &'a [serde_json::Value],
         trigger_ts: &str,
@@ -1358,14 +1303,6 @@ impl SlackChannel {
             .to_string()
     }
 
-    /// Pure composer for the `[Thread context]` block. Takes the
-    /// already-rendered per-message lines (after allow-list filtering and
-    /// reply-cap truncation) plus the two omission counts, and returns the
-    /// final block string with header, gap markers, and char-cap
-    /// truncation applied.
-    ///
-    /// Returns `None` when there is no signal to convey (no rendered
-    /// messages and no omissions).
     fn compose_thread_backfill_block(
         rendered_message_lines: Vec<String>,
         dropped_by_allow_list: usize,
@@ -1696,44 +1633,6 @@ impl SlackChannel {
         Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
     }
 
-    /// Build a `[Thread context]` block summarising the parent and prior
-    /// replies of `thread_ts`, suitable for prepending to the agent payload
-    /// on the bot's first encounter with a thread.
-    ///
-    /// `trigger_ts` is the `ts` of the message currently being forwarded;
-    /// it is filtered out of the backfill so the agent does not see the
-    /// triggering message duplicated (once in the context block, once as
-    /// the message body).
-    ///
-    /// Behaviour:
-    /// - Fail-open: if the underlying Slack fetch fails, returns `None`
-    ///   (logged at WARN so operators can correlate "agent has no context
-    ///   for this thread" with the Slack API failure).
-    /// - Triggering-message filter: the message at `trigger_ts` is dropped
-    ///   so it does not appear twice in the agent payload.
-    /// - Subtype filter: same gate as the main polling loop —
-    ///   `channel_join`, `channel_leave`, bot status messages etc. are
-    ///   skipped so they don't add system noise to the context block.
-    /// - Allow-list filtering: messages from users not on the channel's
-    ///   allow-list are dropped; the count is surfaced as a visible gap
-    ///   marker so the agent knows context is missing for policy reasons.
-    ///   Messages with no `user` field (webhook posts, integration bots)
-    ///   are also dropped and folded into the same gap counter — the
-    ///   normal Socket Mode and polling paths skip these under a
-    ///   restricted allow-list, and the backfill path matches that
-    ///   boundary so historical webhook content can't be smuggled in
-    ///   via `conversations.replies`. The bot's own past replies
-    ///   (`user == bot_user_id`, non-empty) are the only positively-
-    ///   identified passthrough — they're useful self-context and don't
-    ///   widen the channel's privacy boundary.
-    /// - Reply cap: only the most recent `SLACK_PERMALINK_THREAD_MAX_REPLIES`
-    ///   allow-listed messages are rendered, with a `… N earlier thread
-    ///   messages omitted …` prefix marker when the cap activates.
-    /// - Char cap: the joined block is clipped to
-    ///   `SLACK_PERMALINK_TEXT_MAX_CHARS` via `truncate_text`, which
-    ///   appends a `…[truncated]` suffix on overflow.
-    /// - Bot self-mentions (`<@bot_user_id>`) are stripped from each
-    ///   rendered line so downstream re-trigger heuristics don't fire.
     async fn render_thread_backfill_block(
         &self,
         channel_id: &str,
@@ -3324,7 +3223,6 @@ impl SlackChannel {
     }
 
     /// Try to parse a Socket Mode `interactive` envelope as an approval button tap.
-    ///
     /// Returns `Some((token, response))` when the first action's `action_id` matches
     /// `"approval_{TOKEN}_{approve|deny|always}"`, `None` otherwise.
     fn try_parse_approval_block_action(
@@ -4360,13 +4258,6 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    /// Returns the cached `auth.test` `user_id` so the SDK self-loop
-    /// guard can drop the bot's own message echoes (Events API delivers
-    /// the bot's posts back as `bot_id`/`user` events even though
-    /// they're outbound). The cache is populated by
-    /// [`Self::cache_bot_user_id`] on the inbound path; before the
-    /// first hit, returns `None` and the guard falls through to the
-    /// agent-loop fallback in the orchestrator.
     fn self_handle(&self) -> Option<String> {
         self.cached_bot_user_id
             .lock()
@@ -6951,8 +6842,6 @@ mod tests {
 
     // --- Thread-context backfill tests ---
 
-    /// Top-level message (no thread_ts) and thread-parent (`thread_ts == ts`)
-    /// must not trigger backfill, regardless of `seen_threads` state.
     #[test]
     fn thread_backfill_precheck_skips_non_replies() {
         let seen = Mutex::new(HashSet::new());
@@ -6973,14 +6862,6 @@ mod tests {
         assert!(SlackChannel::precheck_thread_backfill(&parent, &seen).is_none());
     }
 
-    /// `filter_backfill_messages` must drop the triggering message
-    /// (otherwise the agent sees it twice — once in `[Thread context]`,
-    /// once as the message body), drop unsupported subtypes such as
-    /// `channel_join`, drop messages with no `user` field (matches the
-    /// normal Socket Mode + polling boundary — webhooks/integration bots
-    /// don't reach the agent under a restricted allow-list), and count
-    /// non-allow-listed and userless messages toward the gap marker so
-    /// the agent learns context exists but is policy-filtered.
     #[test]
     fn thread_backfill_filter_drops_trigger_subtype_userless_and_non_allow_listed() {
         let messages = vec![
@@ -7000,11 +6881,6 @@ mod tests {
             serde_json::json!({"ts": "T_R3", "thread_ts": "T_PARENT", "user": "U_BAD", "text": "filtered"}),
             // Bot's own past reply — must pass through (useful self-context).
             serde_json::json!({"ts": "T_R4", "thread_ts": "T_PARENT", "user": "U_BOT", "text": "bot turn"}),
-            // Userless message — webhook post, integration bot, etc. The
-            // normal inbound path drops these under restricted
-            // `allowed_users`; the backfill path must match that
-            // boundary so historical webhook content can't be smuggled
-            // into [Thread context]. Must be dropped AND counted.
             serde_json::json!({"ts": "T_R5", "thread_ts": "T_PARENT", "text": "from a webhook"}),
             // Same situation with a `bot_id` instead of `user` (some
             // integration messages carry `bot_id` instead of `user`).
@@ -7036,8 +6912,6 @@ mod tests {
         );
     }
 
-    /// Spec 3.5: Mixed allow / non-allow senders → 3 rendered + gap marker
-    /// noting 2 omitted, plus the `[Thread context]` header.
     #[test]
     fn thread_backfill_compose_renders_allow_list_gap_marker() {
         let lines = vec![
@@ -7056,8 +6930,6 @@ mod tests {
         assert!(!block.contains("earlier thread messages omitted"));
     }
 
-    /// Spec 3.6: Thread containing only non-allow-listed senders → only the
-    /// header and the allow-list gap marker (no rendered messages).
     #[test]
     fn thread_backfill_compose_with_only_dropped_senders() {
         let block = SlackChannel::compose_thread_backfill_block(Vec::new(), 4, 0)
@@ -7068,8 +6940,6 @@ mod tests {
         assert!(!block.contains("- "));
     }
 
-    /// Spec 3.7: Thread exceeds reply cap → reply-cap marker rendered
-    /// alongside the most recent messages.
     #[test]
     fn thread_backfill_compose_renders_reply_cap_marker() {
         let lines = (0..SLACK_PERMALINK_THREAD_MAX_REPLIES)
@@ -7083,8 +6953,6 @@ mod tests {
         assert!(!block.contains("non-allow-listed"));
     }
 
-    /// Spec 3.7b: Thread within reply cap but rendered text exceeds char cap
-    /// → block is clipped with the `…[truncated]` suffix marker.
     #[test]
     fn thread_backfill_compose_truncates_long_text() {
         let huge = "x".repeat(SLACK_PERMALINK_TEXT_MAX_CHARS + 1000);
@@ -7095,9 +6963,6 @@ mod tests {
         assert!(block.starts_with("[Thread context]"));
     }
 
-    /// Spec 3.8: Backfilled message containing `<@bot_user_id>` → mention is
-    /// stripped from the rendered line so downstream re-trigger heuristics
-    /// don't fire.
     #[test]
     fn thread_backfill_strip_bot_mentions_removes_self_mention() {
         let line = "- alice: hey <@U_BOT> can you help?";
@@ -7107,9 +6972,6 @@ mod tests {
         assert!(stripped.contains("can you help?"));
     }
 
-    /// Core contract: first reply in an unseen thread triggers backfill;
-    /// after a successful render the thread is recorded; subsequent replies
-    /// skip backfill.
     #[test]
     fn thread_backfill_first_reply_backfills_then_subsequent_replies_do_not() {
         let ch = SlackChannel::new(
@@ -7148,10 +7010,6 @@ mod tests {
         );
     }
 
-    /// Composition order regression: the agent payload must lead with
-    /// `[Thread context]`, then the triggering message text, then any
-    /// attachment / permalink blocks — matching the PR description and
-    /// changelog.
     #[test]
     fn thread_backfill_block_is_prepended_to_payload() {
         let backfill_block = Some("[Thread context]\n- alice: hi\n- bob: hello".to_string());
@@ -7186,9 +7044,6 @@ mod tests {
         );
     }
 
-    /// Fetch failure → triggering message forwarded without
-    /// `[Thread context]` block, and the thread is NOT inserted into
-    /// `seen_threads` so the next message can retry.
     #[test]
     fn thread_backfill_fetch_failure_does_not_record_thread_as_seen() {
         let seen = Mutex::new(HashSet::new());

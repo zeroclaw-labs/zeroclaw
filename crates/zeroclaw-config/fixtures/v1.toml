@@ -591,6 +591,7 @@ timeout_secs = 10
 [text_browser]
 enabled = false
 timeout_secs = 30
+allowed_private_hosts = []  # No private hosts by default; opt-in to allow localhost / RFC1918 / .local
 
 [web_search]
 enabled = true

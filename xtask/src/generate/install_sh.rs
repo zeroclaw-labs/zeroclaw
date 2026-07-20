@@ -2,8 +2,6 @@
 //! hand-authored; we generate one sentinel zone for the source-build
 //! cargo-install step so its dry-run narration and real command come from the
 //! canonical spec and cannot drift. All other install.sh logic (arg parsing,
-//! toolchain bootstrap, web-dist copy, apps, summary) stays outside the
-//! sentinels, unchanged.
 
 use super::spec::{self, Selection};
 use std::path::Path;

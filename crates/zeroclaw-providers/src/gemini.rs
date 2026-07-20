@@ -2,7 +2,6 @@
 //! - Direct API key (`GEMINI_API_KEY` env var or config)
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - ZeroClaw auth-profiles OAuth tokens
-//! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
 use crate::traits::{
@@ -23,12 +22,6 @@ pub struct GeminiModelProvider {
     alias: String,
     auth: Option<GeminiAuth>,
     oauth_project: Arc<tokio::sync::Mutex<Option<String>>>,
-    /// Per-alias seed for the GCP project ID resolved against the
-    /// loadCodeAssist endpoint. Set from
-    /// `GeminiModelProviderConfig.oauth_project`. The seed primes the
-    /// `loadCodeAssist` request body when no project has been resolved
-    /// yet — operators with a fixed project pin avoid the discovery
-    /// round-trip.
     oauth_project_seed: Option<String>,
     oauth_cred_paths: Vec<PathBuf>,
     oauth_index: Arc<tokio::sync::Mutex<usize>>,
@@ -100,22 +93,6 @@ struct GenerateContentRequest {
     generation_config: GenerationConfig,
 }
 
-/// Request envelope for the internal cloudcode-pa API.
-/// OAuth tokens from Gemini CLI are scoped for this endpoint.
-///
-/// The internal API expects a nested structure:
-/// ```json
-/// {
-///   "model": "models/gemini-...",
-///   "project": "...",
-///   "request": {
-///     "contents": [...],
-///     "systemInstruction": {...},
-///     "generationConfig": {...}
-///   }
-/// }
-/// ```
-/// Ref: gemini-cli `packages/core/src/code_assist/converter.ts`
 #[derive(Debug, Serialize)]
 struct InternalGenerateContentEnvelope {
     model: String,
@@ -241,15 +218,6 @@ struct ResponsePart {
 }
 
 impl CandidateContent {
-    /// Extract effective text, skipping thinking/signature parts.
-    ///
-    /// Gemini thinking models (e.g. gemini-3-pro-preview) return parts like:
-    /// - `{"thought": true, "text": "reasoning..."}` — internal reasoning
-    /// - `{"text": "actual answer"}` — the real response
-    /// - `{"thoughtSignature": "..."}` — opaque signature (no text field)
-    ///
-    /// Returns the non-thinking text, falling back to thinking text only when
-    /// no non-thinking content is available.
     fn effective_text(self) -> Option<String> {
         let mut answer_parts: Vec<String> = Vec::new();
         let mut first_thinking: Option<String> = None;
@@ -392,11 +360,6 @@ struct RefreshedToken {
     expiry_millis: Option<i64>,
 }
 
-/// Refresh an expired Gemini CLI OAuth token using the refresh_token grant.
-///
-/// Client credentials are optional and can be sourced from:
-/// - `oauth_creds.json` if present
-/// - `GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` env vars
 fn refresh_gemini_cli_token(
     refresh_token: &str,
     client_id: Option<&str>,
@@ -566,12 +529,6 @@ async fn refresh_gemini_cli_token_async(
 }
 
 impl GeminiModelProvider {
-    /// Create a new Gemini model_provider.
-    ///
-    /// Authentication priority:
-    /// 1. Explicit API key passed in (from `[providers.models.gemini.<alias>]
-    ///    api_key`, reachable via the schema-mirror env grammar)
-    /// 2. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
     pub fn new(alias: &str, api_key: Option<&str>) -> Self {
         let oauth_cred_paths = Self::discover_oauth_cred_paths();
         let resolved_auth = api_key
@@ -595,12 +552,6 @@ impl GeminiModelProvider {
             oauth_client_secret: None,
         }
     }
-    /// Create a new Gemini model_provider with managed OAuth from auth-profiles.json.
-    ///
-    /// Authentication priority:
-    /// 1. Explicit API key passed in (from `[providers.models.gemini.<alias>]`)
-    /// 2. Managed OAuth from auth-profiles.json (if auth_service provided)
-    /// 3. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
     pub fn new_with_auth(
         alias: &str,
         api_key: Option<&str>,
@@ -689,10 +640,6 @@ impl GeminiModelProvider {
         serde_json::from_str(&content).ok()
     }
 
-    /// Discover all OAuth credential files from known Gemini CLI installations.
-    ///
-    /// Looks in `~/.gemini/oauth_creds.json` (default) plus any
-    /// `~/.gemini-*-home/.gemini/oauth_creds.json` siblings.
     fn discover_oauth_cred_paths() -> Vec<PathBuf> {
         let home = match UserDirs::new() {
             Some(u) => u.home_dir().to_path_buf(),
@@ -729,7 +676,6 @@ impl GeminiModelProvider {
 
     /// Try to load OAuth credentials from Gemini CLI's cached credentials.
     /// Location: `~/.gemini/oauth_creds.json`
-    ///
     /// Returns the full `OAuthTokenState` so the model_provider can refresh at runtime.
     fn try_load_gemini_cli_token(path: Option<&PathBuf>) -> Option<OAuthTokenState> {
         let creds = Self::load_gemini_cli_creds(path?)?;
@@ -905,15 +851,6 @@ impl GeminiModelProvider {
         model.strip_prefix("models/").unwrap_or(model).to_string()
     }
 
-    /// Build the API URL based on auth type.
-    ///
-    /// - API key users → public `generativelanguage.googleapis.com/v1beta`
-    /// - OAuth users → internal `cloudcode-pa.googleapis.com/v1internal`
-    ///
-    /// The Gemini CLI OAuth tokens are scoped for the internal Code Assist API,
-    /// not the public API. Sending them to the public endpoint results in
-    /// "400 Bad Request: API key not valid" errors.
-    /// See: <https://github.com/google-gemini/gemini-cli/issues/19200>
     fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
@@ -1017,7 +954,6 @@ impl GeminiModelProvider {
     }
 
     /// Build the HTTP request for generateContent.
-    ///
     /// For OAuth, pass the resolved `oauth_token` and `project`.
     /// For API key, both are `None`.
     fn build_generate_content_request(
@@ -1580,7 +1516,6 @@ mod tests {
     use super::*;
     use reqwest::{StatusCode, header::AUTHORIZATION};
 
-    /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {
         GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(OAuthTokenState {
             access_token: token.to_string(),
@@ -2443,7 +2378,6 @@ mod tests {
         assert!(resp.usage_metadata.is_none());
     }
 
-    /// Validates that warmup() for ManagedOAuth requires auth_service.
     #[tokio::test]
     async fn warmup_managed_oauth_requires_auth_service() {
         let model_provider = GeminiModelProvider {
@@ -2469,7 +2403,6 @@ mod tests {
         );
     }
 
-    /// Validates that warmup() for CLI OAuth skips validation (existing behavior).
     #[tokio::test]
     async fn warmup_cli_oauth_skips_validation() {
         let model_provider = test_model_provider(Some(test_oauth_auth("fake_token")));

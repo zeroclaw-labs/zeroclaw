@@ -8,6 +8,14 @@ use super::payloads::{
 };
 use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
+/// Pin a raw forge-call path under the configured Gitea API base. Same origin
+/// guarantee as the GitHub client: the path is only ever appended after
+/// `base/`, so no absolute URL, `//host`, or `..` in the path can redirect the
+/// request to a different origin.
+fn forge_url(base: &str, path: &str) -> String {
+    format!("{}/{}", base, path.trim_start_matches('/'))
+}
+
 pub struct GiteaApi {
     base: String,
     proxy_url: Option<String>,
@@ -89,13 +97,6 @@ impl GiteaApi {
         }
     }
 
-    /// GET every page of a Gitea list endpoint, following `page` until a short
-    /// page (fewer than `per_page` items) marks the end. Gitea caps `limit`, so
-    /// a single request only ever sees the first page; without this an account
-    /// or repo with more than one page silently drops repos/issues/comments/
-    /// releases. `base_url` must carry any endpoint query params (state/since/
-    /// ...) but NOT `limit`/`page`, which this adds. The `1..=1000` bound is a
-    /// backstop against an endpoint that never returns a short page.
     async fn get_paged<T: DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -264,5 +265,52 @@ impl GiteaApi {
                 .json(&serde_json::json!({ "content": content })),
         )
         .await
+    }
+
+    /// Low-level authed call: build `{base}/{path}`, attach `token`, send, and
+    /// return the raw status + decoded JSON body (Null when empty). Non-2xx is
+    /// returned, not raised, so the caller inspects Gitea's error envelope.
+    pub async fn forge_call(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value), GitChannelError> {
+        let url = forge_url(&self.base, path);
+        let mut req = self.request(method, url, token);
+        if let Some(payload) = body {
+            req = req.json(payload);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        let value = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        };
+        Ok((status, value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forge_url;
+
+    #[test]
+    fn forge_url_pins_raw_path_to_configured_base() {
+        let base = "https://git.example.org/api/v1";
+        assert_eq!(
+            forge_url(base, "repos/o/r/issues/1"),
+            "https://git.example.org/api/v1/repos/o/r/issues/1"
+        );
+        assert_eq!(
+            forge_url(base, "/repos/o/r/issues/1"),
+            "https://git.example.org/api/v1/repos/o/r/issues/1"
+        );
+        assert!(forge_url(base, "https://evil.test/x").starts_with("https://git.example.org/"));
+        assert!(forge_url(base, "//evil.test/x").starts_with("https://git.example.org/"));
+        assert!(forge_url(base, "../../../evil.test").starts_with("https://git.example.org/"));
     }
 }

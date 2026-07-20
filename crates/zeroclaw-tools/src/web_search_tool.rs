@@ -17,7 +17,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
 /// The Bocha key has no boot-time snapshot at all — it is always resolved from
-/// `config.toml` at use time (see [`Self::resolve_bocha_api_key`]), so the
+/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
 /// canonical `[web_search] bocha_api_key` field stays the single source of
 /// truth and rotation/removal takes effect without a restart.
 pub struct WebSearchTool {
@@ -60,11 +60,6 @@ impl WebSearchTool {
         }
     }
 
-    /// Create a `WebSearchTool` with config-reload and decryption support.
-    ///
-    /// `config_path` is the path to `config.toml` so the tool can re-read API
-    /// keys at execution time. `secrets_encrypt` controls whether the keys are
-    /// decrypted via `SecretStore`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         model_provider: String,
@@ -382,13 +377,6 @@ impl WebSearchTool {
             .await
     }
 
-    /// Build the production HTTP client for Tavily, wired through the
-    /// process-global runtime proxy state. Extracted so the
-    /// `search_tavily_with_client` test path can substitute a fresh
-    /// client and stay isolated from concurrent tests that mutate
-    /// `RUNTIME_PROXY_CONFIG` (a request built off a stale "enabled"
-    /// proxy snapshot otherwise routes through a non-existent proxy
-    /// and the wiremock connection fails).
     fn build_tavily_client(&self) -> anyhow::Result<reqwest::Client> {
         let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
         let builder =
@@ -632,12 +620,6 @@ impl WebSearchTool {
         Ok(lines.join("\n"))
     }
 
-    /// Resolve the Bocha AI API key from canonical config at use time.
-    ///
-    /// Unlike the legacy Brave/Tavily/Jina paths, there is intentionally no
-    /// boot-time snapshot for this key: `[web_search] bocha_api_key` in
-    /// `config.toml` is the single source of truth, so key rotation or
-    /// removal after boot takes effect on the next call without a restart.
     fn resolve_bocha_api_key(&self) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -716,16 +698,6 @@ impl WebSearchTool {
             .await
     }
 
-    /// Inner Bocha AI request implementation, parameterized on the HTTP client
-    /// and endpoint URL so request-shape tests can target a local mock server
-    /// with a client that doesn't read process-global proxy state. Production
-    /// calls always go through [`Self::search_bocha`].
-    ///
-    /// API docs: <https://bocha-ai.feishu.cn/wiki/RXEOw02rFiwzGSkd9mUcqoeAnNK>.
-    /// We always pass `summary: true` so each result carries an AI-generated
-    /// excerpt — that's the main draw over the snippet-only Brave/SearXNG
-    /// responses. `freshness` stays at `noLimit` (Bocha's docs explicitly
-    /// recommend this; narrower windows can return empty result sets).
     async fn search_bocha_with_client(
         &self,
         client: &reqwest::Client,
@@ -759,16 +731,6 @@ impl WebSearchTool {
         self.parse_bocha_results(&json, query)
     }
 
-    /// Parse Bocha's response shape into the same plain-text format used by
-    /// the other providers.
-    ///
-    /// Response layout (HTTP 200 success):
-    /// `{"code": 200, "msg": null, "data": {"webPages": {"value": [{"name",
-    /// "url", "snippet", "summary", "siteName", "datePublished"}, ...]}}}`.
-    ///
-    /// Bocha also returns business-logic failures as HTTP 200 with a non-200
-    /// `code` in the body — surface those instead of silently returning
-    /// "No results".
     fn parse_bocha_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         if let Some(code) = json.get("code").and_then(|c| c.as_i64())
             && code != 200
@@ -1138,7 +1100,7 @@ impl Tool for WebSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output: result,
+            output: result.into(),
             error: None,
         })
     }
@@ -1330,7 +1292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_anomaly_modal_block() {
-        // Regression for #6373: DuckDuckGo's anti-bot page now ships an
+        // DuckDuckGo's anti-bot page now ships an
         // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
         // no verification form), and the old detector slid past it,
         // returning a misleading "No results found" message to the agent.
@@ -1658,12 +1620,6 @@ mod tests {
         assert_eq!(key, "tvly-secret-key");
     }
 
-    /// Regression: Tavily auth must travel as `Authorization: Bearer <key>`
-    /// (the documented contract per
-    /// https://docs.tavily.com/documentation/api-reference/endpoint/search),
-    /// NOT as an `api_key` field in the JSON body. The previous shape worked
-    /// against the live service for legacy reasons, but the docs identify
-    /// bearer-header as the canonical method.
     #[tokio::test]
     async fn test_tavily_request_uses_bearer_auth_header_not_body_field() {
         use wiremock::matchers::{header, method, path};
@@ -1694,9 +1650,6 @@ mod tests {
             false,
         );
 
-        // Isolated client so the request shape under test isn't affected
-        // by `RUNTIME_PROXY_CONFIG` mutations from sibling proxy_config
-        // tests running concurrently in the same process.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -2063,9 +2016,6 @@ mod tests {
         assert_eq!(key, "bocha-secret-key");
     }
 
-    /// Rotation and removal must take effect on the next call without a
-    /// restart: the key is resolved from `config.toml` on every call, never
-    /// from a snapshot taken at construction time.
     #[test]
     fn test_resolve_bocha_api_key_tracks_rotation_and_removal() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2186,10 +2136,6 @@ mod tests {
         );
     }
 
-    /// Bocha auth must travel as `Authorization: Bearer <key>` with the
-    /// documented body fields (`summary: true` for AI excerpts, `freshness:
-    /// "noLimit"` per Bocha's own recommendation, `count` bound to
-    /// `max_results`). The key is read from config at request time.
     #[tokio::test]
     async fn test_bocha_request_uses_bearer_auth_and_documented_body() {
         use wiremock::matchers::{header, method, path};
@@ -2218,9 +2164,6 @@ mod tests {
         .unwrap();
         let tool = bocha_tool(config_path, false);
 
-        // Isolated client so the request shape under test isn't affected
-        // by `RUNTIME_PROXY_CONFIG` mutations from sibling proxy_config
-        // tests running concurrently in the same process.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()

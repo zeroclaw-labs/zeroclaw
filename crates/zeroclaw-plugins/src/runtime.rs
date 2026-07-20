@@ -1,10 +1,11 @@
 //! Tool plugin execution: bridges the `tool-plugin` world to the runtime's
 //! `ToolMetadata`/`ToolResult` surface. Fresh store per call, stateless.
 
-use crate::PluginPermission;
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
-use crate::component::{PluginState, call_plugin, engine, load_component, wt};
+use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
+use crate::instance::{PluginGrantSet, PluginInstanceScope};
+use crate::{PluginCapability, PluginPermission};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -62,17 +63,21 @@ fn tool_linker_http() -> &'static Linker<PluginState> {
     })
 }
 
-/// Compile and instantiate a tool plugin under `limits`. The permission set
-/// decides whether the store carries an outbound-HTTP context and whether the
-/// linker exposes `wasi:http`; the two must agree, so both are derived from
-/// `permissions` here.
+/// Compile and instantiate a tool plugin under one host-issued scope.
+///
+/// The scope decides whether the store carries an outbound-HTTP context and
+/// whether the linker exposes `wasi:http`; deriving both from the same scope
+/// prevents authority from drifting between instantiation and execution.
 pub async fn create_plugin(
     wasm_path: &Path,
-    permissions: &[PluginPermission],
+    scope: &PluginInstanceScope,
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
+    scope.require_capability(PluginCapability::Tool)?;
     let component = load_component(wasm_path)?;
-    let mut store = crate::component::new_store(permissions, limits);
+    let mut store = crate::component::new_store(
+        PluginStoreSpec::new(scope.clone(), limits).with_granted_http(),
+    );
     let http = store.data().http_enabled();
     let linker = if http {
         tool_linker_http()
@@ -120,12 +125,14 @@ pub async fn call_execute(
     plugin: &mut Plugin,
     args_json: &[u8],
     config: &HashMap<String, String>,
-    permissions: &[PluginPermission],
 ) -> Result<ToolResult> {
-    let input = inject_config(args_json, effective_config(config, permissions))?;
     call_plugin!(
         plugin,
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
+            let input = inject_config(
+                args_json,
+                effective_config(config, store.data().scope().grants()),
+            )?;
             let result = wt(
                 bindings
                     .zeroclaw_plugin_tool()
@@ -142,7 +149,7 @@ pub async fn call_execute(
 fn into_tool_result(result: WitToolResult) -> ToolResult {
     ToolResult {
         success: result.success,
-        output: result.output,
+        output: result.output.into(),
         error: result.error,
     }
 }
@@ -165,13 +172,13 @@ fn inject_config(args_json: &[u8], config: &HashMap<String, String>) -> Result<S
     serde_json::to_string(&args).context("failed to serialize plugin input")
 }
 
-/// The configured section only when the manifest grants `ConfigRead`, else empty.
+/// The configured section only when the admitted scope grants `ConfigRead`, else empty.
 fn effective_config<'a>(
     config: &'a HashMap<String, String>,
-    permissions: &[PluginPermission],
+    grants: &PluginGrantSet,
 ) -> &'a HashMap<String, String> {
     static EMPTY: OnceLock<HashMap<String, String>> = OnceLock::new();
-    if permissions.contains(&PluginPermission::ConfigRead) {
+    if grants.allows(PluginPermission::ConfigRead) {
         config
     } else {
         EMPTY.get_or_init(HashMap::new)
@@ -231,14 +238,38 @@ mod tests {
     #[test]
     fn effective_config_withholds_section_without_config_read() {
         let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
-        let resolved = effective_config(&config, &[PluginPermission::HttpClient]);
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let resolved = effective_config(&config, scope.grants());
         assert!(resolved.is_empty());
     }
 
     #[test]
     fn effective_config_passes_section_with_config_read() {
         let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
-        let resolved = effective_config(&config, &[PluginPermission::ConfigRead]);
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::ConfigRead],
+        );
+        let resolved = effective_config(&config, scope.grants());
         assert_eq!(resolved.get("api_key").map(String::as_str), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn create_plugin_rejects_a_scope_for_another_capability() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let result = create_plugin(
+            Path::new("/path/that/must/not-be-read.wasm"),
+            &scope,
+            crate::component::test_limits(0),
+        )
+        .await;
+
+        let error = result.err().expect("capability mismatch must fail");
+        assert!(format!("{error:#}").contains("capability"));
     }
 }

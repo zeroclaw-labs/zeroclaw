@@ -1,18 +1,4 @@
 //! Status of the current agent turn, surfaced in the input-bar title.
-//!
-//! `Idle` is the at-rest state: input bar shows " > " and accepts typing.
-//! All other variants mean a turn is in flight; input is disabled and the
-//! title shows a verb + animated dots so the user can see the agent is
-//! still alive even when no chunks are streaming.
-//!
-//! State transitions (driven from `ChatState`):
-//!   * user sends         → `Working`            (request out, nothing back yet)
-//!   * AgentThoughtChunk  → `Thinking`           (reasoning tokens streaming)
-//!   * AgentMessageChunk  → `Responding`         (reply text streaming)
-//!   * ToolCall {name}    → `CallingTool(name)`  (tool invoked, no result yet)
-//!   * matching ToolResult→ back to `Working`    (next chunk will refine)
-//!   * ApprovalRequest    → `WaitingForApproval` (static, no dots)
-//!   * commit / cancel    → `Idle`
 
 use std::time::Instant;
 
@@ -50,11 +36,6 @@ impl TurnStatus {
         }
     }
 
-    /// Compose the title-bar label for the input box.
-    ///
-    /// `animation_origin` is a wall-clock anchor used so the dots animation
-    /// is purely a function of elapsed time. Callers typically pass the
-    /// `Instant` recorded when the turn began.
     pub fn label(&self, animation_origin: Instant) -> String {
         match self {
             TurnStatus::Idle => " > ".to_string(),
@@ -68,11 +49,6 @@ impl TurnStatus {
     }
 }
 
-/// Compute the dot suffix from elapsed time since `origin`.
-///
-/// 400 ms per phase, cycling `""` → `"."` → `".."` → `"..."` → repeat.
-/// With the TUI's 200 ms redraw tick, each phase gets ~2 paints, giving a
-/// smooth pulse without an extra timer.
 fn dots_for(origin: Instant) -> &'static str {
     let phase = (origin.elapsed().as_millis() / 400) % 4;
     match phase {
