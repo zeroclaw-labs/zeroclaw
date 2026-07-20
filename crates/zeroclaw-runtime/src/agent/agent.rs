@@ -1463,8 +1463,11 @@ impl Agent {
             (None, None) if config.sop.sops_dir.is_some() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
                     zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                // CLI / standalone path: no channel map is wired here, so the route
+                // adapter is the no-op (log-only). The daemon path builds the SOP
+                // engine with a real channel-delivering adapter instead.
                 let (engine, audit) =
-                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem);
+                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem, None);
                 (Some(engine), Some(audit))
             }
             _ => (None, None),

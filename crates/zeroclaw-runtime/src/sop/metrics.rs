@@ -32,6 +32,8 @@ struct MetricCounters {
     steps_skipped: u64,
     human_approvals: u64,
     timeout_auto_approvals: u64,
+    /// EPIC G: deterministic `kind = capability` steps executed via the registry.
+    capability_executed: u64,
 }
 
 // ── RunSnapshot ────────────────────────────────────────────────
@@ -174,6 +176,26 @@ impl SopMetricsCollector {
             .or_insert((Instant::now(), 0));
         entry.0 = Instant::now();
         entry.1 += 1;
+    }
+
+    /// EPIC G: record a deterministic capability step execution (global + per-SOP).
+    pub fn record_capability_executed(&self, sop_name: &str) {
+        let Ok(mut state) = self.inner.write() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_capability_executed"
+            );
+            return;
+        };
+        state.global.counters.capability_executed += 1;
+        state
+            .per_sop
+            .entry(sop_name.to_string())
+            .or_default()
+            .counters
+            .capability_executed += 1;
     }
 
     /// Record a timeout auto-approval event.
@@ -572,6 +594,7 @@ fn resolve_from_counters(c: &MetricCounters, metric: &str) -> Option<serde_json:
         "runs_completed" => Some(json!(c.runs_completed)),
         "runs_failed" => Some(json!(c.runs_failed)),
         "runs_cancelled" => Some(json!(c.runs_cancelled)),
+        "capability_executed" => Some(json!(c.capability_executed)),
         "deviation_rate" => {
             if c.steps_executed == 0 {
                 Some(json!(0.0))
