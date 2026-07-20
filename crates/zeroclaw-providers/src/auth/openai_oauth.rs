@@ -226,12 +226,6 @@ pub async fn poll_device_code_tokens(
 }
 
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
-    // OAuth callback receiver has no concrete provider alias at this
-    // level (it's a low-level helper used during the OAuth dance,
-    // before the provider is constructed). Attribute with the provider
-    // type so on-disk events still slot under the right
-    // model_provider_type bucket. The "oauth" alias is a sentinel for
-    // "this happened during the OAuth dance".
     ::zeroclaw_log::scope!(
         model_provider_type: "openai",
         model_provider_alias: "oauth",

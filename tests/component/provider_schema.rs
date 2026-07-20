@@ -1,11 +1,4 @@
 //! TG7: ModelProvider Schema Conformance Tests
-//!
-//! Prevents: Pattern 7 — External schema compatibility bugs (7% of user bugs).
-//! Issues: #769, #843
-//!
-//! Tests request/response serialization to verify required fields are present
-//! for each model_provider's API specification. Validates ChatMessage, ChatResponse,
-//! ToolCall, and AuthStyle serialization contracts.
 
 use zeroclaw::providers::compatible::AuthStyle;
 use zeroclaw::providers::traits::{ChatMessage, ChatResponse, ToolCall};
@@ -67,7 +60,7 @@ fn chat_message_json_roundtrip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ToolCall serialization (#843 - tool_call_id field)
+// ToolCall serialization- tool_call_id field)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]

@@ -116,7 +116,7 @@ struct NativeToolFunctionSpec {
     name: String,
     description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
-    /// transparently, never deep-cloned per request (#8642).
+    /// transparently, never deep-cloned per request
     parameters: std::sync::Arc<serde_json::Value>,
 }
 
@@ -298,13 +298,19 @@ impl OpenAiModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content");
@@ -489,12 +495,6 @@ impl ModelProvider for OpenAiModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
-            // Omit tool_choice when the tool list is empty — vLLM 0.19+ and
-            // spec-compliant validators reject tool_choice without a non-empty
-            // tools field (HTTP 400). `Self::convert_tools` is a plain
-            // `tools.map(...)`, so an empty input slice yields `Some(vec![])`
-            // (not `None`) — guard on `tools` being `Some` *and* the resulting
-            // list being non-empty, not merely on `is_some()`.
             tool_choice: tools
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
@@ -673,12 +673,6 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiModelProvider {
     }
 }
 
-// ── OpenAI Responses API provider (wire_api = "responses") ────────────────
-//
-// Uses the OpenAI Responses API (`/v1/responses`) with a standard API key.
-// Supports full streaming tool calls, unlike the chat-completions `OpenAiModelProvider`.
-// Constructed by the factory when `wire_api = "responses"` without Codex OAuth.
-
 /// Request body for the standard OpenAI Responses API.
 #[derive(Debug, Serialize)]
 struct ResponsesApiRequest {
@@ -774,7 +768,6 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 }
 
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
-///
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
 /// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
 pub(crate) async fn run_responses_sse(
@@ -903,23 +896,6 @@ pub struct OpenAiResponsesModelProvider {
     /// connect timeout so long-running responses aren't killed mid-stream.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
-    /// Extra HTTP headers to include on every request issued through
-    /// `http_client` / `streaming_client`. Each entry is merged into the
-    /// reqwest `Client` builder's `default_headers`.
-    ///
-    /// **Authorization is reserved.** An entry whose key matches
-    /// `Authorization` (case-insensitive) is dropped at
-    /// `build_default_headers` time with a WARN log. The provider's
-    /// built-in bearer credential (configured via the `credential`
-    /// constructor argument and emitted per-request as
-    /// `Authorization: Bearer <key>`) is authoritative; operator auth
-    /// overrides via `extra_headers` are not supported on this code path
-    /// because reqwest 0.12 *appends* per-request headers on top of
-    /// `default_headers` rather than substituting them, which would
-    /// produce two `Authorization` values on the wire and cause most
-    /// servers to reject or pick non-deterministically. To rotate the
-    /// bearer credential, pass it through the `credential` constructor
-    /// argument instead.
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1006,17 +982,6 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    /// Build the default-header set from `extra_headers`. Returns an empty
-    /// `HeaderMap` when the provider has no extra headers configured.
-    ///
-    /// Reserved keys (case-insensitive `Authorization`) are dropped with
-    /// a WARN log: the provider's built-in bearer credential is
-    /// authoritative, and an operator-set `Authorization` would produce
-    /// two header values on the wire (reqwest 0.12 appends per-request
-    /// headers on top of `default_headers`, it does not substitute them).
-    ///
-    /// Invalid header names / values are also logged at WARN and skipped
-    /// (matching the `OpenAiCompatibleModelProvider::http_client` policy).
     fn build_default_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.extra_headers {
@@ -1054,14 +1019,6 @@ impl OpenAiResponsesModelProvider {
         headers
     }
 
-    /// HTTP client for non-streaming responses requests: total timeout from
-    /// `self.timeout_secs` plus a 10s connect timeout, plus any
-    /// `extra_headers` (with reserved keys dropped — see
-    /// `build_default_headers`) merged into reqwest `default_headers`.
-    /// The per-request `.header("Authorization", ...)` calls in
-    /// `chat` / `chat_with_system` / `stream_chat` are the sole source of
-    /// the `Authorization` value on the wire; the built-in provider
-    /// credential is therefore authoritative on this code path.
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1073,12 +1030,6 @@ impl OpenAiResponsesModelProvider {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
-    /// HTTP client for streaming SSE connections: connect timeout only,
-    /// no total timeout (a total timeout would kill long-running SSE
-    /// responses mid-stream). When `extra_headers` is non-empty they are
-    /// merged into `default_headers`; per-request `.header(...)` calls
-    /// (e.g. `Authorization`, `Accept: text/event-stream`) override any
-    /// matching `default_headers` entries.
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
@@ -1348,21 +1299,6 @@ mod tests {
         assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
-    // ----------------------------------------------------------
-    // Issue #7690 follow-up: timeout_secs + extra_headers wiring.
-    //
-    // The PR #8037 wire-body pin covers `max_tokens` / `reasoning_effort` /
-    // model / instructions / temperature / stream / tools / tool_choice /
-    // parallel_tool_calls (everything that flows through `build_request`).
-    // The two remaining runtime options the issue asked for —
-    // `provider_timeout_secs` and `extra_headers` — are client-level
-    // (they configure the `reqwest::Client` builder), so they need
-    // different tests: builder-propagation tests for the struct fields,
-    // and `build_default_headers` tests for the HeaderMap shape (reqwest
-    // `Client` does not expose its internal timeout or default_headers,
-    // so the HeaderMap is the only testable surface).
-    // ----------------------------------------------------------
-
     #[test]
     fn responses_provider_defaults_timeout_to_120() {
         let p = OpenAiResponsesModelProvider::new("test", None, None);
@@ -1497,31 +1433,8 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------
-    // Issue #7690 follow-up: Authorization header precedence (option A).
-    //
-    // Per the review on PR #8037 (singlerider, 2026-06-23): reqwest 0.12
-    // *appends* per-request headers on top of `default_headers`, it does
-    // not substitute them. An `Authorization` entry in `extra_headers`
-    // therefore produces two `Authorization` values on the wire and
-    // most servers reject or pick non-deterministically. The fix is to
-    // drop the reserved key (case-insensitive) from the merge and emit
-    // a WARN. The provider's built-in bearer credential (set via the
-    // `credential` constructor argument and emitted per-request as
-    // `Authorization: Bearer <key>`) stays authoritative.
-    //
-    // These tests pin the precedence at the `build_default_headers`
-    // surface (the only HeaderMap observable test seam — reqwest
-    // `Client` does not expose its internal `default_headers`).
-    // ----------------------------------------------------------
-
     #[test]
     fn build_default_headers_drops_authorization_in_favor_of_builtin() {
-        // Operator sets an `Authorization` in `extra_headers`. The
-        // builder must drop it (case-insensitive) and emit a WARN. The
-        // built-in provider credential (set via the `credential`
-        // constructor argument) is the sole `Authorization` source on
-        // the wire.
         let mut headers = std::collections::HashMap::new();
         headers.insert(
             "Authorization".to_string(),
@@ -1571,11 +1484,6 @@ mod tests {
 
     #[test]
     fn build_default_headers_preserves_non_authorization_extra_headers() {
-        // Reserved-key drop is *narrow*: only `Authorization` (and its
-        // case variants) is reserved. Other custom headers flow through
-        // unchanged. This pins that the drop does not accidentally widen
-        // to a deny-list of common headers like `Cookie`, `X-Api-Key`,
-        // etc.
         let mut headers = std::collections::HashMap::new();
         headers.insert(
             "Authorization".to_string(),
@@ -1942,6 +1850,39 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // Regression for #8675: pins that the openai `convert_messages` call
+        // site of `sanitize_tool_arguments` is wired in. The helper contract
+        // itself is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#.to_string(),
+        )];
+
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#.to_string(),
+        )];
+
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
@@ -2105,89 +2046,6 @@ mod tests {
             1.0
         );
     }
-
-    // ----------------------------------------------------------
-    // Responses-wire option propagation (#7690)
-    //
-    // Pinned regression: non-default options configured on
-    // `OpenAiResponsesModelProvider` (via the `with_*` builders) must
-    // survive into `ResponsesApiRequest` at the wire boundary. Without
-    // these tests, a future refactor could silently drop
-    // `max_tokens` / `reasoning_effort` / `responses_url` / tools /
-    // instructions / temperature while existing smoke tests still pass.
-    //
-    // Test seam: `build_request` is private but reachable via `super::*`
-    // from this `#[cfg(test)] mod tests`. We construct the provider with
-    // the non-default option, call `build_request` with minimal
-    // required arguments, serialize to JSON, and assert each option is
-    // present in the wire body (or, for URL, in the field
-    // `responses_url`).
-    //
-    // No live network dependency. No provider credentials required.
-    // ----------------------------------------------------------
-    //
-    // Supported options (asserted below with `propagates_*_when_set`
-    // tests, and pinned for `None` propagation with `omits_*_when_unset`
-    // tests):
-    //
-    // | Provider builder        | Wire field on `ResponsesApiRequest` | Notes                                  |
-    // |-------------------------|--------------------------------------|----------------------------------------|
-    // | `with_max_tokens`       | `max_output_tokens`                  | Omits when `None`                      |
-    // | `with_reasoning_effort` | `reasoning.effort`                   | Omits when `None`                      |
-    // | `with_timeout_secs`     | (client-level: reqwest total timeout) | Default 120; non-streaming only        |
-    // | `with_extra_headers`    | (client-level: reqwest default headers) | Invalid names/values WARN-skipped     |
-    // | (model arg)             | `model`                              | Always present                         |
-    // | (instructions arg)      | `instructions`                       | Omits when `None`                      |
-    // | (temperature arg)       | `temperature`                        | Force-1.0 for o1/o3/gpt-5-*; else pass |
-    // | (stream arg)            | `stream`                             | Always present (bool)                  |
-    // | (tools arg)             | `tools`                              | Omits when `None`                      |
-    // | (tool_choice arg)       | `tool_choice`                        | Omits when `None` AND tools absent     |
-    // | (parallel arg)          | `parallel_tool_calls`                | Omits when `None` AND tools absent     |
-    //
-    // Intentionally NOT propagated by the responses wire (these would
-    // be silently dropped — listed here as known-unsupported for this
-    // code path so future maintainers do not "fix" them by quietly
-    // adding fields the OpenAI Responses API does not accept):
-    //
-    // - `top_p` — Responses API has no `top_p`; callers who need it
-    //   must use the legacy `OpenAiModelProvider` (chat-completions
-    //   path).
-    // - `frequency_penalty` / `presence_penalty` — Responses API
-    //   rejects both. Same fallback path as `top_p`.
-    // - `stop` / `seed` — not exposed by
-    //   `OpenAiResponsesModelProvider`'s `with_*` builders; add to this
-    //   list if/when a `with_seed` builder is introduced.
-    // - `logprobs` — Responses API uses `top_logprobs` instead; not
-    //   propagated. Same fallback path as `top_p`.
-    //
-    // Runtime options routed through the responses provider
-    // (now supported by the factory + provider — tests below pin the
-    // struct-level defaults, the builder propagation, and the
-    // `build_default_headers` shape, and the factory's end-to-end
-    // timeout forwarding is exercised in
-    // `factory::tests::responses_factory_forwards_timeout_secs_to_responses_provider`):
-    //
-    // - `provider_timeout_secs` — `OpenAiResponsesModelProvider` carries
-    //   a `timeout_secs` field (default 120) with a `with_timeout_secs`
-    //   builder; the non-streaming `http_client` applies it as the
-    //   reqwest `Client::builder().timeout(...)` and the streaming
-    //   `streaming_client` uses connect-timeout only (no total timeout,
-    //   so long SSE responses aren't killed mid-stream).
-    // - `extra_headers` — `OpenAiResponsesModelProvider` carries an
-    //   `extra_headers` field (default empty `HashMap`) with a
-    //   `with_extra_headers` builder; the `build_default_headers`
-    //   helper merges them into the `reqwest::Client` default headers
-    //   for both `http_client` and `streaming_client`, with invalid
-    //   header names / values logged at WARN and skipped (matching
-    //   `OpenAiCompatibleModelProvider::http_client`).
-    // - `api_path` — already routed correctly via the `api_url` argument
-    //   to `OpenAiResponsesModelProvider::new`, which lands in the
-    //   `responses_url` field and composes the final URL with the
-    //   `/responses` suffix. The `opts.api_path` runtime option is
-    //   not separately needed on the responses path because the
-    //   factory maps `api_url` (from the provider config) into the
-    //   `OpenAiResponsesModelProvider::new` constructor.
-    // ----------------------------------------------------------
 
     #[test]
     fn responses_request_propagates_max_tokens_when_set() {

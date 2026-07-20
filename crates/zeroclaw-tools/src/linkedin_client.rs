@@ -590,12 +590,6 @@ impl LinkedInClient {
         Ok(new_token)
     }
 
-    /// Register an image asset with LinkedIn, upload binary data, and return the asset URN.
-    ///
-    /// LinkedIn's image post flow is three steps:
-    /// 1. Register the upload → get an upload URL + asset URN
-    /// 2. PUT the binary image to the upload URL
-    /// 3. Reference the asset URN when creating the post
     pub async fn upload_image(
         &self,
         image_bytes: &[u8],
@@ -823,7 +817,6 @@ impl LinkedInClient {
 // ── Image Generation ─────────────────────────────────────────────
 
 /// Multi-provider image generator with SVG fallback card.
-///
 /// Tries AI model_providers in configured priority order. If all fail (missing keys,
 /// API errors, exhausted credits), falls back to generating a branded SVG card.
 pub struct ImageGenerator {

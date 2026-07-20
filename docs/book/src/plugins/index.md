@@ -80,11 +80,12 @@ The manifest declares two orthogonal things:
   it marks a markdown [skill bundle](../tools/skill-bundles.md) riding the
   install machinery, not code, and needs no component.
 - **Permissions**: what host services the plugin's code may *reach*. The
-  `PluginPermission` enum in the same file. Today `config_read` (the plugin
-  receives its own resolved config section) and `http_client` (outbound
-  `wasi:http` is wired into its store and linker) are enforced; the
-  filesystem and memory-access permissions are accepted by the schema but not
-  yet backed by host functions, so declaring them grants nothing.
+  `PluginPermission` enum in the same file. Today `config_read` is enforced,
+  and `http_client` is the necessary grant for adapters that implement outbound
+  `wasi:http`. Tool and channel adapters enable that surface; memory
+  intentionally does not yet. The filesystem and memory-access permissions are
+  accepted by the schema but not yet backed by host functions, so declaring
+  them grants nothing.
 
 ## The worlds
 
@@ -116,11 +117,11 @@ a precompiled `.cwasm`. Each plugin instantiation gets:
 
 - a `Store` carrying the sandboxed WASI context, the resource table, the
   optional HTTP context, and the fuel budget;
-- a `Linker` with exactly the imports its world and permissions call for:
-  `logging` always, `inbound` for channels, `wasi:http` only when the manifest
-  grants `http_client`. The HTTP context and the linked interface are derived
-  from the same permission set and cross-checked at instantiation
-  (`ensure_http_coherent`), so they cannot disagree.
+- a `Linker` with exactly the imports its world, grants, and adapter support call
+  for: `logging` always, `inbound` for channels, and `wasi:http` for tool and
+  channel adapters only when the manifest grants `http_client`. Memory creates
+  neither an HTTP context nor an HTTP linker. Each adapter cross-checks its
+  context and linker at instantiation (`ensure_http_coherent`).
 
 Tool calls are stateless by construction: `WasmTool::execute` builds a fresh
 store, runs the call, and drops it. Channels and memory backends are stateful
@@ -197,8 +198,8 @@ what loads at all. Both are operator decisions, and they compose:
 - Loaded plugin: bounded by fuel, memory ceilings, no-preopen WASI, and the
   permission-gated import set.
 
-What the sandbox does *not* bound is the semantic behavior of a tool the
-model chooses to call: a granted `http_client` plugin can send whatever the
-model passes it to wherever its code decides. Signature policy exists because
-"which code do I load" is the decision that matters most; make it
-deliberately.
+What the sandbox does *not* bound is the semantic behavior of a tool the model
+chooses to call: a tool with the `http_client` grant and the tool adapter's HTTP
+surface can send whatever the model passes it to wherever its code decides.
+Signature policy exists because "which code do I load" is the decision that
+matters most; make it deliberately.

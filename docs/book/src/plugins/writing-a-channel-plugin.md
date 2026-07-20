@@ -231,9 +231,10 @@ for wit-bindgen guests.
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
 For a channel: `capabilities` containing `channel`, and almost certainly both
-`config_read` (no platform works without credentials) and `http_client` (the
-outbound `wasi:http` surface is the only network you have; without the
-permission, `send` has no way to reach the platform at all).
+`config_read` (no platform works without credentials) and `http_client`. The
+channel adapter implements outbound `wasi:http`, but links it only after that
+grant is validated; without both pieces, `send` has no network path to the
+platform.
 
 ## Build and install
 
