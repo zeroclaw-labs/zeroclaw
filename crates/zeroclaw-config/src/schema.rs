@@ -18788,6 +18788,44 @@ impl Config {
                 "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
+        // Typed-memory producers are a SQLite-only slice: the enabled write
+        // path stores through `store_with_options_and_agent`, and only the
+        // SQLite backend persists the full typed StoreOptions surface. Any
+        // other backend would hit the trait default's explicit failure deep
+        // inside spawned background consolidation, so reject the
+        // configuration at load instead.
+        if self.memory.types.enabled || self.memory.consolidation_extract_facts {
+            let flag_path = if self.memory.types.enabled {
+                "memory.types.enabled"
+            } else {
+                "memory.consolidation_extract_facts"
+            };
+            let backend_kind = self
+                .memory
+                .backend
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if backend_kind != "sqlite" {
+                validation_bail!(
+                    InvalidFormat,
+                    flag_path,
+                    "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
+                    self.memory.backend
+                );
+            }
+            for (alias, agent) in &self.agents {
+                if agent.memory.backend != crate::multi_agent::MemoryBackendKind::Sqlite {
+                    let agent_backend = agent.memory.backend;
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.memory.backend"),
+                        "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
+                    );
+                }
+            }
+        }
         for (alias, agent) in &self.agents {
             if agent.precheck.timeout_secs == 0 {
                 validation_bail!(
@@ -32798,6 +32836,74 @@ allowed_users = []
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_typed_memory_flags_on_non_sqlite_global_backend() {
+        let mut config = multi_agent_test_config();
+        config.memory.types.enabled = true;
+        config.memory.backend = "postgres.work".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("typed memory on a non-sqlite global backend must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory.types.enabled") && msg.contains("SQLite-only"),
+            "expected SQLite-only explanation naming the flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_typed_memory_flags_on_non_sqlite_agent_backend() {
+        let mut config = multi_agent_test_config();
+        config.memory.consolidation_extract_facts = true;
+
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let err = config
+            .validate()
+            .expect_err("typed memory with a non-sqlite agent backend must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory.consolidation_extract_facts")
+                && msg.contains("agents.beta.memory.backend")
+                && msg.contains("Markdown"),
+            "expected SQLite-only explanation naming the agent, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_typed_memory_flags_on_sqlite() {
+        let mut config = multi_agent_test_config();
+        config.memory.types.enabled = true;
+        config.memory.consolidation_extract_facts = true;
+        config.memory.backend = "sqlite".to_string();
+
+        config
+            .validate()
+            .expect("typed memory on sqlite everywhere must pass validation");
+    }
+
+    #[test]
+    async fn validate_allows_non_sqlite_backend_when_typed_memory_flags_off() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "postgres.work".to_string();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Postgres;
+
+        config
+            .validate()
+            .expect("flags-off configs keep every backend choice valid");
     }
 
     #[test]

@@ -547,6 +547,7 @@ mod tests {
     }
 
     use crate::agent_scoped::AgentScopedMemory;
+    use crate::audit::AuditedMemory;
     use crate::sqlite::SqliteMemory;
     use crate::traits::MemoryEntry;
     use async_trait::async_trait;
@@ -900,6 +901,51 @@ mod tests {
         assert_eq!(
             core.kind,
             Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_consolidation_survives_audit_decorator_in_the_stack() {
+        // Composed-stack regression: scope wrapper over the audit decorator
+        // over real SQLite. The scoped store forwards through
+        // `store_with_options_and_agent`, so the decorator must forward the
+        // full typed surface (not inherit the failing trait default) while
+        // still recording the writes in its audit trail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let audited = Arc::new(AuditedMemory::new(sqlite, tmp.path()).unwrap());
+        let alpha = audited.ensure_agent_uuid("alpha").await.unwrap();
+        let scoped = AgentScopedMemory::new(audited.clone(), &alpha, Vec::<String>::new());
+        let provider = ScriptedProvider::new(TYPED_RESPONSE);
+        let config = MemoryConfig {
+            types: MemoryTypesConfig { enabled: true },
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &scoped, &config)
+            .await
+            .unwrap();
+
+        let entries = audited.list(None, None).await.unwrap();
+        let daily = entries
+            .iter()
+            .find(|entry| entry.key.starts_with("daily_"))
+            .expect("daily consolidation row");
+        let core = entries
+            .iter()
+            .find(|entry| entry.key.starts_with("core_"))
+            .expect("core consolidation row");
+        assert_eq!(daily.agent_id.as_deref(), Some(alpha.as_str()));
+        assert_eq!(core.agent_id.as_deref(), Some(alpha.as_str()));
+        assert_eq!(daily.kind, Some(MemoryKind::Episodic));
+        assert_eq!(
+            core.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+        let audited_stores = audited.audit_count().expect("audit trail must be readable");
+        assert!(
+            audited_stores >= 2,
+            "audit trail must record the consolidation stores, got {audited_stores}"
         );
     }
 

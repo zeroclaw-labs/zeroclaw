@@ -4,7 +4,7 @@
 //! and logs all operations to a `memory_audit` table. Opt-in via
 //! `[memory] audit_enabled = true`.
 
-use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage, StoreOptions};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -297,6 +297,47 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.log_audit(AuditOp::Store, Some(key), namespace, session_id, None);
         self.inner
             .store_with_metadata(key, content, category, session_id, namespace, importance)
+            .await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        self.log_audit(
+            AuditOp::Store,
+            Some(key),
+            options.namespace.as_deref(),
+            session_id,
+            None,
+        );
+        self.inner
+            .store_with_options(key, content, category, session_id, options)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.log_audit(
+            AuditOp::Store,
+            Some(key),
+            options.namespace.as_deref(),
+            session_id,
+            None,
+        );
+        self.inner
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
             .await
     }
 
