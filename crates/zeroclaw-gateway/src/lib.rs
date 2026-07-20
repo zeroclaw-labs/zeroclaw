@@ -21,6 +21,7 @@ pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
+mod api_sop_webhook;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -1570,6 +1571,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+        .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -2494,6 +2496,10 @@ fn optional_channel_routes() -> Router<AppState> {
     router
 }
 
+fn sop_webhook_routes() -> Router<AppState> {
+    Router::new().route("/sop/{*rest}", post(api_sop_webhook::handle_sop_webhook))
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -2511,16 +2517,14 @@ pub struct WebhookQuery {
     pub agent: Option<String>,
 }
 
-/// POST /webhook — main webhook endpoint
-async fn handle_webhook(
-    State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Query(query): Query<WebhookQuery>,
-    headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+type WebhookJsonResponse = (StatusCode, Json<serde_json::Value>);
+
+fn authorize_webhook_request(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), WebhookJsonResponse> {
+    let rate_key = client_key_from_request(Some(peer_addr), headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         ::zeroclaw_log::record!(
             WARN,
@@ -2532,10 +2536,9 @@ async fn handle_webhook(
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
     }
 
-    // ── Bearer token auth (pairing) with auth rate limiting ──
     if state.pairing.require_pairing() {
         if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
             ::zeroclaw_log::record!(
@@ -2549,7 +2552,7 @@ async fn handle_webhook(
                 "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
                 "retry_after": e.retry_after_secs,
             });
-            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
         }
         let auth = headers
             .get(header::AUTHORIZATION)
@@ -2567,11 +2570,10 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
-            return (StatusCode::UNAUTHORIZED, Json(err));
+            return Err((StatusCode::UNAUTHORIZED, Json(err)));
         }
     }
 
-    // ── Webhook secret auth (optional, additional layer) ──
     if let Some(ref secret_hash) = state.webhook_secret_hash {
         let header_hash = headers
             .get("X-Webhook-Secret")
@@ -2589,9 +2591,57 @@ async fn handle_webhook(
                     "webhook: rejected request — invalid or missing X-Webhook-Secret"
                 );
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return Err((StatusCode::UNAUTHORIZED, Json(err)));
             }
         }
+    }
+
+    Ok(())
+}
+
+fn check_webhook_idempotency(
+    state: &AppState,
+    headers: &HeaderMap,
+    namespace: Option<&str>,
+) -> Option<WebhookJsonResponse> {
+    let idempotency_key = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let storage_key = namespace
+        .map(|namespace| format!("{namespace}:{idempotency_key}"))
+        .unwrap_or_else(|| idempotency_key.to_string());
+    if state.idempotency_store.record_if_new(&storage_key) {
+        return None;
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"idempotency_key": idempotency_key})),
+        "webhook duplicate ignored"
+    );
+    Some((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "duplicate",
+            "idempotent": true,
+            "message": "Request already processed for this idempotency key"
+        })),
+    ))
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_webhook_request(&state, peer_addr, &headers) {
+        return response;
     }
 
     // ── Parse body ──
@@ -2640,26 +2690,21 @@ async fn handle_webhook(
         }
     }
 
-    // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
-        .get("X-Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && !state.idempotency_store.record_if_new(idempotency_key)
+    let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
+    let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
+        Ok(matches) => matches,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+        return response;
+    }
+
+    if has_matching_sop
+        && let api_sop_webhook::SopWebhookOutcome::Handled(response) =
+            api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
     {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"idempotency_key": idempotency_key})),
-            "webhook duplicate ignored"
-        );
-        let body = serde_json::json!({
-            "status": "duplicate",
-            "idempotent": true,
-            "message": "Request already processed for this idempotency key"
-        });
-        return (StatusCode::OK, Json(body));
+        return response;
     }
 
     let message = &webhook_body.message;
@@ -4044,6 +4089,7 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -4370,6 +4416,54 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    fn webhook_sop_state(
+        tmp: &tempfile::TempDir,
+        trigger_path: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        let sop_dir = sops_dir.join("webhook-test");
+        std::fs::create_dir_all(&sop_dir).unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.toml"),
+            format!(
+                r#"[sop]
+name = "webhook-test"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.md"),
+            "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+        )
+        .unwrap();
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            Arc::clone(&state.mem),
+            None,
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
     }
 
     fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
@@ -5716,6 +5810,184 @@ mod tests {
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_dispatches_matching_path_without_provider_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{"revision":"abc123"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["path"], "/sop/deploy");
+        assert_eq!(parsed["results"][0]["sop"], "webhook-test");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let run_id = parsed["results"][0]["run_id"].as_str().unwrap();
+        let engine = state.sop_engine.as_ref().unwrap().lock().unwrap();
+        let run = engine.get_run(run_id).unwrap();
+        assert_eq!(
+            run.trigger_event.source,
+            zeroclaw_runtime::sop::SopTriggerSource::Webhook
+        );
+        assert_eq!(run.trigger_event.topic.as_deref(), Some("/sop/deploy"));
+        assert_eq!(
+            run.trigger_event.payload.as_deref(),
+            Some(r#"{"revision":"abc123"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_route_reaches_the_shared_dispatch_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post("/sop/deploy")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"revision":"abc123"}"#))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_rejects_unmatched_and_invalid_requests_without_chat_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let unmatched = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("missing".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        let invalid = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(b"not-json"),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_requires_shared_engine_and_webhook_auth() {
+        let disabled_tmp = tempfile::tempdir().unwrap();
+        let disabled = admin_paircode_state(&disabled_tmp, false, false);
+        let unavailable = api_sop_webhook::handle_sop_webhook(
+            State(disabled),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let protected_tmp = tempfile::tempdir().unwrap();
+        let (mut protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
+        let secret = generate_test_secret();
+        protected.webhook_secret_hash = Some(Arc::from(hash_webhook_secret(&secret)));
+        let unauthorized = api_sop_webhook::handle_sop_webhook(
+            State(protected),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_dispatches_sop_first_then_falls_back_to_chat_on_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let sop_response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(sop_response.status(), StatusCode::OK);
+        let payload = sop_response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let no_match_tmp = tempfile::tempdir().unwrap();
+        let (no_match_state, fallback_provider) = webhook_sop_state(&no_match_tmp, "/sop/only");
+        let fallback_response = handle_webhook(
+            State(no_match_state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "chat instead".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(fallback_response.status(), StatusCode::OK);
+        assert_eq!(fallback_provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_and_chat_webhook_idempotency_namespaces_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        let sop_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop_response.status(), StatusCode::OK);
+
+        let chat_response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "chat".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
