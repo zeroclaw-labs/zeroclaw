@@ -52,7 +52,8 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
 
     // When top-level `when` guard is false, bypass ALL routing decisions (switch, explicit_next)
     // and route directly to linear successor or terminal completion
-    // This is the fix for issue #9120 - restores pre-PR #8771 behavior for false guards
+    // Restores the linear-successor behavior for a false guard that predates
+    // unconditional switch evaluation.
     if !when_allows_jump {
         if current.routing.terminal {
             return NextStep::Complete;
@@ -78,7 +79,7 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
     }
 
     // When guard is true or None: proceed with normal routing decisions
-    // Switch evaluation runs first (PR #8771 made it unconditional)
+    // Switch evaluation runs first when the guard allows it.
     if !current.routing.switch.is_empty() {
         let payload = ctx.run_data.to_payload().to_string();
         for rule in &current.routing.switch {
@@ -317,7 +318,7 @@ mod tests {
         assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
-    // Regression test for issue #9120: false top-level `when` should bypass switch to linear
+    // Regression test: false top-level `when` should bypass switch to linear.
     #[test]
     fn when_false_bypasses_switch_to_linear_successor() {
         let switch_rules = vec![
