@@ -106,8 +106,8 @@ otel_tool_io_max_chars = 1000        # per-field truncation limit
 
 `memory.recall`, `memory.store`, and `rag.retrieve` spans nest under the
 `gen_ai.agent.invoke` turn span whenever the operation runs inside an
-attributed agent turn, so a full turn — memory recall, autosave store,
-LLM calls, tool calls — renders as one trace in Langfuse/Tempo. The three
+attributed agent turn, so a full turn (memory recall, autosave store,
+LLM calls, tool calls) renders as one trace in Langfuse/Tempo. The three
 events carry the same `channel` / `agent_alias` / `turn_id` triple as LLM
 and tool events, exposed as `zeroclaw.channel`, `gen_ai.agent.name`, and
 `zeroclaw.turn_id` span attributes.

@@ -3140,7 +3140,7 @@ pub async fn process_message(
         // Pre-mint the turn id so the pre-turn RAG retrieval and the
         // agent_turn bracket share one correlation id. The RAG span stays a
         // root span (it runs before AgentStart) but carries the matching
-        // zeroclaw.turn_id attribute; moving it inside the bracket is #8844.
+        // zeroclaw.turn_id attribute; nesting it is a tracked follow-up.
         let turn_id = uuid::Uuid::new_v4().to_string();
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag

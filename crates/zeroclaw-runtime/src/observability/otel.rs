@@ -1656,7 +1656,7 @@ mod tests {
     }
 
     /// Memory/RAG events carrying a live turn_id must parent under the
-    /// active agent span (issue #6641). As with the other span tests we
+    /// active agent span. As with the other span tests we
     /// cannot assert exported parent/child linkage (OTLP export is async);
     /// we assert the recording path exercises `parent_cx_for` for all three
     /// arms without panicking and without disturbing the live turn entry.
