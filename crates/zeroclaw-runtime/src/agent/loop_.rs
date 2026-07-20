@@ -988,6 +988,16 @@ pub struct AgentRunOverrides {
     /// cron job configured with `uses_memory = false`). Default `false`.
     pub suppress_memory_inject: bool,
     pub memory_free: bool,
+    /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
+    /// worker constructs this once at worker start and shares it across
+    /// every tick so that stdio MCP children live for the daemon's
+    /// lifetime rather than being orphaned and re-spawned per
+    /// `agent::run` call. When `Some`, the loop MUST use this
+    /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
+    /// itself. `None` preserves the legacy per-call connect path
+    /// (CLI / one-shot), which is correct for callers that have no
+    /// cross-turn reuse contract.
+    pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
 }
 
 fn agent_provider_composite(
@@ -1184,13 +1194,15 @@ pub async fn run(
             (None, None)
         };
 
-        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
-        // runtime behavior, matching the documented rollback path.
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (CLI agent run). No channel map is wired on this
+        // path, so the approval route adapter is the no-op (log-only); the daemon
+        // path injects a real channel-delivering adapter.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -1240,6 +1252,12 @@ pub async fn run(
             exclude_memory: memory_free,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            // Honor the daemon worker's pre-built shared registry so stdio
+            // MCP children live for the daemon's lifetime, not per
+            // `agent::run` call. CLI/one-shot callers leave
+            // `mcp_registry` at its default (`None`) and the seam
+            // falls back to the per-call `connect_all`.
+            mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
         })
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
@@ -2762,13 +2780,15 @@ pub async fn process_message(
             (None, None)
         };
 
-        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
-        // runtime behavior, matching the documented rollback path.
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (process_message CLI agent). No channel map is
+        // wired here, so the approval route adapter is the no-op (log-only); the
+        // daemon path injects a real channel-delivering adapter.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -2813,6 +2833,13 @@ pub async fn process_message(
             exclude_memory: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            // `process_message` is the channel/orchestrator live-chat path;
+            // it has no cross-turn reuse contract, so the per-call
+            // `connect_all` path inside `assemble` is the correct choice.
+            // The daemon heartbeat worker — the only caller that has a
+            // reuse contract — passes its own `mcp_registry` through
+            // `agent::run` (`AgentRunOverrides::mcp_registry`).
+            mcp_registry: None,
         })
         .await;
         // process_message injects one combined MCP prompt block: deferred tool-search
@@ -6140,6 +6167,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
@@ -6282,6 +6311,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
@@ -14951,6 +14982,7 @@ Let me check the result."#;
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
+                mcp_registry: None,
             },
         )
         .await;

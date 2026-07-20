@@ -104,13 +104,14 @@ pub(crate) fn mode_bar_click(
     bar_area: Rect,
     labels: &[(&str, &str)],
 ) -> Option<u8> {
-    use unicode_width::UnicodeWidthStr;
     if !in_rect(mouse_col, mouse_row, bar_area) {
         return None;
     }
     let mut x = bar_area.x as usize;
     for (i, (key, label)) in labels.iter().enumerate() {
-        let w = UnicodeWidthStr::width(*key) + UnicodeWidthStr::width(*label) + 1; // +1 for trailing " "
+        let w = crate::display_width::display_width(key)
+            + crate::display_width::display_width(label)
+            + 1; // +1 for trailing " "
         if (mouse_col as usize) >= x && (mouse_col as usize) < x + w {
             return Some((i + 1) as u8);
         }

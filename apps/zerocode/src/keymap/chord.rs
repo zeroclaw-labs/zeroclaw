@@ -43,11 +43,17 @@ impl Chord {
                 == normalise_mods(event.code, event.modifiers)
     }
 
-    /// `Ctrl+K` on most platforms; `⌘K` on darwin.
+    /// `Ctrl+K` on most platforms; `⌘K` on darwin. On darwin, a
+    /// host-reserved chord's control label is the literal word `Ctrl`
+    /// (not the `⌘` glyph) and needs a separator to stay readable —
+    /// see `control_display_label`.
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
+        let mut literal_word_control = false;
         if self.modifiers.contains(KeyModifiers::CONTROL) {
-            parts.push(control_display_label(&self.code));
+            let label = control_display_label(&self.code);
+            literal_word_control = cfg!(target_os = "macos") && label == "Ctrl";
+            parts.push(label);
         }
         if self.modifiers.contains(KeyModifiers::ALT) {
             parts.push(if cfg!(target_os = "macos") {
@@ -62,7 +68,7 @@ impl Chord {
         let key = render_keycode(&self.code);
         if parts.is_empty() {
             key
-        } else if cfg!(target_os = "macos") {
+        } else if cfg!(target_os = "macos") && !literal_word_control {
             format!("{}{}", parts.join(""), key)
         } else {
             format!("{}+{}", parts.join("+"), key)
@@ -375,6 +381,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn session_chords_stay_terminal_safe_ctrl_on_darwin() {
+        // Host-reserved session chords must retain literal Control
+        // matching (not the host-reserved Command event) and display
+        // with the literal word "Ctrl" plus a separator on darwin.
         for c in ['n', 's'] {
             let chord = Chord::ctrl(c);
             let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);

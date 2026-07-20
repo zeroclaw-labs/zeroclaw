@@ -5364,6 +5364,7 @@ async fn process_channel_message_body(
                 zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
                 Some(&topic),
                 Some(&msg.content),
+                None,
             )
             .await;
         }
@@ -8694,6 +8695,8 @@ struct ActiveChannelAliases {
     /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
     /// explicit-binding mode: only enabled owners' bindings count.
     enabled_bindings: HashSet<String>,
+    /// Bindings declared by all agents, including disabled owners. Their
+    /// presence prevents legacy fallback from activating disabled channels.
     all_known_bindings: HashSet<String>,
 }
 
@@ -8706,11 +8709,13 @@ impl ActiveChannelAliases {
     }
 
     /// True when bindings exist somewhere in the config but every owner is
-    /// `enabled = false`. Thebug fires when this returns true.
+    /// `enabled = false`.
     fn disabled_owners_exist(&self) -> bool {
         !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
     }
 
+    /// Computes the canonical channel-binding view used by collection and
+    /// startup checks; disabled owners never make their channels active.
     fn compute(config: &Config) -> Self {
         Self {
             enabled_bindings: config

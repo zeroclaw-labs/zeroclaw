@@ -4329,7 +4329,6 @@ fn render_table(
     width: u16,
 ) -> Vec<Line<'static>> {
     use pulldown_cmark::Alignment as MdAlign;
-    use unicode_width::UnicodeWidthStr;
 
     if rows.is_empty() {
         return Vec::new();
@@ -4351,7 +4350,7 @@ fn render_table(
     let mut natural: Vec<usize> = vec![0; cols];
     for row in &grid {
         for (i, cell) in row.iter().enumerate() {
-            natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
+            natural[i] = natural[i].max(crate::display_width::display_width(cell.as_str()));
         }
     }
 
@@ -4373,11 +4372,10 @@ fn render_table(
     };
 
     fn truncate_to(s: &str, budget: usize) -> String {
-        use unicode_width::UnicodeWidthChar;
         if budget == 0 {
             return String::new();
         }
-        let full_width = UnicodeWidthStr::width(s);
+        let full_width = crate::display_width::display_width(s);
         if full_width <= budget {
             return s.to_string();
         }
@@ -4388,13 +4386,13 @@ fn render_table(
         }
         let mut acc = String::new();
         let mut used = 0usize;
-        for ch in s.chars() {
-            let w = ch.width().unwrap_or(0);
+        // Walk graphemes so presentation sequences (⚠️, 🏔️) stay intact.
+        for (_offset, grapheme, w) in crate::display_width::grapheme_widths(s) {
             if used + w + 1 > budget {
                 acc.push('\u{2026}');
                 return acc;
             }
-            acc.push(ch);
+            acc.push_str(grapheme);
             used += w;
             if used == budget {
                 return acc;
@@ -4404,7 +4402,7 @@ fn render_table(
     }
 
     fn pad_cell(s: &str, budget: usize, align: MdAlign) -> String {
-        let w = UnicodeWidthStr::width(s);
+        let w = crate::display_width::display_width(s);
         let slack = budget.saturating_sub(w);
         match align {
             MdAlign::Right => format!("{}{}", " ".repeat(slack), s),
@@ -4688,6 +4686,15 @@ pub struct ChatState {
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
+    /// Set when any streaming text was flushed during the current turn.
+    /// Used by `commit_turn` to decide whether `full_text` is a fallback
+    /// (no streaming happened) or a duplicate (streaming already committed).
+    turn_had_streaming_text: bool,
+    /// Set when any `ToolCall` event arrived during the current turn.
+    /// Used by `commit_turn` to distinguish "empty completion with tool
+    /// calls" (normal — tool output is the visible record) from "empty
+    /// completion with nothing at all" (needs a diagnostic row).
+    turn_had_tool_calls: bool,
     /// Fine-grained label for the input-bar title while a turn is active.
     /// Lockstep with `turn_in_flight` (`Idle` ↔ `false`) but adds the
     /// thinking / responding / tool-call breakdown for the UI.
@@ -4811,6 +4818,8 @@ impl ChatState {
             pending_approval: None,
             pending_elicitation: None,
             turn_in_flight: false,
+            turn_had_streaming_text: false,
+            turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
             show_thoughts: true,
@@ -5326,8 +5335,6 @@ impl ChatState {
     }
 
     fn refresh_title_hit_rects(&mut self, area: Rect) {
-        use unicode_width::UnicodeWidthStr;
-
         self.title_hit_rects.clear();
         let mut x = area.x.saturating_add(2);
         let right = area.x.saturating_add(area.width);
@@ -5335,7 +5342,7 @@ impl ChatState {
             if idx > 0 {
                 x = x.saturating_add(2);
             }
-            let width = UnicodeWidthStr::width(text.as_str()) as u16;
+            let width = crate::display_width::display_width(text.as_str()) as u16;
             if let Some(target) = target
                 && width > 0
                 && x < right
@@ -5421,12 +5428,16 @@ impl ChatState {
     /// Commit any accumulated streaming text as an `AgentMessage` entry.
     /// Called when a tool call interrupts the text stream so that pre-tool
     /// text is committed in conversation order before the `Tool` entry.
-    fn flush_streaming_text(&mut self) {
+    /// Returns `true` if any text was flushed.
+    fn flush_streaming_text(&mut self) -> bool {
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
             self.entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
             self.mark_dirty_append();
+            true
+        } else {
+            false
         }
     }
 
@@ -5439,6 +5450,7 @@ impl ChatState {
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
+            | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
             | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
         };
@@ -5477,8 +5489,11 @@ impl ChatState {
                 // Flush any accumulated text and thought before the tool call
                 // so that pre-tool agent text and thinking both appear in
                 // conversation order before the Tool entry.
-                self.flush_streaming_text();
+                if self.flush_streaming_text() {
+                    self.turn_had_streaming_text = true;
+                }
                 self.flush_streaming_thought();
+                self.turn_had_tool_calls = true;
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
@@ -5552,6 +5567,22 @@ impl ChatState {
                     self.context_max_tokens = max_context_tokens;
                 }
             }
+            SessionUpdate::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+                ..
+            } => {
+                let dropped = dropped_messages.to_string();
+                let kept = kept_turns.to_string();
+                let notice = crate::i18n::t_args(
+                    "zc-chat-history-trimmed",
+                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                );
+                self.entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.mark_dirty_append();
+            }
             SessionUpdate::TurnComplete {
                 outcome, content, ..
             } => match outcome {
@@ -5575,9 +5606,33 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
-        self.flush_streaming_text();
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
         self.flush_streaming_thought();
-        let _ = full_text;
+        // If no streaming text was accumulated during this turn, use the
+        // daemon-provided final text as a fallback so the turn is never
+        // invisible to the user.
+        if !self.turn_had_streaming_text && !full_text.is_empty() {
+            self.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
+            self.mark_dirty_append();
+        } else if clean
+            && !self.turn_had_streaming_text
+            && !self.turn_had_tool_calls
+            && full_text.is_empty()
+        {
+            // Clean completion with no streamed text, no tool calls, and
+            // no final content — render a diagnostic so the user knows the
+            // turn finished rather than silently vanishing.
+            self.entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                    "zc-turn-no-output",
+                ))));
+            self.mark_dirty_append();
+        }
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
         self.mark_dirty_append();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
@@ -5614,6 +5669,8 @@ impl ChatState {
         });
         self.mark_dirty_append();
         self.turn_in_flight = true;
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
         // first chunk (thought / message / tool-call) tells us otherwise.
         self.turn_status = TurnStatus::Working;
@@ -7535,6 +7592,25 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_update_adds_visible_system_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("history message limit exceeded")
+                    && text.contains("12")
+                    && text.contains("3")
+        ));
+    }
+
+    #[test]
     fn tool_call_followed_by_result_is_one_entry() {
         let mut s = state();
         s.apply_update(SessionUpdate::ToolCall {
@@ -7843,6 +7919,80 @@ mod tests {
         assert!(matches!(&s.entries()[1], ChatEntry::Tool { .. }));
     }
 
+    /// When no streaming text was accumulated, commit_turn must use the
+    /// daemon-provided final text as a fallback — rendered exactly once.
+    #[test]
+    fn commit_turn_renders_nonempty_fallback_when_no_streaming() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // No streaming chunks; commit_turn receives non-empty final text.
+        s.commit_turn("Hello from daemon.".to_string(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Hello from daemon.")
+        );
+    }
+
+    /// When a turn completes with no streamed text, no tool calls, and no
+    /// final content, commit_turn must render a diagnostic system message
+    /// so the user knows the turn finished.
+    #[test]
+    fn commit_turn_shows_diagnostic_when_no_output_at_all() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // Empty everything: no streaming, no tools, empty final text.
+        s.commit_turn(String::new(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::SystemMessage(t) if t.as_ref() == "Turn completed with no output."),
+            "expected diagnostic SystemMessage for empty completion, got {:?}",
+            s.entries()[0]
+        );
+    }
+
+    /// When a cancelled or failed turn has no output, commit_turn must NOT
+    /// append the "Turn completed with no output" diagnostic — cancelled/
+    /// failed turns are not clean completions and should not claim otherwise.
+    #[test]
+    fn commit_turn_no_diagnostic_when_not_clean() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // Clean=false (cancelled/failed), empty everything.
+        s.commit_turn(String::new(), false);
+
+        assert!(
+            s.entries().is_empty(),
+            "cancelled turn should not emit completion diagnostic, got {:?}",
+            s.entries()
+        );
+    }
+
+    /// When tool calls were made during a turn but no text was streamed and
+    /// final text is empty, commit_turn must NOT add a diagnostic — the tool
+    /// entries are the visible record of work.
+    #[test]
+    fn commit_turn_no_diagnostic_when_tool_calls_present() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc1".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "ls"}),
+        });
+        s.commit_turn(String::new(), true);
+
+        // Only the Tool entry — no diagnostic needed.
+        assert_eq!(s.entries().len(), 1);
+        assert!(matches!(&s.entries()[0], ChatEntry::Tool { .. }));
+    }
+
     #[test]
     fn turn_commit_flushes_streaming_buffer() {
         let mut s = state();
@@ -8127,6 +8277,36 @@ mod tests {
             20,
         );
         assert!(out.contains('\u{2026}'), "expected ellipsis: {out}");
+    }
+
+    #[test]
+    fn md_table_pads_emoji_presentation_to_two_cells() {
+        // 🏔️ is U+1F3D4 + U+FE0F. Natural column width must be 2 (not 1), so a
+        // wider sibling cell still leaves a full cell of space after the glyph.
+        let out = rendered("| A | B |\n|---|---|\n| \u{1F3D4}\u{FE0F} | xx |\n", 40);
+        let data = out
+            .lines()
+            .find(|l| l.contains('\u{1F3D4}'))
+            .expect("emoji data row");
+        let emoji = "\u{1F3D4}\u{FE0F}";
+        let idx = data.find(emoji).expect("emoji in row");
+        let after = &data[idx + emoji.len()..];
+        // Column budget for A is max(width("A"), width(emoji)) = 2, so after
+        // the emoji there is no content pad — only the trailing cell space
+        // before the border.
+        assert!(
+            after.starts_with(" \u{2502}"),
+            "emoji column natural width is 2 cells: {data:?}"
+        );
+        // And the header cell for A is padded to that same 2-cell budget.
+        let header = out
+            .lines()
+            .find(|l| l.contains('A') && l.contains('B'))
+            .expect("header row");
+        assert!(
+            header.contains(" A  "),
+            "header A cell must pad to emoji's 2-cell width: {header:?}"
+        );
     }
 
     #[test]
