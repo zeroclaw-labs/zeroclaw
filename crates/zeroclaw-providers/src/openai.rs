@@ -1851,9 +1851,9 @@ mod tests {
 
     #[test]
     fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
-        // Regression for #8675: pins that the openai `convert_messages` call
-        // site of `sanitize_tool_arguments` is wired in. The helper contract
-        // itself is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        // Pins that the openai `convert_messages` call site of
+        // `sanitize_tool_arguments` is wired in. The helper contract itself is
+        // covered in `compatible::tests::sanitize_tool_arguments_*`.
         use zeroclaw_api::model_provider::ChatMessage;
 
         let messages = vec![ChatMessage::assistant(

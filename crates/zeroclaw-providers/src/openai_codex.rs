@@ -332,7 +332,7 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
 /// `sanitize_tool_arguments` helper so the openai_codex call site inherits
 /// the same malformed-JSON → `"{}"` contract as the other four typed
 /// providers. Factored out so the call-site behavior is testable without
-/// running the full input builder. #8675.
+/// running the full input builder.
 pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
     let name = call.name;
     serde_json::json!({
@@ -2526,9 +2526,9 @@ data: [DONE]
 
     #[test]
     fn build_function_call_item_sanitizes_invalid_arguments_to_empty_object() {
-        // Regression for #8675: pins that the openai_codex call site of
-        // `sanitize_tool_arguments` is wired in. The helper contract itself
-        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        // Pins that the openai_codex call site of `sanitize_tool_arguments`
+        // is wired in. The helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
         let call = ProviderToolCall {
             id: "call_bad".to_string(),
             name: "shell".to_string(),
