@@ -4096,10 +4096,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             &current_config.data_dir,
                             None,
                         )?);
+                    let route_adapter = build_sop_route_adapter(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
                         mem,
+                        route_adapter,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -4857,10 +4859,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
                     );
+                    let route_adapter = build_sop_route_adapter(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
                         mem,
+                        route_adapter,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -7554,6 +7558,97 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
+/// Build the SOP approval route adapter from the configured channel map, so a SOP
+/// that parks at a policied gate (or later times out) can deliver its approval
+/// request / escalation notice to a real channel (Discord, Slack, ...). Returns
+/// `None` when no channels are configured, in which case `build_sop_engine` falls
+/// back to the log-only no-op adapter (unchanged behavior). MUST be called from
+/// within the tokio runtime: it captures `Handle::current()` so the sync,
+/// under-the-engine-lock `deliver` can fire-and-forget the async channel `send`.
+#[cfg(feature = "agent-runtime")]
+fn build_sop_route_adapter(
+    config: &Config,
+) -> Option<std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter>> {
+    let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
+    // Startup validation: this send-only adapter's channel map omits channels that
+    // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
+    // configured approval route whose channel is absent here, so a `request_route` /
+    // `escalation_route` that would silently fail to deliver at gate time is caught up
+    // front rather than on the first parked gate. This runs BEFORE the empty-map return:
+    // when there are no deliverable channels at all, EVERY configured route is
+    // undeliverable and must still be surfaced.
+    // A route target must be a channel that can actually deliver OUTBOUND; an
+    // inbound-only channel (e.g. AMQP, whose `send` is a no-op) in the map cannot send
+    // an approval notice, so it is not a resolvable route target.
+    let deliverable_keys: std::collections::HashSet<String> = channels
+        .iter()
+        .filter(|(_, ch)| ch.supports_outbound_send())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for issue in zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
+        &config.sop.approval,
+        &deliverable_keys,
+    ) {
+        match issue {
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::Malformed {
+                policy,
+                route_kind,
+                route,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                        })),
+                    "SOP approval route is malformed; use the required channel:recipient format"
+                );
+            }
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::UndeliverableChannel {
+                policy,
+                route_kind,
+                route,
+                channel_key,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                            "channel": channel_key,
+                        })),
+                    "SOP approval route names a channel the route adapter cannot deliver to; \
+                     its approval notices will not be sent (the channel may require runtime SOP \
+                     handles this send-only adapter lacks)"
+                );
+            }
+        }
+    }
+    if channels.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(
+        zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
+            channels,
+            tokio::runtime::Handle::current(),
+        ),
+    ))
+}
+
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
@@ -7662,7 +7757,12 @@ async fn run_sop_maintenance_tick(
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
                     report.cron_started += 1;
                 }
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced { .. } => {
+                    // A2: deferred (backpressure) / coalesced triggers did not start a
+                    // run this tick; the cron schedule re-fires them next pass. The
+                    // precise outcome is logged by process_headless_results below.
                     report.cron_skipped += 1;
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
@@ -9166,6 +9266,8 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));

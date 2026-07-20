@@ -98,7 +98,13 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
+    route_adapter: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    // Select the run-state backend from config (default: durable sqlite, so parked
+    // HITL runs survive a restart). A backend-open failure must not crash daemon
+    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
+    // daemon data dir (every caller passes `config.data_dir`), so a durable store
+    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
     let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,
@@ -110,10 +116,19 @@ pub fn build_sop_engine(
         Arc::new(store::InMemoryRunStore::new())
     });
     let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
+    // EPIC G: the approval broker (membership + quorum) resolves policies/groups
+    // from the engine's live `[sop.approval]` at use-time. The route adapter
+    // delivers approval request/escalation notices to a channel; the daemon injects
+    // a real channel-delivering adapter, while CLI/standalone callers pass `None`
+    // and fall back to the no-op (log-only) adapter - unchanged behavior there.
+    let route: Arc<dyn approval::ApprovalRouteAdapter> =
+        route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
-        .with_run_notifier(run_tx);
+        .with_run_notifier(run_tx)
+        .with_approval_broker(approval_broker);
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -404,6 +419,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         cooldown_secs,
         max_concurrent,
         deterministic,
+        admission_policy,
+        max_pending_approvals,
         agent,
     } = manifest.sop;
 
@@ -426,6 +443,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         max_concurrent,
         location: Some(sop_dir.to_path_buf()),
         deterministic,
+        admission_policy,
+        max_pending_approvals,
         agent,
     };
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
@@ -562,6 +581,13 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
                     current.calls.push(call);
                 }
+            } else if let Some(val) = bullet.strip_prefix("policy:") {
+                let val = val.trim();
+                current.policy = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -604,6 +630,7 @@ struct StepParseState {
     mode: Option<SopExecutionMode>,
     calls: Vec<PlannedToolCall>,
     agent: Option<String>,
+    policy: Option<String>,
 }
 
 impl StepParseState {
@@ -635,6 +662,7 @@ impl StepParseState {
             calls: std::mem::take(&mut self.calls),
             pos: None,
             agent: self.agent.take(),
+            policy: self.policy.take(),
         });
         *self = Self::default();
     }
@@ -1090,6 +1118,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -1541,6 +1571,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_steps_reads_policy_bullet() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Gate** - Requires the release group.
+   - policy: prod
+2. **Go** - Unpoliced.
+"#,
+        );
+        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
+        assert_eq!(
+            steps[1].policy, None,
+            "a step with no policy bullet stays None"
+        );
+    }
+
+    #[test]
     fn parse_steps_populates_capability_bullets() {
         let steps = parse_steps(
             r#"
@@ -1559,5 +1606,25 @@ mod tests {
             step.capability_input.clone(),
             Some(json!({"require_clean": true}))
         );
+    }
+
+    #[test]
+    fn load_sop_reads_admission_policy_and_pending_cap() {
+        // A2: admission_policy + max_pending_approvals are user-facing SOP.toml knobs;
+        // prove they survive the SOP.toml -> runtime Sop load path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SOP.toml"),
+            "[sop]\nname = \"s\"\ndescription = \"d\"\nadmission_policy = \"drop\"\nmax_pending_approvals = 1\n",
+        )
+        .unwrap();
+        let sop = load_sop(&dir, SopExecutionMode::Supervised).expect("load ok");
+        assert_eq!(
+            sop.admission_policy,
+            crate::sop::types::SopAdmissionPolicy::Drop
+        );
+        assert_eq!(sop.max_pending_approvals, 1);
     }
 }

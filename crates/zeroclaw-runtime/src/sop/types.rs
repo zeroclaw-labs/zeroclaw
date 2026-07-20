@@ -372,6 +372,11 @@ pub struct SopStep {
     /// Capability arguments, serialized as `with` in TOML/JSON definitions.
     #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
     pub capability_input: Option<serde_json::Value>,
+    /// Approval policy name (a key in `[sop.approval].policies`) the approval broker
+    /// enforces for this step's gate: required approver group + quorum. `None` keeps
+    /// today's behavior (`approval_mode` alone governs, no membership/quorum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
 }
 
 impl Default for SopStep {
@@ -393,6 +398,7 @@ impl Default for SopStep {
             agent: None,
             capability: None,
             capability_input: None,
+            policy: None,
         }
     }
 }
@@ -473,6 +479,15 @@ pub struct Sop {
     /// Steps execute sequentially without LLM round-trips.
     #[serde(default)]
     pub deterministic: bool,
+    /// How to handle a trigger that cannot be admitted immediately because this
+    /// SOP's execution slots are full (A2). Default `parallel`.
+    #[serde(default)]
+    pub admission_policy: SopAdmissionPolicy,
+    /// Upper bound on runs of this SOP parked at a HITL approval at once
+    /// (`0` = unlimited). Once reached, further triggers are deferred (surfaced for
+    /// backpressure/redelivery) rather than silently dropped. Default `0`.
+    #[serde(default = "default_max_pending_approvals")]
+    pub max_pending_approvals: u32,
     /// Parent agent alias that owns this procedure. Every `execute` step runs
     /// as this agent unless the step names its own `agent` override. Required
     /// for headless triggers (mqtt, webhook, cron, amqp), which have no
@@ -487,6 +502,65 @@ fn default_cooldown_secs() -> u64 {
 
 fn default_max_concurrent() -> u32 {
     1
+}
+
+fn default_max_pending_approvals() -> u32 {
+    0
+}
+
+/// How concurrent triggers are handled when a SOP's execution slots are full. A
+/// run parked at a HITL approval releases its slot (A1), so this governs the
+/// remaining case: too many runs actively *executing* at once. No variant ever
+/// silently drops a trigger except `Drop`, which is explicit opt-in.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SopAdmissionPolicy {
+    /// Admit up to `max_concurrent` concurrent runs; a trigger that cannot admit
+    /// now is DEFERRED (surfaced for backpressure/redelivery), never silently
+    /// dropped. Best fit for independent work like PR-request approvals.
+    #[default]
+    Parallel,
+    /// Serialize: admit only when no run of this SOP is active or parked; other
+    /// triggers are deferred. For pipelines whose pre-approval steps must not overlap.
+    Hold,
+    /// Collapse concurrent triggers: when a run is already in flight for this SOP a
+    /// new trigger is coalesced (dropped as redundant - the in-flight run already
+    /// covers the latest state). For "only current state matters" SOPs.
+    Coalesce,
+    /// Legacy fire-and-forget: a trigger that cannot admit now is dropped. Explicit
+    /// opt-in only; never the default.
+    Drop,
+}
+
+impl fmt::Display for SopAdmissionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parallel => write!(f, "parallel"),
+            Self::Hold => write!(f, "hold"),
+            Self::Coalesce => write!(f, "coalesce"),
+            Self::Drop => write!(f, "drop"),
+        }
+    }
+}
+
+/// A2: the outcome of evaluating a matched trigger against a SOP's
+/// `SopAdmissionPolicy`. Advisory - `Admit` still passes through the authoritative
+/// CAS `start_run`; the non-admit variants are surfaced by the dispatch layer
+/// (logged + carried on `DispatchResult`) so a trigger is never silently lost.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SopAdmission {
+    /// A slot is available - proceed to start the run.
+    Admit,
+    /// Cannot admit now (execution slots or the pending-approval pool are full).
+    /// Apply backpressure / redelivery rather than dropping.
+    Defer { reason: String },
+    /// A run is already in flight for this SOP; collapse this trigger into it.
+    Coalesce { existing_run_id: String },
+    /// Drop this trigger: either the `drop` policy with no free slot, or a cooldown
+    /// / unknown SOP (which drop regardless of policy).
+    Drop { reason: String },
 }
 
 // ── TOML manifest (internal parse target) ───────────────────────
@@ -532,6 +606,12 @@ pub struct SopMeta {
     /// Opt-in deterministic execution (no LLM round-trips between steps).
     #[serde(default)]
     pub deterministic: bool,
+    /// Concurrent-trigger admission policy (`parallel` | `hold` | `coalesce` | `drop`).
+    #[serde(default)]
+    pub admission_policy: SopAdmissionPolicy,
+    /// Max runs parked at a HITL approval at once (`0` = unlimited).
+    #[serde(default = "default_max_pending_approvals")]
+    pub max_pending_approvals: u32,
     /// Parent agent alias that owns the procedure. Steps run as this agent
     /// unless a step overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,6 +630,8 @@ impl SopManifest {
                 cooldown_secs: sop.cooldown_secs,
                 max_concurrent: sop.max_concurrent,
                 deterministic: sop.deterministic,
+                admission_policy: sop.admission_policy,
+                max_pending_approvals: sop.max_pending_approvals,
                 agent: sop.agent.clone(),
             },
             triggers: sop.triggers.clone(),

@@ -164,6 +164,7 @@ impl FilesystemChannel {
                 SopTriggerSource::Filesystem,
                 Some(&path_str),
                 Some(&payload.to_string()),
+                None,
             )
             .await;
         }
@@ -181,6 +182,10 @@ impl Channel for FilesystemChannel {
         // whatever outbound channel the agent's procedure selects, not back to
         // the watched directory.
         Ok(())
+    }
+
+    fn supports_outbound_send(&self) -> bool {
+        false
     }
 
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {

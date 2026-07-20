@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
+use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, BrokerOutcome, ResolveOutcome};
 use crate::sop::types::{SopRunAction, SopRunStatus};
 use crate::sop::{SopAuditLogger, SopEngine};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -85,22 +85,30 @@ impl Tool for SopApproveTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            match engine.resolve_gate(
+            // EPIC G: route through the broker (membership + quorum). With no
+            // `[sop.approval]` policy it is exactly `resolve_gate`, so behavior is
+            // unchanged; with a policy the agent must be an authorized member and a
+            // quorum must be met before the chokepoint clears the gate.
+            match engine.resolve_via_broker(
                 run_id,
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::agent(&self.agent_alias),
             ) {
-                Ok(ResolveOutcome::NotWaiting) => {
+                // A deterministic checkpoint is an in-band agent pause, not an
+                // out-of-band gate, so the broker reports NotWaiting; resume it
+                // through approve_step (the checkpoint owner).
+                Ok(BrokerOutcome::NotWaiting)
+                | Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting)) => {
                     let is_checkpoint = matches!(
                         engine.get_run(run_id).map(|r| r.status),
                         Some(SopRunStatus::PausedCheckpoint)
                     );
                     if is_checkpoint {
-                        engine
-                            .approve_step(run_id)
-                            .map(|action| ResolveOutcome::Resumed(Box::new(action)))
+                        engine.approve_step(run_id).map(|action| {
+                            BrokerOutcome::Resolved(ResolveOutcome::Resumed(Box::new(action)))
+                        })
                     } else {
-                        Ok(ResolveOutcome::NotWaiting)
+                        Ok(BrokerOutcome::NotWaiting)
                     }
                 }
                 other => other,
@@ -108,7 +116,7 @@ impl Tool for SopApproveTool {
         };
 
         match result {
-            Ok(ResolveOutcome::Resumed(action)) => {
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                 crate::sop::executor::enqueue_live_action(
                     Arc::clone(&self.engine),
                     self.audit.clone(),
@@ -128,7 +136,7 @@ impl Tool for SopApproveTool {
                     error: None,
                 })
             }
-            Ok(ResolveOutcome::RejectedSelfApproval) => Ok(ToolResult {
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(
@@ -138,21 +146,50 @@ impl Tool for SopApproveTool {
                         .to_string(),
                 ),
             }),
-            Ok(ResolveOutcome::AlreadyResolved) => Ok(ToolResult {
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved)) => Ok(ToolResult {
                 success: true,
                 output: format!("Run {run_id} was already resolved.").into(),
                 error: None,
             }),
-            Ok(ResolveOutcome::Denied) => Ok(ToolResult {
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::Denied)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Run {run_id} was denied.")),
             }),
-            Ok(ResolveOutcome::NotWaiting) => Ok(ToolResult {
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting))
+            | Ok(BrokerOutcome::NotWaiting) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!(
                     "Approval failed: run {run_id} is not waiting for approval."
+                )),
+            }),
+            // A quorum can record a valid vote without clearing the gate yet.
+            Ok(BrokerOutcome::PendingQuorum { have, need }) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Approval recorded ({have} of {need}). Awaiting {} more distinct approver(s).",
+                    need.saturating_sub(have)
+                )
+                .into(),
+                error: None,
+            }),
+            Ok(BrokerOutcome::NotAuthorized { required_group }) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Not authorized: approving this step requires membership in the \
+                     '{required_group}' group."
+                )),
+            }),
+            // Fail closed: the step names an approval policy absent from config, so
+            // the gate is left waiting rather than cleared.
+            Ok(BrokerOutcome::PolicyMissing { name }) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Approval failed: step names approval policy '{name}', which is not \
+                     defined in [sop.approval].policies; the gate is left waiting."
                 )),
             }),
             Err(e) => Ok(ToolResult {
@@ -193,6 +230,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }
