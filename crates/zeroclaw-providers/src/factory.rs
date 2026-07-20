@@ -1136,7 +1136,7 @@ impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
 
         let max_tokens = opts
             .provider_max_tokens
-            .map_or(crate::ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
+            .map_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
                 i32::try_from(value).unwrap_or(i32::MAX)
             });
         let tuning = crate::ollama::OllamaTuning {
@@ -1144,21 +1144,23 @@ impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
                 .base
                 .context_window
                 .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
-                .unwrap_or(crate::ollama::HAILO_DEFAULT_NUM_CTX),
+                .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
             num_predict: max_tokens,
             temperature_override: None,
         };
         let endpoint = HailoOllamaEndpoint::default();
         let base_url = api_url.unwrap_or_else(|| endpoint.uri());
-        Ok(Box::new(crate::ollama::OllamaModelProvider::new_hailo(
-            alias,
-            Some(base_url),
-            opts.provider_timeout_secs
-                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
-            self.queue_timeout_secs
-                .unwrap_or(crate::ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
-            tuning,
-        )?))
+        Ok(Box::new(
+            crate::hailo_ollama::HailoOllamaModelProvider::new(
+                alias,
+                Some(base_url),
+                opts.provider_timeout_secs
+                    .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+                self.queue_timeout_secs
+                    .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
+                tuning,
+            )?,
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {

@@ -1,16 +1,16 @@
 use crate::multimodal;
+use crate::ollama_wire::{
+    ApiChatResponse, ChatRequest, Message, OllamaToolCall, Options, OutgoingFunction,
+    OutgoingToolCall,
+};
 use crate::traits::{
     ChatMessage, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
     ToolsPayload,
 };
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
-use tokio::sync::Semaphore;
-use zeroclaw_config::schema::{HailoOllamaEndpoint, ModelEndpoint};
 
 /// Matches Ollama's upstream Modelfile default
 /// (<https://docs.ollama.com/modelfile>): "Increasing the temperature will
@@ -21,11 +21,6 @@ const TIMEOUT_SECS_DEFAULT: u64 = 600;
 /// Ollama's standard localhost endpoint. Overrideable via
 /// `model_providers.<name>.base-url` for remote GPU boxes or non-default ports.
 pub(crate) const BASE_URL: &str = "http://localhost:11434";
-pub const HAILO_DEFAULT_NUM_CTX: u32 = 2048;
-pub const HAILO_DEFAULT_NUM_PREDICT: i32 = 256;
-pub const HAILO_DEFAULT_QUEUE_TIMEOUT_SECS: u64 = 30;
-const HAILO_MAX_HISTORY_MESSAGES: usize = 12;
-const HAILO_MAX_MESSAGE_CHARS: usize = 2_000;
 
 /// Default `num_ctx` (context window, in tokens) sent in every Ollama
 /// `/api/chat` request when no operator override is supplied. Ollama's
@@ -75,311 +70,15 @@ impl OllamaTuning {
     }
 }
 
-#[derive(Clone)]
-enum OllamaCompatibility {
-    Standard,
-    Hailo {
-        queue_timeout: Duration,
-        generation_gate: Arc<HailoGenerationGate>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HailoQuarantineReason {
-    AmbiguousTimeout,
-    AmbiguousTransport,
-    WorkerTerminated,
-}
-
-impl HailoQuarantineReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AmbiguousTimeout => "ambiguous_timeout",
-            Self::AmbiguousTransport => "ambiguous_transport",
-            Self::WorkerTerminated => "worker_terminated",
-        }
-    }
-}
-
-struct HailoGenerationGate {
-    semaphore: Arc<Semaphore>,
-    quarantine_reason: OnceLock<HailoQuarantineReason>,
-}
-
-impl HailoGenerationGate {
-    fn quarantine(&self, reason: HailoQuarantineReason) {
-        if self.quarantine_reason.set(reason).is_err() {
-            return;
-        }
-
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "hailo_endpoint_quarantined",
-                    "reason": reason.as_str(),
-                })),
-            "Hailo-Ollama quarantined an endpoint after an ambiguous in-flight failure"
-        );
-    }
-}
-
-struct HailoInFlightGuard {
-    gate: Arc<HailoGenerationGate>,
-    armed: bool,
-}
-
-impl HailoInFlightGuard {
-    fn new(gate: Arc<HailoGenerationGate>) -> Self {
-        Self { gate, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn quarantine(&mut self, reason: HailoQuarantineReason) {
-        self.gate.quarantine(reason);
-        self.disarm();
-    }
-}
-
-impl Drop for HailoInFlightGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.gate
-                .quarantine(HailoQuarantineReason::WorkerTerminated);
-        }
-    }
-}
-
-fn canonical_hailo_endpoint(endpoint: &str) -> String {
-    let fallback = OllamaModelProvider::normalize_base_url(endpoint);
-    let Ok(mut url) = reqwest::Url::parse(endpoint.trim()) else {
-        return fallback;
-    };
-
-    url.set_query(None);
-    url.set_fragment(None);
-    let _ = url.set_password(None);
-    let _ = url.set_username("");
-    let is_loopback_alias = url.host_str().is_some_and(|host| {
-        matches!(
-            host,
-            "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-        )
-    });
-    if is_loopback_alias {
-        let _ = url.set_host(Some("localhost"));
-    }
-
-    let path = url.path().trim_end_matches('/');
-    let base_path = path
-        .strip_suffix("/api/chat")
-        .or_else(|| path.strip_suffix("/api"))
-        .unwrap_or(path)
-        .to_string();
-    url.set_path(if base_path.is_empty() {
-        "/"
-    } else {
-        &base_path
-    });
-    url.to_string().trim_end_matches('/').to_string()
-}
-
-fn shared_hailo_generation_gate(endpoint: &str) -> Arc<HailoGenerationGate> {
-    type GateRegistry = Mutex<HashMap<String, Arc<HailoGenerationGate>>>;
-    static GATES: OnceLock<GateRegistry> = OnceLock::new();
-
-    let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut gates = gates
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    gates
-        .entry(canonical_hailo_endpoint(endpoint))
-        .or_insert_with(|| {
-            Arc::new(HailoGenerationGate {
-                semaphore: Arc::new(Semaphore::new(1)),
-                quarantine_reason: OnceLock::new(),
-            })
-        })
-        .clone()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HailoMessageKind {
-    User,
-    Assistant,
-    ToolResult,
-}
-
-struct HailoMessageCandidate {
-    kind: HailoMessageKind,
-    content: String,
-}
-
-#[derive(Clone)]
 pub struct OllamaModelProvider {
-    /// Config-key alias from the selected typed provider family.
+    /// `[providers.models.ollama.<alias>]` config-key alias.
     alias: String,
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
     tuning: OllamaTuning,
-    compatibility: OllamaCompatibility,
-    request_timeout_secs: u64,
 }
 
-// ─── Request Structures ───────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<Message>,
-    stream: bool,
-    options: Options,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    think: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<serde_json::Value>>,
-}
-
-/// Observed with the tested Hailo-Ollama 0.5.1 stack: a request containing
-/// literal non-ASCII UTF-8 wedged, while semantically equivalent ASCII-escaped
-/// JSON completed. Emit ASCII-only JSON on the Hailo path as a wire workaround.
-struct HailoAsciiJsonFormatter;
-
-impl serde_json::ser::Formatter for HailoAsciiJsonFormatter {
-    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-
-        let fragment_bytes = fragment.as_bytes();
-        let mut ascii_start = 0;
-        for (index, character) in fragment.char_indices() {
-            if character.is_ascii() {
-                continue;
-            }
-
-            std::io::Write::write_all(writer, &fragment_bytes[ascii_start..index])?;
-            let mut utf16 = [0_u16; 2];
-            for code_unit in character.encode_utf16(&mut utf16) {
-                let escaped = [
-                    b'\\',
-                    b'u',
-                    HEX[(((*code_unit) >> 12) & 0x0f) as usize],
-                    HEX[(((*code_unit) >> 8) & 0x0f) as usize],
-                    HEX[(((*code_unit) >> 4) & 0x0f) as usize],
-                    HEX[((*code_unit) & 0x0f) as usize],
-                ];
-                std::io::Write::write_all(writer, &escaped)?;
-            }
-            ascii_start = index + character.len_utf8();
-        }
-
-        std::io::Write::write_all(writer, &fragment_bytes[ascii_start..])
-    }
-}
-
-fn serialize_hailo_request(request: &ChatRequest) -> anyhow::Result<Vec<u8>> {
-    let mut body = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut body, HailoAsciiJsonFormatter);
-    request.serialize(&mut serializer).map_err(|error| {
-        anyhow::Error::msg(format!("Failed to serialize Hailo-Ollama request: {error}"))
-    })?;
-    Ok(body)
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct Message {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    images: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OutgoingToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OutgoingToolCall {
-    #[serde(rename = "type")]
-    kind: String,
-    function: OutgoingFunction,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OutgoingFunction {
-    name: String,
-    arguments: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct Options {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_ctx: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_predict: Option<i32>,
-}
-
-// ─── Response Structures ──────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct ApiChatResponse {
-    message: ResponseMessage,
-    #[serde(default)]
-    prompt_eval_count: Option<u64>,
-    #[serde(default)]
-    eval_count: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseMessage {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    tool_calls: Vec<OllamaToolCall>,
-    /// Some models return a "thinking" field with internal reasoning
-    #[serde(default)]
-    thinking: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaToolCall {
-    id: Option<String>,
-    function: OllamaFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaFunction {
-    name: String,
-    #[serde(default, deserialize_with = "deserialize_args")]
-    arguments: serde_json::Value,
-}
-
-// ─── serde Helpers ───────────────────────────────────────────────────────────
-fn deserialize_args<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-
-    if let Some(s) = value.as_str() {
-        match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(serde_json::json!({})),
-        }
-    } else {
-        Ok(value)
-    }
-}
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 /// Typed builder for [`OllamaModelProvider`].
@@ -552,37 +251,7 @@ impl OllamaModelProvider {
             api_key,
             reasoning_enabled,
             tuning: OllamaTuning::default(),
-            compatibility: OllamaCompatibility::Standard,
-            request_timeout_secs: 300,
         }
-    }
-
-    /// Construct the explicit native Hailo-Ollama transport.
-    pub fn new_hailo(
-        alias: &str,
-        base_url: Option<&str>,
-        request_timeout_secs: u64,
-        queue_timeout_secs: u64,
-        tuning: OllamaTuning,
-    ) -> anyhow::Result<Self> {
-        let raw_base_url = base_url
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| HailoOllamaEndpoint::default().uri());
-        let base_url = Self::normalize_hailo_base_url(raw_base_url)?;
-        let generation_gate = shared_hailo_generation_gate(&base_url);
-        Ok(Self {
-            alias: alias.to_string(),
-            base_url,
-            api_key: None,
-            reasoning_enabled: Some(false),
-            tuning,
-            compatibility: OllamaCompatibility::Hailo {
-                queue_timeout: Duration::from_secs(queue_timeout_secs.max(1)),
-                generation_gate,
-            },
-            request_timeout_secs: request_timeout_secs.max(1),
-        })
     }
 
     /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
@@ -608,117 +277,6 @@ impl OllamaModelProvider {
             })
     }
 
-    fn is_hailo(&self) -> bool {
-        matches!(self.compatibility, OllamaCompatibility::Hailo { .. })
-    }
-
-    fn request_log_endpoint(&self) -> Option<&str> {
-        (!self.is_hailo()).then_some(self.base_url.as_str())
-    }
-
-    fn ensure_hailo_gate_ready(&self, gate: &HailoGenerationGate) -> anyhow::Result<()> {
-        let Some(reason) = gate.quarantine_reason.get().copied() else {
-            return Ok(());
-        };
-
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "hailo_endpoint_quarantined",
-                    "model_provider": self.alias,
-                    "reason": reason.as_str(),
-                })),
-            "Hailo-Ollama rejected a request because the endpoint is quarantined"
-        );
-        let detail = match reason {
-            HailoQuarantineReason::AmbiguousTimeout => "an ambiguous request timeout",
-            HailoQuarantineReason::AmbiguousTransport => {
-                "an ambiguous post-connect transport failure"
-            }
-            HailoQuarantineReason::WorkerTerminated => "an in-flight request worker failure",
-        };
-        Err(anyhow::Error::msg(format!(
-            "Hailo-Ollama provider is quarantined after {detail}; restart ZeroClaw after \
-             confirming the backend is idle"
-        )))
-    }
-
-    fn hailo_quarantine_reason(error: &anyhow::Error) -> Option<HailoQuarantineReason> {
-        error.chain().find_map(|source| {
-            let error = source.downcast_ref::<reqwest::Error>()?;
-            if error.is_connect() || error.is_builder() {
-                None
-            } else if error.is_timeout() {
-                Some(HailoQuarantineReason::AmbiguousTimeout)
-            } else {
-                Some(HailoQuarantineReason::AmbiguousTransport)
-            }
-        })
-    }
-
-    fn redact_hailo_transport_error(&self, error: anyhow::Error) -> anyhow::Error {
-        let Some(request_error) = error
-            .chain()
-            .find_map(|source| source.downcast_ref::<reqwest::Error>())
-        else {
-            return error;
-        };
-
-        let (transport_kind, message) = if request_error.is_connect() {
-            ("connect", "Hailo-Ollama connection failed".to_string())
-        } else if request_error.is_timeout() {
-            ("timeout", "Hailo-Ollama request timed out".to_string())
-        } else if request_error.is_builder() {
-            (
-                "builder",
-                "Hailo-Ollama request could not be built".to_string(),
-            )
-        } else if let Some(status) = request_error.status() {
-            (
-                "http_status",
-                format!("Hailo-Ollama API request failed with HTTP {status}"),
-            )
-        } else if request_error.is_decode() {
-            (
-                "decode",
-                "Hailo-Ollama response decoding failed".to_string(),
-            )
-        } else if request_error.is_body() {
-            (
-                "body",
-                "Hailo-Ollama response body transfer failed".to_string(),
-            )
-        } else {
-            ("other", "Hailo-Ollama transport request failed".to_string())
-        };
-
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "hailo_transport_error",
-                    "model_provider": self.alias,
-                    "transport_kind": transport_kind,
-                    "status": request_error.status().map(|status| status.as_u16()),
-                })),
-            "Hailo-Ollama transport request failed"
-        );
-
-        anyhow::Error::msg(message)
-    }
-
-    fn externalize_reqwest_error(&self, error: reqwest::Error) -> anyhow::Error {
-        let error = anyhow::Error::from(error);
-        if self.is_hailo() {
-            self.redact_hailo_transport_error(error)
-        } else {
-            error
-        }
-    }
-
     fn is_official_cloud_endpoint(&self) -> bool {
         reqwest::Url::parse(&self.base_url)
             .ok()
@@ -731,27 +289,12 @@ impl OllamaModelProvider {
             .unwrap_or(false)
     }
 
-    fn http_client(&self) -> anyhow::Result<Client> {
-        let component = if self.is_hailo() {
-            "model_provider.hailo_ollama"
-        } else {
-            "model_provider.ollama"
-        };
-        if self.is_hailo() {
-            zeroclaw_config::schema::try_build_runtime_proxy_client_with_timeouts(
-                component,
-                self.request_timeout_secs,
-                10,
-            )
-        } else {
-            Ok(
-                zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-                    component,
-                    self.request_timeout_secs,
-                    10,
-                ),
-            )
-        }
+    fn http_client(&self) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+            "model_provider.ollama",
+            300,
+            10,
+        )
     }
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
@@ -1040,283 +583,6 @@ impl OllamaModelProvider {
             .collect()
     }
 
-    fn normalize_hailo_content(content: &str) -> String {
-        let without_controls: String = content
-            .chars()
-            .filter_map(|ch| match ch {
-                '\r' | '\n' | '\t' => Some(' '),
-                _ if ch.is_control() => None,
-                _ => Some(ch),
-            })
-            .collect();
-        without_controls
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn truncate_hailo_content(content: &str, max_chars: usize) -> String {
-        let char_count = content.chars().count();
-        if char_count <= max_chars {
-            return content.to_string();
-        }
-        if max_chars <= 3 {
-            return content.chars().take(max_chars).collect();
-        }
-
-        let head_chars = (max_chars - 3) / 2;
-        let tail_chars = max_chars - 3 - head_chars;
-        let head: String = content.chars().take(head_chars).collect();
-        let tail_reversed: String = content.chars().rev().take(tail_chars).collect();
-        let tail: String = tail_reversed.chars().rev().collect();
-        format!("{head}...{tail}")
-    }
-
-    fn fold_hailo_system(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        const INSTRUCTIONS_PREFIX: &str = "Instructions: ";
-        const REQUEST_PREFIX: &str = " Request: ";
-
-        let overhead = INSTRUCTIONS_PREFIX.chars().count() + REQUEST_PREFIX.chars().count();
-        let available = HAILO_MAX_MESSAGE_CHARS.saturating_sub(overhead);
-        let system_chars = system.chars().count();
-        let user_chars = user.chars().count();
-        let reserved_system = system_chars.min(available / 3);
-        let user_budget = user_chars.min(available.saturating_sub(reserved_system));
-        let system_budget = system_chars.min(available.saturating_sub(user_budget));
-        let system_truncated = system_chars > system_budget;
-        let user_truncated = user_chars > user_budget;
-
-        if system_truncated && system.contains("## Tool Use Protocol") {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_tool_prompt_too_large",
-                        "model_provider": self.alias,
-                        "system_chars": system_chars,
-                        "system_budget": system_budget,
-                        "user_chars": user_chars,
-                    })),
-                "Hailo-Ollama rejected an oversized prompt-guided tool prompt"
-            );
-            anyhow::bail!(
-                "Hailo-Ollama prompt-guided tool instructions exceed the bounded system prompt; reduce enabled tools or compact the agent context"
-            );
-        }
-
-        if system_truncated || user_truncated {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_prompt_bounded",
-                        "model_provider": self.alias,
-                        "system_chars": system_chars,
-                        "system_budget": system_budget,
-                        "user_chars": user_chars,
-                        "user_budget": user_budget,
-                    })),
-                "Hailo-Ollama bounded an oversized system/user prompt"
-            );
-        }
-
-        let system = Self::truncate_hailo_content(system, system_budget);
-        let user = Self::truncate_hailo_content(user, user_budget);
-        Ok(format!(
-            "{INSTRUCTIONS_PREFIX}{system}{REQUEST_PREFIX}{user}"
-        ))
-    }
-
-    fn push_hailo_message(&self, messages: &mut Vec<Message>, role: String, content: String) {
-        if content.is_empty() {
-            return;
-        }
-        if let Some(previous) = messages.last_mut()
-            && previous.role == role
-        {
-            let previous_content = previous.content.take().unwrap_or_default();
-            let merged_chars = previous_content.chars().count() + 1 + content.chars().count();
-            if merged_chars > HAILO_MAX_MESSAGE_CHARS {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "hailo_message_bounded",
-                            "model_provider": self.alias,
-                            "role": role.as_str(),
-                            "message_chars": merged_chars,
-                            "max_message_chars": HAILO_MAX_MESSAGE_CHARS,
-                        })),
-                    "Hailo-Ollama bounded a merged history message"
-                );
-            }
-            previous.content = Some(Self::truncate_hailo_content(
-                &format!("{previous_content} {content}"),
-                HAILO_MAX_MESSAGE_CHARS,
-            ));
-            return;
-        }
-
-        let message_chars = content.chars().count();
-        if message_chars > HAILO_MAX_MESSAGE_CHARS {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_message_bounded",
-                        "model_provider": self.alias,
-                        "role": role.as_str(),
-                        "message_chars": message_chars,
-                        "max_message_chars": HAILO_MAX_MESSAGE_CHARS,
-                    })),
-                "Hailo-Ollama bounded a history message"
-            );
-        }
-
-        messages.push(Message {
-            role,
-            content: Some(Self::truncate_hailo_content(
-                &content,
-                HAILO_MAX_MESSAGE_CHARS,
-            )),
-            images: None,
-            tool_calls: None,
-            tool_name: None,
-        });
-    }
-
-    fn convert_hailo_messages(&self, messages: Vec<Message>) -> anyhow::Result<Vec<Message>> {
-        let mut system_parts = Vec::new();
-        let mut candidates = Vec::new();
-
-        for message in messages {
-            if message
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-            {
-                anyhow::bail!("Hailo-Ollama does not support image inputs");
-            }
-            let mut content =
-                Self::normalize_hailo_content(message.content.as_deref().unwrap_or(""));
-            if message.role == "system" {
-                if !content.is_empty() {
-                    system_parts.push(content);
-                }
-                continue;
-            }
-
-            if message.role == "assistant"
-                && let Some(tool_calls) = message
-                    .tool_calls
-                    .as_ref()
-                    .filter(|tool_calls| !tool_calls.is_empty())
-            {
-                let rendered = serde_json::to_string(tool_calls).map_err(|error| {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error_key": "hailo_tool_history_serialize",
-                                "model_provider": self.alias,
-                                "error": error.to_string(),
-                            })),
-                        "Hailo-Ollama failed to render tool history"
-                    );
-                    anyhow::Error::msg(format!("failed to render Hailo tool history: {error}"))
-                })?;
-                content = if content.is_empty() {
-                    format!("Tool calls: {rendered}")
-                } else {
-                    format!("{content} Tool calls: {rendered}")
-                };
-            }
-
-            let (kind, content) = match message.role.as_str() {
-                "user" => (HailoMessageKind::User, content),
-                "assistant" => (HailoMessageKind::Assistant, content),
-                "tool" => {
-                    let source = message
-                        .tool_name
-                        .as_deref()
-                        .map_or_else(String::new, |name| format!(" from {name}"));
-                    (
-                        HailoMessageKind::ToolResult,
-                        format!("Tool result{source}: {content}"),
-                    )
-                }
-                _ => continue,
-            };
-            if !content.is_empty() {
-                candidates.push(HailoMessageCandidate { kind, content });
-            }
-        }
-
-        if candidates.len() > HAILO_MAX_HISTORY_MESSAGES {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_history_bounded",
-                        "model_provider": self.alias,
-                        "history_messages": candidates.len(),
-                        "retained_messages": HAILO_MAX_HISTORY_MESSAGES,
-                    })),
-                "Hailo-Ollama bounded chat history"
-            );
-            candidates = candidates.split_off(candidates.len() - HAILO_MAX_HISTORY_MESSAGES);
-        }
-        let first_user = candidates
-            .iter()
-            .position(|candidate| candidate.kind == HailoMessageKind::User)
-            .unwrap_or(candidates.len());
-        if first_user > 0 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_orphan_history_dropped",
-                        "model_provider": self.alias,
-                        "dropped_messages": first_user,
-                    })),
-                "Hailo-Ollama dropped orphaned leading history"
-            );
-            candidates.drain(..first_user);
-        }
-
-        let mut converted = Vec::new();
-        for candidate in candidates {
-            let role = match candidate.kind {
-                HailoMessageKind::User | HailoMessageKind::ToolResult => "user",
-                HailoMessageKind::Assistant => "assistant",
-            };
-            self.push_hailo_message(&mut converted, role.to_string(), candidate.content);
-        }
-
-        let system = system_parts.join(" ");
-        if converted.is_empty() {
-            let content = if system.is_empty() {
-                "hello".to_string()
-            } else {
-                self.fold_hailo_system(&system, "hello")?
-            };
-            self.push_hailo_message(&mut converted, "user".to_string(), content);
-        } else if !system.is_empty() {
-            let first_user = &mut converted[0];
-            let user = first_user.content.take().unwrap_or_default();
-            first_user.content = Some(self.fold_hailo_system(&system, &user)?);
-        }
-
-        Ok(converted)
-    }
-
     fn with_prompt_guided_tool_instructions(
         &self,
         messages: &[ChatMessage],
@@ -1415,46 +681,21 @@ impl OllamaModelProvider {
 
         let url = format!("{}/api/chat", self.base_url);
 
-        if let Some(endpoint) = self.request_log_endpoint() {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Ollama request: url={}/api/chat model={} message_count={} temperature={:?} think={:?} tool_count={}",
-                    endpoint,
-                    model,
-                    request.messages.len(),
-                    temperature,
-                    request.think,
-                    request.tools.as_ref().map_or(0, |t| t.len())
-                )
-            );
-        } else {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "model_provider": self.alias,
-                        "model": model,
-                        "message_count": request.messages.len(),
-                        "temperature": temperature,
-                        "think": request.think,
-                        "tool_count": request.tools.as_ref().map_or(0, |tools| tools.len()),
-                    })),
-                "Hailo-Ollama request"
-            );
-        }
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Ollama request: url={} model={} message_count={} temperature={:?} think={:?} tool_count={}",
+                url,
+                model,
+                request.messages.len(),
+                temperature,
+                request.think,
+                request.tools.as_ref().map_or(0, |tools| tools.len())
+            )
+        );
 
-        let client = self.http_client()?;
-        let mut request_builder = if self.is_hailo() {
-            client
-                .post(&url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(reqwest::header::CONNECTION, "close")
-                .body(serialize_hailo_request(&request)?)
-        } else {
-            client.post(&url).json(&request)
-        };
+        let mut request_builder = self.http_client().post(&url).json(&request);
 
         if should_auth && let Some(key) = self.api_key.as_ref() {
             request_builder = request_builder.bearer_auth(key);
@@ -1478,28 +719,6 @@ impl OllamaModelProvider {
         if !status.is_success() {
             let raw = String::from_utf8_lossy(&body);
             let sanitized = super::sanitize_api_error(&raw);
-            if self.is_hailo() {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "hailo_api_error",
-                            "model_provider": self.alias,
-                            "status": status.as_u16(),
-                        })),
-                    &format!(
-                        "Hailo-Ollama error response: status={} body_excerpt={}",
-                        status, sanitized
-                    )
-                );
-                anyhow::bail!(
-                    "Hailo-Ollama API error ({}): {}. Check that Hailo-Ollama is running and the \
-                     model is loaded",
-                    status,
-                    sanitized
-                );
-            }
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1521,23 +740,6 @@ impl OllamaModelProvider {
             Err(e) => {
                 let raw = String::from_utf8_lossy(&body);
                 let sanitized = super::sanitize_api_error(&raw);
-                if self.is_hailo() {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error_key": "hailo_response_deserialize",
-                                "model_provider": self.alias,
-                                "error": e.to_string(),
-                            })),
-                        &format!(
-                            "Hailo-Ollama response deserialization failed: {e}. body_excerpt={}",
-                            sanitized
-                        )
-                    );
-                    anyhow::bail!("Failed to parse Hailo-Ollama response: {e}");
-                }
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1555,106 +757,6 @@ impl OllamaModelProvider {
     }
 
     async fn send_request(
-        &self,
-        messages: Vec<Message>,
-        model: &str,
-        temperature: Option<f64>,
-        should_auth: bool,
-        tools: Option<&[serde_json::Value]>,
-    ) -> anyhow::Result<ApiChatResponse> {
-        let (queue_timeout, gate) = match &self.compatibility {
-            OllamaCompatibility::Standard => {
-                return self
-                    .send_request_with_retry(messages, model, temperature, should_auth, tools)
-                    .await;
-            }
-            OllamaCompatibility::Hailo {
-                queue_timeout,
-                generation_gate,
-            } => (*queue_timeout, generation_gate.clone()),
-        };
-        let messages = self.convert_hailo_messages(messages)?;
-
-        // Queue waiting is caller-cancellable. Once dispatched, keep the
-        // endpoint-scoped hardware permit in an owned worker. Caller
-        // cancellation cannot release it early, and an ambiguous HTTP timeout
-        // quarantines the process-lifetime endpoint gate before the permit is
-        // released.
-        self.ensure_hailo_gate_ready(&gate)?;
-        let permit = tokio::time::timeout(queue_timeout, gate.semaphore.clone().acquire_owned())
-            .await
-            .map_err(|_| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "hailo_queue_timeout",
-                            "model_provider": self.alias,
-                            "queue_timeout_secs": queue_timeout.as_secs(),
-                        })),
-                    "Hailo-Ollama rejected a request after its queue wait expired"
-                );
-                anyhow::Error::msg("Hailo-Ollama queue wait timed out at its configured deadline")
-            })?
-            .map_err(|_| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "hailo_generation_semaphore_closed",
-                            "model_provider": self.alias,
-                        })),
-                    "Hailo-Ollama generation semaphore closed"
-                );
-                anyhow::Error::msg("Hailo-Ollama generation semaphore closed")
-            })?;
-        self.ensure_hailo_gate_ready(&gate)?;
-        let provider = self.clone();
-        let model = model.to_string();
-        let worker_gate = gate.clone();
-        let worker = zeroclaw_spawn::spawn!(async move {
-            let _permit = permit;
-            let mut in_flight = HailoInFlightGuard::new(worker_gate);
-            let result = provider
-                .send_request_with_retry(messages, &model, temperature, should_auth, None)
-                .await;
-            if let Err(error) = &result
-                && let Some(reason) = Self::hailo_quarantine_reason(error)
-            {
-                in_flight.quarantine(reason);
-            } else {
-                in_flight.disarm();
-            }
-            result
-        });
-        let result = worker.await.map_err(|error| {
-            gate.quarantine(HailoQuarantineReason::WorkerTerminated);
-            let worker_failure = if error.is_panic() {
-                "panic"
-            } else if error.is_cancelled() {
-                "cancelled"
-            } else {
-                "unknown"
-            };
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_request_worker_failed",
-                        "model_provider": self.alias,
-                        "worker_failure": worker_failure,
-                    })),
-                "Hailo-Ollama request worker failed"
-            );
-            anyhow::Error::msg("Hailo-Ollama request worker failed")
-        })?;
-        result.map_err(|error| self.redact_hailo_transport_error(error))
-    }
-
-    async fn send_request_with_retry(
         &self,
         messages: Vec<Message>,
         model: &str,
@@ -1775,25 +877,17 @@ impl ModelProvider for OllamaModelProvider {
     }
 
     fn default_timeout_secs(&self) -> u64 {
-        if self.is_hailo() {
-            self.request_timeout_secs
-        } else {
-            TIMEOUT_SECS_DEFAULT
-        }
+        TIMEOUT_SECS_DEFAULT
     }
 
     fn default_base_url(&self) -> Option<&str> {
-        Some(if self.is_hailo() {
-            HailoOllamaEndpoint::default().uri()
-        } else {
-            BASE_URL
-        })
+        Some(BASE_URL)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: false,
-            vision: !self.is_hailo(),
+            vision: true,
             prompt_caching: false,
             extended_thinking: false,
         }
@@ -1914,9 +1008,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        if self.is_hailo() && !tools.is_empty() {
-            anyhow::bail!("Hailo-Ollama does not support native tool calling");
-        }
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -1948,11 +1039,7 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        let temperature = if self.is_hailo() {
-            temperature
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
         let messages =
             self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
@@ -1961,7 +1048,7 @@ impl ModelProvider for OllamaModelProvider {
             .send_request(
                 api_messages,
                 &normalized_model,
-                temperature,
+                Some(temperature),
                 should_auth,
                 None,
             )
@@ -1974,18 +1061,13 @@ impl ModelProvider for OllamaModelProvider {
         // Local Ollama's /api/tags lists installed models and requires no auth.
         // Remote Ollama endpoints attach the Bearer key; local ones don't.
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        let mut request = self.http_client()?.get(&url);
+        let mut request = self.http_client().get(&url);
         if !self.is_local_endpoint()
             && let Some(key) = self.api_key.as_deref()
         {
             request = request.header("Authorization", format!("Bearer {key}"));
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| self.externalize_reqwest_error(error))?
-            .error_for_status()
-            .map_err(|error| self.externalize_reqwest_error(error))?;
+        let response = request.send().await?.error_for_status()?;
 
         #[derive(Deserialize)]
         struct Resp {
@@ -1996,10 +1078,7 @@ impl ModelProvider for OllamaModelProvider {
             name: String,
         }
 
-        let body: Resp = response
-            .json()
-            .await
-            .map_err(|error| self.externalize_reqwest_error(error))?;
+        let body: Resp = response.json().await?;
         Ok(body.models.into_iter().map(|e| e.name).collect())
     }
 }
@@ -2009,11 +1088,9 @@ impl ModelProvider for OllamaModelProvider {
 impl ::zeroclaw_api::attribution::Attributable for OllamaModelProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Provider(
-            ::zeroclaw_api::attribution::ProviderKind::Model(if self.is_hailo() {
-                ::zeroclaw_api::attribution::ModelProviderKind::HailoOllama
-            } else {
-                ::zeroclaw_api::attribution::ModelProviderKind::Ollama
-            }),
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Ollama,
+            ),
         )
     }
     fn alias(&self) -> &str {
@@ -2024,139 +1101,8 @@ impl ::zeroclaw_api::attribution::Attributable for OllamaModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ollama_wire::OllamaFunction;
     use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn hailo_constructor_normalizes_request_and_gate_url_identity() {
-        let provider = OllamaModelProvider::new_hailo(
-            "edge",
-            Some("HTTP://LOCALHOST:8000/prefix/api/chat/"),
-            90,
-            5,
-            OllamaTuning::default(),
-        )
-        .expect("valid Hailo URL");
-
-        assert_eq!(provider.base_url, "http://localhost:8000/prefix");
-        let equivalent = OllamaModelProvider::new_hailo(
-            "edge-equivalent",
-            Some("http://127.0.0.1:8000/prefix"),
-            90,
-            5,
-            OllamaTuning::default(),
-        )
-        .expect("equivalent valid Hailo URL");
-        let OllamaCompatibility::Hailo {
-            generation_gate, ..
-        } = &provider.compatibility
-        else {
-            panic!("new_hailo must construct Hailo compatibility");
-        };
-        let OllamaCompatibility::Hailo {
-            generation_gate: equivalent_gate,
-            ..
-        } = &equivalent.compatibility
-        else {
-            panic!("new_hailo must construct Hailo compatibility");
-        };
-        assert!(Arc::ptr_eq(generation_gate, equivalent_gate));
-    }
-
-    #[test]
-    fn hailo_constructor_uses_the_typed_default_endpoint() {
-        let provider = OllamaModelProvider::new_hailo("edge", None, 90, 5, OllamaTuning::default())
-            .expect("typed default Hailo URL must be valid");
-
-        assert_eq!(provider.base_url, HailoOllamaEndpoint::default().uri());
-    }
-
-    #[test]
-    fn hailo_constructor_rejects_ambiguous_or_authenticated_urls() {
-        for url in [
-            "http://user:placeholder@localhost:8000",
-            "http://localhost:8000?route=canary",
-            "http://localhost:8000#fragment",
-            "ftp://localhost:8000",
-        ] {
-            let error = match OllamaModelProvider::new_hailo(
-                "edge",
-                Some(url),
-                90,
-                5,
-                OllamaTuning::default(),
-            ) {
-                Ok(_) => panic!("unsafe Hailo URL must be rejected"),
-                Err(error) => error,
-            }
-            .to_string();
-            assert!(
-                error.contains("Hailo-Ollama URL"),
-                "unexpected error: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn hailo_gate_key_canonicalizes_loopback_aliases() {
-        assert_eq!(
-            canonical_hailo_endpoint("http://localhost:8000/api/chat"),
-            canonical_hailo_endpoint("http://127.0.0.1:8000")
-        );
-        assert_eq!(
-            canonical_hailo_endpoint("http://localhost:8000"),
-            canonical_hailo_endpoint("http://[::1]:8000/api")
-        );
-    }
-
-    #[test]
-    fn hailo_request_logging_omits_endpoint_identity() {
-        let hailo = OllamaModelProvider::new_hailo(
-            "edge",
-            Some("http://private.example:8000"),
-            90,
-            5,
-            OllamaTuning::default(),
-        )
-        .expect("valid Hailo URL");
-        assert_eq!(hailo.request_log_endpoint(), None);
-
-        let standard = OllamaModelProvider::new("standard", Some("http://localhost:11434"), None);
-        assert_eq!(
-            standard.request_log_endpoint(),
-            Some("http://localhost:11434")
-        );
-    }
-
-    #[tokio::test]
-    async fn panic_guard_quarantines_before_releasing_gate() {
-        let gate = Arc::new(HailoGenerationGate {
-            semaphore: Arc::new(Semaphore::new(1)),
-            quarantine_reason: OnceLock::new(),
-        });
-        let permit = gate
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("test gate remains open");
-        let worker_gate = gate.clone();
-        let worker = zeroclaw_spawn::spawn!(async move {
-            let _permit = permit;
-            let _guard = HailoInFlightGuard::new(worker_gate);
-            panic!("synthetic Hailo worker panic");
-        });
-
-        let _ = worker.await;
-        let _next = gate
-            .semaphore
-            .acquire()
-            .await
-            .expect("test gate remains open");
-        assert!(
-            gate.quarantine_reason.get().is_some(),
-            "the endpoint must be quarantined before a panic releases its permit"
-        );
-    }
 
     #[test]
     fn default_url() {

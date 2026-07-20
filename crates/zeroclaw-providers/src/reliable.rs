@@ -204,12 +204,15 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         }
     }
 
-    // Heuristic: detect auth/model failures by keyword when no HTTP status
-    // is available (e.g. gRPC or custom transport errors).
-    let msg_lower = msg.to_lowercase();
-    if msg_lower.contains("hailo-ollama provider is quarantined") {
+    if err
+        .chain()
+        .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
+    {
         return true;
     }
+
+    // Heuristic: detect auth/model failures by keyword when no HTTP status
+    // is available (e.g. gRPC or custom transport errors).
     let auth_failure_hints = [
         "invalid api key",
         "incorrect api key",
@@ -224,6 +227,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         "invalid token",
     ];
 
+    let msg_lower = msg.to_lowercase();
     if auth_failure_hints
         .iter()
         .any(|hint| msg_lower.contains(hint))
@@ -2723,8 +2727,10 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::Error::msg(
             "model overloaded, try again later"
         )));
-        assert!(is_non_retryable(&anyhow::Error::msg(
-            "Hailo-Ollama provider is quarantined after an ambiguous request timeout"
+        assert!(is_non_retryable(&anyhow::Error::new(
+            crate::traits::NonRetryableProviderError::new(
+                "provider is quarantined after an ambiguous request timeout",
+            ),
         )));
         // Context window errors are now recoverable (not non-retryable)
         assert!(!is_non_retryable(&anyhow::Error::msg(

@@ -14,6 +14,7 @@ use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, R
 use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
 use zeroclaw_providers::ModelProviderRuntimeOptions;
 use zeroclaw_providers::factory::FamilyProviderFactory;
+use zeroclaw_providers::hailo_ollama::HailoOllamaModelProvider;
 use zeroclaw_providers::ollama::{OllamaModelProvider, OllamaTuning};
 use zeroclaw_providers::traits::{ChatMessage, ModelProvider};
 
@@ -21,15 +22,15 @@ type Capture = Arc<Mutex<Option<Value>>>;
 type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
 type HeaderCapture = Arc<Mutex<Option<HeaderMap>>>;
 
-fn hailo_provider(base_url: &str) -> OllamaModelProvider {
+fn hailo_provider(base_url: &str) -> HailoOllamaModelProvider {
     hailo_provider_with_queue_timeout(base_url, 5)
 }
 
 fn hailo_provider_with_queue_timeout(
     base_url: &str,
     queue_timeout_secs: u64,
-) -> OllamaModelProvider {
-    OllamaModelProvider::new_hailo(
+) -> HailoOllamaModelProvider {
+    HailoOllamaModelProvider::new(
         "edge",
         Some(base_url),
         5,
@@ -190,7 +191,7 @@ async fn native_hailo_normalizes_messages_and_reports_honest_capabilities() {
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(
         body["messages"][0]["content"],
-        "Instructions: Keep format one line. Request: First line Second line."
+        "Instructions: Keep\\nformat\\tone line. Request: First line\\r\\nSecond line."
     );
     assert!(body.get("tools").is_none());
 
@@ -203,7 +204,36 @@ async fn native_hailo_normalizes_messages_and_reports_honest_capabilities() {
         Role::Provider(ProviderKind::Model(ModelProviderKind::HailoOllama))
     );
     assert_eq!(provider.alias(), "edge");
+    server.abort();
+}
 
+#[tokio::test]
+async fn native_hailo_preserves_model_ids_ending_in_cloud() {
+    let capture: Capture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_chat))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    hailo_provider(&format!("http://{addr}"))
+        .simple_chat("hello", "local-model:cloud", Some(0.2))
+        .await
+        .expect("Hailo must treat model IDs as opaque");
+
+    let body = capture
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    assert_eq!(body["model"], "local-model:cloud");
     server.abort();
 }
 
@@ -509,8 +539,21 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
     for message in messages {
         let content = message["content"].as_str().expect("message content");
         assert!(content.chars().count() <= 2_000);
-        assert!(!content.chars().any(char::is_control));
+        assert!(
+            !content
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t')),
+            "only non-structural control characters should be removed"
+        );
     }
+
+    let first_content = messages[0]["content"].as_str().expect("first content");
+    assert!(
+        first_content.contains('\n')
+            || first_content.contains('\t')
+            || first_content.contains(r"\n")
+            || first_content.contains(r"\t")
+    );
 
     server.abort();
 }
@@ -1118,7 +1161,7 @@ async fn timed_out_hailo_request_quarantines_provider_without_overlap() {
             .expect("serve fake Hailo server");
     });
     let endpoint = format!("http://{addr}");
-    let provider = OllamaModelProvider::new_hailo(
+    let provider = HailoOllamaModelProvider::new(
         "timeout_canary",
         Some(&endpoint),
         1,
@@ -1296,7 +1339,7 @@ async fn live_native_hailo_catalog_and_chat() {
         .expect("set HAILO_OLLAMA_LIVE_URL for the ignored hardware test");
     let model =
         std::env::var("HAILO_OLLAMA_LIVE_MODEL").unwrap_or_else(|_| "qwen3:1.7b".to_string());
-    let provider = OllamaModelProvider::new_hailo(
+    let provider = HailoOllamaModelProvider::new(
         "live_hardware",
         Some(&base_url),
         90,
