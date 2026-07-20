@@ -211,7 +211,7 @@ impl Default for EvalConfig {
 }
 
 fn default_eval_suite_dir() -> String {
-    "evals".to_string()
+    "evals/regression".to_string()
 }
 fn default_eval_mode() -> String {
     "replay".to_string()
@@ -225,6 +225,9 @@ fn default_eval_mode() -> String {
 #[prefix = "eval"]
 pub struct EvalHarnessConfig {
     /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    /// Defaults to `evals/regression`, the CI-gating suite. Planned sibling suites
+    /// `evals/capability/` (tracked, non-gating) and `evals/live/` (real-provider,
+    /// never in CI) live alongside it.
     #[serde(default = "default_eval_suite_dir")]
     pub suite_dir: String,
     /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
