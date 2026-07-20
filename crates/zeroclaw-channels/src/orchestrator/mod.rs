@@ -4187,6 +4187,10 @@ fn spawn_supervised_listener_with_health_interval(
 
                 match result {
                     Ok(()) => {
+                        // A clean return during shutdown is expected — don't restart.
+                        if cancel.is_cancelled() {
+                            return;
+                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
