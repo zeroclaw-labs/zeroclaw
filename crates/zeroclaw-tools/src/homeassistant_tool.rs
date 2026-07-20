@@ -1,13 +1,27 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
+use zeroclaw_config::schema::{Config, HomeAssistantConfig};
 
 const HA_REQUEST_TIMEOUT_SECS: u64 = 30;
+const HA_CONNECT_TIMEOUT_SECS: u64 = 10;
+const HA_PROXY_SERVICE_KEY: &str = "tool.homeassistant";
 /// Maximum number of characters to include from an error response body.
 const MAX_ERROR_BODY_CHARS: usize = 500;
+
+const TOOL_DESCRIPTION_KEY: &str = "tool-homeassistant";
+static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
+
+fn tool_msg(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
+
+fn tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, args)
+}
 
 // ── Input validation ──────────────────────────────────────────────────────────
 
@@ -28,9 +42,10 @@ fn validate_slug(kind: &str, value: &str) -> anyhow::Result<()> {
     if is_valid_slug(value) {
         Ok(())
     } else {
-        anyhow::bail!(
-            "Invalid {kind} '{value}'. Expected a lowercase slug matching [a-z0-9_]+ (e.g. light, turn_on)"
-        )
+        Err(anyhow::Error::msg(tool_msg_with_args(
+            "tool-homeassistant-error-invalid-slug",
+            &[("kind", kind), ("value", value)],
+        )))
     }
 }
 
@@ -44,10 +59,30 @@ fn validate_entity_id(entity_id: &str) -> anyhow::Result<()> {
     if valid {
         Ok(())
     } else {
-        anyhow::bail!(
-            "Invalid entity_id '{entity_id}'. Expected format: <domain>.<object_id> with both parts matching [a-z0-9_]+ (e.g. light.kitchen)"
-        )
+        Err(anyhow::Error::msg(tool_msg_with_args(
+            "tool-homeassistant-error-invalid-entity-id",
+            &[("entity_id", entity_id)],
+        )))
     }
+}
+
+/// Resolves per-call Home Assistant configuration (url, token, allowed
+/// domains) from the runtime's canonical config so a config reload is
+/// observed without rebuilding the tool. Mirrors `send_via::AgentPeerGroupResolver`.
+pub type HomeAssistantConfigResolver = Arc<dyn Fn() -> HomeAssistantConfig + Send + Sync>;
+
+/// Build a resolver backed by the runtime's live (canonical) config handle.
+/// Every call re-reads `live.read().homeassistant`, so a config reload takes
+/// effect on the very next tool invocation.
+pub fn live_config_resolver(live: Arc<parking_lot::RwLock<Config>>) -> HomeAssistantConfigResolver {
+    Arc::new(move || live.read().homeassistant.clone())
+}
+
+/// Build a resolver over a fixed snapshot. Used when no live config handle is
+/// available (e.g. one-shot callers) — matches `root_config` fallback used by
+/// `send_via`'s peer-group resolver in `all_tools_with_runtime`.
+pub fn snapshot_config_resolver(config: HomeAssistantConfig) -> HomeAssistantConfigResolver {
+    Arc::new(move || config.clone())
 }
 
 /// Tool for interacting with a Home Assistant instance over its native REST
@@ -55,48 +90,68 @@ fn validate_entity_id(entity_id: &str) -> anyhow::Result<()> {
 ///
 /// Actions are gated by the appropriate security operation:
 /// - `list_entities` / `get_state` are read-only (`Read`).
-/// - `call_service` mutates device state (`Act`).
+/// - `call_service` mutates device state (`Act`), and is additionally
+///   constrained by the operator's `homeassistant.allowed_domains` config
+///   (deny-by-default: empty allowlist blocks every `call_service` call).
+///
+/// `url`, `token`, and `allowed_domains` are resolved fresh from canonical
+/// config on every call via `config` (see [`HomeAssistantConfigResolver`]) —
+/// the tool holds no copied credential/policy state, so a config reload is
+/// observed without rebuilding the tool. The HTTP client is cached
+/// separately through the runtime proxy-client facility.
 ///
 /// This intentionally stays small (read state + a guarded service call). It is
 /// NOT the Model Context Protocol server integration — it talks plain HA REST.
 pub struct HomeAssistantTool {
-    base_url: String,
-    token: String,
-    http: reqwest::Client,
+    config: HomeAssistantConfigResolver,
     security: Arc<SecurityPolicy>,
 }
 
 impl HomeAssistantTool {
-    /// Create a new Home Assistant tool. `base_url` is the HA origin
-    /// (e.g. `http://192.0.2.10:8123`); `token` is a long-lived access token.
-    pub fn new(base_url: String, token: String, security: Arc<SecurityPolicy>) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            token,
-            http: reqwest::Client::new(),
-            security,
-        }
+    /// Create a new Home Assistant tool backed by `config`, a resolver that
+    /// materializes url/token/allowed_domains fresh on every call.
+    pub fn new(config: HomeAssistantConfigResolver, security: Arc<SecurityPolicy>) -> Self {
+        Self { config, security }
     }
 
-    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.bearer_auth(&self.token)
+    fn http_client(&self) -> reqwest::Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+            HA_PROXY_SERVICE_KEY,
+            HA_REQUEST_TIMEOUT_SECS,
+            HA_CONNECT_TIMEOUT_SECS,
+        )
+    }
+
+    fn authed(&self, token: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.bearer_auth(token)
             .timeout(Duration::from_secs(HA_REQUEST_TIMEOUT_SECS))
     }
 
     /// List all entity ids and their current state (compact — no attributes),
     /// optionally filtered to a single domain prefix (e.g. `light`).
-    async fn list_entities(&self, domain: Option<&str>) -> anyhow::Result<Value> {
+    async fn list_entities(
+        &self,
+        base_url: &str,
+        token: &str,
+        domain: Option<&str>,
+    ) -> anyhow::Result<Value> {
         if let Some(d) = domain {
             validate_slug("domain", d)?;
         }
-        let url = format!("{}/api/states", self.base_url);
-        let resp = self.authed(self.http.get(&url)).send().await?;
+        let url = format!("{base_url}/api/states");
+        let resp = self
+            .authed(token, self.http_client().get(&url))
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let truncated =
                 crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Home Assistant list_entities failed ({status}): {truncated}");
+            return Err(anyhow::Error::msg(tool_msg_with_args(
+                "tool-homeassistant-error-list-entities-failed",
+                &[("status", &status.to_string()), ("body", &truncated)],
+            )));
         }
         let states: Value = resp.json().await?;
         let prefix = domain.map(|d| format!("{}.", d.trim_end_matches('.')));
@@ -121,43 +176,95 @@ impl HomeAssistantTool {
     }
 
     /// Read the full state (including attributes) of one entity.
-    async fn get_state(&self, entity_id: &str) -> anyhow::Result<Value> {
+    async fn get_state(
+        &self,
+        base_url: &str,
+        token: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<Value> {
         validate_entity_id(entity_id)?;
-        let url = format!("{}/api/states/{entity_id}", self.base_url);
-        let resp = self.authed(self.http.get(&url)).send().await?;
+        let url = format!("{base_url}/api/states/{entity_id}");
+        let resp = self
+            .authed(token, self.http_client().get(&url))
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let truncated =
                 crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Home Assistant get_state failed ({status}): {truncated}");
+            return Err(anyhow::Error::msg(tool_msg_with_args(
+                "tool-homeassistant-error-get-state-failed",
+                &[("status", &status.to_string()), ("body", &truncated)],
+            )));
         }
-        resp.json().await.map_err(Into::into)
+        resp.json().await.map_err(|e| {
+            anyhow::Error::msg(tool_msg_with_args(
+                "tool-homeassistant-error-decode-failed",
+                &[("err", &e.to_string())],
+            ))
+        })
     }
 
     /// Call a service (`POST /api/services/<domain>/<service>`) with an optional
     /// JSON service-data body (e.g. `{ "entity_id": "light.kitchen" }`).
+    ///
+    /// Enforces the operator's `allowed_domains` boundary BEFORE the request
+    /// is sent — this is authorization on top of (not instead of) the
+    /// `ToolOperation::Act` gate already applied by the caller.
     async fn call_service(
         &self,
+        base_url: &str,
+        token: &str,
+        allowed_domains: &[String],
         domain: &str,
         service: &str,
         service_data: Option<&Value>,
     ) -> anyhow::Result<Value> {
         validate_slug("domain", domain)?;
         validate_slug("service", service)?;
-        let url = format!("{}/api/services/{domain}/{service}", self.base_url);
+        if !allowed_domains.iter().any(|d| d == domain) {
+            let allowed = if allowed_domains.is_empty() {
+                tool_msg("tool-homeassistant-allowed-domains-empty")
+            } else {
+                allowed_domains.join(", ")
+            };
+            return Err(anyhow::Error::msg(tool_msg_with_args(
+                "tool-homeassistant-error-domain-not-allowed",
+                &[("domain", domain), ("allowed", &allowed)],
+            )));
+        }
+        let url = format!("{base_url}/api/services/{domain}/{service}");
         let body = service_data.cloned().unwrap_or_else(|| json!({}));
-        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
+        let resp = self
+            .authed(token, self.http_client().post(&url))
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let truncated =
                 crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Home Assistant call_service failed ({status}): {truncated}");
+            return Err(anyhow::Error::msg(tool_msg_with_args(
+                "tool-homeassistant-error-call-service-failed",
+                &[("status", &status.to_string()), ("body", &truncated)],
+            )));
         }
-        // HA returns a JSON array of changed states (may be empty).
-        let value: Value = resp.json().await.unwrap_or_else(|_| json!([]));
-        Ok(value)
+        // HA returns a JSON array of changed states on success (may be
+        // empty), but a 2xx with an undecodable body is NOT a documented
+        // empty-body success shape — treat it as an error rather than
+        // silently reporting a false success receipt for a physical action.
+        let text = resp.text().await.unwrap_or_default();
+        if text.trim().is_empty() {
+            return Ok(json!([]));
+        }
+        serde_json::from_str::<Value>(&text).map_err(|e| {
+            anyhow::Error::msg(tool_msg_with_args(
+                "tool-homeassistant-error-call-service-malformed-body",
+                &[("err", &e.to_string())],
+            ))
+        })
     }
 }
 
@@ -168,11 +275,9 @@ impl Tool for HomeAssistantTool {
     }
 
     fn description(&self) -> &str {
-        "Control and query a Home Assistant smart-home instance over its REST API. \
-         Actions: 'list_entities' (all entity ids + state, optionally filtered by domain \
-         such as 'light' or 'sensor'), 'get_state' (full state + attributes of one entity), \
-         and 'call_service' (invoke a service like light.turn_on with service_data). \
-         list_entities and get_state are read-only; call_service changes device state."
+        TOOL_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string(TOOL_DESCRIPTION_KEY))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -182,23 +287,23 @@ impl Tool for HomeAssistantTool {
                 "action": {
                     "type": "string",
                     "enum": ["list_entities", "get_state", "call_service"],
-                    "description": "The Home Assistant action to perform"
+                    "description": tool_msg("tool-homeassistant-param-action")
                 },
                 "entity_id": {
                     "type": "string",
-                    "description": "Entity id for get_state (e.g. 'light.kitchen')"
+                    "description": tool_msg("tool-homeassistant-param-entity-id")
                 },
                 "domain": {
                     "type": "string",
-                    "description": "Domain filter for list_entities, or the service domain for call_service (e.g. 'light')"
+                    "description": tool_msg("tool-homeassistant-param-domain")
                 },
                 "service": {
                     "type": "string",
-                    "description": "Service name for call_service (e.g. 'turn_on')"
+                    "description": tool_msg("tool-homeassistant-param-service")
                 },
                 "service_data": {
                     "type": "object",
-                    "description": "Optional JSON body for call_service (e.g. {\"entity_id\": \"light.kitchen\"})"
+                    "description": tool_msg("tool-homeassistant-param-service-data")
                 }
             },
             "required": ["action"]
@@ -212,7 +317,7 @@ impl Tool for HomeAssistantTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some("Missing required parameter: action".into()),
+                    error: Some(tool_msg("tool-homeassistant-error-missing-action")),
                 });
             }
         };
@@ -224,8 +329,9 @@ impl Tool for HomeAssistantTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Unknown action: {action}. Valid actions: list_entities, get_state, call_service"
+                    error: Some(tool_msg_with_args(
+                        "tool-homeassistant-error-unknown-action",
+                        &[("action", action)],
                     )),
                 });
             }
@@ -242,10 +348,32 @@ impl Tool for HomeAssistantTool {
             });
         }
 
+        // Materialize url/token/allowed_domains fresh from canonical config
+        // for this call — never a copied field on `self` (SSOT).
+        let cfg = (self.config)();
+        let base_url = if cfg.url.trim().is_empty() {
+            std::env::var("HASS_URL").unwrap_or_default()
+        } else {
+            cfg.url.trim().to_string()
+        };
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let token = if cfg.token.trim().is_empty() {
+            std::env::var("HASS_TOKEN").unwrap_or_default()
+        } else {
+            cfg.token.trim().to_string()
+        };
+        if base_url.is_empty() || token.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(tool_msg("tool-homeassistant-error-not-configured")),
+            });
+        }
+
         let result = match action {
             "list_entities" => {
                 let domain = args.get("domain").and_then(|v| v.as_str());
-                self.list_entities(domain).await
+                self.list_entities(&base_url, &token, domain).await
             }
             "get_state" => {
                 let entity_id = match args.get("entity_id").and_then(|v| v.as_str()) {
@@ -254,11 +382,11 @@ impl Tool for HomeAssistantTool {
                         return Ok(ToolResult {
                             success: false,
                             output: ToolOutput::default(),
-                            error: Some("get_state requires entity_id parameter".into()),
+                            error: Some(tool_msg("tool-homeassistant-error-missing-entity-id")),
                         });
                     }
                 };
-                self.get_state(entity_id).await
+                self.get_state(&base_url, &token, entity_id).await
             }
             "call_service" => {
                 let domain = match args.get("domain").and_then(|v| v.as_str()) {
@@ -267,7 +395,7 @@ impl Tool for HomeAssistantTool {
                         return Ok(ToolResult {
                             success: false,
                             output: ToolOutput::default(),
-                            error: Some("call_service requires domain parameter".into()),
+                            error: Some(tool_msg("tool-homeassistant-error-missing-domain")),
                         });
                     }
                 };
@@ -277,12 +405,20 @@ impl Tool for HomeAssistantTool {
                         return Ok(ToolResult {
                             success: false,
                             output: ToolOutput::default(),
-                            error: Some("call_service requires service parameter".into()),
+                            error: Some(tool_msg("tool-homeassistant-error-missing-service")),
                         });
                     }
                 };
                 let service_data = args.get("service_data");
-                self.call_service(domain, service, service_data).await
+                self.call_service(
+                    &base_url,
+                    &token,
+                    &cfg.allowed_domains,
+                    domain,
+                    service,
+                    service_data,
+                )
+                .await
             }
             _ => unreachable!(), // Already handled above
         };
@@ -310,27 +446,26 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
+    fn test_config() -> HomeAssistantConfig {
+        HomeAssistantConfig {
+            enabled: true,
+            url: "http://localhost:8123/".into(),
+            token: "test-token".into(),
+            allowed_domains: vec!["light".into(), "switch".into()],
+        }
+    }
+
     fn test_tool() -> HomeAssistantTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
         });
-        HomeAssistantTool::new(
-            "http://localhost:8123/".into(),
-            "test-token".into(),
-            security,
-        )
+        HomeAssistantTool::new(snapshot_config_resolver(test_config()), security)
     }
 
     #[test]
     fn tool_name_is_homeassistant() {
         assert_eq!(test_tool().name(), "homeassistant");
-    }
-
-    #[test]
-    fn base_url_trailing_slash_trimmed() {
-        let tool = test_tool();
-        assert_eq!(tool.base_url, "http://localhost:8123");
     }
 
     #[test]
@@ -364,7 +499,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Unknown action"));
+        let err = result.error.unwrap();
+        assert!(err.contains("explode"), "got: {err}");
     }
 
     #[tokio::test]
@@ -403,13 +539,29 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HomeAssistantTool::new("http://localhost:8123".into(), "t".into(), security);
+        let tool = HomeAssistantTool::new(snapshot_config_resolver(test_config()), security);
         let result = tool
             .execute(json!({"action": "call_service", "domain": "light", "service": "turn_on"}))
             .await
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn execute_not_configured_returns_error_when_url_or_token_empty() {
+        let mut cfg = test_config();
+        cfg.url = String::new();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HomeAssistantTool::new(snapshot_config_resolver(cfg), security);
+        let result = tool
+            .execute(json!({"action": "list_entities"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
     }
 
     // ── Input validation tests ──────────────────────────────────────────────
@@ -462,7 +614,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("Invalid entity_id")
+                .contains("../../etc/passwd")
         );
     }
 
@@ -473,7 +625,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Invalid domain"));
+        assert!(result.error.as_deref().unwrap().contains("../../etc"));
     }
 
     #[tokio::test]
@@ -483,7 +635,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Invalid service"));
+        assert!(result.error.as_deref().unwrap().contains("Turn_On"));
     }
 
     #[tokio::test]
@@ -493,7 +645,124 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Invalid domain"));
+        assert!(result.error.as_deref().unwrap().contains("../etc"));
+    }
+
+    // ── allowed_domains policy tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_service_allowed_domain_passes_policy_check() {
+        // Domain is allowed by policy but there's no live HA server, so this
+        // exercises the policy gate: assert the error is a network/connect
+        // failure, NOT a "not in allowed_domains" rejection.
+        let result = test_tool()
+            .execute(json!({"action": "call_service", "domain": "light", "service": "turn_on"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            !err.contains("not in allowed_domains") && !err.contains("not allowed"),
+            "domain 'light' should pass the allowlist check: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_service_denied_domain_is_rejected_before_http() {
+        let result = test_tool()
+            .execute(json!({"action": "call_service", "domain": "lock", "service": "unlock"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("lock"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn call_service_empty_allowed_domains_blocks_all() {
+        let mut cfg = test_config();
+        cfg.allowed_domains = Vec::new();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HomeAssistantTool::new(snapshot_config_resolver(cfg), security);
+        let result = tool
+            .execute(json!({"action": "call_service", "domain": "light", "service": "turn_on"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("light"), "got: {err}");
+    }
+
+    // ── SSOT: config resolved live at call time ──────────────────────────────
+
+    #[tokio::test]
+    async fn config_update_is_observed_without_rebuilding_tool() {
+        // The same long-lived HomeAssistantTool must reflect a config reload
+        // (allowed_domains changing) without being rebuilt — it resolves its
+        // policy from the live source each call rather than a copied field.
+        let live: Arc<parking_lot::RwLock<Config>> = Arc::new(parking_lot::RwLock::new(Config {
+            homeassistant: HomeAssistantConfig {
+                allowed_domains: vec!["light".into()],
+                ..test_config()
+            },
+            ..Config::default()
+        }));
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HomeAssistantTool::new(live_config_resolver(Arc::clone(&live)), security);
+
+        // Initially "lock" is not allowed.
+        let result = tool
+            .execute(json!({"action": "call_service", "domain": "lock", "service": "unlock"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("lock"));
+
+        // Reload config to widen the allowlist — no tool rebuild.
+        live.write().homeassistant.allowed_domains = vec!["light".into(), "lock".into()];
+
+        // Now "lock" passes the allowlist check (fails downstream on the
+        // network call instead, since there's no live HA server).
+        let result = tool
+            .execute(json!({"action": "call_service", "domain": "lock", "service": "unlock"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            !err.contains("not in allowed_domains") && !err.contains("not allowed"),
+            "domain 'lock' should pass the allowlist check after reload: {err}"
+        );
+    }
+
+    // ── Proxy routing ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn homeassistant_is_a_supported_proxy_service_key() {
+        assert!(
+            zeroclaw_config::schema::ProxyConfig::supported_service_keys()
+                .contains(&HA_PROXY_SERVICE_KEY)
+        );
+    }
+
+    #[test]
+    fn service_scoped_proxy_applies_to_homeassistant_when_listed() {
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
+
+        let proxy = ProxyConfig {
+            enabled: true,
+            scope: ProxyScope::Services,
+            services: vec![HA_PROXY_SERVICE_KEY.to_string()],
+            ..ProxyConfig::default()
+        };
+        assert!(proxy.should_apply_to_service(HA_PROXY_SERVICE_KEY));
+        assert!(!proxy.should_apply_to_service("tool.unrelated"));
     }
 
     // ── HTTP-level (wiremock) tests ──────────────────────────────────────────
@@ -503,7 +772,13 @@ mod tests {
             autonomy,
             ..SecurityPolicy::default()
         });
-        HomeAssistantTool::new(base_url, "test-token".into(), security)
+        let cfg = HomeAssistantConfig {
+            enabled: true,
+            url: base_url,
+            token: "test-token".into(),
+            allowed_domains: vec!["light".into()],
+        };
+        HomeAssistantTool::new(snapshot_config_resolver(cfg), security)
     }
 
     #[tokio::test]
@@ -653,6 +928,86 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_service_denied_domain_never_hits_http() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // No mock mounted for /api/services/lock/unlock — if the request
+        // reached the server at all, `verify()` on an empty expectation set
+        // is a no-op, so we assert on the *tool* error message instead to
+        // pin the pre-HTTP rejection.
+        Mock::given(method("POST"))
+            .and(path("/api/services/light/turn_on"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({"action": "call_service", "domain": "lock", "service": "unlock"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("lock"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_service_2xx_malformed_body_is_reported_as_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A 2xx status with a body that isn't valid JSON must NOT collapse
+        // into a synthetic `[]` success for a physical action.
+        Mock::given(method("POST"))
+            .and(path("/api/services/light/turn_on"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json {"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({"action": "call_service", "domain": "light", "service": "turn_on"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "malformed 2xx body must not report success"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_service_2xx_empty_body_is_documented_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/services/light/turn_on"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = wiremock_tool(server.uri(), AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({"action": "call_service", "domain": "light", "service": "turn_on"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "a genuinely empty 2xx body is a documented success: {:?}",
+            result.error
+        );
         server.verify().await;
     }
 }

@@ -1009,9 +1009,21 @@ pub fn all_tools_with_runtime(
                 "homeassistant tool enabled but url/token missing (set homeassistant.url/token or HASS_URL/HASS_TOKEN env vars) — skipping registration"
             );
         } else {
+            // Resolve url/token/allowed_domains live from the canonical config
+            // handle at every call (not a copied snapshot), so a config reload
+            // takes effect without rebuilding the tool. `Some` from the channel
+            // daemon; falls back to a fixed snapshot of `root_config` for
+            // one-shot / non-channel callers, matching `agent_peer_groups` above.
+            let ha_config: zeroclaw_tools::homeassistant_tool::HomeAssistantConfigResolver =
+                if let Some(live) = live_config.clone() {
+                    zeroclaw_tools::homeassistant_tool::live_config_resolver(live)
+                } else {
+                    zeroclaw_tools::homeassistant_tool::snapshot_config_resolver(
+                        root_config.homeassistant.clone(),
+                    )
+                };
             tool_arcs.push(Arc::new(HomeAssistantTool::new(
-                ha_url,
-                ha_token,
+                ha_config,
                 security.clone(),
             )));
         }
