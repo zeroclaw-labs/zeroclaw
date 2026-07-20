@@ -61,6 +61,7 @@ class ReleaseAttestationContractTest(unittest.TestCase):
         self.assertRegex(self.sbom, r"(?m)^      contents: read$")
         self.assertNotIn("id-token: write", self.sbom)
         self.assertNotIn("attestations: write", self.sbom)
+        self.assertNotRegex(self.sbom, r"(?m)^      [a-z-]+: write$")
         self.assertEqual(self.sbom.count("format: spdx-json"), 1)
         self.assertEqual(self.sbom.count("format: cyclonedx-json"), 1)
         self.assertIn("name: release-sboms", self.sbom)
