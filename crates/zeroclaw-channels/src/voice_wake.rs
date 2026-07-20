@@ -96,6 +96,10 @@ impl Channel for VoiceWakeChannel {
         Ok(())
     }
 
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let self_alias = self.alias.clone();
         let config = self.config.clone();
@@ -633,5 +637,15 @@ mod tests {
         let transcription_config = TranscriptionConfig::default();
         let channel = VoiceWakeChannel::new("testbot", config, transcription_config);
         assert_eq!(channel.name(), "voice_wake");
+    }
+
+    #[test]
+    fn voice_wake_does_not_support_outbound_send() {
+        let channel = VoiceWakeChannel::new(
+            "testbot",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        );
+        assert!(!channel.supports_outbound_send());
     }
 }

@@ -1,6 +1,6 @@
 # ZeroClaw REST API Reference
 
-Complete endpoint reference for the ZeroClaw gateway HTTP API.
+Curated operational reference for common ZeroClaw gateway endpoints. It is not an exhaustive router inventory; use the gateway guide, the documented subset at `/api/openapi.json`, and `crates/zeroclaw-gateway/src/lib.rs` when exact route coverage matters.
 
 ## Table of Contents
 
@@ -30,7 +30,7 @@ Three authentication mechanisms:
 ```
 Authorization: Bearer <token>
 ```
-Obtained via `POST /pair`. Required for all `/api/*` endpoints when `require_pairing = true` (default).
+Obtained via `POST /pair`. The configuration value reads and mutations documented below require it when `require_pairing = true` (default). Shape discovery through `/api/docs`, `/api/openapi.json`, and config `OPTIONS` is public.
 
 ### Webhook Secret
 ```
@@ -354,31 +354,25 @@ List all registered tools with descriptions and parameter schemas.
 ## Configuration
 
 ### GET /api/config
-Get current config. Secrets are masked as `***MASKED***`.
 
-**Response 200:**
+Compatibility whole-config read for older bundled dashboard pages. Returns the current config as JSON with secrets masked; new clients should prefer the per-property API documented in the [gateway guide](../../../../docs/book/src/gateway/api.md).
+
+### PATCH /api/config
+
+Apply an RFC 6902 JSON Patch document. Supported config operations are `add`, `replace`, `remove`, and `test`; ZeroClaw also accepts a `comment` extension for config annotations. Config changes are validated and persisted atomically. Comment annotations are applied after the save on a non-fatal, best-effort basis.
+
+**Request Body:** JSON Patch operation array.
+
+**Example:**
 ```json
-{"format": "toml", "content": "<toml_string>"}
+[
+  {"op": "replace", "path": "/runtime/reasoning_enabled", "value": true}
+]
 ```
 
-### PUT /api/config
-Update config from TOML body. Body limit: 1 MB.
+### OPTIONS /api/config
 
-**Request Body:** Raw TOML text.
-
-**Response 200:**
-```json
-{"status": "ok"}
-```
-
-**Response 400:**
-```json
-{"error": "Invalid TOML: <details>"}
-```
-or
-```json
-{"error": "Invalid config: <validation_error>"}
-```
+Return the whole-config JSON Schema. The current `Allow` header still lists legacy `PUT`, which the router does not register.
 
 ---
 

@@ -92,6 +92,7 @@ zc-input-pending-attachments-header = Pièces jointes en attente :
 zc-input-clipboard-error = Erreur de presse-papiers : { $error }
 zc-queue-empty = Rien à envoyer.
 zc-cancel-timed-out = Délai d'annulation dépassé ; le tour a été réglé localement.
+zc-turn-no-output = Tour terminé sans production.
 zc-queue-full = La file d'attente est pleine ({ $cap } max). Attendez que les messages soient envoyés.
 zc-queue-title = File d'attente ({ $count })
 zc-queue-empty-list = Aucun message en file d'attente.

@@ -63,8 +63,15 @@ struct Session {
 
 // ── ACP Server ───────────────────────────────────────────────────
 
+enum ConfigSource {
+    Standalone(Box<Config>),
+    Live(Arc<parking_lot::RwLock<Config>>),
+}
+
 pub struct AcpServer {
-    config: Config,
+    /// The sole authority for `Config`-backed settings. Standalone ACP owns an
+    /// immutable config; gateway ACP resolves the shared daemon config.
+    config_source: ConfigSource,
     acp_config: AcpServerConfig,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
@@ -99,7 +106,13 @@ pub struct AcpServer {
 impl AcpServer {
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
-        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), None)
+        Self::with_writer(
+            ConfigSource::Standalone(Box::new(config)),
+            acp_config,
+            writer_tx,
+            Some(writer_rx),
+            None,
+        )
     }
 
     pub fn new_with_writer(
@@ -107,7 +120,13 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
     ) -> Self {
-        Self::with_writer(config, acp_config, writer_tx, None, None)
+        Self::with_writer(
+            ConfigSource::Standalone(Box::new(config)),
+            acp_config,
+            writer_tx,
+            None,
+            None,
+        )
     }
 
     pub fn new_with_store(
@@ -116,7 +135,13 @@ impl AcpServer {
         store: Arc<AcpSessionStore>,
     ) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
-        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), Some(store))
+        Self::with_writer(
+            ConfigSource::Standalone(Box::new(config)),
+            acp_config,
+            writer_tx,
+            Some(writer_rx),
+            Some(store),
+        )
     }
 
     pub fn new_with_writer_and_store(
@@ -125,18 +150,61 @@ impl AcpServer {
         writer_tx: mpsc::Sender<String>,
         store: Arc<AcpSessionStore>,
     ) -> Self {
-        Self::with_writer(config, acp_config, writer_tx, None, Some(store))
+        Self::with_writer(
+            ConfigSource::Standalone(Box::new(config)),
+            acp_config,
+            writer_tx,
+            None,
+            Some(store),
+        )
+    }
+
+    /// Create a gateway-backed ACP server without durable session storage.
+    ///
+    /// The server retains no parallel `Config` clone and resolves an on-demand
+    /// view whenever it handles a request.
+    pub fn new_with_live_config_and_writer(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+    ) -> Self {
+        Self::with_writer(
+            ConfigSource::Live(live_config),
+            acp_config,
+            writer_tx,
+            None,
+            None,
+        )
+    }
+
+    /// Create a gateway-backed ACP server with durable session storage.
+    ///
+    /// The server retains no parallel `Config` clone and resolves an on-demand
+    /// view whenever it handles a request.
+    pub fn new_with_live_config_and_writer_and_store(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+        store: Arc<AcpSessionStore>,
+    ) -> Self {
+        Self::with_writer(
+            ConfigSource::Live(live_config),
+            acp_config,
+            writer_tx,
+            None,
+            Some(store),
+        )
     }
 
     fn with_writer(
-        config: Config,
+        config_source: ConfigSource,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
         store: Option<Arc<AcpSessionStore>>,
     ) -> Self {
         Self {
-            config,
+            config_source,
             acp_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
@@ -149,6 +217,47 @@ impl AcpServer {
             sop_audit: None,
             connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
+        }
+    }
+
+    fn config_snapshot(&self) -> Config {
+        match &self.config_source {
+            ConfigSource::Standalone(config) => config.as_ref().clone(),
+            ConfigSource::Live(config) => config.read().clone(),
+        }
+    }
+
+    async fn build_agent(
+        &self,
+        config: &Config,
+        agent_alias: &str,
+        workspace_dir: &std::path::Path,
+        enable_mcp: bool,
+    ) -> Result<Agent> {
+        if let ConfigSource::Live(live_config) = &self.config_source {
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+                Arc::clone(live_config),
+                agent_alias,
+                Some(workspace_dir),
+                enable_mcp,
+                true,
+                self.sop_engine.clone(),
+                self.sop_audit.clone(),
+                self.canvas_store.clone(),
+            )
+            .await
+        } else {
+            Agent::from_config_with_session_cwd_and_mcp_backchannel(
+                config,
+                agent_alias,
+                Some(workspace_dir),
+                enable_mcp,
+                true,
+                self.sop_engine.clone(),
+                self.sop_audit.clone(),
+                self.canvas_store.clone(),
+            )
+            .await
         }
     }
 
@@ -429,8 +538,8 @@ impl AcpServer {
         *self.client_elicitation_caps.write().unwrap() =
             ElicitationCapabilities::from_value(elicitation);
 
-        let default_model = self
-            .config
+        let config = self.config_snapshot();
+        let default_model = config
             .providers
             .models
             .iter_entries()
@@ -478,11 +587,11 @@ impl AcpServer {
     }
 
     /// True when `alias` names a configured agent that can dispatch a turn.
-    fn alias_if_dispatchable(&self, alias: &str) -> Option<String> {
+    fn alias_if_dispatchable(config: &Config, alias: &str) -> Option<String> {
         if alias.trim().is_empty() {
             return None;
         }
-        self.config
+        config
             .agent(alias)
             .filter(|agent| agent.is_dispatchable())
             .map(|_| alias.to_string())
@@ -490,8 +599,11 @@ impl AcpServer {
 
     /// Shared validation for explicit `agentAlias`, `?agent=`, config defaults,
     /// and sole-agent auto-select.
-    fn validate_dispatchable_agent_alias(&self, agent_alias: &str) -> Result<(), RpcError> {
-        match self.config.agent(agent_alias) {
+    fn validate_dispatchable_agent_alias(
+        config: &Config,
+        agent_alias: &str,
+    ) -> Result<(), RpcError> {
+        match config.agent(agent_alias) {
             None => Err(RpcError {
                 code: INVALID_PARAMS,
                 message: format!(
@@ -514,22 +626,22 @@ impl AcpServer {
     /// The connection-scoped `?agent=` default is intentionally omitted: restore
     /// accepts only a session ID and must not let transport input rebind a
     /// persisted workspace/history to a different agent.
-    fn resolve_restore_agent_alias(&self, persisted_agent_alias: &str) -> String {
-        self.alias_if_dispatchable(persisted_agent_alias)
+    fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
+        Self::alias_if_dispatchable(config, persisted_agent_alias)
             .or_else(|| {
-                self.config
+                config
                     .acp
                     .default_agent
                     .as_ref()
-                    .and_then(|alias| self.alias_if_dispatchable(alias))
+                    .and_then(|alias| Self::alias_if_dispatchable(config, alias))
             })
             .or_else(|| {
-                if self.config.agents.len() == 1 {
-                    self.config
+                if config.agents.len() == 1 {
+                    config
                         .agents
                         .keys()
                         .next()
-                        .and_then(|alias| self.alias_if_dispatchable(alias))
+                        .and_then(|alias| Self::alias_if_dispatchable(config, alias))
                 } else {
                     None
                 }
@@ -538,7 +650,8 @@ impl AcpServer {
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
-        let requested_cwd = self.requested_session_cwd(params);
+        let config = self.config_snapshot();
+        let requested_cwd = self.requested_session_cwd(params, &config);
 
         let workspace_dir = std::fs::canonicalize(&requested_cwd)
             .map_err(|e| RpcError {
@@ -567,10 +680,10 @@ impl AcpServer {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .or_else(|| self.connection_default_agent.clone())
-            .or_else(|| self.config.acp.default_agent.clone())
+            .or_else(|| config.acp.default_agent.clone())
             .or_else(|| {
-                let mut keys = self.config.agents.keys();
-                if self.config.agents.len() == 1 {
+                let mut keys = config.agents.keys();
+                if config.agents.len() == 1 {
                     keys.next().cloned()
                 } else {
                     None
@@ -583,7 +696,7 @@ impl AcpServer {
                     .to_string(),
                 data: None,
             })?;
-        self.validate_dispatchable_agent_alias(&agent_alias)?;
+        Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
 
         let session_id = Uuid::new_v4().to_string();
 
@@ -615,21 +728,23 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
-        let enable_mcp = self
-            .config
-            .agent(&agent_alias)
-            .is_some_and(|a| a.acp_enable_mcp);
-        let agent = match Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &self.config,
-            &agent_alias,
-            Some(std::path::Path::new(&workspace_dir)),
-            enable_mcp,
-            true,
-            self.sop_engine.clone(),
-            self.sop_audit.clone(),
-            self.canvas_store.clone(),
-        )
-        .await
+        // Build agent from global config, with the session's cwd pinned as
+        // the file/shell sandbox boundary. The agent's data directory
+        // (identity, scheduled tasks) still lives under `config.data_dir`.
+        // ACP sessions exclude persistent memory — context comes from the
+        // persisted session history, not the agent's long-term memory store.
+        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
+        // by default to keep `session/new` prompt; on to load this agent's
+        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
+        let enable_mcp = config.agent(&agent_alias).is_some_and(|a| a.acp_enable_mcp);
+        let agent = match self
+            .build_agent(
+                &config,
+                &agent_alias,
+                std::path::Path::new(&workspace_dir),
+                enable_mcp,
+            )
+            .await
         {
             Ok(agent) => agent,
             Err(e) => {
@@ -694,13 +809,11 @@ impl AcpServer {
                     created_at: now,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
-                    model_provider: self
-                        .config
+                    model_provider: config
                         .agent(&agent_alias)
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
-                    model: self
-                        .config
+                    model: config
                         .model_provider_for_agent(&agent_alias)
                         .and_then(|mp| mp.model.clone())
                         .unwrap_or_default(),
@@ -708,13 +821,11 @@ impl AcpServer {
             );
         }
 
-        let mp = self
-            .config
+        let mp = config
             .agent(&agent_alias)
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
-        let model_name = self
-            .config
+        let model_name = config
             .model_provider_for_agent(&agent_alias)
             .and_then(|mp| mp.model.clone())
             .unwrap_or_default();
@@ -832,35 +943,27 @@ impl AcpServer {
         };
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
+        let config = self.config_snapshot();
 
         // Restore the agent the session was created with — its alias is
         // persisted on the session row. Fall back to the operator-controlled
         // ACP default (or sole agent, or "default") only when the persisted
         // owner is missing or not dispatchable. `?agent=` is not consulted.
-        let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
+        let restore_alias = Self::resolve_restore_agent_alias(&config, &data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
-        let enable_mcp = self
-            .config
+        let enable_mcp = config
             .agent(&restore_alias)
             .is_some_and(|a| a.acp_enable_mcp);
-        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &self.config,
-            &restore_alias,
-            Some(&workspace_dir),
-            enable_mcp,
-            true,
-            self.sop_engine.clone(),
-            self.sop_audit.clone(),
-            self.canvas_store.clone(),
-        )
-        .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        });
+        let agent_result = self
+            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .await
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to create agent: {e}"),
+                data: None,
+            });
 
         let mut agent = match agent_result {
             Ok(a) => a,
@@ -870,7 +973,22 @@ impl AcpServer {
             }
         };
 
-        agent.seed_conversation_history(data.messages.clone());
+        let stored_messages: Vec<_> = data
+            .messages
+            .into_iter()
+            .filter(|message| {
+                !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
+            })
+            .collect();
+        let restore_trim_event =
+            agent.seed_conversation_history_with_event(stored_messages.clone());
+        let dropped_messages = match &restore_trim_event {
+            Some(TurnEvent::HistoryTrimmed {
+                dropped_messages, ..
+            }) => *dropped_messages,
+            _ => 0,
+        };
+        let restored_messages = stored_messages.into_iter().skip(dropped_messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -894,13 +1012,11 @@ impl AcpServer {
                     created_at: now,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
-                    model_provider: self
-                        .config
+                    model_provider: config
                         .agent(&restore_alias)
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
-                    model: self
-                        .config
+                    model: config
                         .model_provider_for_agent(&restore_alias)
                         .and_then(|mp| mp.model.clone())
                         .unwrap_or_default(),
@@ -908,20 +1024,28 @@ impl AcpServer {
             );
         }
 
-        // Stream conversation history to client as session/update notifications
-        for msg in &data.messages {
-            for notification in history_notifications_for_message(&session_id, msg) {
+        if let Some(event) = restore_trim_event
+            && let Some(notification) = notification_for_turn_event(&session_id, &event)
+        {
+            self.write_notification(&notification).await;
+        }
+
+        // Replay exactly the history retained by the agent. Replaying the
+        // stored pre-trim rows would make the client display context that the
+        // restored agent has already discarded.
+        let mut replayed_messages = 0;
+        for msg in restored_messages {
+            replayed_messages += 1;
+            for notification in history_notifications_for_message(&session_id, &msg) {
                 self.write_notification(&notification).await;
             }
         }
 
-        let mp = self
-            .config
+        let mp = config
             .agent(&restore_alias)
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
-        let model_name = self
-            .config
+        let model_name = config
             .model_provider_for_agent(&restore_alias)
             .and_then(|mp| mp.model.clone())
             .unwrap_or_default();
@@ -932,7 +1056,7 @@ impl AcpServer {
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "session_id": session_id,
-                    "message_count": data.messages.len(),
+                    "message_count": replayed_messages,
                     "agent_alias": restore_alias,
                     "model_provider": mp,
                     "model": model_name,
@@ -1032,35 +1156,27 @@ impl AcpServer {
         };
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
+        let config = self.config_snapshot();
 
         // Restore the agent the session was created with — its alias is
         // persisted on the session row. Fall back to the operator-controlled
         // ACP default (or sole agent, or "default") only when the persisted
         // owner is missing or not dispatchable. `?agent=` is not consulted.
-        let restore_alias = self.resolve_restore_agent_alias(&data.agent_alias);
+        let restore_alias = Self::resolve_restore_agent_alias(&config, &data.agent_alias);
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
-        let enable_mcp = self
-            .config
+        let enable_mcp = config
             .agent(&restore_alias)
             .is_some_and(|a| a.acp_enable_mcp);
-        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &self.config,
-            &restore_alias,
-            Some(&workspace_dir),
-            enable_mcp,
-            true,
-            self.sop_engine.clone(),
-            self.sop_audit.clone(),
-            self.canvas_store.clone(),
-        )
-        .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        });
+        let agent_result = self
+            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .await
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to create agent: {e}"),
+                data: None,
+            });
 
         let mut agent = match agent_result {
             Ok(a) => a,
@@ -1070,7 +1186,7 @@ impl AcpServer {
             }
         };
 
-        agent.seed_conversation_history(data.messages);
+        let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -1094,13 +1210,11 @@ impl AcpServer {
                     created_at: now,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
-                    model_provider: self
-                        .config
+                    model_provider: config
                         .agent(&restore_alias)
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
-                    model: self
-                        .config
+                    model: config
                         .model_provider_for_agent(&restore_alias)
                         .and_then(|mp| mp.model.clone())
                         .unwrap_or_default(),
@@ -1108,13 +1222,17 @@ impl AcpServer {
             );
         }
 
-        let mp = self
-            .config
+        if let Some(event) = restore_trim_event
+            && let Some(notification) = notification_for_turn_event(&session_id, &event)
+        {
+            self.write_notification(&notification).await;
+        }
+
+        let mp = config
             .agent(&restore_alias)
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
-        let model_name = self
-            .config
+        let model_name = config
             .model_provider_for_agent(&restore_alias)
             .and_then(|mp| mp.model.clone())
             .unwrap_or_default();
@@ -1208,16 +1326,14 @@ impl AcpServer {
         Ok(serde_json::json!({}))
     }
 
-    fn requested_session_cwd(&self, params: &Value) -> PathBuf {
+    fn requested_session_cwd(&self, params: &Value, config: &Config) -> PathBuf {
         params
             .get("cwd")
             .or_else(|| params.get("workspaceDir"))
             .or_else(|| params.get("workspace_dir"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| self.config.data_dir.clone())
-            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| config.data_dir.clone()))
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
@@ -1287,12 +1403,13 @@ impl AcpServer {
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
+        let config = self.config_snapshot();
         let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
-            self.config.cost.clone(),
-            &self.config.data_dir,
+            config.cost.clone(),
+            &config.data_dir,
         );
         let cost_pricing = std::sync::Arc::new(
-            zeroclaw_runtime::agent::cost::build_model_provider_pricing(&self.config),
+            zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config),
         );
 
         // Move the Arc into the spawned task and lock inside it.  The inner
@@ -2070,15 +2187,14 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             reason,
         } => JsonRpcNotification {
             jsonrpc: "2.0",
-            method: "session/update",
+            // ACP's SessionUpdate union is closed. Custom notifications use
+            // underscore-prefixed methods so clients can safely ignore them.
+            method: "_zeroclaw/history_trimmed",
             params: serde_json::json!({
                 "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "history_trimmed",
-                    "droppedMessages": dropped_messages,
-                    "keptTurns": kept_turns,
-                    "reason": reason,
-                }
+                "droppedMessages": dropped_messages,
+                "keptTurns": kept_turns,
+                "reason": reason,
             }),
         },
         TurnEvent::Plan { entries } => JsonRpcNotification {
@@ -2381,9 +2497,10 @@ mod tests {
         };
         let server = AcpServer::new(config, AcpServerConfig::default());
         let expected = std::env::current_dir().unwrap();
+        let config = server.config_snapshot();
 
         assert_eq!(
-            server.requested_session_cwd(&serde_json::json!({})),
+            server.requested_session_cwd(&serde_json::json!({}), &config),
             expected
         );
     }
@@ -2392,9 +2509,10 @@ mod tests {
     fn session_new_respects_client_cwd_when_present() {
         let server = AcpServer::new(Config::default(), AcpServerConfig::default());
         let cwd = std::env::current_dir().unwrap();
+        let config = server.config_snapshot();
 
         assert_eq!(
-            server.requested_session_cwd(&serde_json::json!({"cwd": cwd})),
+            server.requested_session_cwd(&serde_json::json!({"cwd": cwd}), &config),
             cwd
         );
     }
@@ -3420,6 +3538,33 @@ mod tests {
     }
 
     #[test]
+    fn restore_trim_event_maps_to_extension_notification() {
+        let notification = notification_for_turn_event(
+            "restored-session",
+            &TurnEvent::HistoryTrimmed {
+                dropped_messages: 12,
+                kept_turns: 3,
+                reason: "message limit".to_string(),
+            },
+        )
+        .expect("history trim must produce an ACP notification");
+        let value = serde_json::to_value(notification).unwrap();
+
+        assert_eq!(value["method"], "_zeroclaw/history_trimmed");
+        assert_eq!(
+            value["params"],
+            serde_json::json!({
+                "sessionId": "restored-session",
+                "droppedMessages": 12,
+                "keptTurns": 3,
+                "reason": "message limit",
+            })
+        );
+        assert!(value["params"].get("update").is_none());
+        assert!(!value.to_string().contains("sessionUpdate"));
+    }
+
+    #[test]
     fn turn_tool_events_include_client_visible_tool_fields() {
         let call = notification_for_turn_event(
             "test-sid",
@@ -3642,6 +3787,34 @@ mod tests {
         cfg
     }
 
+    #[test]
+    fn gateway_backed_server_initialize_uses_reloaded_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = Arc::new(parking_lot::RwLock::new(make_test_config(cwd.path())));
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
+        let server = AcpServer::new_with_live_config_and_writer(
+            Arc::clone(&config),
+            AcpServerConfig::default(),
+            writer_tx,
+        );
+
+        config
+            .write()
+            .providers
+            .models
+            .anthropic
+            .get_mut("default")
+            .unwrap()
+            .base
+            .model = Some("reloaded-model".to_string());
+
+        assert_eq!(
+            server.handle_initialize(&serde_json::json!({})).unwrap()["_meta"]["zeroclaw"]["defaultModel"],
+            "reloaded-model"
+        );
+    }
+
+    /// `session/cancel` on an idle session (no active turn) must succeed silently.
     #[tokio::test]
     async fn session_cancel_idle_session_is_noop() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3882,6 +4055,83 @@ mod tests {
             "agent_message_chunk"
         );
         assert_eq!(n1["params"]["update"]["content"]["text"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_only_history_retained_after_restore_trim() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-load-trimmed-test";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("old request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("new request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+                ],
+            )
+            .unwrap();
+
+        let mut config = make_test_config(cwd.path());
+        config
+            .runtime_profiles
+            .get_mut("default")
+            .unwrap()
+            .max_history_messages = Some(2);
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            notifications.push(serde_json::from_str::<serde_json::Value>(&message).unwrap());
+        }
+
+        assert_eq!(
+            notifications.len(),
+            3,
+            "unexpected replay: {notifications:?}"
+        );
+        assert_eq!(notifications[0]["method"], "_zeroclaw/history_trimmed");
+        assert_eq!(
+            notifications[1]["params"]["update"]["content"]["text"],
+            "new request"
+        );
+        assert_eq!(
+            notifications[2]["params"]["update"]["content"]["text"],
+            "new answer"
+        );
+        assert!(
+            !notifications.iter().any(|notification| {
+                let text = &notification["params"]["update"]["content"]["text"];
+                text == "old request" || text == "old answer"
+            }),
+            "trimmed messages must not be replayed to the client"
+        );
     }
 
     #[tokio::test]

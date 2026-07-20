@@ -92,6 +92,7 @@ zc-input-pending-attachments-header = 待处理附件：
 zc-input-clipboard-error = 剪贴板错误：{ $error }
 zc-queue-empty = 没有可发送的内容。
 zc-cancel-timed-out = 取消操作超时；回合已在本地结束。
+zc-turn-no-output = 回合已完成，无输出。
 zc-queue-full = 队列已满（最多 { $cap } 条）。请等待消息发送。
 zc-queue-title = 队列（{ $count }）
 zc-queue-empty-list = 没有排队消息。
