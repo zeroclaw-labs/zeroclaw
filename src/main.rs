@@ -496,6 +496,11 @@ enum EvalCommands {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
         format: commands::eval::OutputFormat,
+
+        /// Directory to write a per-case run record (JSON) into.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        dump_records: Option<String>,
     },
 }
 
@@ -5192,6 +5197,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 suite,
                 mode,
                 format,
+                dump_records,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
@@ -5199,6 +5205,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let report =
                     commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
+                let wrote_auto = commands::eval::write_dumps(
+                    &report,
+                    dump_records.as_deref().map(std::path::Path::new),
+                    std::path::Path::new(commands::eval::AUTO_DUMP_DIR),
+                )?;
+                // Footer is a table affordance only; never emit it in JSON mode, or
+                // it would corrupt the machine-readable stdout artifact.
+                if wrote_auto && format == commands::eval::OutputFormat::Table {
+                    println!("  failed-case records: {}/", commands::eval::AUTO_DUMP_DIR);
+                }
                 std::process::exit(report.exit_code());
             }
         },

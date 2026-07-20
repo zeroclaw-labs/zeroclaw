@@ -480,6 +480,16 @@ mod tests {
 
     fn run(resp: &str, tools: &[&str], all_ok: bool) -> RunRecord {
         RunRecord {
+            schema: crate::record::RECORD_SCHEMA.to_string(),
+            mode: crate::Mode::Replay,
+            case_id: "test".to_string(),
+            case_hash: String::new(),
+            provider_ref: "scripted".to_string(),
+            tool_surface: Vec::new(),
+            sandbox: crate::record::SandboxStamp {
+                autonomy: "supervised".to_string(),
+                workspace_only: false,
+            },
             final_response: resp.to_string(),
             history: Vec::new(),
             tools_called: tools.iter().map(|s| s.to_string()).collect(),

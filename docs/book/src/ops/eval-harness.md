@@ -76,6 +76,29 @@ failed check or run error). This is the CI gate: the process exit code is the
 signal. The same decision is exposed as the pure function
 `SuiteReport::exit_code()` so it can be tested at its real boundary.
 
+## Run receipts and record dumps
+
+Every case run produces a receipt: a schema tag, the mode, the case id, a
+SHA-256 `case_hash` of the case's canonical JSON, the `provider_ref`
+(`scripted` for replay, `<type>.<alias>:<model>` for live), the sorted effective
+`tool_surface`, and a `sandbox` stamp. These fields appear per case in the JSON
+report and make runs comparable across time (the baseline workflow builds on
+them).
+
+Records can be dumped as JSON:
+
+- `--dump-records <dir>` writes `<dir>/<case_id>.json` (record plus grades) for
+  every case.
+- On every run, any failed or errored case is auto-dumped to
+  `target/eval-last-run/<case_id>.json` (cleared at the start of each run). When
+  any exist, the table footer prints `failed-case records: target/eval-last-run/`.
+
+Dumps are debugging artifacts, not fixtures. A live transcript can embed
+workspace file content and model output, so **never commit a dump**;
+`target/` is gitignored. Promoting a dump into a suite fixture requires the same
+privacy placeholder pass as any other fixture (see the privacy contract): no real
+names, transcripts, hostnames, or credentials.
+
 ## Case format
 
 Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`

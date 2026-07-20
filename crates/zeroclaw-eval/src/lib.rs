@@ -19,7 +19,8 @@ pub use runner::{CaseOutcome, RunDeps, ensure_live_provider, run_case, run_suite
 use std::str::FromStr;
 
 /// How an evaluation suite is executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Deterministic replay against scripted LLM responses — no network, no cost.
     Replay,

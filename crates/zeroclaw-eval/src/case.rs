@@ -171,6 +171,17 @@ impl LlmTrace {
     }
 }
 
+/// SHA-256 hex of the case's canonical JSON, used as the receipt's comparability
+/// key. `serde_json` emits object keys in sorted (BTreeMap) order because nothing
+/// in this workspace enables `preserve_order`, so the hash is stable across
+/// re-serialization (guarded by `canonical_json_is_key_sorted`).
+pub fn case_hash(trace: &LlmTrace) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(&serde_json::to_value(trace)?)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
 /// and free of any `..` component. Used before writing setup files or grading
 /// workspace paths, so a case cannot read or write outside its sandbox.
@@ -286,6 +297,34 @@ mod tests {
         let t: LlmTrace =
             serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
         assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn canonical_json_is_key_sorted() {
+        // Guard: if anyone enables serde_json's `preserve_order`, this fails,
+        // alerting that case_hash would stop being canonical.
+        let v = serde_json::json!({ "b": 1, "a": 2 });
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn case_hash_stable_across_reserialization() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        // Re-parse from a re-serialized form; the hash must be identical.
+        let reserialized: LlmTrace =
+            serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+        assert_eq!(
+            case_hash(&trace).unwrap(),
+            case_hash(&reserialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn case_hash_changes_on_case_edit() {
+        let a: LlmTrace = serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        let b: LlmTrace = serde_json::from_str(r#"{"model_name":"m2","turns":[]}"#).unwrap();
+        assert_ne!(case_hash(&a).unwrap(), case_hash(&b).unwrap());
     }
 
     #[test]

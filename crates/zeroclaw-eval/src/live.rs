@@ -156,7 +156,19 @@ pub async fn run_live_case(
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let (input_tokens, output_tokens) = observer.tokens();
+    let mut tool_surface = effective.clone();
+    tool_surface.sort();
     let record = RunRecord {
+        schema: crate::record::RECORD_SCHEMA.to_string(),
+        mode: crate::Mode::Live,
+        case_id: trace.display_id().to_string(),
+        case_hash: crate::case::case_hash(trace)?,
+        provider_ref: deps.provider_ref.clone(),
+        tool_surface,
+        sandbox: crate::record::SandboxStamp {
+            autonomy: "supervised".to_string(),
+            workspace_only: true,
+        },
         final_response,
         history: agent.history().to_vec(),
         tools_called: observer.tool_names(),
@@ -193,6 +205,7 @@ mod tests {
         RunDeps {
             mode: Mode::Live,
             provider: Box::new(provider),
+            provider_ref: "test.model:test".to_string(),
             live_tools,
             case_timeout: timeout,
         }
