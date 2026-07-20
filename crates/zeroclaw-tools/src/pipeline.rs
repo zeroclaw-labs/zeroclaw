@@ -6,6 +6,8 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
+use crate::tool_search::ToolAccessPolicy;
+
 /// Errors specific to pipeline execution.
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 pub enum PipelineError {
@@ -68,15 +70,24 @@ pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
+    /// Per-agent policy gate, baked in at construction. `None` only when
+    /// no SecurityPolicy gates are configured (all tools allowed, none
+    /// excluded); in that case `validate()` skips the per-agent check.
+    access_policy: Option<ToolAccessPolicy>,
 }
 
 impl PipelineTool {
-    pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn new(
+        config: PipelineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        access_policy: Option<ToolAccessPolicy>,
+    ) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
             config,
             tools,
             allowed_set,
+            access_policy,
         }
     }
 
@@ -94,9 +105,15 @@ impl PipelineTool {
             return Err(PipelineError::TooManySteps(self.config.max_steps));
         }
 
-        // Check all tools are on the allowlist before executing any.
+        // Two-gate check: global pipeline allowlist AND per-agent access policy.
+        // The per-agent policy is baked in at construction — no mutable slot.
         for step in &request.steps {
             if !self.allowed_set.contains(&step.tool) {
+                return Err(PipelineError::UnknownTool(step.tool.clone()));
+            }
+            if let Some(ref policy) = self.access_policy
+                && !policy.is_tool_allowed(&step.tool)
+            {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
@@ -530,7 +547,7 @@ mod tests {
             max_steps: 2,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![
@@ -562,7 +579,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![PipelineStep {
@@ -584,7 +601,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![
@@ -611,7 +628,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec![],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![],
@@ -620,6 +637,73 @@ mod tests {
         };
 
         assert!(tool.validate(&request).is_ok());
+    }
+
+    // ── Per-agent policy gate ──────────────────────────────
+    //
+    // Regression for #7947: a tool present in [pipeline].allowed_tools
+    // must still be rejected when the calling agent's SecurityPolicy
+    // denies it. The per-agent policy is baked into PipelineTool at
+    // construction — no mutable slot.
+
+    #[test]
+    fn validate_per_agent_policy_denies_subtool() {
+        // Global pipeline allowlist admits shell.
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        // Per-agent policy only allows file_read — shell is denied.
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec!["file_read".to_string()]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::new(config, vec![], Some(policy));
+
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        let err = tool.validate(&request).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::UnknownTool(ref name) if name == "shell"),
+            "shell must be rejected by per-agent policy even though pipeline allowlist includes it, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_per_agent_policy_allows_subtool() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        // Per-agent policy allows both.
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec!["shell".to_string(), "file_read".to_string()]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::new(config, vec![], Some(policy));
+
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        assert!(
+            tool.validate(&request).is_ok(),
+            "shell must be allowed when both pipeline and per-agent policy admit it"
+        );
     }
 
     // ── Template resolution ────────────────────────────────
@@ -695,7 +779,7 @@ mod tests {
                 output: "final answer".into(),
             }),
         ];
-        PipelineTool::new(config, tools)
+        PipelineTool::new(config, tools, None)
     }
 
     #[tokio::test]

@@ -187,6 +187,7 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             unfiltered_tool_arcs,
+            pipeline_raw,
         } = built;
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
@@ -225,6 +226,21 @@ impl ScopedToolRegistry {
                     })),
                 "Applied capability-based tool access filter"
             );
+        }
+
+        // ── Wire deferred PipelineTool with per-agent policy gate ───
+        // PipelineTool construction is deferred so the per-agent
+        // ToolAccessPolicy is baked in immutably at construction time.
+        // The top-level `execute_pipeline` tool is gated on both the
+        // agent SecurityPolicy and the caller-supplied allowlist (if present).
+        if let Some(ref raw) = pipeline_raw
+            && security.is_tool_allowed("execute_pipeline")
+            && caller_allowed.is_none_or(|v| v.iter().any(|t| t == "execute_pipeline"))
+        {
+            let policy = mcp_tool_access_policy(security.as_ref(), caller_allowed);
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, policy) {
+                tools_registry.push(pipe);
+            }
         }
 
         // 3. Documented divergence: ACP strips persistent memory tools.
@@ -583,6 +599,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            pipeline_raw: None,
         }
     }
 
