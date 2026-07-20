@@ -11,6 +11,7 @@ use zeroclaw_memory::{
 };
 
 use super::loop_::make_query_summary;
+use crate::agent::TurnMeta;
 use crate::observability::{Observer, ObserverEvent};
 use crate::util::truncate_with_ellipsis;
 
@@ -148,6 +149,7 @@ pub async fn render_memory_context(
     sessions: &[Option<&str>],
     cfg: &MemoryInjectConfig,
     exclude_conversation: bool,
+    turn: TurnMeta<'_>,
 ) -> String {
     let backend = mem.name().to_string();
     let query_summary = make_query_summary(user_msg);
@@ -188,9 +190,9 @@ pub async fn render_memory_context(
         num_entries: entries.len(),
         backend,
         success: any_ok,
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(turn.channel_name.to_string()),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: Some(turn.turn_id.to_string()),
     });
 
     // Older non-Core memories score lower; Core is evergreen.
@@ -405,10 +407,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingObserver {
         recalls: Mutex<Vec<(usize, bool)>>,
+        events: Mutex<Vec<ObserverEvent>>,
     }
 
     impl Observer for RecordingObserver {
         fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
             if let ObserverEvent::MemoryRecall {
                 num_entries,
                 success,
@@ -516,6 +520,11 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -523,6 +532,59 @@ mod tests {
         assert!(context.contains("- user_preference: prefers concise answers"));
         assert!(context.ends_with(&format!("{MEMORY_CONTEXT_CLOSE}\n\n")));
         assert_eq!(observer.recalls.lock().as_slice(), &[(1, true)]);
+    }
+
+    #[tokio::test]
+    async fn recall_event_carries_the_turn_correlation_triple() {
+        let mem = FixtureMemory::with(vec![entry(
+            "user_preference",
+            "prefers concise answers",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]);
+        let observer = RecordingObserver::default();
+
+        let _ = render_memory_context(
+            &mem,
+            &observer,
+            "how should I answer",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            TurnMeta {
+                agent_alias: Some("default"),
+                turn_id: "turn-42",
+                channel_name: "cli",
+            },
+        )
+        .await;
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::MemoryRecall { .. }))
+            .expect("render_memory_context must emit MemoryRecall")
+        {
+            ObserverEvent::MemoryRecall {
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                assert_eq!(channel.as_deref(), Some("cli"));
+                assert_eq!(agent_alias.as_deref(), Some("default"));
+                assert_eq!(turn_id.as_deref(), Some("turn-42"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::MemoryRecall { .. }))
+                .count(),
+            1,
+            "exactly one recall event per turn — the #8619 contract"
+        );
     }
 
     #[tokio::test]
@@ -537,6 +599,11 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -556,6 +623,11 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -583,6 +655,11 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             true,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -617,6 +694,11 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -639,7 +721,20 @@ mod tests {
             min_relevance_score: 0.5,
             ..Default::default()
         };
-        let context = render_memory_context(&mem, &observer, "query", &[], &cfg, false).await;
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
 
         assert!(!context.contains("barely related"));
         assert!(context.contains("- high: very related"));
@@ -665,6 +760,11 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -690,7 +790,20 @@ mod tests {
             max_total_chars: 1_500,
             ..Default::default()
         };
-        let context = render_memory_context(&mem, &observer, "query", &[], &cfg, false).await;
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
 
         assert!(context.contains("- a: "));
         assert!(context.contains("- b: "));
@@ -727,6 +840,11 @@ mod tests {
             &[Some("history"), Some("sender")],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 

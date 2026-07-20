@@ -31,7 +31,7 @@ pub(crate) struct TurnCtx<'a> {
 }
 
 /// Lightweight metadata for turn-level event emission.
-/// Derived on-demand from `TurnCtx` via `meta()` — not a cached duplicate.
+/// Built at emission call sites from the turn's borrows — not a cached duplicate.
 /// The values are borrows from the turn mint site; the mint site stays the
 /// single source of truth for the `(channel, agent_alias, turn_id)` triple.
 #[derive(Clone, Copy, Debug)]

@@ -20417,6 +20417,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             false,
+            zeroclaw_runtime::agent::TurnMeta {
+                agent_alias: Some("test-agent"),
+                turn_id: "test-turn",
+                channel_name: "test-channel",
+            },
         )
         .await
     }
