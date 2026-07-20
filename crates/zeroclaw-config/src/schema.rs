@@ -10300,16 +10300,24 @@ pub struct MarkdownStorageConfig {
 #[prefix = "storage_lucid"]
 #[serde(default)]
 pub struct LucidStorageConfig {
-    /// Optional path to the lucid-memory binary.
+    /// Optional path to the lucid-memory binary. A blank or whitespace-only
+    /// value is rejected at config validation; because startup warns and
+    /// continues after validation errors, a blank value that reaches the
+    /// runtime is treated as unset and falls back to the bare `lucid`
+    /// executable on `PATH`.
     pub binary_path: Option<String>,
     /// Recall (context) timeout override, in milliseconds. Lucid CLI cold
     /// starts (loading the local embedding model) can exceed 1.5s on ARM
     /// hosts; raise this if recalls still time out on your hardware.
-    /// Unset falls back to the built-in default (3000ms).
+    /// Unset falls back to the built-in default (3000ms). `0` is rejected
+    /// at config validation; because startup warns and continues after
+    /// validation errors, a `0` that reaches the runtime is treated as
+    /// unset and falls back to the default.
     pub recall_timeout_ms: Option<u64>,
     /// Store timeout override, in milliseconds. Same cold-start
     /// consideration as `recall_timeout_ms`. Unset falls back to the
-    /// built-in default (3000ms).
+    /// built-in default (3000ms); `0` is rejected at validation and, if
+    /// startup continues after the warning, is likewise treated as unset.
     pub store_timeout_ms: Option<u64>,
 }
 
