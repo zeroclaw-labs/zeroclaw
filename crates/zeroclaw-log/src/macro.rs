@@ -15,6 +15,7 @@ macro_rules! record {
             zc_outcome = %__zc_event.outcome_str(),
             zc_category = %__zc_event.category_str(),
             zc_attrs = %__zc_event.attrs_str(),
+            zc_ephemeral_attrs = %__zc_event.ephemeral_attrs_str(),
             zc_has_duration = %__zc_event.has_duration(),
             zc_duration_ms = %__zc_event.duration_ms_or_zero(),
             zc_file = %file!(),
