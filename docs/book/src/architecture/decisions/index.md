@@ -26,6 +26,7 @@ Accepted ADRs are immutable. If the architecture changes, write a new ADR and ma
 | [ADR-008](./ADR-008-goal-mode-control-plane-and-usage-accounting.md) | accepted | Goal mode uses the durable task control plane and canonical usage ledger. |
 | [ADR-009](./ADR-009-wit-wasmtime-plugin-execution.md) | accepted | WIT components and direct `wasmtime` replace the Extism plugin bridge. |
 | [ADR-010](./ADR-010-memory-authority-boundaries.md) | proposed | Session history, curated memory, and enrichment have separate authority boundaries. |
+| [ADR-011](./ADR-011-multi-agent-runtime-boundaries.md) | accepted | Configured agents have explicit runtime boundaries under one daemon. |
 
 ADR-006 and ADR-007 are implementation-gated roadmap decisions from [FND-002](../../foundations/fnd-002-documentation-standards.md). Their target directions are recorded, but they remain proposed until the acceptance boundaries in each record ship.
 
