@@ -2,25 +2,12 @@
 //! boundaries. Zero business logic beyond trivial serialisation/parsing of the
 //! types themselves — implementation modules (`rest`, `interaction`, `slash`,
 //! `markers`, `chunk`) and the `mod.rs` wiring depend on these; nothing here
-//! depends on them.
 
 use std::sync::Arc;
 
 use super::components::DiscordActionRow;
 use super::embed::DiscordEmbed;
 use super::slash_options::OptionSpec;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Outbound message envelope
-//
-// The single payload the channel-message REST builders collapse onto. The
-// builders already route through `text()`/`to_rest_json()` (EPIC A Phase 2), so
-// the struct and its methods are live; `to_rest_json` is byte-identical to the
-// historical `json!({ "content": content })` when only `content` is populated
-// (proven by the tests below). EPIC C fills `embeds` and EPIC B fills
-// `components`/`flags`; all three are now serialized here, so none is a dead
-// placeholder.
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DiscordOutgoing {
@@ -110,14 +97,6 @@ impl DiscordOutgoing {
 // Slash-command specs (produced by `slash`, consumed by the orchestrator)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A slash command derived from an installed skill. `slug` is the Discord
-/// command name; `skill_name` is the skill's manifest name (sanitized of
-/// quotes and newlines at spec-build time, since it is interpolated into
-/// the synthesized agent prompt); `description` is truncated to Discord's
-/// 100-char limit; `options` are the typed command options (empty → the legacy
-/// single free-text `input`).
-///
-/// `Eq` is not derived: `OptionSpec` carries `f64` numeric bounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscordSlashCommandSpec {
     pub skill_name: String,
@@ -130,19 +109,8 @@ pub struct DiscordSlashCommandSpec {
     pub options: Vec<OptionSpec>,
 }
 
-/// Resolves the current skill-derived command set from canonical state at
-/// READY/interaction time. No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE
-/// SOURCE OF TRUTH") — skills install/uninstall at runtime. The loader does
-/// blocking file IO, so callers must run it via `spawn_blocking`, never on
-/// the gateway listen loop.
 pub type DiscordSlashCommandResolver = Arc<dyn Fn() -> Vec<DiscordSlashCommandSpec> + Send + Sync>;
 
-/// Which Discord command scope a reconcile targets. Mapped from
-/// `DiscordConfig.slash_command_scope` + `guild_ids` in the channel wiring:
-/// `Global` registers application-wide; `Guild` registers to each configured
-/// guild (instant propagation). Either way the reconcile reaps the channel's
-/// commands from the *other* scope, so flipping the scope never leaves the same
-/// command registered in both places.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlashScope {
     Global,
@@ -194,11 +162,6 @@ impl std::error::Error for DiscordListenerFatalError {}
 /// via the interaction followup webhook rather than a normal channel message.
 pub(crate) const DISCORD_INTERACTION_PREFIX: &str = "interaction:";
 
-/// Build the sentinel reply target carrying only the interaction id. The
-/// bearer token deliberately never enters the reply target: reply targets
-/// flow into logs, session keys (and thus on-disk filenames), and memory
-/// rows — `send()` resolves the credentials from the channel-local
-/// `pending_interactions` store instead.
 pub(crate) fn discord_interaction_reply_target(interaction_id: &str) -> String {
     format!("{DISCORD_INTERACTION_PREFIX}{interaction_id}")
 }
@@ -219,7 +182,6 @@ pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<&str> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Discord's maximum message length for regular messages.
-///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 pub(crate) const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 

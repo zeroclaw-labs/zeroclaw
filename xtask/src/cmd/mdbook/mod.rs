@@ -1,5 +1,6 @@
 pub mod build;
 pub mod check;
+pub mod feature_matrix;
 pub mod hardware;
 pub mod keymap;
 pub mod linkcheck;

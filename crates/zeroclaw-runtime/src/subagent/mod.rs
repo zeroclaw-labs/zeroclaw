@@ -2,29 +2,6 @@
 //! agent's identity by default: same UUID, same `SecurityPolicy`, same
 //! memory allowlist. A SubAgent run is auditable as a child of the
 //! parent and stays inside the parent's permissions envelope.
-//!
-//! Two spawn sites converge on [`SubAgentSpawn`]: the agent-loop tool
-//! `spawn_subagent` and the cron scheduler's `JobType::Agent` dispatch.
-//! Sharing the surface keeps permission inheritance, tracing-span
-//! shape, and audit attribution uniform.
-//!
-//! Power-users may narrow a SubAgent's permissions via
-//! [`SubAgentOverrides`]; [`SubAgentSpawn::build`] validates each
-//! override as a subset of the parent (using
-//! [`SecurityPolicy::ensure_no_escalation_beyond`] for the policy and
-//! an alias-set containment check for the memory allowlist) and
-//! returns `Err` with the originating violation chained on any
-//! escalation.
-//!
-//! The memory allowlist is carried as a set of agent **aliases** (the
-//! `[agents.<alias>]` config keys), not backend storage identifiers.
-//! Consumers that build an [`zeroclaw_memory::AgentScopedMemory`] must resolve aliases
-//! to backend identifiers via
-//! [`zeroclaw_memory::Memory::ensure_agent_uuid`] first — SQL-backed
-//! stores use UUIDs from the `agents` table; Markdown / Qdrant / None
-//! use the alias verbatim per the trait default. Holding aliases at
-//! this layer means [`SubAgentSpawn::for_agent`] does not need a
-//! backend handle to construct.
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -33,33 +10,12 @@ use std::sync::Arc;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
-/// Optional narrowing applied to a SubAgent at spawn time. `None` on
-/// every field means "inherit parent verbatim"; `Some(...)` narrows.
-/// Each field is independently validated by [`SubAgentSpawn::build`]
-/// to reject any value that escalates beyond the parent.
-///
-/// The default-everything-inherits model means the common case is
-/// `SubAgentOverrides::default()` — a no-op.
 #[derive(Debug, Clone, Default)]
 pub struct SubAgentOverrides {
     /// Override the SubAgent's [`SecurityPolicy`]. Validated as a
     /// subset of the parent via
     /// [`SecurityPolicy::ensure_no_escalation_beyond`].
     pub policy: Option<SecurityPolicy>,
-    /// Override the SubAgent's memory allowlist (the set of sibling
-    /// agent **aliases** the SubAgent may recall from, as written in
-    /// `[agents.<alias>]` keys). Validated as a subset of the
-    /// parent's allowlist; any alias here that is not on the parent's
-    /// list is rejected.
-    ///
-    /// These are config-layer aliases, not backend storage
-    /// identifiers. Consumers that build an [`zeroclaw_memory::AgentScopedMemory`]
-    /// must resolve aliases to backend identifiers via
-    /// [`zeroclaw_memory::Memory::ensure_agent_uuid`] before passing
-    /// them to the wrapper (SQL backends use UUIDs; Markdown / Qdrant
-    /// / None use the alias verbatim per the trait default). The
-    /// in-tree consumer today is `zeroclaw_memory::create_memory_for_agent`,
-    /// which performs the resolution.
     pub allowed_agent_aliases: Option<HashSet<String>>,
 }
 
@@ -67,26 +23,12 @@ pub struct SubAgentOverrides {
 /// child policy, and the resolved memory allowlist.
 #[derive(Debug, Clone)]
 pub struct SubAgentContext {
-    /// The parent agent's alias (e.g. `"researcher"`). SubAgents share
-    /// the parent's identity at the data layer (no separate row in the
-    /// `agents` table); the distinction between parent and sub-run is
-    /// captured at the tracing-span level
-    /// (`agent.<alias>.subagent.<run_id>`).
     pub parent_alias: String,
     /// The validated [`SecurityPolicy`] this SubAgent operates under.
     /// Identical to the parent's when `SubAgentOverrides::policy` is
     /// `None`; otherwise a narrowed copy that passed
     /// [`SecurityPolicy::ensure_no_escalation_beyond`].
     pub policy: Arc<SecurityPolicy>,
-    /// Resolved memory allowlist as a set of agent **aliases**. The
-    /// bound `parent_alias` is always included so the SubAgent always
-    /// sees the parent's own rows; the rest is either the parent's
-    /// allowlist verbatim or a validated subset.
-    ///
-    /// See [`SubAgentOverrides::allowed_agent_aliases`] for the
-    /// alias-vs-backend-identifier distinction; consumers that build
-    /// an [`zeroclaw_memory::AgentScopedMemory`] must resolve to backend identifiers
-    /// before passing the set to the wrapper.
     pub allowed_agent_aliases: HashSet<String>,
 }
 
@@ -101,26 +43,6 @@ pub struct SubAgentSpawn {
 }
 
 impl SubAgentSpawn {
-    /// Resolve a parent's identity from the loaded config and an
-    /// agent alias. Returns `Err` when the alias does not name a
-    /// configured agent — the spawn site surfaces a structured
-    /// failure instead of invoking the agent loop on a nonexistent
-    /// identity.
-    ///
-    /// The parent policy is rebuilt from config via
-    /// [`SecurityPolicy::for_agent`]. This is the right entry point
-    /// for spawn sites with **no live parent context** — most
-    /// importantly the cron scheduler's `JobType::Agent` dispatch,
-    /// which has no session and must use the per-agent install
-    /// workspace as the sandbox boundary.
-    ///
-    /// Interactive spawn sites that hold the parent's live
-    /// `Arc<SecurityPolicy>` (the agent-loop `spawn_subagent` tool and
-    /// the `delegate` tool when called from an ACP/gateway session)
-    /// must use [`Self::for_agent_with_policy`] instead, so that
-    /// session-scoped policy fields — most importantly
-    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd
-    /// — survive the spawn. See issue #7263.
     pub fn for_agent(config: &Config, agent_alias: &str) -> Result<Self> {
         // Upfront alias check so a missing-agent failure surfaces with
         // the "no agent configured under alias …" message rather than
@@ -137,19 +59,6 @@ impl SubAgentSpawn {
         Self::for_agent_with_policy(config, agent_alias, parent_policy)
     }
 
-    /// Resolve a parent's identity using a **pre-built** security
-    /// policy — the live `Arc<SecurityPolicy>` that the parent's tool
-    /// registry is using. This is the spawn path interactive sites
-    /// (ACP `spawn_subagent`, ACP `delegate`) must take so that
-    /// session-scoped policy fields — most importantly
-    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd
-    /// — survive the spawn. Without this hook the policy is rebuilt
-    /// from config and the session override is silently dropped
-    /// (issue #7263).
-    ///
-    /// The memory allowlist is still resolved from config because it
-    /// is declared statically per agent and the policy carries no
-    /// equivalent field.
     pub fn for_agent_with_policy(
         config: &Config,
         agent_alias: &str,
@@ -175,18 +84,6 @@ impl SubAgentSpawn {
         })
     }
 
-    /// Apply `overrides` to the parent's permissions and return a
-    /// validated [`SubAgentContext`]. On any escalation, returns
-    /// `Err` with the originating violation in the error chain.
-    ///
-    /// When the caller supplies a policy override, the child inherits
-    /// the parent's `PerSenderTracker` so action and cost budgets are
-    /// shared between parent and SubAgent runs. Otherwise a SubAgent
-    /// could be spawned to bypass the parent's `max_actions_per_hour`
-    /// or `max_cost_per_day_cents` ceiling by consuming from a
-    /// fresh-zeroed bucket; the inheritance closes that escape. The
-    /// no-override path already shares the bucket via
-    /// `Arc<SecurityPolicy>` cloning.
     pub fn build(self, overrides: SubAgentOverrides) -> Result<SubAgentContext> {
         let policy = if let Some(mut child_policy) = overrides.policy {
             child_policy
@@ -205,12 +102,6 @@ impl SubAgentSpawn {
                         "subagent policy override escalates beyond parent: {violation}"
                     ))
                 })?;
-            // Share the parent's action/cost tracker. `PerSenderTracker`
-            // is `Clone` (deep-copy of buckets) but the SubAgent must
-            // see the parent's live bucket state, not a frozen
-            // snapshot, so steal the parent's tracker by cloning the
-            // inner `Arc<SecurityPolicy>` once and assigning the
-            // child's `tracker` field from it.
             child_policy.tracker = self.parent_policy.tracker.clone();
             Arc::new(child_policy)
         } else {
@@ -394,14 +285,6 @@ mod tests {
         );
     }
 
-    /// Regression for issue #7263: when an interactive spawn site
-    /// (ACP `spawn_subagent` / `delegate`) supplies a pre-built parent
-    /// policy whose `workspace_dir` was pinned to the session cwd,
-    /// `for_agent_with_policy` must propagate that policy verbatim
-    /// instead of regenerating one from config. Without this the
-    /// child's file/shell tools jail to `~/.zeroclaw/agents/<alias>/
-    /// workspace` rather than the IDE's session cwd, breaking
-    /// subagent-driven workflows in repos outside the install root.
     #[test]
     fn for_agent_with_policy_preserves_session_workspace_dir() {
         let config = config_with_agent("alpha");
@@ -439,9 +322,6 @@ mod tests {
         );
     }
 
-    /// `for_agent` (the cron-style entry point) must continue to
-    /// resolve the workspace from config so scheduled jobs — which
-    /// have no session — jail to the per-agent install dir.
     #[test]
     fn for_agent_uses_config_workspace_dir() {
         let config = config_with_agent("alpha");

@@ -82,8 +82,8 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
         }
-        crate::ChannelCommands::BindTelegram { identity } => {
-            Box::pin(bind_telegram_identity(config, &identity)).await
+        crate::ChannelCommands::BindTelegram { identity, alias } => {
+            Box::pin(bind_telegram_identity(config, &identity, &alias)).await
         }
         crate::ChannelCommands::Send {
             message,

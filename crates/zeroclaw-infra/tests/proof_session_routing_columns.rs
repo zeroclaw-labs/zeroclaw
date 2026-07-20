@@ -2,17 +2,6 @@
 //! columns on `session_metadata` actually exist after the migration runs
 //! and that `set_session_context` writes through to disk where a raw
 //! sqlite reader can see them.
-//!
-//! The test seeds the tempdir with the live daemon's `sessions.db`
-//! whenever `ZEROCLAW_LIVE_SESSIONS_DB` is set so the migration runs
-//! against the operator's real data shape, not a synthetic one. Without
-//! the env var the test still passes by exercising the migration on an
-//! empty file.
-//!
-//! Run with:
-//!   ZEROCLAW_LIVE_SESSIONS_DB=$HOME/.zeroclaw/data/sessions/sessions.db \
-//!     cargo test -p zeroclaw-infra --test proof_session_routing_columns \
-//!     -- --nocapture
 
 use std::path::PathBuf;
 

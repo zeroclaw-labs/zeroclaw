@@ -1,12 +1,4 @@
 //! Tool input/output capture: leak-scan + truncation + denylist.
-//!
-//! The actual `LeakDetector` lives in `zeroclaw-runtime::security` (it
-//! depends on regex tables that themselves depend on other runtime types).
-//! This crate is upstream of runtime, so we can't reach the detector
-//! directly. Instead, callers in runtime invoke
-//! [`capture_tool_input`] / [`capture_tool_output`] with the post-scan
-//! string (the runtime side runs `LeakDetector::scan` first and passes
-//! the redacted output here for truncation + size-flagging).
 
 use crate::config::{LlmRequestPayloadPolicy, ResolvedPolicy, ToolIoPolicy};
 
@@ -19,16 +11,6 @@ pub struct ToolIoCapture {
     pub text: String,
     pub original_bytes: usize,
     pub truncated: bool,
-}
-
-impl ToolIoCapture {
-    fn empty() -> Self {
-        Self {
-            text: String::new(),
-            original_bytes: 0,
-            truncated: false,
-        }
-    }
 }
 
 /// Capture redacted tool input.
@@ -80,15 +62,6 @@ fn capture_with_policy(
     }
 }
 
-/// Capture the (already leak-scanned) LLM request payload per the
-/// request-payload policy. Unlike tool I/O there is no per-tool denylist:
-/// the whole payload is gated by the policy alone, and `truncate_bytes`
-/// reuses the shared tool-io truncate cap. Returns `None` when the policy is
-/// `off` (the default) so the prompt is never persisted unless opted in.
-///
-/// Takes the policy + cap directly (not a [`ResolvedPolicy`]) so the call
-/// site can use [`crate::llm_request_payload_policy`] without holding the
-/// full resolved bundle.
 #[must_use]
 pub fn capture_llm_request(
     policy: LlmRequestPayloadPolicy,
@@ -129,13 +102,6 @@ fn truncate_to_cap(redacted: &str, cap: usize) -> ToolIoCapture {
         original_bytes,
         truncated: true,
     }
-}
-
-#[allow(dead_code)]
-fn empty_unused_marker() {
-    // Suppress unused-import false positives for `ToolIoCapture::empty`
-    // (kept around for future "explicit empty capture" call sites).
-    let _ = ToolIoCapture::empty();
 }
 
 #[cfg(test)]
@@ -197,6 +163,15 @@ mod tests {
         assert_eq!(cap.text, "hell");
         assert_eq!(cap.original_bytes, 11);
         assert!(cap.truncated);
+    }
+
+    #[test]
+    fn llm_request_redacted_truncation_respects_utf8_char_boundaries() {
+        let cap = capture_llm_request(LlmRequestPayloadPolicy::Redacted, 3, "éé").unwrap();
+        assert_eq!(cap.text, "é");
+        assert_eq!(cap.original_bytes, 4);
+        assert!(cap.truncated);
+        assert!(cap.text.len() <= 3);
     }
 
     #[test]
