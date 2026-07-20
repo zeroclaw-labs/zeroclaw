@@ -85,3 +85,60 @@ Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`
 `response_not_contains`, `max_tool_calls: 0`). See `evals/README.md` for the
 authoring rules, including the two-experts test and the privacy requirement that
 fixtures use placeholder identities only.
+
+## Expectations reference
+
+`expects` collects declarative checks. Every field is optional; each declared
+check becomes one graded result, tagged with a category (`response`, `tool`,
+`side_effect`, `budget`, `judge`) surfaced in the JSON report along with a
+per-case `score` and `category_totals`.
+
+Response checks (category `response`):
+
+- `response_contains` / `response_not_contains`: substrings that must / must not
+  appear in the final response.
+- `response_matches`: regex patterns the final response must match (an invalid
+  regex is a failed check, not a crash).
+- `response_json`: a map of JSON pointer to expected value. The final response is
+  parsed as JSON (falling back to the first ` ```json ` fenced block); each
+  pointer must resolve to the expected value. If neither parse succeeds, every
+  pointer check fails with "response is not JSON".
+
+Tool checks (category `tool`):
+
+- `tools_used` / `tools_not_used`: tool names that must / must not have been
+  called.
+- `max_tool_calls`: inclusive upper bound on the number of tool calls.
+- `all_tools_succeeded`: whether every tool call must have succeeded.
+
+Workspace checks (category `side_effect`), under `workspace`:
+
+- `file_exists` / `file_absent`: workspace-relative paths that must / must not
+  exist after the run.
+- `file_contains`: a map of path to substrings that must appear in that file.
+
+Every workspace path is validated as workspace-relative first; a path that
+escapes the workspace (absolute or containing `..`) is a failed check, never a
+filesystem access.
+
+Budget checks (category `budget`), under `budget`, each an inclusive bound:
+`max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_duration_ms`,
+`max_llm_calls`.
+
+Example combining a workspace and a budget check:
+
+```json
+{
+  "model_name": "writes-a-report",
+  "id": "gh1234_report",
+  "tools": ["file_write"],
+  "turns": [{ "user_input": "Write status.json with status ok." }],
+  "expects": {
+    "workspace": {
+      "file_exists": ["status.json"],
+      "file_contains": { "status.json": ["ok"] }
+    },
+    "budget": { "max_llm_calls": 4, "max_total_tokens": 2000 }
+  }
+}
+```
