@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_tag_ships_channels_all_tag_ships_heavyweight() {
+    fn dist_tag_is_lean_while_all_tag_is_kitchen_sink() {
         let s = render(&root()).unwrap();
         let v: toml::Value = toml::from_str(&s).unwrap();
         let tags = v["tags"].as_array().unwrap();
@@ -162,9 +162,10 @@ mod tests {
             dist["features"]
                 .as_str()
                 .unwrap()
-                .contains("channel-discord")
+                .contains("channel-matrix")
         );
-        assert!(!dist["features"].as_str().unwrap().contains("hardware"));
+        assert!(dist["features"].as_str().unwrap().contains("whatsapp-web"));
+        assert!(!dist["features"].as_str().unwrap().contains("channel-slack"));
         assert!(all["features"].as_str().unwrap().contains("hardware"));
     }
 }

@@ -11,7 +11,6 @@ pub enum Command {
 
 impl Command {
     /// Parse a raw JSON line into a `Command`.
-    ///
     /// Returns `None` for unknown or malformed commands.
     pub fn from_line(line: &[u8]) -> Option<Self> {
         if has_cmd(line, b"ping") {

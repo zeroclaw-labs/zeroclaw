@@ -10,12 +10,6 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
-/// Graceful shutdown after the loop exhausts `max_iterations` (upstream loop
-/// body, max-iteration exit): log exhaustion, push a summary-request user
-/// message, make a tools-free `chat` call honoring `pacing.step_timeout_secs`
-/// and the cancellation token, and return `Ok(accumulated + summary)` — or
-/// bail with "exceeded maximum tool iterations" when the summary is empty or
-/// the call fails.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
     model_provider: &dyn ModelProvider,
@@ -59,17 +53,6 @@ pub(crate) async fn finish_after_max_iterations(
             .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
         "Max iterations reached, requesting final summary"
     );
-    // Sanitise tool_use / tool_result pairing before the graceful-shutdown
-    // request. When the loop exits immediately after the model emits a
-    // tool_use (hitting max_tool_iterations before the runner records a
-    // tool_result), the history carries an unpaired tool_use block.
-    // Bedrock/Anthropic reject the follow-up tools-free summary call with:
-    // "Expected toolResult blocks at messages.N.content for the following
-    // Ids: tooluse_*". Two complementary sweeps:
-    //   1. strip_orphaned_tool_calls_from_assistants — removes tool_calls from
-    //      assistant messages whose ids have no following tool result.
-    //   2. remove_orphaned_tool_messages — removes tool-role messages that no
-    //      longer have a matching assistant (symmetric case).
     let tool_calls_stripped =
         crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
     let tool_messages_removed =
@@ -93,11 +76,6 @@ pub(crate) async fn finish_after_max_iterations(
          Summarize what you accomplished and what remains to be done."
             .to_string(),
     );
-    // Pushed into history for the request below, but mirrored into the
-    // append-log (and kept in history) only when the summary call SUCCEEDS:
-    // a failed/cancelled/timed-out/empty summary must not persist an
-    // unanswered synthetic prompt into wrapper transcripts — every failure
-    // exit pops it back off.
     let summary_prompt_mirror = summary_prompt.clone();
     history.push(summary_prompt);
 
@@ -193,12 +171,6 @@ pub(crate) async fn finish_after_max_iterations(
         history.pop();
         anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
     }
-    // Persist the answered prompt + summary like every other final assistant
-    // response: without the summary message, persistent-history callers (the
-    // streamed wrapper's replay, new_messages consumers) store a transcript
-    // ending on the synthetic user prompt with no answer — the delivered
-    // summary would be absent and the model re-answers the synthetic prompt
-    // next turn.
     let summary_msg = ChatMessage::assistant(text.clone());
     if let Some(out) = &mut new_messages_out {
         out.push(summary_prompt_mirror);
@@ -206,6 +178,13 @@ pub(crate) async fn finish_after_max_iterations(
     }
     history.push(summary_msg);
     accumulated_display_text.push_str(&text);
+    // Graceful shutdown with a visible reason so the user knows why the
+    // agent stopped making progress.
+    accumulated_display_text.push_str("\n\n");
+    accumulated_display_text.push_str(&crate::i18n::get_required_cli_string_with_args(
+        "turn-max-iterations-reached",
+        &[("max_iterations", &max_iterations.to_string())],
+    ));
     Ok(accumulated_display_text)
 }
 
@@ -309,6 +288,14 @@ mod graceful_summary_metering_tests {
             .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        // The returned display text must carry both the summary and the visible
+        // stop reason — deleting the stop-reason append would leave this green
+        // on `wrap-up summary` alone, so the stop-reason assertion pins the
+        // user-observed contract.
+        assert!(
+            out.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "stop reason with iteration count must reach returned output: {out}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "provider called once");
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
@@ -344,6 +331,27 @@ mod graceful_summary_metering_tests {
             calls.load(Ordering::SeqCst),
             0,
             "budget gate must fire before the provider call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod i18n_message_tests {
+    /// The graceful max-iteration shutdown must include the iteration count in
+    /// the user-visible message so the operator knows why the agent stopped.
+    #[test]
+    fn max_iterations_message_includes_count() {
+        let msg = crate::i18n::get_required_cli_string_with_args(
+            "turn-max-iterations-reached",
+            &[("max_iterations", "42")],
+        );
+        assert!(
+            msg.contains("42"),
+            "message should contain iteration count: {msg}"
+        );
+        assert!(
+            msg.contains("maximum tool iterations"),
+            "message should describe the limit: {msg}"
         );
     }
 }

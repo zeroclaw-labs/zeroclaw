@@ -1,9 +1,4 @@
 //! Action enums for the keymap.
-//!
-//! Each enum is produced by the `keyactions!` macro. Every variant
-//! declares its default chords and label inline; the macro generates
-//! the enum, `Serialize`/`Deserialize` derives, `label()`,
-//! `bindings()`, and `from_chord()` from one source.
 
 use serde::{Deserialize, Serialize};
 
@@ -141,7 +136,7 @@ keyactions! {
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
-        // and queue navigation conflict (alt+up/down). See issue #8075.
+        // and queue navigation conflict (alt+up/down). See
         BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)), Chord::ctrl('k')] => "enter browse mode",
         BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
@@ -225,6 +220,7 @@ keyactions! {
         DetailWidenDown  [Chord::shift(KeyCode::Down)] => "widen detail down",
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
+        RenameAgent      [Chord::char('e')] => "rename agent",
         KillSession      [Chord::char('X')] => "kill session",
         TriggerCron      [Chord::char('R')] => "run cron job now",
         Refresh          [Chord::char('r')] => "refresh",

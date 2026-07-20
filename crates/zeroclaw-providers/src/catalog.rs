@@ -1,14 +1,4 @@
 //! Per-family catalog source table.
-//!
-//! Reaches the model catalog for any provider family without constructing
-//! a live `ModelProvider` (which would require typed runtime context like
-//! Azure's `resource`/`deployment` or Bedrock's `region`). Used by the
-//! gateway's `/api/config/catalog/models` endpoint and the TUI's
-//! config flow when the operator hasn't supplied a credential yet.
-//!
-//! Each family maps to a tuple `(models_dev_key, openrouter_vendor_prefix)`;
-//! `list_models_for_family` walks them in that order, returning the first
-//! non-empty list.
 
 use std::time::Duration;
 
@@ -182,11 +172,6 @@ pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
     anyhow::bail!("no public catalog for family {family:?}")
 }
 
-/// Sort a raw public model catalog for first-run chat/code setup.
-///
-/// This is a provisional catalog-level heuristic until per-model capabilities
-/// become explicit catalog data. Keeping it with the catalog source prevents
-/// every UI/client surface from growing its own model-name classifier.
 #[must_use]
 pub fn sort_model_catalog_for_chat(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
     let provider_l = provider.to_ascii_lowercase();
@@ -264,11 +249,6 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 mod tests {
     use super::*;
 
-    /// `catalog_source_for` must classify every canonical family the
-    /// `for_each_model_provider_slot!` macro emits. Drift catches a new
-    /// slot added to the macro without a matching catalog-table entry —
-    /// `catalog_source_for` would return `None` and the gateway endpoint
-    /// would surface `unknown provider family` for that family.
     #[test]
     fn every_canonical_family_has_a_catalog_table_entry() {
         macro_rules! collect_family_names {

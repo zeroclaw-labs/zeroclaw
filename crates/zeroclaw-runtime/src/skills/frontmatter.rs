@@ -1,25 +1,4 @@
 //! Canonical `SKILL.md` frontmatter.
-//!
-//! Per the open Agent Skills spec (agentskills.io), `name` and `description`
-//! are required; everything else is conventional. We keep the shape **flat**
-//! — `license`, `author`, `version`, `category` at the top level — so the
-//! existing hand-rolled parser in `super::parse_simple_frontmatter` (which
-//! deliberately avoids a full YAML dep) covers every field. The
-//! `zeroclaw-labs/zeroclaw-skills` registry nests these under a `metadata:`
-//! block; that registry is ours and follows this flat shape going forward.
-//!
-//! The struct is the single source of truth: [`SkillFrontmatter::prop_fields`]
-//! enumerates the same field set that drives the dashboard form, CLI flags
-//! on `zeroclaw skills add`, and the TUI form. Adding a flat scalar field here
-//! = all three surfaces gain it via `prop_fields`.
-//!
-//! The one exception is `slash_options`: a nested `slash_options:` YAML list
-//! (typed Discord slash-command parameters). It is the reason this file keeps
-//! a flat *scalar* schema while still expressing structured options — the
-//! nesting is parsed/serialized by the shared helper in [`super::document`],
-//! not the flat parser, and it is deliberately excluded from `prop_fields`
-//! (the flat form can't render a nested list; the dashboard gets a bespoke
-//! editor for it).
 
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::traits::{PropFieldInfo, PropKind};
@@ -41,21 +20,8 @@ pub struct SkillFrontmatter {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    /// Free-form tags from the YAML `tags:` list. Drive skill tiering and
-    /// opt-in surfaces — notably the `slash` tag, which exposes the skill as a
-    /// Discord slash command (zeroclaw-labs/zeroclaw#7490). Loader-managed tags
-    /// such as `open-skills` also live here. Round-tripped so editing a skill no
-    /// longer silently strips its tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Typed slash-command options a `slash`-tagged skill exposes (Discord
-    /// dropdowns / ranges / autocomplete). The one genuinely *nested* field —
-    /// a `slash_options:` YAML list of maps, each with an optional `choices`
-    /// sub-list. It is parsed/serialized by the shared nested helper in
-    /// [`super::document`] (the flat scalar parser leaves it untouched) and is
-    /// deliberately excluded from [`SkillFrontmatter::prop_fields`] because the
-    /// flat dashboard/CLI/TUI form can't express nesting; the dashboard gets a
-    /// bespoke editor for it instead. See [`SkillSlashOption`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slash_options: Vec<SkillSlashOption>,
 }
@@ -153,11 +119,6 @@ mod tests {
 
     #[test]
     fn prop_fields_matches_struct() {
-        // Drift check: when a FLAT scalar field is added to SkillFrontmatter,
-        // prop_fields must be updated to match. The struct has 8 fields, but
-        // `slash_options` is INTENTIONALLY excluded from prop_fields — it is a
-        // nested list the flat dashboard/CLI/TUI form can't render, so it gets
-        // a bespoke editor instead. Hence 7 flat fields surfaced here.
         let fields = SkillFrontmatter::prop_fields();
         assert_eq!(
             fields.len(),

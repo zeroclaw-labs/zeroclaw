@@ -156,7 +156,7 @@ pub enum SopTrigger {
         /// Request path matched exactly against the event path.
         path: String,
     },
-    /// Time-based firing. Defined and matched, but no scheduler feeds it.
+    /// Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).
     #[trigger(display = "expression")]
     Cron {
         /// Cron expression evaluated over the run window.
@@ -263,7 +263,6 @@ impl fmt::Display for SopStepKind {
 // ── Typed step parameters ────────────────────────────────────────
 
 /// JSON Schema fragment for validating step input/output data.
-///
 /// Stored as a raw `serde_json::Value` so callers can validate without
 /// pulling in a full JSON Schema library.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
