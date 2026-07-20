@@ -105,16 +105,18 @@ otel_tool_io_max_chars = 1000        # per-field truncation limit
 ### Turn-nested memory and RAG spans (`observability-otel`)
 
 `memory.recall`, `memory.store`, and `rag.retrieve` spans nest under the
-`gen_ai.agent.invoke` turn span whenever the memory operation runs inside an
-agent turn, so a full turn (LLM calls, tool calls, memory operations) renders
-as a single trace in Langfuse or Tempo. The three events carry the same
-`channel` / `agent_alias` / `turn_id` correlation triple as LLM and tool
-events, and the spans expose it as `zeroclaw.channel`, `gen_ai.agent.name`,
-and `zeroclaw.turn_id` attributes.
+`gen_ai.agent.invoke` turn span whenever the operation runs inside an
+attributed agent turn, so a full turn — memory recall, autosave store,
+LLM calls, tool calls — renders as one trace in Langfuse/Tempo. The three
+events carry the same `channel` / `agent_alias` / `turn_id` triple as LLM
+and tool events, exposed as `zeroclaw.channel`, `gen_ai.agent.name`, and
+`zeroclaw.turn_id` span attributes.
 
-Memory operations that run outside a correlated turn (for example the gateway
-REST memory store, or channel-orchestrator recalls that emit no observer
-events today) keep producing root spans. A `turn_id` that no longer matches a
+Memory operations outside a correlated turn keep producing root spans: the
+gateway REST memory store, and the `process_message` hardware-RAG
+retrieval, which runs before the turn bracket opens and therefore stays a
+root span carrying the matching `zeroclaw.turn_id` attribute (full nesting
+of that span is tracked in #8844). A `turn_id` that no longer matches a
 live turn also degrades to a root span rather than guessing a parent.
 
 ### LLM request payload capture (`log_llm_request_payload`)
