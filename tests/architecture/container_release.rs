@@ -8,6 +8,12 @@ fn workflow(name: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {name}: {error}"))
 }
 
+fn repository_file(name: &str) -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::read_to_string(root.join(name))
+        .unwrap_or_else(|error| panic!("failed to read {name}: {error}"))
+}
+
 fn top_level_job<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("\n  {name}:\n");
     let (_, rest) = workflow
@@ -121,4 +127,51 @@ fn scheduled_trivy_verifies_published_tag_before_scan() {
         !scheduled.contains("\n  upload-sarif:\n"),
         "each scan matrix leg must upload its own SARIF result independently"
     );
+}
+
+#[test]
+fn root_compose_pins_gateway_host_and_public_bind_permission() {
+    let compose = repository_file("docker-compose.yml");
+    let required_overrides =
+        "- ZEROCLAW_gateway__host=0.0.0.0\n      - ZEROCLAW_gateway__allow_public_bind=true";
+
+    assert!(
+        compose.contains(required_overrides),
+        "Compose must keep the non-loopback gateway host beside its explicit public-bind permission"
+    );
+    assert!(
+        compose.contains("${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"),
+        "Compose must publish the configured gateway port"
+    );
+}
+
+#[test]
+fn compose_smoke_probes_host_port_with_a_loopback_persisted_config() {
+    let workflow = workflow("docker-image-pr.yml");
+    let smoke = repository_file("scripts/ci/smoke_docker_compose.sh");
+
+    for required in [
+        "- docker-compose.yml",
+        "- scripts/ci/smoke_docker_compose.sh",
+        "load: ${{ matrix.compose_smoke }}",
+        "run: bash scripts/ci/smoke_docker_compose.sh",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Docker image PR workflow is missing Compose smoke invariant: {required}"
+        );
+    }
+
+    for required in [
+        "host = \"127.0.0.1\"",
+        "HOST_PORT=\"127.0.0.1:${requested_host_port}\"",
+        "port zeroclaw 42617",
+        "http://127.0.0.1:${published_port}/health",
+        ":/zeroclaw-data/.zeroclaw/config.toml:ro",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "Compose smoke test is missing published-port invariant: {required}"
+        );
+    }
 }

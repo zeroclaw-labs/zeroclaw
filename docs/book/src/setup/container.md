@@ -30,7 +30,11 @@ docker run -d \
 
 </div>
 
-The official image already binds `[::]` with `allow_public_bind = true` and `require_pairing = false` baked into its default config, so the published port is reachable out of the box. The {{#env-var-name gateway.allow_public_bind}} override below only matters if you bind-mount your own config (which replaces the baked one) that defaults to localhost.
+The official image already binds `[::]` with `allow_public_bind = true` and
+`require_pairing = false` baked into its default config, so this direct
+`docker run` example is reachable out of the box. The Compose examples below
+still pin both gateway bind settings so persisted or custom configs cannot
+silently restore a loopback-only listener.
 
 The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config: you still need to run quickstart before it's useful:
 
@@ -84,8 +88,11 @@ services:
       - "42617:42617"      # gateway
     volumes:
       - ./data:/zeroclaw-data
-    # The official image already enables public bind; only add an `environment:`
-    # block with the override above if you bind-mount a localhost-default config.
+    environment:
+      # Both settings are required: host selects the container interface and
+      # allow_public_bind is the explicit permission for that exposure.
+      - ZEROCLAW_gateway__host=0.0.0.0
+      - ZEROCLAW_gateway__allow_public_bind=true
 ```
 
 After the container starts, run quickstart:
@@ -100,7 +107,19 @@ docker compose exec zeroclaw zeroclaw quickstart
 
 </div>
 
-With the official image you can omit the {{#env-var-name gateway.allow_public_bind}} override entirely; it is already enabled in the baked config.
+Compose should set both {{#env-var-name gateway.host}} and
+{{#env-var-name gateway.allow_public_bind}} explicitly. Publishing a port does
+not make a gateway bound to `127.0.0.1` inside the container reachable, and
+`allow_public_bind = true` permits a public bind without selecting one. Keeping
+the two overrides together also makes an existing volume or custom config with
+localhost defaults behave consistently.
+
+This intentionally changes exposure. The gateway must retain the explicit
+`allow_public_bind` opt-in when it listens on `0.0.0.0`. The Compose mapping
+`"42617:42617"` publishes on the host interfaces configured by Docker. To make
+the gateway reachable only from the container host, use
+`"127.0.0.1:42617:42617"`; keep the gateway's in-container host at `0.0.0.0`
+because Docker bridge traffic does not arrive through container loopback.
 
 ### Rootless Compose with the Debian image
 
@@ -117,6 +136,9 @@ services:
       - "42617:42617"
     volumes:
       - ./data:/zeroclaw-data
+    environment:
+      - ZEROCLAW_gateway__host=0.0.0.0
+      - ZEROCLAW_gateway__allow_public_bind=true
     healthcheck:
       test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
       interval: 60s
@@ -127,11 +149,11 @@ services:
 
 The current Debian image carries the packaged dashboard outside
 `/zeroclaw-data`, so the bind mount does not hide it and no
-`gateway.web_dist_dir` override is needed. The official image also carries the
-container-friendly gateway bind defaults. Only add an `environment:` block if
-you bind-mount your own localhost-default config; use the schema-mirror env-var
-spelling shown by {{#env-var-name gateway.allow_public_bind}} rather than the
-legacy all-uppercase aliases.
+`gateway.web_dist_dir` override is needed. The gateway overrides use the
+schema-mirror spellings shown by {{#env-var-name gateway.host}} and
+{{#env-var-name gateway.allow_public_bind}}. They take precedence over a
+persisted localhost-default config while retaining the separate permission
+opt-in.
 
 ## macOS: OrbStack vs Colima
 
@@ -187,8 +209,8 @@ Image=ghcr.io/zeroclaw-labs/zeroclaw:latest
 ContainerName=zeroclaw
 PublishPort=42617:42617
 Volume=zeroclaw-data:/zeroclaw-data
-# The official image already binds publicly; add an `Environment=` line with the
-# allow-public-bind override only if you mount a localhost-default config.
+# The official image already binds publicly. If you mount a localhost-default
+# config, override both gateway.host and gateway.allow_public_bind together.
 # Optional rolling-upgrade path — re-pull a newer image on (re)start and opt into `podman auto-update`:
 Pull=newer
 AutoUpdate=registry
@@ -294,8 +316,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /zeroclaw-data
-          # The official image already binds publicly; add an `env:` entry for the
-          # allow-public-bind override only if you mount a localhost-default config.
+          # The official image already binds publicly. If you mount a
+          # localhost-default config, override both gateway.host and
+          # gateway.allow_public_bind together.
       volumes:
         - name: data
           persistentVolumeClaim:

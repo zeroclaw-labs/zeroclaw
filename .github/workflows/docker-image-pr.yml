@@ -8,10 +8,12 @@ on:
       - Dockerfile.debian
       - Dockerfile.ci
       - .dockerignore
+      - docker-compose.yml
       - dev/config.template.toml
       - .github/workflows/docker-image-pr.yml
       - .github/workflows/release-stable-manual.yml
       - scripts/ci/prepare_docker_context.sh
+      - scripts/ci/smoke_docker_compose.sh
 
 concurrency:
   group: docker-image-pr-${{ github.event.pull_request.number }}
@@ -85,14 +87,17 @@ jobs:
             platform: linux/amd64
             tag: zeroclaw-pr-source-default:build
             cache-scope: docker-source-default-amd64
+            compose_smoke: true
           - dockerfile: Dockerfile
             platform: linux/arm64
             tag: zeroclaw-pr-source-default:build
             cache-scope: docker-source-default-arm64
+            compose_smoke: false
           - dockerfile: Dockerfile.debian
             platform: linux/amd64
             tag: zeroclaw-pr-source-debian:build
             cache-scope: docker-source-debian
+            compose_smoke: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -105,8 +110,14 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          load: false
+          load: ${{ matrix.compose_smoke }}
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max
+
+      - name: Smoke test Compose published gateway port
+        if: matrix.compose_smoke
+        env:
+          ZEROCLAW_COMPOSE_SMOKE_IMAGE: ${{ matrix.tag }}
+        run: bash scripts/ci/smoke_docker_compose.sh
