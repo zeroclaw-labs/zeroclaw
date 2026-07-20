@@ -1627,7 +1627,8 @@ impl RpcDispatcher {
                 let cfg = self.ctx.config.read();
                 (
                     Some(context_usage_max_tokens(&cfg, &alias)),
-                    Some(cfg.effective_model_context_window(&alias) as u64),
+                    cfg.effective_model_context_window_opt(&alias)
+                        .map(|v| v as u64),
                 )
             };
             (alias, mp, m, max_ctx, model_ctx_window)
@@ -5822,8 +5823,10 @@ mod tests {
         // cached_input_tokens is a *subset* of input_tokens per the
         // TokenUsage contract and must NOT be added (double-counts).
         assert_eq!(v["params"]["input_tokens"], 100);
-        assert_eq!(v["params"]["max_context_tokens"], 32_000);
-        // model_context_window absent when None provided
+        assert_eq!(
+            v["params"]["max_context_tokens"], 32_000,
+            "profile budget must be emitted"
+        );
         assert!(v["params"].get("model_context_window").is_none());
     }
 
@@ -5845,10 +5848,7 @@ mod tests {
         assert_eq!(v["params"]["model_context_window"], 1_000_000);
     }
 
-    /// Resolution chain for `effective_max_context_tokens`, exercised through
-    /// `context_usage_max_tokens` (the helper the live emitter calls).
-    /// Chain: runtime_profile.max_context_tokens → 32_000 stub.
-    /// Profile budget wins over the model-window helper.
+    /// Resolution: runtime_profile.max_context_tokens → 32_000 stub.
     #[test]
     fn context_usage_max_tokens_resolution() {
         use std::collections::HashMap;
@@ -5911,8 +5911,7 @@ mod tests {
                 *expected,
                 "resolution (profile={profile:?}, window={window:?})"
             );
-            // sanity: the model-window helper stays at the 32k stub when
-            // no provider context_window is configured, regardless of profile.
+            // Sanity: model-window helper stays at 32k when provider has no context_window.
             if window.is_none() {
                 assert_eq!(
                     cfg.effective_model_context_window("coder"),
@@ -5923,14 +5922,7 @@ mod tests {
         }
     }
 
-    /// Boundary regression: prove the corrected ceiling survives the *wire*
-    /// path, not just the config helper. This threads
-    /// `context_usage_max_tokens(&cfg, alias)` through the exact
-    /// `notification_for_turn_event` serialization the RPC dispatch emits, and
-    /// asserts the on-the-wire `context_usage.max_context_tokens` reads the
-    /// runtime-profile budget (128_000) rather than the model-window fallback
-    /// (32_000). This closes the "helper is right but does the emitted payload
-    /// carry it?" gap without needing a live daemon smoke.
+    /// Regression: wire payload carries profile budget (128k), not the 32k stub.
     #[test]
     fn context_usage_notification_wire_reports_runtime_profile_budget() {
         use std::collections::HashMap;
@@ -5951,7 +5943,6 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 runtime_profile: "coding".into(),
-                // No provider context_window: the broken path would emit 32_000.
                 ..AliasedAgentConfig::default()
             },
         );
@@ -5962,8 +5953,6 @@ mod tests {
             ..Config::default()
         };
 
-        // Resolve the ceiling exactly as RPC dispatch does, then emit it
-        // through the real wire serializer.
         let max_ctx = context_usage_max_tokens(&cfg, "coder");
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
@@ -5981,10 +5970,7 @@ mod tests {
         );
     }
 
-    /// Boundary regression: prove the model_context_window survives the *wire*
-    /// path when the agent has a provider with a known context_window.
-    /// This threads both budget and model window through the exact
-    /// `notification_for_turn_event` serialization the RPC dispatch emits.
+    /// Regression: model_context_window survives the wire when provider has it.
     #[test]
     fn context_usage_notification_wire_reports_model_context_window() {
         use std::collections::HashMap;
@@ -6046,6 +6032,78 @@ mod tests {
         assert_eq!(
             v["params"]["model_context_window"], 1_000_000,
             "emitted context_usage must carry the provider model window"
+        );
+    }
+
+    /// Regression: RPC wire omits model_context_window when provider has
+    /// no explicit context_window — 32k stub leak (#8872).
+    #[test]
+    fn context_usage_notification_omits_model_window_when_provider_unset() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // Profile budget = 128_000; provider window explicitly UNSET.
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openrouter.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("ensure creates entry");
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        let max_ctx = Some(context_usage_max_tokens(&cfg, "coder"));
+        let model_ctx_window = cfg
+            .effective_model_context_window_opt("coder")
+            .map(|v| v as u64);
+        assert!(
+            model_ctx_window.is_none(),
+            "effective_model_context_window_opt must return None when no \
+             provider context_window is set"
+        );
+
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: None,
+        };
+        let json = notification_for_turn_event("s1", &event, max_ctx, model_ctx_window).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["max_context_tokens"], 128_000,
+            "profile budget must be emitted"
+        );
+        assert!(
+            v["params"].get("model_context_window").is_none(),
+            "model_context_window must be absent when provider has no context_window \
+             — 32k stub would freeze meter (#8872)"
         );
     }
 
