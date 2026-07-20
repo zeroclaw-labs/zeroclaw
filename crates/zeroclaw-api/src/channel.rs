@@ -590,6 +590,14 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 
+    /// Whether this particular inbound message can use progressive draft
+    /// updates. Most channels have a capability-wide answer, so the default
+    /// delegates to [`Self::supports_draft_updates`]. Channels whose support
+    /// depends on conversation type can override this method.
+    fn supports_draft_updates_for(&self, _message: &ChannelMessage) -> bool {
+        self.supports_draft_updates()
+    }
+
     /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
     /// this channel, so the orchestrator can drop inbound events whose
     /// `sender` matches. A bot must never respond to its own messages, even
