@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
+  ArrowDownToLine,
   Bot,
   Clock,
   LayoutDashboard,
@@ -20,6 +21,9 @@ import {
 import { t } from '@/lib/i18n';
 import { useEffect, useState } from 'react';
 import { getStatus } from '@/lib/api';
+import { useVersionCheck } from '@/hooks/useVersionCheck';
+import { UpgradeDialog } from '@/components/UpgradeDialog';
+import type { StatusResponse } from '@/types/api';
 
 interface NavItem {
   to: string;
@@ -212,6 +216,20 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const [status, setStatus] = useState<StatusResponse | null>(null);
+  useEffect(() => {
+    getStatus()
+      .then(setStatus)
+      .catch(() => { /* silently ignore */ });
+  }, []);
+  // `check_updates` is undefined on older gateways → treat as enabled.
+  const checkUpdates = status?.check_updates !== false;
+  const { info, loading, refetch } = useVersionCheck(checkUpdates);
+  const hasUpdate = info?.is_newer === true;
+  const version = status?.version ?? null;
+  const [upgradeOpen, setUpgradeOpen] = useState(false);
+  const openUpgrade = () => setUpgradeOpen(true);
+
   return (
     <>
       {/* Backdrop — mobile only */}
@@ -252,7 +270,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
             </div>
           ))}
         </nav>
-        <RailFooter />
+        <RailFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
 
       {/* Mobile drawer — labelled full version (icons + labels), slides in/out. */}
@@ -270,8 +288,20 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
             <DrawerGroup key={group.headingKey} group={group} index={index} onClick={onClose} />
           ))}
         </nav>
-        <DrawerFooter />
+        <DrawerFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
+
+      <UpgradeDialog
+        open={upgradeOpen}
+        info={info}
+        loading={loading}
+        checkUpdatesEnabled={checkUpdates}
+        allowSelfUpgrade={status?.allow_self_upgrade === true}
+        restartMode={status?.restart_mode}
+        restartHint={status?.restart_hint}
+        onRefetch={refetch}
+        onClose={() => setUpgradeOpen(false)}
+      />
     </>
   );
 }
@@ -336,44 +366,110 @@ function DrawerLogo() {
 
 // ── Footers ─────────────────────────────────────────────────────────────────
 
-function useVersion() {
-  const [version, setVersion] = useState<string | null>(null);
-  useEffect(() => {
-    getStatus()
-      .then((s) => { if (s.version) setVersion(s.version); })
-      .catch(() => { /* silently ignore */ });
-  }, []);
-  return version;
+interface FooterProps {
+  version: string | null;
+  /** A newer release is available — render an accent dot. */
+  hasUpdate: boolean;
+  /** Open the upgrade dialog. */
+  onOpen: () => void;
 }
 
-// Rail footer — version tag only, centered, with a native tooltip carrying the
-// full "ZeroClaw Gateway vX" string since the rail has no room for the label.
-function RailFooter() {
-  const version = useVersion();
+// Rail footer — version tag as a button, centered, with a native tooltip
+// carrying the full "ZeroClaw Gateway vX" string since the rail has no room for
+// the label. When an update is available the version row is replaced by a
+// pulsing download-arrow icon stacked above the version text — the dot was
+// too easy to miss against the muted `text-faint` colour.
+function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
+  const title = hasUpdate
+    ? t('sidebar.update_available')
+    : version
+      ? `${t('sidebar.gateway')} v${version}`
+      : t('sidebar.gateway');
   return (
     <div
       className="border-t shrink-0 flex items-center justify-center"
       style={{ borderColor: 'var(--pc-border)', padding: '10px 0' }}
-      title={version ? `${t('sidebar.gateway')} v${version}` : t('sidebar.gateway')}
     >
-      {version && (
-        <span style={{ fontSize: '9px', color: 'var(--pc-text-faint)' }}>
-          v{version}
-        </span>
+      {(version || hasUpdate) && (
+        <button
+          type="button"
+          onClick={onOpen}
+          title={title}
+          aria-label={title}
+          className={[
+            'relative flex flex-col items-center justify-center gap-0.5 rounded px-1.5 py-1 cursor-pointer transition-colors',
+            hasUpdate
+              ? 'bg-pc-accent/10 hover:bg-pc-accent/20'
+              : 'hover:bg-pc-surface',
+          ].join(' ')}
+        >
+          {hasUpdate && (
+            <ArrowDownToLine
+              aria-hidden="true"
+              className="h-3.5 w-3.5 animate-bounce-soft"
+              style={{ color: 'var(--pc-accent)' }}
+            />
+          )}
+          {/* Red badge dot — an unmistakable attention-grabber layered atop the
+              pulsing arrow so an available update is never missed at a glance. */}
+          {hasUpdate && (
+            <span
+              aria-hidden="true"
+              className="absolute rounded-full"
+              style={{
+                top: '2px',
+                right: '2px',
+                width: '7px',
+                height: '7px',
+                backgroundColor: 'var(--color-status-error)',
+                boxShadow: '0 0 0 1.5px var(--pc-bg-surface)',
+              }}
+            />
+          )}
+          <span
+            style={{
+              fontSize: '9px',
+              color: hasUpdate ? 'var(--pc-accent)' : 'var(--pc-text-faint)',
+              fontWeight: hasUpdate ? 600 : undefined,
+            }}
+          >
+            {version ? `v${version}` : t('upgrade.title')}
+          </span>
+        </button>
       )}
     </div>
   );
 }
 
-// Drawer footer — full labelled gateway line for mobile.
-function DrawerFooter() {
-  const version = useVersion();
+// Drawer footer — full labelled gateway line for mobile, clickable to upgrade.
+// When an update is available the dot is replaced by a soft-bouncing download
+// arrow rendered at body-text size so the affordance is unmistakable.
+function DrawerFooter({ version, hasUpdate, onOpen }: FooterProps) {
   return (
     <div
       className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
       style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
     >
-      {t('sidebar.gateway')}
+      <button
+        type="button"
+        onClick={onOpen}
+        title={hasUpdate ? t('sidebar.update_available') : undefined}
+        className={[
+          'flex items-center gap-1.5 cursor-pointer transition-opacity uppercase tracking-wider',
+          hasUpdate ? 'opacity-100' : 'hover:opacity-80',
+        ].join(' ')}
+        style={hasUpdate ? { color: 'var(--pc-accent)' } : undefined}
+      >
+        {hasUpdate && (
+          <ArrowDownToLine
+            aria-hidden="true"
+            className="h-3.5 w-3.5 animate-bounce-soft"
+          />
+        )}
+        <span>
+          {hasUpdate ? t('sidebar.update_available') : t('sidebar.gateway')}
+        </span>
+      </button>
       {version && (
         <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
           v{version}

@@ -82,18 +82,23 @@ pub(crate) fn resolve_display_text(
     }
 }
 
-/// Narration to relay after the live stream, given what was already forwarded.
-/// Returns the suffix of `display_text` past `streamed_visible_text` when the
-/// latter is a genuine prefix. On any divergence the whole `display_text` is
-/// relayed: duplicate output is recoverable noise, a dropped tail is permanent
-/// loss, so the total function never truncates.
 pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
 ) -> &'a str {
+    if let Some(rest) = display_text.strip_prefix(streamed_visible_text) {
+        return rest;
+    }
+    let stream_lead_normalized = streamed_visible_text.trim_start();
+    if !stream_lead_normalized.is_empty()
+        && let Some(rest) = display_text.strip_prefix(stream_lead_normalized)
+    {
+        return rest;
+    }
+    if streamed_visible_text.trim() == display_text {
+        return "";
+    }
     display_text
-        .strip_prefix(streamed_visible_text)
-        .unwrap_or(display_text)
 }
 
 /// The interpreted Ok-arm of one provider call.
@@ -142,11 +147,6 @@ pub(crate) async fn interpret_chat_response(
         messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
     });
 
-    // Record cost via the task-local tracker (no-op when not scoped) and keep
-    // the per-call USD so both the Usage event and the llm_response log line
-    // can carry it. `None` = untracked (no cost scope or no usage);
-    // `Some(0.0)` = tracked but unpriced (the missing-pricing WARN fires
-    // inside record_tool_loop_cost_usage in that case).
     let call_cost_usd = resp
         .usage
         .as_ref()
@@ -340,6 +340,46 @@ mod tests {
             "final visible text"
         );
     }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_trailing_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "Checking the data.\n\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_leading_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data."),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_whitespace_on_both_ends() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data.\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_suffix_past_the_whitespace_trimmed_streamed_prefix() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to"),
+            " check."
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_prefix_space_when_only_the_leading_edge_diverges() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to "),
+            "check."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -349,17 +389,6 @@ mod cost_usd_regression_tests {
     use std::sync::Arc;
     use zeroclaw_providers::traits::TokenUsage;
 
-    /// Regression guard for the per-call USD that
-    /// `record_tool_loop_cost_usage` returns and `interpret_chat_response`
-    /// threads into BOTH the `TurnEvent::Usage { cost_usd }` event and the
-    /// `cost_usd` attribute of the `llm_response` log record. The test fails
-    /// if either path drops the cost.
-    ///
-    /// Pricing/usage are picked so the expected cost is an exact f64:
-    ///   input  = 2_000_000 tokens @ 1.5 / 1e6  = 3.0
-    ///   output = 1_000_000 tokens @ 3.0 / 1e6  = 3.0
-    ///   cached = 0 tokens                       = 0.0
-    ///   expected total                          = 6.0
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cost_usd_flows_to_usage_event_and_llm_response() {

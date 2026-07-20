@@ -100,7 +100,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        run: bash scripts/ci/apt_install.sh libudev-dev
+        run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
@@ -146,6 +146,10 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
+      - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
+        run: |
+          bash scripts/ci/comment_hygiene_gate.test.sh
+          bash scripts/ci/comment_hygiene_gate.sh
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
@@ -448,7 +452,7 @@ jobs:
           set +e
           cargo_log="${RUNNER_TEMP}/cargo-bench.log"
           SECONDS=0
-          cargo bench --no-run --locked 2>&1 | tee "$cargo_log"
+          cargo bench --bench agent_benchmarks --no-run --locked --no-default-features --features agent-runtime 2>&1 | tee "$cargo_log"
           cargo_status=${PIPESTATUS[0]}
           duration_seconds=$SECONDS
           set -e

@@ -10,17 +10,6 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::PacingConfig;
 
-/// Shared references threaded through the turn step functions.
-///
-/// Carries shared refs ONLY — every `&mut` the loop owns (history, loop
-/// detector, counters, accumulated text, retry counters) stays a loop local
-/// passed as an explicit individual argument. Never add a `&mut` field:
-/// it creates overlapping-borrow errors across step calls (RUN_SHEET
-/// `turn.context.TurnCtx`).
-///
-/// Fields the orchestrator threads to steps as explicit arguments
-/// (`model_provider`, `tools_registry`, vision/tool config, receipts, …)
-/// are NOT carried here — only the values steps actually read off `ctx`.
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
     pub(crate) provider_name: &'a str,

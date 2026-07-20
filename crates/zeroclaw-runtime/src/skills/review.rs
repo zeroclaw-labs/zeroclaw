@@ -1,13 +1,3 @@
-// Background skill review fork — post-turn hook that wakes a forked agent
-// loop in a restricted toolset to decide whether the just-finished
-// conversation should change the installed skill library.
-//
-// Inspired by hermes-agent's `_spawn_background_review` pattern (see
-// nousresearch/hermes-agent at run_agent.py). ZeroClaw differs in that the
-// fork runs inline (no background thread — Rust async lets us await it on
-// the same task), targets the agentskills.io `SKILL.md` format directly,
-// and writes through dedicated `skill_manage`/`skill_view` tools.
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -29,17 +19,6 @@ task_local! {
     static SKILL_REVIEW_ACTIVE: ();
 }
 
-/// Decide whether to fire the review fork, and run it if so.
-///
-/// Gating (in this order):
-/// 1. `config.enabled == true`
-/// 2. Not already inside a review (recursion guard)
-/// 3. History accumulated at least `nudge_interval_iterations` tool-result messages
-///
-/// The "failed_slugs" list is passed as a *hint* in the review prompt so the
-/// fork can spend its budget where the user just got hurt — but failure is NOT
-/// the trigger condition. Routine improvements (user corrections, novel
-/// techniques) happen on successful sessions too.
 #[allow(clippy::too_many_arguments)]
 pub async fn maybe_run_skill_review(
     workspace_dir: PathBuf,
@@ -144,8 +123,8 @@ pub async fn maybe_run_skill_review(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias,
@@ -221,12 +200,6 @@ fn count_tool_iterations(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| m.role == "tool").count()
 }
 
-/// Convert the review's tool receipts + final text into a one-line summary
-/// for the user. Returns "" if the fork did nothing notable.
-///
-/// `fork_history` must contain only messages produced by the review fork
-/// itself (not the parent turn), so that the fallback scan does not pick up
-/// tool results from the user's main turn.
 fn summarize_actions(
     receipts: &Mutex<Vec<String>>,
     fork_history: &[ChatMessage],

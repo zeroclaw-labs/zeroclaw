@@ -72,17 +72,6 @@ impl Tool for SopApproveTool {
             anyhow::Error::msg("Missing 'run_id' parameter")
         })?;
 
-        // Lock the engine, route through the chokepoint, then drop the lock.
-        // resolve_gate records both the append-only ledger row and the approval
-        // completion metric (every principal meters identically there); the tool
-        // no longer writes a legacy Memory audit key nor a separate metric. Under
-        // approval_mode=out_of_band_required this returns RejectedSelfApproval (the
-        // gate stays open for a CLI/gateway approver).
-        //
-        // A deterministic SOP paused at a checkpoint is an in-band agent pause, not
-        // an out-of-band approval gate, so resolve_gate reports NotWaiting for it;
-        // resume it through approve_step (the checkpoint owner) so the agent can
-        // still advance deterministic runs.
         let result = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(

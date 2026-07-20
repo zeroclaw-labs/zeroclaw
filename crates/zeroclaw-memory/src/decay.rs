@@ -5,13 +5,6 @@ use chrono::{DateTime, Utc};
 /// After this many days, a non-Core memory's score drops to 50%.
 pub const DEFAULT_HALF_LIFE_DAYS: f64 = 7.0;
 
-/// Apply exponential time decay to memory entry scores.
-///
-/// - `Core` memories are exempt ("evergreen") — their scores are never decayed.
-/// - Entries without a parseable RFC3339 timestamp are left unchanged.
-/// - Entries without a score (`None`) are left unchanged.
-///
-/// Decay formula: `score * 2^(-age_days / half_life_days)`
 pub fn apply_time_decay(entries: &mut [MemoryEntry], half_life_days: f64) {
     let half_life = if half_life_days <= 0.0 {
         DEFAULT_HALF_LIFE_DAYS

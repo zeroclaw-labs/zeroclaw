@@ -1,5 +1,4 @@
 //! Interactive approval workflow for supervised mode.
-//!
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
@@ -82,21 +81,6 @@ pub enum ApprovalRequirement {
 
 // ── ApprovalManager ──────────────────────────────────────────────
 
-/// Manages the approval workflow for tool calls.
-///
-/// - Checks config-level `auto_approve` / `always_ask` lists
-/// - Maintains a session-scoped "always" allowlist
-/// - Records an audit trail of all decisions
-///
-/// Two modes:
-/// - **Interactive** (CLI): tools needing approval trigger a terminal prompt
-///   with stdin fallback.
-/// - **Non-interactive** (channels): tools needing approval are auto-denied
-///   because there is no interactive operator to approve them. `auto_approve`
-///   policy is still enforced, and `always_ask` / supervised-default tools are
-///   denied rather than silently allowed.
-/// - **Non-interactive back-channel** (ACP/WS): tools needing approval are sent
-///   through a client approval channel instead of trusting tool arguments.
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
     auto_approve: HashSet<String>,
@@ -130,11 +114,6 @@ impl ApprovalManager {
         }
     }
 
-    /// Create a non-interactive approval manager for channel-driven runs.
-    ///
-    /// Enforces the same `auto_approve` / `always_ask` / supervised policies
-    /// as the CLI manager, but tools that would require interactive approval
-    /// are auto-denied instead of prompting (since there is no operator).
     pub fn for_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
@@ -147,12 +126,6 @@ impl ApprovalManager {
         }
     }
 
-    /// Create a non-interactive manager for direct agents with a human
-    /// approval back-channel, such as ACP and the web dashboard WebSocket.
-    /// Reads from the same per-agent risk profile as
-    /// [`Self::for_non_interactive`]; the only difference is that shell
-    /// invocations route through the operator-driven backchannel rather
-    /// than auto-denying.
     pub fn for_non_interactive_backchannel(risk_profile: &RiskProfileConfig) -> Self {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
@@ -194,7 +167,6 @@ impl ApprovalManager {
     }
 
     /// Check whether a tool call requires interactive approval.
-    ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
         self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
@@ -216,11 +188,6 @@ impl ApprovalManager {
             return ApprovalRequirement::Prompt;
         }
 
-        // Channel-driven shell execution is still guarded by the shell tool's
-        // own command allowlist and risk policy. Skipping the outer approval
-        // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
-        // non-interactive channels without silently allowing medium/high-risk
-        // commands.
         if self.non_interactive
             && tool_name == "shell"
             && !self.non_interactive_shell_requires_approval
@@ -281,7 +248,6 @@ impl ApprovalManager {
     }
 
     /// Prompt the user on the CLI and return their decision.
-    ///
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
@@ -356,14 +322,6 @@ fn read_approval_line_from<R: BufRead>(mut reader: R) -> io::Result<String> {
     Ok(line)
 }
 
-/// Produce a short human-readable summary of tool arguments. Argument keys
-/// whose names suggest a credential get their value replaced with
-/// `[redacted]` before truncation, so summaries that cross security
-/// boundaries (e.g. the gateway WebSocket `approval_request` frame) cannot
-/// leak secret-bearing fields. Operators MUST treat the summary as
-/// best-effort: a tool that names its credential field something other than
-/// the patterns below still surfaces. The tool author's typed config and
-/// `#[secret]` annotations are the long-term truth source.
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
@@ -873,7 +831,7 @@ mod tests {
         assert_eq!(parsed.tool_name, "shell");
     }
 
-    // ── Regression: #4247 default approved tools in channels ──
+    // ──default approved tools in channels ──
 
     #[test]
     fn non_interactive_allows_default_auto_approve_tools() {
