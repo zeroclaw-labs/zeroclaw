@@ -142,11 +142,16 @@ fn sops_dir(workspace_dir: &Path) -> PathBuf {
 }
 
 /// Resolve the SOPs directory from config, falling back to workspace default.
+///
+/// A relative `config_dir` (the common case in the documented
+/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
+/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
+/// the base entirely when the joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            PathBuf::from(expanded.as_ref())
+            workspace_dir.join(expanded.as_ref())
         }
         _ => sops_dir(workspace_dir),
     }
@@ -1047,6 +1052,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
+        assert_eq!(resolved, workspace.join("shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        assert_eq!(resolved, Path::new("/srv/shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+        assert_eq!(
+            resolve_sops_dir(workspace, Some("")),
+            workspace.join("sops")
+        );
+    }
 
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {
         Sop {

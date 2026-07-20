@@ -5435,6 +5435,7 @@ impl ChatState {
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
+            | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
             | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
         };
@@ -5552,6 +5553,22 @@ impl ChatState {
                 } else if max_context_tokens.is_some() {
                     self.context_max_tokens = max_context_tokens;
                 }
+            }
+            SessionUpdate::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+                ..
+            } => {
+                let dropped = dropped_messages.to_string();
+                let kept = kept_turns.to_string();
+                let notice = crate::i18n::t_args(
+                    "zc-chat-history-trimmed",
+                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                );
+                self.entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.mark_dirty_append();
             }
             SessionUpdate::TurnComplete {
                 outcome, content, ..
@@ -7575,6 +7592,25 @@ mod tests {
             text: " world".to_string(),
         });
         assert_eq!(s.current_agent_text(), "Hello world");
+    }
+
+    #[test]
+    fn history_trimmed_update_adds_visible_system_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("history message limit exceeded")
+                    && text.contains("12")
+                    && text.contains("3")
+        ));
     }
 
     #[test]

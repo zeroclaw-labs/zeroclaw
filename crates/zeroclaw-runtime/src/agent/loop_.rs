@@ -986,6 +986,16 @@ pub struct AgentRunOverrides {
     /// cron job configured with `uses_memory = false`). Default `false`.
     pub suppress_memory_inject: bool,
     pub memory_free: bool,
+    /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
+    /// worker constructs this once at worker start and shares it across
+    /// every tick so that stdio MCP children live for the daemon's
+    /// lifetime rather than being orphaned and re-spawned per
+    /// `agent::run` call. When `Some`, the loop MUST use this
+    /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
+    /// itself. `None` preserves the legacy per-call connect path
+    /// (CLI / one-shot), which is correct for callers that have no
+    /// cross-turn reuse contract.
+    pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
 }
 
 fn agent_provider_composite(
@@ -1238,6 +1248,12 @@ pub async fn run(
             exclude_memory: memory_free,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            // Honor the daemon worker's pre-built shared registry so stdio
+            // MCP children live for the daemon's lifetime, not per
+            // `agent::run` call. CLI/one-shot callers leave
+            // `mcp_registry` at its default (`None`) and the seam
+            // falls back to the per-call `connect_all`.
+            mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
         })
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
@@ -2799,6 +2815,13 @@ pub async fn process_message(
             exclude_memory: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            // `process_message` is the channel/orchestrator live-chat path;
+            // it has no cross-turn reuse contract, so the per-call
+            // `connect_all` path inside `assemble` is the correct choice.
+            // The daemon heartbeat worker — the only caller that has a
+            // reuse contract — passes its own `mcp_registry` through
+            // `agent::run` (`AgentRunOverrides::mcp_registry`).
+            mcp_registry: None,
         })
         .await;
         // process_message injects one combined MCP prompt block: deferred tool-search
@@ -14907,6 +14930,7 @@ Let me check the result."#;
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
+                mcp_registry: None,
             },
         )
         .await;

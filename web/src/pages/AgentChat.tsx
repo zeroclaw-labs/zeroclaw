@@ -703,12 +703,16 @@ const MessageItem = memo(function MessageItem({
       {!compact && (
         <div
           className={`flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border ${
-            msg.role === 'user'
+            msg.notice
+              ? 'bg-status-warning/10 border-status-warning/30'
+              : msg.role === 'user'
               ? 'bg-pc-accent/15 border-pc-accent/30'
               : 'bg-pc-elevated border-pc-border'
           }`}
         >
-          {msg.role === 'user' ? (
+          {msg.notice ? (
+            <AlertCircle className="h-4 w-4 text-status-warning" />
+          ) : msg.role === 'user' ? (
             <User className="h-4 w-4 text-pc-accent" />
           ) : (
             <Bot className="h-4 w-4 text-pc-accent" />
@@ -718,7 +722,9 @@ const MessageItem = memo(function MessageItem({
       <div className="relative max-w-[75%]">
         <div
           className={`${compact ? 'rounded-[var(--radius-md)] px-3 py-1.5 border' : 'rounded-[var(--radius-lg)] px-4 py-3 border'} text-pc-text ${
-            msg.role === 'user'
+            msg.notice
+              ? 'bg-status-warning/5 border-status-warning/30'
+              : msg.role === 'user'
               ? 'bg-pc-accent/10 border-pc-accent/20'
               : 'bg-pc-elevated border-pc-border'
           }`}

@@ -426,8 +426,8 @@ async fn handle_socket(
     }
 
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &config,
+        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
             true,
@@ -466,9 +466,11 @@ async fn handle_socket(
         };
     agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
-    if !stored_messages.is_empty() {
-        agent.seed_history(&stored_messages);
-    }
+    let restore_trim_event = if stored_messages.is_empty() {
+        None
+    } else {
+        agent.seed_history_with_event(&stored_messages)
+    };
 
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
@@ -499,6 +501,19 @@ async fn handle_socket(
             ),
             "Seeded {} channel(s) into dashboard agent session",
         );
+    }
+
+    // Seeding happens before the connection's agent setup is complete. Forward
+    // its one-shot trim outcome only after channels are registered, so restore
+    // notifications cannot race setup or be emitted twice.
+    if let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+        dropped_messages,
+        kept_turns,
+        reason,
+    }) = restore_trim_event
+    {
+        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
     // Process the first message if it was not a connect frame
@@ -812,6 +827,19 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
             zeroclaw_providers::ConversationMessage::Chat(message)
                 if message.role == "assistant"
         )
+    })
+}
+
+fn history_trimmed_ws_frame(
+    dropped_messages: usize,
+    kept_turns: usize,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "history_trimmed",
+        "dropped_messages": dropped_messages,
+        "kept_turns": kept_turns,
+        "reason": reason,
     })
 }
 
@@ -1165,12 +1193,7 @@ async fn process_chat_message(
                             dropped_messages,
                             kept_turns,
                             reason,
-                        } => serde_json::json!({
-                            "type": "history_trimmed",
-                            "dropped_messages": dropped_messages,
-                            "kept_turns": kept_turns,
-                            "reason": reason,
-                        }),
+                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
@@ -1465,6 +1488,21 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn restore_trim_uses_live_history_trimmed_frame_shape() {
+        let frame = history_trimmed_ws_frame(12, 3, "message limit");
+
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "history_trimmed",
+                "dropped_messages": 12,
+                "kept_turns": 3,
+                "reason": "message limit",
+            })
+        );
+    }
 
     #[test]
     fn sop_ws_error_frames_resolve_via_fluent() {

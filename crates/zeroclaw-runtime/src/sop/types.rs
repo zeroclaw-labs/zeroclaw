@@ -156,7 +156,7 @@ pub enum SopTrigger {
         /// Request path matched exactly against the event path.
         path: String,
     },
-    /// Time-based firing. Defined and matched, but no scheduler feeds it.
+    /// Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).
     #[trigger(display = "expression")]
     Cron {
         /// Cron expression evaluated over the run window.

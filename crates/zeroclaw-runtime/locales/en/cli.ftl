@@ -662,6 +662,8 @@ cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = unknown runtime preset `{$preset}`
 cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to agent `{$owner}`
 cli-quickstart-error-channel-required = channel type and alias are required
+cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
+cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -898,6 +900,7 @@ turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ 
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = history message limit exceeded
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).

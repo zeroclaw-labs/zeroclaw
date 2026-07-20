@@ -41,6 +41,24 @@ The key checkpoints:
 - Inline unit tests: `#[cfg(test)] mod tests {}` at the bottom of the file or a sibling `tests.rs`
 - Don't commit secrets, personal data, or real-user identities: the [Privacy & PII discipline](./privacy.md) page is the merge gate
 
+### Comments and drift
+
+Comments should explain durable intent, invariants, hazards, or source ownership. Do not add comments that restate nearby control flow, duplicate schema or config field lists, mirror enum variants, or describe runtime behavior that the code and tests do not enforce. Those comments become drift surfaces: future contributors and tools may trust the prose after the source has changed.
+
+If a comment needs to mention behavior owned elsewhere, point to the owner instead of copying it. Prefer comments that say why a branch is safe, which contract owns a rule, or which source must change first.
+
+Prefer:
+
+- `The config schema owns accepted aliases; keep this resolver generic.`
+- `This panic is unreachable because the parser rejects empty tool names earlier.`
+
+Avoid:
+
+- `Supported variants are A, B, and C.`
+- `This flag always enables vector search.`
+
+If the statement can only stay true by manually editing the comment whenever code, config, WIT, schema, or tests change, make the source clearer or add a source pointer instead.
+
 ## Testing
 
 - Unit tests co-located with the code (`mod tests`)
