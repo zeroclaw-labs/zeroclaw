@@ -106,6 +106,52 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// End-state checks against the case workspace after the run.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceExpects>,
+    /// Resource ceilings for the run.
+    #[serde(default)]
+    pub budget: Option<BudgetExpects>,
+    /// JSON-pointer checks against the final response parsed as JSON.
+    #[serde(default)]
+    pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// End-state checks against the case workspace after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceExpects {
+    /// Workspace-relative paths that must exist as a regular file after the run
+    /// (a directory at the path does not satisfy the check).
+    #[serde(default)]
+    pub file_exists: Vec<String>,
+    /// Workspace-relative paths at which nothing (file or directory) may exist
+    /// after the run.
+    #[serde(default)]
+    pub file_absent: Vec<String>,
+    /// Path -> substrings that must appear in that file.
+    #[serde(default)]
+    pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Resource ceilings for the run (all optional; each present bound is one
+/// inclusive check, `actual <= max`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetExpects {
+    /// Max accumulated input tokens reported by the provider.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    /// Max accumulated output tokens reported by the provider.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Max total tokens (input + output).
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Max wall-clock duration of the turns loop, in milliseconds.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+    /// Max number of LLM responses (model round-trips) during the run.
+    #[serde(default)]
+    pub max_llm_calls: Option<u32>,
 }
 
 impl LlmTrace {

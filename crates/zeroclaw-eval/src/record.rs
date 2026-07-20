@@ -17,4 +17,8 @@ pub struct RunRecord {
     pub input_tokens: u64,
     /// Accumulated output tokens reported by the provider.
     pub output_tokens: u64,
+    /// Wall-clock duration of the turns loop, in milliseconds.
+    pub duration_ms: u64,
+    /// Number of LLM responses observed during the run.
+    pub llm_calls: u32,
 }

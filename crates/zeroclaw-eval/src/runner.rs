@@ -145,10 +145,12 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
         .workspace_dir(tmp.path().to_path_buf())
         .build()?;
 
+    let start = std::time::Instant::now();
     let mut final_response = String::new();
     for turn in &trace.turns {
         final_response = agent.turn(&turn.user_input).await?;
     }
+    let duration_ms = start.elapsed().as_millis() as u64;
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {
@@ -158,6 +160,8 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
         all_tools_succeeded: observer.all_tools_succeeded(),
         input_tokens,
         output_tokens,
+        duration_ms,
+        llm_calls: observer.llm_calls(),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = grade_run(trace, &record, tmp.path()).await;
