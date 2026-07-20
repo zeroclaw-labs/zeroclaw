@@ -81,12 +81,14 @@ pub mod method {
     pub const PERSONALITY_TEMPLATES: &str = "personality/templates";
     // Skills
     pub const SKILLS_LIST: &str = "skills/list";
+    pub const AGENT_SKILLS: &str = "agents/skills";
     pub const SKILLS_READ: &str = "skills/read";
     pub const SKILLS_WRITE: &str = "skills/write";
     pub const SKILLS_DELETE: &str = "skills/delete";
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_SKILL_PROMPT: &str = "session/skill_prompt";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
@@ -270,6 +272,10 @@ pub enum SessionUpdate {
         session_id: String,
         outcome: TurnEndOutcome,
         content: String,
+        /// Machine-readable failure key for client-side localization.
+        /// When set, the client should look up a Fluent key like
+        /// `zc-skill-error-{reason}` instead of displaying `content` verbatim.
+        failure_reason: Option<String>,
     },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
@@ -348,6 +354,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            failure_reason: params
+                .get("failure_reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
@@ -1157,6 +1167,11 @@ impl RpcClient {
             .await
     }
 
+    pub async fn agent_skills(&self, agent: &str) -> Result<AgentSkillsResult> {
+        self.call(method::AGENT_SKILLS, serde_json::json!({ "agent": agent }))
+            .await
+    }
+
     pub async fn skills_read(&self, bundle: &str, name: &str) -> Result<SkillsReadResult> {
         self.call(
             method::SKILLS_READ,
@@ -1645,6 +1660,11 @@ impl RpcClient {
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
+        Self::with_rpc_transport(outbound, Transport::Local)
+    }
+
+    #[cfg(test)]
+    pub fn with_rpc_transport(outbound: Arc<RpcOutbound>, transport: Transport) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
@@ -1657,7 +1677,7 @@ impl RpcClient {
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
-            transport: Transport::Local,
+            transport,
         }
     }
 
@@ -1908,6 +1928,16 @@ pub struct SkillListEntry {
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsListResult {
     pub skills: Vec<SkillListEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AgentSkillEntry {
+    pub name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AgentSkillsResult {
+    pub skills: Vec<AgentSkillEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]

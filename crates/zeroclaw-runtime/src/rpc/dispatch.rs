@@ -8,6 +8,8 @@ use super::types::*;
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
+const SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT: &str = "turn cancelled by daemon: session_not_found";
+
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -45,6 +47,7 @@ pub enum Method {
     SessionNew,
     SessionClose,
     SessionPrompt,
+    SessionSkillPrompt,
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
@@ -98,6 +101,7 @@ pub enum Method {
     // Skills
     SkillsBundles,
     SkillsList,
+    AgentSkills,
     SkillsRead,
     SkillsWrite,
     SkillsDelete,
@@ -165,6 +169,7 @@ impl Method {
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionSkillPrompt, "session/skill_prompt"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
@@ -215,6 +220,7 @@ impl Method {
         // Skills
         (Method::SkillsBundles, "skills/bundles"),
         (Method::SkillsList, "skills/list"),
+        (Method::AgentSkills, "agents/skills"),
         (Method::SkillsRead, "skills/read"),
         (Method::SkillsWrite, "skills/write"),
         (Method::SkillsDelete, "skills/delete"),
@@ -290,6 +296,234 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+fn render_skill_prompt(skill: &crate::skills::Skill, arguments: &str) -> String {
+    let template = if skill.prompts.is_empty() {
+        skill.description.clone()
+    } else {
+        skill.prompts.join("\n\n")
+    };
+    expand_skill_template(&template, arguments)
+}
+
+fn skill_prompt_failure_content(error: &JsonRpcError) -> String {
+    if error.code == SESSION_NOT_FOUND {
+        SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string()
+    } else {
+        format!("turn failed: {}", error.message)
+    }
+}
+
+fn expand_skill_template(template: &str, arguments: &str) -> String {
+    let indexed = split_command_arguments(arguments);
+    let mut rendered = expand_skill_template_placeholders(template, arguments, &indexed);
+    if !has_raw_arguments_placeholder(template)
+        && !has_effective_indexed_placeholder(template, indexed.len())
+        && !arguments.trim().is_empty()
+    {
+        rendered.push_str("\n\n");
+        rendered.push_str(arguments);
+    }
+    rendered
+}
+
+fn expand_skill_template_placeholders(
+    template: &str,
+    arguments: &str,
+    indexed: &[String],
+) -> String {
+    let mut rendered = String::with_capacity(template.len().saturating_add(arguments.len()));
+    let mut index = 0;
+    while index < template.len() {
+        let remaining = &template[index..];
+        if remaining.starts_with("$ARGUMENTS") || remaining.starts_with("${ARGUMENTS}") {
+            rendered.push_str(arguments);
+            index += raw_arguments_placeholder_len(remaining);
+            continue;
+        }
+
+        if let Some((position, placeholder_len)) = indexed_placeholder(remaining) {
+            if let Some(value) = indexed.get(position - 1) {
+                rendered.push_str(value);
+            } else {
+                rendered.push_str(&remaining[..placeholder_len]);
+            }
+            index += placeholder_len;
+            continue;
+        }
+
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        rendered.push(character);
+        index += character.len_utf8();
+    }
+    rendered
+}
+
+fn has_raw_arguments_placeholder(template: &str) -> bool {
+    template.contains("$ARGUMENTS") || template.contains("${ARGUMENTS}")
+}
+
+fn raw_arguments_placeholder_len(template: &str) -> usize {
+    if template.starts_with("${ARGUMENTS}") {
+        "${ARGUMENTS}".len()
+    } else {
+        "$ARGUMENTS".len()
+    }
+}
+
+fn has_effective_indexed_placeholder(template: &str, argument_count: usize) -> bool {
+    let mut index = 0;
+    while index < template.len() {
+        let remaining = &template[index..];
+        if let Some((position, placeholder_len)) = indexed_placeholder(remaining) {
+            if position <= argument_count {
+                return true;
+            }
+            index += placeholder_len;
+            continue;
+        }
+
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        index += character.len_utf8();
+    }
+    false
+}
+
+fn indexed_placeholder(template: &str) -> Option<(usize, usize)> {
+    braced_indexed_placeholder(template).or_else(|| legacy_indexed_placeholder(template))
+}
+
+fn braced_indexed_placeholder(template: &str) -> Option<(usize, usize)> {
+    let bytes = template.as_bytes();
+    if !bytes.starts_with(b"${") {
+        return None;
+    }
+
+    let mut digits_end = 2;
+    while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+        digits_end += 1;
+    }
+    if digits_end == 2 || bytes.get(digits_end) != Some(&b'}') {
+        return None;
+    }
+
+    let position = template[2..digits_end].parse::<usize>().ok()?;
+    (position > 0).then_some((position, digits_end + 1))
+}
+
+fn legacy_indexed_placeholder(template: &str) -> Option<(usize, usize)> {
+    let bytes = template.as_bytes();
+    if bytes.first() != Some(&b'$') || bytes.get(1).is_none_or(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+    if bytes.get(2).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+
+    let position = template[1..2].parse::<usize>().ok()?;
+    (position > 0).then_some((position, 2))
+}
+
+fn split_command_arguments(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            // Only treat as escape if followed by a quote or another backslash
+            if ch == '\\' || ch == '\'' || ch == '"' {
+                current.push(ch);
+            } else {
+                current.push('\\');
+                current.push(ch);
+            }
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+                // Preserve empty quoted position
+                args.push(std::mem::take(&mut current));
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn agent_skill_entry(skill: crate::skills::EffectiveSkill) -> AgentSkillEntry {
+    let (origin, plugin, bundle) = match skill.origin {
+        crate::skills::SkillOrigin::Workspace => ("workspace", None, None),
+        crate::skills::SkillOrigin::OpenSkills => ("open-skills", None, None),
+        crate::skills::SkillOrigin::Plugin(plugin) => ("plugin", Some(plugin), None),
+        crate::skills::SkillOrigin::Bundle(bundle) => ("bundle", None, Some(bundle)),
+    };
+    AgentSkillEntry {
+        name: skill.name,
+        description: skill.description,
+        origin: origin.to_string(),
+        plugin,
+        bundle,
+        directory: skill.directory.map(|path| path.display().to_string()),
+        editable: skill.editable,
+        shadowed: skill
+            .shadowed
+            .into_iter()
+            .map(|shadow| ShadowedSkillEntry {
+                name: shadow.name,
+                origin: shadow.origin_hint,
+            })
+            .collect(),
+    }
+}
+
+fn dropped_skill_entry(skill: crate::skills::DroppedSkill) -> DroppedSkillEntry {
+    let (reason_kind, reason, scripts_blocked) = match skill.reason {
+        crate::skills::SkillDropReason::AuditFindings {
+            summary,
+            scripts_blocked,
+        } => ("audit_findings", summary, scripts_blocked),
+        crate::skills::SkillDropReason::AuditError(error) => ("audit_error", error, false),
+        crate::skills::SkillDropReason::ManifestParseError(error) => {
+            ("manifest_parse_error", error, false)
+        }
+    };
+    DroppedSkillEntry {
+        name: skill.name,
+        origin: skill.origin_hint,
+        reason_kind: reason_kind.to_string(),
+        reason,
+        scripts_blocked,
+        directory: skill.location.map(|path| path.display().to_string()),
     }
 }
 
@@ -627,17 +861,15 @@ impl RpcDispatcher {
             // Sessions
             Method::SessionNew => self.handle_session_new(&req.params).await,
             Method::SessionClose => self.handle_session_close(&req.params).await,
-            Method::SessionPrompt => {
-                // Always spawn — turn completion is signaled by a
-                // TurnComplete notification, not by this method's response.
-                // The response (empty {} or error) is kept only so legacy
-                // request-form callers don't park forever.
+            Method::SessionPrompt | Method::SessionSkillPrompt => {
                 let handle = self.spawn_handle();
                 let id_clone = id;
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
                 zeroclaw_spawn::spawn!(async move {
-                    let result = handle.handle_session_prompt(&params_clone).await;
+                    let result = handle
+                        .handle_session_prompt_method(method, &params_clone)
+                        .await;
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
@@ -702,6 +934,7 @@ impl RpcDispatcher {
             // Skills
             Method::SkillsBundles => self.handle_skills_bundles(),
             Method::SkillsList => self.handle_skills_list(&req.params),
+            Method::AgentSkills => self.handle_agent_skills(&req.params),
             Method::SkillsRead => self.handle_skills_read(&req.params),
             Method::SkillsWrite => self.handle_skills_write(&req.params),
             Method::SkillsDelete => self.handle_skills_delete(&req.params),
@@ -1527,8 +1760,96 @@ impl RpcDispatcher {
         self.ctx.sessions.get_agent(sid).await
     }
 
-    async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
-        let req: SessionPromptParams = parse_params(params)?;
+    async fn handle_session_prompt_method(&self, method: Method, params: &Value) -> RpcResult {
+        match method {
+            Method::SessionPrompt => {
+                let req = parse_params(params)?;
+                self.handle_session_prompt(req).await
+            }
+            Method::SessionSkillPrompt => self.handle_session_skill_prompt(params).await,
+            _ => unreachable!("session prompt dispatcher received non-prompt method"),
+        }
+    }
+
+    async fn handle_session_skill_prompt(&self, params: &Value) -> RpcResult {
+        let req: SessionSkillPromptParams = parse_params(params)?;
+        let session_id = req.session_id.clone();
+        match self.expand_session_skill_prompt(req).await {
+            Ok(req) => self.handle_session_prompt(req).await,
+            Err(error) => {
+                let failure_reason = if error.code == SESSION_NOT_FOUND {
+                    "session-not-found"
+                } else {
+                    "skill-prompt-failure"
+                };
+                let content = skill_prompt_failure_content(&error);
+                self.emit_turn_complete(
+                    &session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    content,
+                    Some(failure_reason),
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn expand_session_skill_prompt(
+        &self,
+        req: SessionSkillPromptParams,
+    ) -> Result<SessionPromptParams, JsonRpcError> {
+        let skill_name = req.skill.trim();
+        if skill_name.is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session/skill_prompt requires a non-empty `skill`",
+            ));
+        }
+        let agent_alias = match self.ctx.sessions.get_agent_alias(&req.session_id).await {
+            Some(alias) => alias,
+            None => match self.rehydrate_reaped_session(&req.session_id).await {
+                Some(_) => self
+                    .ctx
+                    .sessions
+                    .get_agent_alias(&req.session_id)
+                    .await
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?,
+                None => return Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+            },
+        };
+        let config = self.ctx.config.read().clone();
+        let skill = crate::skills::load_skills_for_agent_from_config(&config, &agent_alias)
+            .into_iter()
+            .find(|skill| skill.name == skill_name)
+            .ok_or_else(|| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("Skill not found for agent `{agent_alias}`: {skill_name}"),
+                )
+            })?;
+        let prompt = render_skill_prompt(&skill, &req.arguments);
+        if prompt.trim().is_empty() && req.attachments.is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Skill `{skill_name}` rendered an empty prompt"),
+            ));
+        }
+        let arguments = req.arguments.trim();
+        let original_text = if arguments.is_empty() {
+            Some(format!("/{}", skill_name))
+        } else {
+            Some(format!("/{} {}", skill_name, arguments))
+        };
+        Ok(SessionPromptParams {
+            session_id: req.session_id,
+            prompt,
+            attachments: req.attachments,
+            original_text,
+        })
+    }
+
+    async fn handle_session_prompt(&self, req: SessionPromptParams) -> RpcResult {
         let sid = &req.session_id;
 
         if req.prompt.trim().is_empty() && req.attachments.is_empty() {
@@ -1554,7 +1875,8 @@ impl RpcDispatcher {
                     self.emit_turn_complete(
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
-                        "turn cancelled by daemon: session_not_found".to_string(),
+                        SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string(),
+                        None,
                     )
                     .await;
                     return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -1586,8 +1908,25 @@ impl RpcDispatcher {
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
                 let result =
-                    process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
-                        .await?;
+                    match process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let content = format!("Attachment processing failed: {}", e.message);
+                            self.emit_turn_complete(
+                                sid,
+                                crate::rpc::types::TurnCompletionOutcome::Failed,
+                                content,
+                                Some("attachment-failure"),
+                            )
+                            .await;
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Attachment processing failed: {}", e.message),
+                            ));
+                        }
+                    };
                 if idx > 0 {
                     prompt.push('\n');
                 }
@@ -1595,13 +1934,20 @@ impl RpcDispatcher {
             }
         }
 
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(sid)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _guard = match self.ctx.sessions.session_queue.acquire(sid).await {
+            Ok(g) => g,
+            Err(e) => {
+                let content = format!("Session busy: {e}");
+                self.emit_turn_complete(
+                    sid,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    content.clone(),
+                    Some("session-busy"),
+                )
+                .await;
+                return Err(rpc_err(SESSION_BUSY, content));
+            }
+        };
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
@@ -1809,7 +2155,8 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
+                    let user_text = req.original_text.as_deref().unwrap_or(&prompt);
+                    let _ = backend.append(&key, &ChatMessage::user(user_text));
                     match &outcome {
                         Ok(TurnOutcome::Completed { text, .. }) => {
                             let _ = backend.append(&key, &ChatMessage::assistant(text));
@@ -1831,6 +2178,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
                     text.clone(),
+                    None,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -1874,6 +2222,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
+                    None,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -1902,6 +2251,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     format!("turn failed: {e}"),
+                    None,
                 )
                 .await;
                 Err(rpc_err(INTERNAL_ERROR, e.to_string()))
@@ -1912,16 +2262,19 @@ impl RpcDispatcher {
     /// Emit the terminal `session/update` notification for a turn.
     /// The TUI uses this — not the JSON-RPC response — to flip
     /// `turn_in_flight` back to false.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_turn_complete(
         &self,
         session_id: &str,
         outcome: crate::rpc::types::TurnCompletionOutcome,
         content: String,
+        failure_reason: Option<&str>,
     ) {
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
             content,
+            failure_reason: failure_reason.map(|r| r.to_string()),
         };
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
@@ -3364,6 +3717,21 @@ impl RpcDispatcher {
         to_result(SkillsListResult { skills })
     }
 
+    fn handle_agent_skills(&self, params: &Value) -> RpcResult {
+        let req: AgentSkillsParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let set = svc
+            .resolve_effective_skills(&req.agent)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Agent skills failed: {e}")))?;
+        to_result(AgentSkillsResult {
+            agent: req.agent,
+            skills: set.skills.into_iter().map(agent_skill_entry).collect(),
+            dropped: set.dropped.into_iter().map(dropped_skill_entry).collect(),
+        })
+    }
+
     fn handle_skills_read(&self, params: &Value) -> RpcResult {
         let req: SkillsReadParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
@@ -4587,6 +4955,32 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn split_command_arguments_preserves_empty_first_arg() {
+        let args = split_command_arguments("\"\" dangerous");
+        assert_eq!(
+            args,
+            vec!["", "dangerous"],
+            "empty quoted first arg must preserve position"
+        );
+    }
+
+    #[test]
+    fn split_command_arguments_handles_windows_path() {
+        let args = split_command_arguments(r"C:\temp\file");
+        assert_eq!(
+            args,
+            vec![r"C:\temp\file"],
+            "backslash path separators must be preserved"
+        );
+    }
+
+    #[test]
+    fn split_command_arguments_handles_trailing_backslash() {
+        let args = split_command_arguments(r"foo\");
+        assert_eq!(args, vec![r"foo\"], "trailing backslash must be preserved");
+    }
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
@@ -8230,42 +8624,379 @@ mod tests {
         (dispatcher, rx, sessions)
     }
 
+    fn captured_turn_complete(raw: &str) -> serde_json::Value {
+        let value = captured_session_update(raw);
+        assert_eq!(value["params"]["outcome"], "failed");
+        value
+    }
+
+    fn captured_session_update(raw: &str) -> serde_json::Value {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).expect("notification must be JSON");
+        assert_eq!(value["method"], notification::SESSION_UPDATE);
+        value
+    }
+
+    async fn captured_turn_complete_from_rx(
+        receiver: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> serde_json::Value {
+        let value = captured_session_update_from_rx(receiver).await;
+        assert_eq!(value["params"]["outcome"], "failed");
+        value
+    }
+
+    async fn captured_session_update_from_rx(
+        receiver: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> serde_json::Value {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("session/update notification must arrive before timeout")
+            .expect("session/update notification channel must stay open");
+        captured_session_update(&raw)
+    }
+
+    async fn captured_any_turn_complete_from_rx(
+        receiver: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> serde_json::Value {
+        loop {
+            let value = captured_session_update_from_rx(receiver).await;
+            if value["params"]["type"] == "turn_complete" {
+                return value;
+            }
+        }
+    }
+
+    async fn insert_minimal_session(
+        sessions: &crate::rpc::session::SessionStore,
+        session_id: &str,
+        agent_alias: &str,
+        workspace: &str,
+    ) {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from(workspace))
+            .build()
+            .expect("minimal Agent should build");
+        let session = crate::rpc::session::RpcSession::new(
+            agent,
+            agent_alias,
+            workspace,
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions
+            .insert(session_id.to_string(), session)
+            .await
+            .expect("insert test session");
+    }
+
     #[tokio::test]
     async fn session_prompt_on_missing_session_emits_turn_complete_failed() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
         let config = make_acp_test_config(&tmp);
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
 
         let result = dispatcher
-            .handle_session_prompt(&json!({
-                "session_id": "gone-id",
-                "prompt": "anything",
-            }))
+            .handle_session_prompt(SessionPromptParams {
+                session_id: "gone-id".to_string(),
+                prompt: "anything".to_string(),
+                attachments: Vec::new(),
+                original_text: None,
+            })
             .await;
         assert!(
             result.is_err(),
-            "missing session must still produce an RPC error for legacy \
-             request-form callers; the new behaviour is the additional \
-             notification, not replacing the error"
+            "missing session must still produce an RPC error for request-form callers"
         );
 
-        // The notification must already be queued on the writer channel by
-        // the time `handle_session_prompt` returns. `try_recv` rules out
-        // any test flakiness from racing with a spawned task.
-        let raw = rx.try_recv().expect(
-            "handle_session_prompt must emit a session/update TurnComplete \
-             notification before returning on missing-session — without it \
-             the TUI's `working` state never clears and the next prompt is \
-             the production freeze",
-        );
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("notification must be JSON");
-        assert_eq!(v["method"], notification::SESSION_UPDATE);
-        assert_eq!(v["params"]["session_id"], "gone-id");
+        let raw = rx
+            .try_recv()
+            .expect("missing session must emit TurnComplete before returning");
+        let value = captured_turn_complete(&raw);
+        assert_eq!(value["params"]["session_id"], "gone-id");
+    }
+
+    #[test]
+    fn expand_skill_template_keeps_arguments_dollar_literals() {
         assert_eq!(
-            v["params"]["outcome"], "failed",
-            "missing-session is not Completed and not Cancelled — it is a \
-             distinct Failed verdict. Folding it into Cancelled would lie \
-             about whether the user pressed Esc."
+            expand_skill_template("Please $ARGUMENTS", "use $1 dollars"),
+            "Please use $1 dollars"
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_keeps_indexed_argument_raw_arguments_literal() {
+        assert_eq!(
+            expand_skill_template("First: ${1}\nRaw: $ARGUMENTS", "foo$ARGUMENTS bar"),
+            "First: foo$ARGUMENTS\nRaw: foo$ARGUMENTS bar"
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_appends_arguments_without_placeholders() {
+        assert_eq!(
+            expand_skill_template("Review this", "diff"),
+            "Review this\n\ndiff"
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_preserves_dollar_amounts_with_long_arguments() {
+        let arguments = (1..=100)
+            .map(|number| format!("arg{number}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            expand_skill_template("Budget: $100", &arguments),
+            format!("Budget: $100\n\n{arguments}")
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_supports_legacy_indexed_placeholders() {
+        assert_eq!(expand_skill_template("Use $1", "arg"), "Use arg");
+    }
+
+    #[test]
+    fn expand_skill_template_preserves_out_of_range_braced_indexed_placeholders() {
+        assert_eq!(expand_skill_template("Use ${2}", "arg"), "Use ${2}\n\narg");
+    }
+
+    #[test]
+    fn expand_skill_template_preserves_out_of_range_legacy_indexed_placeholders() {
+        assert_eq!(expand_skill_template("Use $2", "arg"), "Use $2\n\narg");
+    }
+
+    #[test]
+    fn expand_skill_template_preserves_multi_digit_dollar_amounts() {
+        assert_eq!(
+            expand_skill_template("Budget: $10", "arg"),
+            "Budget: $10\n\narg"
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_does_not_append_after_effective_braced_indexed_placeholder() {
+        assert_eq!(expand_skill_template("Use ${1}", "arg"), "Use arg");
+    }
+
+    #[test]
+    fn expand_skill_template_supports_braced_raw_arguments() {
+        assert_eq!(
+            expand_skill_template("Please ${ARGUMENTS}", "use $1 dollars"),
+            "Please use $1 dollars"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_on_missing_session_emits_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+
+        let error = dispatcher
+            .handle_session_prompt_method(
+                Method::SessionSkillPrompt,
+                &json!({
+                    "session_id": "gone-skill-session",
+                    "skill": "not-installed",
+                }),
+            )
+            .await
+            .expect_err("missing session must return an RPC error");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+
+        let raw = rx
+            .try_recv()
+            .expect("missing skill session must emit TurnComplete before returning");
+        let value = captured_turn_complete(&raw);
+        assert_eq!(value["params"]["session_id"], "gone-skill-session");
+        assert_eq!(
+            value["params"]["content"],
+            SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_for_missing_skill_emits_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let (dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        insert_minimal_session(&sessions, "live-skill-session", "test-agent", &workspace).await;
+
+        let error = dispatcher
+            .handle_session_prompt_method(
+                Method::SessionSkillPrompt,
+                &json!({
+                    "session_id": "live-skill-session",
+                    "skill": "not-installed",
+                }),
+            )
+            .await
+            .expect_err("missing skill must return an RPC error");
+        assert_eq!(error.code, INVALID_PARAMS);
+
+        let raw = rx
+            .try_recv()
+            .expect("missing skill must emit TurnComplete before returning");
+        let value = captured_turn_complete(&raw);
+        assert_eq!(value["params"]["session_id"], "live-skill-session");
+        let content = value["params"]["content"]
+            .as_str()
+            .expect("turn_complete content must be text");
+        assert!(content.contains("Skill not found for agent `test-agent`: not-installed"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_missing_skill_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+        insert_minimal_session(&sessions, "notify-skill-session", "test-agent", &workspace).await;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-skill-session",
+                        "skill": "not-installed"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-skill-session");
+        let content = value["params"]["content"]
+            .as_str()
+            .expect("turn_complete content must be text");
+        assert!(content.contains("Skill not found for agent `test-agent`: not-installed"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_installed_skill_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let skill_dir = config
+            .agent_workspace_dir("test-agent")
+            .join("skills")
+            .join("echo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            "[skill]\nname = \"echo-skill\"\ndescription = \"Echo $1\"\n",
+        )
+        .expect("write skill");
+        crate::skills::cache::invalidate();
+        let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+        insert_minimal_session(
+            &sessions,
+            "notify-installed-skill",
+            "test-agent",
+            &workspace,
+        )
+        .await;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-installed-skill",
+                        "skill": "echo-skill",
+                        "arguments": "hello"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_any_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-installed-skill");
+        assert_eq!(value["params"]["outcome"], "completed");
+        assert_eq!(value["params"]["content"], "ok");
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_empty_prompt_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let skill_dir = config
+            .agent_workspace_dir("test-agent")
+            .join("skills")
+            .join("blank-skill");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            "[skill]\nname = \"blank-skill\"\ndescription = \"\"\n",
+        )
+        .expect("write blank skill");
+        crate::skills::cache::invalidate();
+        let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+        insert_minimal_session(&sessions, "notify-empty-skill", "test-agent", &workspace).await;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-empty-skill",
+                        "skill": "blank-skill"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-empty-skill");
+        let content = value["params"]["content"]
+            .as_str()
+            .expect("turn_complete content must be text");
+        assert!(content.contains("Skill `blank-skill` rendered an empty prompt"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_missing_session_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-gone-skill-session",
+                        "skill": "not-installed"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-gone-skill-session");
+        assert_eq!(
+            value["params"]["content"],
+            SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT
         );
     }
 

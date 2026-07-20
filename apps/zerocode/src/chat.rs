@@ -23,7 +23,10 @@ use crate::client::{
 };
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
-use crate::input_bar::{InputBarAction, InputBarState};
+use crate::input_bar::{
+    InputBarAction, InputBarState, SkillInvocation, SlashCommandKind,
+    format_skill_invocation_for_input, slash_command_name,
+};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
 use crate::theme;
@@ -805,63 +808,90 @@ impl Chat {
     }
 
     fn pump_queue(&mut self) {
-        let next = match self.phase {
-            ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
-            _ => None,
-        };
-        let Some(msg) = next else { return };
         let sid = match self.phase {
             ChatPhase::Active(ref state) => state.session_id.clone(),
             _ => return,
         };
-
         let transport = self.rpc.transport();
-        let attachments_json = if msg.attachments.is_empty() {
-            Vec::new()
-        } else {
-            match build_attachments_json(&msg.attachments, transport) {
-                Ok(json) => json,
-                Err(e) => {
-                    if let ChatPhase::Active(ref mut state) = self.phase {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(
-                                crate::i18n::t_args(
-                                    "zc-queue-dispatch-failed",
-                                    &[("error", &e.to_string())],
-                                ),
-                            )));
-                        state.mark_dirty_append();
+
+        // Serialize before removing from queue — if serialization fails the
+        // item stays in place and restore_dispatchable is never needed.
+        let (attachments_json, msg) = match self.phase {
+            ChatPhase::Active(ref mut state) => {
+                let idx = match state.next_dispatch_index() {
+                    Some(idx) => idx,
+                    None => return,
+                };
+                let attachments_json = if state.message_queue[idx].attachments.is_empty() {
+                    Vec::new()
+                } else {
+                    match build_attachments_json(&state.message_queue[idx].attachments, transport) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            let error = error.to_string();
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                    crate::i18n::t_args(
+                                        "zc-queue-dispatch-failed",
+                                        &[("error", &error)],
+                                    ),
+                                )));
+                            state.mark_dirty_append();
+                            return;
+                        }
                     }
-                    return;
+                };
+                let msg = state.message_queue.remove(idx).unwrap();
+                state.resume_override = false;
+                if state.queue_sel == Some(msg.id) {
+                    state.queue_sel = None;
                 }
+                (attachments_json, msg)
             }
+            _ => return,
         };
 
         if let ChatPhase::Active(ref mut state) = self.phase {
             let att_names: Vec<String> =
                 msg.attachments.iter().map(|a| a.filename.clone()).collect();
-            let text = if msg.text.is_empty() {
-                None
-            } else {
-                Some(msg.text.clone())
-            };
+            let text = msg.display_text();
             state.push_user_message(text, att_names);
         }
-        self.spawn_prompt(sid, msg.text, attachments_json);
+        self.spawn_prompt(sid, msg.text, attachments_json, msg.skill);
     }
 
-    fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
+    fn spawn_prompt(
+        &self,
+        sid: String,
+        prompt: String,
+        attachments_json: Vec<serde_json::Value>,
+        skill: Option<SkillInvocation>,
+    ) {
         let rpc_arc = self.rpc_out.clone();
         tokio::spawn(async move {
-            let mut params = serde_json::json!({
-                "session_id": sid,
-                "prompt": prompt,
-            });
+            let (method, mut params) = if let Some(skill) = skill {
+                (
+                    method::SESSION_SKILL_PROMPT,
+                    serde_json::json!({
+                        "session_id": sid,
+                        "skill": skill.name,
+                        "arguments": skill.arguments,
+                    }),
+                )
+            } else {
+                (
+                    method::SESSION_PROMPT,
+                    serde_json::json!({
+                        "session_id": sid,
+                        "prompt": prompt,
+                    }),
+                )
+            };
             if !attachments_json.is_empty() {
                 params["attachments"] = serde_json::Value::Array(attachments_json);
             }
-            rpc_arc.notify(method::SESSION_PROMPT, params).await;
+            rpc_arc.notify(method, params).await;
         });
     }
 
@@ -1374,18 +1404,26 @@ impl Chat {
         if state.pending_approval().is_none() && !state.in_browse_mode() {
             let action = state.input_bar.handle_key(key);
             match action {
-                InputBarAction::Submit { text, attachments } => {
+                InputBarAction::Submit {
+                    text,
+                    attachments,
+                    skill,
+                } => {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
-                    let enq = state.enqueue_message(prompt, attachments);
+                    let enq = state.enqueue_message(prompt, attachments, skill);
                     self.after_enqueue(enq);
                     return false;
                 }
-                InputBarAction::Inject { text, attachments } => {
+                InputBarAction::Inject {
+                    text,
+                    attachments,
+                    skill,
+                } => {
                     state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
-                    let enq = state.inject_message(prompt, attachments);
+                    let enq = state.inject_message(prompt, attachments, skill);
                     if enq.is_ok()
                         && state.turn_in_flight
                         && !matches!(state.turn_status, TurnStatus::Cancelling)
@@ -1870,6 +1908,34 @@ impl Chat {
         {
             let model = Self::configured_model(rpc, &provider_ref).await;
             state.set_model_identity(Some(&provider_ref), model.as_deref());
+        }
+        Self::refresh_skill_catalog(rpc, state).await;
+    }
+
+    async fn refresh_skill_catalog(rpc: &RpcClient, state: &mut ChatState) {
+        match rpc.agent_skills(&state.agent_alias).await {
+            Ok(result) => {
+                let conflicts = state
+                    .input_bar
+                    .set_skill_catalog(result.skills.into_iter().map(|skill| skill.name).collect());
+                if !conflicts.is_empty() {
+                    let names = conflicts.join(", ");
+                    state.set_info_notice(crate::i18n::t_args(
+                        "zc-input-skill-shortcut-conflicts",
+                        &[
+                            ("names", &names),
+                            ("command", slash_command_name(SlashCommandKind::Skill)),
+                        ],
+                    ));
+                }
+            }
+            Err(error) => {
+                state.input_bar.set_skill_catalog(Vec::new());
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-input-skill-catalog-error",
+                    &[("error", &error.to_string())],
+                ));
+            }
         }
     }
 
@@ -2749,6 +2815,10 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
                     E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
+                    E::key(
+                        slash_command_name(SlashCommandKind::ToggleThinking),
+                        crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
+                    ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::NewSession),
@@ -3130,7 +3200,10 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
             chord_label(A::QueueDelete),
             crate::i18n::t("zc-queue-help-delete"),
         ),
-        E::key("/clear-queue", crate::i18n::t("zc-queue-help-clear")),
+        E::key(
+            slash_command_name(SlashCommandKind::ClearQueue),
+            crate::i18n::t("zc-queue-help-clear"),
+        ),
         E::key(
             chord_label(A::QueueEdit),
             crate::i18n::t("zc-queue-help-edit"),
@@ -3208,7 +3281,8 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
             } else {
                 Style::default()
             };
-            let preview = first_line_preview(&msg.text, inner.width.saturating_sub(4) as usize);
+            let preview_text = msg.display_text().unwrap_or_default();
+            let preview = first_line_preview(&preview_text, inner.width.saturating_sub(4) as usize);
             let tag = if msg.status == QueueItemStatus::Injected {
                 format!(" {}", crate::i18n::t("zc-queue-item-injected"))
             } else {
@@ -4653,7 +4727,21 @@ pub(crate) struct QueuedMessage {
     pub id: u64,
     pub text: String,
     pub attachments: Vec<PendingAttachment>,
+    pub skill: Option<SkillInvocation>,
     pub status: QueueItemStatus,
+}
+
+impl QueuedMessage {
+    fn display_text(&self) -> Option<String> {
+        if let Some(skill) = &self.skill {
+            return Some(format_skill_invocation_for_input(&skill.name, &self.text));
+        }
+        if self.text.is_empty() {
+            None
+        } else {
+            Some(self.text.clone())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4792,6 +4880,14 @@ pub struct ChatState {
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
+}
+
+fn is_sendable_message(
+    text: &str,
+    attachments: &[PendingAttachment],
+    skill: &Option<SkillInvocation>,
+) -> bool {
+    !text.trim().is_empty() || !attachments.is_empty() || skill.is_some()
 }
 
 impl ChatState {
@@ -5584,14 +5680,31 @@ impl ChatState {
                 self.mark_dirty_append();
             }
             SessionUpdate::TurnComplete {
-                outcome, content, ..
+                outcome,
+                content,
+                failure_reason,
+                ..
             } => match outcome {
                 TurnEndOutcome::Completed => {
                     self.commit_turn(content, true);
                 }
                 TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
+                    let display = if let Some(reason) = &failure_reason {
+                        let localized = crate::i18n::t_args(
+                            &format!("zc-skill-error-{reason}"),
+                            &[("details", content.as_str())],
+                        );
+                        if localized.starts_with('{') {
+                            // Fluent key not found, fall back to bare content
+                            content.clone()
+                        } else {
+                            localized
+                        }
+                    } else {
+                        content.clone()
+                    };
                     self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(display.as_str())));
                     self.mark_dirty_append();
                     self.commit_turn(String::new(), false);
                 }
@@ -5693,8 +5806,9 @@ impl ChatState {
         &mut self,
         text: String,
         attachments: Vec<PendingAttachment>,
+        skill: Option<SkillInvocation>,
     ) -> Result<(), String> {
-        if text.trim().is_empty() && attachments.is_empty() {
+        if !is_sendable_message(&text, &attachments, &skill) {
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         let pending = self.message_queue.len();
@@ -5709,6 +5823,7 @@ impl ChatState {
             id,
             text,
             attachments,
+            skill,
             status: QueueItemStatus::Pending,
         });
         Ok(())
@@ -5718,8 +5833,9 @@ impl ChatState {
         &mut self,
         text: String,
         attachments: Vec<PendingAttachment>,
+        skill: Option<SkillInvocation>,
     ) -> Result<(), String> {
-        if text.trim().is_empty() && attachments.is_empty() {
+        if !is_sendable_message(&text, &attachments, &skill) {
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         if self.message_queue.len() >= Self::QUEUE_CAP {
@@ -5740,6 +5856,7 @@ impl ChatState {
                 id,
                 text,
                 attachments,
+                skill,
                 status: QueueItemStatus::Injected,
             },
         );
@@ -5771,6 +5888,7 @@ impl ChatState {
             .position(|m| m.status == QueueItemStatus::Pending)
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
         let idx = self.next_dispatch_index()?;
         let msg = self.message_queue.remove(idx)?;
@@ -5779,6 +5897,23 @@ impl ChatState {
             self.queue_sel = None;
         }
         Some(msg)
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn restore_dispatchable(&mut self, msg: QueuedMessage) {
+        if matches!(msg.status, QueueItemStatus::Injected) {
+            self.message_queue.push_front(msg);
+        } else {
+            // Preserve FIFO: insert after injected items, before pending items
+            let insert_idx = self
+                .message_queue
+                .iter()
+                .rposition(|m| m.status == QueueItemStatus::Injected)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            self.message_queue.insert(insert_idx, msg);
+        }
+        self.ensure_queue_selection();
     }
 
     /// Flip the queue pause state. Returns the new paused value so the caller
@@ -5941,7 +6076,11 @@ impl ChatState {
         let msg = self.message_queue.remove(pos)?;
         self.queue_sel = self.editable_ids().first().copied();
         self.mark_dirty_full();
-        Some((msg.text, msg.attachments))
+        let text = msg
+            .skill
+            .map(|skill| format_skill_invocation_for_input(&skill.name, &msg.text))
+            .unwrap_or(msg.text);
+        Some((text, msg.attachments))
     }
 
     /// Slash-command queue removal. `None` clears the whole queue; `Some(n)`
@@ -6224,6 +6363,18 @@ mod tests {
             .as_str()
             .expect("RPC request should have an id");
         rpc.dispatch_response(id, Some(result), None);
+    }
+
+    async fn respond_empty_agent_skills(
+        rpc: &RpcOutbound,
+        rx: &mut mpsc::Receiver<String>,
+        reason: &str,
+        agent: &str,
+    ) {
+        let request = next_rpc_request(rx, reason).await;
+        assert_eq!(request["method"], method::AGENT_SKILLS);
+        assert_eq!(request["params"]["agent"], agent);
+        respond_ok(rpc, &request, serde_json::json!({ "skills": [] }));
     }
 
     fn respond_err(rpc: &RpcOutbound, request: &serde_json::Value, code: i32, message: &str) {
@@ -6783,6 +6934,8 @@ mod tests {
         assert_eq!(request["params"]["prefix"], "agents.beta.model_provider");
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        respond_empty_agent_skills(&rpc, &mut rx, "resume should refresh skills", "beta").await;
+
         let request = next_rpc_request(&mut rx, "resume should load history").await;
         assert_eq!(request["method"], method::SESSION_MESSAGES);
         assert_eq!(request["params"]["session_id"], "sess-beta");
@@ -6896,6 +7049,9 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        respond_empty_agent_skills(&rpc, &mut rx, "fresh session should refresh skills", "beta")
+            .await;
+
         let chat = tokio::time::timeout(Duration::from_secs(2), fresh)
             .await
             .expect("fresh start should finish")
@@ -6965,6 +7121,14 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         assert_eq!(request["params"]["prefix"], "agents.alpha.model_provider");
         respond_ok(&rpc, &request, serde_json::json!([]));
+
+        respond_empty_agent_skills(
+            &rpc,
+            &mut rx,
+            "fresh fallback should refresh skills",
+            "alpha",
+        )
+        .await;
 
         let chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
@@ -7081,6 +7245,9 @@ mod tests {
         let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
+
+        respond_empty_agent_skills(&rpc, &mut rx, "double-click should refresh skills", "beta")
+            .await;
 
         let request = next_rpc_request(&mut rx, "double-click should load history").await;
         assert_eq!(request["method"], method::SESSION_MESSAGES);
@@ -8397,10 +8564,18 @@ mod tests {
         }
     }
 
+    fn skill(name: &str, arguments: &str) -> SkillInvocation {
+        SkillInvocation {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
+    }
+
     #[test]
     fn enqueue_dispatches_immediately_when_idle() {
         let mut s = state();
-        s.enqueue_message("hello".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("hello".to_string(), Vec::new(), None)
+            .unwrap();
         assert_eq!(s.queue_len(), 1);
         let msg = s
             .take_next_dispatchable()
@@ -8413,8 +8588,10 @@ mod tests {
     fn select_queued_by_id_sets_selection() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("b".to_string(), Vec::new(), None)
+            .unwrap();
         let second = s.message_queue[1].id;
         assert!(s.select_queued_by_id(second));
         assert_eq!(s.queue_sel, Some(second));
@@ -8440,8 +8617,10 @@ mod tests {
     fn no_dispatch_while_turn_in_flight() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("b".to_string(), Vec::new(), None)
+            .unwrap();
         assert!(s.take_next_dispatchable().is_none());
         assert_eq!(s.queue_len(), 2);
     }
@@ -8450,8 +8629,10 @@ mod tests {
     fn fifo_order_preserved() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("first".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("second".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("first".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("second".to_string(), Vec::new(), None)
+            .unwrap();
         s.turn_in_flight = false;
         assert_eq!(s.take_next_dispatchable().unwrap().text, "first");
         assert_eq!(s.take_next_dispatchable().unwrap().text, "second");
@@ -8461,11 +8642,12 @@ mod tests {
     fn injection_jumps_ahead_of_pending() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("pending1".to_string(), Vec::new())
+        s.enqueue_message("pending1".to_string(), Vec::new(), None)
             .unwrap();
-        s.enqueue_message("pending2".to_string(), Vec::new())
+        s.enqueue_message("pending2".to_string(), Vec::new(), None)
             .unwrap();
-        s.inject_message("urgent".to_string(), Vec::new()).unwrap();
+        s.inject_message("urgent".to_string(), Vec::new(), None)
+            .unwrap();
         s.turn_in_flight = false;
         assert_eq!(s.take_next_dispatchable().unwrap().text, "urgent");
         assert_eq!(s.take_next_dispatchable().unwrap().text, "pending1");
@@ -8475,14 +8657,15 @@ mod tests {
     fn cancel_pauses_pending_but_injection_resumes() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("queued".to_string(), Vec::new(), None)
+            .unwrap();
         s.commit_turn(String::new(), false);
         assert!(s.queue_paused());
         assert!(
             s.take_next_dispatchable().is_none(),
             "paused queue must not dispatch pending items"
         );
-        s.inject_message("override".to_string(), Vec::new())
+        s.inject_message("override".to_string(), Vec::new(), None)
             .unwrap();
         assert!(
             !s.queue_paused(),
@@ -8511,8 +8694,11 @@ mod tests {
     #[test]
     fn empty_enqueue_rejected() {
         let mut s = state();
-        assert!(s.enqueue_message("   ".to_string(), Vec::new()).is_err());
-        assert!(s.inject_message(String::new(), Vec::new()).is_err());
+        assert!(
+            s.enqueue_message("   ".to_string(), Vec::new(), None)
+                .is_err()
+        );
+        assert!(s.inject_message(String::new(), Vec::new(), None).is_err());
         assert_eq!(s.queue_len(), 0);
     }
 
@@ -8520,9 +8706,101 @@ mod tests {
     fn attachment_only_enqueue_accepted() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message(String::new(), vec![att("a.txt")])
+        s.enqueue_message(String::new(), vec![att("a.txt")], None)
             .unwrap();
         assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn no_argument_skill_enqueue_accepted() {
+        let mut s = state();
+        s.enqueue_message(String::new(), Vec::new(), Some(skill("model", "")))
+            .unwrap();
+        assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn no_argument_skill_inject_accepted() {
+        let mut s = state();
+        s.inject_message(String::new(), Vec::new(), Some(skill("model", "")))
+            .unwrap();
+        assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn turn_complete_returns_skill_prompt_to_idle() {
+        let mut state = state();
+        state.push_user_message(Some("/code-review inspect".to_string()), Vec::new());
+        assert!(state.turn_in_flight);
+
+        state.apply_update(SessionUpdate::TurnComplete {
+            session_id: "sess-1".to_string(),
+            outcome: TurnEndOutcome::Completed,
+            content: "ok".to_string(),
+            failure_reason: None,
+        });
+
+        assert!(!state.turn_in_flight);
+        assert!(matches!(state.turn_status, TurnStatus::Idle));
+        assert!(!state.queue_paused());
+    }
+
+    #[test]
+    fn skill_queue_display_uses_explicit_form_for_reserved_names() {
+        let msg = QueuedMessage {
+            id: 1,
+            text: "inspect".to_string(),
+            attachments: Vec::new(),
+            skill: Some(skill("model", "inspect")),
+            status: QueueItemStatus::Pending,
+        };
+        let expected = format!(
+            "{} model inspect",
+            slash_command_name(SlashCommandKind::Skill)
+        );
+        assert_eq!(msg.display_text().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn restore_dispatchable_preserves_failed_message() {
+        let mut s = state();
+        let msg = QueuedMessage {
+            id: 1,
+            text: "retry".to_string(),
+            attachments: Vec::new(),
+            skill: None,
+            status: QueueItemStatus::Injected,
+        };
+        s.restore_dispatchable(msg);
+        assert_eq!(s.queue_len(), 1);
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "retry");
+    }
+
+    #[test]
+    fn restore_dispatchable_preserves_fifo_order_on_failure() {
+        let mut s = state();
+        s.message_queue.push_back(QueuedMessage {
+            id: 1,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            skill: None,
+            status: QueueItemStatus::Pending,
+        });
+        s.message_queue.push_back(QueuedMessage {
+            id: 2,
+            text: "second".to_string(),
+            attachments: Vec::new(),
+            skill: None,
+            status: QueueItemStatus::Pending,
+        });
+
+        // Simulate failure of the first item: remove and restore
+        let first = s.take_next_dispatchable().unwrap();
+        s.restore_dispatchable(first);
+
+        // The queue should still be [first, second], not [second, first]
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "first");
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "second");
     }
 
     #[test]
@@ -8530,7 +8808,8 @@ mod tests {
         let mut s = state();
         s.turn_in_flight = true;
         assert!(!s.queue_sidebar_open(), "empty queue → sidebar closed");
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
         assert!(s.queue_sidebar_open(), "non-empty queue → sidebar open");
         s.ensure_queue_selection();
         assert!(s.queue_sel.is_some(), "first enqueue seeds a selection");
@@ -8545,8 +8824,10 @@ mod tests {
     fn delete_selected_removes_item() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("b".to_string(), Vec::new(), None)
+            .unwrap();
         s.ensure_queue_selection();
         s.delete_selected_queued();
         assert_eq!(s.queue_len(), 1);
@@ -8556,7 +8837,7 @@ mod tests {
     fn edit_pull_removes_from_queue_and_returns_content() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("draft".to_string(), vec![att("x.txt")])
+        s.enqueue_message("draft".to_string(), vec![att("x.txt")], None)
             .unwrap();
         s.ensure_queue_selection();
         let (text, atts) = s.take_selected_for_edit().expect("selected item");
@@ -8569,9 +8850,12 @@ mod tests {
     fn clear_queue_cmd_removes_one_by_index() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("c".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("b".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("c".to_string(), Vec::new(), None)
+            .unwrap();
         // 1-based: remove the second item ("b").
         s.clear_queue_cmd(Some(2));
         assert_eq!(s.queue_len(), 2);
@@ -8584,8 +8868,10 @@ mod tests {
     fn clear_queue_cmd_none_clears_all() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
+        s.enqueue_message("b".to_string(), Vec::new(), None)
+            .unwrap();
         s.clear_queue_cmd(None);
         assert_eq!(s.queue_len(), 0);
     }
@@ -8594,7 +8880,8 @@ mod tests {
     fn clear_queue_cmd_invalid_index_is_a_noop() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
         // Out of range and the Some(0) sentinel must not remove anything.
         s.clear_queue_cmd(Some(9));
         s.clear_queue_cmd(Some(0));
@@ -8615,7 +8902,8 @@ mod tests {
     #[test]
     fn resume_queue_unpauses_and_reports_prior_state() {
         let mut s = state();
-        s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("queued".to_string(), Vec::new(), None)
+            .unwrap();
         s.commit_turn(String::new(), false);
         assert!(s.queue_paused(), "non-clean turn end must pause");
         assert!(
@@ -8633,7 +8921,8 @@ mod tests {
     fn resume_then_dispatch_after_auto_pause() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("queued".to_string(), Vec::new(), None)
+            .unwrap();
         // Turn cancelled/failed mid-flight -> auto-pause.
         s.commit_turn(String::new(), false);
         assert!(s.take_next_dispatchable().is_none(), "paused: no dispatch");
@@ -8646,7 +8935,8 @@ mod tests {
         let mut s = state();
         s.turn_in_flight = true;
         s.resume_queue();
-        s.enqueue_message("hello".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("hello".to_string(), Vec::new(), None)
+            .unwrap();
         s.commit_turn(String::new(), false);
         assert!(
             s.queue_paused(),
@@ -8662,7 +8952,8 @@ mod tests {
     fn inject_survives_cancel_auto_pause() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.inject_message("now".to_string(), Vec::new()).unwrap();
+        s.inject_message("now".to_string(), Vec::new(), None)
+            .unwrap();
         s.commit_turn(String::new(), false);
         assert_eq!(
             s.take_next_dispatchable().unwrap().text,
@@ -8675,11 +8966,12 @@ mod tests {
     fn inject_resume_override_is_one_shot() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.inject_message("a".to_string(), Vec::new()).unwrap();
+        s.inject_message("a".to_string(), Vec::new(), None).unwrap();
         s.commit_turn(String::new(), false);
         assert_eq!(s.take_next_dispatchable().unwrap().text, "a");
         s.turn_in_flight = true;
-        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("b".to_string(), Vec::new(), None)
+            .unwrap();
         s.commit_turn(String::new(), false);
         assert!(
             s.queue_paused(),
@@ -8749,7 +9041,8 @@ mod tests {
     fn reset_clears_queue() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("a".to_string(), Vec::new(), None)
+            .unwrap();
         s.queue_paused = true;
         s.reset_for_session("sess-2".to_string(), None);
         assert_eq!(s.queue_len(), 0);
@@ -8771,10 +9064,11 @@ mod tests {
         let mut s = state();
         s.turn_in_flight = true;
         for i in 0..ChatState::QUEUE_CAP {
-            s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
+            s.enqueue_message(format!("m{i}"), Vec::new(), None)
+                .unwrap();
         }
         assert!(
-            s.enqueue_message("overflow".to_string(), Vec::new())
+            s.enqueue_message("overflow".to_string(), Vec::new(), None)
                 .is_err()
         );
     }

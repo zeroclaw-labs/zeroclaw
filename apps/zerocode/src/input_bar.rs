@@ -28,19 +28,58 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
-    "/attach",
-    "/attachments",
-    "/clear-queue",
-    "/detach",
-    "/model",
-    "/model-provider",
-    "/new",
-    "/new-session",
-    "/restart-session",
-    "/toggle-thinking",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashCommandKind {
+    Attach,
+    Attachments,
+    ClearQueue,
+    Detach,
+    Model,
+    ModelProvider,
+    New,
+    NewSession,
+    RestartSession,
+    Skill,
+    ToggleThinking,
+}
+
+struct SlashCommandSpec {
+    name: &'static str,
+    kind: SlashCommandKind,
+    fills_only: bool,
+}
+
+macro_rules! slash_commands {
+    ($($kind:ident => $name:literal, fills_only: $fills_only:literal;)+) => {
+        const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+            $(SlashCommandSpec {
+                name: $name,
+                kind: SlashCommandKind::$kind,
+                fills_only: $fills_only,
+            },)+
+        ];
+
+        pub(crate) fn slash_command_name(kind: SlashCommandKind) -> &'static str {
+            match kind {
+                $(SlashCommandKind::$kind => $name,)+
+            }
+        }
+    };
+}
+
+slash_commands! {
+    Attach => "/attach", fills_only: false;
+    Attachments => "/attachments", fills_only: false;
+    ClearQueue => "/clear-queue", fills_only: false;
+    Detach => "/detach", fills_only: false;
+    Model => "/model", fills_only: true;
+    ModelProvider => "/model-provider", fills_only: true;
+    New => "/new", fills_only: false;
+    NewSession => "/new-session", fills_only: false;
+    RestartSession => "/restart-session", fills_only: false;
+    Skill => "/skill", fills_only: true;
+    ToggleThinking => "/toggle-thinking", fills_only: false;
+}
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -52,11 +91,13 @@ pub(crate) enum InputBarAction {
     Submit {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
+        skill: Option<SkillInvocation>,
     },
     /// User requested immediate injection (Ctrl+Enter) — skip the queue.
     Inject {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
+        skill: Option<SkillInvocation>,
     },
     /// Empty Enter (no text, no attachments). Carries no payload but is still
     /// a deliberate keystroke — the parent uses it to resume a paused queue so
@@ -89,6 +130,76 @@ pub(crate) enum InputBarAction {
     NotHandled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillInvocation {
+    pub name: String,
+    pub arguments: String,
+}
+
+pub(crate) fn format_skill_invocation_for_input(name: &str, arguments: &str) -> String {
+    let command = if is_reserved_slash_command_name(name) {
+        format!("{} {name}", slash_command_name(SlashCommandKind::Skill))
+    } else {
+        format!("/{name}")
+    };
+    if arguments.is_empty() {
+        command
+    } else {
+        format!("{command} {arguments}")
+    }
+}
+
+fn slash_command_argument_prefix(kind: SlashCommandKind) -> String {
+    format!("{} ", slash_command_name(kind))
+}
+
+fn slash_command_fills_only(name: &str) -> bool {
+    SLASH_COMMANDS
+        .iter()
+        .any(|command| command.name == name && command.fills_only)
+}
+
+fn is_reserved_slash_command_name(name: &str) -> bool {
+    SLASH_COMMANDS
+        .iter()
+        .any(|command| command.name.strip_prefix('/') == Some(name))
+}
+
+fn is_known_skill(name: &str, skills: &[String]) -> bool {
+    skills.iter().any(|skill| skill == name)
+}
+
+fn is_skill_shortcut_choice(choice: &str, skill: &str) -> bool {
+    choice.strip_prefix('/') == Some(skill)
+}
+
+fn is_skill_shortcut_autocomplete_choice(choice: &str, skills: &[String]) -> bool {
+    skills
+        .iter()
+        .filter(|skill| !is_reserved_slash_command_name(skill))
+        .any(|skill| is_skill_shortcut_choice(choice, skill))
+}
+
+fn skill_invocation(name: &str, arguments: &str) -> SkillInvocation {
+    SkillInvocation {
+        name: name.to_string(),
+        arguments: arguments.to_string(),
+    }
+}
+
+fn parse_skill_shortcut_invocation<'a>(
+    input: &'a str,
+    skills: &[String],
+) -> Option<(&'a str, &'a str)> {
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
+    if is_reserved_slash_command_name(name) || !is_known_skill(name, skills) {
+        return None;
+    }
+    Some((name, arguments.trim()))
+}
+
 // ── Slash commands ───────────────────────────────────────────────
 
 enum SlashCommand<'a> {
@@ -108,53 +219,64 @@ enum SlashCommand<'a> {
     ModelProvider(&'a str),
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
+    /// `/skill <name> [arguments]` invokes any agent skill, including names
+    /// reserved by built-in slash commands.
+    Skill(&'a str, &'a str),
     RestartSession,
     NotACommand,
 }
 
 fn parse_slash_command(input: &str) -> SlashCommand<'_> {
     let trimmed = input.trim();
-    if let Some(path) = trimmed.strip_prefix("/attach ") {
-        SlashCommand::Attach(path.trim())
-    } else if trimmed == "/attach" {
-        SlashCommand::Attach("")
-    } else if let Some(idx) = trimmed.strip_prefix("/detach ") {
-        SlashCommand::Detach(idx.trim().parse().ok())
-    } else if trimmed == "/detach" {
-        SlashCommand::Detach(None)
-    } else if let Some(arg) = trimmed.strip_prefix("/clear-queue ") {
-        // Malformed index -> Some(0): an invalid index, never a clear-all, so a
-        // typo cannot wipe the whole queue. Only the bare form clears all.
-        SlashCommand::ClearQueue(Some(arg.trim().parse().unwrap_or(0)))
-    } else if trimmed == "/clear-queue" {
-        SlashCommand::ClearQueue(None)
-    } else if trimmed == "/attachments" {
-        SlashCommand::ListAttachments
-    } else if trimmed == "/restart-session" || trimmed == "/new-session" || trimmed == "/new" {
-        SlashCommand::RestartSession
-    } else if trimmed == "/toggle-thinking" {
-        SlashCommand::ToggleThinking
-    } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
-        let name = name.trim();
-        if name.is_empty() {
-            SlashCommand::ModelProviderPicker
-        } else {
-            SlashCommand::ModelProvider(name)
+    let (command, argument) = trimmed
+        .split_once(' ')
+        .map(|(command, argument)| (command, argument.trim()))
+        .unwrap_or((trimmed, ""));
+    let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == command) else {
+        return SlashCommand::NotACommand;
+    };
+    match spec.kind {
+        SlashCommandKind::Attach => SlashCommand::Attach(argument),
+        SlashCommandKind::Attachments => SlashCommand::ListAttachments,
+        SlashCommandKind::ClearQueue => SlashCommand::ClearQueue(parse_optional_index(argument)),
+        SlashCommandKind::Detach => SlashCommand::Detach(argument.parse().ok()),
+        SlashCommandKind::Model => model_command(argument),
+        SlashCommandKind::ModelProvider => model_provider_command(argument),
+        SlashCommandKind::New | SlashCommandKind::NewSession | SlashCommandKind::RestartSession => {
+            SlashCommand::RestartSession
         }
-    } else if trimmed == "/model-provider" {
-        SlashCommand::ModelProviderPicker
-    } else if let Some(name) = trimmed.strip_prefix("/model ") {
-        let name = name.trim();
-        if name.is_empty() {
-            SlashCommand::ModelPicker
-        } else {
-            SlashCommand::Model(name)
-        }
-    } else if trimmed == "/model" {
+        SlashCommandKind::Skill => skill_command(argument),
+        SlashCommandKind::ToggleThinking => SlashCommand::ToggleThinking,
+    }
+}
+
+fn parse_optional_index(argument: &str) -> Option<usize> {
+    if argument.is_empty() {
+        None
+    } else {
+        Some(argument.parse().unwrap_or(0))
+    }
+}
+
+fn model_command(argument: &str) -> SlashCommand<'_> {
+    if argument.is_empty() {
         SlashCommand::ModelPicker
     } else {
-        SlashCommand::NotACommand
+        SlashCommand::Model(argument)
     }
+}
+
+fn model_provider_command(argument: &str) -> SlashCommand<'_> {
+    if argument.is_empty() {
+        SlashCommand::ModelProviderPicker
+    } else {
+        SlashCommand::ModelProvider(argument)
+    }
+}
+
+fn skill_command(argument: &str) -> SlashCommand<'_> {
+    let (name, arguments) = argument.split_once(' ').unwrap_or((argument, ""));
+    SlashCommand::Skill(name, arguments.trim())
 }
 
 // ── Wrap geometry helpers ────────────────────────────────────────
@@ -538,6 +660,8 @@ pub(crate) struct InputBarState {
     /// Which model_provider `model_catalog` was fetched for; lets the app layer
     /// decide whether a refetch is needed on provider change.
     model_catalog_provider: Option<String>,
+    /// Cached skill names for direct `/skill-name` invocation autocomplete.
+    skill_catalog: Vec<String>,
     /// Cached model_provider names for `/model-provider <partial>` autocomplete.
     provider_catalog: Vec<String>,
 }
@@ -552,6 +676,8 @@ enum AutocompleteTarget {
     ModelArg,
     /// Completing the `/model-provider <arg>` value (replaces only the argument).
     ModelProviderArg,
+    /// Completing the `/skill <arg>` value (replaces the skill-name argument).
+    SkillArg,
 }
 
 impl InputBarState {
@@ -573,6 +699,7 @@ impl InputBarState {
             autocomplete_active: false,
             model_catalog: Vec::new(),
             model_catalog_provider: None,
+            skill_catalog: Vec::new(),
             provider_catalog: Vec::new(),
         }
     }
@@ -646,22 +773,38 @@ impl InputBarState {
             self.autocomplete_target = AutocompleteTarget::Command;
             self.autocomplete_matches = SLASH_COMMANDS
                 .iter()
-                .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
-                .map(|c| (*c).to_string())
+                .map(|command| command.name)
+                .filter(|command| command.starts_with(prefix) && *command != prefix)
+                .map(str::to_string)
+                .chain(
+                    self.skill_catalog
+                        .iter()
+                        .filter(|skill| !is_reserved_slash_command_name(skill))
+                        .map(|skill| format!("/{skill}"))
+                        .filter(|cmd| cmd.starts_with(prefix) && cmd != prefix),
+                )
                 .collect();
             self.finalize_autocomplete();
             return;
         }
 
-        // Argument completion: `/model <partial>` or `/model-provider <partial>`.
-        // model_provider is checked first — its prefix is longer and `/model `
-        // would otherwise swallow it.
-        if let Some(partial) = text.strip_prefix("/model-provider ") {
+        if let Some(partial) =
+            text.strip_prefix(&slash_command_argument_prefix(SlashCommandKind::Skill))
+        {
+            let partial = partial.trim_start().to_string();
+            self.set_arg_matches(AutocompleteTarget::SkillArg, &partial);
+            return;
+        }
+        if let Some(partial) = text.strip_prefix(&slash_command_argument_prefix(
+            SlashCommandKind::ModelProvider,
+        )) {
             let partial = partial.trim_start().to_string();
             self.set_arg_matches(AutocompleteTarget::ModelProviderArg, &partial);
             return;
         }
-        if let Some(partial) = text.strip_prefix("/model ") {
+        if let Some(partial) =
+            text.strip_prefix(&slash_command_argument_prefix(SlashCommandKind::Model))
+        {
             let partial = partial.trim_start().to_string();
             self.set_arg_matches(AutocompleteTarget::ModelArg, &partial);
             return;
@@ -679,6 +822,7 @@ impl InputBarState {
         let catalog = match target {
             AutocompleteTarget::ModelArg => &self.model_catalog,
             AutocompleteTarget::ModelProviderArg => &self.provider_catalog,
+            AutocompleteTarget::SkillArg => &self.skill_catalog,
             AutocompleteTarget::Command => return,
         };
         let needle = partial.to_ascii_lowercase();
@@ -724,6 +868,17 @@ impl InputBarState {
         &self.model_catalog
     }
 
+    /// Replace the cached skill list for `/skill-name` and `/skill <name>` autocomplete.
+    pub fn set_skill_catalog(&mut self, skills: Vec<String>) -> Vec<String> {
+        let conflicts = skills
+            .iter()
+            .filter(|skill| is_reserved_slash_command_name(skill))
+            .cloned()
+            .collect();
+        self.skill_catalog = skills;
+        conflicts
+    }
+
     /// Replace the cached model_provider list for `/model-provider` autocomplete.
     pub fn set_provider_catalog(&mut self, providers: Vec<String>) {
         self.provider_catalog = providers;
@@ -742,7 +897,8 @@ impl InputBarState {
     fn apply_autocomplete_choice(&mut self, choice: &str) {
         match self.autocomplete_target {
             AutocompleteTarget::Command => {
-                let takes_arg = choice == "/model" || choice == "/model-provider";
+                let takes_arg = slash_command_fills_only(choice)
+                    || is_skill_shortcut_autocomplete_choice(choice, &self.skill_catalog);
                 self.input = if takes_arg {
                     format!("{choice} ")
                 } else {
@@ -750,10 +906,25 @@ impl InputBarState {
                 };
             }
             AutocompleteTarget::ModelArg => {
-                self.input = format!("/model {choice}");
+                self.input = format!(
+                    "{}{}",
+                    slash_command_argument_prefix(SlashCommandKind::Model),
+                    choice
+                );
             }
             AutocompleteTarget::ModelProviderArg => {
-                self.input = format!("/model-provider {choice}");
+                self.input = format!(
+                    "{}{}",
+                    slash_command_argument_prefix(SlashCommandKind::ModelProvider),
+                    choice
+                );
+            }
+            AutocompleteTarget::SkillArg => {
+                self.input = format!(
+                    "{}{} ",
+                    slash_command_argument_prefix(SlashCommandKind::Skill),
+                    choice
+                );
             }
         }
         self.cursor = self.input.len();
@@ -770,8 +941,9 @@ impl InputBarState {
         self.apply_autocomplete_choice(&choice);
         self.dismiss_autocomplete();
         let fills_only = target == AutocompleteTarget::Command
-            && (choice == "/model" || choice == "/model-provider");
-        if fills_only {
+            && (slash_command_fills_only(&choice)
+                || is_skill_shortcut_autocomplete_choice(&choice, &self.skill_catalog));
+        if fills_only || target == AutocompleteTarget::SkillArg {
             return InputBarAction::Consumed;
         }
         self.handle_enter()
@@ -1231,129 +1403,213 @@ impl InputBarState {
     fn handle_enter(&mut self) -> InputBarAction {
         let msg = self.take_input();
         if !msg.is_empty() {
-            match parse_slash_command(&msg) {
-                SlashCommand::Attach(path) => {
-                    if path.is_empty() {
-                        let start = UserDirs::new()
-                            .map(|u| u.home_dir().to_path_buf())
-                            .unwrap_or_else(|| {
-                                if cfg!(windows) {
-                                    PathBuf::from("C:\\")
-                                } else {
-                                    PathBuf::from("/")
-                                }
-                            });
-                        self.file_explorer = Some(FileExplorerState::new(start));
-                        InputBarAction::Consumed
-                    } else {
-                        match PendingAttachment::from_path(path) {
-                            Ok(att) => {
-                                let label = att.label();
-                                self.add_attachment(att);
-                                InputBarAction::StatusMessage(crate::i18n::t_args(
-                                    "zc-input-attached",
-                                    &[("label", &label)],
-                                ))
-                            }
-                            Err(e) => InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-attach-error",
-                                &[("error", &e.to_string())],
-                            )),
-                        }
-                    }
-                }
-                SlashCommand::Detach(idx) => {
-                    let atts = &self.pending_attachments;
-                    if atts.is_empty() {
-                        InputBarAction::StatusMessage(crate::i18n::t(
-                            "zc-input-no-pending-attachments",
-                        ))
-                    } else {
-                        let i = idx.unwrap_or(atts.len() - 1);
-                        if i < atts.len() {
-                            let name = atts[i].filename.clone();
-                            self.remove_attachment(i);
-                            InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-detached",
-                                &[("name", &name)],
-                            ))
-                        } else {
-                            InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-invalid-index",
-                                &[("index", &i.to_string())],
-                            ))
-                        }
-                    }
-                }
-                SlashCommand::ListAttachments => {
-                    let atts = &self.pending_attachments;
-                    if atts.is_empty() {
-                        InputBarAction::StatusMessage(crate::i18n::t(
-                            "zc-input-no-pending-attachments",
-                        ))
-                    } else {
-                        let list = atts
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| format!("  [{i}] {}", a.label()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        InputBarAction::StatusMessage(format!(
-                            "{}\n{list}",
-                            crate::i18n::t("zc-input-pending-attachments-header")
-                        ))
-                    }
-                }
-                SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
-                SlashCommand::RestartSession => InputBarAction::RestartSession,
-                SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
-                SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
-                SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
-                SlashCommand::ModelProvider(name) => {
-                    InputBarAction::SetModelProvider(name.to_string())
-                }
-                SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
-                SlashCommand::NotACommand => {
-                    let attachments = self.take_attachments();
-                    InputBarAction::Submit {
-                        text: Some(msg),
-                        attachments,
-                    }
-                }
-            }
-        } else if !self.pending_attachments.is_empty() {
-            // Empty text but has attachments: send attachments only.
+            return self.handle_message_submit(msg);
+        }
+        if !self.pending_attachments.is_empty() {
             let attachments = self.take_attachments();
-            InputBarAction::Submit {
+            return InputBarAction::Submit {
                 text: None,
                 attachments,
-            }
-        } else {
-            InputBarAction::ResumeQueue
+                skill: None,
+            };
         }
+        InputBarAction::ResumeQueue
     }
 
     fn handle_inject(&mut self) -> InputBarAction {
         let msg = self.take_input();
         if !msg.is_empty() {
-            if matches!(parse_slash_command(&msg), SlashCommand::NotACommand) {
-                let attachments = self.take_attachments();
-                InputBarAction::Inject {
-                    text: Some(msg),
-                    attachments,
-                }
-            } else {
-                self.insert_text(&msg);
-                self.handle_enter()
-            }
-        } else if !self.pending_attachments.is_empty() {
+            return self.handle_message_inject(msg);
+        }
+        if !self.pending_attachments.is_empty() {
             let attachments = self.take_attachments();
-            InputBarAction::Inject {
+            return InputBarAction::Inject {
                 text: None,
                 attachments,
+                skill: None,
+            };
+        }
+        InputBarAction::Consumed
+    }
+
+    fn handle_message_submit(&mut self, msg: String) -> InputBarAction {
+        match parse_slash_command(&msg) {
+            SlashCommand::Attach(path) => self.handle_attach_command(path),
+            SlashCommand::Detach(idx) => self.handle_detach_command(idx),
+            SlashCommand::ListAttachments => self.handle_list_attachments_command(),
+            SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
+            SlashCommand::RestartSession => InputBarAction::RestartSession,
+            SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+            SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
+            SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
+            SlashCommand::ModelProvider(name) => InputBarAction::SetModelProvider(name.to_string()),
+            SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
+            SlashCommand::Skill(name, arguments) => {
+                self.handle_explicit_skill_submit(name, arguments)
             }
-        } else {
-            InputBarAction::Consumed
+            SlashCommand::NotACommand => self.handle_normal_or_shortcut_submit(msg),
+        }
+    }
+
+    fn handle_message_inject(&mut self, msg: String) -> InputBarAction {
+        match parse_slash_command(&msg) {
+            SlashCommand::Attach(path) => self.handle_attach_command(path),
+            SlashCommand::Detach(idx) => self.handle_detach_command(idx),
+            SlashCommand::ListAttachments => self.handle_list_attachments_command(),
+            SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
+            SlashCommand::RestartSession => InputBarAction::RestartSession,
+            SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+            SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
+            SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
+            SlashCommand::ModelProvider(name) => InputBarAction::SetModelProvider(name.to_string()),
+            SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
+            SlashCommand::Skill(name, arguments) => {
+                self.handle_explicit_skill_inject(name, arguments)
+            }
+            SlashCommand::NotACommand => self.handle_normal_or_shortcut_inject(msg),
+        }
+    }
+
+    fn handle_attach_command(&mut self, path: &str) -> InputBarAction {
+        if path.is_empty() {
+            let start = UserDirs::new()
+                .map(|user_dirs| user_dirs.home_dir().to_path_buf())
+                .unwrap_or_else(|| {
+                    if cfg!(windows) {
+                        PathBuf::from("C:\\")
+                    } else {
+                        PathBuf::from("/")
+                    }
+                });
+            self.file_explorer = Some(FileExplorerState::new(start));
+            return InputBarAction::Consumed;
+        }
+        match PendingAttachment::from_path(path) {
+            Ok(attachment) => {
+                let label = attachment.label();
+                self.add_attachment(attachment);
+                InputBarAction::StatusMessage(crate::i18n::t_args(
+                    "zc-input-attached",
+                    &[("label", &label)],
+                ))
+            }
+            Err(error) => InputBarAction::StatusMessage(crate::i18n::t_args(
+                "zc-input-attach-error",
+                &[("error", &error.to_string())],
+            )),
+        }
+    }
+
+    fn handle_detach_command(&mut self, idx: Option<usize>) -> InputBarAction {
+        if self.pending_attachments.is_empty() {
+            return InputBarAction::StatusMessage(crate::i18n::t(
+                "zc-input-no-pending-attachments",
+            ));
+        }
+        let index = idx.unwrap_or(self.pending_attachments.len() - 1);
+        if index >= self.pending_attachments.len() {
+            return InputBarAction::StatusMessage(crate::i18n::t_args(
+                "zc-input-invalid-index",
+                &[("index", &index.to_string())],
+            ));
+        }
+        let name = self.pending_attachments[index].filename.clone();
+        self.remove_attachment(index);
+        InputBarAction::StatusMessage(crate::i18n::t_args("zc-input-detached", &[("name", &name)]))
+    }
+
+    fn handle_list_attachments_command(&self) -> InputBarAction {
+        if self.pending_attachments.is_empty() {
+            return InputBarAction::StatusMessage(crate::i18n::t(
+                "zc-input-no-pending-attachments",
+            ));
+        }
+        let list = self
+            .pending_attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| format!("  [{index}] {}", attachment.label()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        InputBarAction::StatusMessage(format!(
+            "{}\n{list}",
+            crate::i18n::t("zc-input-pending-attachments-header")
+        ))
+    }
+
+    fn handle_explicit_skill_submit(&mut self, name: &str, arguments: &str) -> InputBarAction {
+        if let Some(error) = self.validate_explicit_skill(name) {
+            return error;
+        }
+        let attachments = self.take_attachments();
+        InputBarAction::Submit {
+            text: Some(arguments.to_string()),
+            attachments,
+            skill: Some(skill_invocation(name, arguments)),
+        }
+    }
+
+    fn handle_explicit_skill_inject(&mut self, name: &str, arguments: &str) -> InputBarAction {
+        if let Some(error) = self.validate_explicit_skill(name) {
+            return error;
+        }
+        let attachments = self.take_attachments();
+        InputBarAction::Inject {
+            text: Some(arguments.to_string()),
+            attachments,
+            skill: Some(skill_invocation(name, arguments)),
+        }
+    }
+
+    fn validate_explicit_skill(&self, name: &str) -> Option<InputBarAction> {
+        if name.is_empty() {
+            return Some(InputBarAction::StatusMessage(crate::i18n::t_args(
+                "zc-input-skill-usage",
+                &[("command", slash_command_name(SlashCommandKind::Skill))],
+            )));
+        }
+        if !is_known_skill(name, &self.skill_catalog) {
+            return Some(InputBarAction::StatusMessage(crate::i18n::t_args(
+                "zc-input-skill-not-found",
+                &[("name", name)],
+            )));
+        }
+        None
+    }
+
+    fn handle_normal_or_shortcut_submit(&mut self, msg: String) -> InputBarAction {
+        if let Some((name, arguments)) = parse_skill_shortcut_invocation(&msg, &self.skill_catalog)
+        {
+            let attachments = self.take_attachments();
+            return InputBarAction::Submit {
+                text: Some(arguments.to_string()),
+                attachments,
+                skill: Some(skill_invocation(name, arguments)),
+            };
+        }
+        let attachments = self.take_attachments();
+        InputBarAction::Submit {
+            text: Some(msg),
+            attachments,
+            skill: None,
+        }
+    }
+
+    fn handle_normal_or_shortcut_inject(&mut self, msg: String) -> InputBarAction {
+        if let Some((name, arguments)) = parse_skill_shortcut_invocation(&msg, &self.skill_catalog)
+        {
+            let attachments = self.take_attachments();
+            return InputBarAction::Inject {
+                text: Some(arguments.to_string()),
+                attachments,
+                skill: Some(skill_invocation(name, arguments)),
+            };
+        }
+        let attachments = self.take_attachments();
+        InputBarAction::Inject {
+            text: Some(msg),
+            attachments,
+            skill: None,
         }
     }
 
@@ -1693,7 +1949,7 @@ impl crate::widgets::HelpContext for InputBarState {
                 crate::i18n::t("zc-input-help-slash-commands"),
                 SLASH_COMMANDS
                     .iter()
-                    .map(|cmd| E::key(*cmd, String::new()))
+                    .map(|cmd| E::key(cmd.name, String::new()))
                     .collect(),
             ),
         )
@@ -1932,9 +2188,14 @@ mod tests {
         bar.insert_text("hello world");
         let action = bar.handle_enter();
         match action {
-            InputBarAction::Submit { text, attachments } => {
+            InputBarAction::Submit {
+                text,
+                attachments,
+                skill,
+            } => {
                 assert_eq!(text, Some("hello world".to_string()));
                 assert!(attachments.is_empty());
+                assert!(skill.is_none());
             }
             _ => panic!("expected Submit"),
         }
@@ -1989,6 +2250,14 @@ mod tests {
         assert!(matches!(
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
+        ));
+        assert!(matches!(
+            parse_slash_command("/skill model inspect"),
+            SlashCommand::Skill("model", "inspect")
+        ));
+        assert!(matches!(
+            parse_slash_command("/skill"),
+            SlashCommand::Skill("", "")
         ));
         assert!(matches!(
             parse_slash_command("hello"),
@@ -2083,6 +2352,130 @@ mod tests {
     }
 
     #[test]
+    fn skill_command_autocomplete_appends_space() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["code-review".into()]);
+        bar.apply_autocomplete_choice("/code-review");
+        assert_eq!(bar.input(), "/code-review ");
+    }
+
+    #[test]
+    fn slash_skill_submits_structured_invocation() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["code-review".into()]);
+        bar.insert_text("/code-review inspect this diff");
+        let action = bar.handle_enter();
+        match action {
+            InputBarAction::Submit { text, skill, .. } => {
+                assert_eq!(text.as_deref(), Some("inspect this diff"));
+                assert_eq!(
+                    skill,
+                    Some(SkillInvocation {
+                        name: "code-review".into(),
+                        arguments: "inspect this diff".into(),
+                    })
+                );
+            }
+            _ => panic!("expected Submit"),
+        }
+    }
+
+    #[test]
+    fn reserved_skill_shortcut_does_not_override_builtin() {
+        let mut bar = InputBarState::new();
+        let conflicts = bar.set_skill_catalog(vec!["model".into()]);
+        assert_eq!(conflicts, vec!["model".to_string()]);
+        bar.insert_text("/model gpt-4o");
+        assert!(matches!(bar.handle_enter(), InputBarAction::SetModel(model) if model == "gpt-4o"));
+    }
+
+    #[test]
+    fn explicit_skill_command_invokes_reserved_skill() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["model".into()]);
+        bar.insert_text(&format!(
+            "{} model inspect this",
+            slash_command_name(SlashCommandKind::Skill)
+        ));
+        let action = bar.handle_enter();
+        match action {
+            InputBarAction::Submit { text, skill, .. } => {
+                assert_eq!(text.as_deref(), Some("inspect this"));
+                assert_eq!(
+                    skill,
+                    Some(SkillInvocation {
+                        name: "model".into(),
+                        arguments: "inspect this".into(),
+                    })
+                );
+            }
+            _ => panic!("expected Submit"),
+        }
+    }
+
+    #[test]
+    fn shortcut_autocomplete_excludes_reserved_skill_names() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["model".into(), "code-review".into()]);
+        bar.insert_text("/mo");
+        assert_eq!(
+            bar.autocomplete_matches
+                .iter()
+                .filter(|entry| entry.as_str() == "/model")
+                .count(),
+            1
+        );
+        bar.take_input();
+        bar.insert_text("/co");
+        assert!(
+            bar.autocomplete_matches
+                .iter()
+                .any(|entry| entry == "/code-review")
+        );
+    }
+
+    #[test]
+    fn explicit_skill_autocomplete_includes_reserved_skill_names() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["model".into(), "code-review".into()]);
+        bar.insert_text(&format!(
+            "{} mo",
+            slash_command_name(SlashCommandKind::Skill)
+        ));
+        assert_eq!(bar.autocomplete_target, AutocompleteTarget::SkillArg);
+        assert!(
+            bar.autocomplete_matches
+                .iter()
+                .any(|entry| entry == "model")
+        );
+    }
+
+    #[test]
+    fn explicit_skill_unknown_reports_status() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["code-review".into()]);
+        bar.insert_text(&format!(
+            "{} missing inspect",
+            slash_command_name(SlashCommandKind::Skill)
+        ));
+        let action = bar.handle_enter();
+        let expected = crate::i18n::t_args("zc-input-skill-not-found", &[("name", "missing")]);
+        assert!(matches!(action, InputBarAction::StatusMessage(message) if message == expected));
+    }
+
+    #[test]
+    fn explicit_skill_usage_reports_status() {
+        let mut bar = InputBarState::new();
+        bar.insert_text(slash_command_name(SlashCommandKind::Skill));
+        let action = bar.handle_enter();
+        let expected = crate::i18n::t_args(
+            "zc-input-skill-usage",
+            &[("command", slash_command_name(SlashCommandKind::Skill))],
+        );
+        assert!(matches!(action, InputBarAction::StatusMessage(message) if message == expected));
+    }
+
+    #[test]
     fn model_arg_autocomplete_rewrites_only_arg() {
         let mut bar = InputBarState::new();
         bar.autocomplete_target = AutocompleteTarget::ModelArg;
@@ -2171,14 +2564,63 @@ mod tests {
             .iter()
             .find(|c| c.title.as_deref() == Some(title.as_str()))
             .expect("slash-commands section present");
-        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
-        for cmd in SLASH_COMMANDS {
+        let listed: Vec<String> = section
+            .entries
+            .iter()
+            .map(|entry| entry.key_str())
+            .collect();
+        for command in SLASH_COMMANDS {
             assert!(
-                listed.iter().any(|k| k == cmd),
-                "slash command {cmd} must appear in the help section"
+                listed.iter().any(|key| key == command.name),
+                "slash command {} must appear in the help section",
+                command.name
             );
         }
         assert_eq!(listed.len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
+    fn inject_model_command_with_arg_returns_set_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model gpt-4o");
+        let action = bar.handle_inject();
+        assert!(matches!(action, InputBarAction::SetModel(model) if model == "gpt-4o"));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn inject_model_provider_command_with_arg_returns_set_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model-provider openai.default");
+        let action = bar.handle_inject();
+        assert!(
+            matches!(action, InputBarAction::SetModelProvider(provider) if provider == "openai.default")
+        );
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn inject_explicit_skill_returns_inject_action() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["code-review".into()]);
+        bar.insert_text(&format!(
+            "{} code-review inspect",
+            slash_command_name(SlashCommandKind::Skill)
+        ));
+        let action = bar.handle_inject();
+        match action {
+            InputBarAction::Inject { text, skill, .. } => {
+                assert_eq!(text.as_deref(), Some("inspect"));
+                assert_eq!(
+                    skill,
+                    Some(SkillInvocation {
+                        name: "code-review".into(),
+                        arguments: "inspect".into(),
+                    })
+                );
+            }
+            _ => panic!("expected Inject"),
+        }
     }
 
     #[test]

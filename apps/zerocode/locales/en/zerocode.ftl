@@ -101,6 +101,10 @@ zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
 zc-input-clipboard-error = Clipboard error: { $error }
+zc-input-skill-usage = Usage: { $command } <name> [arguments]
+zc-input-skill-not-found = Skill not found for this agent: { $name }
+zc-input-skill-catalog-error = Could not load skills for this agent: { $error }
+zc-input-skill-shortcut-conflicts = Skill shortcuts disabled for reserved names: { $names }. Use { $command } <name> ...
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.
@@ -125,6 +129,10 @@ zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
 zc-queue-dispatch-failed = Could not send queued message: { $error }
+zc-skill-error-skill-prompt-failure = Skill prompt failed: { $details }
+zc-skill-error-session-not-found = Session not found
+zc-skill-error-attachment-failure = Attachment processing failed: { $details }
+zc-skill-error-session-busy = Session busy: { $details }
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity
