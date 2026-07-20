@@ -2,6 +2,7 @@
 
 pub mod case;
 pub mod grader;
+pub mod live;
 pub mod observer;
 pub mod record;
 pub mod replay;
@@ -9,10 +10,10 @@ pub mod report;
 pub mod runner;
 pub mod tools;
 
-pub use case::{LlmTrace, TraceExpects};
+pub use case::{CaseSetup, LlmTrace, TraceExpects};
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
-pub use runner::{run_case, run_suite};
+pub use runner::{RunDeps, ensure_live_provider, run_case, run_suite};
 
 use std::str::FromStr;
 
