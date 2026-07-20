@@ -18,6 +18,12 @@ Load a SOP with a `channel` trigger, then send a message to that channel. The `c
 
 The fan-in hop is skipped entirely when no loaded SOP has a `channel` trigger, so channels with no channel-sourced SOP pay nothing.
 
+All channel deliveries enter the runtime's shared SOP ingress adapter before an event is built. The
+adapter owns source-interest checks, required engine/audit handle diagnostics, untrusted input
+capping, event timestamps, and dispatch-result logging. Channel code supplies only the
+transport-owned topic and payload. Forge events use the same boundary with their configured target
+SOP, so they cannot bypass trigger matching or the normal safety and audit path.
+
 If nothing starts, confirm a loaded SOP has a `channel` trigger, the trigger `channel`/`alias` matches the instance the message arrived on, and the `condition` matches. See the [fan-in overview troubleshooting table](./overview.md#troubleshooting).
 
 ## Approve and observe
