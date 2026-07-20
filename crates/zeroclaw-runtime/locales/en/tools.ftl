@@ -115,6 +115,28 @@ tool-hardware-memory-map = Return the memory map (flash and RAM address ranges) 
 
 tool-hardware-memory-read = Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory at address', 'dump memory', 'lower memory 0-126', or 'give address and value'. Returns hex dump. Requires Nucleo connected via USB and probe feature. Params: address (hex, e.g. 0x20000000 for RAM start), length (bytes, default 128).
 
+tool-homeassistant = Control and query a Home Assistant smart-home instance over its REST API. Actions: 'list_entities' (all entity ids and state, optionally filtered by domain such as 'light' or 'sensor'), 'get_state' (full state and attributes of one entity), and 'call_service' (invoke a service like light.turn_on with service_data). list_entities and get_state are read-only; call_service changes device state and is restricted to the operator's allowed_domains config.
+tool-homeassistant-param-action = The Home Assistant action to perform.
+tool-homeassistant-param-entity-id = Entity id for get_state (e.g. 'light.kitchen').
+tool-homeassistant-param-domain = Domain filter for list_entities, or the service domain for call_service (e.g. 'light').
+tool-homeassistant-param-service = Service name for call_service (e.g. 'turn_on').
+tool-homeassistant-param-service-data = Optional JSON body for call_service (e.g. {"entity_id": "light.kitchen"}).
+tool-homeassistant-error-missing-action = Missing required parameter: action
+tool-homeassistant-error-unknown-action = Unknown action: { $action }. Valid actions: list_entities, get_state, call_service
+tool-homeassistant-error-missing-entity-id = get_state requires entity_id parameter
+tool-homeassistant-error-missing-domain = call_service requires domain parameter
+tool-homeassistant-error-missing-service = call_service requires service parameter
+tool-homeassistant-error-not-configured = Home Assistant is not configured: set homeassistant.url and homeassistant.token (or HASS_URL / HASS_TOKEN env vars)
+tool-homeassistant-error-invalid-slug = Invalid { $kind } '{ $value }'. Expected a lowercase slug matching [a-z0-9_]+ (e.g. light, turn_on)
+tool-homeassistant-error-invalid-entity-id = Invalid entity_id '{ $entity_id }'. Expected format: <domain>.<object_id> with both parts matching [a-z0-9_]+ (e.g. light.kitchen)
+tool-homeassistant-error-domain-not-allowed = Service domain '{ $domain }' is not in homeassistant.allowed_domains. Allowed: { $allowed }
+tool-homeassistant-allowed-domains-empty = (none — homeassistant.allowed_domains is empty)
+tool-homeassistant-error-list-entities-failed = Home Assistant list_entities failed ({ $status }): { $body }
+tool-homeassistant-error-get-state-failed = Home Assistant get_state failed ({ $status }): { $body }
+tool-homeassistant-error-call-service-failed = Home Assistant call_service failed ({ $status }): { $body }
+tool-homeassistant-error-call-service-malformed-body = Home Assistant call_service returned a 2xx status with a body that could not be decoded as JSON: { $err }
+tool-homeassistant-error-decode-failed = Home Assistant response could not be decoded as JSON: { $err }
+
 tool-http-request = Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits.
 
 tool-image-info = Read image file metadata (format, dimensions, size) and optionally return base64-encoded data.
