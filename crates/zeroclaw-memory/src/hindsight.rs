@@ -454,8 +454,11 @@ impl HindsightMemory {
             .context("hindsight shared/system retain request failed")?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("hindsight shared/system retain returned HTTP {status}: {text}");
+            // Bound and single-line the remote body exactly like the private
+            // retain/recall/list paths so a large or multiline shared/system
+            // error body cannot flood model-visible output or logs.
+            let body = bounded_error_body(resp).await;
+            anyhow::bail!("hindsight shared/system retain returned HTTP {status}: {body}");
         }
         Ok(())
     }
@@ -1528,6 +1531,34 @@ mod tests {
         mem.store_to_bank("zeroclaw-house", "k", "   ", MemoryCategory::Core, "shared")
             .await
             .expect("empty content should short-circuit");
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_error_body_is_bounded_and_single_line() {
+        // The shared/system write path must bound a large multiline remote error
+        // body exactly like the private retain/recall/list paths, so a failing
+        // shared/system write cannot flood model-visible output or logs.
+        let server = MockServer::start().await;
+        let huge = format!("err-line-one\nerr-line-two\n{}", "Y".repeat(4000));
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        let err = mem
+            .store_to_bank("zeroclaw-house", "k", "v", MemoryCategory::Core, "shared")
+            .await
+            .expect_err("a 500 on the shared write must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("truncated"), "body must be truncated: {msg}");
+        assert!(!msg.contains('\n'), "body must be single-line: {msg:?}");
+        assert!(
+            msg.len() < 700,
+            "error message must be bounded: {}",
+            msg.len()
+        );
     }
 
     #[tokio::test]

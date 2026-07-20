@@ -10752,9 +10752,9 @@ impl HindsightMemoryConfig {
 }
 
 /// Canonical Hindsight API base URL. Single source of truth: the typed config
-/// default and the `zeroclaw-memory` driver (including its `from_env`
-/// compatibility path and tests) both consume this constant, so the base URL
-/// can never drift between the config layer and the driver.
+/// default and the `zeroclaw-memory` driver (including its tests) both consume
+/// this constant, so the base URL can never drift between the config layer and
+/// the driver.
 pub const DEFAULT_HINDSIGHT_BASE_URL: &str = "https://tokengate.appz.cloud/api/embedding/hindsight";
 
 /// Canonical default recall breadth (`top_k`) when a caller passes no limit.
@@ -10764,13 +10764,13 @@ pub const DEFAULT_HINDSIGHT_TOP_K: usize = 5;
 
 /// Canonical name of the environment variable holding the Hindsight bearer
 /// token. Single source of truth shared by the typed config default and the
-/// driver's `from_env` compatibility path.
+/// canonical `from_config` constructor.
 pub const DEFAULT_HINDSIGHT_TOKEN_ENV: &str = "ZC_HINDSIGHT_TOKEN";
 
 /// Canonical per-request timeout (seconds) for every outbound Hindsight HTTP
 /// call. Bounds `store`/`recall`/`list`/`forget`/`count`/health so a stalled
 /// service can never park an agent turn indefinitely. Single source of truth
-/// shared by the typed config default and the driver's `from_env` path.
+/// shared by the typed config default and the canonical `from_config` path.
 pub const DEFAULT_HINDSIGHT_TIMEOUT_SECS: u64 = 30;
 
 /// Whether a Hindsight `base_url` targets a loopback host, for which plaintext
@@ -11614,6 +11614,14 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
+    /// Explicit admin grant to WRITE the system memory tier
+    /// (`system_memory_store`). Deny-by-default (`false`): even an unrestricted
+    /// `allowed_tools` profile does NOT receive system-write power unless this
+    /// is set `true`. This is the fail-closed authority behind the admin-only
+    /// system tier; ordinary `allowed_tools`/`excluded_tools`/read-only posture
+    /// still apply on top. Shared-tier writes stay gated by tool name only.
+    #[serde(default)]
+    pub system_memory_admin: bool,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
     pub sandbox_enabled: Option<bool>,
@@ -11640,6 +11648,7 @@ impl Default for RiskProfileConfig {
             approval_route: None,
             allowed_tools: Vec::new(),
             excluded_tools: Vec::new(),
+            system_memory_admin: false,
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
@@ -20414,6 +20423,13 @@ impl Config {
         // agent's private memory readable/writable by another. Reject any
         // cross-agent private-bank collision at load. Only agents that actually
         // use Hindsight (per-agent enum or the install-wide string) participate.
+        //
+        // The same resolved private-bank set is then reused to reject
+        // shared/system TIER banks that alias ANY agent's private bank: a global
+        // `shared_bank`/`system_bank` equal to (say) Alice's private bank would
+        // let every other agent read and write Alice's private memory as a
+        // shared tier. Validating the complete set (not just the constructing
+        // instance's own bank) closes that cross-agent collision.
         {
             let install_wide_hindsight =
                 self.memory.backend.trim().eq_ignore_ascii_case("hindsight");
@@ -20441,6 +20457,40 @@ impl Config {
                          distinct agents must not share a resolved bank (check bank_id overrides \
                          and bank_template)",
                     );
+                }
+            }
+
+            // Tier banks must not alias any agent's private bank. Skip this when
+            // no agent uses Hindsight (the tiers are then inert). The env-var
+            // fallbacks (`ZC_HINDSIGHT_SHARED_BANK`/`_SYSTEM_BANK`) are resolved
+            // at construction, not load, so only the TOML-configured tier IDs
+            // are validated here; the per-instance `resolve_secondary_bank` drop
+            // still guards an env value that happens to equal the private bank.
+            if !resolved_banks.is_empty() {
+                for (field, tier, configured) in [
+                    (
+                        "shared_bank",
+                        "shared",
+                        self.memory.hindsight.shared_bank_configured(),
+                    ),
+                    (
+                        "system_bank",
+                        "system",
+                        self.memory.hindsight.system_bank_configured(),
+                    ),
+                ] {
+                    if let Some(tier_bank) = configured {
+                        if let Some(owner) = resolved_banks.get(tier_bank) {
+                            validation_bail!(
+                                InvalidFormat,
+                                format!("memory.hindsight.{field}"),
+                                "memory.hindsight.{field} = {tier_bank:?} aliases agents.{owner}'s \
+                                 resolved private Hindsight bank; a {tier} tier bank readable and \
+                                 writable by every agent must never equal any agent's private bank, \
+                                 or that agent's private memory leaks across the whole install",
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -33842,6 +33892,76 @@ allowed_users = []
         config
             .validate()
             .expect("distinct per-agent banks should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_shared_tier_aliasing_another_agents_derived_bank() {
+        // The global shared_bank equals beta's DERIVED private bank
+        // (`zeroclaw-beta`). Every agent (including alpha) reads and writes the
+        // shared tier, so this would expose beta's private memory install-wide.
+        // The collision set must be the COMPLETE resolved private-bank set, not
+        // just the constructing instance's own bank.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.memory.hindsight.shared_bank = "zeroclaw-beta".to_string();
+        let err = config
+            .validate()
+            .expect_err("shared tier aliasing an agent's private bank must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shared_bank") && msg.contains("zeroclaw-beta"),
+            "expected shared-tier collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_system_tier_aliasing_explicit_override_bank() {
+        // The global system_bank equals beta's EXPLICIT bank_id override, which
+        // resolves verbatim. The tier collision check must see explicit
+        // overrides too, not only template-derived banks.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.agents.get_mut("beta").unwrap().memory.bank_id = "beta-private".to_string();
+        config.memory.hindsight.system_bank = "beta-private".to_string();
+        let err = config
+            .validate()
+            .expect_err("system tier aliasing an explicit private bank must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system_bank") && msg.contains("beta-private"),
+            "expected system-tier collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_tier_banks_distinct_from_every_private_bank() {
+        // Shared/system tiers that do not alias any agent's private bank are
+        // accepted (the common, correct configuration).
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.memory.hindsight.shared_bank = "zeroclaw-house".to_string();
+        config.memory.hindsight.system_bank = "zeroclaw-system".to_string();
+        config
+            .validate()
+            .expect("tier banks distinct from all private banks should validate");
     }
 
     #[test]

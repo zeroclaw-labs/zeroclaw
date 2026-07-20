@@ -694,7 +694,11 @@ impl DelegateTool {
                 security.clone(),
             )));
         }
-        if SharedMemoryStoreTool::is_supported(&memory, true) {
+        // System tier: gated by the target's explicit admin grant (fail-closed),
+        // so a bounded delegation cannot rebind system-write power onto a target
+        // whose profile is not authorized for it.
+        if SharedMemoryStoreTool::is_supported(&memory, true) && security.can_write_system_memory()
+        {
             tools.push(Box::new(SharedMemoryStoreTool::new_system(
                 memory.clone(),
                 security.clone(),
@@ -2956,12 +2960,12 @@ mod tests {
 
     #[test]
     fn bounded_delegation_gates_memory_tools_by_target_policy() {
-        // Bounded delegation rebinds memory tools to the target scope. The set
-        // of rebound tools must be gated by the TARGET agent's own policy, not
-        // just the caller's, so a delegated turn cannot gain a memory-write
-        // authority (e.g. `system_memory_store`) the target is not allowed to
-        // run. This mirrors the filter applied in `execute` where the delegated
-        // memory tools are collected.
+        // Bounded delegation rebinds memory tools to the TARGET scope. The
+        // rebound set must be gated by the target agent's own policy inside the
+        // production assembly (`memory_tools_for_target`), not by a filter the
+        // test reconstructs afterward, so a delegated turn cannot gain a
+        // memory-write authority (e.g. `system_memory_store`) the target is not
+        // allowed to run.
         use zeroclaw_memory::HindsightMemory;
 
         let memory: Arc<dyn Memory> = Arc::new(HindsightMemory::for_test(
@@ -2973,35 +2977,62 @@ mod tests {
             "test-token",
         ));
 
-        // Both tiers are supported, so both write tools are constructed.
-        let all_tools = DelegateTool::memory_tools_for_target(memory.clone(), test_security());
-        let all_names: Vec<&str> = all_tools.iter().map(|t| t.name()).collect();
-        assert!(all_names.contains(&"system_memory_store"));
-        assert!(all_names.contains(&"shared_memory_store"));
+        // An ADMIN target (explicit deny-by-default system grant) gets the
+        // system write tool, rebound to the target's own memory. The shared tier
+        // is name-gated and present for any profile.
+        let admin_target = Arc::new(SecurityPolicy {
+            system_memory_admin: true,
+            ..SecurityPolicy::default()
+        });
+        let admin_tools =
+            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&admin_target));
+        let admin_names: Vec<&str> = admin_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            admin_names.contains(&"system_memory_store"),
+            "an admin target must receive the system write tool: {admin_names:?}"
+        );
+        assert!(admin_names.contains(&"shared_memory_store"));
+        assert!(admin_names.contains(&"memory_store"));
 
-        // A target policy that excludes the system tool must drop it from the
-        // rebound set while keeping every other memory tool.
-        let target_policy = Arc::new(SecurityPolicy {
+        // A NON-ADMIN target (the default profile) must NOT receive the
+        // system-write tool from the production assembly itself - no external
+        // filter. This is the real bounded-delegation path: `is_tool_allowed`
+        // would still admit the name, so a test that reapplied that filter would
+        // wrongly pass; the assembly must drop it via the admin authority.
+        let non_admin_target = test_security();
+        let default_tools =
+            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&non_admin_target));
+        let default_names: Vec<String> =
+            default_tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            !default_names.iter().any(|n| n == "system_memory_store"),
+            "a non-admin target must not gain system-write via bounded delegation: {default_names:?}"
+        );
+        assert!(
+            default_names.iter().any(|n| n == "shared_memory_store"),
+            "shared_memory_store (name-gated) must remain for the target: {default_names:?}"
+        );
+        assert!(
+            default_names.iter().any(|n| n == "memory_store"),
+            "ordinary memory tools must remain for the target: {default_names:?}"
+        );
+
+        // An admin whose profile additionally EXCLUDES the tool by name is still
+        // denied: `can_write_system_memory` honors excluded_tools on top of the
+        // grant, so the production assembly drops it.
+        let admin_but_excluded = Arc::new(SecurityPolicy {
+            system_memory_admin: true,
             excluded_tools: Some(vec!["system_memory_store".to_string()]),
             ..SecurityPolicy::default()
         });
-        let gated: Vec<String> =
-            DelegateTool::memory_tools_for_target(memory, Arc::clone(&target_policy))
-                .into_iter()
-                .filter(|tool| target_policy.is_tool_allowed(tool.name()))
-                .map(|tool| tool.name().to_string())
+        let excluded_names: Vec<String> =
+            DelegateTool::memory_tools_for_target(memory, admin_but_excluded)
+                .iter()
+                .map(|t| t.name().to_string())
                 .collect();
         assert!(
-            !gated.iter().any(|n| n == "system_memory_store"),
-            "system_memory_store must be gated out for a target that denies it: {gated:?}"
-        );
-        assert!(
-            gated.iter().any(|n| n == "shared_memory_store"),
-            "shared_memory_store must remain for the target: {gated:?}"
-        );
-        assert!(
-            gated.iter().any(|n| n == "memory_store"),
-            "ordinary memory tools must remain for the target: {gated:?}"
+            !excluded_names.iter().any(|n| n == "system_memory_store"),
+            "excluded_tools must still drop the system tool for an admin: {excluded_names:?}"
         );
     }
 

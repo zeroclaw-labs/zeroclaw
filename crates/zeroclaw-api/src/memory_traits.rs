@@ -248,6 +248,15 @@ pub enum MemoryPolicyDecision {
 ///
 /// Reads of the shared/system tiers need no special trait: they already merge
 /// into ordinary `recall`/`list`.
+///
+/// DEFERRED (tracked, not implemented here): under the `#8891` merge order,
+/// `#8984` may wrap every backend in a `ScannedMemory` decorator. When that
+/// lands, shared/system writes should be forwarded THROUGH the composed
+/// decorator chain so they pass the same fail-closed content scan, redaction,
+/// and memory-policy pipeline as private writes, instead of a raw
+/// `HindsightMemory` implementing this trait directly and bypassing the scan.
+/// This is intentionally NOT done in this slice because `#8984` is still open;
+/// see the PR body's deferred-items note.
 #[async_trait]
 pub trait SharedWritable: Send + Sync {
     /// The configured shared/family bank id, or `None` when no shared tier is

@@ -192,6 +192,16 @@ pub struct SecurityPolicy {
     /// allowed set comes from `allowed_tools` or from the unrestricted
     /// default). `None` and `Some(vec![])` both mean "exclude nothing".
     pub excluded_tools: Option<Vec<String>>,
+    /// Explicit deny-by-default authority to WRITE the system memory tier
+    /// (`system_memory_store`). Unlike ordinary tool admission
+    /// ([`is_tool_allowed`](Self::is_tool_allowed)), which is unrestricted for
+    /// the default/empty `allowed_tools` profile, this grant is `false` by
+    /// default: an agent may write the admin-only system tier ONLY when its risk
+    /// profile explicitly opts in (`risk_profiles.<p>.system_memory_admin =
+    /// true`). This closes the gap where every Hindsight agent received
+    /// `system_memory_store` once a system bank existed. See
+    /// [`can_write_system_memory`](Self::can_write_system_memory).
+    pub system_memory_admin: bool,
     /// Tools that never require approval in this profile. Mirrors
     /// `RiskProfileConfig.auto_approve`.
     pub auto_approve: Vec<String>,
@@ -226,6 +236,20 @@ impl SecurityPolicy {
         self.excluded_tools
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name))
+    }
+
+    /// Whether this policy may write the admin-only SYSTEM memory tier.
+    ///
+    /// Deny-by-default: unlike [`is_tool_allowed`](Self::is_tool_allowed) (which
+    /// admits `system_memory_store` for the unrestricted default profile), the
+    /// system tier requires an explicit `system_memory_admin = true` grant on
+    /// the risk profile AND ordinary tool admission (so `excluded_tools` /
+    /// read-only posture still apply). This is the fail-closed authority the
+    /// `system_memory_store` tool checks before writing, so no non-admin agent
+    /// receives system-write power merely because a system bank is configured.
+    #[must_use]
+    pub fn can_write_system_memory(&self) -> bool {
+        self.system_memory_admin && self.is_tool_allowed("system_memory_store")
     }
 }
 
@@ -497,6 +521,7 @@ impl Default for SecurityPolicy {
             shell_timeout_secs: 60,
             allowed_tools: None,
             excluded_tools: None,
+            system_memory_admin: false,
             auto_approve: vec![],
             always_ask: vec![],
             sandbox_enabled: None,
@@ -2189,6 +2214,7 @@ impl SecurityPolicy {
             } else {
                 Some(risk_profile.excluded_tools.clone())
             },
+            system_memory_admin: risk_profile.system_memory_admin,
             auto_approve: risk_profile.auto_approve.clone(),
             always_ask: risk_profile.always_ask.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
@@ -2512,14 +2538,23 @@ mod tests {
     }
 
     #[test]
-    fn is_tool_allowed_gates_shared_and_system_memory_writes_by_name() {
-        // The shared/system memory write tiers are gated by tool NAME, the same
-        // mechanism as any native tool. An unconstrained profile has both; a
-        // profile that excludes system keeps shared but loses system; a
-        // non-empty allowlist admits only the listed tier.
+    fn shared_write_is_gated_by_name_but_system_write_needs_admin_grant() {
+        // The SHARED tier is gated by tool NAME like any native tool: an
+        // unconstrained profile has it; excluding or allowlisting adjusts it.
+        // The SYSTEM tier is different: `is_tool_allowed` admission is NOT the
+        // admin grant. Even an unrestricted profile must be denied system-write
+        // authority unless `system_memory_admin` is explicitly set, so a default
+        // Hindsight agent never receives system-write power once a system bank
+        // exists.
         let unconstrained = SecurityPolicy::default();
         assert!(unconstrained.is_tool_allowed("shared_memory_store"));
+        // Name admission alone still returns true (it is not the authority)...
         assert!(unconstrained.is_tool_allowed("system_memory_store"));
+        // ...but the deny-by-default authority refuses the write.
+        assert!(
+            !unconstrained.can_write_system_memory(),
+            "default/unrestricted profile must NOT be able to write system memory"
+        );
 
         let shared_not_system = SecurityPolicy {
             excluded_tools: Some(vec!["system_memory_store".into()]),
@@ -2527,6 +2562,7 @@ mod tests {
         };
         assert!(shared_not_system.is_tool_allowed("shared_memory_store"));
         assert!(!shared_not_system.is_tool_allowed("system_memory_store"));
+        assert!(!shared_not_system.can_write_system_memory());
 
         let only_shared = SecurityPolicy {
             allowed_tools: Some(vec!["memory_recall".into(), "shared_memory_store".into()]),
@@ -2535,6 +2571,35 @@ mod tests {
         assert!(only_shared.is_tool_allowed("shared_memory_store"));
         assert!(!only_shared.is_tool_allowed("system_memory_store"));
         assert!(!only_shared.is_tool_allowed("memory_store"));
+
+        // The explicit admin grant confers system-write authority, but ordinary
+        // admission still applies on top: excluding the tool name or omitting it
+        // from a non-empty allowlist re-denies it even for an admin.
+        let admin = SecurityPolicy {
+            system_memory_admin: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(admin.can_write_system_memory());
+
+        let admin_but_excluded = SecurityPolicy {
+            system_memory_admin: true,
+            excluded_tools: Some(vec!["system_memory_store".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !admin_but_excluded.can_write_system_memory(),
+            "excluded_tools must still subtract even from an admin grant"
+        );
+
+        let admin_but_not_listed = SecurityPolicy {
+            system_memory_admin: true,
+            allowed_tools: Some(vec!["memory_recall".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !admin_but_not_listed.can_write_system_memory(),
+            "a non-empty allowlist omitting the tool must still deny it"
+        );
     }
 
     #[test]
@@ -2581,6 +2646,7 @@ mod tests {
             approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
+            system_memory_admin: true,
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
@@ -2588,6 +2654,10 @@ mod tests {
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
 
+        assert!(
+            policy.system_memory_admin,
+            "system_memory_admin grant must flow through from_profiles"
+        );
         assert_eq!(policy.autonomy, AutonomyLevel::ReadOnly, "level → autonomy");
         assert!(policy.workspace_only, "workspace_only");
         assert_eq!(policy.allowed_commands, vec!["only_this".to_string()]);

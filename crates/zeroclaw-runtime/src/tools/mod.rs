@@ -674,7 +674,11 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
     }
-    if SharedMemoryStoreTool::is_supported(&memory, true) {
+    // The system tier additionally requires the explicit deny-by-default admin
+    // grant. Registering it only for authorized profiles keeps a non-admin
+    // agent from ever seeing a tool it could only ever be refused (the tool
+    // also re-checks `can_write_system_memory` at execute time, fail-closed).
+    if SharedMemoryStoreTool::is_supported(&memory, true) && security.can_write_system_memory() {
         tool_arcs.push(Arc::new(SharedMemoryStoreTool::new_system(
             memory.clone(),
             security.clone(),
