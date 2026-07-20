@@ -295,4 +295,411 @@ mod tests {
         );
         assert!(result.history_entry.ends_with('…'));
     }
+
+    #[test]
+    fn strip_media_markers_replaces_all_marker_kinds() {
+        let text = "see [IMAGE:/a.png] [DOCUMENT:/b.pdf] [FILE:/c.txt] \
+                    [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.mp3] done";
+        let stripped = strip_media_markers(text);
+        assert_eq!(
+            stripped,
+            "see [media attachment] [media attachment] [media attachment] \
+             [media attachment] [media attachment] [media attachment] done"
+        );
+    }
+
+    #[test]
+    fn strip_media_markers_leaves_other_text_unchanged() {
+        let text = "plain sentence with [NOTE:keep me] and no media tags";
+        assert_eq!(strip_media_markers(text), text);
+    }
+}
+
+#[cfg(test)]
+mod consolidate_turn_tests {
+    use super::*;
+    use crate::sqlite::SqliteMemory;
+    use crate::traits::MemoryEntry;
+    use async_trait::async_trait;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_config::schema::MemoryDedupAction;
+
+    /// Scripted model: returns a canned consolidation reply (or fails) and
+    /// records the prompt it was sent, so tests can assert on the outbound
+    /// text without any network access.
+    struct ScriptedProvider {
+        reply: Option<String>,
+        last_prompt: Mutex<Option<String>>,
+    }
+
+    impl ScriptedProvider {
+        fn replying(reply: &str) -> Self {
+            Self {
+                reply: Some(reply.to_string()),
+                last_prompt: Mutex::new(None),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                reply: None,
+                last_prompt: Mutex::new(None),
+            }
+        }
+
+        fn update_reply(update: &str) -> Self {
+            Self::replying(
+                &serde_json::json!({
+                    "history_entry": "Turn summary.",
+                    "memory_update": update,
+                })
+                .to_string(),
+            )
+        }
+
+        fn last_prompt(&self) -> Option<String> {
+            self.last_prompt.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            *self.last_prompt.lock().unwrap() = Some(message.to_string());
+            match &self.reply {
+                Some(reply) => Ok(reply.clone()),
+                None => anyhow::bail!("scripted provider failure"),
+            }
+        }
+    }
+
+    impl Attributable for ScriptedProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "ScriptedProvider"
+        }
+    }
+
+    async fn run(
+        provider: &ScriptedProvider,
+        memory: &SqliteMemory,
+        cfg: &MemoryConfig,
+    ) -> anyhow::Result<()> {
+        consolidate_turn(
+            provider,
+            "test-model",
+            None,
+            memory,
+            cfg,
+            "user message",
+            "assistant response",
+        )
+        .await
+    }
+
+    async fn count(memory: &SqliteMemory, category: MemoryCategory) -> u64 {
+        memory.count_in_scope(None, Some(&category)).await.unwrap()
+    }
+
+    fn open_db(workspace: &Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(workspace.join("memory").join("brain.db")).unwrap()
+    }
+
+    fn superseded_by(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT superseded_by FROM memories WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    async fn store_core_fact(memory: &SqliteMemory, key: &str, content: &str) {
+        memory
+            .store_with_options(
+                key,
+                content,
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_namespace("default"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persists_history_and_core_update() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let provider = ScriptedProvider::update_reply("User tracks budgets in TOML files.");
+
+        run(&provider, &memory, &MemoryConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(count(&memory, MemoryCategory::Daily).await, 1);
+        assert_eq!(count(&memory, MemoryCategory::Core).await, 1);
+
+        let conn = open_db(tmp.path());
+        let (content, importance): (String, Option<f64>) = conn
+            .query_row(
+                "SELECT content, importance FROM memories \
+                 WHERE category = 'core' AND key LIKE 'core_%'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content, "User tracks budgets in TOML files.");
+        assert!(
+            importance.is_some(),
+            "core writes carry a computed importance"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_memory_update_writes_history_only() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let provider = ScriptedProvider::replying(
+            r#"{"history_entry": "Routine greeting.", "memory_update": null}"#,
+        );
+
+        run(&provider, &memory, &MemoryConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(count(&memory, MemoryCategory::Daily).await, 1);
+        assert_eq!(count(&memory, MemoryCategory::Core).await, 0);
+    }
+
+    #[tokio::test]
+    async fn media_markers_are_stripped_from_the_outbound_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let provider = ScriptedProvider::replying(
+            r#"{"history_entry": "Reviewed an image.", "memory_update": null}"#,
+        );
+
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &memory,
+            &MemoryConfig::default(),
+            "please review [IMAGE:/home/user/private/cat.png]",
+            "described the picture in [DOCUMENT:/tmp/notes.pdf]",
+        )
+        .await
+        .unwrap();
+
+        let prompt = provider.last_prompt().expect("model must be called");
+        assert!(prompt.contains("[media attachment]"));
+        assert!(
+            !prompt.contains("/home/user/private/cat.png"),
+            "local paths must not reach the model"
+        );
+        assert!(!prompt.contains("/tmp/notes.pdf"));
+        assert!(prompt.contains("User:"));
+        assert!(prompt.contains("Assistant:"));
+    }
+
+    #[tokio::test]
+    async fn dedup_reject_skips_duplicate_core_update() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let fact = "User prefers Rust for systems work";
+        store_core_fact(&memory, "existing_fact", fact).await;
+
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            ..MemoryConfig::default()
+        };
+        let provider = ScriptedProvider::update_reply(fact);
+
+        run(&provider, &memory, &cfg).await.unwrap();
+
+        assert_eq!(
+            count(&memory, MemoryCategory::Core).await,
+            1,
+            "exact duplicate is rejected, only the pre-existing row remains"
+        );
+        let conn = open_db(tmp.path());
+        let new_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key LIKE 'core_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_rows, 0, "no consolidation-keyed row was written");
+    }
+
+    #[tokio::test]
+    async fn dedup_merge_folds_update_into_the_survivor() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let survivor = "User prefers Rust for systems work";
+        let update = "User prefers Rust for systems programming work";
+        store_core_fact(&memory, "fact_rust", survivor).await;
+
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            dedup_action: MemoryDedupAction::Merge,
+            dedup_jaccard_threshold: 0.5,
+            ..MemoryConfig::default()
+        };
+        let provider = ScriptedProvider::update_reply(update);
+
+        run(&provider, &memory, &cfg).await.unwrap();
+
+        assert_eq!(count(&memory, MemoryCategory::Core).await, 1);
+        let merged: MemoryEntry = memory.get("fact_rust").await.unwrap().unwrap();
+        assert_eq!(
+            merged.content,
+            format!("{update}\n{survivor}"),
+            "near-duplicate is folded into the survivor row in place"
+        );
+    }
+
+    /// Keyword-only recall scores come from BM25, which needs corpus
+    /// contrast: in a corpus where every document contains the query terms
+    /// the IDF collapses to ~0 and conflict scores become meaningless.
+    /// Seed unrelated facts so the conflicting row scores above threshold.
+    async fn seed_filler_facts(memory: &SqliteMemory) {
+        store_core_fact(memory, "filler_editor", "Preferred editor is Helix").await;
+        store_core_fact(memory, "filler_tz", "Timezone offset UTC plus ten").await;
+        store_core_fact(memory, "filler_lang", "Speaks French and Japanese").await;
+        store_core_fact(memory, "filler_ci", "CI provider is Buildkite").await;
+    }
+
+    fn live_rows_with_content(conn: &rusqlite::Connection, content: &str) -> u64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE content = ?1 AND superseded_by IS NULL",
+            rusqlite::params![content],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn conflict_supersede_marks_the_loser_reversibly() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed_filler_facts(&memory).await;
+        store_core_fact(
+            &memory,
+            "stale_fact",
+            "User deploys the app on Fridays every week",
+        )
+        .await;
+
+        let cfg = MemoryConfig {
+            // Keyword-only scores vary with corpus statistics; a low
+            // threshold keeps the conflict decision deterministic here.
+            conflict_threshold: 0.01,
+            ..MemoryConfig::default()
+        };
+        assert!(
+            cfg.conflict_supersede_enabled,
+            "supersede must be the default"
+        );
+        let update = "User deploys the app on Mondays every week";
+        let provider = ScriptedProvider::update_reply(update);
+
+        run(&provider, &memory, &cfg).await.unwrap();
+
+        let conn = open_db(tmp.path());
+        let marker = superseded_by(&conn, "stale_fact")
+            .expect("conflicting row is reversibly soft-hidden, not deleted");
+        assert!(
+            marker.starts_with("core_"),
+            "superseded_by points at the winning consolidation write"
+        );
+        assert_eq!(
+            live_rows_with_content(&conn, update),
+            1,
+            "the winning update is stored live"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersede_disabled_leaves_conflicting_rows_live() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed_filler_facts(&memory).await;
+        store_core_fact(
+            &memory,
+            "stale_fact",
+            "User deploys the app on Fridays every week",
+        )
+        .await;
+
+        let cfg = MemoryConfig {
+            conflict_threshold: 0.01,
+            conflict_supersede_enabled: false,
+            ..MemoryConfig::default()
+        };
+        let update = "User deploys the app on Mondays every week";
+        let provider = ScriptedProvider::update_reply(update);
+
+        run(&provider, &memory, &cfg).await.unwrap();
+
+        let conn = open_db(tmp.path());
+        assert!(
+            superseded_by(&conn, "stale_fact").is_none(),
+            "flag off: the conflicting row stays visible"
+        );
+        assert_eq!(live_rows_with_content(&conn, update), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_gate_rejection_bails_the_core_write() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+
+        let mut cfg = MemoryConfig::default();
+        cfg.policy.read_only_namespaces = vec!["default".into()];
+        let provider = ScriptedProvider::update_reply("User uses zsh.");
+
+        let err = run(&provider, &memory, &cfg)
+            .await
+            .expect_err("policy violation must fail the consolidation write");
+        assert!(err.to_string().contains("denied by policy"));
+
+        assert_eq!(
+            count(&memory, MemoryCategory::Daily).await,
+            1,
+            "the history entry precedes the gate and is kept"
+        );
+        assert_eq!(
+            count(&memory, MemoryCategory::Core).await,
+            0,
+            "the gated core write never lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_failure_aborts_before_any_write() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let provider = ScriptedProvider::failing();
+
+        let result = run(&provider, &memory, &MemoryConfig::default()).await;
+
+        assert!(result.is_err());
+        assert_eq!(count(&memory, MemoryCategory::Daily).await, 0);
+        assert_eq!(count(&memory, MemoryCategory::Core).await, 0);
+    }
 }
