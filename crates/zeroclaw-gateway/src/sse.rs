@@ -171,6 +171,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 messages_count,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let mut json = serde_json::json!({
@@ -183,6 +184,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 });
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
@@ -192,6 +194,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 success,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
                 ..
             } => {
@@ -205,6 +208,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 });
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
@@ -212,6 +216,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 tool,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
                 ..
             } => {
@@ -223,6 +228,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 });
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
@@ -353,6 +359,7 @@ mod tests {
         let (obs, mut rx, buffer) = make_broadcast();
 
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: std::time::Duration::from_millis(42),
@@ -379,6 +386,7 @@ mod tests {
         let (obs, mut rx, _buffer) = make_broadcast();
 
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "mcp_filesystem__read_file".into(),
             tool_call_id: None,
             arguments: None,
@@ -519,6 +527,7 @@ mod tests {
 
         let cases: Vec<ObserverEvent> = vec![
             ObserverEvent::LlmRequest {
+                parent_agent_alias: None,
                 model_provider: "p".into(),
                 model: "m".into(),
                 messages_count: 0,
@@ -527,6 +536,7 @@ mod tests {
                 turn_id: None,
             },
             ObserverEvent::ToolCall {
+                parent_agent_alias: None,
                 tool: "shell".into(),
                 tool_call_id: None,
                 duration: std::time::Duration::from_millis(1),
@@ -538,6 +548,7 @@ mod tests {
                 turn_id: None,
             },
             ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
                 tool: "shell".into(),
                 tool_call_id: None,
                 arguments: None,
@@ -606,6 +617,7 @@ mod tests {
         let observer = zeroclaw_runtime::observability::create_observer(&cfg);
 
         observer.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: std::time::Duration::from_millis(7),

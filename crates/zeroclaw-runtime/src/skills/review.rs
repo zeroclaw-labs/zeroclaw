@@ -149,6 +149,7 @@ pub async fn maybe_run_skill_review(
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias,
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .await

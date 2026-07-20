@@ -2931,6 +2931,7 @@ async fn handle_webhook(
             messages_count: 1,
             channel: Some(channel_name.to_string()),
             agent_alias: agent_alias.map(|s| s.to_string()),
+            parent_agent_alias: None,
             turn_id: Some(turn_id.clone()),
         },
     );
@@ -2968,6 +2969,7 @@ async fn handle_webhook(
                     output_tokens,
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
+                    parent_agent_alias: None,
                     turn_id: Some(turn_id.clone()),
                     messages: None,
                 },
@@ -3006,6 +3008,7 @@ async fn handle_webhook(
                     output_tokens: None,
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
+                    parent_agent_alias: None,
                     turn_id: Some(turn_id.clone()),
                     messages: None,
                 },

@@ -2497,21 +2497,18 @@ impl Agent {
                         }),
                         ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
                         turn_id: &turn_id,
                         // Live-daemon SOP path: re-assemble a nested step's agent
                         // when it delegates elsewhere. Config survives only via
-                        // `provider_switch_config`; `None` (test builder) falls
-                        // back to the parent context.
+                        // `provider_switch_config`; with `None` (test builder) a
+                        // cross-agent step FAILS CLOSED rather than inheriting
+                        // this turn's context.
                         sop_reassembly: self
                             .provider_switch_config
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly {
-                                config,
-                                // Top of the tree: baseline is the agent this
-                                // live-daemon turn runs as.
-                                baseline_alias: agent_alias_for_loop.as_deref(),
-                            }),
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
                     }),
                 ),
             )
@@ -2889,21 +2886,18 @@ impl Agent {
                             }),
                             ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),
+                            parent_agent_alias: None,
                             turn_id: &turn_id,
                             // Live-daemon SOP path: re-assemble a nested step's
                             // agent when it delegates elsewhere. Config survives
-                            // only via `provider_switch_config`; `None` (test
-                            // builder) falls back to the parent context.
+                            // only via `provider_switch_config`; with `None`
+                            // (test builder) a cross-agent step FAILS CLOSED
+                            // rather than inheriting this turn's context.
                             sop_reassembly: self
                                 .provider_switch_config
                                 .as_ref()
                                 .and_then(|c| c.config.as_deref())
-                                .map(|config| crate::agent::turn::SopStepReassembly {
-                                    config,
-                                    // Top of the tree: baseline is the agent this
-                                    // live-daemon turn runs as.
-                                    baseline_alias: agent_alias_for_loop.as_deref(),
-                                }),
+                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
                         }),
                     ),
                 )

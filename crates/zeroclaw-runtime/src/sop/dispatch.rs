@@ -944,6 +944,7 @@ mod tests {
             eng.advance_step(
                 &run_id,
                 crate::sop::types::SopStepResult {
+                    effective_agent: None,
                     step_number: 1,
                     status: crate::sop::types::SopStepStatus::Completed,
                     output: "done".into(),

@@ -129,12 +129,17 @@ const MATRIX: &[ParityRow] = &[
         // delegates to a different agent re-assembles THAT agent's context
         // through the one ScopedToolRegistry::assemble seam (via
         // assemble_owned_execution), so the step runs with the step agent's own
-        // gated tools/policy/MCP scope rather than the parent turn's broader one.
-        // Backed by an in-file positive parity test.
+        // gated tools/policy/MCP scope, provider binding, runtime controls, and
+        // an isolated child transcript rather than the parent turn's. Backed by
+        // the seam-level test here plus loop-boundary regressions in
+        // `agent::turn::sop_step_reassembly_tests` that drive the REAL nested
+        // loop with distinct parent/child providers (history isolation, child
+        // filter-group narrowing of offered tool specs, audit identity, and
+        // fail-closed guards).
         status: RowStatus::Tested,
-        evidence: "parity_l2_sop_live_step_agent_isolation \
-                   (positive parity assertion: the SOP-live re-assembly resolves the \
-                   step agent's tool set through the same seam)",
+        evidence: "parity_l2_sop_live_step_agent_isolation (seam-level tool-set parity) + \
+                   sop_step_reassembly_tests::cross_agent_step_* (through the live \
+                   nested loop boundary)",
     },
 ];
 
@@ -198,6 +203,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
     let (dtx, _drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = run_tool_call_loop(ToolLoop {
+        parent_agent_alias: None,
         sop_reassembly: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -438,6 +444,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
         &config,
         "restricted",
         Arc::clone(&engine),
+        None,
         None,
     )
     .await

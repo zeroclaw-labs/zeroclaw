@@ -221,6 +221,7 @@ async fn drive_headless_run(
                         output,
                         started_at,
                         completed_at: Some(completed_at),
+                        effective_agent: Some(agent_alias.clone()),
                         tool_calls: Vec::new(),
                     },
                     Err(e) => SopStepResult {
@@ -229,6 +230,7 @@ async fn drive_headless_run(
                         output: e.to_string(),
                         started_at,
                         completed_at: Some(completed_at),
+                        effective_agent: Some(agent_alias.clone()),
                         tool_calls: Vec::new(),
                     },
                 };
@@ -489,6 +491,7 @@ mod tests {
             &engine,
             &run_id,
             SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "ok".to_string(),
