@@ -3018,8 +3018,11 @@ mod tests {
         // would still admit the name, so a test that reapplied that filter would
         // wrongly pass; the assembly must drop it via the admin authority.
         let non_admin_target = test_security();
-        let default_tools =
-            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&non_admin_target), 25);
+        let default_tools = DelegateTool::memory_tools_for_target(
+            memory.clone(),
+            Arc::clone(&non_admin_target),
+            25,
+        );
         let default_names: Vec<String> =
             default_tools.iter().map(|t| t.name().to_string()).collect();
         assert!(

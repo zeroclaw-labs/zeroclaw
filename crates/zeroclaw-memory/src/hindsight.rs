@@ -187,18 +187,17 @@ fn resolve_secondary_bank(
 /// Env var restricting recall to specific Hindsight fact types (comma-separated).
 const RECALL_TYPES_ENV: &str = "ZC_HINDSIGHT_RECALL_TYPES";
 
-/// Parse `ZC_HINDSIGHT_RECALL_TYPES` (comma-separated fact types) into a trimmed,
-/// non-empty-token list. Returns `None` when the var is unset so callers can
-/// fall back to typed config; returns `Some(vec![])` when the var is set but
-/// blank so an explicit empty override disables the filter.
+/// Split `ZC_HINDSIGHT_RECALL_TYPES` (comma-separated fact types) into raw
+/// tokens. Returns `None` when the var is unset so callers fall back to typed
+/// config; returns `Some(tokens)` when the var is set (even if blank, yielding an
+/// explicit empty override that disables the filter). Trimming, blank-dropping,
+/// and fact-type validation are all delegated to
+/// [`HindsightMemoryConfig::normalize_recall_types`] so the env and TOML paths
+/// share exactly one validator.
 fn recall_types_from_env() -> Option<Vec<String>> {
-    std::env::var(RECALL_TYPES_ENV).ok().map(|raw| {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
+    std::env::var(RECALL_TYPES_ENV)
+        .ok()
+        .map(|raw| raw.split(',').map(str::to_string).collect())
 }
 
 impl HindsightMemory {
@@ -271,8 +270,23 @@ impl HindsightMemory {
         };
 
         // Recall type filter: an explicit env override (comma-separated) wins,
-        // else the typed config value. Empty means "no filter" (all types).
-        let recall_types = recall_types_from_env().unwrap_or_else(|| cfg.recall_types.clone());
+        // else the typed config value. BOTH sources are routed through the one
+        // normalizing validator (`HindsightMemoryConfig::normalize_recall_types`)
+        // so an invalid env value (e.g. a typo like `observations`) fails at
+        // startup exactly like an invalid TOML value, instead of being silently
+        // sent on every recall. The typed config was already validated by
+        // `validate_self` above; the env value is validated here. Empty means
+        // "no filter" (all types).
+        let recall_types = match recall_types_from_env() {
+            Some(raw) => HindsightMemoryConfig::normalize_recall_types(raw).map_err(|bad| {
+                anyhow::anyhow!(
+                    "environment variable {RECALL_TYPES_ENV} contains an invalid Hindsight \
+                     fact type {bad:?}; must be a comma-separated list of experience, \
+                     observation, world"
+                )
+            })?,
+            None => cfg.recall_types.clone(),
+        };
 
         Ok(Self {
             alias: agent_alias.to_string(),
@@ -504,6 +518,14 @@ impl HindsightMemory {
     }
 
     /// List a single named bank.
+    ///
+    /// The Hindsight list endpoint has no server-side `types` filter, so when
+    /// `recall_types` is configured the filter is applied LOCALLY on each row's
+    /// fact type here. This makes the recent-recall (empty/`*` query) path -
+    /// which falls back to `list` - honor the same type restriction as the
+    /// query-based `recall` path, instead of returning every fact type. A row
+    /// with no server-provided type is KEPT so unlabeled/legacy history is never
+    /// silently dropped by the filter.
     async fn list_bank(&self, bank: &str) -> Result<Vec<MemoryEntry>> {
         let resp = self
             .client
@@ -524,8 +546,26 @@ impl HindsightMemory {
         Ok(parsed
             .items
             .into_iter()
+            .filter(|i| self.fact_type_allowed(i.fact_type.as_deref()))
             .map(|i| Self::to_entry(i.id, i.text, i.context, i.mentioned_at, &i.tags, None))
             .collect())
+    }
+
+    /// Whether a row with the given server fact type passes the configured
+    /// `recall_types` filter. No configured filter admits everything; a row
+    /// whose type is absent is admitted (legacy/unlabeled rows are never
+    /// silently dropped); otherwise the type must be in the configured set.
+    fn fact_type_allowed(&self, fact_type: Option<&str>) -> bool {
+        if self.recall_types.is_empty() {
+            return true;
+        }
+        match fact_type {
+            None => true,
+            Some(ft) => {
+                let ft = ft.trim();
+                self.recall_types.iter().any(|t| t == ft)
+            }
+        }
     }
 }
 
@@ -609,6 +649,13 @@ struct ListItem {
     /// `MemoryCategory` (see [`RecallResult::tags`]).
     #[serde(default)]
     tags: Vec<String>,
+    /// The server's Hindsight fact type (`experience`/`observation`/`world`).
+    /// The list endpoint has no server-side `types` filter, so the recent-recall
+    /// (empty/`*` query) path filters on this value locally to honor the
+    /// configured `recall_types`. Absent on older rows; a missing type is kept
+    /// so unlabeled history is never silently dropped.
+    #[serde(default, rename = "type")]
+    fact_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1194,6 +1241,107 @@ mod tests {
         let hits = mem.recall("*", 10, None, None, None).await.expect("list");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].content, "first");
+    }
+
+    #[test]
+    fn recall_types_env_and_config_share_one_normalizing_validator() {
+        // The driver's `from_config` routes the `ZC_HINDSIGHT_RECALL_TYPES` env
+        // override through `HindsightMemoryConfig::normalize_recall_types` - the
+        // SAME validator `validate_self` applies to the TOML value. Rather than
+        // mutate the process-global env var (which would race parallel
+        // `from_config` tests), assert the shared validator directly: an invalid
+        // env-style token is rejected exactly like an invalid TOML token, and
+        // whitespace normalizes identically for both sources.
+        use zeroclaw_config::schema::HindsightMemoryConfig;
+        // env-style comma split (what recall_types_from_env yields) with a typo.
+        let env_tokens: Vec<String> = "observations, world"
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let err = HindsightMemoryConfig::normalize_recall_types(&env_tokens)
+            .expect_err("an invalid env token must be rejected");
+        assert_eq!(err, "observations");
+        // Valid env-style value normalizes to the same canonical vec a TOML
+        // value would.
+        let ok_tokens: Vec<String> = " world , experience "
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let normalized = HindsightMemoryConfig::normalize_recall_types(&ok_tokens)
+            .expect("valid env value must normalize");
+        assert_eq!(
+            normalized,
+            vec!["world".to_string(), "experience".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_query_recall_honors_recall_types_on_list() {
+        // The recent-recall (empty query) path falls back to `list`, which has
+        // no server-side type filter. With recall_types configured, mixed fact
+        // types returned by list must be filtered locally so an
+        // observations-only agent does not receive experience/world rows. A row
+        // with no server type is kept (legacy/unlabeled history).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "obs", "text": "kept-observation", "type": "observation", "context": "c" },
+                    { "id": "exp", "text": "dropped-experience", "type": "experience", "context": "c" },
+                    { "id": "wor", "text": "dropped-world", "type": "world", "context": "c" },
+                    { "id": "leg", "text": "kept-legacy-untyped", "context": "c" }
+                ],
+                "total": 4
+            })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.recall_types = vec!["observation".to_string()];
+        // Empty query -> list fallback; only observation + untyped survive.
+        let hits = mem.recall("", 10, None, None, None).await.expect("list");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"obs"),
+            "observation row must be kept: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"leg"),
+            "untyped legacy row must be kept: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"exp") && !ids.contains(&"wor"),
+            "experience/world rows must be dropped by the type filter: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn star_query_recall_honors_recall_types_with_mixed_types() {
+        // Same as above via the bare `*` recent-recall alias, proving the
+        // normalized empty/`*` branch applies the filter (regression for the
+        // `*` case specifically).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "w", "text": "world-fact", "type": "world", "context": "c" },
+                    { "id": "e", "text": "exp-fact", "type": "experience", "context": "c" }
+                ],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.recall_types = vec!["world".to_string(), "experience".to_string()];
+        let hits = mem.recall("*", 10, None, None, None).await.expect("list");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"w") && ids.contains(&"e"),
+            "both configured types must survive: {ids:?}"
+        );
     }
 
     #[tokio::test]

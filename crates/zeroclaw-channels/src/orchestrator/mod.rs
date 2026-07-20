@@ -617,6 +617,30 @@ fn scope_override_key(
     sanitize_session_key(&raw)
 }
 
+/// Build the per-turn memory-injection config for the channel-orchestrator
+/// dispatch path from the agent's RESOLVED recall/render caps.
+///
+/// The channel path previously used `MemoryInjectConfig` defaults (recall limit
+/// 5, render cap 4) plus only `min_relevance_score`, so a hindsight agent whose
+/// `top_k` (or runtime-profile `memory_recall_limit`) requested deeper recall
+/// still received only five records, and a fact ranked past the default render
+/// cap never surfaced. Resolving both caps here threads the same effective depth
+/// the direct/daemon paths use into the channel context. Extracted as a small
+/// helper so the resolution is unit-testable without standing up a full
+/// orchestrator.
+fn channel_memory_inject_cfg(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    min_relevance_score: f64,
+) -> zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+    zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+        limit: config.effective_memory_recall_limit(agent_alias),
+        min_relevance_score,
+        max_entries: config.effective_memory_inject_max_entries(),
+        ..Default::default()
+    }
+}
+
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
     if is_matrix_channel_name(&msg.channel) {
         msg.thread_ts.clone()
@@ -5398,10 +5422,19 @@ async fn process_channel_message_body(
                     query: msg.content.clone(),
                     sessions: memory_sessions.clone(),
                     suppress: false,
-                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
-                        min_relevance_score: ctx.min_relevance_score,
-                        ..Default::default()
-                    },
+                    // Thread the agent's RESOLVED recall depth and render cap
+                    // into the channel context. Previously this used
+                    // MemoryInjectConfig defaults (limit 5, max_entries 4),
+                    // ignoring effective_memory_recall_limit()/
+                    // effective_memory_inject_max_entries(), so a hindsight agent
+                    // whose top_k requested deeper recall got only 5 records and
+                    // a fact ranked past the default cap never surfaced on the
+                    // channel/Telegram path.
+                    cfg: channel_memory_inject_cfg(
+                        &ctx.prompt_config,
+                        ctx.agent_alias.as_str(),
+                        ctx.min_relevance_score,
+                    ),
                 }),
                 ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
@@ -11113,6 +11146,42 @@ mod tests {
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
         );
+    }
+
+    #[test]
+    fn channel_memory_inject_cfg_threads_resolved_recall_depth() {
+        // Regression: the channel-orchestrator dispatch path must build its
+        // MemoryInjectConfig from the agent's RESOLVED recall/render caps, not
+        // the MemoryInjectConfig defaults (limit 5 / max_entries 4). A hindsight
+        // agent whose top_k asks for deeper recall must have that depth reach the
+        // injection assembler on the channel path.
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "scout".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config.agents.get_mut("scout").unwrap().memory.backend = MemoryBackendKind::Hindsight;
+        // top_k drives the effective recall limit for a hindsight agent with no
+        // runtime-profile override; raise the render cap opt-in.
+        config.memory.hindsight.top_k = 17;
+        config.memory.inject_max_entries = 9;
+
+        let cfg = super::channel_memory_inject_cfg(&config, "scout", 0.3);
+        assert_eq!(
+            cfg.limit, 17,
+            "resolved recall depth (top_k) must reach the channel assembler"
+        );
+        assert_eq!(
+            cfg.max_entries, 9,
+            "resolved inject render cap must reach the channel assembler"
+        );
+        assert!((cfg.min_relevance_score - 0.3).abs() < 1e-9);
+        // Sanity: this is NOT the default limit/cap.
+        let default_cfg = zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::default();
+        assert_ne!(cfg.limit, default_cfg.limit);
+        assert_ne!(cfg.max_entries, default_cfg.max_entries);
     }
 
     #[tokio::test]

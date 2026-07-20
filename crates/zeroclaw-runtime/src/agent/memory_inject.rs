@@ -16,14 +16,14 @@ use crate::util::truncate_with_ellipsis;
 
 /// Default recall limit per session (all legacy paths used 5).
 pub const DEFAULT_RECALL_LIMIT: usize = 5;
-/// Default cap on rendered entries. Was 4 (the channel renderer's original
-/// budget), which silently dropped deeper-ranked-but-relevant facts (e.g. a
-/// birthday ranking ~#12) on the channel/daemon injection path. Raised to match
-/// the config-driven `[memory] inject_max_entries` default so the fallback used
-/// when no config is threaded is no longer surprisingly small. The live daemon/
-/// channel paths always pass the config value; this constant is the builder/
-/// test fallback and the two stay in sync intentionally.
-pub const DEFAULT_MAX_ENTRIES: usize = 12;
+/// Default cap on rendered entries. Preserves the pre-existing global default
+/// (4); it is NOT flipped by this stack. The config-driven `[memory]
+/// inject_max_entries` key lets an operator raise the cap opt-in (routing any
+/// opinionated default increase to #8995 with project-wide evidence, per the
+/// #8891 merge-gate decision). The live daemon/channel paths always pass the
+/// resolved config value; this constant is the builder/test fallback and the two
+/// stay in sync intentionally.
+pub const DEFAULT_MAX_ENTRIES: usize = 4;
 /// Default per-entry character cap before ellipsis truncation.
 pub const DEFAULT_ENTRY_MAX_CHARS: usize = 800;
 /// Default total character budget for the rendered block.
@@ -709,9 +709,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_max_entries_now_admits_a_fifth_entry() {
-        // The default cap rose from 4 to DEFAULT_MAX_ENTRIES; a 5th entry that
-        // the old default dropped now renders under the new default.
+    async fn default_max_entries_preserves_the_cap_of_four() {
+        // The global default cap is PRESERVED at 4 (the stack does not flip it);
+        // a 5th entry is dropped under the default, matching pre-existing
+        // behavior. Raising the cap is opt-in via `max_entries`
+        // (`[memory] inject_max_entries`).
         let mem = FixtureMemory::with(vec![
             entry("a", "one", MemoryCategory::Core, None),
             entry("b", "two", MemoryCategory::Core, None),
@@ -731,7 +733,20 @@ mod tests {
         )
         .await;
 
-        assert!(context.contains("- e: five"));
+        // The 4-entry default keeps the first four and drops the fifth.
+        assert!(context.contains("- d: four"));
+        assert!(
+            !context.contains("- e: five"),
+            "the default cap of 4 must drop the fifth entry: {context}"
+        );
+
+        // Opt-in raise admits it.
+        let raised = MemoryInjectConfig {
+            max_entries: 6,
+            ..Default::default()
+        };
+        let context2 = render_memory_context(&mem, &observer, "query", &[], &raised, false).await;
+        assert!(context2.contains("- e: five"));
     }
 
     #[tokio::test]

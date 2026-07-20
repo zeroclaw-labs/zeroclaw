@@ -10491,12 +10491,13 @@ pub struct MemoryConfig {
     /// Maximum number of recalled memory entries rendered into the per-turn
     /// memory-injection preamble (the `[Memory context]` block prepended before
     /// the user message on the chat/channel/daemon paths). This is the hard cap
-    /// on injected facts after recall, decay, and relevance filtering. Was a
-    /// hardcoded 4, which hid deeper-ranked-but-relevant facts (e.g. a birthday
-    /// ranking ~#12) on the Telegram/daemon path even though they were in the
-    /// bank and API-recallable. Raise it to surface more context; `0` means
-    /// unlimited (bounded only by the per-entry and total-character budgets).
-    /// Default: 12.
+    /// on injected facts after recall, decay, and relevance filtering. Exposed
+    /// as an OPT-IN key: previously a hardcoded 4, which could hide
+    /// deeper-ranked-but-relevant facts (e.g. a birthday ranking ~#12) on the
+    /// Telegram/daemon path. The global default is PRESERVED at 4 (this stack
+    /// does not flip it; any opinionated default increase is routed to #8995);
+    /// raise it explicitly to surface more context. `0` means unlimited
+    /// (bounded only by the per-entry and total-character budgets). Default: 4.
     #[serde(default = "default_inject_max_entries")]
     pub inject_max_entries: usize,
     /// Max embedding cache entries before LRU eviction
@@ -10828,16 +10829,46 @@ impl HindsightMemoryConfig {
         }
         // recall_types, when set, must name real Hindsight fact types; a typo
         // would otherwise surface only as a runtime HTTP 400 on every recall.
-        for t in &self.recall_types {
-            let v = t.trim();
-            if !matches!(v, "experience" | "observation" | "world") {
-                return Err(format!(
-                    "[memory.hindsight] recall_types entries must be one of \
-                     experience, observation, world (got {t:?})"
-                ));
-            }
-        }
+        // Route the TOML value through the SAME normalizing validator the driver
+        // applies to the `ZC_HINDSIGHT_RECALL_TYPES` env override, so both
+        // sources produce the same canonical values or the same startup error.
+        Self::normalize_recall_types(&self.recall_types).map_err(|bad| {
+            format!(
+                "[memory.hindsight] recall_types entries must be one of \
+                 experience, observation, world (got {bad:?})"
+            )
+        })?;
         Ok(())
+    }
+
+    /// Normalize and validate a set of Hindsight `recall_types` values from ANY
+    /// source (typed TOML config or the `ZC_HINDSIGHT_RECALL_TYPES` env
+    /// override). Trims each entry, drops blanks, and rejects any token that is
+    /// not a real Hindsight fact type (`experience`, `observation`, `world`),
+    /// returning the offending value as `Err`. This is the SINGLE validator both
+    /// [`validate_self`](Self::validate_self) (config load) and the driver's
+    /// canonical constructor use, so an invalid env value fails at startup
+    /// exactly like an invalid TOML value instead of being sent on every recall.
+    ///
+    /// Accepts anything iterable of string-like items so both a `Vec<String>`
+    /// (config) and a split env string can share it.
+    pub fn normalize_recall_types<I, S>(values: I) -> Result<Vec<String>, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut out = Vec::new();
+        for raw in values {
+            let v = raw.as_ref().trim();
+            if v.is_empty() {
+                continue;
+            }
+            if !matches!(v, "experience" | "observation" | "world") {
+                return Err(v.to_string());
+            }
+            out.push(v.to_string());
+        }
+        Ok(out)
     }
 }
 
@@ -11001,7 +11032,11 @@ fn default_min_relevance_score() -> f64 {
     0.4
 }
 fn default_inject_max_entries() -> usize {
-    12
+    // Preserve the pre-existing global default (4). The config KEY stays opt-in
+    // so an operator can raise the cap explicitly, but the global default is NOT
+    // flipped here; any opinionated default increase is routed to #8995 with
+    // project-wide evidence (per the #8891 merge-gate decision).
+    4
 }
 fn default_cache_size() -> usize {
     10_000
@@ -31552,14 +31587,15 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[::core::prelude::v1::test]
-    fn inject_max_entries_defaults_to_twelve_and_is_config_driven() {
-        // The former hardcoded cap was 4; the config-driven default is 12 so
-        // deeper-ranked-but-relevant facts are no longer silently dropped.
+    fn inject_max_entries_defaults_to_four_and_is_config_driven() {
+        // The global default is PRESERVED at 4 (not flipped by this stack); the
+        // config KEY stays opt-in so an operator can raise the cap explicitly.
+        // Any opinionated default increase is routed to #8995.
         let mut config = multi_agent_test_config();
-        assert_eq!(config.memory.inject_max_entries, 12);
-        assert_eq!(config.effective_memory_inject_max_entries(), 12);
+        assert_eq!(config.memory.inject_max_entries, 4);
+        assert_eq!(config.effective_memory_inject_max_entries(), 4);
 
-        // A raised cap flows through.
+        // A raised cap flows through (opt-in).
         config.memory.inject_max_entries = 25;
         assert_eq!(config.effective_memory_inject_max_entries(), 25);
 
@@ -34118,6 +34154,46 @@ allowed_users = []
         config
             .validate()
             .expect("tier banks distinct from all private banks should validate");
+    }
+
+    #[test]
+    async fn normalize_recall_types_trims_and_validates_from_any_source() {
+        use crate::schema::HindsightMemoryConfig;
+        // Whitespace normalization: blanks dropped, valid tokens trimmed. The
+        // SAME normalizer serves both the TOML value and the env override, so
+        // both sources produce identical canonical values.
+        let normalized =
+            HindsightMemoryConfig::normalize_recall_types([" observation ", "", "world", "   "])
+                .expect("valid types with whitespace must normalize");
+        assert_eq!(
+            normalized,
+            vec!["observation".to_string(), "world".to_string()]
+        );
+
+        // An invalid token (e.g. the plural typo) is rejected, returning the
+        // offending value. This is what makes an invalid env value fail at
+        // startup like an invalid TOML value.
+        let bad = HindsightMemoryConfig::normalize_recall_types(["observations"])
+            .expect_err("a typo must be rejected");
+        assert_eq!(bad, "observations");
+    }
+
+    #[test]
+    async fn validate_rejects_invalid_recall_types_in_toml() {
+        // The TOML config path routes through the same normalizer, so an invalid
+        // fact type fails config validation for a hindsight agent.
+        let mut config = multi_agent_test_config();
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.agents.get_mut("alpha").unwrap().memory.backend =
+            crate::multi_agent::MemoryBackendKind::Hindsight;
+        config.memory.hindsight.recall_types = vec!["observations".to_string()];
+        let err = config
+            .validate()
+            .expect_err("an invalid recall_types entry must fail validation");
+        assert!(
+            err.to_string().contains("recall_types") && err.to_string().contains("observations"),
+            "expected recall_types explanation, got: {err}"
+        );
     }
 
     #[test]
