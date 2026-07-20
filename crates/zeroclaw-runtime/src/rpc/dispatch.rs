@@ -495,7 +495,7 @@ impl RpcDispatcher {
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
         if let Some(event) = event
-            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None, None)
         {
             let _ = self.rpc.send_raw(notification).await;
         }
@@ -6136,7 +6136,7 @@ mod tests {
     }
 
     /// Regression: RPC wire omits model_context_window when provider has
-    /// no explicit context_window — 32k stub leak (#8872).
+    /// no explicit context_window — 32k stub leak.
     #[test]
     fn context_usage_notification_omits_model_window_when_provider_unset() {
         use std::collections::HashMap;

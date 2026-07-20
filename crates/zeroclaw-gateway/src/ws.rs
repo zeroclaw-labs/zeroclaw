@@ -877,7 +877,7 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 
 /// Build the `done`-frame JSON. `model_context_window` is only included
 /// when the provider has an explicit `context_window` — absent means
-/// clients fall back to `max_context_tokens` (#8872).
+/// clients fall back to `max_context_tokens`.
 fn build_done_frame_json(
     full_response: &str,
     input_tokens: Option<u64>,
@@ -946,7 +946,7 @@ async fn process_chat_message(
     // Resolve both wire fields in one config read. `model_context_window`
     // is omitted by `build_done_frame_json` when the provider has no
     // explicit `context_window` — clients then fall back to
-    // `max_context_tokens` instead of the 32k stub (#8872).
+    // `max_context_tokens` instead of the 32k stub.
     let (max_context_tokens, model_context_window) = {
         let cfg = state.config.read();
         (
@@ -2019,7 +2019,7 @@ mod tests {
     }
 
     /// Regression: done-frame omits `model_context_window` when provider
-    /// has no explicit `context_window` (#8872).
+    /// has no explicit `context_window`.
     #[test]
     fn done_frame_omits_model_context_window_when_provider_unset() {
         use std::collections::HashMap;
