@@ -765,7 +765,9 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// `(channel, agent_alias, turn_id)` correlation triple that observer
 /// consumers (Prometheus, OTel, the gateway `/api/events` stream) rely on for
 /// per-agent attribution. `None` opts out for callers without a resolved
-/// alias (tests, benches).
+/// alias (tests, benches). `turn_id` follows the same pattern: `Some` reuses
+/// a caller-minted id so pre-turn events (the `process_message` RAG
+/// retrieval) join the bracket; `None` self-mints.
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
@@ -793,8 +795,9 @@ pub async fn agent_turn(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    turn_id: Option<&str>,
 ) -> Result<String> {
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
     // messages) surface turn lifecycle events to observers — mirroring the
@@ -3232,6 +3235,7 @@ pub async fn process_message(
                         },
                     }),
                     Some(agent_alias),
+                    Some(&turn_id),
                 ),
             )
             .await
@@ -3757,7 +3761,7 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3799,7 +3803,7 @@ mod tests {
             .unwrap()
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3847,7 +3851,7 @@ mod tests {
         })
         .join();
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3880,7 +3884,7 @@ mod tests {
         let observer = NoopObserver;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3934,7 +3938,7 @@ mod tests {
         };
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -11295,6 +11299,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11366,6 +11371,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11494,6 +11500,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -11573,6 +11580,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -15245,6 +15253,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("agent_turn should complete");
@@ -15296,6 +15305,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("turn should succeed");
@@ -15325,6 +15335,60 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// When the caller pre-mints a turn id (`process_message` does, so its
+    /// pre-turn RAG retrieval correlates with the turn), `agent_turn` must
+    /// bracket the turn with that id instead of minting its own.
+    #[tokio::test]
+    async fn agent_turn_uses_the_pre_minted_turn_id_on_its_bracket() {
+        // Harness mirrors agent_turn_brackets_turn_with_agent_start_and_agent_end.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let _ = agent_turn(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            capturing.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false, // parallel_tools
+            0,     // max_tool_result_chars: disabled for test
+            0,     // context_token_budget: disabled for test
+            None,  // channel
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+            Some("pre-minted-turn"),
+        )
+        .await;
+
+        let events = capturing.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .expect("agent_turn must emit AgentStart")
+        {
+            ObserverEvent::AgentStart { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("pre-minted-turn"));
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// `build_hardware_context` must forward the caller's TurnMeta onto the
