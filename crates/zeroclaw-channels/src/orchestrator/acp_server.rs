@@ -777,7 +777,7 @@ impl AcpServer {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "workspace_dir": workspace_dir,
-                                "error": error,
+                                "error": error.as_str(),
                             })),
                             "ACP session/new failed: agent init error"
                         );
@@ -786,7 +786,7 @@ impl AcpServer {
                 .await;
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
-                    message: format!("Failed to create agent: {e}"),
+                    message: format!("Failed to create agent: {error}"),
                     data: None,
                 });
             }
@@ -2661,6 +2661,12 @@ mod tests {
         assert!(
             error.message.contains("API key prefix mismatch"),
             "the RPC error must retain the agent construction failure: {}",
+            error.message
+        );
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(
+            !error.message.contains(EXPOSED_PREFIX),
+            "the RPC error must not expose the credential fragment: {}",
             error.message
         );
 
