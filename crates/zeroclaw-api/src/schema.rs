@@ -90,7 +90,7 @@ pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
 const SCHEMA_META_KEYS: &[&str] = &["description", "title", "default"];
 
 /// Schema cleaning strategies for different LLM model_providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CleaningStrategy {
     /// Gemini (Google AI / Vertex AI) - Most restrictive
     Gemini,
@@ -583,6 +583,119 @@ impl SchemaCleanr {
     }
 }
 
+/// Upper bound on retained [`SchemaCleanCache`] entries. Sized for the
+/// realistic ceiling of registered tools × strategies; overflow first drops
+/// entries whose source schema is gone, then falls back to a full clear.
+const SCHEMA_CLEAN_CACHE_CAP: usize = 512;
+
+struct SchemaCleanCacheEntry {
+    /// Identity of the source schema this result was cleaned from. `Weak`
+    /// so a cache entry never keeps a replaced (e.g. MCP-reconnect) schema
+    /// alive on its own.
+    source: std::sync::Weak<Value>,
+    cleaned: Arc<Value>,
+}
+
+/// Bounded memo of [`SchemaCleanr::clean_shared`] results, keyed by source
+/// schema identity and strategy.
+///
+/// Cleaning is a pure function of `(schema, strategy)`, but tool schemas
+/// that need rewriting (`$ref`/`$defs`, `const`, unions — pervasive in
+/// generated MCP schemas) would otherwise be deep-copied on every provider
+/// request. Providers that clean per request embed one of these so each
+/// distinct schema is cleaned once per strategy for as long as it stays
+/// registered. This holds no canonical state: entries are derived values,
+/// keyed by the identity of the canonical `Arc` the tool registry owns, and
+/// the memoized result is byte-stable across requests (which also keeps
+/// provider-side prompt caching stable).
+///
+/// Only *rewritten* results are cached. A no-op clean is returned straight
+/// from the pre-scan and never inserted: such an entry's `cleaned` field
+/// would be the very allocation its `source` `Weak` watches, pinning it
+/// forever (the dead-entry prune could never fire), and ephemeral per-call
+/// `Arc`s — the default `Tool::spec()` builds a fresh one every iteration —
+/// would flood the map until the overflow clear evicted the live memos this
+/// cache exists to keep.
+///
+/// A hit requires upgrading the stored `Weak` **and** `Arc::ptr_eq` with
+/// the candidate. Stale hits are impossible twice over: while an entry
+/// lives, its `Weak` keeps the source `ArcInner` allocation reserved, so no
+/// new schema can occupy that address; and once the source is dropped the
+/// `Weak` permanently refuses to upgrade, so the entry can only miss.
+pub struct SchemaCleanCache {
+    entries: std::sync::Mutex<HashMap<(usize, CleaningStrategy), SchemaCleanCacheEntry>>,
+}
+
+impl Default for SchemaCleanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SchemaCleanCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Memoized [`SchemaCleanr::clean_shared`]: returns the shared source
+    /// `Arc` when cleaning is a no-op, and otherwise the cleaned tree —
+    /// deep-computed at most once per (live schema, strategy) pair.
+    pub fn clean_shared(&self, schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
+        let key = (Arc::as_ptr(schema) as usize, strategy);
+        {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = entries.get(&key)
+                && let Some(live_source) = entry.source.upgrade()
+                && Arc::ptr_eq(&live_source, schema)
+            {
+                return Arc::clone(&entry.cleaned);
+            }
+        }
+
+        // Compute outside the lock; the function is pure, so a concurrent
+        // duplicate compute is wasted work, never wrong results.
+        let cleaned = SchemaCleanr::clean_shared(schema, strategy);
+        if Arc::ptr_eq(&cleaned, schema) {
+            // No-op clean: nothing worth caching (see the struct docs — a
+            // cached no-op would self-pin its source and pollute the map
+            // with ephemeral per-call allocations).
+            return cleaned;
+        }
+
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= SCHEMA_CLEAN_CACHE_CAP && !entries.contains_key(&key) {
+            entries.retain(|_, entry| entry.source.strong_count() > 0);
+            if entries.len() >= SCHEMA_CLEAN_CACHE_CAP {
+                entries.clear();
+            }
+        }
+        entries.insert(
+            key,
+            SchemaCleanCacheEntry {
+                source: Arc::downgrade(schema),
+                cleaned: Arc::clone(&cleaned),
+            },
+        );
+        cleaned
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +778,157 @@ mod tests {
             &has_min_length,
             CleaningStrategy::Anthropic
         ));
+    }
+
+    #[test]
+    fn schema_clean_cache_memoizes_dirty_schema_per_identity() {
+        let cache = SchemaCleanCache::new();
+        let dirty = Arc::new(json!({ "type": "string", "const": "x" }));
+
+        let first = cache.clean_shared(&dirty, CleaningStrategy::Anthropic);
+        let second = cache.clean_shared(&dirty, CleaningStrategy::Anthropic);
+
+        assert!(
+            !Arc::ptr_eq(&dirty, &first),
+            "dirty schema must be rewritten"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated cleaning of the same live schema must return the memoized allocation"
+        );
+        assert_eq!(
+            *first,
+            SchemaCleanr::clean((*dirty).clone(), CleaningStrategy::Anthropic),
+            "memoized result must equal the uncached cleaner output"
+        );
+    }
+
+    #[test]
+    fn schema_clean_cache_shares_clean_schema_without_inserting() {
+        let cache = SchemaCleanCache::new();
+        let clean = Arc::new(json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        }));
+
+        let shared = cache.clean_shared(&clean, CleaningStrategy::OpenAI);
+        assert!(
+            Arc::ptr_eq(&clean, &shared),
+            "no-op cleaning must share the source Arc, not copy it"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "no-op results must not be cached: a cached no-op self-pins its \
+             source (cleaned aliases it, so the dead-entry prune can never \
+             fire) and ephemeral per-call Arcs from the default Tool::spec() \
+             would flood the map"
+        );
+    }
+
+    #[test]
+    fn schema_clean_cache_keys_strategies_independently() {
+        let cache = SchemaCleanCache::new();
+        // Dirty for Gemini (minLength is stripped), no-op for Anthropic.
+        let schema = Arc::new(json!({ "type": "string", "minLength": 1 }));
+
+        let gemini = cache.clean_shared(&schema, CleaningStrategy::Gemini);
+        let anthropic = cache.clean_shared(&schema, CleaningStrategy::Anthropic);
+
+        assert!(!Arc::ptr_eq(&schema, &gemini));
+        assert!(gemini.get("minLength").is_none());
+        assert!(
+            Arc::ptr_eq(&schema, &anthropic),
+            "a strategy the schema is already clean for must still share"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &gemini,
+                &cache.clean_shared(&schema, CleaningStrategy::Gemini)
+            ),
+            "each strategy keeps its own memoized entry"
+        );
+    }
+
+    #[test]
+    fn schema_clean_cache_never_serves_stale_result_for_new_schema() {
+        let cache = SchemaCleanCache::new();
+        let original = Arc::new(json!({ "type": "string", "const": "old" }));
+        let original_cleaned = cache.clean_shared(&original, CleaningStrategy::OpenAI);
+        assert_eq!(original_cleaned["enum"], json!(["old"]));
+        drop(original);
+
+        // A replacement schema (e.g. MCP reconnect) cannot land at the old
+        // address while the entry lives — the entry's own `Weak` keeps the
+        // old `ArcInner` allocation reserved — so this exercises the plain
+        // miss-then-recompute path. Address reuse only becomes possible
+        // after the entry (and its `Weak`) is pruned, at which point no
+        // stale entry exists to hit. Either way: fresh compute.
+        let replacement = Arc::new(json!({ "type": "string", "const": "new" }));
+        let replacement_cleaned = cache.clean_shared(&replacement, CleaningStrategy::OpenAI);
+        assert_eq!(
+            replacement_cleaned["enum"],
+            json!(["new"]),
+            "cache must never serve a dropped schema's cleaned result"
+        );
+    }
+
+    #[test]
+    fn schema_clean_cache_stays_bounded_when_all_sources_live() {
+        let cache = SchemaCleanCache::new();
+        // Keep every source alive so the dead-entry prune removes nothing
+        // and the overflow path has to fall back to a full clear.
+        let sources: Vec<Arc<Value>> = (0..=SCHEMA_CLEAN_CACHE_CAP)
+            .map(|i| Arc::new(json!({ "type": "string", "const": format!("v{i}") })))
+            .collect();
+        for source in &sources {
+            cache.clean_shared(source, CleaningStrategy::OpenAI);
+        }
+        assert!(
+            cache.len() <= SCHEMA_CLEAN_CACHE_CAP,
+            "cache must never retain more than its cap ({}), got {}",
+            SCHEMA_CLEAN_CACHE_CAP,
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn schema_clean_cache_overflow_prunes_dead_entries_and_keeps_live_memos() {
+        let cache = SchemaCleanCache::new();
+
+        // A long-lived dirty schema (the MCP case this cache exists for).
+        let survivor = Arc::new(json!({ "type": "string", "const": "survivor" }));
+        let survivor_memo = cache.clean_shared(&survivor, CleaningStrategy::OpenAI);
+
+        // Fill the map exactly to its cap with dirty entries, keeping the
+        // sources alive so no mid-fill overflow fires, then drop them all
+        // (e.g. per-iteration rebuilt specs going out of scope).
+        let ephemerals: Vec<Arc<Value>> = (0..SCHEMA_CLEAN_CACHE_CAP - 1)
+            .map(|i| Arc::new(json!({ "type": "string", "const": format!("e{i}") })))
+            .collect();
+        for ephemeral in &ephemerals {
+            cache.clean_shared(ephemeral, CleaningStrategy::OpenAI);
+        }
+        assert_eq!(cache.len(), SCHEMA_CLEAN_CACHE_CAP);
+        drop(ephemerals);
+
+        // The next new-key insert overflows: the graceful tier must drop the
+        // dead entries instead of clearing, and the live memo must survive.
+        let trigger = Arc::new(json!({ "type": "string", "const": "trigger" }));
+        cache.clean_shared(&trigger, CleaningStrategy::OpenAI);
+        assert!(
+            cache.len() <= 2,
+            "overflow with dead entries must prune them (survivor + trigger \
+             remain), not fall through to a full clear; got {}",
+            cache.len()
+        );
+        assert!(
+            Arc::ptr_eq(
+                &survivor_memo,
+                &cache.clean_shared(&survivor, CleaningStrategy::OpenAI)
+            ),
+            "a live schema's memo must survive the dead-entry prune"
+        );
     }
 
     #[test]
