@@ -401,18 +401,15 @@ If you need to raise the floor to drop support for an older version:
 
 ## If something goes wrong
 
-**The run dies instantly with `startup_failure` (zero jobs created):** GitHub
-refused to start the workflow, almost always because an action or reusable
-workflow it references is not on the repository Actions allowlist
-(Settings → Actions → General; this is settings state, not anything in the repo).
-Compare the workflow's `uses:` refs against
-[Allowed actions](./ci-and-actions.md#allowed-actions) and add the missing
-pattern. Two gotchas: allowlist changes can take a few minutes to propagate,
-so wait before re-triggering; and never click **Re-run** on a
-`startup_failure` run: the re-run can wedge permanently in `queued`, and
-because it holds the `promote-release` concurrency slot it blocks every
-subsequent dispatch until GitHub reaps it (it cannot be cancelled or deleted
-while stuck). Always dispatch a fresh run instead.
+**The run dies instantly with `startup_failure` (zero jobs created):** Treat
+this as a symptom, not an allowlist diagnosis. Check the run summary and
+repository Actions policy. If GitHub reports a selected-actions rejection and
+the release workflow recently added or changed `uses:` refs, compare those refs
+with [Allowed actions](./ci-and-actions.md#allowed-actions). Add only the
+rejected pattern in Settings → Actions → General, wait a few minutes for the
+setting to propagate, then dispatch a fresh run. If GitHub does not report a
+policy rejection, investigate the workflow definition or other repository
+policy instead.
 
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
