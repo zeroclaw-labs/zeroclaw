@@ -1,6 +1,6 @@
 //! RPC session state.
 
-use crate::agent::agent::Agent;
+use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -258,8 +258,18 @@ impl SessionStore {
     }
 
     pub async fn seed_history(&self, id: &str, msgs: &[zeroclaw_api::model_provider::ChatMessage]) {
+        let _ = self.seed_history_with_event(id, msgs).await;
+    }
+
+    pub async fn seed_history_with_event(
+        &self,
+        id: &str,
+        msgs: &[zeroclaw_api::model_provider::ChatMessage],
+    ) -> Option<TurnEvent> {
         if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent.lock().await.seed_history(msgs);
+            s.agent.lock().await.seed_history_with_event(msgs)
+        } else {
+            None
         }
     }
 
@@ -282,8 +292,21 @@ impl SessionStore {
         id: &str,
         msgs: Vec<zeroclaw_api::model_provider::ConversationMessage>,
     ) {
+        let _ = self.seed_conversation_history_with_event(id, msgs).await;
+    }
+
+    pub async fn seed_conversation_history_with_event(
+        &self,
+        id: &str,
+        msgs: Vec<zeroclaw_api::model_provider::ConversationMessage>,
+    ) -> Option<TurnEvent> {
         if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent.lock().await.seed_conversation_history(msgs);
+            s.agent
+                .lock()
+                .await
+                .seed_conversation_history_with_event(msgs)
+        } else {
+            None
         }
     }
 

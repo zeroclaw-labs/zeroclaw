@@ -25,6 +25,7 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    timeout_secs: u64,
 }
 
 #[cfg(test)]
@@ -234,13 +235,14 @@ struct NativeContentIn {
 /// `alias` is the only positional argument. Everything else has a
 /// sensible default: the base URL falls back to Anthropic's published
 /// endpoint, no credential leaves the provider unauthenticated (fine
-/// for local mocks), and `max_tokens` uses the workspace baseline.
+/// for local mocks), and token/timeout limits use the workspace baselines.
 #[must_use]
 pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
     max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
 }
 
 impl AnthropicBuilder {
@@ -269,6 +271,13 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Override the HTTP request timeout for LLM API calls. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS`] when unset.
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -277,6 +286,9 @@ impl AnthropicBuilder {
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            timeout_secs: self
+                .timeout_secs
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
         }
     }
 }
@@ -290,6 +302,7 @@ impl AnthropicModelProvider {
             credential: None,
             base_url: None,
             max_tokens: None,
+            timeout_secs: None,
         }
     }
 
@@ -840,7 +853,7 @@ impl AnthropicModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.anthropic",
-            120,
+            self.timeout_secs,
             10,
         )
     }
@@ -2845,6 +2858,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
+            timeout_secs: 120,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
@@ -3346,5 +3360,67 @@ data: {\"type\":\"message_stop\"}\n\n";
                 window[0].role
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_factory_forwards_timeout_to_native_provider() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::time::{Duration, Instant};
+        use zeroclaw_config::schema::AnthropicModelProviderConfig;
+
+        async fn slow_messages() -> Json<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(json!({
+                "id": "msg_late",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "too late"}],
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new().route("/v1/messages", post(slow_messages));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = AnthropicModelProviderConfig::default()
+            .create_provider(
+                "native",
+                Some("test-key"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("anthropic provider should build");
+
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hello", "claude-sonnet-4-5", Some(0.7))
+            .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "slow response should time out when factory forwards provider_timeout_secs"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+        );
     }
 }

@@ -19,8 +19,8 @@ pub struct TelnyxModelProvider {
 
 /// Typed builder for [`TelnyxModelProvider`].
 ///
-/// Only `alias` is required; `api_key` falls back to the same
-/// `TELNYX_API_KEY` env lookup the pre-builder ctor used.
+/// Only `alias` is required; `api_key` falls back to the
+/// `TELNYX_API_KEY` environment variable.
 #[must_use]
 pub struct TelnyxBuilder {
     alias: String,
@@ -36,7 +36,15 @@ impl TelnyxBuilder {
     }
 
     pub fn build(self) -> TelnyxModelProvider {
-        TelnyxModelProvider::new(&self.alias, self.api_key.as_deref())
+        TelnyxModelProvider {
+            alias: self.alias,
+            api_key: resolve_telnyx_api_key(self.api_key.as_deref()),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+        }
     }
 }
 
@@ -47,20 +55,6 @@ impl TelnyxModelProvider {
         TelnyxBuilder {
             alias: alias.to_string(),
             api_key: None,
-        }
-    }
-
-    /// Create a new Telnyx AI model_provider.
-    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
-        let resolved_key = resolve_telnyx_api_key(api_key);
-        Self {
-            alias: alias.to_string(),
-            api_key: resolved_key,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
     }
 

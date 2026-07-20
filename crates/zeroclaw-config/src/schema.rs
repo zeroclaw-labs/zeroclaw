@@ -721,10 +721,11 @@ pub trait FamilyEndpoint {
 }
 
 /// Wire protocol flavor for the model_provider client. `responses` routes
-/// through OpenAI's Codex/Responses API (`POST /v1/responses`);
+/// through OpenAI's Responses API (`POST /v1/responses`);
 /// `chat_completions` routes through the legacy `/v1/chat/completions` (or
-/// the family's chat-completions-compatible endpoint). Auto-selected per
-/// family when unset.
+/// the family's chat-completions-compatible endpoint). New OpenAI provider
+/// slots default to `responses`; other families default to chat-completions
+/// (or ignore the field) when unset.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
@@ -823,7 +824,7 @@ pub struct ModelProviderConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
-    /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider; only override if you're forcing an unusual combination.
+    /// Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
@@ -964,13 +965,43 @@ impl ModelEndpoint for OpenAIEndpoint {
 /// because they're consumed by validation and runtime helpers that operate
 /// on the base struct without family awareness; this wrapper is a thin
 /// typed slot, no extra fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// New OpenAI provider entries **persisted via `create_map_key` / `ensure`**
+/// (quickstart, gateway/config UI, programmatic slot creation) default to
+/// `wire_api = "responses"` because OpenAI has moved recent GPT models onto
+/// `POST /v1/responses` as the primary wire. OpenAI-compatible families
+/// (`custom`, `llamacpp`, branded vendors, …) keep the shared
+/// `ModelProviderConfig` default of unset / chat-completions.
+///
+/// This default governs **persisted slot creation only**. Two paths keep the
+/// legacy chat-completions wire for backward compatibility:
+/// - Existing persisted configs that omit `wire_api` deserialize as `None`, and
+///   the factory falls back to chat-completions.
+/// - Implicit dispatch with no config entry at all — a bare
+///   `model_provider = "openai"` reference or a dotted ref to a nonexistent
+///   alias — is built from a chat-anchored fallback config (see
+///   `openai_missing_entry_fallback_config` in `zeroclaw-providers`), not this
+///   `Default`, and stays on the chat wire so existing bare-ref installs don't
+///   flip wire + tool-calling mode on upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.openai"]
 pub struct OpenAIModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+}
+
+impl Default for OpenAIModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig {
+                // OpenAI's current default wire for new provider slots.
+                wire_api: Some(WireApi::Responses),
+                ..ModelProviderConfig::default()
+            },
+        }
+    }
 }
 
 // ── Azure OpenAI ──
@@ -3960,6 +3991,28 @@ impl Config {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_history_messages)
             .unwrap_or(50)
+    }
+
+    /// Resolve the whole-turn history cap used by structured `Agent` sessions.
+    ///
+    /// An explicit runtime-profile cap remains authoritative. When omitted, the
+    /// cap scales with the profile's tool-iteration limit while preserving the
+    /// legacy floor of 50 messages.
+    #[must_use]
+    pub fn effective_structured_max_history_messages(&self, agent_alias: &str) -> usize {
+        if let Some(max_history_messages) = self
+            .runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_history_messages)
+        {
+            return max_history_messages;
+        }
+
+        // Each tool iteration adds two structural messages; user/final assistant
+        // add two more, while the floor preserves the structured default cap of 50.
+        self.effective_max_tool_iterations(agent_alias)
+            .saturating_mul(2)
+            .saturating_add(2)
+            .max(50)
     }
 
     #[must_use]
@@ -13245,6 +13298,27 @@ impl Default for TelegramConfig {
     }
 }
 
+impl TelegramConfig {
+    /// Validate this alias's bot-token placeholder and enabled-state rules.
+    pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
+        if self.bot_token.trim() == crate::traits::UNSET_DISPLAY {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("channels.telegram.{alias}.bot_token"),
+                "channels.telegram.{alias}.bot_token must not contain the unset display placeholder",
+            );
+        }
+        if self.enabled && crate::traits::is_unset_display_value(&self.bot_token) {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("channels.telegram.{alias}.bot_token"),
+                "channels.telegram.{alias}.bot_token is required when channels.telegram.{alias}.enabled = true",
+            );
+        }
+        Ok(())
+    }
+}
+
 impl ChannelConfig for TelegramConfig {
     fn name() -> &'static str {
         "Telegram"
@@ -18718,6 +18792,7 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
+            tg.validate_bot_token(alias)?;
             validate_http_base_url(
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
@@ -21343,11 +21418,12 @@ pub struct SopConfig {
     #[serde(default = "default_sop_maintenance_interval_secs")]
     pub maintenance_interval_secs: u64,
 
-    /// Persist run state durably across restarts. Default `false` keeps today's
-    /// ephemeral in-memory behavior (no surprise activation on upgrade). When set
-    /// to `true`, `build_sop_engine` selects the configured backend and in-flight
-    /// runs survive a restart.
-    #[serde(default)]
+    /// Persist run state durably across restarts. Default `true`: `build_sop_engine`
+    /// selects the configured backend (`sqlite`) and in-flight runs - including runs
+    /// parked at a HITL approval - survive a restart. This is the durable substrate
+    /// the HITL admission model relies on so a pending approval is not lost when the
+    /// daemon restarts. Set to `false` to opt back into ephemeral in-memory state.
+    #[serde(default = "default_sop_persist_runs")]
     pub persist_runs: bool,
 
     /// Durable run-state backend when `persist_runs` is true: `sqlite` (default,
@@ -21372,6 +21448,17 @@ pub struct SopConfig {
     /// approval-routing fail-closed default; reconcile with that model if both land.)
     #[serde(default)]
     pub approval_timeout_action: ApprovalTimeoutAction,
+
+    /// Approval broker policy config (`[sop.approval]`): named approver groups and
+    /// per-name approval policies (required group + quorum + escalation route) the
+    /// approval broker consumes for group-membership and quorum checks. Members are
+    /// channel-provided identities (a gateway user, a forge login), so this is a
+    /// permanent identity source, not a stopgap; a future auth system adds another
+    /// resolver alongside it rather than replacing it. An empty block means no broker
+    /// policy applies (`approval_mode` alone governs a gate, unchanged behavior).
+    #[serde(default)]
+    #[nested]
+    pub approval: SopApprovalConfig,
 
     /// Enforce per-step tool scope. Default false keeps `tools:` advisory.
     #[serde(default)]
@@ -21480,6 +21567,72 @@ pub enum ApprovalTimeoutAction {
     AutoApprove,
 }
 
+/// `[sop.approval]` - approval broker policy config. A permanent identity source
+/// for channel-provided approvers (not a stopgap): the approval broker consumes it
+/// for group-membership and quorum checks. Empty = no broker policy applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "sop_approval"]
+pub struct SopApprovalConfig {
+    /// Named approver groups: `group name -> members`. A member is matched against
+    /// the transport-derived (channel-authenticated) `ApprovalPrincipal` identity.
+    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:alice`,
+    /// `ws:<subject>`, `agent:<alias>`) to grant rights on one transport only, or a
+    /// bare identity (`alice`) to grant from any source. A future auth system adds a
+    /// second resolver alongside this one; it does not replace channel identities.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    #[nested]
+    pub groups: std::collections::HashMap<String, ApprovalGroupConfig>,
+    /// Named approval policies a SOP step may reference by name.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    #[nested]
+    pub policies: std::collections::HashMap<String, ApprovalPolicyConfig>,
+}
+
+/// A named approver group (`[sop.approval.groups.<name>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "sop_approval_group"]
+pub struct ApprovalGroupConfig {
+    /// Identity labels that belong to this group.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+/// A named approval policy (`[sop.approval.policies.<name>]`) the broker enforces.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "sop_approval_policy"]
+pub struct ApprovalPolicyConfig {
+    /// Group whose members may satisfy this policy's gate. `None`/empty = any
+    /// principal permitted by `approval_mode` (back-compat, no membership gate).
+    #[serde(default)]
+    pub required_group: Option<String>,
+    /// Distinct approvers required before the gate clears. `0`/`1` both mean a
+    /// single approval; `>= 2` requires a quorum of distinct approver identities.
+    #[serde(default)]
+    pub quorum: u32,
+    /// Channel to deliver the INITIAL approval request to when a run parks at a
+    /// gate this policy governs, formatted `channel[:recipient]` (e.g.
+    /// `discord.ops:123456789012345678`). The `channel` names a configured channel
+    /// (the `<channel>.<alias>` / bare-`<channel>` key from the channel map); the
+    /// `recipient` is that channel's addressee (a Discord channel id, a chat id,
+    /// etc.). Delivery is best-effort - the gate is the source of truth and a
+    /// delivery failure never blocks or clears it; approvals still come back
+    /// through the normal HTTP/WS/tool surfaces. `None`/empty = no out-of-band
+    /// request notice (today's behavior: only the originating surface is notified).
+    /// This is a DISTINCT lifecycle event from `escalation_route`: the request goes
+    /// out when the run parks; the escalation goes out only if it later times out.
+    /// When configured, the route must use the `channel:recipient` format.
+    #[serde(default)]
+    pub request_route: Option<String>,
+    /// Route to escalate to on timeout (the distinct "second route"). `None`/empty
+    /// re-surfaces to the same route (today's `Escalate` behavior). When configured,
+    /// the route must use the `channel:recipient` format.
+    #[serde(default)]
+    pub escalation_route: Option<String>,
+}
+
 fn default_sop_max_concurrent_total() -> usize {
     4
 }
@@ -21490,6 +21643,10 @@ fn default_sop_approval_timeout_secs() -> u64 {
 
 fn default_sop_max_finished_runs() -> usize {
     100
+}
+
+fn default_sop_persist_runs() -> bool {
+    true
 }
 
 fn default_sop_step_mandatory_tools() -> Vec<String> {
@@ -21544,11 +21701,12 @@ impl Default for SopConfig {
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
             maintenance_interval_secs: default_sop_maintenance_interval_secs(),
-            persist_runs: false,
+            persist_runs: default_sop_persist_runs(),
             run_store_backend: SopRunStoreBackend::Sqlite,
             run_state_dir: None,
             approval_mode: ApprovalMode::Both,
             approval_timeout_action: ApprovalTimeoutAction::Escalate,
+            approval: SopApprovalConfig::default(),
             step_scope_enforce: false,
             step_mandatory_tools: default_sop_step_mandatory_tools(),
             step_schema_enforce: default_sop_step_schema_enforce(),
@@ -23008,6 +23166,78 @@ api_base_url = "http://127.0.0.1:8081"
         assert!(msg.contains("channels.telegram.default.api_base_url"));
     }
 
+    #[test]
+    async fn validate_rejects_enabled_telegram_without_bot_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Telegram channel must require a bot token");
+        assert!(
+            err.to_string()
+                .contains("channels.telegram.telegram.bot_token")
+        );
+    }
+
+    #[test]
+    async fn validate_allows_disabled_telegram_without_bot_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: false,
+                bot_token: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Telegram channel may be staged without a bot token");
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_telegram_with_unset_display_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect_err("enabled Telegram channel must reject the display sentinel");
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_telegram_with_unset_display_token() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "telegram".to_string(),
+            TelegramConfig {
+                enabled: false,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect_err("the unset display sentinel must never become persisted config");
+    }
+
     // Regression (fail closed, both PAT-backed forge providers): a Gitea or
     // Forgejo alias with an access token but no api_base_url must be rejected
     // at config-validation time. The old behavior silently defaulted to
@@ -24234,6 +24464,101 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
+    }
+
+    #[test]
+    async fn runtime_profile_structured_history_cap_scales_when_omitted() {
+        let raw = r#"
+[runtime_profiles.long_turn]
+max_tool_iterations = 100
+
+[agents.default]
+runtime_profile = "long_turn"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_history_messages("default"), 50);
+        assert_eq!(
+            parsed.effective_structured_max_history_messages("default"),
+            202
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_history_messages, 50);
+    }
+
+    #[test]
+    async fn runtime_profile_history_cap_explicit_value_remains_authoritative() {
+        let raw = r#"
+[runtime_profiles.long_turn]
+max_tool_iterations = 100
+max_history_messages = 80
+
+[agents.default]
+runtime_profile = "long_turn"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_history_messages("default"), 80);
+        assert_eq!(
+            parsed.effective_structured_max_history_messages("default"),
+            80
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_history_messages, 80);
+    }
+
+    #[test]
+    async fn runtime_profile_history_cap_explicit_zero_remains_authoritative() {
+        let raw = r#"
+[runtime_profiles.long_turn]
+max_tool_iterations = 100
+max_history_messages = 0
+
+[agents.default]
+runtime_profile = "long_turn"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_history_messages("default"), 0);
+        assert_eq!(
+            parsed.effective_structured_max_history_messages("default"),
+            0
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_history_messages, 0);
+    }
+
+    #[test]
+    async fn runtime_profile_history_cap_saturates_at_usize_max() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "long_turn".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: usize::MAX,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "long_turn".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.effective_structured_max_history_messages("default"),
+            usize::MAX
+        );
+        assert_eq!(config.effective_max_history_messages("default"), 50);
+    }
+
+    #[test]
+    async fn default_runtime_profile_history_cap_remains_50() {
+        let parsed = parse_test_config("");
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
+        assert_eq!(parsed.effective_max_history_messages("default"), 50);
+        assert_eq!(
+            parsed.effective_structured_max_history_messages("default"),
+            50
+        );
     }
 
     #[test]
@@ -30595,6 +30920,117 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn generated_config_fields_keep_operator_descriptions() {
+        fn assert_description(
+            fields: &[crate::traits::PropFieldInfo],
+            suffix: &str,
+            expected: &str,
+        ) {
+            let matches = fields
+                .iter()
+                .filter(|field| field.name.ends_with(suffix))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one configurable field ending in `{suffix}`"
+            );
+            let field = matches[0];
+            assert!(
+                field
+                    .description
+                    .to_ascii_lowercase()
+                    .contains(&expected.to_ascii_lowercase()),
+                "description for {} must retain `{expected}`: {}",
+                field.name,
+                field.description,
+            );
+        }
+
+        let workspace = crate::multi_agent::AgentWorkspaceConfig::default().prop_fields();
+        assert_description(&workspace, ".access", "cross-agent workspace allowlist");
+        assert_description(
+            &workspace,
+            ".read_memory_from",
+            "Cross-agent memory allowlist",
+        );
+
+        let a2a = crate::multi_agent::A2aServerConfig::default().prop_fields();
+        assert_description(&a2a, ".public_base_url", "operator-supplied base URL");
+
+        let thinking = crate::scattered_types::ThinkingConfig::default().prop_fields();
+        assert_description(&thinking, ".native_thinking", "selected level has a budget");
+
+        let compression = crate::scattered_types::ContextCompressionConfig::default().prop_fields();
+        assert_description(&compression, ".summary_provider", "<type>.<alias>");
+        assert_description(&compression, ".summary_model", "DEPRECATED bare model id");
+
+        let email = crate::scattered_types::EmailConfig::default().prop_fields();
+        assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    async fn generated_config_types_keep_schema_descriptions() {
+        fn assert_schema_description<T: schemars::JsonSchema>(name: &str) {
+            let schema =
+                serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes to json");
+            let description = schema
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name} schema must have a top-level description"));
+            assert!(
+                !description.trim().is_empty(),
+                "{name} schema description must not be empty",
+            );
+        }
+
+        use crate::autonomy::{ApprovalRoute, AutonomyLevel, DelegationPolicy};
+        use crate::multi_agent::{
+            A2aServerConfig, A2aServerSection, AccessMode, AgentA2aConfig, AgentMemoryConfig,
+            AgentWorkspaceConfig, MemoryBackendKind, OutputModality,
+        };
+        use crate::presets::{
+            BuilderSubmission, ChannelQuickStart, ModelProviderChoice, SelectorChoice,
+        };
+        use crate::providers::{ModelProviders, Providers};
+        use crate::scattered_types::ChannelPrecheckConfig;
+        use crate::sections::{Section, SectionGroup};
+        use crate::validation_warnings::ValidationWarning;
+
+        assert_schema_description::<AutonomyLevel>("AutonomyLevel");
+        assert_schema_description::<DelegationPolicy>("DelegationPolicy");
+        assert_schema_description::<ApprovalRoute>("ApprovalRoute");
+        assert_schema_description::<AccessMode>("AccessMode");
+        assert_schema_description::<MemoryBackendKind>("MemoryBackendKind");
+        assert_schema_description::<AgentWorkspaceConfig>("AgentWorkspaceConfig");
+        assert_schema_description::<AgentMemoryConfig>("AgentMemoryConfig");
+        assert_schema_description::<OutputModality>("OutputModality");
+        assert_schema_description::<A2aServerConfig>("A2aServerConfig");
+        assert_schema_description::<A2aServerSection>("A2aServerSection");
+        assert_schema_description::<AgentA2aConfig>("AgentA2aConfig");
+        assert_schema_description::<ModelProviderChoice>("ModelProviderChoice");
+        assert_schema_description::<ChannelQuickStart>("ChannelQuickStart");
+        assert_schema_description::<BuilderSubmission>("BuilderSubmission");
+        assert_schema_description::<SelectorChoice<ModelProviderChoice>>("SelectorChoice");
+        assert_schema_description::<ModelProviders>("ModelProviders");
+        assert_schema_description::<Providers>("Providers");
+        assert_schema_description::<ChannelPrecheckConfig>("ChannelPrecheckConfig");
+        assert_schema_description::<SectionGroup>("SectionGroup");
+        assert_schema_description::<Section>("Section");
+        assert_schema_description::<ValidationWarning>("ValidationWarning");
+
+        let map_key_schema =
+            serde_json::to_value(schemars::schema_for!(crate::traits::MapKeySection))
+                .expect("MapKeySection schema serializes to json");
+        let natural_key = map_key_schema
+            .pointer("/properties/natural_key/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("MapKeySection.natural_key must have a schema description");
+        assert!(natural_key.contains("natural key"));
+    }
+
+    #[test]
     async fn get_prop_returns_values_by_path() {
         let mx = test_matrix_config();
 
@@ -31620,6 +32056,15 @@ model = "gpt-4o"
             .create_map_key("providers.models.openai", "myalias")
             .expect("typed family slot accepts a new alias");
         assert!(created);
+        assert_eq!(
+            config
+                .providers
+                .models
+                .find("openai", "myalias")
+                .and_then(|e| e.wire_api),
+            Some(WireApi::Responses),
+            "new OpenAI provider slots default to wire_api = responses"
+        );
         config.mark_dirty("providers.models.openai.myalias");
         config.save_dirty().await.unwrap();
 
@@ -31633,6 +32078,15 @@ model = "gpt-4o"
                 .find("openai", "myalias")
                 .is_some(),
             "created alias must survive save_dirty + reload; got:\n{written}"
+        );
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "myalias")
+                .and_then(|e| e.wire_api),
+            Some(WireApi::Responses),
+            "default wire_api must survive save_dirty + reload; got:\n{written}"
         );
     }
 

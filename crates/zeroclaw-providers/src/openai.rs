@@ -338,13 +338,19 @@ impl OpenAiModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content");
@@ -985,8 +991,8 @@ impl OpenAiResponsesBuilder {
     /// ignored (the default 120 s is kept) so a stray `Some(0)` from
     /// config cannot silently disable the safety timeout — same guard
     /// applied by [`OpenAiBuilder::timeout_secs`],
-    /// [`OpenAiCompatibleBuilder::timeout_secs`], and
-    /// [`OpenRouterBuilder::timeout_secs`].
+    /// [`crate::compatible::OpenAiCompatibleBuilder::timeout_secs`], and
+    /// [`crate::openrouter::OpenRouterBuilder::timeout_secs`].
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         if secs > 0 {
             self.timeout_secs = Some(secs);
@@ -1982,6 +1988,39 @@ mod tests {
         let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // Regression for #8675: pins that the openai `convert_messages` call
+        // site of `sanitize_tool_arguments` is wired in. The helper contract
+        // itself is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#.to_string(),
+        )];
+
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#.to_string(),
+        )];
+
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
     }
 
     #[test]

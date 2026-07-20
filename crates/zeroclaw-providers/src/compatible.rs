@@ -91,6 +91,70 @@ pub enum AuthStyle {
     ZhipuJwt,
 }
 
+/// Sanitize a tool-call `arguments` string before it is re-serialized into an
+/// outbound OpenAI-compatible chat-completions request.
+///
+/// Several strict upstream providers (Cohere, OpenInference, Nvidia …,
+/// surfaced most often through OpenRouter) reject requests where
+/// `tool_calls[].function.arguments` is not well-formed JSON. Smaller /
+/// reasoning models sometimes emit a malformed arguments string; when that
+/// happens the whole turn fails with HTTP 400 and the user receives the
+/// generic fallback instead of the agent's response. #8675.
+///
+/// Contract:
+/// - empty / whitespace-only → `"{}"` (every upstream accepts this)
+/// - valid JSON → returned unchanged
+/// - invalid JSON → WARN-logged with **safe metadata only** (function name,
+///   payload length, stable error key), then `"{}"`. The raw arguments
+///   string is **never** recorded, because tool-call arguments can contain
+///   commands, URLs, credentials, file paths, or user content and WARN
+///   events enter the broadcast and rolling-persistence path regardless of
+///   the tool/LLM content-capture policy.
+///
+/// This is the single source of truth for the tool-call arguments
+/// normalization contract. The streaming accumulator's
+/// `StreamToolCallAccumulator::into_provider_tool_call` and all typed
+/// providers' outbound `convert_messages` paths route through here.
+pub(crate) fn sanitize_tool_arguments(function_name: &str, arguments: &str) -> String {
+    if arguments.trim().is_empty() {
+        return "{}".to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(serde_json::Value::Object(_)) => return arguments.to_string(),
+        Ok(_non_object) => {
+            // Accept only JSON objects; null, arrays, strings, numbers, and
+            // booleans do not satisfy a strict-provider function-arguments
+            // contract (reported by Cohere, tracked by OpenRouter's
+            // auto-exacto validator).
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "function": function_name,
+                        "payload_len": arguments.len(),
+                        "error_key": "tool_args_not_object",
+                    })),
+                "Non-object tool-call arguments being sent to strict upstream provider, dropping to empty object"
+            );
+            return "{}".to_string();
+        }
+        Err(_) => {}
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "function": function_name,
+                "payload_len": arguments.len(),
+                "error_key": "tool_args_invalid_json",
+            })),
+        "Invalid JSON in tool-call arguments being sent to upstream provider, dropping to empty object"
+    );
+    "{}".to_string()
+}
+
 /// Generate a Zhipu JWT from an `id.secret` API key.
 /// Returns `Authorization: Bearer <jwt>` value. Token is valid for 3.5 minutes.
 fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
@@ -220,22 +284,20 @@ pub struct OpenAiCompatibleBuilder {
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user`] — the
     /// combined "merge + drop native tool calling" preset. Distinct from
     /// [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
-    /// (which mirrors [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]
-    /// and keeps native tools on).
+    /// which keeps native tools on.
     merge_system_into_user: bool,
-    /// Mirror of [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]:
-    /// enables the merge behaviour without disabling native tool calling.
+    /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
+    /// to enable the merge behaviour without disabling native tool calling.
     merge_system_into_user_preserve_native: bool,
-    /// When `Some(false)`, mirrors
-    /// [`OpenAiCompatibleModelProvider::without_native_tools`]. `None`
-    /// preserves the default derived from `merge_system_into_user`.
+    /// Set to `Some(false)` by [`OpenAiCompatibleBuilder::without_native_tools`].
+    /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
     reasoning_effort: Option<String>,
-    /// `Some(false)` mirrors
-    /// [`OpenAiCompatibleModelProvider::without_assistant_reasoning_replay`].
-    /// `None` preserves the default (replay enabled).
+    /// Set to `Some(false)` by
+    /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
+    /// preserves the default (replay enabled).
     replay_assistant_reasoning_override: Option<bool>,
     api_path: Option<String>,
     max_tokens: Option<u32>,
@@ -306,26 +368,23 @@ impl OpenAiCompatibleBuilder {
     /// generally reject OpenAI-style `tools` payloads as well.
     ///
     /// Prefer [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
-    /// (or [`OpenAiCompatibleModelProvider::with_merge_system_into_user`] on
-    /// the built provider) when you want the merge behaviour but still want
-    /// native tool calling (e.g. Bedrock).
+    /// when you want the merge behaviour but still want native tool calling
+    /// (e.g. Bedrock).
     pub fn merge_system_into_user(mut self) -> Self {
         self.merge_system_into_user = true;
         self
     }
 
     /// Merge all system messages into the first user message before sending,
-    /// preserving native tool calling. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]. Use
-    /// when the upstream rejects `role: system` but still accepts
-    /// OpenAI-style `tools` payloads (e.g. Bedrock's Anthropic pass-through).
+    /// preserving native tool calling. Use when the upstream rejects
+    /// `role: system` but still accepts OpenAI-style `tools` payloads (e.g.
+    /// Bedrock's Anthropic pass-through).
     pub fn merge_system_into_user_preserving_native(mut self) -> Self {
         self.merge_system_into_user_preserve_native = true;
         self
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
-    /// Mirrors [`OpenAiCompatibleModelProvider::without_native_tools`].
     pub fn without_native_tools(mut self) -> Self {
         self.native_tool_calling_override = Some(false);
         self
@@ -333,8 +392,7 @@ impl OpenAiCompatibleBuilder {
 
     /// Override the HTTP request timeout for LLM API calls. Values of 0
     /// are ignored (the default 120 s is kept) so a stray `Some(0)` from
-    /// config cannot silently disable the safety timeout. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_timeout_secs`].
+    /// config cannot silently disable the safety timeout.
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         if timeout_secs > 0 {
             self.timeout_secs = Some(timeout_secs);
@@ -342,65 +400,56 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
-    /// Set extra HTTP headers to include in all API requests. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_extra_headers`].
+    /// Set extra HTTP headers to include in all API requests.
     pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
         self.extra_headers = headers;
         self
     }
 
     /// Set reasoning effort for GPT-5/Codex-compatible chat-completions APIs.
-    /// Mirrors [`OpenAiCompatibleModelProvider::with_reasoning_effort`].
     pub fn reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.reasoning_effort = reasoning_effort;
         self
     }
 
     /// Disable replay of stored assistant reasoning on outbound assistant
-    /// history messages. Mirrors
-    /// [`OpenAiCompatibleModelProvider::without_assistant_reasoning_replay`].
+    /// history messages.
     pub fn without_assistant_reasoning_replay(mut self) -> Self {
         self.replay_assistant_reasoning_override = Some(false);
         self
     }
 
-    /// Set a custom API path suffix for this model_provider. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_api_path`].
+    /// Set a custom API path suffix for this model_provider.
     pub fn api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
         self
     }
 
-    /// Set the maximum output tokens for API requests. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_max_tokens`].
+    /// Set the maximum output tokens for API requests.
     pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
-    /// Set the models.dev catalog key for this model_provider. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_models_dev_key`].
+    /// Set the models.dev catalog key for this model_provider.
     pub fn models_dev_key(mut self, key: &str) -> Self {
         self.models_dev_key = Some(key.to_string());
         self
     }
 
-    /// Set the OpenRouter vendor prefix for this model_provider. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_openrouter_vendor_prefix`].
+    /// Set the OpenRouter vendor prefix for this model_provider.
     pub fn openrouter_vendor_prefix(mut self, prefix: &str) -> Self {
         self.openrouter_vendor_prefix = Some(prefix.to_string());
         self
     }
 
-    /// Opt into per-model conservative tool-schema sanitization. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_local_model_tool_sanitize`].
+    /// Opt into per-model conservative tool-schema sanitization.
     pub fn local_model_tool_sanitize(mut self) -> Self {
         self.local_model_tool_sanitize = true;
         self
     }
 
-    /// Treat the `/models` endpoint as publicly accessible. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_public_model_listing`].
+    /// Treat the `/models` endpoint as publicly accessible.
     pub fn public_model_listing(mut self) -> Self {
         self.public_model_listing = true;
         self
@@ -408,23 +457,20 @@ impl OpenAiCompatibleBuilder {
 
     /// Path to a PEM-encoded custom CA certificate for TLS connections.
     /// The file is read once at [`Self::build`] time; failures are logged
-    /// at WARN and TLS falls back to the system trust store. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_tls_ca_cert_path`].
+    /// at WARN and TLS falls back to the system trust store.
     pub fn tls_ca_cert_path(mut self, path: &str) -> Self {
         self.tls_ca_cert_path = Some(path.to_string());
         self
     }
 
-    /// Inject extra JSON fields into every API request body. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_extra_body`].
+    /// Inject extra JSON fields into every API request body.
     pub fn extra_body(mut self, extra: serde_json::Value) -> Self {
         self.extra_body = Some(extra);
         self
     }
 
     /// Use a stored auth profile as a bearer credential when no explicit
-    /// `api_key` was configured on this provider entry. Mirrors
-    /// [`OpenAiCompatibleModelProvider::with_auth_profile`].
+    /// `api_key` was configured on this provider entry.
     pub fn auth_profile(
         mut self,
         model_provider: &str,
@@ -437,9 +483,9 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
-    /// Finalize the builder into a ready provider. Post-construction tweaks
-    /// (timeout, max_tokens, extra headers, TLS CA, catalog keys, …) use the
-    /// `with_*` methods on the returned [`OpenAiCompatibleModelProvider`].
+    /// Finalize the builder into a ready provider. Every optional construction
+    /// value must be set on this builder; the returned provider has no
+    /// post-construction mutators.
     ///
     /// # Panics
     /// Panics if [`Self::display_name`], [`Self::base_url`], or
@@ -455,9 +501,7 @@ impl OpenAiCompatibleBuilder {
         let auth_style = self
             .auth_style
             .expect("OpenAiCompatibleBuilder: auth_style() is required");
-        // Merge flag: either the "combined preset" builder setter or the
-        // "preserve-native" setter (or the post-build `with_*` method) can
-        // enable it.
+        // Either merge preset can enable the shared merge behavior.
         let merge_system_into_user =
             self.merge_system_into_user || self.merge_system_into_user_preserve_native;
         // Default `native_tool_calling` is `!merge_system_into_user_disable_native`,
@@ -468,7 +512,7 @@ impl OpenAiCompatibleBuilder {
             .unwrap_or(!self.merge_system_into_user);
         // Read the PEM bytes now so later HTTP clients incur no per-request I/O.
         // A read error is logged at WARN and TLS falls back to system roots —
-        // preserving the previous `with_tls_ca_cert_path` semantics.
+        // preserving the established warning-and-fallback semantics.
         let tls_ca_cert_pem =
             self.tls_ca_cert_path
                 .as_deref()
@@ -1415,24 +1459,11 @@ impl StreamToolCallAccumulator {
         used_tool_call_ids: &mut std::collections::HashSet<String>,
     ) -> Option<ProviderToolCall> {
         let name = self.name?;
-        let arguments = if self.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            self.arguments
-        };
-        let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok()
-        {
-            arguments
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"function": name, "arguments": arguments})),
-                "Invalid JSON in streamed native tool-call arguments, using empty object"
-            );
-            "{}".to_string()
-        };
+        // Route through the shared `sanitize_tool_arguments` helper so the
+        // normalization contract (empty/whitespace → "{}", invalid JSON →
+        // WARN + "{}", valid JSON → passthrough) has a single source of
+        // truth. #8675.
+        let normalized_arguments = sanitize_tool_arguments(&name, &self.arguments);
 
         Some(ProviderToolCall {
             id: reserve_tool_call_id_for_contract(
@@ -3448,6 +3479,47 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCompatibleModelProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty / whitespace arguments must collapse to `"{}"` so OpenAI-style
+    /// providers never see an invalid `tool_calls[].function.arguments`.
+    #[test]
+    fn sanitize_tool_arguments_empty_or_whitespace_becomes_empty_object() {
+        assert_eq!(sanitize_tool_arguments("f", ""), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "   \n\t  "), "{}");
+    }
+
+    /// Well-formed JSON object returns untouched — only object-shaped arguments
+    /// satisfy the strict-provider function-arguments contract.
+    #[test]
+    fn sanitize_tool_arguments_valid_json_is_passthrough() {
+        let args = r#"{"path":"/tmp/x","recursive":true}"#;
+        assert_eq!(sanitize_tool_arguments("file_read", args), args);
+    }
+
+    /// Non-object JSON values (null, array, string, number, boolean) are
+    /// rejected to `"{}"` because strict providers require a JSON object for
+    /// tool-call arguments.
+    #[test]
+    fn sanitize_tool_arguments_non_object_becomes_empty_object() {
+        assert_eq!(sanitize_tool_arguments("f", "null"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "[]"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "42"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "\"hello\""), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "true"), "{}");
+    }
+
+    /// Malformed arguments are dropped to `"{}"` so strict upstreams (Cohere,
+    /// OpenInference, Nvidia via OpenRouter) no longer reject the whole request
+    /// with HTTP 400 just because the model emitted junk arguments.
+    #[test]
+    fn sanitize_tool_arguments_invalid_json_becomes_empty_object() {
+        // Unterminated string
+        assert_eq!(sanitize_tool_arguments("f", r#"{"path":"/tmp"#), "{}");
+        // Trailing junk
+        assert_eq!(sanitize_tool_arguments("f", r#"{"x":1}garbage"#), "{}");
+        // Truncated (the actual observed failure case from #8675)
+        assert_eq!(sanitize_tool_arguments("f", ""), "{}");
+    }
 
     fn make_model_provider(
         name: &str,

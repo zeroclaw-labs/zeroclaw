@@ -845,20 +845,6 @@ impl BedrockModelProvider {
         }
     }
 
-    /// Backward-compatible synchronous entry point that walks the AWS
-    /// ambient credential chain (same behaviour as
-    /// `Self::builder(alias).build()`).
-    pub fn new(alias: &str) -> Self {
-        Self::builder(alias).build()
-    }
-
-    /// Backward-compatible async entry point that walks the AWS
-    /// credential chain including EC2 IMDSv2 (same behaviour as
-    /// `Self::builder(alias).build_async().await`).
-    pub async fn new_async(alias: &str) -> Self {
-        Self::builder(alias).build_async().await
-    }
-
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.bedrock",

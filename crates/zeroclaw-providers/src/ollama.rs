@@ -208,8 +208,7 @@ impl OllamaBuilder {
         self
     }
 
-    /// Explicit API key. Whitespace-only inputs are treated as absent
-    /// (mirrors the trimming the pre-builder ctor applied in-line).
+    /// Explicit API key. Whitespace-only inputs are treated as absent.
     pub fn api_key(mut self, api_key: Option<&str>) -> Self {
         self.api_key = api_key.and_then(|value| {
             let trimmed = value.trim();
@@ -227,8 +226,7 @@ impl OllamaBuilder {
     }
 
     /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
-    /// `temperature_override`). Mirrors
-    /// [`OllamaModelProvider::with_tuning`]. When unset, defaults to
+    /// `temperature_override`). When unset, defaults to
     /// [`OllamaTuning::default`].
     pub fn tuning(mut self, tuning: OllamaTuning) -> Self {
         self.tuning = Some(tuning);

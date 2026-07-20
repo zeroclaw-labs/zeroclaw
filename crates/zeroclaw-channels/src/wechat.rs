@@ -42,6 +42,12 @@ const QR_SCAN_TIMEOUT: Duration = Duration::from_secs(480);
 
 const WECHAT_BIND_COMMAND: &str = "/bind";
 
+/// State-dir file holding the persisted bot token / account identity.
+/// Single source of truth for every reader, writer, and the relink purge.
+const ACCOUNT_FILE: &str = "account.json";
+/// State-dir file holding the persisted sync cursor and context tokens.
+const SYNC_FILE: &str = "sync.json";
+
 /// iLink Bot message types.
 const MESSAGE_TYPE_BOT: u32 = 2;
 /// iLink Bot message state.
@@ -769,7 +775,7 @@ impl WeChatChannel {
 
     /// Read `account.json` from a state directory, if present and parseable.
     fn read_account_data(state_dir: &Path) -> Option<AccountData> {
-        let data = std::fs::read_to_string(state_dir.join("account.json")).ok()?;
+        let data = std::fs::read_to_string(state_dir.join(ACCOUNT_FILE)).ok()?;
         serde_json::from_str::<AccountData>(&data).ok()
     }
 
@@ -781,6 +787,32 @@ impl WeChatChannel {
         Self::read_account_data(state_dir)
             .and_then(|account| account.token)
             .is_some_and(|token| !token.is_empty())
+    }
+
+    /// Channel-owned relink hook: delete the persisted login state so the
+    /// next channel start finds no session and begins a fresh QR pairing.
+    ///
+    /// Removes exactly the files this module persists — [`ACCOUNT_FILE`]
+    /// (the bot token, i.e. the credential) and [`SYNC_FILE`] (the sync
+    /// cursor, which belongs to the replaced session) — and never the
+    /// directory itself. Returns the paths actually removed; an already
+    /// absent file is not an error, so relinking an unpaired channel is a
+    /// safe no-op that returns an empty list.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// in-memory token until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_login(state_dir: &Path) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for file in [ACCOUNT_FILE, SYNC_FILE] {
+            let path = state_dir.join(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
     }
 
     /// Load persisted token and cursor from state_dir.
@@ -801,7 +833,7 @@ impl WeChatChannel {
             }
         }
 
-        let sync_path = self.state_dir.join("sync.json");
+        let sync_path = self.state_dir.join(SYNC_FILE);
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
         {
@@ -843,7 +875,7 @@ impl WeChatChannel {
             user_id: user_id.map(String::from),
             saved_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        let path = self.state_dir.join("account.json");
+        let path = self.state_dir.join(ACCOUNT_FILE);
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -882,7 +914,7 @@ impl WeChatChannel {
             get_updates_buf: self.cursor.lock().clone(),
             context_tokens: self.context_tokens.lock().clone(),
         };
-        let path = self.state_dir.join("sync.json");
+        let path = self.state_dir.join(SYNC_FILE);
         match serde_json::to_string(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -1574,13 +1606,16 @@ impl WeChatChannel {
             qr_refresh_count += 1;
             if qr_refresh_count > MAX_QR_REFRESH {
                 let max = MAX_QR_REFRESH.to_string();
-                anyhow::bail!(
-                    "{}",
-                    wechat_cli_string_with_args(
-                        "cli-wechat-qr-expired-giving-up",
-                        &[("max", &max)],
-                    )
+                let reason = wechat_cli_string_with_args(
+                    "cli-wechat-qr-expired-giving-up",
+                    &[("max", &max)],
                 );
+                crate::login_events::LoginEvent::Failed { reason: &reason }.emit(
+                    self.name(),
+                    &self.alias,
+                    "WeChat QR login gave up after repeated expiry",
+                );
+                anyhow::bail!("{reason}");
             }
 
             // Fetch QR code
@@ -1637,6 +1672,17 @@ impl WeChatChannel {
             } else {
                 qrcode_img_url
             };
+            crate::login_events::LoginEvent::Qr {
+                payload: qr_payload,
+                image_url: (!qrcode_img_url.is_empty()).then_some(qrcode_img_url),
+                attempt: Some(qr_refresh_count),
+                max_attempts: Some(MAX_QR_REFRESH),
+            }
+            .emit(
+                self.name(),
+                &self.alias,
+                "WeChat login QR code ready (scan with the WeChat app)",
+            );
             match render_login_qr(qr_payload) {
                 Ok(qr) => println!("{qr}"),
                 Err(err) => {
@@ -1727,6 +1773,11 @@ impl WeChatChannel {
                     "scaned" => {
                         if !scanned_printed {
                             println!("  {}", wechat_cli_string("cli-wechat-scanned-confirm"));
+                            crate::login_events::LoginEvent::Scanned.emit(
+                                self.name(),
+                                &self.alias,
+                                "WeChat QR code scanned — waiting for in-app confirmation",
+                            );
                             scanned_printed = true;
                         }
                     }
@@ -1734,6 +1785,15 @@ impl WeChatChannel {
                         println!(
                             "  {}",
                             wechat_cli_string("cli-wechat-qr-expired-refreshing")
+                        );
+                        crate::login_events::LoginEvent::Expired {
+                            attempt: qr_refresh_count,
+                            max_attempts: MAX_QR_REFRESH,
+                        }
+                        .emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login QR code expired",
                         );
                         break; // Will loop back and get a new QR code
                     }
@@ -1764,6 +1824,11 @@ impl WeChatChannel {
                             .map(String::from);
 
                         println!("  {}", wechat_cli_string("cli-wechat-connected"));
+                        crate::login_events::LoginEvent::Connected.emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login confirmed — channel connected",
+                        );
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
@@ -2523,6 +2588,25 @@ mod tests {
         )
         .unwrap();
         assert!(WeChatChannel::has_persisted_login(dir));
+    }
+
+    #[test]
+    fn clear_persisted_login_removes_state_files_and_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("account.json"), r#"{"token": "tok_persisted"}"#).unwrap();
+        std::fs::write(dir.join("sync.json"), r#"{"get_updates_buf": "cursor"}"#).unwrap();
+
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!dir.join("account.json").exists());
+        assert!(!dir.join("sync.json").exists());
+        assert!(!WeChatChannel::has_persisted_login(dir));
+        assert!(dir.exists(), "the state directory itself must survive");
+
+        // Relinking an already unpaired channel is a safe no-op.
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert!(removed.is_empty());
     }
 
     #[test]

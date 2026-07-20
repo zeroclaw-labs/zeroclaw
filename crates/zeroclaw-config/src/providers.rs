@@ -222,6 +222,7 @@ macro_rules! for_each_model_provider_slot {
 
 macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+        /// Typed model provider container with one alias map per provider family.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
@@ -711,6 +712,7 @@ mod tests {
     }
 }
 
+/// Top-level wrapper for every configured provider category.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]

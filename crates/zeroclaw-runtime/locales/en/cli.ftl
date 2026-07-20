@@ -506,6 +506,8 @@ cli-sop-execution-mode = {"  "}Execution mode: {$value}
 cli-sop-deterministic = {"  "}Deterministic:  {$value}
 cli-sop-cooldown = {"  "}Cooldown:       {$value}s
 cli-sop-max-concurrent = {"  "}Max concurrent: {$value}
+cli-sop-admission-policy = {"  "}Admission:      {$value}
+cli-sop-max-pending-approvals = {"  "}Max pending:    {$value}
 cli-sop-location = {"  "}Location:       {$value}
 cli-sop-triggers = {"  "}Triggers:
 cli-sop-steps = {"  "}Steps:
@@ -662,6 +664,8 @@ cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = unknown runtime preset `{$preset}`
 cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to agent `{$owner}`
 cli-quickstart-error-channel-required = channel type and alias are required
+cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
+cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -890,11 +894,15 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Shown at the end of agent output when the tool call loop exhausted its
+# iteration budget and the agent cannot continue without exceeding limits.
+turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = history message limit exceeded
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
