@@ -59,16 +59,23 @@ pub struct BaselineEntry {
     pub checks: BTreeMap<String, bool>,
     pub total_tokens: u64,
     pub score: f64,
+    /// Judge provider reference when any judge rubric ran (joins the comparability
+    /// key: a judge swap makes cases unverifiable, not silently compared).
+    #[serde(default)]
+    pub judge_ref: Option<String>,
 }
 
+/// The comparability key: two runs are comparable only when these agree.
+type ComparabilityKey<'a> = (&'a str, Mode, &'a str, &'a [String], Option<&'a str>);
+
 impl BaselineEntry {
-    /// The comparability key: two entries are comparable only when these agree.
-    fn key(&self) -> (&str, Mode, &str, &[String]) {
+    fn key(&self) -> ComparabilityKey<'_> {
         (
             self.case_hash.as_str(),
             self.mode,
             self.provider_ref.as_str(),
             self.tool_surface.as_slice(),
+            self.judge_ref.as_deref(),
         )
     }
 }
@@ -122,6 +129,7 @@ fn entry_from_case(case: &CaseReport) -> Option<BaselineEntry> {
             .collect(),
         total_tokens: rec.input_tokens + rec.output_tokens,
         score: case.score(),
+        judge_ref: rec.judge_ref.clone(),
     })
 }
 
@@ -170,12 +178,13 @@ impl BaselineComparison {
     }
 }
 
-fn current_key(rec: &crate::record::RunRecord) -> (&str, Mode, &str, &[String]) {
+fn current_key(rec: &crate::record::RunRecord) -> ComparabilityKey<'_> {
     (
         rec.case_hash.as_str(),
         rec.mode,
         rec.provider_ref.as_str(),
         rec.tool_surface.as_slice(),
+        rec.judge_ref.as_deref(),
     )
 }
 
@@ -300,6 +309,8 @@ mod tests {
             output_tokens: 0,
             duration_ms: 0,
             llm_calls: 0,
+            judge_ref: None,
+            judge_usage: None,
         }
     }
 
@@ -309,6 +320,7 @@ mod tests {
             passed,
             detail: String::new(),
             category,
+            diagnostic: false,
         }
     }
 
@@ -465,6 +477,21 @@ mod tests {
         let flaky2 = downgrade_flaky_regressions(&mut cmp2, Mode::Replay, &rerun);
         assert!(flaky2.is_empty());
         assert_eq!(cmp2.confirmed_regressions(), 1);
+    }
+
+    #[test]
+    fn judge_ref_joins_comparability_key() {
+        // Same case, different judge_ref => not comparable (a judge swap must not
+        // be silently compared).
+        let mut base_case = case("a", vec![grade("c", true, GradeCategory::Response)], 10);
+        base_case.record.as_mut().unwrap().judge_ref = Some("judge.v1:m".to_string());
+        let baseline = baseline_of(&SuiteReport {
+            cases: vec![base_case],
+        });
+        let mut cur = case("a", vec![grade("c", true, GradeCategory::Response)], 10);
+        cur.record.as_mut().unwrap().judge_ref = Some("judge.v2:m".to_string());
+        let cmp = compare(&SuiteReport { cases: vec![cur] }, &baseline);
+        assert_eq!(cmp.per_case["a"], CaseComparison::Unverifiable);
     }
 
     #[test]

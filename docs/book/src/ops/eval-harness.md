@@ -102,6 +102,40 @@ Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never
 gate. To refresh a baseline after an intentional behavior change, re-run with
 `--write-baseline` and commit the updated file.
 
+## LLM judge (diagnostic by default)
+
+A case can declare `expects.judge`: a list of rubrics, one per dimension. Each
+rubric has a `name`, a `rubric` string, a pass `threshold` (default 0.7 on the
+judge's 0.0 to 1.0 score), and an optional `include_transcript` flag. Configure a
+judge with `[eval].judge_provider` (a dotted `providers.models` reference); prefer
+a different model family than the one under test, since self-judging is biased
+(the harness warns when the judge and live provider share a family).
+
+Each rubric is graded by one isolated judge call at temperature 0.0. The judge's
+0.0 to 1.0 score decides pass/fail against the threshold; its own opinion is
+advisory. A score at or above the threshold passes; below fails; an `unknown`
+verdict, malformed output, or a transport error is reported as
+`UNKNOWN (diagnostic)` and never fails a build.
+
+**Judge grades are diagnostic by default:** they are stripped from the pass/fail
+gate unless `[eval].judge_gate` is true AND a calibration file exists at
+`evals/calibration/<judge_ref>.json`, where `judge_ref` is the model-inclusive
+`<type>.<alias>:<model>` with `/`, `.`, and `:` replaced by `_` (so calibration
+is model-specific, matching the comparability key). When
+`judge_gate` is set but no calibration file exists, the harness warns and stays
+diagnostic. Judge token usage is never added to the case's own token totals (the
+judge runs outside the agent), and the judge reference joins the baseline
+comparability key, so swapping judges makes cases unverifiable rather than
+silently compared.
+
+Authoring rules: one dimension per rubric entry, and every judge case must also
+declare at least one deterministic check (workspace, tool, or budget) so it is not
+judge-only. Calibration protocol: dump at least 50 records with `--dump-records`,
+have a human label them, compute the judge's agreement with the human labels, and
+commit a calibration file `{"schema":"zeroclaw-eval/calibration/v1","judge_ref":
+"...","labeled_records":N,"agreement":0.0-1.0,"labeler":"...","date":"YYYY-MM-DD"}`
+with N at least 50 before enabling `judge_gate`.
+
 ## Exit-code contract
 
 The process exit code is the CI gate, and it is suite-kind aware:

@@ -247,6 +247,15 @@ pub struct EvalHarnessConfig {
     /// Wall-clock timeout per conversation turn in live mode, seconds.
     #[serde(default = "default_eval_case_timeout_secs")]
     pub case_timeout_secs: u64,
+    /// Judge provider for `expects.judge` rubrics, dotted `providers.models`
+    /// reference. Empty disables judge grading. Prefer a different model family
+    /// than the one under test (self-judging is biased).
+    #[serde(default)]
+    pub judge_provider: crate::providers::ModelProviderRef,
+    /// When true AND a calibration file exists for the judge, judge failures
+    /// affect the exit code. Default false: judge grades are diagnostic.
+    #[serde(default)]
+    pub judge_gate: bool,
 }
 
 impl Default for EvalHarnessConfig {
@@ -257,6 +266,8 @@ impl Default for EvalHarnessConfig {
             live_provider: crate::providers::ModelProviderRef::default(),
             live_allowed_tools: Vec::new(),
             case_timeout_secs: default_eval_case_timeout_secs(),
+            judge_provider: crate::providers::ModelProviderRef::default(),
+            judge_gate: false,
         }
     }
 }

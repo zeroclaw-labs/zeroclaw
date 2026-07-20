@@ -47,4 +47,12 @@ pub struct RunRecord {
     pub duration_ms: u64,
     /// Number of LLM responses observed during the run.
     pub llm_calls: u32,
+    /// Judge provider reference when any judge rubric ran (joins the comparability
+    /// key so a judge swap makes cases unverifiable). `None` when no judge ran.
+    #[serde(default)]
+    pub judge_ref: Option<String>,
+    /// Judge token usage `(input, output)` when measured. Never added to the
+    /// case's own token totals (the judge runs outside the agent/observer).
+    #[serde(default)]
+    pub judge_usage: Option<(u64, u64)>,
 }

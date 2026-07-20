@@ -46,6 +46,8 @@ pub struct RunDeps {
     pub live_tools: Vec<String>,
     /// Wall-clock timeout applied per conversation turn in live mode.
     pub case_timeout: Duration,
+    /// Judge provider deps, when `[eval].judge_provider` is configured.
+    pub judge: Option<crate::grader::JudgeDeps>,
 }
 
 impl RunDeps {
@@ -63,6 +65,7 @@ impl RunDeps {
             provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(120),
+            judge: None,
         }
     }
 }
@@ -177,10 +180,22 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
         output_tokens,
         duration_ms,
         llm_calls: observer.llm_calls(),
+        judge_ref: judge_ref_for(trace, deps),
+        judge_usage: None,
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
-    let grades = grade_run(trace, &record, tmp.path()).await;
+    let grades = grade_run(trace, &record, tmp.path(), deps.judge.as_ref()).await;
     Ok(CaseOutcome { record, grades })
+}
+
+/// The judge reference stamped on a record: `Some` exactly when the case declares
+/// rubrics and a judge provider is configured (the same condition under which
+/// `grade_run` runs the judge grader). One canonical derivation for both paths.
+pub(crate) fn judge_ref_for(trace: &LlmTrace, deps: &RunDeps) -> Option<String> {
+    if trace.expects.judge.is_empty() {
+        return None;
+    }
+    deps.judge.as_ref().map(|j| j.judge_ref.clone())
 }
 
 #[cfg(test)]
@@ -268,6 +283,41 @@ mod tests {
             err.to_string().contains("no scripted steps"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn judge_tokens_excluded_from_case_budget() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "jt",
+                "turns": [{ "user_input": "hi", "steps": [
+                    { "response": { "type": "text", "content": "done", "input_tokens": 20, "output_tokens": 5 } }
+                ] }],
+                "expects": { "judge": [{ "name": "h", "rubric": "grade it" }] }
+            }"#,
+        )
+        .unwrap();
+        let judge_trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"j","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"{\"score\":0.9,\"unknown\":false,\"reason\":\"ok\"}"}}]}]}"#,
+        )
+        .unwrap();
+        let mut deps = RunDeps::replay();
+        deps.judge = Some(crate::grader::JudgeDeps {
+            provider: Arc::new(
+                crate::replay::TraceLlmProvider::try_from_trace(&judge_trace).unwrap(),
+            ),
+            model: "m".to_string(),
+            judge_ref: "judge.m:x".to_string(),
+            gates: false,
+        });
+        let outcome = run_case(&trace, &deps).await.unwrap();
+        // The case budget reflects only the agent's tokens, never the judge's.
+        assert_eq!(outcome.record.input_tokens, 20);
+        assert_eq!(outcome.record.output_tokens, 5);
+        assert!(outcome.record.judge_usage.is_none());
+        // The judge ran and stamped its ref (which joins the comparability key).
+        assert_eq!(outcome.record.judge_ref.as_deref(), Some("judge.m:x"));
+        assert!(outcome.grades.iter().any(|g| g.check == "judge:h"));
     }
 
     #[tokio::test]

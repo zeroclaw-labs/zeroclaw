@@ -79,8 +79,25 @@ impl ModelProvider for TraceLlmProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        // Not exercised by the agent loop (which uses `chat`); kept for trait completeness.
-        Ok(String::new())
+        // Not used by the agent loop (which uses `chat`); used to script the judge
+        // in tests: pop the next step, which must be a Text step, and return it.
+        let step = {
+            let mut steps = self.steps.lock().unwrap();
+            steps.pop_front()
+        };
+        match step {
+            Some(TraceResponse::Text { content, .. }) => Ok(content),
+            Some(TraceResponse::ToolCalls { .. }) => {
+                anyhow::bail!(
+                    "TraceLlmProvider({}): chat_with_system got a tool_calls step; scripted judge responses must be text",
+                    self.trace_name
+                )
+            }
+            None => anyhow::bail!(
+                "TraceLlmProvider({}): chat_with_system requested more responses than scripted",
+                self.trace_name
+            ),
+        }
     }
 
     async fn chat(

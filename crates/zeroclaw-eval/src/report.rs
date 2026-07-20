@@ -27,9 +27,10 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error and every non-diagnostic check
+    /// passed. Diagnostic grades (e.g. an uncalibrated judge dimension) never gate.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && self.grades.iter().all(|g| g.passed || g.diagnostic)
     }
 
     fn checks_passed(&self) -> usize {
@@ -233,6 +234,9 @@ impl SuiteReport {
                         "total_tokens".into(),
                         (rec.input_tokens + rec.output_tokens).into(),
                     );
+                    if let Some(judge_ref) = &rec.judge_ref {
+                        map.insert("judge_ref".into(), judge_ref.clone().into());
+                    }
                 }
                 obj
             })
@@ -259,6 +263,7 @@ mod tests {
             passed,
             detail: detail.to_string(),
             category: crate::grader::GradeCategory::Response,
+            diagnostic: false,
         }
     }
 
@@ -517,6 +522,7 @@ mod tests {
             passed,
             detail: String::new(),
             category,
+            diagnostic: false,
         };
         let report = CaseReport {
             name: "mixed".to_string(),

@@ -18770,13 +18770,19 @@ impl Config {
             }
         }
 
-        // Eval harness live provider — a dotted `providers.models` reference, or
-        // empty to opt out of live mode. Validated at the top level (not per agent)
-        // because it is a global `[eval]` field, mirroring the per-agent typed
+        // Eval harness provider refs — dotted `providers.models` references, or
+        // empty to opt out. Validated at the top level (not per agent) because
+        // they are global `[eval]` fields, mirroring the per-agent typed
         // provider-ref checks below.
-        let eval_live_provider = self.eval.live_provider.trim();
-        if !eval_live_provider.is_empty() {
-            match eval_live_provider.split_once('.') {
+        let eval_provider_refs: &[(&str, &str)] = &[
+            ("eval.live_provider", self.eval.live_provider.trim()),
+            ("eval.judge_provider", self.eval.judge_provider.trim()),
+        ];
+        for (field, value) in eval_provider_refs {
+            if value.is_empty() {
+                continue;
+            }
+            match value.split_once('.') {
                 Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
                     let exists = self
                         .get_map_keys(&format!("providers.models.{ty}"))
@@ -18784,15 +18790,15 @@ impl Config {
                     if !exists {
                         validation_bail!(
                             DanglingReference,
-                            "eval.live_provider",
-                            "eval.live_provider = {eval_live_provider:?} but providers.models.{ty}.{inner} is not configured",
+                            (*field).to_string(),
+                            "{field} = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
                 _ => validation_bail!(
                     InvalidFormat,
-                    "eval.live_provider",
-                    "eval.live_provider must be dotted form `<type>.<alias>` (got {eval_live_provider:?})",
+                    (*field).to_string(),
+                    "{field} must be dotted form `<type>.<alias>` (got {value:?})",
                 ),
             }
         }
@@ -33542,6 +33548,39 @@ allowed_users = []
         let cfg = eval_live_provider_config("");
         cfg.validate()
             .expect("empty eval.live_provider must validate");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_judge_provider_dangling_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            judge_provider = "custom.nope"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("dangling judge_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.judge_provider")
+                && msg.contains("providers.models.custom.nope is not configured"),
+            "expected DanglingReference for eval.judge_provider, got: {msg}"
+        );
     }
 
     // effective_summary_provider precedence — agent → profile → None.

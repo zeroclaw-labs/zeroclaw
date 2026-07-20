@@ -177,9 +177,11 @@ pub async fn run_live_case(
         output_tokens,
         duration_ms,
         llm_calls: observer.llm_calls(),
+        judge_ref: crate::runner::judge_ref_for(trace, deps),
+        judge_usage: None,
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
-    let grades = crate::grader::grade_run(trace, &record, tmp.path()).await;
+    let grades = crate::grader::grade_run(trace, &record, tmp.path(), deps.judge.as_ref()).await;
     Ok(crate::runner::CaseOutcome { record, grades })
 }
 
@@ -208,6 +210,7 @@ mod tests {
             provider_ref: "test.model:test".to_string(),
             live_tools,
             case_timeout: timeout,
+            judge: None,
         }
     }
 

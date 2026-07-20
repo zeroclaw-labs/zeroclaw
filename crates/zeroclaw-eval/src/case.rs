@@ -115,6 +115,30 @@ pub struct TraceExpects {
     /// JSON-pointer checks against the final response parsed as JSON.
     #[serde(default)]
     pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Per-dimension LLM-judge rubrics. Diagnostic unless the judge is gated and
+    /// calibrated.
+    #[serde(default)]
+    pub judge: Vec<JudgeRubric>,
+}
+
+fn default_judge_threshold() -> f64 {
+    0.7
+}
+
+/// One judged dimension of a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeRubric {
+    /// Short dimension name, e.g. "helpfulness" — one dimension per entry.
+    pub name: String,
+    /// The rubric for THIS dimension only.
+    pub rubric: String,
+    /// Pass threshold on the judge's 0.0–1.0 score. Uncalibrated default.
+    #[serde(default = "default_judge_threshold")]
+    pub threshold: f64,
+    /// Include a rendered transcript (tool calls + results), not just the final
+    /// response, so state-dependent rubrics can't be gamed by prose.
+    #[serde(default)]
+    pub include_transcript: bool,
 }
 
 /// End-state checks against the case workspace after the run.

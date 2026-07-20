@@ -149,11 +149,12 @@ fn print_comparison(
 /// config so live mode can resolve its provider. Replay injects the deterministic
 /// trace-replay provider; live resolves `[eval].live_provider` per case.
 fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
-    match mode {
+    let judge = build_judge_deps(config)?;
+    let mut deps = match mode {
         // Replay's provider wiring is owned by `RunDeps::replay()`; delegate so the
         // trace-replay factory has a single definition. Replay ignores the live-only
         // tool allowlist and timeout.
-        Mode::Replay => Ok(RunDeps::replay()),
+        Mode::Replay => RunDeps::replay(),
         Mode::Live => {
             // Trim so validation (which trims) and runtime resolution agree: a
             // whitespace-padded ref must not pass `Config::validate` then miss here.
@@ -165,8 +166,17 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             let (_, _provider_type, resolved_model) =
                 build_session_model_provider(config, &provider_ref, None)?;
             let receipt_ref = format!("{provider_ref}:{resolved_model}");
+            // Self-judge bias warning: judge and agent share the same provider ref.
+            if judge
+                .as_ref()
+                .is_some_and(|j| j.judge_ref.split(':').next() == Some(provider_ref.as_str()))
+            {
+                println!(
+                    "  warning: judge and live provider are the same provider reference (self-judging bias)"
+                );
+            }
             let cfg = config.clone();
-            Ok(RunDeps {
+            RunDeps {
                 mode,
                 provider: Box::new(move |_trace: &LlmTrace| {
                     let (provider, _provider_type, _resolved_model) =
@@ -176,9 +186,58 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 provider_ref: receipt_ref,
                 live_tools: config.eval.live_allowed_tools.clone(),
                 case_timeout: Duration::from_secs(config.eval.case_timeout_secs),
-            })
+                judge: None,
+            }
         }
+    };
+    deps.judge = judge;
+    Ok(deps)
+}
+
+/// Sanitize a judge ref into a calibration filename stem: `/`, `.`, and `:` all
+/// become `_` so the model-inclusive `judge_ref` is a safe single-segment name.
+fn calibration_stem(judge_ref: &str) -> String {
+    judge_ref
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '.' || c == ':' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Build judge deps from config, or `None` when `[eval].judge_provider` is empty.
+/// Judge grades gate only when `judge_gate` is set AND a calibration file exists
+/// for the judge (keyed by the model-inclusive `judge_ref`, matching the
+/// comparability key); otherwise they stay diagnostic (a missing file warns).
+fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
+    let judge_provider = config.eval.judge_provider.as_str().trim().to_string();
+    if judge_provider.is_empty() {
+        return Ok(None);
     }
+    let (provider, _provider_type, model) =
+        build_session_model_provider(config, &judge_provider, None)?;
+    let judge_ref = format!("{judge_provider}:{model}");
+    let calibration = std::path::Path::new(&format!(
+        "evals/calibration/{}.json",
+        calibration_stem(&judge_ref)
+    ))
+    .exists();
+    let gates = config.eval.judge_gate && calibration;
+    if config.eval.judge_gate && !calibration {
+        println!(
+            "  warning: [eval].judge_gate is set but no calibration file for {judge_ref}; judge grades stay diagnostic"
+        );
+    }
+    Ok(Some(zeroclaw_eval::grader::JudgeDeps {
+        provider: std::sync::Arc::from(provider),
+        model,
+        judge_ref,
+        gates,
+    }))
 }
 
 /// Run a suite of eval cases and return the aggregated report. The failed-case
@@ -296,6 +355,8 @@ mod tests {
             output_tokens: 0,
             duration_ms: 0,
             llm_calls: 0,
+            judge_ref: None,
+            judge_usage: None,
         }
     }
 
@@ -311,6 +372,21 @@ mod tests {
                 Some("boom".to_string())
             },
         }
+    }
+
+    #[test]
+    fn calibration_stem_keys_on_model_inclusive_judge_ref() {
+        // The stem is derived from judge_ref (provider:model), not the bare
+        // provider, so calibration is model-specific and matches the docs.
+        assert_eq!(
+            calibration_stem("anthropic.sonnet:claude-x"),
+            "anthropic_sonnet_claude-x"
+        );
+        // A model swap under the same provider produces a different stem.
+        assert_ne!(
+            calibration_stem("anthropic.sonnet:model-a"),
+            calibration_stem("anthropic.sonnet:model-b")
+        );
     }
 
     #[test]
