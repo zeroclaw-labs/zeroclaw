@@ -628,11 +628,15 @@ impl AcpServer {
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|mp| mp.model.clone())
                     .unwrap_or_default();
+                let error = zeroclaw_runtime::security::scrub(
+                    &zeroclaw_providers::sanitize_api_error(&e.to_string()),
+                );
                 ::zeroclaw_log::scope!(
                     session_key: session_id.as_str(),
                     agent_alias: agent_alias.as_str(),
                     model_provider: model_provider.as_str(),
-                    model: model.as_str()
+                    model: model.as_str(),
+                    channel: "acp",
                     => async {
                         ::zeroclaw_log::record!(
                             ERROR,
@@ -644,7 +648,7 @@ impl AcpServer {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "workspace_dir": workspace_dir,
-                                "error": e.to_string(),
+                                "error": error,
                             })),
                             "ACP session/new failed: agent init error"
                         );
@@ -2579,6 +2583,117 @@ mod tests {
         .expect("session/new should create a session");
 
         assert!(result["sessionId"].as_str().is_some());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_new_agent_init_failure_log_is_attributed_and_redacted() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        const EXPOSED_PREFIX: &str = "sk-ant-z";
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: cwd.path().to_path_buf(),
+            providers: {
+                let mut providers = zeroclaw_config::providers::Providers::default();
+                providers.models.openrouter.insert(
+                    "default".to_string(),
+                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                        base: zeroclaw_config::schema::ModelProviderConfig {
+                            api_key: Some("sk-ant-zeroclaw_test_credential".to_string()),
+                            model: Some("test-model".to_string()),
+                            ..Default::default()
+                        },
+                    },
+                );
+                providers
+            },
+            ..Default::default()
+        };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "openrouter.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        let server = AcpServer::new(config, AcpServerConfig::default());
+
+        let error = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect_err("the mismatched credential must fail agent construction");
+        assert!(
+            error.message.contains("API key prefix mismatch"),
+            "the RPC error must retain the agent construction failure: {}",
+            error.message
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "agent init failure event was not emitted"
+            );
+            match tokio::time::timeout(remaining.min(Duration::from_millis(50)), rx.recv()).await {
+                Ok(Ok(value))
+                    if value.get("message").and_then(Value::as_str)
+                        == Some("ACP session/new failed: agent init error") =>
+                {
+                    break value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("log broadcast closed before the agent init failure event")
+                }
+                Err(_elapsed) => {}
+            }
+        };
+
+        assert_eq!(event["severity_text"], "ERROR");
+        assert_eq!(event["event"]["category"], "channel");
+        assert_eq!(event["event"]["action"], "fail");
+        assert_eq!(event["event"]["outcome"], "failure");
+        assert_eq!(event["zeroclaw"]["channel_type"], "acp");
+        assert_eq!(event["zeroclaw"]["agent_alias"], "test-agent");
+        assert_eq!(event["zeroclaw"]["model_provider"], "openrouter.default");
+        assert_eq!(event["zeroclaw"]["model"], "test-model");
+        assert!(
+            event["zeroclaw"]["session_key"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "the generated session key must be harvested as attribution: {event}"
+        );
+        assert_eq!(
+            event["attributes"]["workspace_dir"],
+            std::fs::canonicalize(cwd.path())
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        let logged_error = event["attributes"]["error"]
+            .as_str()
+            .expect("the failure event must retain sanitized error detail");
+        assert!(logged_error.contains("API key prefix mismatch"));
+        assert!(logged_error.contains("openrouter"));
+        assert!(logged_error.contains("[REDACTED]"));
+        assert!(
+            !logged_error.contains(EXPOSED_PREFIX),
+            "the persisted event must not contain the credential fragment: {logged_error}"
+        );
     }
 
     /// Spin up a wiremock server speaking the minimum MCP HTTP handshake
