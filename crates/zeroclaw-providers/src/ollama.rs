@@ -29,32 +29,10 @@ pub const OLLAMA_DEFAULT_NUM_CTX: u32 = 8192;
 /// server-side default is 128, which silently truncates responses.
 pub const OLLAMA_DEFAULT_NUM_PREDICT: i32 = 2048;
 
-/// Per-deployment tuning knobs for the Ollama provider. Bundled into
-/// every `/api/chat` request's `options` field so the wire payload is
-/// explicit instead of relying on Ollama server defaults.
-///
-/// Note: temperature is intentionally NOT held as a default here.
-/// `temperature_override` is `Some(v)` only when an operator explicitly
-/// sets `ollama_temperature_override` in `config.toml`; otherwise the
-/// per-call temperature passed through `ModelProvider::chat_with_system(..)`
-/// wins (preserving backward compatibility with `TEMPERATURE_DEFAULT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OllamaTuning {
     pub num_ctx: u32,
     pub num_predict: i32,
-    /// Operator-supplied override for the per-call temperature passed
-    /// through `ModelProvider::chat_with_system(.., temperature)`. When
-    /// `Some(v)`, every Ollama `/api/chat` request uses `v` regardless
-    /// of the per-call argument — this is the wire knob behind the
-    /// `ollama_temperature_override` config field. When `None`, the
-    /// per-call temperature wins (full backward compatibility).
-    //
-    // Note: `Option<f64>` here, vs `Option<u32>`/`Option<i32>` on the
-    // runtime-override constructor's first two args, because temperature
-    // has fall-through semantics (None means "let the per-call temp win"),
-    // whereas num_ctx/num_predict unset just falls back to framework
-    // constants — there is no meaningful "let the call decide" mode for
-    // those two.
     pub temperature_override: Option<f64>,
 }
 
@@ -476,11 +454,6 @@ impl OllamaModelProvider {
         (content, Some(images))
     }
 
-    /// Convert internal chat history format to Ollama's native tool-call message schema.
-    ///
-    /// `run_tool_call_loop` stores native assistant/tool entries as JSON strings in
-    /// `ChatMessage.content`. We decode those payloads here so follow-up requests send
-    /// structured `assistant.tool_calls` and `tool.tool_name`, as expected by Ollama.
     fn convert_messages(&self, messages: &[ChatMessage]) -> Vec<Message> {
         let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
 
@@ -745,13 +718,6 @@ impl OllamaModelProvider {
         Ok(chat_response)
     }
 
-    /// Send a request to Ollama and get the parsed response.
-    /// Pass `tools` to enable native function-calling for models that support it.
-    ///
-    /// When `reasoning_enabled` (`think`) is set to `true`, the first request
-    /// includes `think: true`.  If that request fails (the model may not support
-    /// the `think` parameter), we automatically retry once with `think` omitted
-    /// so the call succeeds instead of entering an infinite retry loop.
     async fn send_request(
         &self,
         messages: Vec<Message>,
@@ -797,11 +763,6 @@ impl OllamaModelProvider {
         }
     }
 
-    /// Convert Ollama tool calls to the JSON format expected by parse_tool_calls in loop_.rs
-    ///
-    /// Handles quirky model behavior where tool calls are wrapped:
-    /// - `{"name": "tool_call", "arguments": {"name": "shell", "arguments": {...}}}`
-    /// - `{"name": "tool.shell", "arguments": {...}}`
     fn format_tool_calls_for_loop(&self, tool_calls: &[OllamaToolCall]) -> String {
         let formatted_calls: Vec<serde_json::Value> = tool_calls
             .iter()
@@ -1031,12 +992,6 @@ impl ModelProvider for OllamaModelProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        // Default to prompt-guided tool calling (XML instructions in system prompt)
-        // because many Ollama-served models do not support Ollama's native
-        // /api/chat tool-calling parameter. Models that lack support silently
-        // ignore the tools array and emit tool-call JSON as plain text, which the
-        // agent loop cannot parse without the XML protocol instructions.
-        // See: https://github.com/zeroclaw-labs/zeroclaw/issues/3999
         false
     }
 
@@ -1279,18 +1234,17 @@ mod tests {
             ChatMessage::system("You are helpful."),
             ChatMessage::user("read a file"),
         ];
-        let tools = vec![ToolSpec {
-            name: "file_read".to_string(),
-            description: "Read a file".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "file_read",
+            "Read a file",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"}
                 },
                 "required": ["path"]
-            })
-            .into(),
-        }];
+            }),
+        )];
 
         let response = provider
             .chat(

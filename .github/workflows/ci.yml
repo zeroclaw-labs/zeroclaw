@@ -100,7 +100,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        run: bash scripts/ci/apt_install.sh libudev-dev
+        run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
@@ -146,6 +146,10 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
+      - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
+        run: |
+          bash scripts/ci/comment_hygiene_gate.test.sh
+          bash scripts/ci/comment_hygiene_gate.sh
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
@@ -448,7 +452,7 @@ jobs:
           set +e
           cargo_log="${RUNNER_TEMP}/cargo-bench.log"
           SECONDS=0
-          cargo bench --no-run --locked 2>&1 | tee "$cargo_log"
+          cargo bench --bench agent_benchmarks --no-run --locked --no-default-features --features agent-runtime 2>&1 | tee "$cargo_log"
           cargo_status=${PIPESTATUS[0]}
           duration_seconds=$SECONDS
           set -e
@@ -535,7 +539,18 @@ jobs:
       - name: Validate YAML workflow syntax
         run: |
           pip install pyyaml -q 2>/dev/null || true
-          python3 -c "import sys, yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ci.yml: valid')"
+          python3 - <<'PY'
+          import yaml
+
+          for path in (
+              ".github/workflows/ci.yml",
+              ".github/workflows/project-dashboard-plan.yml",
+          ):
+              yaml.safe_load(open(path))
+              print(f"{path}: valid")
+          PY
+      - name: Validate project dashboard planner
+        run: python3 scripts/github/project_dashboard_plan_test.py
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \

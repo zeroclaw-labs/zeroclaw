@@ -17,7 +17,7 @@ record; the date above is the date this ADR was added to the
 architecture docs.
 
 This record was drafted from
-[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-retroactive-adrs)
+[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-foundational-adr-backlog)
 and the current repository structure. It was not recovered from an
 older ADR file.
 

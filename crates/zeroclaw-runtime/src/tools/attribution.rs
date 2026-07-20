@@ -1,7 +1,3 @@
-//! Centralized `Attributable` impls for every concrete `Tool` defined
-//! in `zeroclaw-runtime`. See the sibling file in `zeroclaw-tools` for
-//! the rationale; same pattern.
-
 use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 use zeroclaw_api::tool_attribution;
 
@@ -59,11 +55,6 @@ tool_attribution!(SopStatusTool, ToolKind::SopStatus);
 tool_attribution!(SpawnSubagentTool, ToolKind::SpawnSubagent);
 tool_attribution!(VerifiableIntentTool, ToolKind::Plugin);
 
-// Arc-wrapping shell: surface the inner tool's attribution so the
-// registered tool reports its real identity, not a generic mask.
-// Private wrappers (`ArcDelegatingTool`, `ToolArcRef`) carry their
-// own impls next to their `impl Tool` blocks in `mod.rs` and
-// `delegate.rs` respectively, since the structs aren't `pub`.
 impl Attributable for ArcToolRef {
     fn role(&self) -> Role {
         self.0.role()

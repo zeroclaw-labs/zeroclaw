@@ -1,10 +1,4 @@
 //! Google/Gemini OAuth2 authentication flow.
-//!
-//! Supports:
-//! - Authorization code flow with PKCE (loopback redirect)
-//! - Device code flow for headless environments
-//!
-//! Uses the same client credentials as Gemini CLI for compatibility.
 
 use crate::auth::oauth_common::{parse_query_params, url_decode, url_encode};
 use crate::auth::profiles::TokenSet;
@@ -328,7 +322,6 @@ pub async fn poll_device_code_tokens(
 }
 
 /// Receive OAuth code via loopback callback OR manual stdin input.
-///
 /// If the callback server can't receive the redirect (e.g., remote/headless environment),
 /// the user can paste the full callback URL or just the code.
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
