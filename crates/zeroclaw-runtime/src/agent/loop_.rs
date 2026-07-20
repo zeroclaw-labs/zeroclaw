@@ -117,6 +117,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
     }
     Some(Arc::new(parking_lot::RwLock::new(map)))
 }
+use crate::agent::TurnMeta;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -705,6 +706,7 @@ fn build_hardware_context(
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
+    turn: TurnMeta<'_>,
 ) -> String {
     if rag.is_empty() || boards.is_empty() {
         return String::new();
@@ -726,9 +728,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(turn.channel_name.to_string()),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: Some(turn.turn_id.to_string()),
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -1722,7 +1724,18 @@ pub async fn run(
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| {
-                    build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
+                    build_hardware_context(
+                        r,
+                        &*observer,
+                        &effective_msg,
+                        &board_names,
+                        rag_limit,
+                        TurnMeta {
+                            agent_alias: Some(agent_alias),
+                            turn_id: &turn_id,
+                            channel_name,
+                        },
+                    )
                 })
                 .unwrap_or_default();
             let context = hw_context;
@@ -2236,6 +2249,11 @@ pub async fn run(
                             &effective_input,
                             &board_names,
                             rag_limit,
+                            TurnMeta {
+                                agent_alias: Some(agent_alias),
+                                turn_id: &turn_id,
+                                channel_name,
+                            },
                         )
                     })
                     .unwrap_or_default();
@@ -3116,11 +3134,27 @@ pub async fn process_message(
         // origin (agent::memory_inject); recall is scoped to this entry's
         // session_id. Hardware RAG stays site-built; the engine prepends the
         // memory block above it.
+        // Pre-mint the turn id so the pre-turn RAG retrieval and the
+        // agent_turn bracket share one correlation id. The RAG span stays a
+        // root span (it runs before AgentStart) but carries the matching
+        // zeroclaw.turn_id attribute; moving it inside the bracket is #8844.
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| {
-                build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
+                build_hardware_context(
+                    r,
+                    &*observer,
+                    effective_msg_ref,
+                    &board_names,
+                    rag_limit,
+                    TurnMeta {
+                        agent_alias: Some(agent_alias),
+                        turn_id: &turn_id,
+                        channel_name: "daemon",
+                    },
+                )
             })
             .unwrap_or_default();
         let context = hw_context;
@@ -15291,6 +15325,58 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `build_hardware_context` must forward the caller's TurnMeta onto the
+    /// RagRetrieve event it emits. Prior review flagged that RagRetrieve
+    /// correlation had no executing assertion anywhere.
+    #[test]
+    fn build_hardware_context_forwards_turn_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("datasheets");
+        std::fs::create_dir_all(&base).unwrap();
+        let content = r#"# Test Board
+## Pin Aliases
+red_led: 13
+## GPIO
+Pin 13: LED
+"#;
+        std::fs::write(base.join("test-board.md"), content).unwrap();
+        let rag = crate::rag::HardwareRag::load(tmp.path(), "datasheets").unwrap();
+        let boards = vec!["test-board".to_string()];
+        let observer = CapturingObserver::default();
+
+        let _ = build_hardware_context(
+            &rag,
+            &observer,
+            "led",
+            &boards,
+            5,
+            TurnMeta {
+                agent_alias: Some("coder"),
+                turn_id: "turn-7",
+                channel_name: "daemon",
+            },
+        );
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::RagRetrieve { .. }))
+            .expect("build_hardware_context must emit RagRetrieve")
+        {
+            ObserverEvent::RagRetrieve {
+                turn_id,
+                channel,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-7"));
+                assert_eq!(channel.as_deref(), Some("daemon"));
+                assert_eq!(agent_alias.as_deref(), Some("coder"));
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// `read_capped_line` returns a full line and [`CappedLine::Line`]
