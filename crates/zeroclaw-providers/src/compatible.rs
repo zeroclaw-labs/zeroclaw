@@ -99,7 +99,7 @@ pub enum AuthStyle {
 /// `tool_calls[].function.arguments` is not well-formed JSON. Smaller /
 /// reasoning models sometimes emit a malformed arguments string; when that
 /// happens the whole turn fails with HTTP 400 and the user receives the
-/// generic fallback instead of the agent's response. #8675.
+/// generic fallback instead of the agent's response.
 ///
 /// Contract:
 /// - empty / whitespace-only → `"{}"` (every upstream accepts this)
@@ -1371,7 +1371,7 @@ impl StreamToolCallAccumulator {
         // Route through the shared `sanitize_tool_arguments` helper so the
         // normalization contract (empty/whitespace → "{}", invalid JSON →
         // WARN + "{}", valid JSON → passthrough) has a single source of
-        // truth. #8675.
+        // truth.
         let normalized_arguments = sanitize_tool_arguments(&name, &self.arguments);
 
         Some(ProviderToolCall {
@@ -3426,7 +3426,7 @@ mod tests {
         assert_eq!(sanitize_tool_arguments("f", r#"{"path":"/tmp"#), "{}");
         // Trailing junk
         assert_eq!(sanitize_tool_arguments("f", r#"{"x":1}garbage"#), "{}");
-        // Truncated (the actual observed failure case from #8675)
+        // Truncated arguments must normalize to an empty object.
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
     }
 
