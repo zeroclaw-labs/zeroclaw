@@ -339,6 +339,26 @@ mod tests {
     }
 
     #[test]
+    fn homeassistant_available_when_disabled() {
+        // HomeAssistantConfig defaults to enabled=false.
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Home Assistant"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn homeassistant_active_when_enabled() {
+        let mut config = Config::default();
+        config.homeassistant.enabled = true;
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Home Assistant"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
     fn cron_available_when_no_jobs_configured() {
         let config = Config::default();
         assert!(matches!(
