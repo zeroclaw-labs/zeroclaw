@@ -1045,6 +1045,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
+        turn_id: &str,
     ) {
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
@@ -1064,9 +1065,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.to_string()),
             });
         }
 
@@ -2112,6 +2113,19 @@ impl Agent {
                 )));
         }
 
+        let effective_model = self.classify_model(user_message);
+
+        let turn_id = Self::new_turn_id();
+        let turn_observer = Arc::clone(&self.observer);
+        let mut guard = crate::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            self.model_provider_name.clone(),
+            effective_model.clone(),
+            Some(self.channel_name.clone()),
+            self.observer_agent_alias(),
+            Some(turn_id.clone()),
+        );
+
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
         if self.auto_save {
@@ -2130,9 +2144,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
             });
         }
 
@@ -2147,19 +2161,6 @@ impl Agent {
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
-        let effective_model = self.classify_model(user_message);
-
-        let turn_id = Self::new_turn_id();
-        let turn_observer = Arc::clone(&self.observer);
-        let mut guard = crate::observability::AgentTurnGuard::start(
-            turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
-            Some(self.channel_name.clone()),
-            self.observer_agent_alias(),
-            Some(turn_id.clone()),
-        );
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -2425,9 +2426,6 @@ impl Agent {
         }
 
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
-        self.append_streamed_user_message_to_history(user_message, &mut new_msgs)
-            .await;
-
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_pending_model_switch`) can rebind it for later rounds
@@ -2443,6 +2441,8 @@ impl Agent {
             self.observer_agent_alias(),
             Some(turn_id.clone()),
         );
+        self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
+            .await;
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -2564,8 +2564,12 @@ impl Agent {
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
-                    .await;
+                self.append_streamed_user_message_to_history(
+                    &steering_message,
+                    &mut new_msgs,
+                    &turn_id,
+                )
+                .await;
                 if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
                     loop_history.push(user_msg.clone());
                 }
@@ -7865,7 +7869,10 @@ mod tests {
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
             | ObserverEvent::ToolCall { turn_id, .. }
-            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
             _ => None,
         }
     }
@@ -7914,6 +7921,24 @@ mod tests {
                     turn_id,
                     ..
                 } => ("ToolCall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryRecall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryRecall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryStore {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryStore", channel, agent_alias, turn_id),
+                ObserverEvent::RagRetrieve {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("RagRetrieve", channel, agent_alias, turn_id),
                 _ => continue,
             };
             assert!(
@@ -7946,7 +7971,10 @@ mod tests {
                     | ObserverEvent::LlmRequest { agent_alias, .. }
                     | ObserverEvent::LlmResponse { agent_alias, .. }
                     | ObserverEvent::ToolCallStart { agent_alias, .. }
-                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    | ObserverEvent::ToolCall { agent_alias, .. }
+                    | ObserverEvent::MemoryRecall { agent_alias, .. }
+                    | ObserverEvent::MemoryStore { agent_alias, .. }
+                    | ObserverEvent::RagRetrieve { agent_alias, .. } => agent_alias,
                     _ => continue,
                 };
                 assert_eq!(
@@ -7965,7 +7993,10 @@ mod tests {
                     | ObserverEvent::LlmResponse { channel: ch, .. }
                     | ObserverEvent::ToolCallStart { channel: ch, .. }
                     | ObserverEvent::ToolCall { channel: ch, .. }
-                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    | ObserverEvent::AgentEnd { channel: ch, .. }
+                    | ObserverEvent::MemoryRecall { channel: ch, .. }
+                    | ObserverEvent::MemoryStore { channel: ch, .. }
+                    | ObserverEvent::RagRetrieve { channel: ch, .. } => ch,
                     _ => continue,
                 };
                 assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
@@ -8441,12 +8472,70 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .agent_alias("test-agent".into())
+            .auto_save(true)
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must cause Agent::turn to emit a MemoryStore event \
+             so its (channel, agent_alias, turn_id) triple is actually asserted below"
+        );
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_events_share_consistent_turn_id() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("test", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+        while event_rx.recv().await.is_some() {}
+
+        let events = capturing.events.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must cause the streamed turn to emit a MemoryStore event"
+        );
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 
