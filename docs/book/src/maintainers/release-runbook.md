@@ -166,6 +166,12 @@ real `GITHUB_TOKEN` to every workflow run:
 
    </div>
 
+   Artifact-producing jobs require `act` v0.2.90 or newer. The helper checks
+   this before starting a job that uses the pinned artifact actions. Older
+   releases cannot serve the protocol used by `actions/upload-artifact` v7 and
+   `actions/download-artifact` v8. If the extension installer does not yet
+   offer a qualifying stable release, use the GitHub-hosted fallback below.
+
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
    the `docker` group so you don't need `sudo`. `act` also works with
@@ -228,6 +234,34 @@ value never lands in argv), and sets `--artifact-server-path` so
 `actions/upload-artifact` and `actions/download-artifact` work between
 jobs. All of that is plain `act` underneath; the script just removes
 the flag soup.
+
+Before any artifact-producing or artifact-consuming job starts, the helper
+checks the resolved standalone `act` or `gh act` version. The supported policy
+is `act` v0.2.90 or newer. An older, prerelease, or unparseable version fails
+before the build and points to GitHub-hosted Actions; do not downgrade the
+pinned artifact actions to make a local runner pass.
+
+For `--all`, compatibility is checked across the complete selected job set
+before the first job starts. If any selected job needs the artifact service and
+the installed `act` is unsupported, the whole sweep exits without running a
+partial subset. `--all --no-allowlist` follows the same compatibility policy.
+
+When the local artifact preflight blocks a release check, push the exact commit
+to GitHub and use the hosted workflow as the validation fallback. The
+read-only cross-platform build can be dispatched safely and watched from the
+CLI:
+
+```sh
+gh workflow run cross-platform-build-manual.yml --ref <validation-branch>
+gh run list --workflow cross-platform-build-manual.yml --branch <validation-branch> --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Do not trigger `release-stable-manual.yml` early as a dry-run substitute: that
+workflow publishes after its environment approvals. Record the local artifact
+jobs as skipped because of the version policy, use the hosted cross-platform
+build for the artifact round trip, and leave the protected stable-release run
+for Step 4.
 
 ### `--all` only runs jobs on a dry-run-safe allowlist
 
