@@ -1154,6 +1154,12 @@ async fn run_job_command_with_timeout(
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = match output_format {
+                // Raw mode on success returns bare stdout, by design — the
+                // point is to hand back exactly what a direct shell run
+                // would print on stdout, with no wrapper. stderr on a
+                // successful exit is intentionally dropped, not lost by
+                // accident; a failing exit still gets the full wrapped
+                // status/stdout/stderr envelope below for diagnosis.
                 CronShellOutputFormat::Raw if output.status.success() => stdout.trim().to_string(),
                 _ => format!(
                     "status={}\nstdout:\n{}\nstderr:\n{}",
@@ -1481,6 +1487,34 @@ mod tests {
         // Raw output should be just the command's trimmed stdout, no wrapper.
         assert_eq!(output, "raw-format-ok");
         assert!(!output.contains("status="));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_success_drops_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // A zero-exit command that still writes to stderr (e.g. a tool's
+        // progress/warning chatter) must not leak into raw-mode output.
+        config.cron.insert(
+            "test-raw-stderr".into(),
+            zeroclaw_config::schema::CronJobDecl {
+                command: Some("echo raw-stdout-ok; echo raw-stderr-noise >&2".into()),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..Default::default()
+            },
+        );
+        let mut job = test_job("echo raw-stdout-ok; echo raw-stderr-noise >&2");
+        job.id = "test-raw-stderr".into();
+        job.source = "declarative".into();
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Dropping stderr on a successful exit is intentional design, not
+        // an oversight — see the comment at the call site.
+        assert_eq!(output, "raw-stdout-ok");
+        assert!(!output.contains("raw-stderr-noise"));
     }
 
     #[tokio::test]
