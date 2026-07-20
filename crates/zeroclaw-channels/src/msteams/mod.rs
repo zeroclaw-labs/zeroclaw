@@ -248,6 +248,21 @@ impl MsTeamsChannel {
         ))
     }
 
+    /// Address a thread only for channel conversations. Teams includes
+    /// `;messageid=` in a personal conversation id too, but Connector rejects
+    /// that form outside a channel conversation.
+    fn conversation_id_for_thread(ctx: &SendContext, thread_ts: Option<&str>) -> String {
+        match (
+            ctx.reference.conversation_type.as_deref(),
+            thread_ts.filter(|thread_id| !thread_id.is_empty()),
+        ) {
+            (Some("channel"), Some(thread_id)) => {
+                format!("{};messageid={thread_id}", ctx.base_id)
+            }
+            _ => ctx.base_id.clone(),
+        }
+    }
+
     /// `{service_url}/v3/conversations/{conversation_id}/activities[/{activity_id}]`.
     fn activities_url(
         reference: &ConversationReference,
@@ -571,15 +586,7 @@ impl Channel for MsTeamsChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let (_, ctx) = self.send_context(&message.recipient).await?;
-        let conversation_id = match (
-            ctx.reference.conversation_type.as_deref(),
-            message.thread_ts.as_deref(),
-        ) {
-            (Some("channel"), Some(thread_id)) if !thread_id.is_empty() => {
-                format!("{};messageid={thread_id}", ctx.base_id)
-            }
-            _ => ctx.base_id.clone(),
-        };
+        let conversation_id = Self::conversation_id_for_thread(&ctx, message.thread_ts.as_deref());
         let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
         let mut body = serde_json::json!({ "type": "message", "text": message.content });
         if let Some(reply_to_id) = message.in_reply_to.as_deref() {
@@ -657,39 +664,39 @@ impl Channel for MsTeamsChannel {
         self.stream_mode() == StreamMode::Partial
     }
 
+    fn supports_draft_updates_for(&self, message: &ChannelMessage) -> bool {
+        self.supports_draft_updates() && self.is_direct_message(message)
+    }
+
     fn supports_multi_message_streaming(&self) -> bool {
         self.stream_mode() == StreamMode::MultiMessage
     }
 
-    /// Open a draft. Personal chats use Teams' native streaming protocol:
-    /// the first `streaminfo` typing activity opens the gray in-progress
-    /// bubble and its activity id becomes the `streamId`. Group chats and
-    /// team channels post a regular message that later updates edit.
+    /// Open a native streaming draft in a personal chat. Team channels and
+    /// group chats use the ordinary typing indicator and deliver one final
+    /// reply, since editing a placeholder causes Teams to notify only the
+    /// placeholder rather than the completed answer.
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         if self.stream_mode() != StreamMode::Partial {
             return Ok(None);
         }
         let (_, ctx) = self.send_context(&message.recipient).await?;
+        if !ctx.reference.is_personal() {
+            return Ok(None);
+        }
         let text = if message.content.is_empty() {
             "..."
         } else {
             message.content.as_str()
         };
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+        let conversation_id = Self::conversation_id_for_thread(&ctx, message.thread_ts.as_deref());
+        let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
 
-        let draft_id = if ctx.reference.is_personal() {
-            let body = streaming_activity_body("typing", text, "informative", Some(1), None);
-            let stream_id = Self::activity_request(&ctx, reqwest::Method::POST, url, &body)
-                .await?
-                .context("Teams streaming draft opened but no streamId was returned")?;
-            self.draft_streams.lock().insert(stream_id.clone(), 2);
-            stream_id
-        } else {
-            let body = serde_json::json!({ "type": "message", "text": text });
-            Self::activity_request(&ctx, reqwest::Method::POST, url, &body)
-                .await?
-                .context("Teams draft message posted but no activity id was returned")?
-        };
+        let body = streaming_activity_body("typing", text, "informative", Some(1), None);
+        let draft_id = Self::activity_request(&ctx, reqwest::Method::POST, url, &body)
+            .await?
+            .context("Teams streaming draft opened but no streamId was returned")?;
+        self.draft_streams.lock().insert(draft_id.clone(), 2);
         self.mark_draft_update(&message.recipient);
         Ok(Some(draft_id))
     }
@@ -1457,50 +1464,31 @@ mod tests {
         assert!(ch.draft_streams.lock().is_empty());
     }
 
-    /// Group chats and team channels cannot use native streaming: the
-    /// draft is a normal message updated (and finalized) via PUT edits.
     #[tokio::test]
-    async fn group_draft_falls_back_to_message_edits() {
+    async fn only_personal_chats_support_partial_drafts() {
         let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(
-                "/teams/v3/conversations/19:general@thread.tacv2/activities",
-            ))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "act-7" })),
-            )
-            .expect(1)
-            .mount(&connector)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(
-                "/teams/v3/conversations/19:general@thread.tacv2/activities/act-7",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(2)
-            .mount(&connector)
-            .await;
-
         let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
         record_reference(&ch, &connector, "19:general@thread.tacv2", "channel");
 
-        let draft_id = ch
-            .send_draft(&SendMessage::new("drafting...", "19:general@thread.tacv2"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(draft_id, "act-7");
-        // Progress updates are personal-chat only; must not edit.
-        ch.update_draft_progress("19:general@thread.tacv2", &draft_id, "status")
-            .await
-            .unwrap();
-        ch.update_draft("19:general@thread.tacv2", &draft_id, "more text")
-            .await
-            .unwrap();
-        ch.finalize_draft("19:general@thread.tacv2", &draft_id, "done", false)
-            .await
-            .unwrap();
+        let personal = ChannelMessage::new(
+            "inbound-personal",
+            "sender",
+            "a:1conv",
+            "hello",
+            "msteams",
+            0,
+        );
+        let channel = ChannelMessage::new(
+            "inbound-channel",
+            "sender",
+            "19:general@thread.tacv2",
+            "hello",
+            "msteams",
+            0,
+        );
+        assert!(ch.supports_draft_updates_for(&personal));
+        assert!(!ch.supports_draft_updates_for(&channel));
     }
 
     #[tokio::test]

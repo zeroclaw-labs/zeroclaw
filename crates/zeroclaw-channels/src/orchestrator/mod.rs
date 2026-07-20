@@ -5120,7 +5120,7 @@ async fn process_channel_message_body(
 
     let use_draft_streaming = target_channel
         .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
+        .is_some_and(|ch| ch.supports_draft_updates_for(&msg));
 
     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_target_channel": target_channel.is_some(), "use_draft_streaming": use_draft_streaming})), "Streaming decision");
 
@@ -5136,9 +5136,7 @@ async fn process_channel_message_body(
     let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                )
+                .send_draft(&SendMessage::reply_to(&msg, "..."))
                 .await
             {
                 Ok(id) => id,
@@ -5222,9 +5220,9 @@ async fn process_channel_message_body(
 
     // Skip typing only for Partial mode — the draft message itself provides
     // visual feedback. MultiMessage and Off both keep typing active.
-    let is_partial_draft = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming());
+    let is_partial_draft = target_channel.as_ref().is_some_and(|ch| {
+        ch.supports_draft_updates_for(&msg) && !ch.supports_multi_message_streaming()
+    });
     let typing_cancellation = if is_partial_draft {
         None
     } else {

@@ -120,11 +120,13 @@ Set `stream_mode = "partial"` for progressive responses:
   accumulating response text, then is replaced by the final message. Status
   history disappears once the final message lands — this matches the
   built-in Copilot experience.
-- **Group chats and team channels** don't support native streaming; the
-  channel posts an initial message and edits it as content accumulates.
+- **Group chats and team channels** don't support native streaming. They show
+  the normal typing indicator, then receive one final reply. This avoids a
+  notification for an initial placeholder (such as `...`) while the completed
+  answer is only an edit.
 
-Updates are throttled by `draft_update_interval_ms` (default 1000 ms —
-Teams rate-limits streaming updates to roughly one per second).
+Personal-chat updates are throttled by `draft_update_interval_ms` (default
+1000 ms — Teams rate-limits streaming updates to roughly one per second).
 
 `stream_mode = "multi_message"` sends the response as separate messages at
 paragraph boundaries instead.
