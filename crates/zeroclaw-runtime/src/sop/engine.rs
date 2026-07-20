@@ -2579,11 +2579,46 @@ impl SopEngine {
             .get(run_id)
             .cloned()
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        // UNCAPPED reacquire: a denial may terminate the run, and gating a
-        // terminating run on a free slot would strand it under load. The concurrency
-        // cap applies to resume-to-CONTINUE paths (approve/checkpoint-approve/
-        // deterministic-resume), not to a denial's terminal-rollback atomicity.
-        self.reacquire_claim_uncapped(run_id)?;
+        // Classify the denial's routing outcome BEFORE any mutation, using the
+        // AUTHORITATIVE failure router (not a second copy of its logic). A denial
+        // records the checkpoint step `Failed`; the router computes `retries_consumed`
+        // as (Failed count - 1) after that record, so before it the current Failed
+        // count for this step is exactly that value.
+        let retries_consumed = self
+            .active_runs
+            .get(run_id)
+            .map(|run| {
+                run.step_results
+                    .iter()
+                    .filter(|r| {
+                        r.step_number == current_step.number && r.status == SopStepStatus::Failed
+                    })
+                    .count() as u32
+            })
+            .unwrap_or(0);
+        let terminates = matches!(
+            route::failure::route_failure(
+                &current_step.on_failure,
+                retries_consumed,
+                self.config.max_step_retries,
+            ),
+            NextStep::Fail(_)
+        );
+        if terminates {
+            // TERMINAL denial (default `Fail`, or a `Retry` whose budget is spent):
+            // it must reacquire to complete atomically even under saturation - gating
+            // a run that is ENDING on a free slot would strand it. This is the
+            // terminal-rollback atomicity path; it stays UNCAPPED by design.
+            self.reacquire_claim_uncapped(run_id)?;
+        } else {
+            // CONTINUING denial (`Goto`, or a `Retry` with budget remaining): it
+            // resumes execution, so it must pass the SAME capped store CAS every other
+            // resume-to-continue path uses, honoring the per-SOP and global limits. At
+            // capacity this returns `ResumeAtCapacity`; the `?` early-returns with the
+            // checkpoint still parked and re-resolvable (no mutation, no retention
+            // marker yet) - typed backpressure, never an over-cap execution.
+            self.reacquire_claim_on_resume(run_id)?;
+        }
         if let Err(marker_err) = self
             .store
             .mark_claim_retained_after_terminal_rollback(run_id)
@@ -10246,6 +10281,130 @@ type = "manual"
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deny_checkpoint_goto_continuation_respects_per_sop_cap() {
+        // A denied checkpoint whose `on_failure = Goto` CONTINUES execution, so it must
+        // pass the same capped store CAS as every other resume-to-continue path. With
+        // max_concurrent = 1 and the slot already taken, denying a parked checkpoint
+        // returns typed backpressure and leaves it parked - it does NOT resume above cap.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = deterministic_sop("det-cp");
+        sop.max_concurrent = 1;
+        sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+
+        let a = engine.start_run("det-cp", manual_event()).unwrap();
+        let id_a = extract_run_id(&a).to_string();
+        engine
+            .advance_deterministic_step(&id_a, serde_json::json!("a1"), None)
+            .unwrap();
+        let b = engine.start_run("det-cp", manual_event()).unwrap();
+        let id_b = extract_run_id(&b).to_string();
+        engine
+            .advance_deterministic_step(&id_b, serde_json::json!("b1"), None)
+            .unwrap();
+        assert_eq!(
+            store.claim_counts("det-cp").unwrap(),
+            (0, 0),
+            "both parked at the checkpoint: no exec claim held"
+        );
+
+        // Approve A -> it takes the one slot.
+        engine.approve_step(&id_a).unwrap();
+        assert_eq!(
+            store.claim_counts("det-cp").unwrap().0,
+            1,
+            "A holds the one slot"
+        );
+
+        // Deny B's checkpoint: its Goto continuation must be refused at capacity.
+        let err = engine
+            .decide_checkpoint(
+                &id_b,
+                ApprovalDecision::Deny {
+                    reason: Some("nope".into()),
+                },
+            )
+            .expect_err("a denied Goto continuation must be refused at capacity");
+        assert!(
+            err_is_resume_at_capacity(&err),
+            "the refusal is typed capacity backpressure, not a fault: {err}"
+        );
+        assert_eq!(
+            engine.get_run(&id_b).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "B stays paused at the checkpoint, re-resolvable"
+        );
+        assert_eq!(
+            store.claim_counts("det-cp").unwrap().0,
+            1,
+            "still exactly one slot in use, not two"
+        );
+    }
+
+    #[test]
+    fn deny_checkpoint_retry_continuation_respects_global_cap() {
+        // A denied checkpoint whose `on_failure = Retry` (budget remaining) CONTINUES,
+        // so it is capped against the GLOBAL limit too. Two SOPs share
+        // max_concurrent_total = 1; with the one global slot taken, denying a parked
+        // checkpoint on the other returns typed backpressure and stays parked. A
+        // terminal denial (Fail, or Retry exhausted) would instead stay uncapped.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut s1 = deterministic_sop("det-a");
+        s1.max_concurrent = 1;
+        let mut s2 = deterministic_sop("det-b");
+        s2.max_concurrent = 1;
+        s2.steps[1].on_failure = StepFailure::Retry { max: 3 };
+        let cfg = SopConfig {
+            max_concurrent_total: 1,
+            ..SopConfig::default()
+        };
+        let mut engine = engine_with_config_sops(cfg, vec![s1, s2]).with_store(store.clone());
+
+        let a = engine.start_run("det-a", manual_event()).unwrap();
+        let id_a = extract_run_id(&a).to_string();
+        engine
+            .advance_deterministic_step(&id_a, serde_json::json!("a1"), None)
+            .unwrap();
+        let b = engine.start_run("det-b", manual_event()).unwrap();
+        let id_b = extract_run_id(&b).to_string();
+        engine
+            .advance_deterministic_step(&id_b, serde_json::json!("b1"), None)
+            .unwrap();
+
+        // Approve det-a -> it takes the one global slot.
+        engine.approve_step(&id_a).unwrap();
+        assert_eq!(
+            store.claim_counts("det-a").unwrap().1,
+            1,
+            "the one global slot is taken"
+        );
+
+        // Deny det-b's checkpoint: its Retry continuation is refused at the global cap.
+        let err = engine
+            .decide_checkpoint(
+                &id_b,
+                ApprovalDecision::Deny {
+                    reason: Some("nope".into()),
+                },
+            )
+            .expect_err("a denied Retry continuation must be refused at the global cap");
+        assert!(
+            err_is_resume_at_capacity(&err),
+            "the refusal is typed capacity backpressure: {err}"
+        );
+        assert_eq!(
+            engine.get_run(&id_b).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "det-b stays paused, re-resolvable"
+        );
+        assert_eq!(
+            store.claim_counts("det-b").unwrap().1,
+            1,
+            "still exactly one global slot in use, not two"
+        );
     }
 
     #[test]
