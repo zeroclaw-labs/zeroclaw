@@ -1869,7 +1869,7 @@ mod tests {
 
     #[test]
     fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
-        // Regression for #8675: a malformed arguments string in the assistant
+        // A malformed arguments string in the assistant
         // history must be normalized to "{}" so the outbound chat-completions
         // request doesn't 400 on strict upstreams. This test pins that the
         // openrouter call site of `sanitize_tool_arguments` is wired in; the
