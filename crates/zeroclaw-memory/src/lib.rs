@@ -190,16 +190,19 @@ where
             audit_enabled,
         ),
         MemoryBackendKind::Hindsight => {
-            // The install-wide/builder entry point has no agent alias; the
-            // per-agent factory (`create_memory_for_agent`) is the primary
-            // path and builds hindsight with the real alias. Here we honor an
-            // explicit ZC_HINDSIGHT_BANK or fall back to a generic alias so CLI
-            // `zeroclaw memory` and migration paths still resolve a bank.
-            wrap_scanned_and_audit(
-                hindsight::HindsightMemory::from_env("zeroclaw")?,
-                policy,
-                workspace_dir,
-                audit_enabled,
+            // This builder path has only a backend NAME, not the typed
+            // `[memory.hindsight]` config the single canonical constructor
+            // requires. The install-wide daemon/CLI path builds hindsight in
+            // `create_memory_with_storage_and_routes` (which carries the typed
+            // config) and the per-agent factory in `create_memory_for_agent`.
+            // Migration imports bulk rows into a local SQLite store, so a
+            // remote append-only Hindsight bank is not a valid migration
+            // target: fail loudly rather than constructing an unvalidated
+            // backend from env guesses.
+            anyhow::bail!(
+                "memory backend 'hindsight' cannot be built from this path{unknown_context}: \
+                 it requires the typed [memory.hindsight] config; migration imports into a \
+                 local store, so choose sqlite, lucid, or markdown as the migration target"
             )
         }
         MemoryBackendKind::Unknown => {
@@ -733,6 +736,24 @@ pub fn create_memory_with_storage_and_routes(
         )?;
         return wrap_scanned_and_audit(
             build_lucid_memory(workspace_dir, local, active_storage),
+            &config.policy,
+            workspace_dir,
+            config.audit_enabled,
+        );
+    }
+
+    // Hindsight external backend on the install-wide path (`memory.backend =
+    // "hindsight"`). CLI/migration/status share this entry point and have no
+    // per-agent alias, so use the generic `zeroclaw` alias. Route through the
+    // single canonical typed constructor (`from_config`) so the install-wide
+    // path is validated identically to the per-agent factory: an invalid
+    // endpoint or bank template is refused here too, and the typed
+    // endpoint/token_env/timeout/bank are honored instead of env-only guesses.
+    // The content-scan decorator wraps this backend too, so the remote
+    // read/write boundary is scanned like every local store.
+    if matches!(backend_kind, MemoryBackendKind::Hindsight) {
+        return wrap_scanned_and_audit(
+            hindsight::HindsightMemory::from_config(&config.hindsight, "zeroclaw", "")?,
             &config.policy,
             workspace_dir,
             config.audit_enabled,
