@@ -36,9 +36,12 @@
 //! the same bank writes land in.
 //!
 //! Shared and system tiers (this slice): the typed `[memory.hindsight]`
-//! `shared_bank` / `system_bank` fields (env fallback `ZC_HINDSIGHT_SHARED_BANK`
-//! / `ZC_HINDSIGHT_SYSTEM_BANK`) name two extra banks every agent can READ from
-//! (merged into recall + list). Ordinary writes (`store`, including automatic
+//! `shared_bank` / `system_bank` fields name two extra banks every agent can
+//! READ from (merged into recall + list). The legacy `ZC_HINDSIGHT_SHARED_BANK`
+//! / `ZC_HINDSIGHT_SYSTEM_BANK` env vars are bridged into those typed fields at
+//! config load so they are validated against every agent's private bank exactly
+//! like a TOML value, rather than resolved late at construction against only the
+//! constructing agent's own bank. Ordinary writes (`store`, including automatic
 //! per-turn consolidation) always land in the per-agent private `bank`, so
 //! personal memory stays isolated. The shared/system banks are written ONLY via
 //! the explicit [`HindsightMemory::store_to_bank`] path behind the dedicated
@@ -63,11 +66,6 @@ use serde::Deserialize;
 use zeroclaw_config::schema::{
     DEFAULT_HINDSIGHT_TIMEOUT_SECS, DEFAULT_HINDSIGHT_TOP_K, HindsightMemoryConfig,
 };
-
-/// Env var naming the shared/family bank (read-merged; written via tool only).
-const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
-/// Env var naming the system bank (read-merged; written via tool only).
-const SYSTEM_BANK_ENV: &str = "ZC_HINDSIGHT_SYSTEM_BANK";
 
 /// Percent-encode a single URL path segment (bank id or server-provided memory
 /// id). Encodes everything that is not an unreserved URL character so a bank
@@ -229,22 +227,22 @@ impl std::fmt::Debug for HindsightMemory {
     }
 }
 
-/// Resolve a secondary (shared/system) bank from typed config with an env
-/// fallback, dropping it when empty or when it collides with an already-taken
-/// bank (private or, for system, the shared bank).
-fn resolve_secondary_bank(
-    configured: Option<&str>,
-    env_var: &str,
-    taken: &[&str],
-) -> Option<String> {
+/// Resolve a secondary (shared/system) bank from typed config, dropping it when
+/// empty or when it collides with an already-taken bank (private or, for system,
+/// the shared bank).
+///
+/// The tier banks are TYPED-CONFIG ONLY here: the legacy
+/// `ZC_HINDSIGHT_SHARED_BANK` / `ZC_HINDSIGHT_SYSTEM_BANK` env vars are bridged
+/// into `memory.hindsight.shared_bank` / `system_bank` at config load
+/// (`env_overrides::apply_hindsight_tier_bank_env_bridge`), so by the time the
+/// backend constructs, an env-provided tier bank has already been validated by
+/// `Config::validate` against EVERY agent's private bank - not just this one.
+/// Resolving the env var here again would reintroduce the cross-agent leak this
+/// closed, so it is deliberately not read. The per-instance collision drop below
+/// remains as defense-in-depth for the single constructing instance.
+fn resolve_secondary_bank(configured: Option<&str>, taken: &[&str]) -> Option<String> {
     configured
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var(env_var)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
         .filter(|b| !b.is_empty() && !taken.contains(&b.as_str()))
 }
 
@@ -295,20 +293,17 @@ impl HindsightMemory {
             })?;
         let base_url = cfg.base_url.trim().trim_end_matches('/').to_string();
         let bank = cfg.bank_for(agent_alias, bank_override);
-        // Shared/system banks: typed config wins, env is the fallback. A bank
-        // colliding with the private bank (or, for system, the shared bank) is
-        // dropped so private writes can never leak into a shared tier. The
-        // authoritative cross-agent collision check runs at config load
-        // (`validate_self` + install-wide `Config` validation); this per-instance
-        // drop is defense-in-depth for the constructing instance.
-        let shared_bank = resolve_secondary_bank(
-            cfg.shared_bank_configured(),
-            SHARED_BANK_ENV,
-            &[bank.as_str()],
-        );
+        // Shared/system banks come from typed config only (the legacy env vars
+        // are bridged into that typed config at load, so they are already
+        // validated against every agent's private bank). A bank colliding with
+        // the private bank (or, for system, the shared bank) is dropped so
+        // private writes can never leak into a shared tier. The authoritative
+        // cross-agent collision check runs at config load (`validate_self` +
+        // install-wide `Config` validation); this per-instance drop is
+        // defense-in-depth for the constructing instance.
+        let shared_bank = resolve_secondary_bank(cfg.shared_bank_configured(), &[bank.as_str()]);
         let system_bank = resolve_secondary_bank(
             cfg.system_bank_configured(),
-            SYSTEM_BANK_ENV,
             &[bank.as_str(), shared_bank.as_deref().unwrap_or_default()],
         );
         let default_top_k = if cfg.top_k == 0 {
@@ -529,8 +524,11 @@ impl HindsightMemory {
             .context("hindsight shared/system retain request failed")?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("hindsight shared/system retain returned HTTP {status}: {text}");
+            // Bound and single-line the remote body exactly like the private
+            // retain/recall/list paths so a large or multiline shared/system
+            // error body cannot flood model-visible output or logs.
+            let body = bounded_error_body(resp).await;
+            anyhow::bail!("hindsight shared/system retain returned HTTP {status}: {body}");
         }
         Ok(())
     }
@@ -2399,6 +2397,34 @@ mod tests {
         mem.store_to_bank("zeroclaw-house", "k", "   ", MemoryCategory::Core, "shared")
             .await
             .expect("empty content should short-circuit");
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_error_body_is_bounded_and_single_line() {
+        // The shared/system write path must bound a large multiline remote error
+        // body exactly like the private retain/recall/list paths, so a failing
+        // shared/system write cannot flood model-visible output or logs.
+        let server = MockServer::start().await;
+        let huge = format!("err-line-one\nerr-line-two\n{}", "Y".repeat(4000));
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        let err = mem
+            .store_to_bank("zeroclaw-house", "k", "v", MemoryCategory::Core, "shared")
+            .await
+            .expect_err("a 500 on the shared write must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("truncated"), "body must be truncated: {msg}");
+        assert!(!msg.contains('\n'), "body must be single-line: {msg:?}");
+        assert!(
+            msg.len() < 700,
+            "error message must be bounded: {}",
+            msg.len()
+        );
     }
 
     #[tokio::test]

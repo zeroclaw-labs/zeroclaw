@@ -183,15 +183,25 @@ impl Tool for SharedMemoryStoreTool {
             Some(other) => MemoryCategory::Custom(other.to_string()),
         };
 
-        // Authority gate at the target-owned boundary: the tier write tool must
-        // itself be permitted by this agent's risk profile. The agent loop
-        // already filters the toolset by `allowed_tools`/`excluded_tools`, but
-        // shared/system writes cross an agent's private boundary (system writes
-        // are admin/system-tier authority), so we re-check here rather than
-        // trusting only the dispatch-site filter. A denied name (e.g.
-        // `system_memory_store` excluded for a non-admin profile) is refused
-        // even if the tool were reached through a path that skipped the filter.
-        if !self.security.is_tool_allowed(self.name()) {
+        // Authority gate at the target-owned boundary. The SHARED tier is gated
+        // by tool NAME via `allowed_tools`/`excluded_tools`; the agent loop
+        // already applies that filter, but we re-check here because a shared
+        // write crosses the agent's private boundary.
+        //
+        // The SYSTEM tier is stricter and fail-closed: `is_tool_allowed` is NOT
+        // the admin grant (the default/empty `allowed_tools` profile is
+        // unrestricted, so every Hindsight agent would otherwise receive
+        // `system_memory_store` once a system bank exists). It requires the
+        // explicit deny-by-default `system_memory_admin` authority
+        // (`can_write_system_memory`, which still honors excluded_tools and a
+        // non-empty allowlist on top). A non-admin profile is refused here even
+        // if the tool were reached through a path that skipped the dispatch
+        // filter.
+        let authorized = match self.tier {
+            SharedTier::Shared => self.security.is_tool_allowed(self.name()),
+            SharedTier::System => self.security.can_write_system_memory(),
+        };
+        if !authorized {
             return Ok(ToolResult {
                 success: false,
                 output: String::new().into(),
@@ -279,6 +289,15 @@ mod tests {
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    /// A profile that additionally holds the explicit deny-by-default system
+    /// memory admin grant, needed to exercise successful SYSTEM-tier writes.
+    fn admin_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            system_memory_admin: true,
+            ..SecurityPolicy::default()
+        })
     }
 
     /// A hindsight memory pointed at `base_url` with the given shared/system
@@ -488,13 +507,36 @@ mod tests {
             Some("zeroclaw-house"),
             Some("zeroclaw-system"),
         );
-        let tool = SharedMemoryStoreTool::new_system(mem, test_security());
+        // A successful system write requires the explicit admin grant.
+        let tool = SharedMemoryStoreTool::new_system(mem, admin_security());
         let result = tool
             .execute(serde_json::json!({"key": "policy", "content": "reboot weekly"}))
             .await
             .unwrap();
         assert!(result.success, "expected success, got {result:?}");
         assert!(result.output.contains("system"));
+    }
+
+    #[tokio::test]
+    async fn system_write_denied_without_admin_grant() {
+        // Deny-by-default: a default (unrestricted) profile has NO system-write
+        // authority even though `is_tool_allowed("system_memory_store")` is
+        // true and a system bank is configured. The write is refused before any
+        // network call (no mock mounted).
+        let mem = hindsight_mem(
+            "http://127.0.0.1:1",
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+        );
+        let tool = SharedMemoryStoreTool::new_system(mem, test_security());
+        let result = tool
+            .execute(serde_json::json!({"key": "policy", "content": "reboot weekly"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a non-admin profile must be refused system-write, got {result:?}"
+        );
     }
 
     #[tokio::test]

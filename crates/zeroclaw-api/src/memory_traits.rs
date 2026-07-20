@@ -252,6 +252,15 @@ pub enum MemoryPolicyDecision {
 ///
 /// Reads of the shared/system tiers need no special trait: they already merge
 /// into ordinary `recall`/`list`.
+///
+/// Composed-chain routing: the raw `HindsightMemory` implements this trait, but
+/// the per-agent handle returned by the memory factory is wrapped in the
+/// `ScannedMemory` -> `AuditedMemory` -> retrieval decorator chain. Those
+/// decorators OWN this capability (their `as_shared_writable` returns
+/// `Some(self)` when the inner backend supports the tier) so a shared/system
+/// write passes the same fail-closed content scan, redaction, memory policy,
+/// and audit as a private write before reaching the backend - it is never
+/// forwarded raw around the composed chain.
 #[async_trait]
 pub trait SharedWritable: Send + Sync {
     /// The configured shared/family bank id, or `None` when no shared tier is

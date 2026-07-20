@@ -11045,9 +11045,9 @@ impl HindsightMemoryConfig {
 }
 
 /// Canonical Hindsight API base URL. Single source of truth: the typed config
-/// default and the `zeroclaw-memory` driver (including its `from_env`
-/// compatibility path and tests) both consume this constant, so the base URL
-/// can never drift between the config layer and the driver.
+/// default and the `zeroclaw-memory` driver (including its tests) both consume
+/// this constant, so the base URL can never drift between the config layer and
+/// the driver.
 pub const DEFAULT_HINDSIGHT_BASE_URL: &str = "https://tokengate.appz.cloud/api/embedding/hindsight";
 
 /// Canonical default recall breadth (`top_k`) when a caller passes no limit.
@@ -11057,13 +11057,13 @@ pub const DEFAULT_HINDSIGHT_TOP_K: usize = 5;
 
 /// Canonical name of the environment variable holding the Hindsight bearer
 /// token. Single source of truth shared by the typed config default and the
-/// driver's `from_env` compatibility path.
+/// canonical `from_config` constructor.
 pub const DEFAULT_HINDSIGHT_TOKEN_ENV: &str = "ZC_HINDSIGHT_TOKEN";
 
 /// Canonical per-request timeout (seconds) for every outbound Hindsight HTTP
 /// call. Bounds `store`/`recall`/`list`/`forget`/`count`/health so a stalled
 /// service can never park an agent turn indefinitely. Single source of truth
-/// shared by the typed config default and the driver's `from_env` path.
+/// shared by the typed config default and the canonical `from_config` path.
 pub const DEFAULT_HINDSIGHT_TIMEOUT_SECS: u64 = 30;
 
 /// Whether a Hindsight `base_url` targets a loopback host, for which plaintext
@@ -12110,6 +12110,14 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
+    /// Explicit admin grant to WRITE the system memory tier
+    /// (`system_memory_store`). Deny-by-default (`false`): even an unrestricted
+    /// `allowed_tools` profile does NOT receive system-write power unless this
+    /// is set `true`. This is the fail-closed authority behind the admin-only
+    /// system tier; ordinary `allowed_tools`/`excluded_tools`/read-only posture
+    /// still apply on top. Shared-tier writes stay gated by tool name only.
+    #[serde(default)]
+    pub system_memory_admin: bool,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
     pub sandbox_enabled: Option<bool>,
@@ -12136,6 +12144,7 @@ impl Default for RiskProfileConfig {
             approval_route: None,
             allowed_tools: Vec::new(),
             excluded_tools: Vec::new(),
+            system_memory_admin: false,
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
@@ -19274,13 +19283,22 @@ impl Config {
             .await
             .context("Config secret decryption task failed")??;
 
+            // Bridge the legacy Hindsight tier-bank env vars into typed config
+            // FIRST, so a generic `ZEROCLAW_memory__hindsight__*` override below
+            // still wins, and so the bridged values are subject to the same
+            // complete-set cross-agent collision validation as TOML values.
+            let bridged = crate::env_overrides::apply_hindsight_tier_bank_env_bridge(&mut config)?;
             // Apply ZEROCLAW_<lowercase_path> env-var overrides. Hard-errors
             // on any unresolvable path — no silent ignores. Tracks overridden
             // paths and per-path pre-override snapshots so save() can mask
             // env-injected values back to the original on-disk state.
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
+            config.env_overridden_paths.extend(bridged.paths);
             config.pre_override_snapshots = applied.snapshots;
+            // Bridge snapshots hold the true on-disk value; keep them even if a
+            // generic override later re-snapshotted the same path post-bridge.
+            config.pre_override_snapshots.extend(bridged.snapshots);
 
             // Validation must NOT prevent the daemon from booting. If
             // it did, a single broken agent reference would lock the
@@ -19318,9 +19336,12 @@ impl Config {
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
+            let bridged = crate::env_overrides::apply_hindsight_tier_bank_env_bridge(&mut config)?;
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
+            config.env_overridden_paths.extend(bridged.paths);
             config.pre_override_snapshots = applied.snapshots;
+            config.pre_override_snapshots.extend(bridged.snapshots);
 
             // Same boot-resilience as the load-existing branch above:
             // a fresh-init config can't realistically fail validation,
@@ -21541,6 +21562,13 @@ impl Config {
         // agent's private memory readable/writable by another. Reject any
         // cross-agent private-bank collision at load. Only agents that actually
         // use Hindsight (per-agent enum or the install-wide string) participate.
+        //
+        // The same resolved private-bank set is then reused to reject
+        // shared/system TIER banks that alias ANY agent's private bank: a global
+        // `shared_bank`/`system_bank` equal to (say) Alice's private bank would
+        // let every other agent read and write Alice's private memory as a
+        // shared tier. Validating the complete set (not just the constructing
+        // instance's own bank) closes that cross-agent collision.
         {
             let install_wide_hindsight =
                 self.memory.backend.trim().eq_ignore_ascii_case("hindsight");
@@ -21568,6 +21596,42 @@ impl Config {
                          distinct agents must not share a resolved bank (check bank_id overrides \
                          and bank_template)",
                     );
+                }
+            }
+
+            // Tier banks must not alias any agent's private bank. Skip this when
+            // no agent uses Hindsight (the tiers are then inert). The legacy
+            // env vars (`ZC_HINDSIGHT_SHARED_BANK`/`_SYSTEM_BANK`) are bridged
+            // into these typed fields at config load
+            // (`env_overrides::apply_hindsight_tier_bank_env_bridge`) BEFORE this
+            // runs, so an env-provided tier bank is validated here against the
+            // complete resolved private-bank set - every agent's bank, not just
+            // the constructing instance's own - exactly like a TOML value.
+            if !resolved_banks.is_empty() {
+                for (field, tier, configured) in [
+                    (
+                        "shared_bank",
+                        "shared",
+                        self.memory.hindsight.shared_bank_configured(),
+                    ),
+                    (
+                        "system_bank",
+                        "system",
+                        self.memory.hindsight.system_bank_configured(),
+                    ),
+                ] {
+                    if let Some(tier_bank) = configured
+                        && let Some(owner) = resolved_banks.get(tier_bank)
+                    {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("memory.hindsight.{field}"),
+                            "memory.hindsight.{field} = {tier_bank:?} aliases agents.{owner}'s \
+                             resolved private Hindsight bank; a {tier} tier bank readable and \
+                             writable by every agent must never equal any agent's private bank, \
+                             or that agent's private memory leaks across the whole install",
+                        );
+                    }
                 }
             }
         }
@@ -36683,6 +36747,165 @@ allowed_users = []
         config
             .validate()
             .expect("distinct per-agent banks should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_shared_tier_aliasing_another_agents_derived_bank() {
+        // The global shared_bank equals beta's DERIVED private bank
+        // (`zeroclaw-beta`). Every agent (including alpha) reads and writes the
+        // shared tier, so this would expose beta's private memory install-wide.
+        // The collision set must be the COMPLETE resolved private-bank set, not
+        // just the constructing instance's own bank.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.memory.hindsight.shared_bank = "zeroclaw-beta".to_string();
+        let err = config
+            .validate()
+            .expect_err("shared tier aliasing an agent's private bank must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shared_bank") && msg.contains("zeroclaw-beta"),
+            "expected shared-tier collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_system_tier_aliasing_explicit_override_bank() {
+        // The global system_bank equals beta's EXPLICIT bank_id override, which
+        // resolves verbatim. The tier collision check must see explicit
+        // overrides too, not only template-derived banks.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.agents.get_mut("beta").unwrap().memory.bank_id = "beta-private".to_string();
+        config.memory.hindsight.system_bank = "beta-private".to_string();
+        let err = config
+            .validate()
+            .expect_err("system tier aliasing an explicit private bank must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system_bank") && msg.contains("beta-private"),
+            "expected system-tier collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_env_shared_tier_aliasing_another_agents_derived_bank() {
+        // The env-provided shared tier equals beta's DERIVED private bank
+        // (`zeroclaw-beta`). The legacy `ZC_HINDSIGHT_SHARED_BANK` var must be
+        // bridged into typed config BEFORE validation so it is checked against
+        // EVERY agent's private bank, not just the constructing instance's own.
+        // Before the bridge, an env value only met the per-instance drop that
+        // compared against the constructing agent's bank, so beta dropped it but
+        // alpha accepted it and could read/write beta's private data.
+        let _guard = env_override_lock().await;
+        let _shared = EnvValueGuard::set("ZC_HINDSIGHT_SHARED_BANK", "zeroclaw-beta");
+        let _system = EnvValueGuard::remove("ZC_HINDSIGHT_SYSTEM_BANK");
+
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+
+        crate::env_overrides::apply_hindsight_tier_bank_env_bridge(&mut config)
+            .expect("bridge succeeds");
+        assert_eq!(
+            config.memory.hindsight.shared_bank, "zeroclaw-beta",
+            "the legacy env var must be bridged into the typed field"
+        );
+        let err = config
+            .validate()
+            .expect_err("env shared tier aliasing an agent's private bank must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shared_bank") && msg.contains("zeroclaw-beta"),
+            "expected shared-tier collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_env_system_tier_aliasing_explicit_override_bank() {
+        // The env-provided system tier equals beta's EXPLICIT bank_id override,
+        // which resolves verbatim. The bridged env value must be validated
+        // against explicit overrides too, not only template-derived banks.
+        let _guard = env_override_lock().await;
+        let _system = EnvValueGuard::set("ZC_HINDSIGHT_SYSTEM_BANK", "beta-private");
+        let _shared = EnvValueGuard::remove("ZC_HINDSIGHT_SHARED_BANK");
+
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.agents.get_mut("beta").unwrap().memory.bank_id = "beta-private".to_string();
+
+        crate::env_overrides::apply_hindsight_tier_bank_env_bridge(&mut config)
+            .expect("bridge succeeds");
+        assert_eq!(config.memory.hindsight.system_bank, "beta-private");
+        let err = config
+            .validate()
+            .expect_err("env system tier aliasing an explicit private bank must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system_bank") && msg.contains("beta-private"),
+            "expected system-tier collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn env_tier_bank_bridge_yields_to_configured_toml_value() {
+        // A TOML value always wins over the legacy env fallback: the env var is
+        // only bridged when the typed field is unset, preserving the historical
+        // "typed config wins" precedence.
+        let _guard = env_override_lock().await;
+        let _shared = EnvValueGuard::set("ZC_HINDSIGHT_SHARED_BANK", "env-house");
+
+        let mut config = multi_agent_test_config();
+        config.memory.hindsight.shared_bank = "toml-house".to_string();
+
+        crate::env_overrides::apply_hindsight_tier_bank_env_bridge(&mut config)
+            .expect("bridge succeeds");
+        assert_eq!(
+            config.memory.hindsight.shared_bank, "toml-house",
+            "a configured TOML tier bank must not be overwritten by the legacy env var"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_tier_banks_distinct_from_every_private_bank() {
+        // Shared/system tiers that do not alias any agent's private bank are
+        // accepted (the common, correct configuration).
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.memory.hindsight.shared_bank = "zeroclaw-house".to_string();
+        config.memory.hindsight.system_bank = "zeroclaw-system".to_string();
+        config
+            .validate()
+            .expect("tier banks distinct from all private banks should validate");
     }
 
     #[test]

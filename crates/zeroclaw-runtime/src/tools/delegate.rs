@@ -694,7 +694,11 @@ impl DelegateTool {
                 security.clone(),
             )));
         }
-        if SharedMemoryStoreTool::is_supported(&memory, true) {
+        // System tier: gated by the target's explicit admin grant (fail-closed),
+        // so a bounded delegation cannot rebind system-write power onto a target
+        // whose profile is not authorized for it.
+        if SharedMemoryStoreTool::is_supported(&memory, true) && security.can_write_system_memory()
+        {
             tools.push(Box::new(SharedMemoryStoreTool::new_system(
                 memory.clone(),
                 security.clone(),
@@ -2969,12 +2973,12 @@ mod tests {
 
     #[test]
     fn bounded_delegation_gates_memory_tools_by_target_policy() {
-        // Bounded delegation rebinds memory tools to the target scope. The set
-        // of rebound tools must be gated by the TARGET agent's own policy, not
-        // just the caller's, so a delegated turn cannot gain a memory-write
-        // authority (e.g. `system_memory_store`) the target is not allowed to
-        // run. This mirrors the filter applied in `execute` where the delegated
-        // memory tools are collected.
+        // Bounded delegation rebinds memory tools to the TARGET scope. The
+        // rebound set must be gated by the target agent's own policy inside the
+        // production assembly (`memory_tools_for_target`), not by a filter the
+        // test reconstructs afterward, so a delegated turn cannot gain a
+        // memory-write authority (e.g. `system_memory_store`) the target is not
+        // allowed to run.
         use zeroclaw_memory::HindsightMemory;
 
         let memory: Arc<dyn Memory> = Arc::new(HindsightMemory::for_test(
@@ -2986,35 +2990,62 @@ mod tests {
             "test-token",
         ));
 
-        // Both tiers are supported, so both write tools are constructed.
-        let all_tools = DelegateTool::memory_tools_for_target(memory.clone(), test_security());
-        let all_names: Vec<&str> = all_tools.iter().map(|t| t.name()).collect();
-        assert!(all_names.contains(&"system_memory_store"));
-        assert!(all_names.contains(&"shared_memory_store"));
+        // An ADMIN target (explicit deny-by-default system grant) gets the
+        // system write tool, rebound to the target's own memory. The shared tier
+        // is name-gated and present for any profile.
+        let admin_target = Arc::new(SecurityPolicy {
+            system_memory_admin: true,
+            ..SecurityPolicy::default()
+        });
+        let admin_tools =
+            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&admin_target));
+        let admin_names: Vec<&str> = admin_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            admin_names.contains(&"system_memory_store"),
+            "an admin target must receive the system write tool: {admin_names:?}"
+        );
+        assert!(admin_names.contains(&"shared_memory_store"));
+        assert!(admin_names.contains(&"memory_store"));
 
-        // A target policy that excludes the system tool must drop it from the
-        // rebound set while keeping every other memory tool.
-        let target_policy = Arc::new(SecurityPolicy {
+        // A NON-ADMIN target (the default profile) must NOT receive the
+        // system-write tool from the production assembly itself - no external
+        // filter. This is the real bounded-delegation path: `is_tool_allowed`
+        // would still admit the name, so a test that reapplied that filter would
+        // wrongly pass; the assembly must drop it via the admin authority.
+        let non_admin_target = test_security();
+        let default_tools =
+            DelegateTool::memory_tools_for_target(memory.clone(), Arc::clone(&non_admin_target));
+        let default_names: Vec<String> =
+            default_tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            !default_names.iter().any(|n| n == "system_memory_store"),
+            "a non-admin target must not gain system-write via bounded delegation: {default_names:?}"
+        );
+        assert!(
+            default_names.iter().any(|n| n == "shared_memory_store"),
+            "shared_memory_store (name-gated) must remain for the target: {default_names:?}"
+        );
+        assert!(
+            default_names.iter().any(|n| n == "memory_store"),
+            "ordinary memory tools must remain for the target: {default_names:?}"
+        );
+
+        // An admin whose profile additionally EXCLUDES the tool by name is still
+        // denied: `can_write_system_memory` honors excluded_tools on top of the
+        // grant, so the production assembly drops it.
+        let admin_but_excluded = Arc::new(SecurityPolicy {
+            system_memory_admin: true,
             excluded_tools: Some(vec!["system_memory_store".to_string()]),
             ..SecurityPolicy::default()
         });
-        let gated: Vec<String> =
-            DelegateTool::memory_tools_for_target(memory, Arc::clone(&target_policy))
-                .into_iter()
-                .filter(|tool| target_policy.is_tool_allowed(tool.name()))
-                .map(|tool| tool.name().to_string())
+        let excluded_names: Vec<String> =
+            DelegateTool::memory_tools_for_target(memory, admin_but_excluded)
+                .iter()
+                .map(|t| t.name().to_string())
                 .collect();
         assert!(
-            !gated.iter().any(|n| n == "system_memory_store"),
-            "system_memory_store must be gated out for a target that denies it: {gated:?}"
-        );
-        assert!(
-            gated.iter().any(|n| n == "shared_memory_store"),
-            "shared_memory_store must remain for the target: {gated:?}"
-        );
-        assert!(
-            gated.iter().any(|n| n == "memory_store"),
-            "ordinary memory tools must remain for the target: {gated:?}"
+            !excluded_names.iter().any(|n| n == "system_memory_store"),
+            "excluded_tools must still drop the system tool for an admin: {excluded_names:?}"
         );
     }
 
@@ -8036,6 +8067,198 @@ command = "echo hi"
         fn alias(&self) -> &str {
             "ToolListInspector"
         }
+    }
+
+    /// Records the exact set of tool names presented to the child turn, so a
+    /// test can assert what the surrounding bounded assembly actually built.
+    struct ToolNameCaptureModelProvider {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolNameCaptureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tools) = request.tools {
+                let mut seen = self.seen.lock().unwrap();
+                *seen = tools.iter().map(|tool| tool.name.clone()).collect();
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolNameCaptureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolNameCaptureModelProvider"
+        }
+    }
+
+    /// Regression for the bounded-assembly path (WARNING companion to
+    /// `bounded_delegation_gates_memory_tools_by_target_policy`, which probes
+    /// `memory_tools_for_target` in isolation). This drives the REAL
+    /// `execute_agentic` Bounded assembly end-to-end so it would catch a
+    /// regression in the surrounding wiring - a reintroduced caller-scoped
+    /// fallback, or the shared/system tools being dropped before they reach the
+    /// child turn - that the isolated helper test cannot see.
+    ///
+    /// A Hindsight target with a configured shared bank must have
+    /// `shared_memory_store` rebound onto its own memory and presented to the
+    /// child, while a non-admin target must NOT receive `system_memory_store`
+    /// even though its system bank exists - the admin gate lives inside the
+    /// assembly, not in an after-the-fact filter.
+    #[tokio::test]
+    async fn bounded_delegation_assembly_exposes_shared_but_not_system_memory_tool() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
+        use zeroclaw_memory::HindsightMemory;
+
+        let tmp = TempDir::new().unwrap();
+        let mut root_config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // A Hindsight install with shared AND system tiers configured, so the
+        // target backend supports both tiers; only the admin gate should keep
+        // the system tool off a non-admin target.
+        root_config.memory.hindsight.base_url = "http://127.0.0.1:1".to_string();
+        root_config.memory.hindsight.token = Some("test-token".to_string());
+        root_config.memory.hindsight.shared_bank = "zeroclaw-house".to_string();
+        root_config.memory.hindsight.system_bank = "zeroclaw-system".to_string();
+        // Caller may delegate and run the shared/system memory tools; the target
+        // profile also admits them by name but is NOT a system admin, so the
+        // system tool must still be withheld by the assembly's admin gate.
+        root_config.risk_profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![
+                    "shared_memory_store".to_string(),
+                    "system_memory_store".to_string(),
+                    DelegateTool::NAME.to_string(),
+                ],
+                ..RiskProfileConfig::default()
+            },
+        );
+        root_config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
+            memory: zeroclaw_config::multi_agent::AgentMemoryConfig {
+                backend: ConfigBackend::Hindsight,
+                ..Default::default()
+            },
+            ..AliasedAgentConfig::default()
+        };
+        root_config
+            .agents
+            .insert("caller".to_string(), target_config.clone());
+        root_config
+            .agents
+            .insert("target".to_string(), target_config.clone());
+        let root_config = Arc::new(root_config);
+
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        // The caller's parent registry carries the shared/system memory tools,
+        // bound to the caller's own Hindsight handle. Bounded delegation must
+        // rebind the admitted ones to the target and drop the rest.
+        let caller_memory: Arc<dyn Memory> = Arc::new(HindsightMemory::for_test(
+            "caller",
+            "http://127.0.0.1:1",
+            "zeroclaw-caller",
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+            "test-token",
+        ));
+        let parent_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(SharedMemoryStoreTool::new_shared(
+                caller_memory.clone(),
+                caller_security.clone(),
+            )),
+            Arc::new(SharedMemoryStoreTool::new_system(
+                caller_memory.clone(),
+                caller_security.clone(),
+            )),
+        ];
+
+        let tool = DelegateTool::new(
+            root_config.agents.clone(),
+            None,
+            Arc::clone(&caller_security),
+        )
+        .with_root_config(Arc::clone(&root_config))
+        .with_workspace_dir(tmp.path().join("workspace"))
+        .with_memory(Arc::clone(&caller_memory))
+        .with_parent_tools(Arc::new(RwLock::new(parent_tools)))
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone())
+        .with_caller_alias("caller");
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let model_provider = ToolNameCaptureModelProvider { seen: seen.clone() };
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "custom",
+                "delegate-test-model",
+                &model_provider,
+                "write a house note",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "bounded delegate failed: {result:?}");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|name| name == "shared_memory_store"),
+            "the bounded assembly must expose shared_memory_store to the target: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|name| name == "system_memory_store"),
+            "a non-admin target must not gain system_memory_store through the bounded assembly: {seen:?}"
+        );
     }
 
     #[tokio::test]
