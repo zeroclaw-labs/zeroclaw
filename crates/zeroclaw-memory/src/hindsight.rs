@@ -35,11 +35,18 @@
 //! set to the server id in `to_entry`). Deletion targets the private bank only -
 //! the same bank writes land in.
 //!
-//! Recall type filter: `recall_types` (typed `[memory.hindsight] recall_types`,
-//! env fallback `ZC_HINDSIGHT_RECALL_TYPES`) restricts recall to selected
-//! Hindsight fact types (`experience`, `observation`, `world`); it is sent as
-//! the recall body's `types` array and applied on BOTH the query and the
-//! recent/empty-query (`list`) paths. Empty = no filter (all types).
+//! Recall type filter: `recall_types` restricts recall to selected Hindsight
+//! fact types (`experience`, `observation`, `world`); it is sent as the recall
+//! body's `types` array and applied on BOTH the query and the recent/empty-query
+//! (`list`) paths. Empty = no filter (all types). The effective value comes
+//! solely from the typed `[memory.hindsight] recall_types` field: the generic
+//! `ZEROCLAW_memory__hindsight__recall_types` override and the legacy short form
+//! `ZC_HINDSIGHT_RECALL_TYPES` are both resolved into that typed field during
+//! config loading (the legacy name is bridged in
+//! `zeroclaw_config::env_overrides`, validated by the shared
+//! `HindsightMemoryConfig::normalize_recall_types` so an invalid fact type is a
+//! startup error), so this constructor never re-reads the environment and there
+//! is a single observable source of truth visible to config inspection.
 //!
 //! Shared and system tiers (this slice): the typed `[memory.hindsight]`
 //! `shared_bank` / `system_bank` fields name two extra banks every agent can
@@ -259,23 +266,6 @@ fn resolve_secondary_bank(configured: Option<&str>, taken: &[&str]) -> Option<St
         .filter(|b| !b.is_empty() && !taken.contains(&b.as_str()))
 }
 
-/// Env var restricting recall to specific Hindsight fact types (comma-separated).
-const RECALL_TYPES_ENV: &str = "ZC_HINDSIGHT_RECALL_TYPES";
-
-/// Parse `ZC_HINDSIGHT_RECALL_TYPES` (comma-separated fact types) into a trimmed,
-/// non-empty-token list. Returns `None` when the var is unset so callers can
-/// fall back to typed config; returns `Some(vec![])` when the var is set but
-/// blank so an explicit empty override disables the filter.
-fn recall_types_from_env() -> Option<Vec<String>> {
-    std::env::var(RECALL_TYPES_ENV).ok().map(|raw| {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
-}
-
 impl HindsightMemory {
     /// Build a hindsight backend for `agent_alias` from the typed
     /// `[memory.hindsight]` config plus a per-agent `bank_id` override.
@@ -342,9 +332,16 @@ impl HindsightMemory {
             cfg.top_k
         };
 
-        // Recall type filter: an explicit env override (comma-separated) wins,
-        // else the typed config value. Empty means "no filter" (all types).
-        let recall_types = recall_types_from_env().unwrap_or_else(|| cfg.recall_types.clone());
+        // Recall type filter: the effective value comes ONLY from the typed
+        // config field. Empty means "no filter" (all types). The legacy
+        // `ZC_HINDSIGHT_RECALL_TYPES` override is NOT re-read here: it is bridged
+        // into `cfg.recall_types` during config loading
+        // (`env_overrides::apply_env_overrides`) alongside the generic
+        // `ZEROCLAW_memory__hindsight__recall_types` form, so there is exactly
+        // ONE observable source of truth (typed `Config`, visible to config
+        // inspection and drift) instead of a second env read that could silently
+        // disagree with reported config.
+        let recall_types = cfg.recall_types.clone();
 
         Ok(Self {
             alias: agent_alias.to_string(),
@@ -574,6 +571,14 @@ impl HindsightMemory {
     }
 
     /// List a single named bank.
+    ///
+    /// The Hindsight list endpoint has no server-side `types` filter, so when
+    /// `recall_types` is configured the filter is applied LOCALLY on each row's
+    /// fact type here. This makes the recent-recall (empty/`*` query) path -
+    /// which falls back to `list` - honor the same type restriction as the
+    /// query-based `recall` path, instead of returning every fact type. A row
+    /// with no server-provided type is KEPT so unlabeled/legacy history is never
+    /// silently dropped by the filter.
     async fn list_bank(&self, bank: &str) -> Result<Vec<MemoryEntry>> {
         let resp = self
             .client
@@ -592,8 +597,26 @@ impl HindsightMemory {
         Ok(parsed
             .items
             .into_iter()
+            .filter(|i| self.fact_type_allowed(i.fact_type.as_deref()))
             .map(|i| Self::to_entry(i.id, i.text, i.context, i.mentioned_at, &i.tags, None))
             .collect())
+    }
+
+    /// Whether a row with the given server fact type passes the configured
+    /// `recall_types` filter. No configured filter admits everything; a row
+    /// whose type is absent is admitted (legacy/unlabeled rows are never
+    /// silently dropped); otherwise the type must be in the configured set.
+    fn fact_type_allowed(&self, fact_type: Option<&str>) -> bool {
+        if self.recall_types.is_empty() {
+            return true;
+        }
+        match fact_type {
+            None => true,
+            Some(ft) => {
+                let ft = ft.trim();
+                self.recall_types.iter().any(|t| t == ft)
+            }
+        }
     }
 }
 
@@ -677,6 +700,13 @@ struct ListItem {
     /// `MemoryCategory` (see [`RecallResult::tags`]).
     #[serde(default)]
     tags: Vec<String>,
+    /// The server's Hindsight fact type (`experience`/`observation`/`world`).
+    /// The list endpoint has no server-side `types` filter, so the recent-recall
+    /// (empty/`*` query) path filters on this value locally to honor the
+    /// configured `recall_types`. Absent on older rows; a missing type is kept
+    /// so unlabeled history is never silently dropped.
+    #[serde(default, rename = "type")]
+    fact_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1303,6 +1333,70 @@ mod tests {
     use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Process-wide lock serializing EVERY Hindsight test that mutates a
+    /// process-global environment variable. Rust's test harness runs tests on
+    /// multiple threads by default and `std::env::set_var`/`remove_var` mutate
+    /// shared process state, so without a single shared lock two env-mutating
+    /// tests can interleave and observe each other's values (reproducible with
+    /// `--test-threads=16`). A `std::sync::Mutex` is used so the guard can be
+    /// held across the synchronous `from_config` env reads without an await
+    /// point; the guarded data is `()` so a panicking test cannot corrupt it.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the shared env lock, tolerant of a prior test having poisoned it
+    /// by panicking while holding it. There is no invariant to protect (the
+    /// guarded value is `()`), so recover the guard and keep serializing.
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RAII guard that sets or clears one environment variable for the duration
+    /// of a test and restores its PRIOR value (or prior absence) on drop - even
+    /// if the test panics. Paired with [`env_test_lock`], this replaces the
+    /// unenforceable "single-threaded test" comment with real serialization plus
+    /// panic-safe restoration.
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        /// Set `key` to `value`, remembering the prior value to restore on drop.
+        fn set(key: &str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: every caller holds `env_test_lock()`, so no other test
+            // thread reads or writes the environment concurrently.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+
+        /// Ensure `key` is unset for the test, remembering the prior value.
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: see `set`.
+            unsafe { std::env::remove_var(key) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold `env_test_lock()` for the guard's lifetime.
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
+    }
+
     /// A HindsightMemory pointed at a mock server with a fixed token/bank and
     /// no shared bank, so tests exercise the store/recall/list HTTP mapping
     /// without any environment or live network.
@@ -1335,10 +1429,11 @@ mod tests {
 
     #[test]
     fn from_config_reads_token_env_then_bank_template() {
-        // A unique env var name avoids cross-test interference.
+        // Serialize on the shared env lock; the RAII guard restores the token
+        // var (and its prior absence) even on panic.
+        let _lock = env_test_lock();
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_A";
-        // SAFETY: single-threaded test; set + read within this test only.
-        unsafe { std::env::set_var(env_name, "env-token-123") };
+        let _tok = EnvVarGuard::set(env_name, "env-token-123");
         let cfg = HindsightMemoryConfig {
             base_url: "https://example.test/hs/".to_string(),
             bank_template: "zeroclaw-{agent}".to_string(),
@@ -1350,13 +1445,13 @@ mod tests {
         assert_eq!(mem.token, "env-token-123");
         // Trailing slash on base_url is trimmed for clean URL joins.
         assert_eq!(mem.base_url, "https://example.test/hs");
-        unsafe { std::env::remove_var(env_name) };
     }
 
     #[test]
     fn from_config_falls_back_to_inline_token_when_env_absent() {
+        let _lock = env_test_lock();
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ABSENT";
-        unsafe { std::env::remove_var(env_name) };
+        let _tok = EnvVarGuard::unset(env_name);
         let cfg = HindsightMemoryConfig {
             base_url: "https://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
@@ -1374,8 +1469,9 @@ mod tests {
         // the refused third-party default endpoint cannot be reached even on a
         // path (CLI/install-wide/status) that skipped `Config::validate`. A
         // token is present so the failure is unambiguously the endpoint.
+        let _lock = env_test_lock();
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_DEFAULT_EP";
-        unsafe { std::env::set_var(env_name, "tok") };
+        let _tok = EnvVarGuard::set(env_name, "tok");
         let cfg = HindsightMemoryConfig {
             // Default base_url is the refused third-party endpoint.
             token_env: env_name.to_string(),
@@ -1386,15 +1482,15 @@ mod tests {
             err.to_string().contains("operator-owned"),
             "constructor must refuse the default endpoint: {err}"
         );
-        unsafe { std::env::remove_var(env_name) };
     }
 
     #[test]
     fn from_config_rejects_plaintext_remote_endpoint() {
         // Plaintext http:// to a remote host is refused by the constructor's
         // re-validation on every path.
+        let _lock = env_test_lock();
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_PLAINTEXT";
-        unsafe { std::env::set_var(env_name, "tok") };
+        let _tok = EnvVarGuard::set(env_name, "tok");
         let cfg = HindsightMemoryConfig {
             base_url: "http://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
@@ -1405,13 +1501,13 @@ mod tests {
             err.to_string().contains("https"),
             "constructor must refuse a plaintext remote endpoint: {err}"
         );
-        unsafe { std::env::remove_var(env_name) };
     }
 
     #[test]
     fn from_config_errors_without_any_token() {
+        let _lock = env_test_lock();
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_MISSING";
-        unsafe { std::env::remove_var(env_name) };
+        let _tok = EnvVarGuard::unset(env_name);
         let cfg = HindsightMemoryConfig {
             base_url: "https://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
@@ -1568,6 +1664,139 @@ mod tests {
         let hits = mem.recall("*", 10, None, None, None).await.expect("list");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].content, "first");
+    }
+
+    #[test]
+    fn recall_types_env_and_config_share_one_normalizing_validator() {
+        // The config-load bridge routes the `ZC_HINDSIGHT_RECALL_TYPES` env
+        // override through `HindsightMemoryConfig::normalize_recall_types` - the
+        // SAME validator `validate_self` applies to the TOML value. Rather than
+        // mutate the process-global env var (which would race parallel
+        // `from_config` tests), assert the shared validator directly: an invalid
+        // env-style token is rejected exactly like an invalid TOML token, and
+        // whitespace normalizes identically for both sources.
+        use zeroclaw_config::schema::HindsightMemoryConfig;
+        // env-style comma split (what the config bridge feeds the validator)
+        // with a typo.
+        let env_tokens: Vec<String> = "observations, world"
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let err = HindsightMemoryConfig::normalize_recall_types(&env_tokens)
+            .expect_err("an invalid env token must be rejected");
+        assert_eq!(err, "observations");
+        // Valid env-style value normalizes to the same canonical vec a TOML
+        // value would.
+        let ok_tokens: Vec<String> = " world , experience "
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let normalized = HindsightMemoryConfig::normalize_recall_types(&ok_tokens)
+            .expect("valid env value must normalize");
+        assert_eq!(
+            normalized,
+            vec!["world".to_string(), "experience".to_string()]
+        );
+    }
+
+    /// Blocker fix (single observable source of truth): the effective
+    /// `recall_types` must come ONLY from the typed config field. The
+    /// `from_config` constructor must NOT re-read any environment variable -
+    /// even the legacy `ZC_HINDSIGHT_RECALL_TYPES` name, which is now bridged
+    /// into the typed field during config loading. Here the typed field is
+    /// empty (no filter) while the legacy env is set to `observation`; the
+    /// constructor must honor the typed field and ignore the stray env, proving
+    /// the backend no longer has a second, config-invisible source.
+    #[tokio::test]
+    async fn from_config_recall_types_ignores_legacy_env_uses_typed_field_only() {
+        let _lock = env_test_lock();
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_RECALL_TYPED_ONLY";
+        let _tok = EnvVarGuard::set(env_name, "tok");
+        // A stray legacy env value must NOT reach the backend; only config
+        // loading bridges it, and that is exercised in the config crate.
+        let _stray = EnvVarGuard::set("ZC_HINDSIGHT_RECALL_TYPES", "observation");
+        let cfg = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
+            token_env: env_name.to_string(),
+            // Typed config says "no filter"; the stray env would (wrongly) add one.
+            recall_types: Vec::new(),
+            ..HindsightMemoryConfig::default()
+        };
+        let mem = HindsightMemory::from_config(&cfg, "scout", "").expect("construct");
+        assert!(
+            mem.recall_types.is_empty(),
+            "from_config must use the typed field only and ignore the legacy \
+             ZC_HINDSIGHT_RECALL_TYPES env (bridged during config load instead)"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_query_recall_honors_recall_types_on_list() {
+        // The recent-recall (empty query) path falls back to `list`, which has
+        // no server-side type filter. With recall_types configured, mixed fact
+        // types returned by list must be filtered locally so an
+        // observations-only agent does not receive experience/world rows. A row
+        // with no server type is kept (legacy/unlabeled history).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "obs", "text": "kept-observation", "type": "observation", "context": "c" },
+                    { "id": "exp", "text": "dropped-experience", "type": "experience", "context": "c" },
+                    { "id": "wor", "text": "dropped-world", "type": "world", "context": "c" },
+                    { "id": "leg", "text": "kept-legacy-untyped", "context": "c" }
+                ],
+                "total": 4
+            })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.recall_types = vec!["observation".to_string()];
+        // Empty query -> list fallback; only observation + untyped survive.
+        let hits = mem.recall("", 10, None, None, None).await.expect("list");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"obs"),
+            "observation row must be kept: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"leg"),
+            "untyped legacy row must be kept: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"exp") && !ids.contains(&"wor"),
+            "experience/world rows must be dropped by the type filter: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn star_query_recall_honors_recall_types_with_mixed_types() {
+        // Same as above via the bare `*` recent-recall alias, proving the
+        // normalized empty/`*` branch applies the filter (regression for the
+        // `*` case specifically).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "w", "text": "world-fact", "type": "world", "context": "c" },
+                    { "id": "e", "text": "exp-fact", "type": "experience", "context": "c" }
+                ],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.recall_types = vec!["world".to_string(), "experience".to_string()];
+        let hits = mem.recall("*", 10, None, None, None).await.expect("list");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"w") && ids.contains(&"e"),
+            "both configured types must survive: {ids:?}"
+        );
     }
 
     #[tokio::test]
