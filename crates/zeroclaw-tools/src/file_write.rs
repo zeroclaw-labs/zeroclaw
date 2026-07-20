@@ -549,9 +549,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Rejected writes (invalid base64 / unsupported encoding) targeting a
-    /// missing nested parent must fail WITHOUT mutating the workspace — no
-    /// file and, crucially, no parent directory may be created.
     #[tokio::test]
     async fn file_write_rejected_encoding_does_not_create_parent_dirs() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_write_no_dir_on_reject");

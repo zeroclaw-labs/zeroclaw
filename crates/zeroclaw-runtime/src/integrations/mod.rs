@@ -4,11 +4,6 @@ pub mod registry;
 use anyhow::Result;
 use zeroclaw_config::schema::Config;
 
-/// Integration status
-///
-/// Two states only: an integration is either configured (`Active`) or it
-/// exists in the schema but isn't configured (`Available`). There is no
-/// "coming soon" state — if it is not real, it does not get listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationStatus {
     /// Fully implemented and ready to use
@@ -46,11 +41,6 @@ impl IntegrationCategory {
     }
 }
 
-/// A registered integration. The `status` is computed against a
-/// specific `&Config` at construction time (see
-/// `registry::all_integrations`). `name` and `description` are owned
-/// strings so the schema-derived path can build them at runtime from
-/// the `ChannelsConfig` field set.
 pub struct IntegrationEntry {
     pub name: String,
     pub description: String,
@@ -94,7 +84,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw config set channels.telegram.default.bot-token <token>");
+            println!("    3. Run: zeroclaw config set channels.telegram.default.bot_token <token>");
             println!("    4. Start: zeroclaw channel start");
         }
         "Discord" => {

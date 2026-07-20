@@ -156,6 +156,29 @@ impl Observer for LogObserver {
                     "memory.store"
                 );
             }
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                // Action::Note keeps this arm out of the observer bridge's
+                // "memory_audit" projection: re-recording Action::MemoryAudit
+                // here would loop the event back into this observer when a
+                // bridge observer is installed.
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "memory_action": action,
+                            "backend": backend,
+                            "duration_ms": ms,
+                            "success": success
+                        })),
+                    "memory.audit"
+                );
+            }
             ObserverEvent::RagRetrieve {
                 duration,
                 num_chunks,
@@ -380,6 +403,12 @@ mod tests {
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "outbound".into(),
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(5),
+            success: true,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {

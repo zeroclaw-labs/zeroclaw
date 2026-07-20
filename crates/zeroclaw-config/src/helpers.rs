@@ -2,23 +2,6 @@
 
 use crate::traits::{ConfigTab, CredentialSurfaceClass, PropFieldInfo, PropKind};
 
-/// For a `#[nested] HashMap<String, T>` field, parse a `get_prop`/`set_prop`
-/// path of the form `<my_prefix>.<field_name>.<hm_key>.<inner_suffix>` and
-/// return the HashMap key + the fully-qualified inner name that the value
-/// type's own `get_prop` / `set_prop` expects.
-///
-/// HashMap keys are user-controlled and may contain dots, URLs, or hostnames
-/// (for example `model_providers.custom:https://example.invalid/v1.api-key`).
-/// Inner values may themselves be deeply nested (`AliasedAgentConfig` has
-/// `agent.thinking.<...>` subpaths), so neither left-splitting nor
-/// right-splitting works in isolation. Match against the actual present
-/// keys and pick the longest prefix that is followed by `.` — this
-/// correctly handles dotted keys *and* deep inner paths in one parse.
-///
-/// `keys` is an iterator over the live HashMap's keys (typically
-/// `self.<field>.keys().map(String::as_str)` from the derive). Returns
-/// `None` when the path doesn't match, letting the derive's generated
-/// code fall through to the next nested field.
 pub fn route_hashmap_path<'a, 'k, I>(
     name: &'a str,
     my_prefix: &str,
@@ -35,9 +18,6 @@ where
         format!("{my_prefix}.{field_name}")
     };
     let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
-    // Longest-match against present map keys. Dotted keys (URL-shaped
-    // custom provider entries) sort longer than their unprefixed siblings,
-    // so this also disambiguates `custom:https://x` vs. `custom`.
     let mut best: Option<(usize, &'a str)> = None;
     for k in keys {
         if let Some(_suffix) = rest.strip_prefix(k).and_then(|s| s.strip_prefix('.'))
@@ -60,11 +40,6 @@ where
     Some((hm_key, inner_name))
 }
 
-/// For a `#[nested] HashMap<String, HashMap<String, T>>` field, parse a path
-/// `<my_prefix>.<field_name>.<outer_key>.<inner_key>.<inner_suffix>` and
-/// return (outer_key, inner_key, fully-qualified inner name for T::get_prop).
-///
-/// Returns `None` when the path doesn't match (wrong prefix or too few segments).
 pub fn route_double_hashmap_path<'a>(
     name: &'a str,
     my_prefix: &str,
@@ -87,31 +62,6 @@ pub fn route_double_hashmap_path<'a>(
     Some((outer_key, inner_key, inner_name))
 }
 
-/// For a `#[nested] Vec<T>` field whose element type `T` carries a
-/// natural-key field (e.g. `McpServerConfig::name`), parse a path of the
-/// form `<my_prefix>.<field_name>.<natural_key>.<inner_suffix>` and
-/// return `(matched_natural_key_index_in_vec, fully-qualified inner name
-/// for T::get_prop / set_prop)`.
-///
-/// `natural_keys` is an iterator over `(index, key)` pairs from the live
-/// `Vec<T>`: typically `self.<field>.iter().enumerate().map(|(i, e)|
-/// (i, e.<natural_key_field>.as_str()))` from the derive.
-///
-/// Matching is longest-key-wins (same as [`route_hashmap_path`]) so dotted
-/// natural keys disambiguate against their shorter siblings.
-///
-/// Ambiguity (two elements sharing the same natural key) is *not* resolved
-/// silently: when two or more indices match the same longest natural key,
-/// the returned [`VecRoute`] is [`VecRoute::Ambiguous`] carrying the key
-/// and the duplicate count. Callers (get_prop / set_prop / prop_is_secret
-/// dispatch sites) surface this as an error rather than mutating one of
-/// the duplicates by accident — the schema validator catches the broken
-/// state at save time, but until the operator fixes it, in-flight edits
-/// must refuse to route.
-///
-/// Returns [`VecRoute::Miss`] when the path doesn't match this field's
-/// prefix, letting the derive's generated code fall through to the next
-/// nested field (same fall-through contract as [`route_hashmap_path`]).
 pub fn route_vec_path<'a, 'k, I>(
     name: &'a str,
     my_prefix: &str,
@@ -203,13 +153,14 @@ pub enum VecRoute<'a> {
     /// Path resolved to a unique element. `index` is the element's
     /// position in the underlying `Vec`; `inner_name` is the property
     /// path to pass to `T::get_prop` / `T::set_prop`.
-    Hit { index: usize, inner_name: String },
-    /// Path's natural key matches two or more elements. Callers must
-    /// surface this as an error: editing either duplicate silently is
-    /// a correctness hazard. The schema's per-section validator
-    /// (`validate_mcp_config` for `mcp.servers`) is the source of truth
-    /// for the on-save check; this variant is the in-flight equivalent.
-    Ambiguous { key: &'a str, count: usize },
+    Hit {
+        index: usize,
+        inner_name: String,
+    },
+    Ambiguous {
+        key: &'a str,
+        count: usize,
+    },
 }
 
 /// Return a comma-separated string of valid enum variant names for display in error messages.
@@ -632,18 +583,6 @@ fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
     }
 }
 
-/// Validate that an alias key is safe for use in TOML dotted paths, URLs,
-/// filesystem paths on Windows/macOS/Linux, and `ZEROCLAW_*` env-var grammar.
-///
-/// Allowed: lowercase ASCII alphanumeric plus single underscore, 1-63 chars.
-/// Must start AND end with alphanumeric. Adjacent underscores (`__`) are
-/// forbidden because they collide with the env-var grammar's path separator.
-///
-/// The env-var grammar uses `__` as path separator, which lets aliases keep
-/// single `_` literally (`prod_v2`, `staging_api`). Hyphens are forbidden
-/// because they are illegal in POSIX env-var identifiers; uppercase is
-/// forbidden so the bootstrap env-vars (`ZEROCLAW_WORKSPACE`,
-/// `ZEROCLAW_CONFIG_DIR`) stay disambiguated by case.
 pub fn validate_alias_key(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("alias must not be empty".to_string());
@@ -684,16 +623,6 @@ pub fn validate_alias_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve a CLI-typed config path to its canonical form.
-///
-/// Field segments derived from the schema are kebab-case; aliases are
-/// snake-only per [`validate_alias_key`]. For each known canonical
-/// path, segments are compared pairwise: equal verbatim, equal after
-/// swapping `-` → `_` when the canonical segment contains `-`, or
-/// equal after swapping `_` → `-` for the final field segment. The
-/// final-segment rule lets older CLI spelling like `api-key` resolve
-/// to schema-canonical `api_key` without rewriting map aliases such as
-/// `my_bot`. Returns `raw` unchanged when no canonical path matches.
 #[must_use]
 pub fn resolve_field_path(known_paths: &[String], raw: &str) -> String {
     let raw_segs: Vec<&str> = raw.split('.').collect();
@@ -719,14 +648,6 @@ pub fn resolve_field_path(known_paths: &[String], raw: &str) -> String {
     raw.to_string()
 }
 
-/// Inverse of the `Configurable` macro's internal `snake_to_kebab`.
-///
-/// Field paths emitted by `prop_fields()` are kebab-case (per the macro's
-/// snake→kebab transform of the underlying Rust idents). Surfaces that want
-/// to display the field under its serde-canonical snake_case spelling — for
-/// example `api_key` rather than `api-key` — use this to convert.
-///
-/// No-op for keys without `-`.
 pub fn kebab_to_snake(key: &str) -> String {
     key.replace('-', "_")
 }
