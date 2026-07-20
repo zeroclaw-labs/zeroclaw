@@ -7,6 +7,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -17,7 +18,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
-const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
+const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -65,6 +67,7 @@ pub mod method {
     pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
+    pub const CONFIG_RENAME_MAP_KEY: &str = "config/map-key-rename";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
     pub const CONFIG_SECTIONS: &str = "config/sections";
     pub const CONFIG_CATALOG_MODELS: &str = "config/catalog-models";
@@ -1071,6 +1074,20 @@ impl RpcClient {
         Ok(())
     }
 
+    pub async fn config_map_key_rename(
+        &self,
+        path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<ConfigRenameMapKeyResult> {
+        self.call_with_timeout(
+            method::CONFIG_RENAME_MAP_KEY,
+            serde_json::json!({ "path": path, "from": from, "to": to }),
+            CONFIG_RENAME_TIMEOUT,
+        )
+        .await
+    }
+
     pub async fn config_templates(&self) -> Result<Vec<ConfigTemplateEntry>> {
         let result: ConfigTemplatesResult = self
             .call(method::CONFIG_TEMPLATES, serde_json::json!({}))
@@ -1751,6 +1768,14 @@ pub struct LocalesFetchResult {
 #[serde(rename_all = "snake_case")]
 pub struct ConfigMapKeysResult {
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfigRenameMapKeyResult {
+    pub renamed: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3416,6 +3441,48 @@ mod session_method_tests {
             .expect("client.session_approve must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_sends_path_and_aliases() {
+        assert_eq!(CONFIG_RENAME_TIMEOUT, std::time::Duration::from_secs(120));
+
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task =
+            tokio::spawn(async move { client.config_map_key_rename("agents", "old", "new").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.config_map_key_rename must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "config/map-key-rename");
+        assert_eq!(req["params"]["path"], "agents");
+        assert_eq!(req["params"]["from"], "old");
+        assert_eq!(req["params"]["to"], "new");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "path": "agents",
+                "from": "old",
+                "to": "new",
+                "renamed": true,
+                "warnings": ["workspace move skipped"]
+            })),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.config_map_key_rename must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert!(result.renamed);
+        assert_eq!(result.warnings, vec!["workspace move skipped"]);
     }
 }
 

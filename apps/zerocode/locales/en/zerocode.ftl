@@ -172,6 +172,15 @@ zc-dashboard-memory-not-configured = Memory is not configured yet. Use Quickstar
 zc-dashboard-search-action-apply = apply
 zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
+zc-dashboard-agent-rename-action-apply = rename
+zc-dashboard-agent-rename-action-cancel = cancel
+zc-dashboard-agent-rename-hint = rename
+zc-dashboard-agent-rename-prefix = rename:
+zc-dashboard-agent-rename-empty = Agent name cannot be empty
+zc-dashboard-agent-rename-unchanged = Agent name unchanged
+zc-dashboard-agent-rename-success = Renamed { $from } to { $to }
+zc-dashboard-agent-rename-success-warnings = Renamed { $from } to { $to } with warnings: { $warnings }
+zc-dashboard-agent-rename-failed = Rename failed: { $error }
 
 zc-dashboard-label-connected = Connected
 zc-dashboard-label-server = Server
@@ -263,7 +272,6 @@ zc-dashboard-run-already-running = Run already in progress: { $id }
 zc-dashboard-run-pending-status = running
 zc-dashboard-run-pending-window = starting now
 zc-dashboard-run-pending-output = Manual trigger in progress…
-
 
 zc-dashboard-yes = yes
 zc-dashboard-no = no

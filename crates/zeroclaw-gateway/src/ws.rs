@@ -1,4 +1,8 @@
 //! WebSocket agent chat handler.
+//!
+//! Approval summaries are operator-facing strings produced by the runtime's
+//! key-name redaction heuristic. Approval decisions bind to `request_id`; this
+//! transport forwards the summary without rebuilding it from raw arguments.
 
 use super::AppState;
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
@@ -707,6 +711,8 @@ async fn handle_socket(
 
             approval_event = approval_event_rx.recv() => {
                 let Some(event) = approval_event else { break };
+                // Forward the runtime-produced summary without inspecting or
+                // reconstructing it from the raw argument object.
                 let frame = match event {
                     zeroclaw_api::agent::TurnEvent::ApprovalRequest {
                         request_id,
