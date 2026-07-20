@@ -58,7 +58,7 @@ interface StagedChannel {
   mode: "fresh" | "existing";
   channel_type: string;
   alias: string;
-  extras: Record<string, string>;
+  fields: Record<string, string>;
 }
 
 interface StagedPeerGroup {
@@ -183,11 +183,7 @@ export default function Quickstart() {
               value: {
                 channel_type: c.channel_type,
                 alias: c.alias,
-                token:
-                  c.extras["bot_token"] ??
-                  c.extras["token"] ??
-                  c.extras["access_token"] ??
-                  null,
+                fields: c.fields,
               },
             },
       ),
@@ -1048,7 +1044,7 @@ function ChannelAddForm({
   const [descriptors, setDescriptors] = useState<QuickstartFieldDescriptor[]>(
     [],
   );
-  const [extras, setExtras] = useState<Record<string, string>>({});
+  const [fields, setFields] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (mode !== "fresh" || !type) {
@@ -1081,13 +1077,13 @@ function ChannelAddForm({
     if (mode === "existing") {
       const [t, a] = existingRef.split(".");
       if (!t || !a) return;
-      onAdd({ mode: "existing", channel_type: t, alias: a, extras: {} });
+      onAdd({ mode: "existing", channel_type: t, alias: a, fields: {} });
     } else {
       onAdd({
         mode: "fresh",
         channel_type: type,
         alias: alias.trim(),
-        extras,
+        fields,
       });
     }
   };
@@ -1147,7 +1143,7 @@ function ChannelAddForm({
                 const next = e.target.value;
                 setType(next);
                 setAlias((prev) => (prev === "" || prev === type ? next : prev));
-                setExtras({});
+                setFields({});
               }}
             >
               <option value="" disabled>
@@ -1173,8 +1169,8 @@ function ChannelAddForm({
               key={d.key}
               label={d.label}
               type={d.is_secret ? "password" : "text"}
-              value={extras[d.key] ?? ""}
-              onChange={(v) => setExtras((x) => ({ ...x, [d.key]: v }))}
+              value={fields[d.key] ?? ""}
+              onChange={(v) => setFields((x) => ({ ...x, [d.key]: v }))}
               placeholder={d.help}
             />
           ))}

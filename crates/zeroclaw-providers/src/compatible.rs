@@ -91,6 +91,70 @@ pub enum AuthStyle {
     ZhipuJwt,
 }
 
+/// Sanitize a tool-call `arguments` string before it is re-serialized into an
+/// outbound OpenAI-compatible chat-completions request.
+///
+/// Several strict upstream providers (Cohere, OpenInference, Nvidia …,
+/// surfaced most often through OpenRouter) reject requests where
+/// `tool_calls[].function.arguments` is not well-formed JSON. Smaller /
+/// reasoning models sometimes emit a malformed arguments string; when that
+/// happens the whole turn fails with HTTP 400 and the user receives the
+/// generic fallback instead of the agent's response. #8675.
+///
+/// Contract:
+/// - empty / whitespace-only → `"{}"` (every upstream accepts this)
+/// - valid JSON → returned unchanged
+/// - invalid JSON → WARN-logged with **safe metadata only** (function name,
+///   payload length, stable error key), then `"{}"`. The raw arguments
+///   string is **never** recorded, because tool-call arguments can contain
+///   commands, URLs, credentials, file paths, or user content and WARN
+///   events enter the broadcast and rolling-persistence path regardless of
+///   the tool/LLM content-capture policy.
+///
+/// This is the single source of truth for the tool-call arguments
+/// normalization contract. The streaming accumulator's
+/// `StreamToolCallAccumulator::into_provider_tool_call` and all typed
+/// providers' outbound `convert_messages` paths route through here.
+pub(crate) fn sanitize_tool_arguments(function_name: &str, arguments: &str) -> String {
+    if arguments.trim().is_empty() {
+        return "{}".to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(serde_json::Value::Object(_)) => return arguments.to_string(),
+        Ok(_non_object) => {
+            // Accept only JSON objects; null, arrays, strings, numbers, and
+            // booleans do not satisfy a strict-provider function-arguments
+            // contract (reported by Cohere, tracked by OpenRouter's
+            // auto-exacto validator).
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "function": function_name,
+                        "payload_len": arguments.len(),
+                        "error_key": "tool_args_not_object",
+                    })),
+                "Non-object tool-call arguments being sent to strict upstream provider, dropping to empty object"
+            );
+            return "{}".to_string();
+        }
+        Err(_) => {}
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "function": function_name,
+                "payload_len": arguments.len(),
+                "error_key": "tool_args_invalid_json",
+            })),
+        "Invalid JSON in tool-call arguments being sent to upstream provider, dropping to empty object"
+    );
+    "{}".to_string()
+}
+
 /// Generate a Zhipu JWT from an `id.secret` API key.
 /// Returns `Authorization: Bearer <jwt>` value. Token is valid for 3.5 minutes.
 fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
@@ -1304,24 +1368,11 @@ impl StreamToolCallAccumulator {
         used_tool_call_ids: &mut std::collections::HashSet<String>,
     ) -> Option<ProviderToolCall> {
         let name = self.name?;
-        let arguments = if self.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            self.arguments
-        };
-        let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok()
-        {
-            arguments
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"function": name, "arguments": arguments})),
-                "Invalid JSON in streamed native tool-call arguments, using empty object"
-            );
-            "{}".to_string()
-        };
+        // Route through the shared `sanitize_tool_arguments` helper so the
+        // normalization contract (empty/whitespace → "{}", invalid JSON →
+        // WARN + "{}", valid JSON → passthrough) has a single source of
+        // truth. #8675.
+        let normalized_arguments = sanitize_tool_arguments(&name, &self.arguments);
 
         Some(ProviderToolCall {
             id: reserve_tool_call_id_for_contract(
@@ -3337,6 +3388,47 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCompatibleModelProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty / whitespace arguments must collapse to `"{}"` so OpenAI-style
+    /// providers never see an invalid `tool_calls[].function.arguments`.
+    #[test]
+    fn sanitize_tool_arguments_empty_or_whitespace_becomes_empty_object() {
+        assert_eq!(sanitize_tool_arguments("f", ""), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "   \n\t  "), "{}");
+    }
+
+    /// Well-formed JSON object returns untouched — only object-shaped arguments
+    /// satisfy the strict-provider function-arguments contract.
+    #[test]
+    fn sanitize_tool_arguments_valid_json_is_passthrough() {
+        let args = r#"{"path":"/tmp/x","recursive":true}"#;
+        assert_eq!(sanitize_tool_arguments("file_read", args), args);
+    }
+
+    /// Non-object JSON values (null, array, string, number, boolean) are
+    /// rejected to `"{}"` because strict providers require a JSON object for
+    /// tool-call arguments.
+    #[test]
+    fn sanitize_tool_arguments_non_object_becomes_empty_object() {
+        assert_eq!(sanitize_tool_arguments("f", "null"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "[]"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "42"), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "\"hello\""), "{}");
+        assert_eq!(sanitize_tool_arguments("f", "true"), "{}");
+    }
+
+    /// Malformed arguments are dropped to `"{}"` so strict upstreams (Cohere,
+    /// OpenInference, Nvidia via OpenRouter) no longer reject the whole request
+    /// with HTTP 400 just because the model emitted junk arguments.
+    #[test]
+    fn sanitize_tool_arguments_invalid_json_becomes_empty_object() {
+        // Unterminated string
+        assert_eq!(sanitize_tool_arguments("f", r#"{"path":"/tmp"#), "{}");
+        // Trailing junk
+        assert_eq!(sanitize_tool_arguments("f", r#"{"x":1}garbage"#), "{}");
+        // Truncated (the actual observed failure case from #8675)
+        assert_eq!(sanitize_tool_arguments("f", ""), "{}");
+    }
 
     fn make_model_provider(
         name: &str,

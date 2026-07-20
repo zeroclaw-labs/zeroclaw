@@ -1,157 +1,101 @@
 # History management
 
-The runtime keeps one conversation history per agent session and sends it to
-the model on every turn. Left unbounded that history outgrows the context
-window, so the runtime has two complementary mechanisms to bound it:
+The runtime keeps conversation history for each agent session and sends a
+provider-facing working history to the model. Two complementary limits operate
+on different representations:
 
-1. **Whole-turn trimming** (the primary mechanism): drops oldest whole turns
-   to fit a token budget.
-2. **Message-count hard cap** (a safety net): enforces a ceiling on the total
-   number of messages after each turn.
+1. **Token-budget trimming** acts on the provider-facing `ChatMessage` working
+   history and drops oldest whole turns until the estimated context fits the
+   token budget.
+2. **Structured message-count trimming** mutates `Agent::history`
+   (`ConversationMessage`) used by RPC, gateway, and ACP `Agent` turns when it
+   exceeds the structured agent's effective message cap. Daemon channel loops
+   that call the legacy `agent::run` path use the separate raw-message cap
+   described below.
 
-This page documents both, disambiguates them from the adjacent operations
-people conflate them with, and describes the user-visible signals they emit.
+Token-budget trimming and the structured message-count limit retain turns
+atomically. A turn starts at a real user message and includes the assistant
+response and any tool calls and tool results before the next user message.
+Trimming therefore does not split a tool call from its result.
 
-Everything here is sourced from the runtime code in
-`crates/zeroclaw-runtime/src/agent/`. Where a behavior is named, the function
-that implements it is named with it.
+## Whole-turn retention
 
-## Whole-turn trimming (primary)
+`history_trim::trim_to_recent_turns` enforces the token budget, while
+`history_trim::trim_conversation_to_recent_turns` enforces the structured
+message-count limit. Each keeps the newest complete turn even when that turn by
+itself exceeds the relevant limit. This is intentional: preserving a complete
+current turn is safer than satisfying a numeric cap by dropping its newest
+messages or breaking a tool exchange.
 
-`history_trim::trim_to_recent_turns(history, budget_tokens)` is the primary
-trimming mechanism. Its rule is deliberately small enough to hold in your head:
+Leading system messages are retained. When no trim is needed, message order and
+shape are left unchanged.
 
-> Keep the most recent whole turns that fit the token budget, drop the rest,
-> never cut a turn in half.
+## Token budget
 
-A **turn** starts at a real user message and runs until the next real user
-message, covering the assistant reply, any assistant tool-call rows, and any
-tool-result rows in between. Tool exchanges live entirely inside a turn, so
-dropping whole turns can never split a `tool_use` from its `tool_result`.
-Pairing safety for providers that enforce it (Anthropic among them) is
-**structural**, not patched up afterward.
+The token budget comes from `ResolvedRuntime::effective_context_budget()`:
 
-The function returns a `TrimResult` carrying `dropped_turns`, `dropped_messages`,
-`kept_turns`, `tokens_before`, `tokens_after`, and `trimmed`. `trimmed` is true
-only when at least one whole turn was dropped. Leading system messages are
-always preserved, and at least the most recent whole turn is always kept even
-if that single turn exceeds the budget: the model never gets nuked to nothing.
-
-## When it runs
-
-Trimming runs at two moments, never mid-tool-loop:
-
-1. **Preemptive**, once at the start of a turn, when the history already exceeds
-   the effective budget (`run_tool_call_loop`, iteration 0).
-2. **Reactive**, when a provider returns a context-window-exceeded error; the
-   recovery path drops oldest whole turns and retries
-   (`turn::context_recovery::try_recover_context_overflow` and the interactive
-   loop's overflow arm).
-
-Both paths call the same `trim_to_recent_turns`. There is no per-iteration
-pruning and no summarization step.
-
-## The budget
-
-The budget comes from `ResolvedRuntime::effective_context_budget()`:
-
-- When `history_pruning.enabled` is set with a positive `history_pruning.max_tokens`,
-  the budget is the lower of that floor and `max_context_tokens`, so an explicit
-  budget trims earlier than the hard ceiling.
-- Otherwise the budget is `max_context_tokens` and the hard ceiling is the only
-  trigger.
+- When `history_pruning.enabled` is set with a positive
+  `history_pruning.max_tokens`, the budget is the lower of that value and
+  `max_context_tokens`.
+- Otherwise the budget is `max_context_tokens`.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
-characters per token plus four framing tokens per message. It is a heuristic,
-not a tokenizer.
+characters per token plus four framing tokens per message. This is a heuristic,
+not a provider tokenizer.
 
-> The `history_pruning.*` config keys are reused as-is; `collapse_tool_results`
-> and `keep_recent` no longer drive any code path (the most recent whole turn is
-> kept structurally). The key idents are scheduled to be renamed at config
-> schema V4 and are intentionally left in place until then.
+Token-budget trimming runs before the first provider call of a turn when
+history already exceeds the effective budget and at provider-call boundaries
+between tool-loop iterations, including reactively when a provider reports that
+the context window was exceeded. It retains whole turns, so it never splits a
+tool exchange.
 
-## Message-count hard cap (safety net)
+## Structured message-count limit
 
-After the primary whole-turn trim, a second mechanism enforces an absolute
-ceiling on the number of messages in the conversation:
+`max_history_messages` is the configured value in the agent's runtime profile.
+An explicitly configured value is authoritative for both the legacy raw path
+and structured agent history, including `0`. Because structured trimming always
+retains the newest whole turn, a value of `0` removes older turns but does not
+erase the current turn.
 
-- `history::trim_history(history, max_history)` operates on the interactive
-  (`ChatMessage`) history in `loop_.rs`. It preserves the system prompt, the
-  first user message (the framing anchor that prevents silent-amnesia bugs),
-  and the most recent `max_history` messages, dropping from the middle when
-  the ceiling is exceeded.
-- `Agent::trim_history()` (`agent.rs`) applies an equivalent cap to structured
-  `ConversationMessage` history in the ACP/gateway turn path, with additional
-  orphan-safety cascades that avoid creating dangling `ToolResults` or
-  `AssistantToolCalls` at the head after a drop.
+When `max_history_messages` is omitted, the legacy raw cap remains `50`. The
+structured agent's effective cap is derived from the tool-loop allowance:
 
-Both emit a log record on every fire so silent message loss is detectable.
+```text
+max(50, 2 * max_tool_iterations + 2)
+```
 
-The value of `max_history` is set through `max_history_messages` in the
-agent's runtime profile config. Because the hard cap runs *after* every turn,
-it acts as a safety net: even if the whole-turn trim's token budget is
-generous enough to keep many turns, the message-count cap limits the
-structural size of the history.
+Each tool iteration can add a tool call and a tool result; the extra two slots
+cover the user message and final assistant response. With the default
+`max_tool_iterations = 10`, the derived limit remains `50`.
 
-> The hard cap does **not** inject a breadcrumb or emit a `history_trimmed`
-> event (unlike whole-turn trimming). The only user-visible signal is the log
-> record. The cap is intended as a structural safety net, not a first-line
-> trimming strategy.
+## Visible trimming
 
-## It is never silent
+Whenever token-budget trimming or the structured message-count limit drops
+older turns, the runtime:
 
-When `trimmed` is true the caller does two things so the loss is always visible:
+1. Inserts a breadcrumb before the first retained turn so the model knows that
+   earlier context was omitted.
+2. Emits `HistoryTrimmed` with the number of dropped messages, retained turns,
+   and a reason identifying the token budget or message limit.
 
-1. Injects a breadcrumb into the history, after the leading system messages and
-   before the first kept turn:
-   `[earlier turns omitted to fit the context window]` (`history_trim::breadcrumb`).
-2. Emits a visible "context was trimmed" signal on every client surface, the
-   same multi-surface visibility contract that turn cancellation uses:
-   - **ACP** (`session/update` of type `history_trimmed`, mapped in
-     `acp_server.rs`) carrying `sessionId`, `droppedMessages`, `keptTurns`,
-     and `reason` (`SessionUpdateEvent::HistoryTrimmed`).
-   - **Gateway WebSocket** (`{"type":"history_trimmed", ...}`, mapped in
-     `ws.rs` from `TurnEvent::HistoryTrimmed`).
-   - **SSE `/api/events`** (`{"type":"history_trimmed", ...}`, mapped in
-     `sse.rs` from `ObserverEvent::HistoryTrimmed`) carrying
-     `dropped_messages`, `kept_turns`, `reason`, plus `agent_alias` /
-     `channel` / `turn_id` when the attribution span carries them.
+The event is surfaced through the active client transport and through the
+observer path used by dashboards and event subscribers. Trimming is therefore
+not log-only and is not silent to either the model or connected clients.
 
-   When the context changes underneath the model, the end user is told why.
-
-The breadcrumb matters beyond the UI. With it in context, a model asked to
-recall dropped work answers honestly ("the earlier turns were omitted from my
-context window") instead of fabricating a result it can no longer see.
-
-## What trimming is not
-
-These are distinct operations. Only the first two drop conversation history.
-
-| Operation | What it does | Where |
-|---|---|---|
-| **Whole-turn trimming** | Drops oldest **whole turns** to fit the token budget. The primary history-removal mechanism. | `history_trim::trim_to_recent_turns` |
-| **Message-count hard cap** | Drops oldest messages when the number of messages exceeds `max_history_messages`. A safety net that preserves the system prompt, first user anchor, and most recent messages. | `history::trim_history` / `Agent::trim_history` |
-| **Orphan sweep** | Removes a `tool_result` whose `tool_use` is gone (or vice versa) so providers do not 400 on a dangling pair. A pairing-safety net, not a size control. | `history_pruner::remove_orphaned_tool_messages` |
-| **System normalization** | Merges and reorders system messages to the front. Changes shape, never drops turns. | `history::normalize_system_messages` |
-| **Tool-result capping** | At collection time, caps a single tool result's length (`max_tool_result_chars`). Bounds one message as it is recorded; does not touch history. | `history::truncate_tool_result` |
-| **Provider truncation** | The provider's own context-window enforcement, server-side. Out of the runtime's hands; the reactive path reacts to it. | provider API |
-
-There is no context **compression** or **summarization** step. The runtime does
-not replace old turns with a synthetic summary and does not inject placeholder
-markers into provider-visible history. If you are looking for that, it was
-removed: collapsing turns into summaries is exactly the silent-mutation pattern
-that made models report work they could no longer see.
+The legacy `agent::run` path in `loop_.rs` is an unchanged exception. Its raw
+`ChatMessage` cap in `history::trim_history` remains message-level and reports
+trimming through logs only, without the breadcrumb or `HistoryTrimmed` event.
+This path serves interactive use as well as one-shot and non-interactive daemon,
+cron, subagent, and SOP callers.
 
 ## Pairing safety
 
-The hard invariant is that a request never carries a `tool_use` without its
-`tool_result` or vice versa. Two things guarantee it:
+Whole-turn retention is the primary tool-pairing guarantee: a tool call and its
+result belong to the same turn and are retained or dropped together. The orphan
+sweep remains a final safety net for histories that were already inconsistent,
+such as restored or externally modified sessions.
 
-1. Whole-turn trimming cannot split a pair, because both halves live inside the
-   same turn and turns are dropped atomically.
-2. The orphan sweep runs as a final net for histories that arrive already
-   broken (reloaded sessions, upstream edits), removing any dangling tool row
-   before the request goes out.
-
-A trimmed history therefore passes the orphan sweep with nothing to remove,
-which is asserted directly in the `history_trim` unit tests.
+Tool-result length limits are separate. `max_tool_result_chars` bounds an
+individual result when it is recorded; it does not trim conversation history.
+Provider-side context enforcement is also separate, though a provider overflow
+can trigger the runtime's reactive token-budget trim.

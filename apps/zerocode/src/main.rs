@@ -321,7 +321,7 @@ async fn run() -> anyhow::Result<()> {
                 Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
-                    spawn_ephemeral_daemon(&config_dir)?;
+                    spawn_ephemeral_daemon(&config_dir, socket)?;
                     owns_ephemeral = true;
                     await_daemon_ready(socket).await?
                 }
@@ -406,17 +406,17 @@ async fn run_until_exit(
     }
 }
 
-pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn spawn_ephemeral_daemon(
+    config_dir: &std::path::Path,
+    socket: &std::path::Path,
+) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("zeroclaw")))
         .unwrap_or_else(|| PathBuf::from("zeroclaw"));
 
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("daemon")
-        .arg("--ephemeral")
-        .arg("--config-dir")
-        .arg(config_dir);
+    configure_ephemeral_daemon_command(&mut cmd, config_dir, socket);
 
     // Lower the daemon's log level to DEBUG when spawned ephemerally by
     // zerocode so that the Logs pane can show debug events without any
@@ -438,6 +438,20 @@ pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Re
         .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
 
     Ok(())
+}
+
+fn configure_ephemeral_daemon_command(
+    cmd: &mut std::process::Command,
+    config_dir: &std::path::Path,
+    socket: &std::path::Path,
+) {
+    cmd.arg("daemon")
+        .arg("--ephemeral")
+        .arg("--config-dir")
+        .arg(config_dir)
+        // The TUI waits on this exact endpoint, so the child must bind it
+        // instead of independently deriving a potentially different path.
+        .env("ZEROCLAW_SOCKET", socket);
 }
 
 async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::RpcClient> {
@@ -467,6 +481,35 @@ fn is_daemon_version_mismatch(err: &anyhow::Error) -> bool {
 mod connection_tests {
     use super::*;
     use crate::config::WssSection;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn ephemeral_daemon_command_sets_selected_socket() {
+        let mut cmd = std::process::Command::new("zeroclaw");
+        configure_ephemeral_daemon_command(
+            &mut cmd,
+            std::path::Path::new("/tmp/zeroclaw-config"),
+            std::path::Path::new("/tmp/zeroclaw.sock"),
+        );
+
+        assert_eq!(
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "daemon",
+                "--ephemeral",
+                "--config-dir",
+                "/tmp/zeroclaw-config",
+            ]
+        );
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(name, _)| *name == OsStr::new("ZEROCLAW_SOCKET"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("/tmp/zeroclaw.sock"))
+        );
+    }
 
     #[test]
     fn flag_connect_overrides_config_uri() {
