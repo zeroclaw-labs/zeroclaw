@@ -2262,7 +2262,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Apply mention_only gate before downloading. Photo / document
         // updates carry no `text` field, so the text-only gate in
         // `parse_update_message` can never see them and they used to slip
-        // through unconditionally. See #6229.
+        // through unconditionally.
         let gated_caption =
             self.check_media_mention_gate(message, attachment.caption.as_deref())?;
         let (chat_id, message_id) = Self::extract_update_message_target(update)?;
