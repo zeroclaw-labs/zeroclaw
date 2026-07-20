@@ -799,6 +799,34 @@ pub async fn create_memory_for_agent(
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     let backend_kind = agent_cfg.memory.backend;
 
+    // Typed-memory producers are SQLite-only. Config::validate already
+    // rejects this combination on every save path, but boot is
+    // deliberately validation-resilient (a hand-edited config still
+    // starts the daemon so the operator can repair it via /config), so
+    // enforce again here: failing agent-memory construction is an
+    // operator-visible startup error and keeps background consolidation
+    // from ever running typed writes into a backend that would reject
+    // them deep inside spawned work.
+    if config.memory.types.enabled || config.memory.consolidation_extract_facts {
+        let flag = if config.memory.types.enabled {
+            "memory.types.enabled"
+        } else {
+            "memory.consolidation_extract_facts"
+        };
+        let global_kind = backend_kind_from_dotted(&config.memory.backend);
+        if global_kind != "sqlite" {
+            anyhow::bail!(
+                "{flag} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
+                config.memory.backend
+            );
+        }
+        if !matches!(backend_kind, ConfigBackend::Sqlite) {
+            anyhow::bail!(
+                "{flag} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{agent_alias}.memory.backend = {backend_kind:?}"
+            );
+        }
+    }
+
     // Markdown branch: the wrapper composes per-agent dirs, not a
     // shared backend. Skip the inner-backend factory entirely.
     if matches!(backend_kind, ConfigBackend::Markdown) {
@@ -1301,6 +1329,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stores, 1, "none-backed agent store attempt must be audited");
+    }
+
+    /// Boot is validation-resilient (a hand-edited config that fails
+    /// `Config::validate` still starts the daemon), so the SQLite-only
+    /// typed-memory boundary must ALSO hold at agent-memory construction:
+    /// the last chokepoint before background consolidation could produce
+    /// typed writes into a backend that rejects them.
+    #[tokio::test]
+    async fn create_memory_for_agent_rejects_typed_flags_on_non_sqlite_backend() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.types.enabled = true;
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let err = match create_memory_for_agent(&cfg, "scribe", None).await {
+            Ok(_) => panic!("typed flags with a non-sqlite agent backend must fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("SQLite-only"),
+            "expected the SQLite-only boundary in the error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_memory_for_agent_allows_typed_flags_on_sqlite() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.types.enabled = true;
+        cfg.memory.consolidation_extract_facts = true;
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Sqlite,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        create_memory_for_agent(&cfg, "scribe", None)
+            .await
+            .expect("typed flags on the default sqlite backend must construct");
     }
 
     #[test]

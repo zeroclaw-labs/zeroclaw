@@ -500,7 +500,6 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             .await
     }
 
-
     async fn store_with_agent(
         &self,
         key: &str,

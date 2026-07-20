@@ -10378,7 +10378,8 @@ pub struct MemoryConfig {
     pub hygiene_enabled: bool,
     /// Also extract atomic durable facts from each consolidated turn and store
     /// them as individual Core memories. Default off; the flip is sequenced in
-    /// a later phase.
+    /// a later phase. SQLite-only: enabling this requires the sqlite memory
+    /// backend globally and on every agent (validated at config load).
     #[serde(default)]
     pub consolidation_extract_facts: bool,
     /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
@@ -10544,7 +10545,8 @@ pub struct MemoryConfig {
 ///
 /// Behaviour-neutral by default: `enabled` gates MemoryKind assignment on new
 /// consolidation writes and defaults off; the flip is sequenced in a later
-/// phase.
+/// phase. SQLite-only: enabling requires the sqlite memory backend globally
+/// and on every agent (validated at config load).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.types"]
@@ -18898,13 +18900,17 @@ impl Config {
             } else {
                 "memory.consolidation_extract_facts"
             };
+            // Mirror the runtime's backend classification
+            // (`backend_kind_from_dotted`): trim, take the prefix before the
+            // first dot, compare case-insensitively.
             let backend_kind = self
                 .memory
                 .backend
+                .trim()
                 .split('.')
                 .next()
                 .unwrap_or_default()
-                .trim();
+                .to_ascii_lowercase();
             if backend_kind != "sqlite" {
                 validation_bail!(
                     InvalidFormat,
@@ -33349,6 +33355,20 @@ allowed_users = []
         config
             .validate()
             .expect("typed memory on sqlite everywhere must pass validation");
+    }
+
+    #[test]
+    async fn validate_accepts_typed_memory_flags_on_mixed_case_sqlite() {
+        // The runtime classifies backends case-insensitively
+        // (`backend_kind_from_dotted` lowercases), so the SQLite-only gate
+        // must accept every spelling the runtime resolves to sqlite.
+        let mut config = multi_agent_test_config();
+        config.memory.types.enabled = true;
+        config.memory.backend = " SQLite.default ".to_string();
+
+        config
+            .validate()
+            .expect("mixed-case sqlite spellings the runtime accepts must pass the typed gate");
     }
 
     #[test]
